@@ -119,7 +119,7 @@ These are proposals. The engineering review will confirm them.
 - **Language:** TypeScript. A Node server and a React user interface, shipped as one npm package.
 - **Storage:** SQLite. It holds tasks, plan revisions, approvals, feedback, the schedule, and a run log. **SQLite is the only master copy of each plan.**
 - **Storage code:** All database access goes through one small module. It uses only Node's built-in `node:sqlite` (engineering review, R7). The minimum Node version is the oldest one that continuous integration proves loads `node:sqlite` with no warning. Node 26 is confirmed today. On an older Node, codeboost stops at start-up and tells you which version to install. The module is still a thin wrapper, so an API change touches one file.
-- **Workspaces:** each task gets its own standalone clone (`git clone --local`), whose `.git` folder sits inside the task folder, so git works inside the agent's container (engineering review, O6). codeboost pushes to GitHub from outside the container. It never touches or mounts your own checkout. Elsewhere in this document, "worktree" means this per-task folder.
+- **Workspaces:** each task gets its own standalone clone (`git clone --local --no-hardlinks`), whose `.git` folder sits inside the task folder, so git works inside the agent's container (engineering review, O6). Objects must be independent copies, with no hard links or alternates back to the source. codeboost pushes to GitHub from outside the container. It never touches or mounts your own checkout. Elsewhere in this document, "worktree" means this per-task folder.
 - **Agents:** one small adapter per agent: `claude -p` and `codex exec`. Each takes a prompt, a worktree, and a set of permissions, and reports progress as it runs.
 - **GitHub:** codeboost uses `gh` for issues, PRs, and merging. **Only codeboost runs `gh`. Agents never do.**
 
@@ -1452,11 +1452,11 @@ Comparison grid:
 
 | Choice | Current | A | B | C | D |
 |---|---|---|---|---|---|
-| Task workspace | `git worktree` | a standalone per-task clone (`git clone --local`), whose `.git` folder is inside the task folder | `git worktree` | `git worktree`, investigate | `git worktree`, deferred |
+| Task workspace | `git worktree` | a standalone per-task clone (`git clone --local --no-hardlinks`), whose `.git` folder is inside the task folder | `git worktree` | `git worktree`, investigate | `git worktree`, deferred |
 | What the container mounts | the worktree (git broken inside) | the task folder, including its own `.git` | the worktree | the worktree | the worktree |
 | Who pushes to GitHub | codeboost | codeboost, from outside the container (the clone's remote is a local path, unreachable inside; the network rule R2 also blocks GitHub) | codeboost | codeboost | codeboost |
 | Your main checkout | untouched | untouched, and never mounted | untouched | untouched | untouched |
-| Disk use | shared objects | objects hard-linked where the file system allows, else copied | shared | shared | shared |
+| Disk use | shared objects | independent object copies; no hard links or alternates | shared | shared | shared |
 
 Question D16:
 D16 — How should each task get a working git inside its container?
@@ -1469,7 +1469,7 @@ Net: working git and a sealed main repo (A), or broken git in the container (B, 
 Header: Container git
 Options:
 A) Apply this change (recommended)
-Replace per-task worktrees with a standalone per-task clone (git clone --local) that the container mounts, .git included. codeboost pushes from outside the container. ✅ Git works normally inside the container. ✅ Your main repository is never mounted or writable. ❌ Uses more disk per task when hard links are not possible. (human: ~3 hours / CC: ~15 min)
+Replace per-task worktrees with a standalone per-task clone (git clone --local --no-hardlinks) that the container mounts, .git included. codeboost pushes from outside the container. ✅ Git works normally inside the container. ✅ Your main repository is never mounted or writable. ❌ Uses more disk per task because objects are copied. (human: ~3 hours / CC: ~15 min)
 B) Keep this row's current value
 Keep git worktree and mount only the worktree. ✅ No change. ✅ Least disk use. ❌ Git does not work inside the container, so agents cannot inspect their own changes. (human: 0 / CC: 0)
 C) Investigate before choosing
@@ -1479,8 +1479,8 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Th
 
 State: approved
 Actual answer: A) Apply this change (answer to D16, 2026-09-22)
-Accepted scope: each task uses a standalone clone (`git clone --local`) with its own `.git` inside the task folder; the container mounts that folder as `/work`; codeboost pushes from outside the container; the main checkout is never mounted. Objects are hard-linked where possible, else copied. Test case: inside the container, `git status` and `git diff` work, and the main repository path is absent. Design sections amended: Tools and storage (Workspaces), Keeping unattended runs safe (container contents).
-History: none
+Accepted scope: each task uses a standalone clone (`git clone --local --no-hardlinks`) with its own `.git` inside the task folder; the container mounts that folder as `/work`; codeboost pushes from outside the container; the main checkout is never mounted. Objects are copied, never hard-linked or borrowed through alternates. Test case: inside the container, `git status` and `git diff` work, and the main repository path is absent. In disposable repositories, modifying an object in the task clone must leave the source object unchanged. Design sections amended: Tools and storage (Workspaces), Keeping unattended runs safe (container contents).
+History: PR #1 review found that `--local` alone shares object inodes with the source. The corrected command uses `--no-hardlinks`; a local probe reproduced source-object corruption without it.
 
 ### O7: Changes that have no text lines
 Finding: outside voice 7, P1, confidence 8/10, "How codeboost links code to plan items" (segments are runs of changed lines), reviewer: Codex (outside voice), confirmed by Claude
@@ -1771,7 +1771,7 @@ Codex (outside voice, completed, 2026-09-22) raised 8 findings. Claude checked e
 
 ### What already exists
 
-- **git** already provides worktrees, `clone --local`, rebase, and per-commit diffs. The plan uses these rather than writing its own.
+- **git** already provides worktrees, `clone --local --no-hardlinks`, rebase, and per-commit diffs. The plan uses these rather than writing its own.
 - **gh** already provides rulesets, checks, and `pr merge --match-head-commit`. The plan uses these rather than calling the API directly.
 - **Docker** is installed on this machine. The plan runs agents in containers instead of relying on vendor sandboxes.
 - **Claude CLI** already provides `--disallowedTools`, `--strict-mcp-config`, and `setup-token`. Used for the network and sign-in rules.
@@ -1862,7 +1862,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T1 (P1, human: ~3 days / CC: ~1 hour)** — agents — Build the pinned agent container that mounts only `/work` (with its own `.git`) and the agent's sign-in
   - Surfaced by: R1 (D2: B), O6 (D16: A)
   - Files: agents/container/, git/clone
-  - Verify: real-Docker test shows only `/work` and sign-in; `git status` works inside; the main repo path is absent
+  - Verify: real-Docker test shows only `/work` and sign-in; `git status` works inside; the main repo path is absent; changing a task-clone object in disposable repos leaves the source object unchanged
 - [ ] **T2 (P1, human: ~1 day / CC: ~30 min)** — agents — Add the vendor-only egress proxy and turn off web and MCP tools
   - Surfaced by: R2 (D3: A)
   - Files: agents/network/, agents/claude, agents/codex
@@ -1931,7 +1931,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T18 (P2, human: ~2 days / CC: ~45 min)** — core, agents, web — Plan schema: draft plans with either agent, import YAML or JSON, apply typed suggestions
   - Surfaced by: P1 (approved 2026-09-22)
   - Files: schema/, docs/plan-format.md, prompts/plan-author.md, core/plan (schema and meaning checks), agents/claude, agents/codex, web/plans (Import plan, suggestion cards)
-  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; `codex exec` runs with stdin closed
+  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate before conversion; `codex exec` runs with stdin closed
 
 ### Unresolved decisions
 

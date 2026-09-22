@@ -100,13 +100,17 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | Item IDs are unique. | Failure |
 | Every `depends_on` ID exists, comes earlier in the list, and there is no loop. | Failure |
 | A path has no `..` part and stays inside the repo. | Failure |
-| A file with kind `edit`, `delete`, or `rename` exists in the repo at the plan's base commit. For `rename`, `renamed_from` exists. For `add`, the path does not exist yet. | Failure |
+| File operations are valid in the projected repo state immediately before the item runs (see below). `edit` and `delete` need an existing path; `add` needs an unused path; `rename` needs an existing `renamed_from` and an unused destination `path`. | Failure |
 | `renamed_from` is set only for kind `rename`. | Failure |
 | The same path is not declared twice in one item. | Failure |
 | The item has at least one `cmd`. | Warning: "No test command" |
 | Each `cmd` starts with a command on the repo's allowed list (Settings, Safety). | Warning; the command does not run until you add it to the list |
 | A `cmd` changes a dependency or a script codeboost runs. | The task stops in "needs approval" when it runs, as for any such change |
 | `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
+
+**Projected file state.** Start with the paths at the plan's base commit, then walk items in their listed execution order. Check an item's file operations against the state before that item; after it passes, apply its declared additions, deletions, and renames to the projected state before checking the next item. No repo files change during validation. A path may participate in only one operation per item, counting both the source and destination of a rename. If an item uses a path created or renamed by an earlier item, it must depend on that item, directly or through other dependencies.
+
+For example, P1 may add `src/new.go`, then P2 with `depends_on: [P1]` may edit it. Likewise, P1 may rename `src/old.go` to `src/new.go`, then P2 may edit the new path. Editing a missing path, adding an existing path, or renaming onto an occupied path blocks approval. Recompute the projected state from the base commit after each plan edit.
 
 codeboost never treats issue text as instructions, wherever it appears. If an agent copies issue text into a plan field, the text is still just text: the agent that carries out the plan follows the plan items you approved, and nothing else.
 
@@ -144,8 +148,11 @@ Fields an operation does not use are `null`. After you apply an edit, the plan r
 ## Versions
 
 - Every plan carries `schema_version`. This document describes version 1.
-- A change that adds an optional field, or relaxes a limit, keeps version 1.
-- A change that renames, removes, or tightens a field makes version 2. codeboost keeps reading version 1 plans and converts them when it imports them.
+- Wording changes that do not change accepted data keep the same version. Changes to accepted data, including adding, renaming, or removing a field or changing a limit, require the next schema version. This applies to both plan and suggested-edit schemas.
+- A nullable field is still required. Adding one breaks old plans (the field is missing) and old readers (the field is unknown), so it must not be added under version 1.
+- Keep released schemas unchanged. On import, read `schema_version`, validate against that version's schema, convert using an explicit version migration, then validate against the current schema and run the meaning checks. Reject unsupported versions with an explanation. Never validate an old plan against a newer schema before converting it. Suggested edits must use a supported schema version and still match the current plan revision; otherwise ask the assistant to regenerate them.
+
+**PR #1 review decisions.** File validation uses projected state so dependent items can work on new or renamed files. Version changes are explicit because every field is required and unknown fields are rejected. T18 includes regression checks for both rules.
 
 ## Notes for builders
 
