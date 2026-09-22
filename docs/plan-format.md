@@ -104,7 +104,7 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | `renamed_from` is set only for kind `rename`. | Failure |
 | The same path is not declared twice in one item. | Failure |
 | The item has at least one `cmd`. | Warning: "No test command" |
-| Each `cmd` starts with a command on the repo's allowed list (Settings, Safety). | Warning; the command does not run until you add it to the list |
+| Each `cmd` is parsed as one executable and literal arguments, with the executable/subcommand matched exactly against the repo's allowed list. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
 | A `cmd` changes a dependency or a script codeboost runs. | The task stops in "needs approval" when it runs, as for any such change |
 | `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
 
@@ -112,7 +112,7 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 
 For example, P1 may add `src/new.go`, then P2 with `depends_on: [P1]` may edit it. Likewise, P1 may rename `src/old.go` to `src/new.go`, then P2 may edit the new path. Editing a missing path, adding an existing path, or renaming onto an occupied path blocks approval. Recompute the projected state from the base commit after each plan edit.
 
-codeboost never treats issue text as instructions, wherever it appears. If an agent copies issue text into a plan field, the text is still just text: the agent that carries out the plan follows the plan items you approved, and nothing else.
+Issue text and agent-produced plan fields remain untrusted. The prompt builder serializes issue data and previous plans as JSON and escapes delimiter characters before insertion (see the template). Escaping prevents data from closing its wrapper; it does not guarantee that a model ignores malicious instructions. Human plan approval, command validation, and the container remain required. Test both delimiter-escape payloads and instruction-like issue text.
 
 ## How a plan gets into codeboost
 
@@ -143,7 +143,7 @@ When you ask the plan assistant on the Plans screen for changes, it answers in t
 | `remove_check` | `item`, `check_index` | Removes an acceptance entry by position, starting at 0. |
 | `set_depends` | `item`, `depends_on` | Replaces the item's `depends_on` list. |
 
-Fields an operation does not use are `null`. After you apply an edit, the plan runs the checks after import again. An example: [`schema/examples/plan-edit-412-r3.json`](../schema/examples/plan-edit-412-r3.json).
+Fields an operation does not use are `null`. The strict answer schema checks structure, not the relationship between `op` and its payload. Before showing an enabled Apply button, a semantic validator must enforce the operation table: required payloads are non-null, unused payloads are null, and `item` identifies an existing item except for `add_item`, where it matches the unique `new_item.id`. File updates/removals must target an existing entry; additions must not duplicate one; `check_index` must be in range; and `set_field` must satisfy the destination field's limits. Reject invalid suggestions with an explanation. Dry-run each edit on a copy and run both the plan schema and all meaning checks; repeat against the current revision atomically when Apply is clicked. Invalid edits never mutate the saved plan. An example: [`schema/examples/plan-edit-412-r3.json`](../schema/examples/plan-edit-412-r3.json).
 
 ## Versions
 

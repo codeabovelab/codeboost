@@ -317,7 +317,7 @@ Added by the design review. Each rule cites the design-review decision (Dn) that
 - Items the mockups show but the plan does not have (Drafts, Templates, Rules, Experiments, PRs, Metrics) are removed.
 
 **Review screen: plan-item list (D14).**
-- Each row shows: item ID, title, approval state, change count, and the three status icons.
+- Each row shows: item ID, title, approval state, change count, and the four status icons.
 - Declared files appear only for the selected item.
 - A strip above the list always stays visible, for example **"2 unplanned · 1 ambiguous changes"**. Each part links to its row.
 
@@ -529,7 +529,7 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 ### Build order and the go/no-go check
 
 1. **Plan format and linking engine.** A code library, tested with sample git histories.
-2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the three checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
+2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
 3. **Go/no-go check.** Run the real-PR test in "How we will know it works." Continue only if reviewing by plan item wins. If it does not, change the linking design, or switch to option C, before building anything more.
 4. **Merge gate and merging** (step 9): the merge rules, the pre-merge sequence, and merging through `gh`.
 5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6).
@@ -629,7 +629,7 @@ You asked us to resolve all 17 concerns from the second review round before appr
 | R2-8: hunks with lines from several plan items | How codeboost links code to plan items: segments; test cases |
 | R2-9: whether assignments carry forward | How codeboost links code to plan items: assigning ambiguous or unplanned changes |
 | R2-10: whitespace changes | How codeboost links code to plan items: what an approval records; test cases |
-| R2-11: what the "Attributed" check means | How codeboost links code to plan items: the three checks |
+| R2-11: what the "Attributed" check means | How codeboost links code to plan items: the four checks |
 | R2-12: failing checks do not block merging | Approving and merging: when you can merge |
 | R2-13: stopping did not match step 5 | The queue, stopping, and recovery: stopping, and time and round limits |
 | R2-14: who owns the PR description; when questions run | The plan format: where the plan lives; Asking questions |
@@ -1931,7 +1931,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T18 (P2, human: ~2 days / CC: ~45 min)** — core, agents, web — Plan schema: draft plans with either agent, import YAML or JSON, apply typed suggestions
   - Surfaced by: P1 (approved 2026-09-22)
   - Files: schema/, docs/plan-format.md, prompts/plan-author.md, core/plan (schema and meaning checks), agents/claude, agents/codex, web/plans (Import plan, suggestion cards)
-  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate before conversion; `codex exec` runs with stdin closed
+  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate before conversion; malformed edit payloads and invalid resulting plans cannot be applied; command chains and delimiter-escape payloads are rejected or remain data; `codex exec` runs with stdin closed
 
 ### Unresolved decisions
 
@@ -1995,11 +1995,11 @@ Also applied without a new decision: the Learning screen's scope labels follow L
 | 2. States | 2 | 9 | — |
 | 3. Journey | 5 | 9 | — |
 | 4. AI slop and labels | 6 | 9 | — |
-| 5. Design system | 1 | 7 | DESIGN.md not yet created (D22) |
+| 5. Design system | 1 | 8 | DESIGN.md created (D22); implementation QA remains |
 | 6. Window sizes and accessibility | 2 | 9 | — |
 | 7. Unresolved decisions | — | 3 resolved, 0 deferred | — |
 
-Overall (the lowest pass): **1 → 7**. It reaches 8 or more once DESIGN.md exists.
+Overall (the lowest pass): **1 → 8**. D22 is complete: DESIGN.md defines the required tokens. This is a specification score; UI implementation QA remains.
 
 ### Not in scope
 
@@ -2031,7 +2031,7 @@ None proposed. Every fix is in the plan and in the tasks below.
 
 Built from this review's decisions. Tick each one as you ship it.
 
-- [ ] **DT1 (P1, human: ~1 day / CC: ~30 min)** — design system — Create DESIGN.md with `/design-consultation` before build step 2
+- [x] **DT1 (P1, human: ~1 day / CC: ~30 min)** — design system — Create DESIGN.md with `/design-consultation` before build step 2
   - Surfaced by: D22 · Files: DESIGN.md · Verify: every screen's colors and fonts come from its tokens
 - [ ] **DT2 (P1, human: ~1 day / CC: ~30 min)** — review screen — Approve button by the code, progress count, state-only row circles
   - Surfaced by: D12 · Files: web/review · Verify: approving P1 changes only P1; the header shows "n of m approved"
@@ -2073,11 +2073,11 @@ None from this design review.
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
 | Outside Review | Codex (eng outside voice; design outside voice) | Independent 2nd opinion | 2 | completed | Eng: 8 findings, all resolved. Design: 12 findings, merged into D12 to D28 |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 2 | ISSUES OPEN (PLAN) | 10 issues, 0 critical gaps; all decided; learning added (L1 to L4) |
-| Design Review | `/plan-design-review` | UI/UX gaps | 1 | ISSUES OPEN (FULL) | score: 1/10 → 7/10, 17 decisions |
+| Design Review | `/plan-design-review` | UI/UX gaps | 1 | ISSUES OPEN (FULL) | score: 1/10 → 8/10 after D22, 17 decisions |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
 - **OUTSIDE COVERAGE:** Codex plan-review phase, completed on 5036e0f, 8 findings, all resolved. Codex design phase, completed on 5036e0f, 12 findings. A Claude subagent (in-host, design phase) completed with 12 findings. Both design voices found no hard rejections. The learning requirement (L1 to L4) has not had an outside review.
 - **CROSS-MODEL:** In the design phase, Codex and the Claude subagent agreed on 9 of their top findings: per-item approve, stale reasons, the composer modes, merge blockers, inconsistent menus, scope labels, file-change evidence, keyboard wording, and missing tokens. Only the subagent raised the merge step list and the thin-data rule. Only Codex raised the "Correct" label.
-- **VERDICT:** No review is CLEAR yet. Eng review: every decision is made and mapped to tasks. Design review: 7/10, which reaches 8 or more once DESIGN.md exists (D22). eng review required.
+- **VERDICT:** No review is CLEAR yet. Eng review: every decision is made and mapped to tasks. Design review: 8/10 after DESIGN.md was added (D22); UI implementation QA remains. eng review required.
 
 NO UNRESOLVED DECISIONS
