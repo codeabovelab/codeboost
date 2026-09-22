@@ -1,0 +1,160 @@
+# The codeboost plan format (version 1)
+
+**Who this is for.** Anyone who writes, imports, or builds code around a codeboost plan: people, and the Claude and Codex agents that draft plans. **What it is for.** It defines the one structure every plan must follow, so codeboost can import a plan from any source and check it the same way. It is written in plain language (ISO 24495-1:2023).
+
+## Summary
+
+- A plan is a list of **plan items** for one GitHub issue. Each item says which files it will change, what changes in each file, and how to check the result.
+- One schema, [`schema/plan.schema.json`](../schema/plan.schema.json), defines the structure. It is the contract for three things:
+  1. **Generating.** codeboost gives the schema to Claude (`claude -p --json-schema`) or Codex (`codex exec --output-schema`), so the agent's answer always has the right shape.
+  2. **Importing.** A plan in a YAML or JSON file, written by a person or another tool, is checked against the same schema.
+  3. **Suggesting.** The plan assistant's suggested edits follow a second schema, [`schema/plan-edit.schema.json`](../schema/plan-edit.schema.json).
+- YAML and JSON have exactly the same structure. YAML is for people; JSON is what the agents return.
+- After the schema check, codeboost runs a second set of checks that a schema cannot express (see "Checks after import").
+- A full example: [`schema/examples/plan-412-r3.yaml`](../schema/examples/plan-412-r3.yaml).
+
+## Terms
+
+| Term | Meaning |
+|---|---|
+| Plan | All plan items for one issue, at one revision. |
+| Revision | The plan's version number: r1, r2, and so on. Each import or approved change makes a new revision. |
+| Plan item | One change with an ID such as P1. |
+| Declared files | The files a plan item lists. The agent may edit only these. |
+| Acceptance | How to check a plan item: a `cmd` that codeboost runs, or a `check` that the review agent judges. |
+| Schema | The file that defines which fields a plan must have and what each may hold. |
+
+## The structure
+
+### The plan
+
+| Field | Type | Rule |
+|---|---|---|
+| `schema_version` | number | Always `1`. |
+| `issue` | number | The GitHub issue number. |
+| `revision` | number | 1 or more. codeboost sets the final number when it imports the plan. |
+| `summary` | text | What the plan does, in one or two sentences. |
+| `items` | list of plan items | 1 to 30 items, in the order they run. |
+| `questions` | list of text | Questions for the reviewer when the issue leaves something undecided. Use `[]` when there are none. |
+
+### A plan item
+
+| Field | Type | Rule |
+|---|---|---|
+| `id` | text | `P` and a number, such as `P1`. Unique in the plan. |
+| `title` | text | Short, like a good commit subject. Up to 120 characters. |
+| `intent` | text | Why the item exists, in one or two sentences. The review agent checks the code against it. |
+| `files` | list of files | 1 to 40. Every file the item will add, change, rename, or delete. |
+| `acceptance` | list of checks | 1 to 10. Include at least one `cmd` when you can. |
+| `depends_on` | list of IDs | Items that must be done first. Only earlier items. `[]` when none. |
+
+### A file
+
+| Field | Type | Rule |
+|---|---|---|
+| `path` | text | From the repo root, with forward slashes. For a rename, the new path. |
+| `kind` | one of `edit`, `add`, `delete`, `rename` | What happens to the file. |
+| `renamed_from` | text or `null` | The old path for a rename; otherwise `null`. |
+| `change` | text | What changes in this file, in plain words. Name functions and behavior, not line numbers. |
+
+### A check
+
+| Field | Type | Rule |
+|---|---|---|
+| `type` | `cmd` or `check` | `cmd` runs in the agent's container and passes when it exits with 0. `check` is a statement the review agent judges. |
+| `text` | text | The command, or the statement. |
+
+**Every field is always present.** A field with nothing to say is `null` or `[]`, never left out. This is what lets the same schema work with both agents' strict answer modes.
+
+A short example:
+
+```yaml
+schema_version: 1
+issue: 412
+revision: 3
+summary: Keep the Idempotency-Key header on every retry.
+items:
+  - id: P1
+    title: Preserve idempotency key across retries
+    intent: Every retry must send the same key as the first attempt.
+    files:
+      - path: src/retry/client.go
+        kind: edit
+        renamed_from: null
+        change: Read the key once before the loop and set it on every attempt.
+    acceptance:
+      - type: cmd
+        text: go test ./src/retry/... -run TestRetryKeepsKey
+      - type: check
+        text: The key is set on every attempt, not only the first.
+    depends_on: []
+questions: []
+```
+
+## Checks after import
+
+The schema checks the shape. codeboost then checks the meaning. A **failure** blocks approval. A **warning** shows on the item, and you can approve anyway.
+
+| Check | Result if it fails |
+|---|---|
+| Item IDs are unique. | Failure |
+| Every `depends_on` ID exists, comes earlier in the list, and there is no loop. | Failure |
+| A path has no `..` part and stays inside the repo. | Failure |
+| A file with kind `edit`, `delete`, or `rename` exists in the repo at the plan's base commit. For `rename`, `renamed_from` exists. For `add`, the path does not exist yet. | Failure |
+| `renamed_from` is set only for kind `rename`. | Failure |
+| The same path is not declared twice in one item. | Failure |
+| The item has at least one `cmd`. | Warning: "No test command" |
+| Each `cmd` starts with a command on the repo's allowed list (Settings, Safety). | Warning; the command does not run until you add it to the list |
+| A `cmd` changes a dependency or a script codeboost runs. | The task stops in "needs approval" when it runs, as for any such change |
+| `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
+
+codeboost never treats issue text as instructions, wherever it appears. If an agent copies issue text into a plan field, the text is still just text: the agent that carries out the plan follows the plan items you approved, and nothing else.
+
+## How a plan gets into codeboost
+
+| Source | What happens |
+|---|---|
+| **Claude or Codex drafts it** | codeboost runs the agent with the prompt in [`prompts/plan-author.md`](../prompts/plan-author.md) and passes the schema. The answer is a JSON plan. codeboost runs the checks after import and shows the plan on the Plans screen as a draft. |
+| **You import a file** | On the Plans screen, choose "Import plan" and pick a `.yaml`, `.yml`, or `.json` file, or paste one. codeboost reads it, runs the schema and the checks after import, and saves it as the next draft revision. The file's `revision` is replaced by the next free number. |
+| **You edit on the Plans screen** | Each change is checked as you type. Approving saves the revision. |
+
+codeboost keeps the master copy in its own database. The copy in the PR description is written from that master and is never read back.
+
+## Suggested edits (plan assistant)
+
+When you ask the plan assistant on the Plans screen for changes, it answers in the shape of [`schema/plan-edit.schema.json`](../schema/plan-edit.schema.json):
+
+- `reply`: its answer to you, in plain words;
+- `base_revision`: the revision it read. codeboost refuses edits made against an older revision;
+- `edits`: 0 to 10 suggested edits. Each one becomes a card with **Apply** and **Dismiss**. Nothing changes until you click Apply.
+
+| `op` | Fields it uses | What it does |
+|---|---|---|
+| `add_item` | `new_item` | Adds a whole new plan item. |
+| `remove_item` | `item` | Removes an item. |
+| `set_field` | `item`, `field` (`title` or `intent`), `value` | Replaces the title or intent. |
+| `add_file`, `update_file` | `item`, `file` | Declares a file, or changes a declared file's entry. |
+| `remove_file` | `item`, `value` (the path) | Removes a declared file. |
+| `add_check` | `item`, `check` | Adds an acceptance entry. |
+| `remove_check` | `item`, `check_index` | Removes an acceptance entry by position, starting at 0. |
+| `set_depends` | `item`, `depends_on` | Replaces the item's `depends_on` list. |
+
+Fields an operation does not use are `null`. After you apply an edit, the plan runs the checks after import again. An example: [`schema/examples/plan-edit-412-r3.json`](../schema/examples/plan-edit-412-r3.json).
+
+## Versions
+
+- Every plan carries `schema_version`. This document describes version 1.
+- A change that adds an optional field, or relaxes a limit, keeps version 1.
+- A change that renames, removes, or tightens a field makes version 2. codeboost keeps reading version 1 plans and converts them when it imports them.
+
+## Notes for builders
+
+- **The schema files have no `$schema` line.** Claude Code's `--json-schema` rejects the draft 2020-12 URL (tested with Claude Code 2.1.278). Validate with a draft 2020-12 validator, set in code.
+- **Strict-mode rule.** Every object lists all its properties in `required` and sets `additionalProperties: false`. Optional values are nullable. Keep this rule for every new field, or Codex's `--output-schema` may refuse the schema.
+- **One file per schema.** Each agent receives one schema file, so `plan-edit.schema.json` holds exact copies of the `item`, `file`, and `check` definitions. A test must fail if the copies differ.
+- **Closing stdin.** `codex exec` reads extra input from stdin when stdin is not a terminal, and waits forever if nothing arrives. Always run it with stdin closed (`< /dev/null`).
+- **Tested with:** Claude Code 2.1.278 and Codex CLI 0.153.4, 2026-09-22. Both returned plans and suggested edits that passed both schemas.
+
+## Test this document with a reader
+
+Before relying on this format, ask someone who has not seen codeboost to write a two-item plan for a small issue using only this page. Note every place they hesitate or ask a question, and fix that part of the page.

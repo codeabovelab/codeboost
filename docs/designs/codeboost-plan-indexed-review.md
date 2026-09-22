@@ -34,6 +34,7 @@ Writing standard: plain language, ISO 24495-1:2023
 |---|---|
 | Plan | A list of plan items for one GitHub issue. Each plan has a revision number (r1, r2, …). |
 | Plan item | One change in the plan, with an ID such as P1. It lists the files it will change and how to check it. |
+| Plan schema | The file that defines the structure every plan must have (`schema/plan.schema.json`). Agents answer in it, and imported plans are checked against it. |
 | Declared files | The files a plan item says it will change. |
 | Invocation | One run of an AI agent (Claude or Codex) on one task. |
 | Trailer | A line at the end of a git commit message, such as `Plan-Item: P1`. |
@@ -124,21 +125,37 @@ These are proposals. The engineering review will confirm them.
 
 ### The plan format
 
-Each plan looks like this:
+Changed by decision P1 (below, in the Decision ledger). The full rules are in [`docs/plan-format.md`](../plan-format.md).
+
+- **One schema is the contract.** [`schema/plan.schema.json`](../../schema/plan.schema.json) defines every plan, version 1. codeboost passes it to Claude (`claude -p --json-schema`) or Codex (`codex exec --output-schema`) when they draft a plan, and checks every imported plan against it.
+- **YAML and JSON have the same structure.** People read and write YAML; agents return JSON. Every field is always present, with `null` or `[]` when it has nothing to say.
+- **Each declared file carries its own change.** A file entry has a path, a kind (`edit`, `add`, `delete`, or `rename`), the old path for a rename, and what changes in it. This keeps the plan file by file (step 3).
+- **Acceptance entries are typed.** `cmd` is a command codeboost runs. `check` is a statement the review agent judges.
+- **After the schema, codeboost checks meaning.** For example: unique IDs, `depends_on` only to earlier items, no `..` in paths, and declared files that exist. A failure blocks approval; a warning, such as "No test command", does not.
+
+Each plan looks like this (shortened; the full example is [`schema/examples/plan-412-r3.yaml`](../../schema/examples/plan-412-r3.yaml)):
 
 ```yaml
+schema_version: 1
 issue: 412
 revision: 3
+summary: Keep the Idempotency-Key header on every retry.
 items:
   - id: P1
     title: Preserve idempotency key across retries
-    intent: <why, in one or two sentences>
-    files: [src/http/retry.ts]            # declared files (signal 2)
-    changes: <what changes, file by file>
+    intent: Every retry must send the same key as the first attempt.
+    files:                                  # declared files (signal 2), each with its change
+      - path: src/retry/client.go
+        kind: edit
+        renamed_from: null
+        change: Read the key once before the loop and set it on every attempt.
     acceptance:
-      - cmd: pnpm test -- retry.test.ts   # a command codeboost runs
-      - check: key is set on every attempt, not only the first   # the review agent judges this
+      - type: cmd                           # a command codeboost runs
+        text: go test ./src/retry/... -run TestRetryKeepsKey
+      - type: check                         # the review agent judges this
+        text: The key is set on every attempt, not only the first.
     depends_on: []
+questions: []                               # open choices the agent wants you to decide
 ```
 
 **Where the plan lives.** The plan is not committed to the PR branch. Instead, codeboost writes it into the PR description, between two markers: `<!-- codeboost:plan:start -->` and `<!-- codeboost:plan:end -->`.
@@ -1716,6 +1733,30 @@ Actual answer: A) Track and flag (answer to D24, 2026-09-22)
 Accepted scope: per repo, codeboost tracks rejections per task, review rounds per task, and repeated feedback (new feedback the distilling agent matches to an approved lesson); a Learning screen shows these over time; a lesson whose feedback keeps repeating is flagged for rewording or removal. Test cases: repeated feedback matching an approved lesson increments its repeat count and flags it after a set number of repeats.
 History: none
 
+### P1: One plan schema for drafting, importing, and suggestions
+Finding: request from you (2026-09-22): "Codex or Claude should be able to generate plans. Should we create a template for them to follow and that we can directly import from", reviewer: Claude (after the design review)
+Plan baseline: "The plan format" showed a YAML example with free-text `changes` for all files of an item and untyped `cmd:` / `check:` lines. Nothing defined which fields are required, how an agent's answer is parsed, or how a hand-written plan is imported.
+Runtime evidence (probed 2026-09-22):
+- `claude --help` (Claude Code 2.1.278) lists `--json-schema <schema>`; `codex exec --help` (Codex CLI 0.153.4) lists `--output-schema <FILE>`.
+- Both CLIs returned a plan for a test issue that passed `schema/plan.schema.json`, and a suggested edit that passed `schema/plan-edit.schema.json`.
+- Claude Code rejected the schema while it had a `$schema` line for draft 2020-12 ("no schema with key or ref"), and accepted it without that line.
+- `codex exec` waits on stdin when stdin is not a terminal; it must run with stdin closed.
+Comparison grid:
+
+| Choice | Current | A | B | C |
+|---|---|---|---|---|
+| How agents answer | not defined | JSON that must match one schema, enforced by the CLI flag | Markdown or YAML text that codeboost parses | free text that a second agent converts |
+| Importing a plan file | not possible | YAML or JSON, checked by the same schema | YAML only, with a hand-written parser | not possible |
+| Plan assistant suggestions | not defined | typed edit operations (second schema); Apply is exact | free text; the person edits by hand | free text; an agent applies it |
+| Checks after the schema | none | unique IDs, earlier-only dependencies, safe paths, files exist; failures block approval | same | same |
+| Versioning | none | `schema_version` in every plan | none | none |
+
+Question: asked in conversation, not as a numbered question. Claude recommended A.
+State: approved
+Actual answer: yes, add it to the design doc and create them (2026-09-22)
+Accepted scope: one versioned plan schema (`schema/plan.schema.json`) and one edit schema (`schema/plan-edit.schema.json`), both strict-mode compatible and without a `$schema` line; YAML and JSON with the same structure; a plain-language guide (`docs/plan-format.md`); one prompt template for both agents (`prompts/plan-author.md`); worked examples in `schema/examples/`; import on the Plans screen as the next draft revision; checks after import as listed in the guide. Test cases: both examples pass; broken plans (no acceptance, extra field, bad ID, absolute path, unknown kind, no files, wrong version, missing field) fail; the edit schema's copied definitions match the plan schema's; a recorded Claude answer and a recorded Codex answer both pass.
+History: none
+
 Approval readiness: PASS (re-checked after the learning requirement). Checked L1 (D21: A), L2 (D22: A), L3 (D23: A), L4 (D24: A), D1 (scope, structure B), R1 (D2: B), R2 (D3: A), R3 (D4: A), R4 (D5: A), R5 (D6: B), R6 (D7: A), R7 (D8: A), R8 (D9: A), T1 (D10: A), O1 (D11: A), O2 (D12: A), O3 (D13: A), O4 (D14: A), O5 (D15: A), O6 (D16: A), O7 (D17: A), O8 (D18: A), O9 (D19: A). Every accepted change cites its own answer. No TODO proposals were raised by this review; the design's existing Open questions stay as written.
 
 ### Outside voice
@@ -1736,6 +1777,7 @@ Codex (outside voice, completed, 2026-09-22) raised 8 findings. Claude checked e
 - **Claude CLI** already provides `--disallowedTools`, `--strict-mcp-config`, and `setup-token`. Used for the network and sign-in rules.
 - **Codex CLI** already provides `--sandbox` and `CODEX_HOME`. Used for the sign-in mount.
 - **Node 26** has `node:sqlite` built in. Used as the only storage engine.
+- **Claude CLI and Codex CLI** both take a JSON Schema for their final answer: `claude -p --json-schema` and `codex exec --output-schema`. Used for plan drafting and plan suggestions (P1). Tested on 2026-09-22 with Claude Code 2.1.278 and Codex CLI 0.153.4.
 
 Nothing in the repo is rebuilt.
 
@@ -1886,6 +1928,10 @@ Built from this review's findings. Each task comes from a specific decision abov
   - Surfaced by: L4 (D24: A)
   - Files: web/learning, runner/metrics
   - Verify: repeated feedback matching an approved lesson raises its count and flags it
+- [ ] **T18 (P2, human: ~2 days / CC: ~45 min)** — core, agents, web — Plan schema: draft plans with either agent, import YAML or JSON, apply typed suggestions
+  - Surfaced by: P1 (approved 2026-09-22)
+  - Files: schema/, docs/plan-format.md, prompts/plan-author.md, core/plan (schema and meaning checks), agents/claude, agents/codex, web/plans (Import plan, suggestion cards)
+  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; `codex exec` runs with stdin closed
 
 ### Unresolved decisions
 
@@ -1976,6 +2022,10 @@ None proposed. Every fix is in the plan and in the tasks below.
 | Review screen | /Users/maxhwang/.gstack/projects/codeboost/designs/updated-after-design-review-20260922/review-screen.png | Three panes: compact plan-item list, code with Approve button, and Ask / Request change conversation | Highlight the current page, not Settings (D13). Earlier reference: mockup-20260922/variant-B.png |
 | Lessons inbox | /Users/maxhwang/.gstack/projects/codeboost/designs/updated-after-design-review-20260922/lessons-inbox.png | Compact sortable, filterable table; rows expand in place; bulk Discard only | Earlier pick: lessons-inbox-20260922/r5/variant-B.png. Menu highlight follows D13 |
 | Learning screen | /Users/maxhwang/.gstack/projects/codeboost/designs/updated-after-design-review-20260922/learning-screen.png | Three tiles, task-number chart, flagged-lessons table | Key strip must follow D24 (there is no "Dashboard"). Menu highlight follows D13 |
+| Issues | /Users/maxhwang/.gstack/projects/codeboost/designs/issues-screen-20260922/variant-A.png | Triage table: score and word, rows expand to "Why it ranks", untrusted issue text, trust step for outside authors | Approved 2026-09-22 (/design-shotgun). HTML: issues-screen-20260922/finalized.html |
+| Plans (plan editor) | /Users/maxhwang/.gstack/projects/codeboost/designs/plans-screen-20260922/variant-C.png | Plan table with rows that expand to edit; plan assistant in a bottom drawer | Approved 2026-09-22. Fields follow P1's schema. HTML: plans-screen-20260922/finalized.html |
+| Queue | /Users/maxhwang/.gstack/projects/codeboost/designs/queue-screen-20260922/variant-A.png | Run-state bar, "Waiting for you" rows with one action each, reorderable "Up next" table | Approved 2026-09-22, without the mockup's duplicate left list. HTML: queue-screen-20260922/finalized.html |
+| Settings | /Users/maxhwang/.gstack/projects/codeboost/designs/settings-screen-20260922/variant-C.png | Health checklist first, then grouped settings | Approved 2026-09-22. Values come from this document, not the mockup. HTML: settings-screen-20260922/finalized.html |
 
 ## Design Implementation Tasks
 

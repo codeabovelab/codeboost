@@ -1,0 +1,49 @@
+{
+  "schema_version": 1,
+  "base_revision": 3,
+  "reply": "With +25% jitter, the last retry can wait about 37 seconds. I suggest a new item that caps each delay at MaxDelay.",
+  "edits": [
+    {
+      "op": "add_item",
+      "item": "P6",
+      "summary": "Add P6: Cap the jittered delay at MaxDelay",
+      "reason": "A cap keeps the longest wait at 30 seconds, even with jitter.",
+      "field": null,
+      "value": null,
+      "file": null,
+      "check": null,
+      "check_index": null,
+      "depends_on": null,
+      "new_item": {
+        "id": "P6",
+        "title": "Cap the jittered delay at MaxDelay",
+        "intent": "No retry waits longer than MaxDelay (30 seconds), even with jitter.",
+        "files": [
+          {
+            "path": "src/retry/backoff.go",
+            "kind": "edit",
+            "renamed_from": null,
+            "change": "Clamp jitteredDelay to MaxDelay."
+          }
+        ],
+        "acceptance": [
+          { "type": "cmd", "text": "go test ./src/retry/... -run TestDelayCapped" }
+        ],
+        "depends_on": ["P2"]
+      }
+    },
+    {
+      "op": "add_check",
+      "item": "P3",
+      "summary": "Add a test for a negative Retry-After value to P3",
+      "reason": "A negative number of seconds must be ignored, like a date in the past.",
+      "field": null,
+      "value": null,
+      "file": null,
+      "check": { "type": "check", "text": "A negative Retry-After value is ignored." },
+      "check_index": null,
+      "depends_on": null,
+      "new_item": null
+    }
+  ]
+}

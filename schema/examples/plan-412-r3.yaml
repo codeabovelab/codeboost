@@ -1,0 +1,108 @@
+# codeboost plan, format version 1. See docs/plan-format.md.
+# The same structure is valid as JSON; schema/plan.schema.json checks both.
+schema_version: 1
+issue: 412
+revision: 3
+summary: >-
+  Keep the Idempotency-Key header on every retry so a retried charge is never
+  charged twice, then make retry waits kinder to the server.
+items:
+  - id: P1
+    title: Preserve idempotency key across retries
+    intent: >-
+      Every retry must send the same Idempotency-Key as the first attempt, so a
+      retried charge is never charged twice.
+    files:
+      - path: src/retry/client.go
+        kind: edit
+        renamed_from: null
+        change: >-
+          In doRequest, read the key once before the loop. Set it on every
+          attempt instead of deleting it after the first.
+    acceptance:
+      - type: cmd
+        text: go test ./src/retry/... -run TestRetryKeepsKey
+      - type: check
+        text: The key is set on every attempt, not only the first.
+    depends_on: []
+
+  - id: P2
+    title: Add backoff jitter
+    intent: Spread retries by up to ±25% so clients that failed together do not retry together.
+    files:
+      - path: src/retry/backoff.go
+        kind: edit
+        renamed_from: null
+        change: Add jitteredDelay(base, rand) that returns base ± MaxJitter.
+      - path: src/retry/client.go
+        kind: edit
+        renamed_from: null
+        change: Use jitteredDelay. Wait with a select on ctx.Done() instead of time.Sleep.
+      - path: src/retry/config.go
+        kind: edit
+        renamed_from: null
+        change: Add MaxJitter = 0.25 with a comment that says what it is.
+      - path: src/retry/client_test.go
+        kind: edit
+        renamed_from: null
+        change: Add TestJitterStaysInBounds with a fixed seed.
+    acceptance:
+      - type: cmd
+        text: go test ./src/retry/... -run 'Jitter|Retry' -count=3
+      - type: check
+        text: Delays stay within 75% to 125% of the base delay.
+    depends_on: [P1]
+
+  - id: P3
+    title: Respect the Retry-After header on 429 and 503
+    intent: When the server says how long to wait, wait that long instead of using backoff.
+    files:
+      - path: src/retry/retryafter.go
+        kind: add
+        renamed_from: null
+        change: >-
+          New retryAfter(resp, now) that reads seconds or an HTTP date. Returns 0
+          when the header is missing, cannot be read, or is in the past.
+      - path: src/retry/client.go
+        kind: edit
+        renamed_from: null
+        change: Prefer retryAfter over backoff when it is above 0.
+    acceptance:
+      - type: cmd
+        text: go test ./src/retry/... -run TestRetryAfter
+      - type: check
+        text: An HTTP date in the past is ignored.
+    depends_on: [P1]
+
+  - id: P4
+    title: Unit tests for retry logic
+    intent: Cover the 5xx path, the key on every attempt, and giving up after the limit.
+    files:
+      - path: src/retry/client_test.go
+        kind: edit
+        renamed_from: null
+        change: >-
+          Add TestRetryOn503 and TestGivesUpAfterMaxAttempts. Give each test its
+          own httptest server.
+    acceptance:
+      - type: cmd
+        text: go test ./src/retry/... -count=3
+    depends_on: [P1, P2, P3]
+
+  - id: P5
+    title: Update the retry docs
+    intent: Describe jitter, Retry-After, and why the key is kept on every attempt.
+    files:
+      - path: docs/retries.md
+        kind: rename
+        renamed_from: docs/retry.md
+        change: Add sections on jitter and Retry-After. Explain the Idempotency-Key rule.
+    acceptance:
+      - type: cmd
+        text: markdownlint docs/retries.md
+      - type: check
+        text: The docs match the new behavior.
+    depends_on: [P1, P2, P3]
+
+questions:
+  - Should a 429 without Retry-After use normal backoff, or wait a fixed 60 seconds?

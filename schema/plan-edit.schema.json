@@ -1,0 +1,294 @@
+{
+  "$id": "https://github.com/codeabovelab/codeboost/schema/plan-edit.schema.json",
+  "title": "codeboost plan edit",
+  "description": "The plan assistant's answer on the Plans screen: a reply to the person, plus zero or more suggested edits to one plan revision. Nothing changes until the person clicks Apply on an edit. Version 1. Strict-mode compatible: every object lists all its properties as required; unused values are null. See docs/plan-format.md. The item, file, and check definitions are exact copies of those in plan.schema.json, so this file works on its own; codeboost's tests check that the copies match. There is no $schema line on purpose: Claude Code's --json-schema rejects the draft 2020-12 URL. Validate with a draft 2020-12 validator.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "base_revision",
+    "reply",
+    "edits"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "enum": [
+        1
+      ]
+    },
+    "base_revision": {
+      "description": "The plan revision these edits apply to. codeboost refuses edits made against an older revision.",
+      "type": "integer",
+      "minimum": 1
+    },
+    "reply": {
+      "description": "The answer to the person, in plain words. Empty string only when there is nothing to say beyond the edits.",
+      "type": "string",
+      "maxLength": 4000
+    },
+    "edits": {
+      "description": "Suggested edits. Each one is shown as a card with Apply and Dismiss. Empty when the person only asked a question.",
+      "type": "array",
+      "maxItems": 10,
+      "items": {
+        "$ref": "#/$defs/edit"
+      }
+    }
+  },
+  "$defs": {
+    "edit": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "op",
+        "item",
+        "summary",
+        "reason",
+        "field",
+        "value",
+        "file",
+        "check",
+        "check_index",
+        "depends_on",
+        "new_item"
+      ],
+      "properties": {
+        "op": {
+          "description": "add_item: new_item. remove_item: item. set_field: item, field, value. add_file or update_file: item, file. remove_file: item, value (the path). add_check: item, check. remove_check: item, check_index. set_depends: item, depends_on.",
+          "type": "string",
+          "enum": [
+            "add_item",
+            "remove_item",
+            "set_field",
+            "add_file",
+            "update_file",
+            "remove_file",
+            "add_check",
+            "remove_check",
+            "set_depends"
+          ]
+        },
+        "item": {
+          "description": "The ID of the item to change. For add_item, the new item's ID.",
+          "type": "string",
+          "pattern": "^P[1-9][0-9]{0,2}$"
+        },
+        "summary": {
+          "description": "The card title, for example \"Add src/retry/config.go to P2's declared files\".",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 160
+        },
+        "reason": {
+          "description": "Why, in one sentence.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        },
+        "field": {
+          "description": "For set_field: which field. Otherwise null.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "enum": [
+            "title",
+            "intent",
+            null
+          ]
+        },
+        "value": {
+          "description": "For set_field: the new text. For remove_file: the path. Otherwise null.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 1200
+        },
+        "file": {
+          "description": "For add_file and update_file: the file entry. Otherwise null.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/file"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check": {
+          "description": "For add_check: the new acceptance entry. Otherwise null.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/check"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "check_index": {
+          "description": "For remove_check: the 0-based position of the acceptance entry. Otherwise null.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "minimum": 0
+        },
+        "depends_on": {
+          "description": "For set_depends: the full new list. Otherwise null.",
+          "anyOf": [
+            {
+              "type": "array",
+              "maxItems": 29,
+              "items": {
+                "type": "string",
+                "pattern": "^P[1-9][0-9]{0,2}$"
+              }
+            },
+            {
+              "type": "null"
+            }
+          ]
+        },
+        "new_item": {
+          "description": "For add_item: the whole new item. Otherwise null.",
+          "anyOf": [
+            {
+              "$ref": "#/$defs/item"
+            },
+            {
+              "type": "null"
+            }
+          ]
+        }
+      }
+    },
+    "item": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "title",
+        "intent",
+        "files",
+        "acceptance",
+        "depends_on"
+      ],
+      "properties": {
+        "id": {
+          "description": "P followed by a number: P1, P2, and so on. Unique in the plan.",
+          "type": "string",
+          "pattern": "^P[1-9][0-9]{0,2}$"
+        },
+        "title": {
+          "description": "A short title, like a good commit subject.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "intent": {
+          "description": "Why this item exists, in one or two sentences. The review agent checks the code against it.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 600
+        },
+        "files": {
+          "description": "The declared files: every file this item will add, change, rename, or delete, with what changes in each. The agent may edit only these.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 40,
+          "items": {
+            "$ref": "#/$defs/file"
+          }
+        },
+        "acceptance": {
+          "description": "How to check the item. At least one entry. Prefer a cmd that codeboost can run.",
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10,
+          "items": {
+            "$ref": "#/$defs/check"
+          }
+        },
+        "depends_on": {
+          "description": "IDs of items that must be done first. Only earlier items. Empty when none.",
+          "type": "array",
+          "maxItems": 29,
+          "items": {
+            "type": "string",
+            "pattern": "^P[1-9][0-9]{0,2}$"
+          }
+        }
+      }
+    },
+    "file": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "kind",
+        "renamed_from",
+        "change"
+      ],
+      "properties": {
+        "path": {
+          "description": "Path from the repo root, with forward slashes. For a rename, the new path.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 300,
+          "pattern": "^[^/\\\\][^\\\\]*$"
+        },
+        "kind": {
+          "description": "edit: change an existing file. add: create a new file. delete: remove a file. rename: move a file, optionally changing it.",
+          "type": "string",
+          "enum": [
+            "edit",
+            "add",
+            "delete",
+            "rename"
+          ]
+        },
+        "renamed_from": {
+          "description": "The old path when kind is rename; otherwise null.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "maxLength": 300
+        },
+        "change": {
+          "description": "What changes in this file, in plain words. Name functions and behavior, not line numbers.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1200
+        }
+      }
+    },
+    "check": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "text"
+      ],
+      "properties": {
+        "type": {
+          "description": "cmd: a shell command codeboost runs in the container; it passes when it exits 0. check: a statement the review agent judges against the code.",
+          "type": "string",
+          "enum": [
+            "cmd",
+            "check"
+          ]
+        },
+        "text": {
+          "description": "The command, or the statement to check.",
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 400
+        }
+      }
+    }
+  }
+}
