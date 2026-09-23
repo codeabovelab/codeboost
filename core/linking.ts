@@ -18,8 +18,9 @@ export interface Segment {
   oldLine: number | null; newLine: number | null; operation: '+' | '-' | null;
   content: string; context: string; hunk: number; sharesHunkWith: string[];
 }
-interface TrackedLine { text: string; owners: (string | null)[]; origins: string[]; movedOwners: (string | null)[] }
-interface TrackedFile { lines: TrackedLine[]; metadataOwners: (string | null)[] }
+interface Evidence { owners: (string | null)[]; outOfScope: string[] }
+interface TrackedLine { text: string; evidence: Evidence; origins: string[]; moved: Evidence }
+interface TrackedFile { lines: TrackedLine[]; metadata: Evidence }
 const lines = (text: string | null | undefined): string[] => text?.match(/[^\n]*\n|[^\n]+$/g) ?? [];
 const unique = <T>(values: T[]): T[] => [...new Set(values)];
 const origin = (path: string, i: number) => `${path}\0${i}`;
@@ -30,21 +31,25 @@ function metadataChange(delta: FileDelta): boolean {
   return delta.oldPath !== delta.newPath || delta.before?.mode !== delta.after?.mode ||
     !textFile(delta.before) || !textFile(delta.after);
 }
-function classify(plan: Plan, owners: (string | null)[], paths: string[]): Pick<Segment, 'row' | 'scope'> {
+const empty = (): Evidence => ({ owners: [], outOfScope: [] });
+const combine = (...evidence: Evidence[]): Evidence => ({
+  owners: unique(evidence.flatMap(e => e.owners)),
+  outOfScope: unique(evidence.flatMap(e => e.outOfScope)),
+});
+function classify(evidence: Evidence): Pick<Segment, 'row' | 'scope'> {
+  const { owners, outOfScope } = evidence;
   if (!owners.length || owners.includes(null)) return { row: 'Unplanned', scope: 'unplanned' };
   if (owners.length > 1) return { row: 'Ambiguous', scope: 'ambiguous' };
-  const item = plan.items.find(item => item.id === owners[0]);
-  if (!item) throw new Error(`Ledger references unknown plan item ${owners[0]}.`);
-  const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]));
-  return { row: item.id, scope: paths.every(path => declared.has(path)) ? 'in-scope' : 'out-of-scope' };
+  const owner = owners[0]!;
+  return { row: owner, scope: outOfScope.includes(owner) ? 'out-of-scope' : 'in-scope' };
 }
 
 /** Replays a linear history. Commit messages and Plan-Item trailers are never trusted. */
 export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<string, string>): Segment[] {
   const files = new Map<string, TrackedFile>();
-  const removed = new Map<string, (string | null)[]>();
+  const removed = new Map<string, Evidence>();
   // Deletions retain metadata even after the file leaves the tree.
-  const metadata = new Map<string, (string | null)[]>();
+  const metadata = new Map<string, Evidence>();
   let parent = history.base;
   for (const commit of history.commits) {
     if (commit.parent !== parent) throw new Error('Linking requires a contiguous linear history.');
@@ -53,11 +58,14 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
     if (owner !== null && !plan.items.some(item => item.id === owner)) throw new Error(`Unknown ledger item: ${owner}`);
     for (const delta of commit.files) {
       const oldPath = delta.oldPath;
-      const path = delta.newPath ?? oldPath!;
+      const item = plan.items.find(item => item.id === owner);
+      const declared = new Set(item?.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]));
+      const touched = [delta.oldPath, delta.newPath].filter((path): path is string => path !== null);
+      const current: Evidence = { owners: [owner], outOfScope: owner !== null && touched.some(path => !declared.has(path)) ? [owner] : [] };
       let previous = oldPath ? files.get(oldPath) : undefined;
       if (!previous) previous = {
-        lines: lines(textFile(delta.before) ? delta.before!.text : '').map((text, i) => ({ text, owners: [], origins: [origin(oldPath!, i)], movedOwners: [] })),
-        metadataOwners: [],
+        lines: lines(textFile(delta.before) ? delta.before!.text : '').map((text, i) => ({ text, evidence: empty(), origins: [origin(oldPath!, i)], moved: empty() })),
+        metadata: empty(),
       };
       const next: TrackedLine[] = [];
       const changes = diffArrays(previous.lines.map(line => line.text), lines(textFile(delta.after) ? delta.after!.text : ''), { timeout: 2000 });
@@ -68,22 +76,22 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
         if (!change.added && !change.removed) { next.push(...previous.lines.slice(cursor, cursor + change.value.length)); cursor += change.value.length; continue; }
         const deleted = change.removed ? previous.lines.slice(cursor, cursor + change.value.length) : [];
         if (change.removed) cursor += change.value.length;
-        const owners = unique([...deleted.flatMap(line => line.owners), owner]);
+        const evidence = combine(...deleted.map(line => line.evidence), current);
         const origins = unique(deleted.flatMap(line => line.origins));
-        for (const id of origins) removed.set(id, owners);
+        for (const id of origins) removed.set(id, evidence);
         const added = change.added ? change : changes[n + 1]?.added ? changes[++n]! : undefined;
-        if (added) for (const text of added.value) next.push({ text, owners, origins, movedOwners: unique(deleted.flatMap(line => line.movedOwners)) });
+        if (added) for (const text of added.value) next.push({ text, evidence, origins, moved: combine(...deleted.map(line => line.moved)) });
       }
       if (oldPath && delta.newPath && oldPath !== delta.newPath) {
         for (let i = 0; i < next.length; i++) {
           const line = next[i]!;
-          next[i] = { ...line, movedOwners: unique([...line.movedOwners, owner]) };
-          for (const id of line.origins) if (!removed.has(id)) removed.set(id, unique([...line.owners, owner]));
+          next[i] = { ...line, moved: combine(line.moved, current) };
+          for (const id of line.origins) if (!removed.has(id)) removed.set(id, combine(line.evidence, current));
         }
       }
-      const metadataOwners = metadataChange(delta) ? unique([...previous.metadataOwners, owner]) : previous.metadataOwners;
-      if (oldPath) { files.delete(oldPath); metadata.set(oldPath, metadataOwners); }
-      if (delta.newPath) { files.set(delta.newPath, { lines: next, metadataOwners }); metadata.set(delta.newPath, metadataOwners); }
+      const metadataEvidence = metadataChange(delta) ? combine(previous.metadata, current) : previous.metadata;
+      if (oldPath) { files.delete(oldPath); metadata.set(oldPath, metadataEvidence); }
+      if (delta.newPath) { files.set(delta.newPath, { lines: next, metadata: metadataEvidence }); metadata.set(delta.newPath, metadataEvidence); }
     }
   }
   if (parent !== history.head) throw new Error('History does not end at the requested head.');
@@ -96,17 +104,17 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
     let oldIndex = 0, newIndex = 0, hunk = 0;
     const fileSegments: Segment[] = [];
     const affectedPaths = unique([delta.oldPath, delta.newPath].filter((p): p is string => p !== null));
-    const push = (part: Omit<Segment, 'row' | 'scope' | 'sharesHunkWith'>) => fileSegments.push({
-      ...part, ...classify(plan, part.owners, affectedPaths), sharesHunkWith: [],
+    const push = (part: Omit<Segment, 'row' | 'scope' | 'sharesHunkWith' | 'owners'>, evidence: Evidence) => fileSegments.push({
+      ...part, owners: evidence.owners, ...classify(evidence), sharesHunkWith: [],
     });
     if (metadataChange(delta)) {
-      const owners = unique(affectedPaths.flatMap(path => metadata.get(path) ?? []));
-      push({ path, oldPath: delta.oldPath, kind: 'file', owners, oldLine: null, newLine: null,
+      const evidence = combine(...affectedPaths.map(path => metadata.get(path) ?? empty()));
+      push({ path, oldPath: delta.oldPath, kind: 'file', oldLine: null, newLine: null,
         operation: null, context: '', hunk: -1,
         content: JSON.stringify({ oldPath: delta.oldPath, newPath: delta.newPath,
           oldMode: delta.before?.mode ?? null, newMode: delta.after?.mode ?? null,
           oldOid: delta.before?.oid ?? null, newOid: delta.after?.oid ?? null }),
-      });
+      }, evidence);
     }
     const finalChanges = diffArrays(oldLines, newLines, { timeout: 2000 });
     if (!finalChanges) throw new Error('Final diff exceeded the time budget.');
@@ -118,16 +126,16 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
       }
       for (const text of change.value) {
         const trackedLine = tracked?.lines[newIndex];
-        const owners = change.added
-          ? trackedLine?.owners.length ? trackedLine.owners : trackedLine?.movedOwners ?? []
-          : removed.get(origin(delta.oldPath!, oldIndex)) ?? [];
+        const evidence = change.added
+          ? trackedLine?.evidence.owners.length ? trackedLine.evidence : trackedLine?.moved ?? empty()
+          : removed.get(origin(delta.oldPath!, oldIndex)) ?? empty();
         const context = delta.contexts.find(range => change.added
           ? newIndex + 1 >= range.newStart && newIndex + 1 < range.newStart + range.newCount
           : oldIndex + 1 >= range.oldStart && oldIndex + 1 < range.oldStart + range.oldCount)?.name ?? '';
-        push({ path, oldPath: delta.oldPath, kind: 'text', owners, content: text, context, hunk,
+        push({ path, oldPath: delta.oldPath, kind: 'text', content: text, context, hunk,
           oldLine: change.removed ? oldIndex + 1 : null, newLine: change.added ? newIndex + 1 : null,
           operation: change.added ? '+' : '-',
-        });
+        }, evidence);
         if (change.added) newIndex++; else oldIndex++;
       }
     }
@@ -136,7 +144,7 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
     for (const part of fileSegments) {
       const last = grouped.at(-1);
       if (last && part.kind === 'text' && last.kind === 'text' && last.hunk === part.hunk &&
-          last.operation === part.operation && last.context === part.context &&
+          last.operation === part.operation && last.context === part.context && last.scope === part.scope &&
           (part.operation === '+' ? last.newLine! + lines(last.content).length === part.newLine : last.oldLine! + lines(last.content).length === part.oldLine) &&
           JSON.stringify(last.owners) === JSON.stringify(part.owners)) last.content += part.content;
       else grouped.push({ ...part });

@@ -31,6 +31,12 @@ A focused independent review found BOM-only changes could disappear because the 
 
 The rename case first failed (moved lines became Unplanned), then passed after the provenance fix. `npm run typecheck` checks all source and tests. The public examples and shared schema definitions are checked on every test run.
 
+## Review round 1
+
+Copilot reported two findings. Fixed scope after rename: scope now travels with each owning change at its actual path, instead of comparing all segments against both ends of the final rename. Real rename/edit and rename/delete cases failed before the fix and pass after it; declaring only the historical name does not authorize the destination.
+
+Declined the claim that repository aliases can override `rev-parse`, `rev-list`, `diff`, or `cat-file`: these are built-in commands, and Git ignores aliases that shadow them. A scratch probe and a permanent adapter regression confirmed the shell alias never ran. See [Git's alias documentation](https://git-scm.com/docs/git-config/2.54.0).
+
 ## Remaining gates
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.

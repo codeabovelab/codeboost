@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, symlinkSync, renameSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, chmodSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -135,4 +135,29 @@ it('reads the whole repository even when called from a subdirectory with relativ
   f.git('config', 'diff.relative', 'true');
   const parts = linkHistory(f.plan, readHistory(join(f.dir, 'sub'), f.base), f.ledger);
   expect(new Set(parts.map(s => s.path))).toEqual(new Set(['a.txt', 'sub/b.txt']));
+});
+it('checks scope at each owning commit, not against both ends of a final rename', () => {
+  const f = fixture();
+  f.plan.items[0]!.files = [{ path: 'b.txt', kind: 'rename', renamed_from: 'a.txt', change: 'Move' }];
+  f.plan.items[1]!.files = [{ path: 'b.txt', kind: 'edit', renamed_from: null, change: 'Edit new name' }];
+  renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt')); f.commit('P1');
+  f.write('b.txt', 'ONE\ntwo\nthree\n'); f.commit('P2');
+  expect(f.segments().filter(s => s.row === 'P2').every(s => s.scope === 'in-scope')).toBe(true);
+  // Declaring only the old name must not authorize edits to the new one.
+  f.plan.items[1]!.files[0]!.path = 'a.txt';
+  expect(f.segments().filter(s => s.row === 'P2').every(s => s.scope === 'out-of-scope')).toBe(true);
+});
+it('checks scope of deletion after a rename using the deleted current path', () => {
+  const f = fixture(); f.plan.items[0]!.files = [{ path: 'b.txt', kind: 'rename', renamed_from: 'a.txt', change: 'Move' }];
+  f.plan.items[1]!.files = [{ path: 'b.txt', kind: 'delete', renamed_from: null, change: 'Delete' }];
+  renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt')); f.commit('P1');
+  rmSync(join(f.dir, 'b.txt')); f.commit('P2');
+  expect(f.segments().filter(s => s.row === 'P2').every(s => s.scope === 'in-scope')).toBe(true);
+});
+
+it('Git built-ins cannot be overridden by repository shell aliases', () => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
+  for (const name of ['rev-parse', 'rev-list', 'diff', 'cat-file']) f.git('config', `alias.${name}`, '!touch alias-executed');
+  expect(f.segments().length).toBeGreaterThan(0);
+  expect(existsSync(join(f.dir, 'alias-executed'))).toBe(false);
 });
