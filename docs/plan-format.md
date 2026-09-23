@@ -184,6 +184,7 @@ Fields an operation does not use are `null`. The strict answer schema checks str
 
 ## Versions
 
+- Validators register only registry-selected retained snapshots, once per absolute `$id`. Unversioned CLI copies are transport copies for CLI input only, never additional validator resources. Do not glob/register all schema files. Test loading all retained versions plus selecting a current CLI copy without duplicate registration; both plan/edit validation and references must resolve through the registry.
 - Every plan carries `schema_version`. This document describes version 1.
 - Wording changes that do not change accepted data keep the same version. Changes to accepted data, including adding, renaming, or removing a field or changing a limit, require the next schema version. This applies to both plan and suggested-edit schemas.
 - A nullable field is still required. Adding one breaks old plans (the field is missing) and old readers (the field is unknown), so it must not be added under version 1.

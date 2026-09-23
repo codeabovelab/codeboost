@@ -9,7 +9,7 @@
     const schemaText = readFileSync(schemaPath, 'utf8');
     const profile = requireValidatedPlanningProfile(pinnedCliVersion);
     assertWithinLaunchBudget(promptText, schemaText, profile, phaseEnvironment);
-    const options = { cwd: workPath, env: phaseEnvironment, maxBuffer: 1048576,
+    const options = { cwd: workPath, env: phaseEnvironment, maxBuffer: 16777216,
       shell: false, stdio: ['ignore', 'pipe', 'pipe'] };
     execFileSync('claude', [...profile.claudeArgs, '-p', promptText, '--json-schema', schemaText,
       '--output-format', 'json'], options);
@@ -24,6 +24,15 @@
   pinned-version startup probe must attempt each forbidden tool and confirm
   refusal; if those controls cannot be enforced, planning is unavailable.
   Profiles are immutable runner configuration outside /work, never agent data.
+  A trusted supervisor outside the container bounds stdout to 16 MiB, stderr
+  to 4 MiB, and their combined capture to 20 MiB; it terminates the entire
+  invocation container on overflow or deadline, including children that ignore
+  SIGTERM. maxBuffer is only an additional local guard, not that supervisor.
+  Parse the bounded vendor envelope separately, then enforce the 1 MiB plan
+  document limit on the extracted JSON. Budgeting 16 MiB stdout gives headroom
+  for JSON escaping/envelopes around a near-limit plan; oversized envelopes
+  still fail explicitly. Test a near-1 MiB valid plan in the pinned CLI envelope
+  as well as infinite stdout/stderr and a child that ignores termination.
   stdio 'ignore' closes stdin through the process API; schemaPath is selected
   from the trusted registry. Before launch, the runner copies that schema into
   /run/codeboost-input/plan.schema.json in a dedicated read-only input mount,
