@@ -200,7 +200,7 @@ The script approval gate covers codeboost-run commands, while container and netw
 - **The schema files have no `$schema` line.** Claude Code's `--json-schema` rejects the draft 2020-12 URL (tested with Claude Code 2.1.278). Validate with a draft 2020-12 validator, set in code.
 - **Strict-mode rule.** Every object lists all its properties in `required` and sets `additionalProperties: false`. Optional values are nullable. Keep this rule for every new field, or Codex's `--output-schema` may refuse the schema.
 - **One file per schema.** Each agent receives one schema file, so `plan-edit.schema.json` holds exact copies of the `item`, `file`, and `check` definitions. A test must fail if the copies differ.
-- **Closing stdin.** `codex exec` reads extra input from stdin when stdin is not a terminal, and waits forever if nothing arrives. Always run it with stdin closed (`< /dev/null`).
+- **Closing stdin.** `codex exec` reads extra input from stdin when stdin is not a terminal, and waits forever if nothing arrives. Close stdin through the process API (`stdio[0] = 'ignore'`); do not wrap adapter launches in a shell.
 - **Tested with:** Claude Code 2.1.278 and Codex CLI 0.153.4, 2026-09-22. Both returned plans and suggested edits that passed both schemas.
 
 ## Test this document with a reader
