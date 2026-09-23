@@ -85,7 +85,7 @@ codeboost keeps your approved plan in control from start to finish. It follows t
 ## Assumptions we agreed on
 
 1. **The value is in the review, not the queue.** Many tools already turn issues into PRs: issue-orchestrator, Agent Orchestrator, Bernstein, NEEDLE, no_human, and GitHub's own Copilot agent. So codeboost keeps its queue simple and puts its effort into steps 7 to 9.
-2. **Two separate signals link code to plan items.** This assumption was changed after the outside review. Signal 1 is the commit trailer. Signal 2 is the plan item's declared files. The review screen shows separate checks for each plan item: attributed, in scope, tests, and AI review (renamed from "correct" by design-review D21). Ambiguous changes are always shown as ambiguous. codeboost never guesses an owner. Neither signal can catch an unrelated edit inside a declared file. Only the review agent and you can catch that (engineering review, R3).
+2. **Two separate signals link code to plan items.** This assumption was changed after the outside review. Signal 1 is the runner-owned commit ledger (O5); trailers are informational and cannot establish ownership. A commit absent from the ledger is foreign even if its trailer names a plan item. Signal 2 is the plan item's declared files. The review screen shows separate checks for each plan item: attributed, in scope, tests, and AI review (renamed from "correct" by design-review D21). Ambiguous changes are always shown as ambiguous. codeboost never guesses an owner. Neither signal can catch an unrelated edit inside a declared file. Only the review agent and you can catch that (engineering review, R3).
 3. **Local and single-user.** You start codeboost from the command line. It opens in your browser.
 4. **Rejecting revises the same PR.** Your feedback attaches to plan items. The plan gets a new revision. The agent redoes only the affected plan items.
 
@@ -131,7 +131,7 @@ Changed by decision P1 (below, in the Decision ledger). The full rules are in [`
 - **YAML and JSON have the same structure.** People read and write YAML; agents return JSON. Every field is always present, with `null` or `[]` when it has nothing to say.
 - **Each declared file carries its own change.** A file entry has a path, a kind (`edit`, `add`, `delete`, or `rename`), the old path for a rename, and what changes in it. This keeps the plan file by file (step 3).
 - **Acceptance entries are typed.** `cmd` is a command codeboost runs. `check` is a statement the review agent judges.
-- **After the schema, codeboost checks meaning.** For example: unique IDs, `depends_on` only to earlier items, no `..` in paths, and declared files that exist. A failure blocks approval; a warning, such as "No test command", does not.
+- **After the schema, codeboost checks meaning.** For example: unique IDs, `depends_on` only to earlier items, no `..` in paths, and valid projected file operations: existing sources for edits/deletes/renames, unused destinations for adds/renames. A failure blocks approval; a warning, such as "No test command", does not.
 
 Each plan looks like this (shortened; the full example is [`schema/examples/plan-412-r3.yaml`](../../schema/examples/plan-412-r3.yaml)):
 
@@ -189,7 +189,7 @@ This keeps the plan out of the code, and there is only one master copy.
 4. waits for you to approve or edit the proposal on the planning screen. Your approval creates the next plan revision;
 5. puts the task back in the queue at its old position, and re-runs that plan item from the start.
 
-If an invocation finishes normally but edited an undeclared file anyway, codeboost still commits the change. The change shows on that plan item's row, marked out of scope.
+If an invocation finishes normally and passes the safety audit but edited an undeclared regular file within the task repository, codeboost still commits the change. Unsafe path, metadata, symlink, or submodule violations instead stop the invocation before any test or commit and move it to needs human. The change shows on that plan item's row, marked out of scope.
 
 **Checking whether the issue is already fixed.** Before it opens the PR, and again before merging, codeboost checks:
 - whether something other than this task's PR closed the issue;
@@ -1766,7 +1766,7 @@ Comparison grid:
 | How agents answer | not defined | JSON that must match one schema, enforced by the CLI flag | Markdown or YAML text that codeboost parses | free text that a second agent converts |
 | Importing a plan file | not possible | YAML or JSON, checked by the same schema | YAML only, with a hand-written parser | not possible |
 | Plan assistant suggestions | not defined | typed edit operations (second schema); Apply is exact | free text; the person edits by hand | free text; an agent applies it |
-| Checks after the schema | none | unique IDs, earlier-only dependencies, safe paths, files exist; failures block approval | same | same |
+| Checks after the schema | none | unique IDs, earlier-only dependencies, safe paths, valid projected source/destination state; failures block approval | same | same |
 | Versioning | none | `schema_version` in every plan | none | none |
 
 Question: asked in conversation, not as a numbered question. Claude recommended A.
