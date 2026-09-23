@@ -306,3 +306,12 @@ it('bounds linking duration and replacement-origin fanout', () => {
   try { expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxDurationMs: 3 })).toThrow(/deadline/i); }
   finally { clock.mockRestore(); }
 });
+
+it.each(['P1', undefined])('retains deletion and recreation owners on reused-path file cards (%s)', owner => {
+  const f = fixture({ 'a.txt': '\0old binary' });
+  rmSync(join(f.dir, 'a.txt')); f.commit(owner);
+  f.write('a.txt', '\0new binary'); f.commit('P2');
+  const card = f.segments().find(s => s.kind === 'file')!;
+  expect(card.owners).toEqual([owner ?? null, 'P2']);
+  expect(card.row).toBe(owner ? 'Ambiguous' : 'Unplanned');
+});

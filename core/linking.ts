@@ -146,10 +146,12 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
           for (const id of line.origins) if (!removed.has(id)) removed.set(id, combine([line.evidence, current]));
         }
       }
-      const metadataEvidence = metadataChange(delta) ? combine([previous.metadata, current]) : previous.metadata;
+      const metadataEvidence = metadataChange(delta)
+        ? combine([previous.metadata, ...touched.map(path => metadata.get(path) ?? empty()), current])
+        : previous.metadata;
       const metadataPaths = unique([...previous.metadataPaths, ...touched]);
       charge(metadataPaths.length);
-      for (const path of metadataPaths) metadata.set(path, metadataEvidence);
+      for (const path of metadataPaths) metadata.set(path, combine([metadata.get(path) ?? empty(), metadataEvidence]));
       if (oldPath) files.delete(oldPath);
       if (delta.newPath) files.set(delta.newPath, { lines: next, metadata: metadataEvidence, metadataPaths });
     }
