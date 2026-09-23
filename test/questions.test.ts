@@ -46,3 +46,13 @@ it('times out an unresponsive agent and allows expired pending attempts to be re
  service.store.beginAnswer(service.config.identity,asked.createdNoteId!,'interrupted');await vi.advanceTimersByTimeAsync(125001);service.store.beginAnswer(service.config.identity,asked.createdNoteId!,'replacement');service.store.finishAnswer(service.config.identity,asked.createdNoteId!,'interrupted',{status:'complete',text:'Old answer'});expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.attempt).toBe('replacement');
  } finally {vi.useRealTimers();}
 });
+it('does not replace a locally running job when its persisted lease expires',async()=>{
+ const service=fixture(),asked=question(service);let calls=0,signal:AbortSignal|undefined;
+ const manager=new Questions(service,(_prompt,currentSignal)=>{calls++;signal=currentSignal;return new Promise(()=>{});});managers.push(manager);
+ manager.start(asked.createdNoteId!,asked);
+ const original=service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt;
+ const later=Date.now()+130000;vi.spyOn(Date,'now').mockReturnValue(later);
+ expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow(/already answering/);
+ expect(calls).toBe(1);expect(service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt).toBe(original);
+ await manager.close();expect(signal?.aborted).toBe(true);expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/Server stopped/);
+});

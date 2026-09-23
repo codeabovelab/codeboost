@@ -22,6 +22,7 @@ export class Questions {
   private agent?: QuestionAgent;
   constructor(service: ReviewService, agent?: QuestionAgent) { this.service=service; this.agent=agent; }
   start(id: string, view: ReturnType<ReviewService['load']>) {
+    if (this.running.has(id)) throw new Error('Agent is already answering this question.');
     const note = view.notes.find(n=>n.id===id && n.kind==='question');
     if (!note) throw new Error('Question not found.');
     if (note.snapshotId!==view.snapshot.id || note.revision!==view.plan.revision) throw new Error('This question belongs to an older review. Ask again against the current code.');
