@@ -165,3 +165,15 @@ for (const readingEarlier of [false,true]) test(`answer arrival ${readingEarlier
  if(readingEarlier) expect(await notes.evaluate(element=>element.scrollTop)).toBeCloseTo(before,0);
  else await expect.poll(()=>notes.evaluate(element=>element.scrollHeight-element.clientHeight-element.scrollTop)).toBeLessThan(2);
 });
+test('resizes Conversation using its divider and keyboard',async({page})=>{
+ await page.goto(app.url);const pane=page.locator('#conversation-pane');const divider=page.getByRole('separator',{name:'Resize conversation'});
+ await expect(divider).toBeVisible();const initial=(await pane.boundingBox())!.width;const handle=(await divider.boundingBox())!;
+ await page.mouse.move(handle.x+handle.width/2,handle.y+100);await page.mouse.down();await page.mouse.move(handle.x-100,handle.y+100);await page.mouse.up();
+ expect((await pane.boundingBox())!.width).toBeGreaterThan(initial+90);
+ await divider.press('Home');await expect(divider).toHaveAttribute('aria-valuenow','280');
+ await divider.press('ArrowLeft');await expect(divider).toHaveAttribute('aria-valuenow','300');
+ await divider.press('End');await expect(divider).toHaveAttribute('aria-valuenow','480');
+ expect((await page.locator('.code-pane').boundingBox())?.width ?? 0).toBeGreaterThan(400);
+ await page.getByRole('button',{name:'Collapse conversation',exact:true}).click();await expect(divider).toBeHidden();
+ await page.getByRole('button',{name:'Conversation',exact:true}).click();await expect(divider).toBeVisible();expect((await pane.boundingBox())!.width).toBe(480);
+});

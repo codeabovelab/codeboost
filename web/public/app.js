@@ -582,4 +582,43 @@ $("settings").onclick=async()=>{
   } catch(error){$("dialog-body").textContent=error.message;}
 };
 
+const conversationResize = $("conversation-resize");
+const conversationPane = $("conversation-pane");
+function resizeConversation(width) {
+  const bounded = Math.round(Math.max(280, Math.min(480, width)));
+  conversationPane.style.width = `${bounded}px`;
+  conversationResize.setAttribute("aria-valuenow", String(bounded));
+}
+let conversationDrag;
+conversationResize.onpointerdown = event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  conversationDrag = { x: event.clientX, width: conversationPane.getBoundingClientRect().width };
+  conversationResize.setPointerCapture(event.pointerId);
+  conversationResize.focus();
+  document.body.classList.add("resizing-conversation");
+};
+conversationResize.onpointermove = event => {
+  if (conversationDrag) resizeConversation(conversationDrag.width + conversationDrag.x - event.clientX);
+};
+function endConversationResize() {
+  conversationDrag = null;
+  document.body.classList.remove("resizing-conversation");
+}
+conversationResize.onpointerup = event => {
+  if (conversationResize.hasPointerCapture(event.pointerId)) conversationResize.releasePointerCapture(event.pointerId);
+  endConversationResize();
+};
+conversationResize.onpointercancel = endConversationResize;
+conversationResize.onlostpointercapture = endConversationResize;
+conversationResize.onkeydown = event => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  resizeConversation(event.key === "Home" ? 280 : event.key === "End" ? 480 : conversationPane.getBoundingClientRect().width + (event.key === "ArrowLeft" ? 20 : -20));
+};
+new ResizeObserver(() => {
+  const width = conversationPane.getBoundingClientRect().width;
+  if (width) conversationResize.setAttribute("aria-valuenow", String(Math.round(width)));
+}).observe(conversationPane);
+
 await refresh();

@@ -465,7 +465,6 @@ pre {
   flex-direction: column;
   background: var(--surface);
   border-left: 1px solid var(--line);
-  resize: horizontal;
   overflow: auto;
 }
 .tabs {
@@ -680,3 +679,19 @@ dialog::backdrop {
 .agent-answer { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
 .agent-answer p { white-space: pre-wrap; overflow-wrap: anywhere; }
 #question-provider { display: block; width: 100%; margin: 8px 0; }
+
+#conversation-resize {
+  flex: 0 0 6px;
+  cursor: col-resize;
+  touch-action: none;
+  background: var(--line);
+}
+#conversation-resize:hover, #conversation-resize:focus-visible { background: var(--primary); }
+body.resizing-conversation { cursor: col-resize; user-select: none; }
+@media (min-width: 1440px) {
+  body.conversation-closed #conversation-resize { display: none; }
+}
+@media (max-width: 1439px) {
+  #conversation-resize { display: none; }
+  body.conversation-open #conversation-resize { display: block; }
+}
