@@ -124,3 +124,7 @@ it('attributes unchanged moved lines when final rename detection is lost', () =>
   const parts = f.segments();
   expect(parts.filter(s => s.kind === 'text').every(s => s.row !== 'Unplanned')).toBe(true);
 });
+it('does not hide a UTF-8 byte-order-mark-only change', () => {
+  const f = fixture(); f.write('a.txt', '\uFEFFone\ntwo\nthree\n'); f.commit('P1');
+  expect(f.segments().some(s => s.operation === '+' && s.content.startsWith('\uFEFF'))).toBe(true);
+});

@@ -27,13 +27,14 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): Hi
     if (!blobs.has(oid)) {
       const data = run('cat-file', 'blob', oid);
       let text: string | null = null;
-      if (!data.includes(0)) { try { text = new TextDecoder('utf-8', { fatal: true }).decode(data); } catch { /* binary */ } }
+      if (!data.includes(0)) { try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data); } catch { /* binary */ } }
       blobs.set(oid, text);
     }
     return { oid, mode, text: blobs.get(oid)! };
   };
   const diff = (from: string, to: string, contexts: boolean): FileDelta[] => {
-    const fields = run('diff', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--').toString().split('\0');
+    const raw = run('diff', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--');
+    const fields = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw).split('\0');
     const result: FileDelta[] = [];
     for (let i = 0; i < fields.length && fields[i];) {
       const match = /^:(\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])\d*$/.exec(fields[i++]!);

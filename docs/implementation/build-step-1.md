@@ -27,6 +27,8 @@ Started from PR #1 and updated to its design commit `2229e88`. Work follows the 
 
 `npm test` runs schema fixtures and real Git repositories: the documented invalid plans; projected add/edit/rename/delete chains; bad dependencies/paths; malformed suggestions; stale revisions; two owners in one hunk; forged trailers; out-of-scope changes; pure deletions; overlapping edits; reverted work; all six non-text change kinds; literal filenames; clean rebases with remapped ledger; stale checks/dependents; whitespace/context changes; assignment and duplicate-copy expiry; and rename provenance when final rename detection is lost.
 
+A focused independent review found BOM-only changes could disappear because the default UTF-8 decoder strips the mark. A real-Git regression first failed, then passed with BOM-preserving decoding. Invalid UTF-8 filenames fail instead of being silently replaced.
+
 The rename case first failed (moved lines became Unplanned), then passed after the provenance fix. `npm run typecheck` checks all source and tests. The public examples and shared schema definitions are checked on every test run.
 
 ## Remaining gates
