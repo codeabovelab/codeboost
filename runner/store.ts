@@ -176,7 +176,8 @@ export class Store {
       this.#expect(key, expected);
       const plan = this.getPlan(identity);
       for (const entry of entries) {
-        if (entry.owner !== null && !plan.items.some(item => item.id === entry.owner)) throw new Error('Unknown ledger owner.');
+        const existing = this.#get('SELECT sha FROM ledger WHERE key=? AND sha=?', key, entry.sha);
+        if (!existing && entry.owner !== null && !plan.items.some(item => item.id === entry.owner)) throw new Error('Unknown ledger owner.');
         this.#entry(key, entry);
       }
       return this.#snapshot(key, base, head);

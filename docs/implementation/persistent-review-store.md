@@ -33,3 +33,7 @@ Build the review screen under #3 next. The real-issue assignment, experiment pro
 ## Review round 1
 
 Copilot's summary identified two findings (no inline threads). Both were reproduced with failing regressions, then fixed: immutable ledger comparisons now compare the typed fields rather than JSON property order, and a checkpoint's item must be the last item in its completed prefix. No findings were declined. Final suite: 151 tests.
+
+## Review round 2
+
+Reproduced a historical-owner retry failure after an amendment removed the owning item. Normal history writes now apply current-item validation only to new ledger entries; existing SHAs still pass the immutable field comparison. The regression also checks that new commits cannot claim the removed owner and that rebases retain historical ownership. No findings declined. Final suite: 152 tests.

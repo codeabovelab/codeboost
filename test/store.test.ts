@@ -176,3 +176,12 @@ it('requires the checkpoint item to be the last item in the completed prefix', (
   expect(() => store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries })).toThrow(/prefix/);
   expect(store.recordCheckpoint(identity, state(store), { item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries }).item).toBe('P2');
 });
+it('allows historical ledger retries after the owning item is removed, but rejects new entries for it', () => {
+  const { store } = fixture(); const entry = { sha: oid(2), owner: 'P1', origin: 'owned' as const, sourceSha: null };
+  store.recordHistory(identity, state(store), oid(1), oid(2), [entry]);
+  const next = plan(); next.items[0]!.id = 'P2'; store.importRevision(JSON.stringify(next), 'json', context, 1);
+  expect(() => store.recordHistory(identity, state(store), oid(1), oid(2), [entry])).not.toThrow();
+  expect(() => store.recordHistory(identity, state(store), oid(1), oid(3), [{ ...entry, sha: oid(3) }])).toThrow(/Unknown ledger owner/);
+  store.recordRebase(identity, state(store), oid(4), oid(5), [{ oldSha: oid(2), newSha: oid(5) }]);
+  expect(store.ownership(identity).get(oid(5))).toBe('P1');
+});
