@@ -189,7 +189,7 @@ This keeps the plan out of the code, and there is only one master copy.
 4. waits for you to approve or edit the proposal on the planning screen. Your approval creates the next plan revision;
 5. puts the task back in the queue at its old position, and re-runs that plan item from the start.
 
-If an invocation finishes normally and passes the safety audit but edited an undeclared regular file within the task repository, codeboost still commits the change. Unsafe path, metadata, symlink, or submodule violations instead stop the invocation before any test or commit and move it to needs human. The change shows on that plan item's row, marked out of scope.
+If an invocation finishes normally and passes the safety audit but edited an undeclared regular file within the task repository, codeboost still commits the change. Unsafe path, metadata, symlink, or submodule violations instead stop the invocation before any test or commit and move it to needs human. The change shows on that plan item's row, marked out of scope. Execution deliberately pauses in **needs amendment** before any later item or check invocation. A person must approve a revised plan and continuation; the runner reconciles the already-executed prefix with the audited current head, then validates remaining operations from that actual checkpoint. Do not silently add the file to scope or erase its original out-of-scope evidence.
 
 **Checking whether the issue is already fixed.** Before it opens the PR, and again before merging, codeboost checks:
 - whether something other than this task's PR closed the issue;
@@ -267,11 +267,11 @@ All phases run in the container (R1). The allowed list comes from your repo's sc
 - A removed line belongs to the commit that removed it. So even changes that only delete code have an owner.
 - A line changed by commits from two or more plan items is marked **multi-item**.
 
-**It trusts its own commit ledger, not commit messages** (engineering review, O5). `runner/store` keeps a ledger of every commit codeboost creates. When codeboost rebases, it also records which old commit became which new one. Only ledger commits count as a plan item's work. A commit that is not in the ledger is foreign, even if its message carries a `Plan-Item` trailer, so its lines go to the Unplanned row. Trailers stay in history as a readable label, not as proof.
+**It trusts its own commit ledger, not commit messages** (engineering review, O5). `runner/store` keeps a ledger of every commit codeboost creates, with SHA, nullable plan-item owner, and origin classification. Rewriting a foreign commit records a new entry with owner `null` and origin `foreign`; creating the rewritten commit does not assign it to a plan item. When codeboost rebases, it also records which old commit became which new one. Only ledger entries with an explicit non-null plan-item owner count as that item's work; entries marked unowned/foreign remain Unplanned. A commit that is not in the ledger is foreign, even if its message carries a `Plan-Item` trailer, so its lines go to the Unplanned row. Trailers stay in history as a readable label, not as proof.
 
 **It shows segments, not whole hunks.** codeboost splits each hunk wherever the owner changes. For example, a hunk with some lines from P1 and some from P2 becomes two segments: one on P1's row, one on P2's row. Both carry a "shares a hunk with P1/P2" label.
 
-**Changes with no text lines** (engineering review, O7). V1 can review externally produced gitlink changes, but cannot author submodule-pointer changes; a future typed target-commit operation is required before enabling that execution path. Some changes have no lines: binary content, file mode (such as the executable bit), empty files added or deleted, renames without content change, symlinks, and submodule pointers. Each one becomes a **file-change segment**. It is owned through the commit ledger and placed by the same table below. Its approval records the old and new path, the old and new mode, and the old and new content id (git blob id). On the review screen it shows as a card, for example "binary changed (12 KB → 14 KB)", "made executable", or "renamed from x". The merge gate treats it like any other segment.
+**Changes with no text lines** (engineering review, O7). V1 can review externally produced gitlink changes, but cannot author submodule-pointer changes; a future typed target-commit operation is required before enabling that execution path. Some changes have no lines: binary content, file mode (such as the executable bit), empty files added or deleted, renames without content change, symlinks, and submodule pointers. Each one becomes a **file-change segment**. It is owned through the commit ledger and placed by the same table below. Its approval records the old and new path, the old and new mode, and the old and new typed object IDs: `{kind: blob, oid}` for regular files/symlinks, `{kind: commit, oid}` for mode-160000 gitlinks, and `null` for an absent side. On the review screen it shows as a card, for example "binary changed (12 KB → 14 KB)", "made executable", or "renamed from x". The merge gate treats it like any other segment.
 
 **Where each segment goes.** First find who made the segment (rows). Then find whose declared files it is in (columns).
 
@@ -494,7 +494,7 @@ codeboost also rebases before it first shows you the review. So you always revie
 
 **A conflict on a commit codeboost did not make** (engineering review, R5, answer D6: B). A person may push a commit to the PR branch. That commit is not in codeboost's commit ledger (O5), whatever its message says. If git stops on it:
 1. codeboost runs a conflict-resolution invocation in the same container, with the same network rule. The agent sees the conflicting files, that commit, and the base commits that caused the conflict. It may edit only the conflicting files.
-2. The resolved commit keeps its original author and gets no `Plan-Item` trailer. So its lines stay in the red Unplanned row, marked "conflict resolved by agent," for you to review.
+2. The resolved commit keeps its original author and gets no `Plan-Item` trailer. The runner records it as an explicitly unowned ledger entry (owner `null`, origin `foreign`, plus its source SHA) and maps the old SHA to the new SHA while preserving that classification. Its lines therefore stay in the red Unplanned row, marked "conflict resolved by agent," regardless of whether any trailer is present.
 3. If the fix needs another file, or the invocation fails, codeboost cancels the rebase and moves the task to **needs human**, as for any other conflict.
 
 If codeboost is stopped or crashes during a rebase, it always cancels the rebase first when it recovers.
@@ -1524,7 +1524,7 @@ Net: every change visible and gated (A), or some changes invisible (B, C, D).
 Header: Non-text changes
 Options:
 A) Apply this change (recommended)
-Treat binary, mode, empty-file, rename, symlink and submodule changes as "file change" segments, placed by the same table, approved by path, mode and content id, and shown as a card on the review screen. ✅ No change can bypass review or the merge gate. ✅ Reuses the existing rules. ❌ One more segment kind to build and test. (human: ~1 day / CC: ~30 min)
+Treat binary, mode, empty-file, rename, symlink and submodule changes as "file change" segments, placed by the same table, approved by path, mode and typed object ID, and shown as a card on the review screen. ✅ No change can bypass review or the merge gate. ✅ Reuses the existing rules. ❌ One more segment kind to build and test. (human: ~1 day / CC: ~30 min)
 B) Keep this row's current value
 Leave non-text changes out of the model. ✅ No change. ✅ Simpler engine. ❌ Binary and permission changes merge unseen. (human: 0 / CC: 0)
 C) Investigate before choosing
@@ -1534,7 +1534,7 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Th
 
 State: approved
 Actual answer: A) Apply this change (answer to D17, 2026-09-22)
-Accepted scope: binary, mode, empty-file, rename, symlink, and submodule changes become file-change segments, owned via the commit ledger (O5), placed by the classification table, approved by old/new path, mode, and blob id, shown as cards, and gated like any segment. Test cases: one of each of the six kinds lands in the correct row and blocks merge until approved. Design sections amended: How codeboost links code to plan items.
+Accepted scope: binary, mode, empty-file, rename, symlink, and submodule changes become file-change segments, owned via the commit ledger (O5), placed by the classification table, approved by old/new path, mode, and typed object ID (blob for files/links, commit for gitlinks), shown as cards, and gated like any segment. Test cases: one of each of the six kinds lands in the correct row and blocks merge until approved. Design sections amended: How codeboost links code to plan items.
 History: none
 
 ### O8: Narrowing build step 2 to a read-only review screen
