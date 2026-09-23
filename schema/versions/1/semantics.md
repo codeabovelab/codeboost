@@ -149,7 +149,7 @@ Issue text and agent-produced plan fields remain untrusted. The prompt builder s
 
 | Source | What happens |
 |---|---|
-| **Claude or Codex drafts it** | codeboost runs the agent with the prompt in [`prompts/plan-author.md`](../prompts/plan-author.md) and passes the schema. The answer is a JSON plan. codeboost runs the checks after import and shows the plan on the Plans screen as a draft. |
+| **Claude or Codex drafts it** | codeboost runs the agent with the prompt in [`prompts/plan-author.md`](../../../prompts/plan-author.md) and passes the schema. The answer is a JSON plan. codeboost runs the checks after import and shows the plan on the Plans screen as a draft. |
 | **You import a file** | On the Plans screen, choose "Import plan" and pick a `.yaml`, `.yml`, or `.json` file, or paste one. codeboost reads it, runs the schema and the checks after import, and saves it as the next draft revision. The file's `revision` is replaced by the next free number. |
 | **You edit on the Plans screen** | Each change is checked as you type. Approving saves the revision. |
 

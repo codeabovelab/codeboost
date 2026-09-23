@@ -7,13 +7,23 @@
     const scratchOutputPath = '/tmp/codeboost-output/plan.json';
     const workPath = '/work';
     const schemaText = readFileSync(schemaPath, 'utf8');
-    const options = { cwd: workPath, env: phaseEnvironment,
+    const profile = requireValidatedPlanningProfile(pinnedCliVersion);
+    assertWithinLaunchBudget(promptText, schemaText, profile, phaseEnvironment);
+    const options = { cwd: workPath, env: phaseEnvironment, maxBuffer: 1048576,
       shell: false, stdio: ['ignore', 'pipe', 'pipe'] };
-    execFileSync('claude', ['-p', promptText, '--json-schema', schemaText,
+    execFileSync('claude', [...profile.claudeArgs, '-p', promptText, '--json-schema', schemaText,
       '--output-format', 'json'], options);
-    execFileSync('codex', ['exec', '--output-schema', schemaPath,
+    execFileSync('codex', ['exec', ...profile.codexExecArgs, '--output-schema', schemaPath,
       '-o', scratchOutputPath, promptText], options);
-  These are alternative vendor launches, not two calls for one request.
+  These are adapter pseudocode and alternative vendor launches, not two calls
+  for one request. The required runner-owned profile injects the tested phase
+  flags/config: Claude disables WebFetch/WebSearch, uses strict empty MCP config,
+  and exposes read/list/search only; Codex disables web search and all MCP
+  servers and exposes read/list/search only. Both deny process/write tools.
+  Do not use an empty profile or inherit repository/user CLI settings. The
+  pinned-version startup probe must attempt each forbidden tool and confirm
+  refusal; if those controls cannot be enforced, planning is unavailable.
+  Profiles are immutable runner configuration outside /work, never agent data.
   stdio 'ignore' closes stdin through the process API; schemaPath is selected
   from the trusted registry. Before launch, the runner copies that schema into
   /run/codeboost-input/plan.schema.json in a dedicated read-only input mount,
@@ -33,6 +43,18 @@
   and issue-number slots; evaluate conditionals before inserting data, once. Build
   repo_data_json as one object containing repo, base_ref, base_sha, repo_tree
   (an array of path strings), and allowed_commands (an array of argv arrays).
+  Bound input before serialization and check the final UTF-8 prompt again:
+  at most 32 KiB prompt, 32 KiB schema text, 16 KiB explicit environment, and
+  128 KiB aggregate argv/environment including separators and profile arguments.
+  Reject NUL input and any oversized request before spawning; do not silently
+  truncate any source. Report which input exceeded the budget and ask the person
+  to narrow the issue/comments, selected path set, or lesson set before retrying.
+  Also enforce the selected pinned model profile's token budget (including
+  schema/system overhead and reserved answer tokens) before launch; missing
+  budget/tokenizer support fails closed. The launch probe must test these caps
+  on the supported container OS/CLI; lower them if needed, never raise them
+  automatically. Tests include one huge field, many small fields exceeding the
+  aggregate, post-escaping expansion, and exact boundary accepted/rejected inputs.
   In every serialized data string, escape <, >, and & as JSON Unicode escapes. Never insert
   raw source text or recursively render placeholders inside serialized values.
   These wrappers do not prevent semantic prompt injection: container permissions,

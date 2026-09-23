@@ -300,7 +300,7 @@ A plan item with no changes can be approved only if you confirm "no change neede
 - code that only moved up or down, because of other plan items or a rebase, keeps its approval.
 
 **An approval also covers the job, the place, and the dependencies** (engineering review, O2). Besides the lines, an approval records:
-- a fingerprint of the plan item itself: its title, intent, changes, declared files, acceptance checks, and `depends_on` list. If any of these changes, the approval becomes stale;
+- a fingerprint bound to the stable repository/task/plan IDs and plan-item `id`, including its title, intent, changes, declared files, acceptance checks, and `depends_on` list. If any of these changes, the approval becomes stale; an ID-only import is a different ownership key and cannot inherit the old approval, even when all text matches;
 - for each segment, the name of the function it sits in, taken from git's hunk header (not a line number). If the same lines move into a different function, the approval becomes stale. Line shifts and clean rebases still keep it;
 - its dependencies. If a plan item becomes stale, every plan item that lists it in `depends_on` becomes stale too.
 
@@ -576,6 +576,7 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 - one hunk with lines from two plan items. Expected: split into two segments, each labeled as sharing a hunk;
 - a new revision that changes one approved plan item. Expected: only that approval goes stale;
 - a rebase that only moves lines. Expected: no approval goes stale;
+- an import that changes only a plan-item ID. Expected: the old approval cannot transfer; the new item requires review and merge blocks until ownership and approvals are reconciled;
 - a whitespace-only change to approved code. Expected: that approval goes stale;
 - approve each non-line segment type, then independently change its content/object ID, path, mode, operation, or presence without adding text lines. Expected: approval and dependent approvals become stale and merge blocks; an unchanged fingerprint survives line shifts;
 - assigning an Unplanned segment to a plan item. Expected: that plan item goes stale, and the assignment survives an unrelated revision;
