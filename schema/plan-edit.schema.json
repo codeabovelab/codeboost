@@ -107,7 +107,7 @@
           "maxLength": 1200
         },
         "file": {
-          "description": "For add_file and update_file: the file entry. Otherwise null.",
+          "description": "For add_file: the new file entry. For update_file: replacement for the existing entry with exactly the same path; path is immutable and a missing match is an error. Path changes require a newly imported complete plan revision (or separately valid add/remove edits). Otherwise null.",
           "anyOf": [
             {
               "$ref": "#/$defs/file"
