@@ -72,14 +72,14 @@ export function assertEditReply(value: unknown): asserts value is EditReply {
 }
 /** Canonical paths make duplicate checks reliable and exclude Git metadata. */
 export function isRepoPath(path: string): boolean {
-  return path.length > 0 && !/[\\:\x00-\x1f\x7f]/u.test(path) &&
+  return path.length > 0 && !/[\\:\p{Cc}]/u.test(path) &&
     path.split('/').every(part => part !== '' && part !== '.' && part !== '..' &&
       part.toLowerCase() !== '.git');
 }
 
 /** Small literal-argv grammar, deliberately not a shell parser. Never executes. */
 export function commandArgv(command: string): string[] {
-  if (/[\\\x00-\x1f\x7f]/u.test(command))
+  if (/[\\\p{Cc}]/u.test(command))
     fail('command-syntax', 'Commands must contain literal arguments, not shell syntax.');
   const argv: string[] = [];
   let word = '', quote = '', started = false;
@@ -109,7 +109,7 @@ function parents(path: string): string[] {
   const parts = path.split('/'); return parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'));
 }
 function linkTarget(path: string, target: string, key: (path: string) => string, entries: ReadonlyMap<string, BaseEntry>): string | null {
-  if (!target || target.startsWith('/') || /[\\:\x00-\x1f\x7f]/u.test(target)) return null;
+  if (!target || target.startsWith('/') || /[\\:\p{Cc}]/u.test(target)) return null;
   const parts = path.split('/').slice(0, -1);
   for (const component of target.split('/')) {
     if (component === '' || component === '.') continue;

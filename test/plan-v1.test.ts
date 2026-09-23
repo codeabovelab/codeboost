@@ -89,3 +89,9 @@ it('rejects directories, colliding base leaves, and retained links through hidde
  p.items[0]!.files[0] = { path: 'b', kind: 'rename', renamed_from: 'a', change: 'Move' };
  expect(validatePlan(p, { ...context, baseEntries: [{ path: 'a', kind: 'symlink', target: 'other/../target' }, { path: 'other', kind: 'symlink', target: 'dir' }] }).errors.some(e => e.code === 'symlink-target')).toBe(true);
 });
+
+it('rejects C1 control characters in commands and paths', () => {
+ expect(() => commandArgv("test '\u0085'")).toThrow();
+ const p = plan(); p.items[0]!.files[0]!.path = 'a\u0085';
+ expect(validatePlan(p, { ...context, baseEntries: [{ path: 'a\u0085', kind: 'file' }] }).errors.length).toBeGreaterThan(0);
+});
