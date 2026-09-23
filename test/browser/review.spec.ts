@@ -289,6 +289,7 @@ test('hides Retry until a timed-out invocation has actually settled',async({page
  await expect(page.getByText('Agent · Answering…',{exact:true})).toBeVisible();
  const note=app.service.store.getReviewNotes(config.identity).find(note=>note.text==='Slow question')!;
  app.service.store.finishAnswer(config.identity,note.id,note.answer!.attempt,{status:'failed',error:'Agent timed out. Try again.'});
+ await page.reload();
  await expect(page.getByText('Agent · Finishing cancellation…',{exact:true})).toBeVisible({timeout:10000});
  await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toHaveCount(0);
  settle('Late answer');

@@ -106,3 +106,5 @@ PR #11 round 9 returned no inline findings and identified shutdown ordering in i
 Current PR validation: 187 unit/integration tests, 32 browser tests, typecheck, and diff checks. Earlier counts above identify the stage when each behavior was added.
 
 The documentation-only review after adding `AGENTS.md` exposed one more concrete lifecycle race: an expired persisted attempt could show Retry while its cancelled provider was still settling. Question polling now exposes whether the local invocation remains active, displays Finishing cancellation, and keeps polling without exposing Retry until settlement. A browser regression advances the persisted clock while leaving the invocation unresolved, then confirms Retry appears only after settlement.
+
+The follow-up review exposed the same active-job marker missing from the initial review response. Reloading during provider settlement could therefore expose Retry and stop polling. Initial loads and action responses now include the marker used by question polling; the browser regression reloads during settlement and confirms Retry remains hidden until the invocation finishes.

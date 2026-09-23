@@ -8,6 +8,7 @@ const publicRoot = new URL('./public/', import.meta.url);
 export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent) {
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   const questions=new Questions(service,questionAgent);
+  const load=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
   const server = createServer(async (req, res) => {
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
@@ -21,8 +22,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const supplied = req.headers['x-codeboost-token'];
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
-        if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:service.load().notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))});return; }
-        if (req.method === 'GET' && path === '/api/review') { json(200, service.load()); return; }
+        if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:load().notes});return; }
+        if (req.method === 'GET' && path === '/api/review') { json(200, load()); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
         for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
@@ -31,7 +32,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
-          questions.start(input.id,view);json(200,service.load());return;
+          questions.start(input.id,view);json(200,load());return;
         }
         const view=service.act(input);
         if(view.createdNoteId && input.kind==='question') {
@@ -39,7 +40,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             // The saved question remains visible and retryable when capacity is reached.
           }
         }
-        json(200,service.load());return;
+        json(200,load());return;
       }
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
