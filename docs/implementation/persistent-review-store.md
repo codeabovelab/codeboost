@@ -47,3 +47,7 @@ Declined the duplicate-source-mapping finding as a correctness issue: the rewrit
 ## Review round 4
 
 Reproduced a saved assignment throwing in `applyChoices` after its target item was removed by amendment. Revision commits now discard assignments whose targets no longer exist, in the same transaction as the revision and request invalidation. Unrelated assignments and standalone acceptances remain. Removed assignments cannot reactivate if an ID is later reintroduced. No finding declined this round. Final suite: 155 tests.
+
+## Review round 5
+
+Reproduced and fixed three cases: old approvals reviving after item removal/reintroduction; an unknown identity-mapped SHA remaining unrecorded and later claimable; and the linking engine rejecting historical owners absent from the selected plan revision. Revision commits now discard approvals for removed IDs. Missing identity-map sources receive immutable foreign/null-owner ledger entries. `ownership(identity, revision)` produces a conservative view for that revision, mapping absent owners to null without altering the historical ledger; pass the same revision as the plan supplied to the linking engine. `getLedger` remains the raw provenance record. No findings declined this round. Final suite: 157 tests.

@@ -100,6 +100,9 @@ it('feeds persisted remapped ownership into the linking engine on real Git histo
   store.recordRebase(identity, state(store), base, head, [{ oldSha: oid(9), newSha: head }]);
   const segments = linkHistory(store.getPlan(identity), readHistory(dir, base, head), store.ownership(identity), p => p);
   expect(segments.length).toBeGreaterThan(0); expect(segments.every(s => s.row === 'P1')).toBe(true);
+  const amended = plan(); amended.items[0]!.id = 'P2'; store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  const afterRemoval = linkHistory(store.getPlan(identity), readHistory(dir, base, head), store.ownership(identity), p => p);
+  expect(afterRemoval.every(s => s.row === 'Unplanned')).toBe(true);
 });
 it('retains typed file-card approvals/choices while fingerprints detect later metadata and plan changes', () => {
   const { store, path } = fixture(); const current = store.getPlan(identity);
@@ -183,7 +186,7 @@ it('allows historical ledger retries after the owning item is removed, but rejec
   expect(() => store.recordHistory(identity, state(store), oid(1), oid(2), [entry])).not.toThrow();
   expect(() => store.recordHistory(identity, state(store), oid(1), oid(3), [{ ...entry, sha: oid(3) }])).toThrow(/Unknown ledger owner/);
   store.recordRebase(identity, state(store), oid(4), oid(5), [{ oldSha: oid(2), newSha: oid(5) }]);
-  expect(store.ownership(identity).get(oid(5))).toBe('P1');
+  expect(store.getLedger(identity).find(entry => entry.sha === oid(5))!.owner).toBe('P1');
 });
 it('allows a later amended revision to receive a fresh continuation approval', () => {
   const { store } = fixture(); const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
@@ -209,4 +212,15 @@ it('expires assignments to removed plan items atomically with the amendment', ()
   expect(store.getReview(identity).choices).toEqual([]);
   store.importRevision(JSON.stringify(plan()), 'json', context, 2);
   expect(store.getReview(identity).choices).toEqual([]);
+});
+it('does not revive an old approval when a removed item ID is reintroduced', () => {
+  const { store } = fixture(); store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  const next = plan(); next.items[0]!.id = 'P2'; store.importRevision(JSON.stringify(next), 'json', context, 1);
+  store.importRevision(JSON.stringify(plan()), 'json', context, 2);
+  expect(approvalStates(store.getPlan(identity), [], store.getReview(identity).approvals, identity).P1).toBe('unreviewed');
+});
+it('persists foreign ownership for an unknown SHA mapped to itself', () => {
+  const { store } = fixture(); store.recordRebase(identity, state(store), oid(1), oid(2), [{ oldSha: oid(2), newSha: oid(2) }]);
+  expect(store.getLedger(identity)).toEqual([{ sha: oid(2), owner: null, origin: 'foreign', sourceSha: null }]);
+  expect(() => store.recordHistory(identity, state(store), oid(1), oid(2), [{ sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null }])).toThrow(/immutable/);
 });

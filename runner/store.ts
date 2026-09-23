@@ -80,6 +80,9 @@ export class Store {
     this.#run('INSERT INTO revisions VALUES (?,?,?)', key, plan.revision, encode(plan));
     this.#run("UPDATE requests SET state='invalidated' WHERE key=? AND state IN ('pending','ready')", key);
     const items = new Set(plan.items.map(item => item.id));
+    for (const row of this.#db.prepare('SELECT item FROM approvals WHERE key=?').all(key)) {
+      if (!items.has(row.item as string)) this.#run('DELETE FROM approvals WHERE key=? AND item=?', key, row.item!);
+    }
     for (const row of this.#db.prepare('SELECT choice_key,data FROM choices WHERE key=?').all(key)) {
       const choice = decode<SegmentChoice>(row.data);
       if (choice.action === 'assign' && !items.has(choice.item!))
@@ -193,8 +196,10 @@ export class Store {
     const key = identityKey(identity); this.#current(key);
     return this.#db.prepare('SELECT data FROM ledger WHERE key=? ORDER BY sha').all(key).map(row => decode<LedgerEntry>(row.data));
   }
-  ownership(identity: PlanIdentity): ReadonlyMap<string, string | null> {
-    return new Map(this.getLedger(identity).map(entry => [entry.sha, entry.owner]));
+  /** Link a selected revision conservatively; the raw ledger retains historical owners. */
+  ownership(identity: PlanIdentity, revision?: number): ReadonlyMap<string, string | null> {
+    const items = new Set(this.getPlan(identity, revision).items.map(item => item.id));
+    return new Map(this.getLedger(identity).map(entry => [entry.sha, entry.owner !== null && items.has(entry.owner) ? entry.owner : null]));
   }
   recordRebase(identity: PlanIdentity, expected: ReviewState, base: string, head: string, mappings: readonly { oldSha: string; newSha: string }[]): Snapshot {
     const key = identityKey(identity);
@@ -209,6 +214,7 @@ export class Store {
         destinations.add(newSha);
         const source = ledger.get(oldSha);
         if (oldSha !== newSha) this.#entry(key, { sha: newSha, owner: source?.owner ?? null, origin: source?.origin ?? 'foreign', sourceSha: oldSha });
+        else if (!source) this.#entry(key, { sha: newSha, owner: null, origin: 'foreign', sourceSha: null });
         this.#run('INSERT INTO rewrites VALUES (?,?,?,?)', key, snapshot.id, oldSha, newSha);
       }
       return snapshot;
