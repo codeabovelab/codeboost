@@ -225,3 +225,12 @@ it('supports a caller-selected symlinked gitdir with regular object storage', ()
   rmSync(metadata, { recursive: true }); renameSync(join(f.dir, '.git'), metadata); symlinkSync(metadata, join(f.dir, '.git'));
   expect(readHistory(f.dir, f.base).final[0]!.after!.text).toBe('changed\n');
 });
+
+it.each([
+  [{ maxDiffBytes: 1 }, /diff byte budget/i],
+  [{ maxFileEntries: 1 }, /file entry budget/i],
+] as const)('bounds accumulated diff records with %j', (limits, error) => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
+  expect(() => readHistory(f.dir, f.base, 'HEAD', limits)).toThrow(error);
+  expect(readHistory(f.dir, f.base, 'HEAD', { maxFileEntries: 2 }).final).toHaveLength(1);
+});

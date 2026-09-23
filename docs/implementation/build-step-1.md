@@ -63,6 +63,10 @@ Declined the YAML finding: the pinned yaml 2.9.1 implementation and types explic
 
 Clarified the gitdir policy rather than rejecting normal linked worktrees. The caller selects and trusts the repository and its administrative directory; gitfiles and symlinked gitdirs are supported, while object-storage symlinks and alternates within that gitdir are rejected. Real-Git fixtures exercise both administrative layouts. Filesystem containment of an untrusted repository root belongs to the runner, not this read-only library.
 
+## Review round 8
+
+Fixed aggregate diff retention outside the blob budget. The adapter limits total raw-diff and context-patch output to 8 MiB and total file records across commit and final diffs to 20,000. Both budgets can be lowered by callers. Small-budget cases first failed and now reject explicitly; the exact file-record boundary succeeds.
+
 ## Remaining gates
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.

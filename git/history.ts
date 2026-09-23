@@ -4,12 +4,21 @@ import { resolve as resolvePath, join } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
-export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number; maxObjectEntries?: number } = {}): History {
+export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number; maxObjectEntries?: number; maxDiffBytes?: number; maxFileEntries?: number } = {}): History {
   const maxBlobBytes = limits.maxBlobBytes ?? 64 * 1024 * 1024;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > 64 * 1024 * 1024) throw new Error('Blob byte budget must be a positive integer no larger than 64 MiB.');
   const maxObjectEntries = limits.maxObjectEntries ?? 100_000;
   if (!Number.isSafeInteger(maxObjectEntries) || maxObjectEntries < 1 || maxObjectEntries > 100_000) throw new Error('Object entry budget must be a positive integer no larger than 100000.');
-  let blobBytes = 0;
+  const maxDiffBytes = limits.maxDiffBytes ?? 8 * 1024 * 1024;
+  if (!Number.isSafeInteger(maxDiffBytes) || maxDiffBytes < 1 || maxDiffBytes > 8 * 1024 * 1024) throw new Error('Diff byte budget must be a positive integer no larger than 8 MiB.');
+  const maxFileEntries = limits.maxFileEntries ?? 20_000;
+  if (!Number.isSafeInteger(maxFileEntries) || maxFileEntries < 1 || maxFileEntries > 20_000) throw new Error('File entry budget must be a positive integer no larger than 20000.');
+  let blobBytes = 0, diffBytes = 0, fileEntries = 0;
+  const accountDiff = (data: Buffer): Buffer => {
+    diffBytes += data.length;
+    if (diffBytes > maxDiffBytes) throw new Error('Review history exceeds the cumulative diff byte budget; choose a narrower base.');
+    return data;
+  };
   // Inherited Git variables can redirect repository, index, config, and object lookup.
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
   const run = (...args: string[]) => execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
@@ -67,10 +76,11 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     return { oid, mode, text: blobs.get(oid)! };
   };
   const diff = (from: string, to: string, contexts: boolean): FileDelta[] => {
-    const raw = run('diff', '--ignore-submodules=none', '--no-relative', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--');
+    const raw = accountDiff(run('diff', '--ignore-submodules=none', '--no-relative', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--'));
     const fields = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw).split('\0');
     const result: FileDelta[] = [];
     for (let i = 0; i < fields.length && fields[i];) {
+      if (++fileEntries > maxFileEntries) throw new Error('Review history exceeds the cumulative file entry budget; choose a narrower base.');
       const match = /^:(\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])\d*$/.exec(fields[i++]!);
       if (!match) throw new Error('Unexpected Git raw diff record.');
       const [, oldMode, newMode, oldOid, newOid, status] = match;
@@ -82,7 +92,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
       if (contexts && (before?.text !== null || after?.text !== null)) {
         const paths = [...new Set([oldPath, newPath].filter((path): path is string => path !== null))];
         // Literal pathspecs preserve filenames containing Git pathspec metacharacters.
-        const patch = run('diff', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', '-M', from, to, '--', ...paths.map(path => `:(literal)${path}`)).toString();
+        const patch = accountDiff(run('diff', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', '-M', from, to, '--', ...paths.map(path => `:(literal)${path}`))).toString();
         for (const line of patch.split('\n')) {
           const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line);
           if (hunk) ranges.push({ oldStart: +hunk[1]!, oldCount: +(hunk[2] ?? 1), newStart: +hunk[3]!, newCount: +(hunk[4] ?? 1), name: hunk[5]!.trim() });
