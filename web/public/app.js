@@ -81,12 +81,15 @@ async function refresh() {
   $("banner").textContent = "Linking changes to plan items…";
   try {
     rememberDraft();
-    data = await api("/api/review");
+    const updated = await api("/api/review");
+    rememberDraft();
+    data = updated;
     snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
     since = data.items.find((item) => item.id === selected)?.state === "stale";
     render();
   } catch (error) {
+    rememberDraft();
     showFailure(
       `Could not read this branch’s history. ${error.message} Use Refresh to retry.`,
     );
@@ -126,7 +129,12 @@ function select(id) {
 }
 function render() {
   const item = data.items.find((item) => item.id === selected);
-  if (!item && !["Unplanned", "Ambiguous", "Accepted"].includes(selected)) {
+  const retainedItems = [...new Set([
+    ...[...drafts].filter(([, text]) => text.length).map(([key]) => key.split(":")[0]),
+    ...[...attachments.keys()].map((key) => key.split(":")[0]),
+  ])].filter((id) => !data.items.some((entry) => entry.id === id) && !["Unplanned", "Ambiguous", "Accepted"].includes(id));
+  const retained = retainedItems.includes(selected);
+  if (!item && !retained && !["Unplanned", "Ambiguous", "Accepted"].includes(selected)) {
     selected = data.items[0]?.id || "Unplanned";
     return render();
   }
@@ -164,7 +172,9 @@ function render() {
         (row) =>
           `<button class="plan-row ${row === selected ? "selected" : ""}" data-select="${row}"><span class="row-title ${row === "Unplanned" ? "bad" : row === "Ambiguous" ? "warn" : "muted"}">${row === "Unplanned" ? "✕" : row === "Ambiguous" ? "!" : "✓"} ${row}${row === "Unplanned" ? " changes" : ""}<span class="count">${data.segments.filter((s) => s.row === row).length}</span></span></button>`,
       )
-      .join("");
+      .join("") + retainedItems.map((id) =>
+        `<button class="plan-row ${id === selected ? "selected" : ""}" data-select="${esc(id)}"><span class="warn">! ${esc(id)} · Retained draft</span></button>`,
+      ).join("");
   document
     .querySelectorAll("[data-select]")
     .forEach((button) =>
@@ -174,7 +184,7 @@ function render() {
   $("item-title").textContent = item?.title || selected;
   $("item-details").innerHTML = item
     ? `<p>${esc(item.intent)}</p>${item.reasons.map((reason) => `<p class="warn">! Stale: ${esc(reason)}</p>`).join("")}`
-    : "";
+    : retained ? '<p class="warn">This item is no longer in the plan. Your draft is retained in this page. Copy the text, select a current plan item, and reselect any code before submitting.</p>' : "";
   $("approve").hidden = !item;
   $("approve").textContent = item?.ambiguousCount
     ? "Resolve ambiguous changes"
@@ -214,7 +224,7 @@ function render() {
     }),
   );
   renderNotes();
-  $("message").disabled = !item;
+  $("message").disabled = !item && !retained;
   $("save-note").disabled = !item;
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
   renderCode();
