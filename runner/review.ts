@@ -52,7 +52,7 @@ export class ReviewService {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
     }
     const expected: ReviewState = { revision: plan.revision, snapshotId: snapshot.id, reviewVersion };
-    const notes = this.store.getReviewNotes(identity).map(note => ({ ...note, outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) }));
+    const notes = this.store.getReviewNotes(identity).map(note => ({ ...note, answerOutdated: note.snapshotId!==snapshot.id || note.revision!==plan.revision, outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) }));
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
     const items = plan.items.map(item => {
       const owned = segments.filter(segment => segment.row === item.id);
@@ -78,6 +78,7 @@ export class ReviewService {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');
     const command = input as Record<string, unknown>;
     const view = this.load();
+    let createdNoteId: string | undefined;
     if (command.token !== view.token) throw new Error('Stale review state. Reload before writing.');
     const { identity } = this.config;
     if (command.action === 'approve' && typeof command.item === 'string') {
@@ -106,8 +107,8 @@ export class ReviewService {
         if (text.length > 16000) throw new Error('Selected snippet exceeds 16000 characters.');
         reference = { key: segment.key, path: segment.operation === '-' ? segment.oldPath ?? segment.path : segment.path, side: segment.operation === '+' ? 'new' : 'old', start, end, text, head: view.snapshot.head, base: view.snapshot.base };
       }
-      this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text, reference);
+      createdNoteId = this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text, reference).id;
     } else throw new Error('Unknown review command.');
-    return this.load();
+    return { ...this.load(), createdNoteId };
   }
 }

@@ -203,33 +203,13 @@ function render() {
         );
     }),
   );
-  $("notes").innerHTML = item
-    ? data.notes
-        .filter((note) => note.item === selected)
-        .map(
-          (note) =>
-            `<div class="note"><strong>You · ${note.kind === "change" ? "Change requested" : "Question"}</strong><p>${esc(note.text)}</p>${note.reference ? `<button class="note-reference" data-note="${esc(note.id)}">${esc(note.reference.path)} · ${note.reference.side === "new" ? "Added" : "Removed"} L${note.reference.start}–${note.reference.end}${note.outdated ? " · ! Outdated" : ""}</button><pre class="snippet-preview">${esc(note.reference.text)}</pre>` : ""}<small>r${note.revision} · ${esc(new Date(note.createdAt).toLocaleString())}${note.kind === "change" ? " · Pending" : " · Awaiting discussion"}</small></div>`,
-        )
-        .join("") ||
-      '<p class="muted">No conversation yet. Keep questions and requested changes beside the evidence.</p>'
-    : '<p class="muted">Select a plan item to add a question or request a change.</p>';
+  renderNotes();
   $("message").disabled = !item;
   $("save-note").disabled = !item;
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
   renderCode();
   renderAttachment();
-  document.querySelectorAll("[data-note]").forEach(button => button.onclick = () => {
-    const note = data.notes.find(note => note.id === button.dataset.note);
-    const ref = note.reference;
-    if (note.outdated) {
-      showDialog(`<h2>! Outdated code reference</h2><p>${esc(ref.path)} · ${ref.side} L${ref.start}–${ref.end}</p><p>Reviewed commit ${esc(ref.head)} · base ${esc(ref.base)}</p><pre>${esc(ref.text)}</pre>`);
-      return;
-    }
-    select(note.item);
-    const segment = data.segments.find(s => s.key === ref.key);
-    chooseSnippet(segment, ref.start, ref.end);
-    document.querySelector(`[data-segment="${ref.key}"]`)?.scrollIntoView({block:"center"});
-  });
+
 }
 function renderCode() {
   const item = data.items.find((item) => item.id === selected),
@@ -343,7 +323,7 @@ function setMode(value) {
   $("composer-label").textContent =
     mode === "change" ? "Change to request" : "Question about this item";
   $("save-note").textContent =
-    mode === "change" ? "Save change request" : "Save question";
+    mode === "change" ? "Save change request" : "Ask agent";
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
   renderAttachment();
 }
@@ -387,7 +367,7 @@ $("composer").onsubmit = async (event) => {
     $("saved").textContent =
       kind === "change"
         ? "Saved for the next revision."
-        : "Question saved. No agent has been invoked.";
+        : "Question saved. See agent status in Conversation.";
   }
 };
 $("conversation-toggle").onclick = () => {
@@ -463,7 +443,6 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "?") $("help").click();
 });
-await refresh();
 
 function chooseSnippet(segment, start, end, anchor = start) {
   if (!data.items.some(item => item.id === selected)) {
@@ -533,3 +512,61 @@ function captureHighlightedLines() {
 }
 $("code").addEventListener("mouseup",captureHighlightedLines);
 $("code").addEventListener("keyup",captureHighlightedLines);
+
+function answerMarkup(note) {
+  if(note.kind!=="question") return "";
+  const answer=note.answer;
+  if(answer?.status==="complete") return `<section class="agent-answer"><strong>${answer.provider === "claude" ? "Claude Code" : answer.provider === "codex" ? "Codex" : "Agent"}</strong><p>${esc(answer.text)}</p>${note.answerOutdated ? '<small>! Answer refers to an earlier review snapshot.</small>' : ""}</section>`;
+  if(answer?.status==="pending" && answer.expiresAt>Date.now()) return '<p role="status">Agent · Answering…</p>';
+  const error=answer?.status==="failed"?answer.error:answer?.status==="pending"?"Agent was interrupted or timed out.":"Answer not started. Choose an agent in Settings or retry when capacity is available.";
+  return `<p class="warn">! ${esc(error)}</p><button data-retry-question="${esc(note.id)}">Retry answer</button>`;
+}
+function renderNotes() {
+  const item=data.items.find(item=>item.id===selected);
+  $("notes").innerHTML = item
+    ? data.notes
+        .filter((note) => note.item === selected)
+        .map(
+          (note) =>
+            `<div class="note"><strong>You · ${note.kind === "change" ? "Change requested" : "Question"}</strong><p>${esc(note.text)}</p>${note.reference ? `<button class="note-reference" data-note="${esc(note.id)}">${esc(note.reference.path)} · ${note.reference.side === "new" ? "Added" : "Removed"} L${note.reference.start}–${note.reference.end}${note.outdated ? " · ! Outdated" : ""}</button><pre class="snippet-preview">${esc(note.reference.text)}</pre>` : ""}<small>r${note.revision} · ${esc(new Date(note.createdAt).toLocaleString())}${note.kind === "change" ? " · Pending" : ""}</small>${answerMarkup(note)}</div>`,
+        )
+        .join("") ||
+      '<p class="muted">No conversation yet. Keep questions and requested changes beside the evidence.</p>'
+    : '<p class="muted">Select a plan item to add a question or request a change.</p>';
+  document.querySelectorAll("[data-note]").forEach(button => button.onclick = () => {
+    const note = data.notes.find(note => note.id === button.dataset.note);
+    const ref = note.reference;
+    if (note.outdated) {
+      showDialog(`<h2>! Outdated code reference</h2><p>${esc(ref.path)} · ${ref.side} L${ref.start}–${ref.end}</p><p>Reviewed commit ${esc(ref.head)} · base ${esc(ref.base)}</p><pre>${esc(ref.text)}</pre>`);
+      return;
+    }
+    select(note.item);
+    const segment = data.segments.find(s => s.key === ref.key);
+    chooseSnippet(segment, ref.start, ref.end);
+    document.querySelector(`[data-segment="${ref.key}"]`)?.scrollIntoView({block:"center"});
+  });
+  document.querySelectorAll("[data-retry-question]").forEach(button=>button.onclick=()=>act({action:"retry-question",id:button.dataset.retryQuestion}));
+}
+let pollingQuestions=false;
+setInterval(async()=>{
+  if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending")) return;
+  if(data.notes.every(n=>n.answer?.status!=="pending" || n.answer.expiresAt<=Date.now())) {
+    data.notes=data.notes.map(n=>n.answer?.status==="pending"?{...n,answer:{...n.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."}}:n);
+    renderNotes();return;
+  }
+  pollingQuestions=true;
+  try {const response=await api("/api/questions");if(data){data.notes=response.notes;renderNotes();}}
+  catch { $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
+  finally {pollingQuestions=false;}
+},2000);
+$("settings").onclick=async()=>{
+  showDialog('<h2>Settings</h2><p>Loading…</p>');
+  try {
+    const settings=await api("/api/settings");
+    $("dialog-body").innerHTML=`<h2>Settings</h2><label for="question-provider">Question agent</label><select id="question-provider"><option value="">Not configured</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><p>Ask sends the question, selected code, plan item, and conversation to this provider using your local CLI login. Answers cannot edit source files. This choice is saved for this review database.</p><button id="save-settings">Save settings</button><p id="settings-status" role="status"></p>`;
+    $("question-provider").value=settings.questionProvider||"";
+    $("save-settings").onclick=async()=>{try{await api("/api/settings",{questionProvider:$("question-provider").value||null});$("settings-status").textContent="Settings saved.";}catch(error){$("settings-status").textContent=error.message;}};
+  } catch(error){$("dialog-body").textContent=error.message;}
+};
+
+await refresh();

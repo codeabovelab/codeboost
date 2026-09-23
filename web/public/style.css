@@ -677,3 +677,6 @@ dialog::backdrop {
 #attachment small { display: block; color: var(--muted); }
 .snippet-preview { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow: auto; font: 12px/1.5 "IBM Plex Mono", monospace; }
 .note-reference { max-width: 100%; height: auto; text-align: left; overflow-wrap: anywhere; }
+.agent-answer { margin-top: 12px; padding-top: 8px; border-top: 1px solid var(--line); }
+.agent-answer p { white-space: pre-wrap; overflow-wrap: anywhere; }
+#question-provider { display: block; width: 100%; margin: 8px 0; }

@@ -41,7 +41,7 @@ test('requires private credentials and rejects foreign origins',async({request})
   expect((await request.get(base+'api/review',{headers:{'x-codeboost-token':app.token}})).status()).toBe(200);
 });
 test('shows an honest history error and keeps markup in notes as text',async({page})=>{
- await page.goto(app.url);await page.getByLabel('Question about this item').fill('<img src=x onerror=alert(1)>');await page.getByRole('button',{name:'Save question'}).click();await expect(page.getByText('<img src=x onerror=alert(1)>',{exact:true})).toBeVisible();await expect(page.locator('#notes img')).toHaveCount(0);
+ await page.goto(app.url);await page.getByLabel('Question about this item').fill('<img src=x onerror=alert(1)>');await page.getByRole('button',{name:'Ask agent'}).click();await expect(page.getByText('<img src=x onerror=alert(1)>',{exact:true})).toBeVisible();await expect(page.locator('#notes img')).toHaveCount(0);
  const repository=app.service.config.repository;execFileSync('git',['checkout','--orphan','unrelated'],{cwd:repository,stdio:'pipe'});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Unrelated history'],{cwd:repository,stdio:'pipe'});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('Could not read this branch’s history.',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Approve P1',exact:true})).not.toBeVisible();
 });
@@ -82,7 +82,7 @@ test('attaches clicked lines to a question, persists and navigates the reference
  const line=page.locator('.added [data-line]').first();await line.click();
  await page.getByRole('button',{name:'Ask about selection',exact:true}).click();
  await expect(page.locator('#attachment')).toContainText('retry.ts');
- await page.getByLabel('Question about this item').fill('Why this exact line?');await page.getByRole('button',{name:'Save question',exact:true}).click();
+ await page.getByLabel('Question about this item').fill('Why this exact line?');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
  await page.reload();await page.locator('.note-reference').click();await expect(page.locator('.selected-line').first()).toBeVisible();
  execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','another revision'],{cwd:app.service.config.repository,stdio:'pipe'});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.locator('.note-reference')).toContainText('Outdated');await page.locator('.note-reference').click();await expect(page.getByRole('heading',{name:'! Outdated code reference'})).toBeVisible();await expect(page.locator('#dialog-body pre')).toContainText('Math.min');
@@ -105,4 +105,32 @@ test('supports shift ranges, highlighted lines, and independent snippet drafts',
  await page.getByRole('button',{name:'Remove snippet',exact:true}).click();await expect(page.locator('#attachment')).toBeHidden();
  await page.getByRole('button',{name:'Request change',exact:true}).click();await expect(page.locator('#attachment pre')).toContainText('export const delay');
  await page.getByRole('button',{name:'Save change request',exact:true}).click();await expect(page.locator('.note-reference')).toContainText('L1–3');
+});
+test('configures the question agent in Settings and displays persisted asynchronous answers',async({page})=>{
+ const config=app.service.config;await app.close();let providerAtCall:string|null=null;
+ app=await startServer(config,0,async prompt=>{providerAtCall=app.service.store.questionProvider();expect(prompt).toContain('Why this cap?');await new Promise(resolve=>setTimeout(resolve,300));return 'The cap prevents unbounded retry delays.';});
+ await page.goto(app.url);await page.getByRole('button',{name:'Settings',exact:true}).click();await page.getByLabel('Question agent',{exact:true}).selectOption('codex');await page.getByRole('button',{name:'Save settings',exact:true}).click();await expect(page.getByText('Settings saved.',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Close',exact:true}).click();
+ await page.getByLabel('Question about this item').fill('Why this cap?');await page.getByRole('button',{name:'Ask agent',exact:true}).click();await expect(page.getByText('Agent · Answering…',{exact:true})).toBeVisible();
+ await page.getByLabel('Question about this item').fill('My next draft');await expect(page.getByText('The cap prevents unbounded retry delays.',{exact:true})).toBeVisible({timeout:10000});await expect(page.getByLabel('Question about this item')).toHaveValue('My next draft');expect(providerAtCall).toBe('codex');
+ await page.reload();await expect(page.getByText('The cap prevents unbounded retry delays.',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Settings',exact:true}).click();await expect(page.getByLabel('Question agent',{exact:true})).toHaveValue('codex');
+});
+test('shows agent errors and retries the saved question',async({page})=>{
+ const config=app.service.config;await app.close();let attempts=0;app=await startServer(config,0,async()=>{if(++attempts===1)throw new Error('Test login failure');return 'Answer after retry';});
+ await page.goto(app.url);await page.getByLabel('Question about this item').fill('Explain this');await page.getByRole('button',{name:'Ask agent',exact:true}).click();await expect(page.getByText('! Test login failure',{exact:true})).toBeVisible();await page.getByRole('button',{name:'Retry answer',exact:true}).click();await expect(page.getByText('Answer after retry',{exact:true})).toBeVisible({timeout:10000});expect(app.service.store.getReviewNotes(config.identity)).toHaveLength(1);
+});
+test('shows interrupted questions as retryable without polling indefinitely',async({page})=>{
+ const service=app.service,view=service.load();const asked=service.act({action:'note',item:'P1',kind:'question',text:'Interrupted question',token:view.token});
+ const now=Date.now;Date.now=()=>now()-200000;
+ try {service.store.beginAnswer(service.config.identity,asked.createdNoteId!,'interrupted-attempt');} finally {Date.now=now;}
+ let polls=0;page.on('request',request=>{if(request.url().endsWith('/api/questions'))polls++;});
+ await page.clock.install();await page.goto(app.url);await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toBeVisible();await page.clock.fastForward(3000);await expect(page.getByText(/Agent was interrupted or timed out/)).toBeVisible();expect(polls).toBe(0);
+});
+test('opens Settings while the initial review is still loading',async({page})=>{
+ let release!:()=>void;const ready=new Promise<void>(resolve=>{release=resolve;});
+ await page.route('**/api/review',async route=>{await ready;await route.continue();});
+ try {
+  await page.goto(app.url);
+  await page.getByRole('button',{name:'Settings',exact:true}).click();
+  await expect(page.getByLabel('Question agent',{exact:true})).toBeVisible();
+ } finally {release();}
 });

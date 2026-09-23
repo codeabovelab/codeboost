@@ -2,7 +2,7 @@
 
 Review agent-made Git changes one plan item at a time. The approved plan lists each item's files and acceptance checks; the review engine shows which item produced each change and flags foreign or overlapping work.
 
-**Status:** the plan/linking library, SQLite store, and local read-only review screen are implemented. Run `npm run demo` and open its private local URL. There is no agent execution or merge command. The human go/no-go experiment is still pending; see [the local review guide](docs/implementation/read-only-review.md).
+**Status:** the plan/linking library, SQLite store, and local read-only review screen are implemented. Run `npm run demo` and open its private local URL. Ask can invoke Claude Code or Codex for read-only answers; choose the provider in Settings. Code-writing agents and merge commands are not implemented. The human go/no-go experiment is still pending; see [the local review guide](docs/implementation/read-only-review.md).
 
 ## Development
 
@@ -52,6 +52,6 @@ Inputs such as `planText` and the ledger must come from the trusted runner. `run
 - Ownership uses line diffs, not semantic inference. Within one replacement block, new lines inherit all affected owners conservatively. Function context comes from Git hunk headers, not an AST.
 - The importer requires accurate typed base entries, stable plan identity, a selected issue, and a trusted checkout path-identity function. It rejects path traversal, Git metadata paths, and traversal through a listed file/symlink/submodule. Runtime symlink and write-scope enforcement belong to the future container/runner; plan validation alone is not a sandbox.
 - Allowed commands restrict accidents, not hostile programs or changed scripts. Parsing returns argv and never executes it. An unlisted valid command is a warning and must not run until allowed.
-- No code here claims container isolation, vendor-only network access, credential protection, or safe dependency installation. Those controls must be implemented before running agents.
+- No code here claims container isolation, vendor-only network access, credential protection, or safe dependency installation. Those controls must be implemented before running code-writing agents. Question answering uses bounded supplied context in a separate temporary working directory, with command tools disabled.
 
 See [implementation decisions and evidence](docs/implementation/build-step-1.md) and the [plan format](docs/plan-format.md).

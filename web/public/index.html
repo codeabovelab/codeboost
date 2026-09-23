@@ -42,7 +42,7 @@
         <nav aria-label="Main navigation">
           <span>Issues</span><span>Plans</span><span>Queue</span
           ><a href="/" aria-current="page" id="review-link">Review</a
-          ><span>Lessons</span><span>Learning</span><span>Settings</span>
+          ><span>Lessons</span><span>Learning</span><button id="settings">Settings</button>
         </nav>
         <span class="muted">Local review</span>
       </header>
@@ -100,7 +100,7 @@
             ><button id="request" aria-pressed="false">Request change</button>
           </div>
           <p class="muted conversation-help" id="conversation-help">
-            Questions stay with this item. No agent is connected yet.
+            Ask gets an answer from the agent chosen in Settings. Change requests stay with this item.
           </p>
           <div id="notes"></div>
           <form id="composer">
@@ -114,7 +114,7 @@
               placeholder="What would you like to understand?"
               required
             ></textarea
-            ><button type="submit" id="save-note">Save question</button
+            ><button type="submit" id="save-note">Ask agent</button
             ><span id="saved" role="status"></span>
           </form>
         </aside>
