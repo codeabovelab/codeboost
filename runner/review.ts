@@ -1,7 +1,7 @@
 import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
-import { Store, type ReviewState } from './store.ts';
+import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
@@ -52,7 +52,8 @@ export class ReviewService {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
     }
     const expected: ReviewState = { revision: plan.revision, snapshotId: snapshot.id, reviewVersion };
-    const notes = this.store.getReviewNotes(identity);
+    const contextIds = new Map(plan.items.map(item => [item.id,createHash('sha256').update(JSON.stringify(segments.filter(segment=>segment.row===item.id).map(segment=>segment.key))).digest('hex')]));
+    const notes = this.store.getReviewNotes(identity).map(note => {const contextId=contextIds.get(note.item)!;return { ...note, contextId, answerOutdated: note.snapshotId!==snapshot.id || note.revision!==plan.revision || (!!note.answer?.contextId && note.answer.contextId!==contextId), outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) };});
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
     const items = plan.items.map(item => {
       const owned = segments.filter(segment => segment.row === item.id);
@@ -78,6 +79,7 @@ export class ReviewService {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');
     const command = input as Record<string, unknown>;
     const view = this.load();
+    let createdNoteId: string | undefined;
     if (command.token !== view.token) throw new Error('Stale review state. Reload before writing.');
     const { identity } = this.config;
     if (command.action === 'approve' && typeof command.item === 'string') {
@@ -92,8 +94,22 @@ export class ReviewService {
       const storedKey = choiceKeys(view.segments, identity)[view.segments.indexOf(segment)]!;
       this.store.saveReview(identity, view.expected, [], [{ key: storedKey, action: command.action, item }]);
     } else if (command.action === 'note' && typeof command.item === 'string' && typeof command.text === 'string' && (command.kind === 'question' || command.kind === 'change')) {
-      this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text);
+      let reference: SnippetReference | undefined;
+      if (command.reference !== undefined) {
+        if (!command.reference || typeof command.reference !== 'object') throw new Error('Invalid snippet reference.');
+        const input = command.reference as Record<string, unknown>;
+        const segment = view.segments.find(s => s.key === input.key && s.row === command.item && s.kind !== 'file');
+        const start = input.start as number, end = input.end as number;
+        if (!segment || !Number.isSafeInteger(start) || !Number.isSafeInteger(end)) throw new Error('Invalid snippet reference.');
+        const first = segment.operation === '+' ? segment.newLine : segment.oldLine;
+        const lines = segment.content.split('\n'); if (lines.at(-1) === '') lines.pop();
+        if (first === null || start < first || end < start || end >= first + lines.length || end - start >= 200) throw new Error('Select up to 200 lines within one changed block.');
+        const text = lines.slice(start-first, end-first+1).join('\n');
+        if (text.length > 16000) throw new Error('Selected snippet exceeds 16000 characters.');
+        reference = { key: segment.key, path: segment.operation === '-' ? segment.oldPath ?? segment.path : segment.path, side: segment.operation === '+' ? 'new' : 'old', start, end, text, head: view.snapshot.head, base: view.snapshot.base };
+      }
+      createdNoteId = this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text, reference).id;
     } else throw new Error('Unknown review command.');
-    return this.load();
+    return { ...this.load(), createdNoteId };
   }
 }

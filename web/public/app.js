@@ -19,7 +19,10 @@ let data,
   mode = "question",
   since = false,
   busy = false;
+let reviewGeneration = 0;
 const drafts = new Map();
+const attachments = new Map();
+let snippetSelection = null;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -46,6 +49,9 @@ function rememberDraft() {
 }
 function showFailure(message) {
   data = null;
+  snippetSelection = null;
+  $("selection-actions").hidden = true;
+  $("attachment").hidden = true;
   $("banner").textContent = message;
   $("progress").textContent = "Review unavailable";
   $("item-title").textContent = "Review unavailable";
@@ -70,10 +76,13 @@ function showFailure(message) {
 async function refresh() {
   if (busy) return;
   busy = true;
+  reviewGeneration++;
+  renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
   try {
     rememberDraft();
     data = await api("/api/review");
+    snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
     since = data.items.find((item) => item.id === selected)?.state === "stale";
     render();
@@ -83,26 +92,34 @@ async function refresh() {
     );
   } finally {
     busy = false;
+    renderAttachment();
   }
 }
 async function act(command) {
   if (busy || !data) return false;
   busy = true;
+  reviewGeneration++;
+  renderAttachment();
   try {
     rememberDraft();
-    data = await api("/api/action", { ...command, token: data.token });
+    const updated = await api("/api/action", { ...command, token: data.token });
+    rememberDraft();
+    data = updated;
     render();
     return true;
   } catch (error) {
+    rememberDraft();
     showFailure(`${error.message} Refresh to review the latest state.`);
     return false;
   } finally {
     busy = false;
+    renderAttachment();
   }
 }
 function select(id) {
   rememberDraft();
   selected = id;
+  snippetSelection = null;
   change = 0;
   since = data.items.find((item) => item.id === id)?.state === "stale";
   render();
@@ -196,20 +213,13 @@ function render() {
         );
     }),
   );
-  $("notes").innerHTML = item
-    ? data.notes
-        .filter((note) => note.item === selected)
-        .map(
-          (note) =>
-            `<div class="note"><strong>You · ${note.kind === "change" ? "Change requested" : "Question"}</strong><p>${esc(note.text)}</p><small>r${note.revision} · ${esc(new Date(note.createdAt).toLocaleString())}${note.kind === "change" ? " · Pending" : " · Awaiting discussion"}</small></div>`,
-        )
-        .join("") ||
-      '<p class="muted">No conversation yet. Keep questions and requested changes beside the evidence.</p>'
-    : '<p class="muted">Select a plan item to add a question or request a change.</p>';
+  renderNotes();
   $("message").disabled = !item;
   $("save-note").disabled = !item;
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
   renderCode();
+  renderAttachment();
+
 }
 function renderCode() {
   const item = data.items.find((item) => item.id === selected),
@@ -263,7 +273,7 @@ function renderCode() {
           if (lines.at(-1) === "") lines.pop();
           const start =
             segment.operation === "+" ? segment.newLine : segment.oldLine;
-          content = `<div class="diff ${segment.operation === "+" ? "added" : "removed"}"><div class="provenance ${provenance === "Unplanned" ? "unplanned" : ""}">${esc(provenance)}</div><pre class="line-numbers">${lines.map((_, i) => (start === null ? "" : start + i)).join("\n")}</pre><div class="sign">${esc(segment.operation)}</div><pre>${esc(segment.content)}</pre></div>`;
+          content = `<div class="diff ${segment.operation === "+" ? "added" : "removed"}" data-segment="${segment.key}"><div class="provenance ${provenance === "Unplanned" ? "unplanned" : ""}">${esc(provenance)}</div><div class="line-numbers">${lines.map((_, i) => `<button type="button" class="line-number" data-line="${start + i}" aria-label="Select ${segment.operation === "+" ? "added" : "removed"} line ${start + i}">${start + i}</button>`).join("")}</div><div class="sign">${esc(segment.operation)}</div><pre class="code-lines">${lines.map((line,i) => `<span data-code-line="${start+i}">${esc(line) || "&#8203;"}</span>`).join("\n")}</pre></div>`;
         }
         const choices = ["Unplanned", "Ambiguous"].includes(segment.row)
           ? `<div class="choice-controls"><p>Assigning this change makes the selected item’s approval stale.</p><select aria-label="Assign change ${index + 1} to" data-target="${index}"><option value="">Assign to…</option>${data.items.map((p) => `<option value="${esc(p.id)}">${esc(p.id)} · ${esc(p.title)}</option>`).join("")}</select><button data-assign="${index}">Assign</button><button data-accept="${index}">Accept as is</button></div>`
@@ -274,6 +284,14 @@ function renderCode() {
       (data.segments.length
         ? '<div class="empty"><h2>No changes in this row</h2><p>There are no current segments here. An item with no changes requires explicit confirmation before approval.</p></div>'
         : '<div class="empty"><h2>No code changes yet</h2><p>This branch has no changes against the selected base. Open task shows the compared commits.</p></div>'));
+  paintSelection();
+  document.querySelectorAll("[data-line]").forEach(button => button.onclick = event => {
+    const key = button.closest("[data-segment]").dataset.segment;
+    const segment = data.segments.find(s => s.key === key);
+    const line = Number(button.dataset.line);
+    const anchor = event.shiftKey && snippetSelection?.key === key ? snippetSelection.anchor : line;
+    chooseSnippet(segment, Math.min(anchor,line), Math.max(anchor,line), anchor);
+  });
   document.querySelectorAll("[data-assign]").forEach((button) =>
     button.addEventListener("click", () => {
       const index = Number(button.dataset.assign);
@@ -315,8 +333,9 @@ function setMode(value) {
   $("composer-label").textContent =
     mode === "change" ? "Change to request" : "Question about this item";
   $("save-note").textContent =
-    mode === "change" ? "Save change request" : "Save question";
+    mode === "change" ? "Save change request" : "Ask agent";
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
+  renderAttachment();
 }
 function showDialog(html) {
   $("dialog-body").innerHTML = html;
@@ -346,15 +365,30 @@ $("ask").onclick = () => setMode("question");
 $("request").onclick = () => setMode("change");
 $("composer").onsubmit = async (event) => {
   event.preventDefault();
+  if (busy || !data) return;
   const item = selected,
     kind = mode;
-  if (await act({ action: "note", item, kind, text: $("message").value })) {
-    drafts.delete(`${item}:${kind}`);
-    $("message").value = "";
+  const submittedText = $("message").value;
+  const attached = attachments.get(`${item}:${kind}`);
+  if (attached && (attached.head !== data.snapshot.head || attached.base !== data.snapshot.base)) return;
+  $("saved").textContent = kind === "change" ? "Saving change request…" : "Asking agent…";
+  if (await act({ action: "note", item, kind, text: submittedText, ...(attached ? {reference:{key:attached.key,start:attached.start,end:attached.end}} : {}) })) {
+    if (selected === item) $("notes").lastElementChild?.scrollIntoView({ block: "nearest" });
+    const unchanged = drafts.get(`${item}:${kind}`) === submittedText && attachments.get(`${item}:${kind}`) === attached;
+    if (unchanged) {
+      drafts.delete(`${item}:${kind}`);
+      attachments.delete(`${item}:${kind}`);
+    }
+    renderAttachment();
+    $("message").value = drafts.get(`${selected}:${mode}`) || "";
     $("saved").textContent =
       kind === "change"
         ? "Saved for the next revision."
-        : "Question saved. No agent has been invoked.";
+        : "Question submitted. Follow the agent’s response in Conversation.";
+  } else {
+    $("saved").textContent = kind === "change"
+      ? "Could not save. Your draft is preserved; refresh and try again."
+      : "Could not ask the agent. Your question is preserved; refresh and try again.";
   }
 };
 $("conversation-toggle").onclick = () => {
@@ -430,4 +464,199 @@ document.addEventListener("keydown", (event) => {
   }
   if (event.key === "?") $("help").click();
 });
+
+function chooseSnippet(segment, start, end, anchor = start) {
+  if (!data.items.some(item => item.id === selected)) {
+    $("saved").textContent = "Assign this change to a plan item before adding feedback.";
+    return;
+  }
+  const first = segment.operation === "+" ? segment.newLine : segment.oldLine;
+  const text = segment.content.split("\n").slice(start-first,end-first+1).join("\n");
+  if (end-start >= 200 || text.length > 16000) {
+    $("saved").textContent = "Select at most 200 lines and 16000 characters.";
+    return;
+  }
+  snippetSelection = {key:segment.key,start,end,anchor,text,path:segment.operation === "-" ? segment.oldPath || segment.path : segment.path,side:segment.operation === "+" ? "new" : "old",head:data.snapshot.head,base:data.snapshot.base};
+  paintSelection();
+}
+function referenceLabel(ref) {
+  return `${ref.path} · ${ref.side === "new" ? "Added" : "Removed"} L${ref.start}–${ref.end}`;
+}
+function paintSelection() {
+  const ref = snippetSelection;
+  $("selection-actions").hidden = !ref;
+  $("selection-label").textContent = ref ? referenceLabel(ref) : "";
+  document.querySelectorAll("[data-code-line], [data-line]").forEach(element => {
+    const line = Number(element.dataset.codeLine ?? element.dataset.line);
+    const active = !!ref && element.closest("[data-segment]").dataset.segment === ref.key && line >= ref.start && line <= ref.end;
+    element.classList.toggle("selected-line",active);
+    if (element.matches("button")) element.setAttribute("aria-pressed",String(active));
+  });
+  positionSelectionActions();
+}
+function positionSelectionActions() {
+  const toolbar = $("selection-actions");
+  if (!snippetSelection) { toolbar.hidden = true; return; }
+  const bounds = $("code").getBoundingClientRect();
+  const visible = [...document.querySelectorAll("[data-code-line].selected-line")]
+    .map(line => line.getBoundingClientRect())
+    .filter(rect => rect.bottom > bounds.top && rect.top < bounds.bottom);
+  if (!visible.length || bounds.width < 1) { toolbar.hidden = true; return; }
+  const anchor = visible[visible.length - 1];
+  toolbar.hidden = false;
+  const inset = Math.min(140, bounds.width / 3);
+  toolbar.style.width = `${Math.min(440, bounds.width - inset - 8)}px`;
+  const height = toolbar.getBoundingClientRect().height;
+  const below = anchor.bottom + 8;
+  const top = below + height <= bounds.bottom - 8 ? below : anchor.top - height - 8;
+  toolbar.style.left = `${bounds.left + inset}px`;
+  toolbar.style.top = `${Math.max(bounds.top + 8, Math.min(top, bounds.bottom - height - 8))}px`;
+}
+$("code").addEventListener("scroll", positionSelectionActions);
+window.addEventListener("resize", positionSelectionActions);
+new ResizeObserver(positionSelectionActions).observe($("code"));
+
+function renderAttachment() {
+  const ref = attachments.get(`${selected}:${mode}`);
+  $("attachment").hidden = !ref;
+  const stale = ref && (!data || ref.head !== data.snapshot.head || ref.base !== data.snapshot.base || !data.segments.some(s => s.key === ref.key && s.row === selected));
+  $("attachment").innerHTML = ref ? `<strong>${esc(referenceLabel(ref))}</strong><small>Commit ${esc(ref.head.slice(0,8))}${stale ? " · ! Outdated — remove and select again" : ""}</small><pre class="snippet-preview">${esc(ref.text)}</pre><button type="button" id="remove-reference">Remove snippet</button>` : "";
+  $("save-note").disabled = busy || !!stale || !data?.items.some(item=>item.id === selected);
+  if (ref) $("remove-reference").onclick = () => {attachments.delete(`${selected}:${mode}`);renderAttachment();};
+}
+function attachSelection(kind) {
+  if (!snippetSelection) return;
+  setMode(kind);
+  attachments.set(`${selected}:${mode}`, {...snippetSelection});
+  document.body.classList.add("conversation-open");
+  document.body.classList.remove("conversation-closed");
+  renderAttachment();
+  $("message").focus();
+}
+$("snippet-ask").onclick = () => attachSelection("question");
+$("snippet-request").onclick = () => attachSelection("change");
+$("selection-clear").onclick = () => {
+  window.getSelection()?.removeAllRanges();
+  snippetSelection = null;
+  paintSelection();
+};
+function captureHighlightedLines() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+  const range = selection.getRangeAt(0);
+  const element = node => node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  const first = element(range.startContainer)?.closest("[data-code-line]");
+  const last = element(range.endContainer)?.closest("[data-code-line]");
+  if (!first || !last) return;
+  const block = first.closest("[data-segment]");
+  if (block !== last.closest("[data-segment]")) {
+    snippetSelection=null;paintSelection();
+    $("saved").textContent="Select lines within one changed block and diff side.";
+    return;
+  }
+  let end=Number(last.dataset.codeLine);
+  if (range.endOffset===0 && last!==first) end--;
+  chooseSnippet(data.segments.find(s=>s.key===block.dataset.segment),Number(first.dataset.codeLine),end);
+}
+$("code").addEventListener("mouseup",captureHighlightedLines);
+$("code").addEventListener("keyup",captureHighlightedLines);
+
+function answerMarkup(note) {
+  if(note.kind!=="question") return "";
+  const answer=note.answer;
+  if(answer?.status==="complete") return `<section class="agent-answer"><strong>${answer.provider === "claude" ? "Claude Code" : answer.provider === "codex" ? "Codex" : "Agent"}</strong><p>${esc(answer.text)}</p>${note.answerOutdated || note.outdated ? '<small>! Answer refers to earlier code or review context.</small>' : ""}</section>`;
+  if(note.answerOutdated || note.outdated) return '<p class="warn">This question refers to an earlier review. Ask again against the current code.</p>';
+  if(answer?.status==="pending" && answer.expiresAt>Date.now()) return '<p role="status">Agent · Answering…</p>';
+  if(note.answerActive) return '<p role="status">Agent · Finishing cancellation…</p>';
+  const error=answer?.status==="failed"?answer.error:answer?.status==="pending"?"Agent was interrupted or timed out.":"Answer not started. Choose an agent in Settings or retry when capacity is available.";
+  return `<p class="warn">! ${esc(error)}</p><button data-retry-question="${esc(note.id)}">Retry answer</button>`;
+}
+function renderNotes({ follow = false } = {}) {
+  const notes = $("notes");
+  const scrollTop = notes.scrollTop;
+  const atBottom = notes.scrollHeight - notes.clientHeight - scrollTop <= 32;
+  const item=data.items.find(item=>item.id===selected);
+  $("notes").innerHTML = item
+    ? data.notes
+        .filter((note) => note.item === selected)
+        .map(
+          (note) =>
+            `<div class="note"><strong>You · ${note.kind === "change" ? "Change requested" : "Question"}</strong><p>${esc(note.text)}</p>${note.reference ? `<button class="note-reference" data-note="${esc(note.id)}">${esc(note.reference.path)} · ${note.reference.side === "new" ? "Added" : "Removed"} L${note.reference.start}–${note.reference.end}${note.outdated ? " · ! Outdated" : ""}</button><pre class="snippet-preview">${esc(note.reference.text)}</pre>` : ""}<small>r${note.revision} · ${esc(new Date(note.createdAt).toLocaleString())}${note.kind === "change" ? " · Pending" : ""}</small>${answerMarkup(note)}</div>`,
+        )
+        .join("") ||
+      '<p class="muted">No conversation yet. Keep questions and requested changes beside the evidence.</p>'
+    : '<p class="muted">Select a plan item to add a question or request a change.</p>';
+  if (follow) notes.scrollTop = atBottom ? notes.scrollHeight : scrollTop;
+  document.querySelectorAll("[data-note]").forEach(button => button.onclick = () => {
+    const note = data.notes.find(note => note.id === button.dataset.note);
+    const ref = note.reference;
+    if (note.outdated) {
+      showDialog(`<h2>! Outdated code reference</h2><p>${esc(ref.path)} · ${ref.side} L${ref.start}–${ref.end}</p><p>Reviewed commit ${esc(ref.head)} · base ${esc(ref.base)}</p><pre>${esc(ref.text)}</pre>`);
+      return;
+    }
+    select(note.item);
+    const segment = data.segments.find(s => s.key === ref.key);
+    chooseSnippet(segment, ref.start, ref.end);
+    document.querySelector(`[data-segment="${ref.key}"]`)?.scrollIntoView({block:"center"});
+  });
+  document.querySelectorAll("[data-retry-question]").forEach(button=>button.onclick=()=>act({action:"retry-question",id:button.dataset.retryQuestion}));
+}
+let pollingQuestions=false;
+setInterval(async()=>{
+  if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending" || n.answerActive)) return;
+  pollingQuestions=true;
+  const generation = reviewGeneration;
+  try {const response=await api("/api/questions");if(data && generation === reviewGeneration){data.notes=response.notes.map(note=>note.answer?.status==="pending" && note.answer.expiresAt<=Date.now() && !note.answerActive ? {...note,answer:{...note.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."}} : note);renderNotes({ follow: true });}}
+  catch { if (generation === reviewGeneration) $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
+  finally {pollingQuestions=false;}
+},2000);
+$("settings").onclick=async()=>{
+  showDialog('<h2>Settings</h2><p>Loading…</p>');
+  try {
+    const settings=await api("/api/settings");
+    $("dialog-body").innerHTML=`<h2>Settings</h2><label for="question-provider">Question agent</label><select id="question-provider"><option value="">Not configured</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><p>Ask sends the question, selected code, plan item, and conversation to this provider using your local CLI login. Answers cannot edit source files. This choice is saved for this review database.</p><button id="save-settings">Save settings</button><p id="settings-status" role="status"></p>`;
+    $("question-provider").value=settings.questionProvider||"";
+    $("save-settings").onclick=async()=>{try{await api("/api/settings",{questionProvider:$("question-provider").value||null});$("settings-status").textContent="Settings saved.";}catch(error){$("settings-status").textContent=error.message;}};
+  } catch(error){$("dialog-body").textContent=error.message;}
+};
+
+const conversationResize = $("conversation-resize");
+const conversationPane = $("conversation-pane");
+function resizeConversation(width) {
+  const bounded = Math.round(Math.max(280, Math.min(480, width)));
+  conversationPane.style.width = `${bounded}px`;
+  conversationResize.setAttribute("aria-valuenow", String(bounded));
+}
+let conversationDrag;
+conversationResize.onpointerdown = event => {
+  if (event.button !== 0) return;
+  event.preventDefault();
+  conversationDrag = { x: event.clientX, width: conversationPane.getBoundingClientRect().width };
+  conversationResize.setPointerCapture(event.pointerId);
+  conversationResize.focus();
+  document.body.classList.add("resizing-conversation");
+};
+conversationResize.onpointermove = event => {
+  if (conversationDrag) resizeConversation(conversationDrag.width + conversationDrag.x - event.clientX);
+};
+function endConversationResize() {
+  conversationDrag = null;
+  document.body.classList.remove("resizing-conversation");
+}
+conversationResize.onpointerup = event => {
+  if (conversationResize.hasPointerCapture(event.pointerId)) conversationResize.releasePointerCapture(event.pointerId);
+  endConversationResize();
+};
+conversationResize.onpointercancel = endConversationResize;
+conversationResize.onlostpointercapture = endConversationResize;
+conversationResize.onkeydown = event => {
+  if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+  event.preventDefault();
+  resizeConversation(event.key === "Home" ? 280 : event.key === "End" ? 480 : conversationPane.getBoundingClientRect().width + (event.key === "ArrowLeft" ? 20 : -20));
+};
+new ResizeObserver(() => {
+  const width = conversationPane.getBoundingClientRect().width;
+  if (width) conversationResize.setAttribute("aria-valuenow", String(Math.round(width)));
+}).observe(conversationPane);
+
 await refresh();

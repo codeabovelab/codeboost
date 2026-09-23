@@ -42,3 +42,19 @@ it('refuses no-change confirmation while the item still owns ambiguous changes',
  expect(view.items[1]!.count).toBeGreaterThan(0);
  expect(()=>service.act({action:'approve',item:'P2',token:view.token})).toThrow(/ambiguous/i);
 });
+it('anchors notes to server-owned code and rejects invalid ranges and cross-item references',()=>{
+ const {service,config}=fixture();let view=service.load();const segment=view.segments.find(s=>s.row==='P1'&&s.kind!=='file'&&s.operation==='+')!;
+ const start=segment.newLine!;
+ expect(()=>service.act({action:'note',item:'P2',kind:'question',text:'Why?',reference:{key:segment.key,start,end:start},token:view.token})).toThrow(/Invalid snippet/);
+ expect(()=>service.act({action:'note',item:'P1',kind:'question',text:'Why?',reference:{key:segment.key,start:0,end:start},token:view.token})).toThrow(/changed block/);
+ view=service.act({action:'note',item:'P1',kind:'question',text:'Why?',reference:{key:segment.key,start,end:start,text:'forged',path:'forged'},token:view.token});
+ const ref=view.notes[0]!.reference!;expect(ref.text).toBe(segment.content.split('\n')[0]);expect(ref.path).toBe(segment.path);expect(ref.head).toBe(view.snapshot.head);expect(view.notes[0]!.outdated).toBe(false);
+ const reopened=new ReviewService(config);services.push(reopened);expect(reopened.load().notes[0]!.reference).toEqual(ref);
+});
+it('preserves removed-side snippets and marks their references outdated after HEAD changes',async()=>{
+ const {service,config}=fixture();let view=service.load();const segment=view.segments.find(s=>s.row==='P1'&&s.kind!=='file'&&s.operation==='-')!;
+ view=service.act({action:'note',item:'P1',kind:'change',text:'Keep this?',reference:{key:segment.key,start:segment.oldLine,end:segment.oldLine},token:view.token});
+ const ref=view.notes[0]!.reference!;expect(ref.side).toBe('old');
+ const {execFileSync}=await import('node:child_process');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','new revision'],{cwd:config.repository,stdio:'pipe'});
+ view=service.load();expect(view.notes[0]!.outdated).toBe(true);expect(view.notes[0]!.reference).toEqual(ref);
+});

@@ -12,7 +12,9 @@ export function requireSupportedNode(version = process.versions.node): void {
 }
 export interface Snapshot { id: string; base: string; head: string }
 export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
-export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; createdAt: string; revision: number; snapshotId: string }
+export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
+export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
+export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
 export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
 export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
@@ -38,8 +40,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version;
-        if (version !== 0 && version !== 1 && version !== 2) throw new Error('Unsupported store schema version.');
-        if (version === 2) return;
+        if (version !== 0 && version !== 1 && version !== 2 && version !== 3) throw new Error('Unsupported store schema version.');
+        if (version === 3) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -53,11 +55,20 @@ export class Store {
           CREATE TABLE continuations (key TEXT NOT NULL REFERENCES plans(key), checkpoint_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,checkpoint_id,revision));
           PRAGMA user_version=1;
         `);
-        this.#db.exec(`ALTER TABLE plans ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0;
+        if (version !== 2) this.#db.exec(`ALTER TABLE plans ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0;
           CREATE TABLE review_notes (key TEXT NOT NULL REFERENCES plans(key), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,id));
           PRAGMA user_version=2;`);
+        this.#db.exec("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=3;");
       });
     } catch (error) { this.#db.close(); throw error; }
+  }
+  questionProvider(): 'claude' | 'codex' | null {
+    const value=this.#get("SELECT value FROM app_settings WHERE key='question_provider'")?.value;
+    return value==='claude'||value==='codex'?value:null;
+  }
+  setQuestionProvider(value: unknown): void {
+    if(value!==null&&value!=='claude'&&value!=='codex') throw new Error('Choose Claude Code or Codex.');
+    this.#run("INSERT INTO app_settings VALUES ('question_provider',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",value??'');
   }
   close(): void { this.#db.close(); }
   #get(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).get(...args); }
@@ -246,15 +257,38 @@ export class Store {
     });
   }
   reviewVersion(identity: PlanIdentity): number { return this.#current(identityKey(identity)).review_version as number; }
-  addReviewNote(identity: PlanIdentity, expected: ReviewState, item: string, kind: ReviewNote['kind'], text: string): ReviewNote {
+  addReviewNote(identity: PlanIdentity, expected: ReviewState, item: string, kind: ReviewNote['kind'], text: string, reference?: SnippetReference): ReviewNote {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
       if (!this.getPlan(identity).items.some(entry => entry.id === item) || !['question', 'change'].includes(kind) || typeof text !== 'string' || !text.trim() || text.length > 4000) throw new Error('Invalid review note.');
-      const note = { id: randomUUID(), item, kind, text: text.trim(), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
+      const note = { id: randomUUID(), item, kind, text: text.trim(), ...(reference ? { reference } : {}), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
       this.#run('INSERT INTO review_notes VALUES (?,?,?)', key, note.id, encode(note));
       this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
       return note;
+    });
+  }
+  beginAnswer(identity: PlanIdentity, id: string, attempt: string, provider?: 'claude' | 'codex', contextId?: string): void {
+    const key=identityKey(identity);
+    this.#transaction(()=>{
+      const row=this.#get('SELECT data FROM review_notes WHERE key=? AND id=?',key,id);
+      if(!row) throw new Error('Question not found.');
+      const note=decode<ReviewNote>(row.data);
+      if(note.kind!=='question' || note.answer?.status==='complete') throw new Error('Question already answered.');
+      if(note.answer?.status==='pending' && note.answer.expiresAt>Date.now()) throw new Error('Agent is already answering this question.');
+      note.answer={attempt,status:'pending',expiresAt:Date.now()+125000,...(provider?{provider}:{}),...(contextId?{contextId}:{})};
+      this.#run('UPDATE review_notes SET data=? WHERE key=? AND id=?',encode(note),key,id);
+    });
+  }
+  finishAnswer(identity: PlanIdentity, id: string, attempt: string, result: {status:'complete'|'failed';text?:string;error?:string}): void {
+    const key=identityKey(identity);
+    this.#transaction(()=>{
+      const row=this.#get('SELECT data FROM review_notes WHERE key=? AND id=?',key,id);
+      if(!row) return;
+      const note=decode<ReviewNote>(row.data);
+      if(note.answer?.attempt!==attempt || note.answer.status!=='pending') return;
+      note.answer={...note.answer,...result};
+      this.#run('UPDATE review_notes SET data=? WHERE key=? AND id=?',encode(note),key,id);
     });
   }
   getReviewNotes(identity: PlanIdentity): ReviewNote[] {

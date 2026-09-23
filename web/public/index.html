@@ -42,7 +42,7 @@
         <nav aria-label="Main navigation">
           <span>Issues</span><span>Plans</span><span>Queue</span
           ><a href="/" aria-current="page" id="review-link">Review</a
-          ><span>Lessons</span><span>Learning</span><span>Settings</span>
+          ><span>Lessons</span><span>Learning</span><button id="settings">Settings</button>
         </nav>
         <span class="muted">Local review</span>
       </header>
@@ -81,10 +81,12 @@
             ><button id="previous" aria-label="Previous change">←</button
             ><button id="next" aria-label="Next change">→</button>
           </div>
+          <div id="selection-actions" hidden role="group" aria-label="Selected code"><span id="selection-label"></span><button id="snippet-ask">Ask about selection</button><button id="snippet-request">Request change to selection</button><button id="selection-clear">Clear selection</button></div>
           <div id="code" tabindex="0"></div>
           <div id="checks" class="check-strip"></div>
         </section>
-        <aside class="conversation-pane" aria-label="Conversation">
+        <div id="conversation-resize" role="separator" tabindex="0" aria-label="Resize conversation" aria-orientation="vertical" aria-controls="conversation-pane" aria-valuemin="280" aria-valuemax="480" aria-valuenow="344"></div>
+        <aside id="conversation-pane" class="conversation-pane" aria-label="Conversation">
           <div class="pane-heading">
             CONVERSATION
             <button
@@ -99,10 +101,11 @@
             ><button id="request" aria-pressed="false">Request change</button>
           </div>
           <p class="muted conversation-help" id="conversation-help">
-            Questions stay with this item. No agent is connected yet.
+            Ask gets an answer from the agent chosen in Settings. Change requests stay with this item.
           </p>
           <div id="notes"></div>
           <form id="composer">
+            <div id="attachment" hidden></div>
             <label for="message" id="composer-label"
               >Question about this item</label
             ><textarea
@@ -112,7 +115,7 @@
               placeholder="What would you like to understand?"
               required
             ></textarea
-            ><button type="submit" id="save-note">Save question</button
+            ><button type="submit" id="save-note">Ask agent</button
             ><span id="saved" role="status"></span>
           </form>
         </aside>
