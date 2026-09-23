@@ -1449,7 +1449,7 @@ Net: a ledger codeboost controls (A), or labels anyone can forge (B, C, D).
 Header: Commit ledger
 Options:
 A) Apply this change (recommended)
-Record every commit sha codeboost creates, and the old-to-new sha mapping for each rebase it runs. Only ledger commits count as a plan item's work; any other commit is foreign, whatever its message says. The R3 plant script also records its amended commits in the ledger, so the go/no-go test still measures the hard case. ✅ Plan-item labels can no longer be forged. ✅ Cheap, since codeboost already makes every commit. ❌ Commits rewritten outside codeboost lose their attribution. (human: ~4 hours / CC: ~20 min)
+Record every commit sha codeboost creates, and the old-to-new sha mapping for each rebase it runs. Only ledger entries with a non-null plan-item owner count as that item's work; explicitly unowned entries stay Unplanned; any other commit is foreign, whatever its message says. The R3 plant script also records its amended commits in the ledger, so the go/no-go test still measures the hard case. ✅ Plan-item labels can no longer be forged. ✅ Cheap, since codeboost already makes every commit. ❌ Commits rewritten outside codeboost lose their attribution. (human: ~4 hours / CC: ~20 min)
 B) Keep this row's current value
 Keep using the trailer as proof. ✅ No change. ✅ Survives any history rewriting. ❌ Anyone who can push can make code look planned. (human: 0 / CC: 0)
 C) Investigate before choosing
@@ -1459,7 +1459,7 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Th
 
 State: approved
 Actual answer: A) Apply this change (answer to D15, 2026-09-22)
-Accepted scope: `runner/store` keeps a ledger of every commit sha codeboost creates and old-to-new sha mappings for every rebase it runs. Only ledger commits count as a plan item's work; a commit not in the ledger is foreign regardless of its trailer (lines to Unplanned, conflicts per R5). Trailers remain as readable labels. The R3 plant script records its amended commits in the ledger. Test cases: forged trailer on a pushed commit lands in Unplanned; rebased ledger commits keep their attribution through the mapping. Design sections amended: How codeboost links code to plan items; A conflict on a commit codeboost did not make; How we will know it works (plant step).
+Accepted scope: `runner/store` keeps a ledger of every commit sha codeboost creates and old-to-new sha mappings for every rebase it runs. Only ledger entries with a non-null plan-item owner count as that item's work; explicitly unowned entries stay Unplanned; a commit not in the ledger is foreign regardless of its trailer (lines to Unplanned, conflicts per R5). Trailers remain as readable labels. The R3 plant script records its amended commits in the ledger. Test cases: forged trailer on a pushed commit lands in Unplanned; rebased ledger commits keep their attribution through the mapping. Design sections amended: How codeboost links code to plan items; A conflict on a commit codeboost did not make; How we will know it works (plant step).
 History: none
 
 ### O6: Giving the container a working git without exposing your main repo
@@ -1509,7 +1509,7 @@ Comparison grid:
 | Choice | Current | A | B | C | D |
 |---|---|---|---|---|---|
 | Binary, mode, empty-file, rename, symlink, submodule changes | not represented | each becomes a "file change" segment, owned through the commit ledger (O5) and placed by the same classification table | not represented | not represented, investigate | not represented, deferred |
-| Approval snapshot for a file change | none | old and new path, old and new mode, and old and new blob id | none | none | none |
+| Approval snapshot for a file change | none | old and new path, old and new mode, and old and new typed object ID (blob for files/links, commit for gitlinks) | none | none | none |
 | Review screen | nothing shown | a file-change card: "binary changed (size a → b)", "made executable", "renamed from x", and so on | nothing shown | nothing shown | nothing shown |
 | Merge gate | ignores them | treats them like any other segment | ignores them | ignores them | ignores them |
 
