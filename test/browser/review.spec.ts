@@ -151,3 +151,17 @@ test('acknowledges the first Ask agent click immediately and prevents duplicate 
  await expect(page.getByRole('button',{name:'Ask agent',exact:true})).toBeEnabled();
  expect(submissions).toBe(1);expect(calls).toBe(1);expect(app.service.store.getReviewNotes(config.identity)).toHaveLength(1);
 });
+for (const readingEarlier of [false,true]) test(`answer arrival ${readingEarlier ? 'preserves earlier reading position' : 'follows the conversation bottom'}`,async({page})=>{
+ const config=app.service.config;await app.close();let answer!:(text:string)=>void;
+ app=await startServer(config,0,()=>new Promise(resolve=>{answer=resolve;}));
+ for(let i=0;i<3;i++) app.service.act({action:'note',item:'P1',kind:'change',text:`Earlier message ${i}\n`+'Earlier context.\n'.repeat(20),token:app.service.load().token});
+ await page.goto(app.url);await page.getByLabel('Question about this item').fill('Explain the cap');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
+ await expect(page.getByText('Agent · Answering…',{exact:true})).toBeVisible();
+ const notes=page.locator('#notes');
+ await notes.evaluate((element,earlier)=>{element.scrollTop=earlier ? 80 : element.scrollHeight;},readingEarlier);
+ const before=await notes.evaluate(element=>element.scrollTop);
+ answer('Detailed answer.\n'.repeat(60)+'Answer end.');
+ await expect(page.locator('.agent-answer')).toHaveCount(1,{timeout:10000});
+ if(readingEarlier) expect(await notes.evaluate(element=>element.scrollTop)).toBeCloseTo(before,0);
+ else await expect.poll(()=>notes.evaluate(element=>element.scrollHeight-element.clientHeight-element.scrollTop)).toBeLessThan(2);
+});

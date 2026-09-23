@@ -530,7 +530,10 @@ function answerMarkup(note) {
   const error=answer?.status==="failed"?answer.error:answer?.status==="pending"?"Agent was interrupted or timed out.":"Answer not started. Choose an agent in Settings or retry when capacity is available.";
   return `<p class="warn">! ${esc(error)}</p><button data-retry-question="${esc(note.id)}">Retry answer</button>`;
 }
-function renderNotes() {
+function renderNotes({ follow = false } = {}) {
+  const notes = $("notes");
+  const scrollTop = notes.scrollTop;
+  const atBottom = notes.scrollHeight - notes.clientHeight - scrollTop <= 32;
   const item=data.items.find(item=>item.id===selected);
   $("notes").innerHTML = item
     ? data.notes
@@ -542,6 +545,7 @@ function renderNotes() {
         .join("") ||
       '<p class="muted">No conversation yet. Keep questions and requested changes beside the evidence.</p>'
     : '<p class="muted">Select a plan item to add a question or request a change.</p>';
+  if (follow) notes.scrollTop = atBottom ? notes.scrollHeight : scrollTop;
   document.querySelectorAll("[data-note]").forEach(button => button.onclick = () => {
     const note = data.notes.find(note => note.id === button.dataset.note);
     const ref = note.reference;
@@ -561,10 +565,10 @@ setInterval(async()=>{
   if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending")) return;
   if(data.notes.every(n=>n.answer?.status!=="pending" || n.answer.expiresAt<=Date.now())) {
     data.notes=data.notes.map(n=>n.answer?.status==="pending"?{...n,answer:{...n.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."}}:n);
-    renderNotes();return;
+    renderNotes({ follow: true });return;
   }
   pollingQuestions=true;
-  try {const response=await api("/api/questions");if(data){data.notes=response.notes;renderNotes();}}
+  try {const response=await api("/api/questions");if(data){data.notes=response.notes;renderNotes({ follow: true });}}
   catch { $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
   finally {pollingQuestions=false;}
 },2000);
