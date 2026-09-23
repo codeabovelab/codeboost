@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, writeFileSync, existsSync, rmSync, chmodSync, symlinkSync, renameSync } from 'node:fs';
+import { mkdtempSync, readdirSync, mkdirSync, writeFileSync, existsSync, rmSync, chmodSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -198,4 +198,13 @@ it('fails explicitly when cumulative unique blob bytes exceed the history budget
   const f = fixture(); f.write('a.txt', 'changed text\n'); f.commit('P1');
   expect(() => readHistory(f.dir, f.base, 'HEAD', { maxBlobBytes: 20 })).toThrow(/blob byte budget/i);
   expect(readHistory(f.dir, f.base, 'HEAD', { maxBlobBytes: 27 }).final).toHaveLength(1);
+});
+
+it.each(['root', 'loose', 'pack'])('rejects symlinked %s object storage', kind => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
+  const objects = join(f.dir, '.git/objects');
+  const storage = kind === 'root' ? objects : join(objects, kind === 'pack' ? 'pack' : readdirSync(objects).find(name => /^[0-9a-f]{2}$/.test(name))!);
+  const borrowed = join(f.dir, 'borrowed-objects');
+  renameSync(storage, borrowed); symlinkSync(borrowed, storage);
+  expect(() => readHistory(f.dir, f.base)).toThrow(/symlinked object storage/i);
 });

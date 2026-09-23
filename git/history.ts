@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync } from 'node:fs';
-import { resolve as resolvePath } from 'node:path';
+import { lstatSync, readdirSync } from 'node:fs';
+import { resolve as resolvePath, join } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
@@ -16,7 +16,21 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
       GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-  const alternates = resolvePath(repo, run('rev-parse', '--git-path', 'objects/info/alternates').toString().trim());
+  // Inspect storage without following links before any object-resolving command.
+  const objects = resolvePath(repo, run('rev-parse', '--git-path', 'objects').toString().trim());
+  const pending = [objects];
+  let inspected = 0;
+  while (pending.length) {
+    const path = pending.pop()!;
+    if (++inspected > 100_000) throw new Error('Object storage inspection exceeds 100000 entries.');
+    const stat = lstatSync(path);
+    if (stat.isSymbolicLink()) throw new Error('Review repositories must not use symlinked object storage.');
+    if (stat.isDirectory()) for (const entry of readdirSync(path)) {
+      if (pending.length + inspected >= 100_000) throw new Error('Object storage inspection exceeds 100000 entries.');
+      pending.push(join(path, entry));
+    }
+  }
+  const alternates = join(objects, 'info/alternates');
   if (lstatSync(alternates, { throwIfNoEntry: false })) throw new Error('Review repositories must not use object alternates.');
   const resolve = (ref: string) => run('rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`).toString().trim();
   const base = resolve(baseRef), head = resolve(headRef);
