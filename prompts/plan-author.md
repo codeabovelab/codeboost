@@ -23,7 +23,9 @@
   (Claude returns bounded stdout instead);
   reject missing, oversized, non-regular, or schema-invalid output. The startup
   probe exercises the schema input and vendor-specific output channel for both vendors.
-  The agent runs in its container with no project write access and no web access.
+  The agent runs in its container with no project write access; web-browsing
+  and MCP tools are disabled, while the pinned selected-vendor API remains
+  reachable through the approved egress proxy.
   Build issue_data_json with a JSON serializer from number, title, body, and
   comments; build previous_plan_json from the prior structured plan. Serialize
   approved lessons as lessons_data_json and revision feedback as feedback_data_json
