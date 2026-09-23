@@ -126,7 +126,7 @@ test('shows interrupted questions as retryable without polling indefinitely',asy
  const now=Date.now;Date.now=()=>now()-200000;
  try {service.store.beginAnswer(service.config.identity,asked.createdNoteId!,'interrupted-attempt');} finally {Date.now=now;}
  let polls=0;page.on('request',request=>{if(request.url().endsWith('/api/questions'))polls++;});
- await page.clock.install();await page.goto(app.url);await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toBeVisible();await page.clock.fastForward(3000);await expect(page.getByText(/Agent was interrupted or timed out/)).toBeVisible();expect(polls).toBe(0);
+ await page.clock.install();await page.goto(app.url);await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toBeVisible();await page.clock.fastForward(3000);await expect(page.getByText(/Agent was interrupted or timed out/)).toBeVisible();expect(polls).toBe(1);
 });
 test('opens Settings while the initial review is still loading',async({page})=>{
  let release!:()=>void;const ready=new Promise<void>(resolve=>{release=resolve;});
@@ -281,4 +281,16 @@ test('drains an in-flight question request before closing its agent manager',asy
   expect(calls).toBe(1);expect(note?.answer?.status).toBe('failed');expect(note?.answer?.error).toMatch(/Server stopped/);
   expect(JSON.parse(response).notes.some((candidate:{text:string})=>candidate.text==='Question during shutdown')).toBe(true);
  } finally {reopened.close();app=await startServer(config,0);}
+});
+test('hides Retry until a timed-out invocation has actually settled',async({page})=>{
+ const config=app.service.config;await app.close();let settle!:(answer:string)=>void;
+ app=await startServer(config,0,()=>new Promise(resolve=>settle=resolve));
+ await page.goto(app.url);await page.getByLabel('Question about this item').fill('Slow question');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
+ await expect(page.getByText('Agent · Answering…',{exact:true})).toBeVisible();
+ const note=app.service.store.getReviewNotes(config.identity).find(note=>note.text==='Slow question')!;
+ app.service.store.finishAnswer(config.identity,note.id,note.answer!.attempt,{status:'failed',error:'Agent timed out. Try again.'});
+ await expect(page.getByText('Agent · Finishing cancellation…',{exact:true})).toBeVisible({timeout:10000});
+ await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toHaveCount(0);
+ settle('Late answer');
+ await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toBeVisible({timeout:10000});
 });

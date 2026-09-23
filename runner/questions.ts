@@ -22,6 +22,7 @@ export class Questions {
   private service: ReviewService;
   private agent?: QuestionAgent;
   constructor(service: ReviewService, agent?: QuestionAgent) { this.service=service; this.agent=agent; }
+  isRunning(id: string) { return this.running.has(id); }
   start(id: string, view: ReturnType<ReviewService['load']>) {
     if (this.closing) throw new Error('Server is stopping. Reconnect before asking again.');
     if (this.running.has(id)) throw new Error('Agent is already answering this question.');

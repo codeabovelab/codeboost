@@ -567,6 +567,7 @@ function answerMarkup(note) {
   if(answer?.status==="complete") return `<section class="agent-answer"><strong>${answer.provider === "claude" ? "Claude Code" : answer.provider === "codex" ? "Codex" : "Agent"}</strong><p>${esc(answer.text)}</p>${note.answerOutdated || note.outdated ? '<small>! Answer refers to earlier code or review context.</small>' : ""}</section>`;
   if(note.answerOutdated || note.outdated) return '<p class="warn">This question refers to an earlier review. Ask again against the current code.</p>';
   if(answer?.status==="pending" && answer.expiresAt>Date.now()) return '<p role="status">Agent · Answering…</p>';
+  if(note.answerActive) return '<p role="status">Agent · Finishing cancellation…</p>';
   const error=answer?.status==="failed"?answer.error:answer?.status==="pending"?"Agent was interrupted or timed out.":"Answer not started. Choose an agent in Settings or retry when capacity is available.";
   return `<p class="warn">! ${esc(error)}</p><button data-retry-question="${esc(note.id)}">Retry answer</button>`;
 }
@@ -602,14 +603,10 @@ function renderNotes({ follow = false } = {}) {
 }
 let pollingQuestions=false;
 setInterval(async()=>{
-  if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending")) return;
-  if(data.notes.every(n=>n.answer?.status!=="pending" || n.answer.expiresAt<=Date.now())) {
-    data.notes=data.notes.map(n=>n.answer?.status==="pending"?{...n,answer:{...n.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."}}:n);
-    renderNotes({ follow: true });return;
-  }
+  if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending" || n.answerActive)) return;
   pollingQuestions=true;
   const generation = reviewGeneration;
-  try {const response=await api("/api/questions");if(data && generation === reviewGeneration){data.notes=response.notes;renderNotes({ follow: true });}}
+  try {const response=await api("/api/questions");if(data && generation === reviewGeneration){data.notes=response.notes.map(note=>note.answer?.status==="pending" && note.answer.expiresAt<=Date.now() && !note.answerActive ? {...note,answer:{...note.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."}} : note);renderNotes({ follow: true });}}
   catch { if (generation === reviewGeneration) $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
   finally {pollingQuestions=false;}
 },2000);

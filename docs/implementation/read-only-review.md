@@ -103,4 +103,6 @@ PR #11 round 8 returned no inline findings and identified one related summary ga
 
 PR #11 round 9 returned no inline findings and identified shutdown ordering in its summary. Server shutdown now stops accepting connections and drains in-flight HTTP requests before closing the question manager and database. A partial-body request regression proves a question already admitted during shutdown starts its agent and is persisted as interrupted rather than left unanswered.
 
-Current PR validation: 187 unit/integration tests, 31 browser tests, typecheck, and diff checks. Earlier counts above identify the stage when each behavior was added.
+Current PR validation: 187 unit/integration tests, 32 browser tests, typecheck, and diff checks. Earlier counts above identify the stage when each behavior was added.
+
+The documentation-only review after adding `AGENTS.md` exposed one more concrete lifecycle race: an expired persisted attempt could show Retry while its cancelled provider was still settling. Question polling now exposes whether the local invocation remains active, displays Finishing cancellation, and keeps polling without exposing Retry until settlement. A browser regression advances the persisted clock while leaving the invocation unresolved, then confirms Retry appears only after settlement.
