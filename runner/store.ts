@@ -162,7 +162,9 @@ export class Store {
     if ((entry.origin === 'foreign' && entry.owner !== null) || (entry.origin === 'owned' && !entry.owner) || !['foreign', 'owned'].includes(entry.origin)) throw new Error('Invalid ledger ownership.');
     const existing = this.#get('SELECT data FROM ledger WHERE key=? AND sha=?', key, entry.sha);
     if (existing) {
-      if (existing.data !== encode(entry)) throw new Error('Cannot overwrite immutable ledger ownership.');
+      const prior = decode<LedgerEntry>(existing.data);
+      if (prior.sha !== entry.sha || prior.owner !== entry.owner || prior.origin !== entry.origin || prior.sourceSha !== entry.sourceSha)
+        throw new Error('Cannot overwrite immutable ledger ownership.');
       return;
     }
     this.#run('INSERT INTO ledger VALUES (?,?,?)', key, entry.sha, encode(entry));
@@ -237,7 +239,7 @@ export class Store {
     return this.#transaction(() => {
       this.#expect(key, expected);
       const plan = this.getPlan(identity), ids = plan.items.map(item => item.id);
-      if (!ids.includes(evidence.item) || !evidence.completedItems.includes(evidence.item) || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i])) throw new Error('Checkpoint must describe the executed plan prefix.');
+      if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i])) throw new Error('Checkpoint must describe the executed plan prefix.');
       const checkpoint = { ...evidence, ...expected, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint)); return checkpoint;
     });

@@ -164,3 +164,15 @@ it('keeps identical commit SHAs and local item IDs isolated across plan identiti
   expect(store.ownership(other).has(oid(2))).toBe(false);
   expect(() => store.getSnapshot(other, store.getSnapshot(identity).id)).toThrow(/Unknown/);
 });
+it('accepts idempotent ledger retries regardless of object property order', () => {
+  const { store } = fixture();
+  store.recordHistory(identity, state(store), oid(1), oid(2), [{ sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null }]);
+  expect(() => store.recordHistory(identity, state(store), oid(1), oid(2), [{ sourceSha: null, origin: 'owned', owner: 'P1', sha: oid(2) }])).not.toThrow();
+  expect(store.getLedger(identity)).toHaveLength(1);
+});
+it('requires the checkpoint item to be the last item in the completed prefix', () => {
+  const { store } = fixture(); const next = plan(); next.items.push({ ...structuredClone(next.items[0]!), id: 'P2' });
+  store.importRevision(JSON.stringify(next), 'json', context, 1);
+  expect(() => store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries })).toThrow(/prefix/);
+  expect(store.recordCheckpoint(identity, state(store), { item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries }).item).toBe('P2');
+});
