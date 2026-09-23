@@ -2,3 +2,7 @@ node_modules/
 coverage/
 dist/
 .DS_Store
+
+.codeboost-local/
+playwright-report/
+test-results/

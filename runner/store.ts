@@ -11,7 +11,8 @@ export function requireSupportedNode(version = process.versions.node): void {
     throw new Error('codeboost requires Node 26.7.0 or later. Upgrade Node before opening the store.');
 }
 export interface Snapshot { id: string; base: string; head: string }
-export interface ReviewState { revision: number; snapshotId: string }
+export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
+export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; createdAt: string; revision: number; snapshotId: string }
 export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
 export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
@@ -37,9 +38,9 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version;
-        if (version !== 0 && version !== 1) throw new Error('Unsupported store schema version.');
-        if (version === 1) return;
-        this.#db.exec(`
+        if (version !== 0 && version !== 1 && version !== 2) throw new Error('Unsupported store schema version.');
+        if (version === 2) return;
+        if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
           CREATE TABLE snapshots (key TEXT NOT NULL REFERENCES plans(key), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,id));
@@ -52,6 +53,9 @@ export class Store {
           CREATE TABLE continuations (key TEXT NOT NULL REFERENCES plans(key), checkpoint_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,checkpoint_id,revision));
           PRAGMA user_version=1;
         `);
+        this.#db.exec(`ALTER TABLE plans ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0;
+          CREATE TABLE review_notes (key TEXT NOT NULL REFERENCES plans(key), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,id));
+          PRAGMA user_version=2;`);
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -70,7 +74,8 @@ export class Store {
   }
   #expect(key: string, expected: ReviewState): void {
     const row = this.#current(key);
-    if (row.revision !== expected.revision || row.snapshot_id !== expected.snapshotId) throw new Error('Stale review state. Reload before writing.');
+    if (row.revision !== expected.revision || row.snapshot_id !== expected.snapshotId ||
+        (expected.reviewVersion !== undefined && row.review_version !== expected.reviewVersion)) throw new Error('Stale review state. Reload before writing.');
   }
   #context(key: string, context: PlanContext): void {
     if (identityKey(context.identity) !== key || context.issue !== this.#current(key).issue) throw new Error('Plan context identity/issue mismatch.');
@@ -93,7 +98,7 @@ export class Store {
     sha(base); sha(head);
     const key = identityKey(context.identity), plan = importPlan(source, format, context, 1).plan;
     return this.#transaction(() => {
-      this.#run('INSERT INTO plans VALUES (?,?,?,NULL)', key, plan.issue, 0);
+      this.#run('INSERT INTO plans (key,issue,revision,snapshot_id) VALUES (?,?,?,NULL)', key, plan.issue, 0);
       this.#savePlan(key, plan, 0);
       this.#snapshot(key, base, head);
       return plan;
@@ -237,7 +242,23 @@ export class Store {
         if (!choice.key || !['assign','accept'].includes(choice.action) || (choice.action === 'assign' ? !plan.items.some(item => item.id === choice.item) : choice.item !== null)) throw new Error('Invalid segment choice.');
         this.#run('INSERT OR REPLACE INTO choices VALUES (?,?,?)', key, choice.key, encode({ ...choice, ...expected }));
       }
+      this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
     });
+  }
+  reviewVersion(identity: PlanIdentity): number { return this.#current(identityKey(identity)).review_version as number; }
+  addReviewNote(identity: PlanIdentity, expected: ReviewState, item: string, kind: ReviewNote['kind'], text: string): ReviewNote {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#expect(key, expected);
+      if (!this.getPlan(identity).items.some(entry => entry.id === item) || !['question', 'change'].includes(kind) || typeof text !== 'string' || !text.trim() || text.length > 4000) throw new Error('Invalid review note.');
+      const note = { id: randomUUID(), item, kind, text: text.trim(), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
+      this.#run('INSERT INTO review_notes VALUES (?,?,?)', key, note.id, encode(note));
+      this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
+      return note;
+    });
+  }
+  getReviewNotes(identity: PlanIdentity): ReviewNote[] {
+    return this.#db.prepare('SELECT data FROM review_notes WHERE key=? ORDER BY rowid').all(identityKey(identity)).map(row => decode<ReviewNote>(row.data));
   }
   getReview(identity: PlanIdentity): { approvals: (Approval & ReviewState)[]; choices: (SegmentChoice & ReviewState)[] } {
     const key = identityKey(identity); this.#current(key);

@@ -1,0 +1,30 @@
+# Read-only review screen (#3)
+
+Started from `dd6a1e7`, after merging the SQLite store PR. This delivers the local review surface and experiment tooling; issue #3 remains open until the human go/no-go work is complete.
+
+## Run it
+
+`npm ci --ignore-scripts`, then `npm run demo`. Open the private loopback URL printed by the command. The demo uses a real disposable Git repository and SQLite database under ignored `.codeboost-local/demo`; restart preserves approvals and notes. No source files in the codeboost checkout are edited by the demo. Stop with Ctrl+C.
+
+For an existing trusted store, use `npm start -- --config /absolute/path/review.json`. The JSON has `database`, `repository`, `identity` (`repositoryId`, `taskId`, `planId`), and `pathIdentity` (`caseSensitive` boolean, `unicodeNormalization` equal to `none` or `NFC`). Paths should be absolute. Supply actual checkout identity rules, not an OS guess. The demo probes its local filesystem; it uses only simple ASCII fixture paths. Unsupported or more complex filesystem equivalence must not be approximated by this adapter.
+
+The selected repository's current HEAD is compared to the stored base. Refresh observes new heads and creates an immutable snapshot; approvals are recomputed for the resulting changes. It does not fetch, rebase, run tests, invoke agents, or merge. Histories still obey the library's linear/complete/bounded-history constraints.
+
+## UI and storage
+
+The app follows the Evidence Desk tokens and self-hosts IBM Plex Sans/Mono. It has item and exception rows, four status checks, a provenance gutter, file metadata, shared-hunk labels, assignments, standalone acceptance, no-change confirmation, approval counts/staleness, before/after approval evidence, per-item questions/change requests, keyboard controls, resizable/collapsible side panes, desktop breakpoints, and loading/error/empty states. Questions are saved for discussion; no AI answer is fabricated. Tests/AI review are explicitly not run. Change requests remain pending for a future revision workflow.
+
+The server binds only 127.0.0.1 and requires its random private token for APIs. Host/origin checks, a restrictive CSP, bounded UTF-8 JSON bodies, and DOM escaping prevent another website from reading or writing local review state. Browser commands contain item/segment IDs and the reviewed state token, never approval fingerprints or ledger ownership. The runner derives those from Git/store data. A database review counter prevents concurrent review actions from approving unseen assignments; plan and snapshot CAS remain enforced.
+
+Store schema v2 adds the review counter and per-item notes through a transactional v1 migration. The test suite verifies existing revisions and ledger entries survive. This is an automatic local SQLite migration, not a migration against a shared environment.
+
+## Known limits and remaining gates
+
+- No agent answers, test execution, AI findings ingestion, send-to-agent action, or merge control is included. These belong after the go/no-go gate. Four checks distinguish unavailable evidence from success.
+- File cards show mode/path/object IDs; binary/image previews and byte-size retrieval are not implemented and explicitly say unavailable. The pure history API does not expose binary bytes.
+- The protocol at `docs/experiments/review-protocol.md` must be filled with the real pairs and committed before the first timed review. The manual assignment, real paired PRs, human timing, and final result are pending. Do not mark issue #3 closed or claim the gate passed.
+- The planting helper is intentionally limited to disposable clones and supported regular top-level paths; it never publishes PRs.
+
+## Validation
+
+Baseline before this slice: 157 tests. Run `npm run typecheck`, `npm test`, and `npm run test:browser`. Browser tests use real Git and SQLite with Chromium and cover persistence, assignments, metadata, no-change approval, stale views, unsafe origins, keyboard/breakpoints, error display, and untrusted text. A browser regression exposed false stale reasons from JSON field order; structural comparison replaced that check. The plant test verifies source HEAD stays unchanged and both plants retain ledger ownership.

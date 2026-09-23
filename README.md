@@ -2,7 +2,7 @@
 
 Review agent-made Git changes one plan item at a time. The approved plan lists each item's files and acceptance checks; the review engine shows which item produced each change and flags foreign or overlapping work.
 
-**Status:** the first library slice is implemented. There is no application, server, agent runner, database, or merge command yet. Follow the [build order](docs/designs/codeboost-plan-indexed-review.md#build-order-and-the-gono-go-check); the read-only screen and real-PR go/no-go experiment come before agent execution.
+**Status:** the plan/linking library, SQLite store, and local read-only review screen are implemented. Run `npm run demo` and open its private local URL. There is no agent execution or merge command. The human go/no-go experiment is still pending; see [the local review guide](docs/implementation/read-only-review.md).
 
 ## Development
 
@@ -41,7 +41,7 @@ const history = readHistory(repoPath, baseCommit, headCommit);
 const segments = linkHistory(plan, history, trustedCommitLedger, checkoutPathKey);
 ```
 
-Inputs such as `planText` and the ledger must come from the caller. The future `runner/store` owns the database and ledger; this library does not infer them from commit messages. Before saving a suggested edit, the store must load its captured identity/revision binding by opaque suggestion ID, reject canceled or consumed IDs, and compare-and-swap the plan revision plus consume/invalidate old suggestions in one transaction. The pure `applySuggestion` function requires that trusted binding and validates a copy, but cannot lock storage or prevent replay by itself. Applying one card stales its siblings; refresh and review regenerated cards before the next Apply. Approvals and choices likewise require the stored plan identity.
+Inputs such as `planText` and the ledger must come from the trusted runner. `runner/store` owns the database, persistent request lifecycle, revision allocation, and atomic Apply. The browser sends review commands through `runner/review`; it cannot write ledger ownership or approval fingerprints. See [storage decisions](docs/implementation/persistent-review-store.md).
 
 ## Current limits and safety
 
