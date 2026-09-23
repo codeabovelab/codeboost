@@ -2,7 +2,7 @@ import { mkdtempSync, readdirSync, mkdirSync, writeFileSync, existsSync, rmSync,
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
 import { approveItem as approveBound, approvalStates as statesBound, applyChoices as choicesBound, choiceKeys as keysBound } from '../core/approvals.ts';
@@ -269,4 +269,40 @@ it('parses scored renames and consumes both paths before the next raw record', (
   const history = readHistory(f.dir, f.base);
   expect(history.final.some(d => d.oldPath === 'a.txt' && d.newPath === 'b.txt')).toBe(true);
   expect(history.final.some(d => d.oldPath === null && d.newPath === 'z.txt')).toBe(true);
+});
+
+it('bounds cumulative line and segment allocation before replay can grow', () => {
+  const f = fixture(); f.write('a.txt', 'changed\ntwo\nthree\n'); f.commit('P1');
+  const history = readHistory(f.dir, f.base);
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxLines: 2 })).toThrow(/line.*budget/i);
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxSegments: 1 })).toThrow(/segment.*budget/i);
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxLines: 12, maxSegments: 2 })).not.toThrow();
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxLines: 11 })).toThrow(/line.*budget/i);
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxReferences: 1 })).toThrow(/reference.*budget/i);
+});
+it.each(['one\n', '', '\0binary'])('carries rename lineage into a final deletion file card (%j)', content => {
+  const f = fixture({ 'a.txt': content }); f.plan.items[0]!.files = [{ path: 'b.txt', kind: 'rename', renamed_from: 'a.txt', change: 'Move' }];
+  f.plan.items[1]!.files = [{ path: 'b.txt', kind: 'delete', renamed_from: null, change: 'Delete' }];
+  renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt')); f.commit('P1');
+  rmSync(join(f.dir, 'b.txt')); f.commit('P2');
+  expect(f.segments().find(s => s.kind === 'file')!.owners).toContain('P2');
+});
+it('bounds the total Git read duration across subprocesses', () => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
+  let elapsed = 0;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => (elapsed += 1000));
+  try { expect(() => readHistory(f.dir, f.base, 'HEAD', { maxDurationMs: 3000 })).toThrow(/deadline|duration/i); }
+  finally { clock.mockRestore(); }
+});
+
+it('bounds linking duration and replacement-origin fanout', () => {
+  const f = fixture({ 'a.txt': 'old\n'.repeat(100) });
+  f.write('a.txt', 'new\n'.repeat(100)); f.commit('P1');
+  const history = readHistory(f.dir, f.base);
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxReferences: 1000 })).toThrow(/reference.*budget/i);
+  expect(() => linkHistory(f.plan, history, f.ledger, p => p)).not.toThrow();
+  let elapsed = 0;
+  const clock = vi.spyOn(performance, 'now').mockImplementation(() => elapsed++);
+  try { expect(() => linkHistory(f.plan, history, f.ledger, p => p, { maxDurationMs: 3 })).toThrow(/deadline/i); }
+  finally { clock.mockRestore(); }
 });

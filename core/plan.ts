@@ -111,12 +111,16 @@ function parents(path: string): string[] {
 function linkTarget(path: string, target: string, key: (path: string) => string, entries: ReadonlyMap<string, BaseEntry>): string | null {
   if (!target || target.startsWith('/') || /[\\:\p{Cc}]/u.test(target)) return null;
   const parts = path.split('/').slice(0, -1);
-  for (const component of target.split('/')) {
+  const components = target.split('/');
+  for (const [index, component] of components.entries()) {
     if (component === '' || component === '.') continue;
     if (component === '..') { if (!parts.length) return null; parts.pop(); }
     else {
       parts.push(component);
-      try { if (entries.get(key(parts.join('/')))?.kind === 'symlink') return null; } catch { return null; }
+      try {
+        const entry = entries.get(key(parts.join('/')));
+        if (entry && (entry.kind === 'symlink' || index < components.length - 1)) return null;
+      } catch { return null; }
     }
   }
   try { return parts.length ? key(parts.join('/')) : ''; } catch { return null; }
@@ -228,13 +232,14 @@ function validateV1(value: Plan, context: PlanContext): Validation {
         const target = linkTarget(location, entry.target, key, entries);
         const traversesLink = target !== null && [...parents(target), target].some(p => entries.get(p)?.kind === 'symlink');
         if (target === null || traversesLink) {
-          if (file.kind !== 'delete' && file.kind !== 'edit') error('symlink-target', 'Retained link target is unsafe.', item.id);
+          if ((file.kind !== 'delete' && file.kind !== 'edit') || item.files.length !== 1)
+            error('symlink-target', 'Unsafe link repair must be isolated in its own item; retained rename targets must be safe.', item.id);
           continue; // Deletion or replacement may repair an unsafe old link.
         }
         for (const other of item.files) {
           if (other === file) continue;
           const otherPaths = other.kind === 'rename' ? [other.path, other.renamed_from!] : [other.path];
-          if (otherPaths.some(p => p === target || target === '' || p.startsWith(`${target}/`)))
+          if (otherPaths.some(p => p === target || target === '' || p.startsWith(`${target}/`) || target.startsWith(`${p}/`)))
             error('symlink-target', 'A link and its writable target cannot share an invocation.', item.id);
         }
       }

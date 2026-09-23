@@ -94,3 +94,9 @@ Issue #6 remains open for runner/store integration: obtain typed base entries an
 ## Merged-contract review round 1
 
 Updated README import/linking examples to supply the new required context. Declined the scored-rename report: the raw-diff regex captures only `([A-Z])` and consumes the score separately with `\d*`, so the existing branch receives `R`, not `R100`. A focused real-Git test observed a scored rename followed by an added-file record and loaded both correctly before any parser change. Retained that regression. A separate locally discovered C1-control regression failed first, then passed after using the complete Unicode control category for commands/paths.
+
+## Merged-contract review round 3
+
+Reproduced seven failing fixtures covering six valid findings. Replay now rejects before cumulative line/segment/reference/text growth exceeds its budget; origin unions and hunk-sharing avoid unchecked flattening, and grouping no longer repeatedly re-splits accumulated text. Read and linking operations each use a monotonic overall deadline, with Git subprocess/diff timeouts clamped to the remaining budget. Filesystem checks are cooperative between calls; process-level containment remains the runner's job.
+
+File metadata retains the whole rename path lineage, so a later deletion includes its owner's evidence on the final original-path file card. Multiple metadata owners remain conservatively Ambiguous; foreign owners remain Unplanned. Link target validation rejects intermediate regular-file/gitlink entries, overlap in both ancestry directions, and multi-file unsafe-link repair. Repair of an unsafe existing link remains possible as its own item. Tests cover text, empty, and binary rename/deletion cards; exact line/segment boundaries; reference fanout; and deterministic deadline exhaustion.

@@ -95,3 +95,16 @@ it('rejects C1 control characters in commands and paths', () => {
  const p = plan(); p.items[0]!.files[0]!.path = 'a\u0085';
  expect(validatePlan(p, { ...context, baseEntries: [{ path: 'a\u0085', kind: 'file' }] }).errors.length).toBeGreaterThan(0);
 });
+
+it.each(['file', 'gitlink'] as const)('rejects retained targets traversing a %s entry', kind => {
+ const p = plan(); p.items[0]!.files[0] = { path: 'moved', kind: 'rename', renamed_from: 'a', change: 'Move' };
+ expect(validatePlan(p, { ...context, baseEntries: [{ path: 'a', kind: 'symlink', target: 'target/child' }, { path: 'target', kind }] }).errors.some(e => e.code === 'symlink-target')).toBe(true);
+});
+it('requires unsafe-link repair to be isolated from other writes', () => {
+ const p = plan(); p.items[0]!.files.push({ path: 'dir', kind: 'edit', renamed_from: null, change: 'Repair' });
+ expect(validatePlan(p, { ...context, baseEntries: [{ path: 'a', kind: 'symlink', target: 'dir' }, { path: 'dir', kind: 'symlink', target: 'elsewhere' }] }).errors.some(e => e.code === 'symlink-target')).toBe(true);
+});
+it('rejects declared ancestors of a retained link target', () => {
+ const p = plan(); p.items[0]!.files.push({ path: 'target', kind: 'add', renamed_from: null, change: 'Create' });
+ expect(validatePlan(p, { ...context, baseEntries: [{ path: 'a', kind: 'symlink', target: 'target/child' }] }).errors.some(e => e.code === 'symlink-target')).toBe(true);
+});

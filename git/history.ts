@@ -4,7 +4,15 @@ import { resolve as resolvePath, join } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
-export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number; maxObjectEntries?: number; maxDiffBytes?: number; maxFileEntries?: number } = {}): History {
+export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number; maxObjectEntries?: number; maxDiffBytes?: number; maxFileEntries?: number; maxDurationMs?: number } = {}): History {
+  const maxDurationMs = limits.maxDurationMs ?? 30_000;
+  if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1 || maxDurationMs > 30_000) throw new Error('Duration budget must be a positive integer no larger than 30000 ms.');
+  const deadline = performance.now() + maxDurationMs;
+  const remaining = () => {
+    const ms = deadline - performance.now();
+    if (ms <= 0) throw new Error('History read exceeded its overall deadline.');
+    return Math.max(1, Math.ceil(ms));
+  };
   const maxBlobBytes = limits.maxBlobBytes ?? 64 * 1024 * 1024;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > 64 * 1024 * 1024) throw new Error('Blob byte budget must be a positive integer no larger than 64 MiB.');
   const maxObjectEntries = limits.maxObjectEntries ?? 100_000;
@@ -21,17 +29,29 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
   };
   // Inherited Git variables can redirect repository, index, config, and object lookup.
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
-  const run = (...args: string[]) => execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
-    cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout: 30_000,
-    env: { ...environment, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
-      GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const run = (...args: string[]) => {
+    const timeout = remaining();
+    let result: Buffer;
+    try {
+      result = execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
+        cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout, killSignal: 'SIGKILL',
+        env: { ...environment, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
+          GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+        stdio: ['ignore', 'pipe', 'pipe'],
+      });
+    } catch (error) {
+      if ((error as { code?: string }).code === 'ETIMEDOUT') throw new Error('History read exceeded its overall deadline.', { cause: error });
+      throw error;
+    }
+    remaining();
+    return result;
+  };
   // Inspect storage without following links before any object-resolving command.
   const objects = resolvePath(repo, run('rev-parse', '--git-path', 'objects').toString().trim());
   const pending = [objects];
   let inspected = 0;
   while (pending.length) {
+    remaining();
     const path = pending.pop()!;
     if (++inspected > maxObjectEntries) throw new Error('Object storage inspection exceeds its entry budget.');
     const stat = lstatSync(path);
@@ -40,6 +60,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
       const directory = opendirSync(path, { bufferSize: 1 });
       try {
         for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+          remaining();
           if (pending.length + inspected >= maxObjectEntries) throw new Error('Object storage inspection exceeds its entry budget.');
           pending.push(join(path, entry.name));
         }
@@ -80,6 +101,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     const fields = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw).split('\0');
     const result: FileDelta[] = [];
     for (let i = 0; i < fields.length && fields[i];) {
+      remaining();
       if (++fileEntries > maxFileEntries) throw new Error('Review history exceeds the cumulative file entry budget; choose a narrower base.');
       const match = /^:(\d+) (\d+) ([0-9a-f]+) ([0-9a-f]+) ([A-Z])\d*$/.exec(fields[i++]!);
       if (!match) throw new Error('Unexpected Git raw diff record.');
@@ -103,5 +125,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     return result;
   };
   for (const commit of commits) commit.files = diff(commit.parent, commit.sha, false);
-  return { base, head, commits, final: diff(base, head, true) };
+  const final = diff(base, head, true);
+  remaining();
+  return { base, head, commits, final };
 }
