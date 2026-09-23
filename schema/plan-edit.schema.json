@@ -1,5 +1,5 @@
 {
-  "$id": "https://github.com/codeabovelab/codeboost/schema/plan-edit.schema.json",
+  "$id": "https://github.com/codeabovelab/codeboost/schema/versions/1/plan-edit.schema.json",
   "title": "codeboost plan edit",
   "description": "The plan assistant's answer on the Plans screen: a reply to the person, plus zero or more suggested edits to one plan revision. Nothing changes until the person clicks Apply on an edit. Version 1. Strict-mode compatible: every object lists all its properties as required; unused values are null. See docs/plan-format.md. The item, file, and check definitions are exact copies of those in plan.schema.json, so this file works on its own; codeboost's tests check that the copies match. There is no $schema line on purpose: Claude Code's --json-schema rejects the draft 2020-12 URL. Validate with a draft 2020-12 validator.",
   "type": "object",

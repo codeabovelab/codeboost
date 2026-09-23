@@ -1,5 +1,5 @@
 {
-  "$id": "https://github.com/codeabovelab/codeboost/schema/plan.schema.json",
+  "$id": "https://github.com/codeabovelab/codeboost/schema/versions/1/plan.schema.json",
   "title": "codeboost plan",
   "description": "A plan for one GitHub issue, written by Claude, Codex, or a person. Version 1. Strict-mode compatible: every object lists all its properties as required and allows no others; optional values are nullable. See docs/plan-format.md. There is no $schema line on purpose: Claude Code's --json-schema rejects the draft 2020-12 URL. Validate with a draft 2020-12 validator.",
   "type": "object",
