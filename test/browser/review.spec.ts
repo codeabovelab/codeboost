@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createDemo } from '../../scripts/demo.ts';
+import { choiceKeys } from '../../core/approvals.ts';
 import { startServer } from '../../web/server.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
@@ -244,4 +245,16 @@ for(const switchItem of [false,true]) test(`preserves edits made while a questio
  if(switchItem){await expect(page.locator('#saved')).toContainText('Question submitted');await expect(page.getByLabel('Question about this item')).toHaveValue('Other item draft');await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();}
  await expect(page.getByText('Submitted question',{exact:true})).toBeVisible();
  await expect(page.getByLabel('Question about this item')).toHaveValue('New unsent draft');
+});
+test('warns on completed answers when a snippet assignment changes',async({page})=>{
+ const service=app.service,identity=service.config.identity,initial=service.load();
+ const foreign=initial.segments.find(s=>s.row==='Unplanned'&&s.operation==='+')!;
+ const assigned=service.act({action:'assign',item:'P1',key:foreign.key,token:initial.token});
+ const asked=service.act({action:'note',item:'P1',kind:'question',text:'Explain assigned code',reference:{key:foreign.key,start:foreign.newLine,end:foreign.newLine},token:assigned.token});
+ service.store.beginAnswer(identity,asked.createdNoteId!,'completed');service.store.finishAnswer(identity,asked.createdNoteId!,'completed',{status:'complete',text:'Historical answer'});
+ const index=initial.segments.findIndex(s=>s.key===foreign.key);
+ service.store.saveReview(identity,asked.expected,[],[{action:'assign',item:'P2',key:choiceKeys(initial.segments,identity)[index]!}]);
+ await page.goto(app.url);
+ await expect(page.locator('.agent-answer')).toContainText('Historical answer');
+ await expect(page.locator('.agent-answer')).toContainText('Answer refers to earlier code or review context.');
 });
