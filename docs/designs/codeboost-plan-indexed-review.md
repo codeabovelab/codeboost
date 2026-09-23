@@ -212,7 +212,7 @@ It ignores this task's own PR, any draft PRs it opened earlier, and its own comm
 - Every invocation records which comments it was given.
 
 **The container (the real safety boundary).** Changed by the engineering review, R1 (answer D2: B). Every invocation, of every phase, runs inside a Docker or Podman container. The agent tool itself runs inside it. The container holds only:
-- the task's folder, including its own `.git` (O6), mounted as `/work`. This is the only project folder the agent can write to;
+- the task's folder, including its own `.git` (O6), mounted as `/work`: writable only for carrying out/fixing, read-only for planning/questions/review. This is the only project folder an execution-phase agent can write to;
 - the agent's own sign-in. For Codex, that is its `auth.json` from `CODEX_HOME`, mounted read-only. For Claude, it is a long-lived token made with `claude setup-token`, passed as an environment variable. (On macOS, Claude keeps its normal sign-in in the keychain, which a container cannot read.)
 
 Nothing else from your computer is inside. So `~/.ssh`, `~/.config/gh`, `~/.npmrc`, `~/.aws`, `~/.docker`, and your git credential helper simply are not there. The container's `HOME` is its own empty folder.
@@ -245,6 +245,8 @@ If Docker or Podman is missing or not running, codeboost runs no agents and tell
 | Planning, questions | No | No | Agent vendor's API only |
 | Carrying out and fixing | Worktree only | Allowed list only (test, lint, build) | Agent vendor's API only |
 | Reviewing | No | `cmd:` checks only | Agent vendor's API only |
+
+**Phase enforcement.** The runner selects the mount and tool profile before launching the agent. Planning/questions expose read/list/search tools only; the dispatcher denies process execution, shell, write, and edit tools. Review uses the same read-only `/work` mount and cannot invoke arbitrary processes: it may request only the exact approved `cmd:` argv through a runner-controlled dispatcher. Those checks use the read-only project mount and writable scratch; a check that requires writing project files fails explicitly rather than weakening the mount. Carrying-out/fixing uses a writable `/work` and the command allowlist. These are enforced permissions, not prompt requests; if an adapter cannot enforce a phase profile, refuse that phase. Container tests must attempt file writes and forbidden process/tool calls in every phase and confirm refusal.
 
 All phases run in the container (R1). The allowed list comes from your repo's scripts, and you can edit it. It limits accidental commands; it is not a hostile-code boundary. A carrying-out agent can edit an allowed script and execute the changed script in the same invocation, before codeboost gets control back. The container and network restrictions must therefore contain arbitrary code from the start. Script approval protects codeboost's later invocation only; it does not prevent that earlier agent execution. The real-container suite must exercise this edit-then-execute case and confirm that host access and disallowed network access remain blocked.
 
@@ -472,10 +474,10 @@ Approvals on other plan items stay valid, as long as their code did not change.
 The top of the screen lists anything that is not yet true. You can still use "Merge anyway." It asks you to confirm, and codeboost records it.
 
 **What happens when you click "Approve & merge".**
-1. codeboost fetches the latest base branch.
-2. If the base has not moved since GitHub's checks last passed, it goes straight to step 5.
-3. If the base has moved, codeboost rebases the PR branch (see below) and pushes it. If the rebase changed any plan item's code, codeboost stops and sends you back to review those plan items. Otherwise it re-runs every plan item's `cmd:` checks on the rebased code, in the container. If any check fails, merging stops and you go back to review (engineering review, O3). Test results are tied to the commit they ran on. Results for any other commit are shown as out of date.
-4. codeboost waits for GitHub's required checks on the new code. It reads which checks are required from the branch's rules at that moment (rulesets first, then classic protection). If there are none, this step passes at once. Code reviews, such as Copilot code review, are not checks and do not count. The screen shows the checks' progress. If they take longer than 30 minutes, the task moves to **approved, merge blocked** (engineering review, R6).
+1. codeboost fetches the latest base branch and PR head, recording both SHAs.
+2. Compare both SHAs with the base/head used for attribution, approvals, and validation. If the head changed even when the base did not, reload the history and ledger, recompute links and approval staleness, and return changed or unplanned items to review. Re-run all `cmd:` checks for any head without current passing results. Continue only after the current head satisfies review and validation; do not skip the rule refresh in step 4 even when both SHAs match.
+3. If the base has moved, codeboost rebases the PR branch (see below) and pushes it. If the rebase changed any plan item's code, codeboost stops and sends you back to review those plan items. Otherwise it re-runs every plan item's `cmd:` checks on the rebased code, in the container. If the base did not move, keep the current head and the validation requirements from step 2. If any check fails, merging stops and you go back to review (engineering review, O3). Test results are tied to the commit they ran on. Results for any other commit are shown as out of date.
+4. codeboost waits for GitHub's required checks on the new code. It reads which checks are required from the branch's rules at that moment (the union of all applicable active rulesets and classic branch protection, preserving check context and required app identity). Only a successfully read, explicitly empty union passes at once; an unreadable or ambiguous source blocks merging as unknown. Code reviews, such as Copilot code review, are not checks and do not count. The screen shows the checks' progress. If they take longer than 30 minutes, the task moves to **approved, merge blocked** (engineering review, R6).
 5. codeboost runs the "already fixed" check again, then merges with `gh pr merge --match-head-commit <sha>`. The sha is the commit whose approvals, `cmd:` results, and required checks all passed. If anyone pushed after that, GitHub refuses the merge. codeboost then reloads the PR, recomputes the links, and sends you back to review, with the changed plan items stale (engineering review, O4).
 
 codeboost also rebases before it first shows you the review. So you always review code that sits on the latest base.
@@ -498,7 +500,7 @@ If codeboost is stopped or crashes during a rebase, it always cancels the rebase
 
 **When GitHub refuses the merge.** For example, a rule may require a second reviewer, a check may be blocked, or there may be a conflict. Then codeboost shows GitHub's exact error, and the task moves to **approved, merge blocked**.
 
-**Checking branch rules.** When you add a repo, codeboost reads its branch rules through GitHub's rulesets API. That needs only read access. If that fails, it tries the older branch-protection API. If both are refused, the rules show as "unknown," and codeboost learns them from the first merge. codeboost 1.0 does not support rules that require a second human reviewer, and it warns you about them when you add the repo.
+**Checking branch rules.** At repository setup and again before merging, read both all applicable active rulesets (including inherited organization rules) and classic branch protection, following pagination. Combine required checks from both sources; one never replaces the other. Preserve each required check's context and app identity, and require every applicable condition. Permission errors, incomplete responses, and ambiguous not-found responses mean "unknown" and block merging; only a confirmed absence of protection counts as an empty source. Do not learn unknown rules by attempting a merge. codeboost 1.0 does not support rules that require a second human reviewer, and it warns you about them when you add the repo. Acceptance cases include rulesets with no checks plus a classic required check, checks required by both, and either source unreadable.
 
 ### The queue, stopping, and recovery (steps 4 and 5)
 
@@ -1145,7 +1147,7 @@ Comparison grid:
 
 | Choice | Current | A | B | C |
 |---|---|---|---|---|
-| Source of "required" | not stated | the branch's rules (rulesets API, then classic protection), read at merge time | every check reported on the PR, required or not | not stated |
+| Source of "required" | not stated | the branch's rules (all applicable rulesets plus classic protection, unioned; unreadable sources block), read at merge time | every check reported on the PR, required or not | not stated |
 | Zero required checks | undefined (may wait 30 min, then block) | passes immediately | passes if no checks are reported at all | undefined |
 | Copilot code review (a review, not a check) | not stated | ignored by the merge gate | ignored by the merge gate | not stated |
 
@@ -1168,7 +1170,7 @@ Leave "required checks" undefined. ✅ No change. ✅ Nothing to build now. ❌ 
 
 State: approved
 Actual answer: A) Follow branch rules (answer to D7, 2026-09-22)
-Accepted scope: at merge time, codeboost reads the branch's required checks from its rules (rulesets API, then classic protection). Zero required checks passes immediately. Reviews such as Copilot code review are not checks and are ignored by the merge gate. Optional checks do not block. Add test cases: zero required checks, one required check pending then passing, and a timeout. Design sections amended: Approving and merging, pre-merge step 4.
+Accepted scope: at merge time, codeboost reads the branch's required checks from its rules (all applicable rulesets plus classic protection, unioned; unreadable sources block). Zero required checks passes immediately. Reviews such as Copilot code review are not checks and are ignored by the merge gate. Optional checks do not block. Add test cases: zero required checks, one required check pending then passing, and a timeout. Design sections amended: Approving and merging, pre-merge step 4.
 History: none
 
 ### R7: Whether to keep the `sql.js` storage fallback
@@ -1895,7 +1897,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T6 (P1, human: ~3 hours / CC: ~15 min)** — runner — Re-run `cmd:` checks after a pre-merge rebase; tie results to the head
   - Surfaced by: O3 (D13: A)
   - Files: runner/merge
-  - Verify: a rebase onto a breaking main blocks the merge
+  - Verify: a rebase onto a breaking main blocks the merge; a head-only collaborator push recomputes review and reruns checks; matching SHAs still refresh both rule sources
 - [ ] **T7 (P1, human: ~2 hours / CC: ~10 min)** — github — Merge with `--match-head-commit` and reload on refusal
   - Surfaced by: O4 (D14: A)
   - Files: github/merge
@@ -1907,7 +1909,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T9 (P1, human: ~2 weeks / CC: ~3 hours)** — tests — Set up Vitest, real git, recorded gh and CLI outputs, the real-Docker CI suite, Playwright, and the hostile-issue eval
   - Surfaced by: T1 (D10: A)
   - Files: test/, .github/workflows/
-  - Verify: CI runs every suite; the Docker suite fails if isolation breaks
+  - Verify: CI runs every suite; the Docker suite fails if isolation breaks, a read-only phase can write `/work`, or planning/questions can execute a process
 - [ ] **T10 (P2, human: ~2 hours / CC: ~10 min)** — core — Duplicate-segment key: file, content, copy number, and copy count
   - Surfaced by: R4 (D5: A), O1 (D11: A)
   - Files: core/choices
