@@ -3,7 +3,9 @@
   "versions": {
     "1": {
       "plan": "versions/1/plan.schema.json",
-      "edit": "versions/1/plan-edit.schema.json"
+      "edit": "versions/1/plan-edit.schema.json",
+      "semantics": "versions/1/semantics.md",
+      "validator": "v1"
     }
   }
 }

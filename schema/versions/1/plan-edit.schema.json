@@ -18,7 +18,7 @@
       ]
     },
     "base_revision": {
-      "description": "The plan revision these edits apply to. codeboost refuses edits made against an older revision.",
+      "description": "The revision of the plan captured by the server-side request context. Apply must verify that stable plan identity and this revision atomically; matching revision/item IDs on a different plan never authorizes mutation.",
       "type": "integer",
       "minimum": 1
     },
