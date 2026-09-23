@@ -1,0 +1,9 @@
+{
+  "current": 1,
+  "versions": {
+    "1": {
+      "plan": "versions/1/plan.schema.json",
+      "edit": "versions/1/plan-edit.schema.json"
+    }
+  }
+}

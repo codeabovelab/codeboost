@@ -154,13 +154,15 @@ Fields an operation does not use are `null`. The strict answer schema checks str
 - Every plan carries `schema_version`. This document describes version 1.
 - Wording changes that do not change accepted data keep the same version. Changes to accepted data, including adding, renaming, or removing a field or changing a limit, require the next schema version. This applies to both plan and suggested-edit schemas.
 - A nullable field is still required. Adding one breaks old plans (the field is missing) and old readers (the field is unknown), so it must not be added under version 1.
+- [`schema/versions.json`](../schema/versions.json) is the version registry. Its `current` number selects the schema used for new drafts; its `versions` object maps exact decimal version numbers to plan and edit schema paths relative to `schema/`. Version 1 is retained at `schema/versions/1/plan.schema.json` and `schema/versions/1/plan-edit.schema.json`. These snapshots are immutable, including descriptions. The unversioned `schema/plan.schema.json` and `schema/plan-edit.schema.json` are exact copies of the current snapshots for CLI compatibility; verification must check those copies against the registry.
+- Parse the input as data, require an integer `schema_version`, and look it up in the registry without constructing a path from user input. Reject missing or unsupported versions. A new version adds a new directory and registry entry; retain all earlier entries. With only version 1 registered there is no migration to run.
 - Keep released schemas unchanged. On import, read `schema_version`, validate against that version's schema, convert using an explicit version migration, then validate against the current schema and run the meaning checks. Reject unsupported versions with an explanation. Never validate an old plan against a newer schema before converting it. Suggested edits must use a supported schema version and still match the current plan revision; otherwise ask the assistant to regenerate them.
 
 **PR #1 review decisions.** File validation uses projected state so dependent items can work on new or renamed files. Version changes are explicit because every field is required and unknown fields are rejected. T18 includes regression checks for both rules.
 
 ## PR #1 feedback dispositions
 
-The script approval gate covers codeboost-run commands, while container and network isolation must contain an agent that edits and immediately executes a script. Symlink parent components are prohibited; declared final links are supported with target checks. Imported plans must match the already-selected issue and repository context. These are semantic/runtime requirements, not guarantees supplied by JSON Schema alone.
+The script approval gate covers codeboost-run commands, while container and network isolation must contain an agent that edits and immediately executes a script. Symlink parent components are prohibited; declared final links are supported with target checks. Imported plans must match the already-selected issue and repository context. Retained schemas have explicit registry paths, and repository metadata in authoring prompts uses escaped JSON data blocks just like issue text. These are semantic/runtime requirements, not guarantees supplied by JSON Schema alone.
 
 ## Notes for builders
 
