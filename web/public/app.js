@@ -19,6 +19,7 @@ let data,
   mode = "question",
   since = false,
   busy = false;
+let reviewGeneration = 0;
 const drafts = new Map();
 const attachments = new Map();
 let snippetSelection = null;
@@ -75,6 +76,7 @@ function showFailure(message) {
 async function refresh() {
   if (busy) return;
   busy = true;
+  reviewGeneration++;
   renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
   try {
@@ -96,6 +98,7 @@ async function refresh() {
 async function act(command) {
   if (busy || !data) return false;
   busy = true;
+  reviewGeneration++;
   renderAttachment();
   try {
     rememberDraft();
@@ -597,8 +600,9 @@ setInterval(async()=>{
     renderNotes({ follow: true });return;
   }
   pollingQuestions=true;
-  try {const response=await api("/api/questions");if(data){data.notes=response.notes;renderNotes({ follow: true });}}
-  catch { $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
+  const generation = reviewGeneration;
+  try {const response=await api("/api/questions");if(data && generation === reviewGeneration){data.notes=response.notes;renderNotes({ follow: true });}}
+  catch { if (generation === reviewGeneration) $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
   finally {pollingQuestions=false;}
 },2000);
 $("settings").onclick=async()=>{
