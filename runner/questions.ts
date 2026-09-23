@@ -18,10 +18,12 @@ export function questionPrompt(view: ReturnType<ReviewService['load']>, note: Re
 }
 export class Questions {
   private running = new Map<string, {controller:AbortController;done:Promise<void>}>();
+  private closing = false;
   private service: ReviewService;
   private agent?: QuestionAgent;
   constructor(service: ReviewService, agent?: QuestionAgent) { this.service=service; this.agent=agent; }
   start(id: string, view: ReturnType<ReviewService['load']>) {
+    if (this.closing) throw new Error('Server is stopping. Reconnect before asking again.');
     if (this.running.has(id)) throw new Error('Agent is already answering this question.');
     const note = view.notes.find(n=>n.id===id && n.kind==='question');
     if (!note) throw new Error('Question not found.');
@@ -46,5 +48,5 @@ export class Questions {
     this.running.set(id,{controller,done});
     void done.finally(()=>this.running.delete(id));
   }
-  async close() {for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));await Promise.all([...this.running.values()].map(job=>job.done));}
+  async close() {this.closing = true;for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));await Promise.all([...this.running.values()].map(job=>job.done));}
 }

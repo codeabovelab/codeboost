@@ -56,3 +56,14 @@ it('does not replace a locally running job when its persisted lease expires',asy
  expect(calls).toBe(1);expect(service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt).toBe(original);
  await manager.close();expect(signal?.aborted).toBe(true);expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/Server stopped/);
 });
+it('rejects new work as soon as shutdown begins',async()=>{
+ const service=fixture(),first=question(service),second=question(service);let calls=0;
+ const manager=new Questions(service,()=>{calls++;return new Promise(()=>{});});managers.push(manager);
+ manager.start(first.createdNoteId!,first);
+ const closing=manager.close();
+ expect(()=>manager.start(second.createdNoteId!,second)).toThrow(/stopping/);
+ await closing;
+ expect(()=>manager.start(second.createdNoteId!,second)).toThrow(/stopping/);
+ expect(calls).toBe(1);
+ expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===second.createdNoteId)?.answer).toBeUndefined();
+});
