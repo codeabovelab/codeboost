@@ -28,7 +28,7 @@ export class Questions {
     if (this.running.has(id)) throw new Error('Agent is already answering this question.');
     const note = view.notes.find(n=>n.id===id && n.kind==='question');
     if (!note) throw new Error('Question not found.');
-    if (note.outdated || note.snapshotId!==view.snapshot.id || note.revision!==view.plan.revision) throw new Error('This question belongs to an older review. Ask again against the current code.');
+    if (note.outdated || note.answerOutdated || note.snapshotId!==view.snapshot.id || note.revision!==view.plan.revision) throw new Error('This question belongs to an older review. Ask again against the current code.');
     const provider=this.service.store.questionProvider();
     const agent=this.agent ?? (provider ? cliQuestionAgent(provider) : undefined);
     const attempt=randomUUID(), controller=new AbortController();
