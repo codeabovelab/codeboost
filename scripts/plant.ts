@@ -16,10 +16,17 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
   const root=resolve(destination);
   if(existsSync(root))throw new Error('Experiment destination must not exist.');
   if((!isRepoPath(input.undeclaredPath)||input.undeclaredPath.includes('/'))||!input.declaredText?.trim()||!input.undeclaredText?.trim()||input.declaredText.length>4000||input.undeclaredText.length>4000)throw new Error('Invalid plant input.');
+  const pathKey=(path:string)=>{
+    if(!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
+    const p=config.pathIdentity.unicodeNormalization==='NFC'?path.normalize('NFC'):path;
+    return config.pathIdentity.caseSensitive?p:p.toLowerCase();
+  };
+  pathKey(input.undeclaredPath);
   const source=new Store(config.database);
   let plan, snapshot, entries;
   try{plan=source.getPlan(config.identity);snapshot=source.getSnapshot(config.identity);entries=source.getLedger(config.identity);}finally{source.close();}
   if(plan.items.some(item=>item.files.some(file=>file.path===input.undeclaredPath||file.renamed_from===input.undeclaredPath)))throw new Error('Undeclared plant must be outside every declared file.');
+  for(const item of plan.items) for(const file of item.files) { pathKey(file.path); if(file.renamed_from) pathKey(file.renamed_from); }
   const history=readHistory(config.repository,snapshot.base,snapshot.head);
   const owners=new Map(entries.map(entry=>[entry.sha,entry.owner]));
   const candidates=history.commits.flatMap((commit,index)=>{
@@ -64,7 +71,6 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
     const output:ReviewConfig={...config,repository,database:join(root,'review.sqlite'),identity,demo:false};
     const store=new Store(output.database);
     try{
-      const pathKey=(path:string)=>{const p=config.pathIdentity.unicodeNormalization==='NFC'?path.normalize('NFC'):path;return config.pathIdentity.caseSensitive?p:p.toLowerCase();};
       store.createPlan(JSON.stringify(plan),'json',{identity,issue:plan.issue,baseEntries,pathKey,allowedCommands:[]},snapshot.base,snapshot.head);
       const validEntries=entries.filter(entry=>entry.owner===null||plan.items.some(item=>item.id===entry.owner));
       store.recordHistory(identity,{revision:1,snapshotId:store.getSnapshot(identity).id},snapshot.base,snapshot.head,validEntries);

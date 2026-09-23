@@ -15,3 +15,8 @@ it('plants in an isolated clone, retains ledger attribution, and leaves source h
  try {const view=service.load();expect(view.segments.some(s=>s.path==='extra.txt'&&s.scope==='out-of-scope')).toBe(true);expect(view.segments.some(s=>s.content.includes('// planted extra behavior')&&s.row.startsWith('P'))).toBe(true);}finally{service.close();}
  expect(JSON.parse(readFileSync(join(root,'experiment','sealed.json'),'utf8')).mappings).toHaveLength(3);
 },15000);
+it('refuses non-ASCII plants on case-insensitive filesystems pending an identity adapter', () => {
+ const root=mkdtempSync(join(tmpdir(),'codeboost-plant-path-'));roots.push(root);
+ const config=createDemo(join(root,'source'));config.pathIdentity.caseSensitive=false;
+ expect(()=>plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'café.txt'})).toThrow(/filesystem-specific identity adapter/);
+},15000);
