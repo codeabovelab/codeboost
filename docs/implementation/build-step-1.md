@@ -1,6 +1,6 @@
 # Build step 1: plan format and linking foundation
 
-Started from PR #1 and updated to its design commit `2229e88`. Work follows the approved build order; the user explicitly chose it over prioritizing plan drafting in the UI.
+Started from PR #1 and updated to its merged baseline `91fd2b4` on main. Work follows the approved build order; the user explicitly chose it over prioritizing plan drafting in the UI.
 
 ## Delivered in this slice
 
@@ -21,7 +21,7 @@ Started from PR #1 and updated to its design commit `2229e88`. Work follows the 
 
 **Command grammar.** One executable with literal argv. Space-separated arguments and single/double quotes are supported; shell syntax outside quotes is rejected. Quoted punctuation (for example a test regex) is literal data. The library never executes a command.
 
-**Persistence.** Caller supplies the immutable base-file list and trusted ledger. Suggested edits return a new revision; atomic compare-and-swap and revision allocation are requirements for the later store integration.
+**Persistence.** Caller supplies typed immutable base entries, the actual checkout path-identity function, stable repository/task/plan IDs, selected issue, and trusted ledger. Suggested edits return a new revision; atomic compare-and-swap and revision allocation are requirements for the later store integration.
 
 ## Validation
 
@@ -72,3 +72,21 @@ Fixed aggregate diff retention outside the blob budget. The adapter limits total
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.
 
 The design's manual real-issue assignment and timed go/no-go experiment have not been performed. Disposable Git histories are engineering tests, not evidence that plan-indexed review beats raw review. Write and commit the experiment protocol before using the real review screen for that comparison. Do not proceed to merging, agent execution, planning UI, queue, or learning until the documented gate passes.
+
+## Alignment with the merged v1 contract (#6)
+
+This library slice now selects retained v1 schemas and dispatches the registered `v1` semantics. CLI schema copies are never registered separately. Version-specific parser fixtures remain in `test/plan-v1.test.ts`; future versions need separate semantics and fixtures rather than editing acceptance rules in place.
+
+The importer accepts strings or UTF-8 bytes, bounds input to 1 MiB and nesting to 50 containers, detects decoded duplicate keys in both formats, and inspects YAML nodes without alias expansion. It rejects anchors, aliases, tags, merge keys, implicit empty values, non-JSON numeric spellings, unsafe/lossy integers, and extra documents. Exact complete argv approval replaces prefix matching; tokenizer rules follow the retained v1 grammar.
+
+`PlanContext` now requires stable identity, selected issue, typed base entries, and a trusted `pathKey` function that implements the checkout's actual case/Unicode identity. Unknown rules fail closed. The library never guesses filesystem behavior from the OS. Caller-provided identity must preserve components/separators and throw for unrepresentable paths. Projected membership, collisions, leaf checks, dependencies, and linking scope use these keys. Gitlinks cannot be authored. Existing symlink types survive renames; parent traversal, unsafe retained rename targets, and declared-link/writable-target overlap are rejected. No target or file type is inferred from plan prose.
+
+Suggestion transformations require the trusted identity/revision binding captured when the request began. A delayed response cannot apply to another plan with matching local IDs. Applying a card increments revision and thereby makes siblings stale; callers must regenerate remaining cards. **This pure API is not a server endpoint:** the store must load the binding by opaque suggestion ID, enforce cancellation/consumption, and atomically CAS plus consume/invalidate IDs. A caller must never construct the binding from UI/model claims at Apply time.
+
+Approval fingerprints and standalone choice keys include stable plan identity; fingerprints retain item IDs and file-change metadata. File cards now record typed blob/commit object IDs. Explicit null ledger owners remain foreign.
+
+Validation began with 60 passing tests. The added v1 regressions reproduced 18 failures before fixes. The final suite also covers decoded duplicate keys, byte/depth boundaries, unsafe numbers, Unicode identity, symlink lineage, cross-plan suggestions/approvals/choices, refreshed suggestions, and real-Git identity/metadata cases.
+
+### Explicit remaining work
+
+Issue #6 remains open for runner/store integration: obtain typed base entries and actual filesystem identity from a trusted checkout; audit actual occupancy, new symlinks/conversions, link targets and target mutations after execution; provide persistent request IDs, cancellation, replay prevention and concurrent CAS; enforce prompt budgets/profiles, output limits, container mounts, and process termination. The library only checks declared/projected state and trusted supplied context. In particular an edit may repair an unsafe existing link, but only the future runtime audit can validate its new target and accepted filesystem state. No application, runtime safety boundary, or concurrent store has been added here. Issues #2 and #3 remain the next approved build steps.

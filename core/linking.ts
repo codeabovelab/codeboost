@@ -45,7 +45,8 @@ function classify(evidence: Evidence): Pick<Segment, 'row' | 'scope'> {
 }
 
 /** Replays a linear history. Commit messages and Plan-Item trailers are never trusted. */
-export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<string, string>): Segment[] {
+export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<string, string | null>, pathKey: (path: string) => string): Segment[] {
+  if (typeof pathKey !== 'function') throw new Error('Known checkout path identity is required.');
   const files = new Map<string, TrackedFile>();
   const removed = new Map<string, Evidence>();
   // Deletions retain metadata even after the file leaves the tree.
@@ -59,9 +60,9 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
     for (const delta of commit.files) {
       const oldPath = delta.oldPath;
       const item = plan.items.find(item => item.id === owner);
-      const declared = new Set(item?.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]));
+      const declared = new Set(item?.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
       const touched = [delta.oldPath, delta.newPath].filter((path): path is string => path !== null);
-      const current: Evidence = { owners: [owner], outOfScope: owner !== null && touched.some(path => !declared.has(path)) ? [owner] : [] };
+      const current: Evidence = { owners: [owner], outOfScope: owner !== null && touched.some(path => !declared.has(pathKey(path))) ? [owner] : [] };
       let previous = oldPath ? files.get(oldPath) : undefined;
       if (!previous) previous = {
         lines: lines(textFile(delta.before) ? delta.before!.text : '').map((text, i) => ({ text, evidence: empty(), origins: [origin(oldPath!, i)], moved: empty() })),
@@ -113,7 +114,8 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
         operation: null, context: '', hunk: -1,
         content: JSON.stringify({ oldPath: delta.oldPath, newPath: delta.newPath,
           oldMode: delta.before?.mode ?? null, newMode: delta.after?.mode ?? null,
-          oldOid: delta.before?.oid ?? null, newOid: delta.after?.oid ?? null }),
+          oldObject: delta.before ? { kind: delta.before.mode === '160000' ? 'commit' : 'blob', oid: delta.before.oid } : null,
+          newObject: delta.after ? { kind: delta.after.mode === '160000' ? 'commit' : 'blob', oid: delta.after.oid } : null }),
       }, evidence);
     }
     const finalChanges = diffArrays(oldLines, newLines, { timeout: 2000 });

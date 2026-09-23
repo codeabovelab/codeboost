@@ -1,7 +1,9 @@
 import { Ajv2020 } from 'ajv/dist/2020.js';
-import { parseDocument } from 'yaml';
-import planSchema from '../schema/plan.schema.json' with { type: 'json' };
-import editSchema from '../schema/plan-edit.schema.json' with { type: 'json' };
+import { identityKey, type PlanIdentity } from './identity.ts';
+import { parseV1 } from './parse-v1.ts';
+import registry from '../schema/versions.json' with { type: 'json' };
+import planSchema from '../schema/versions/1/plan.schema.json' with { type: 'json' };
+import editSchema from '../schema/versions/1/plan-edit.schema.json' with { type: 'json' };
 
 export interface PlanFile {
   path: string; kind: 'add' | 'edit' | 'delete' | 'rename';
@@ -28,12 +30,17 @@ export interface EditReply {
   schema_version: 1; base_revision: number; reply: string; edits: PlanEdit[];
 }
 export interface Diagnostic { code: string; message: string; item?: string }
+export type BaseEntry = { path: string; kind: 'file' | 'gitlink' } | { path: string; kind: 'symlink'; target: string };
 export interface PlanContext {
-  /** Files at the immutable base commit, not the current working directory. */
-  baseFiles: readonly string[];
-  /** Exact executable + subcommand prefixes, already tokenized by Settings. */
+  identity: PlanIdentity;
+  /** Leaf entries from the trusted immutable base tree. No directories. */
+  baseEntries: readonly BaseEntry[];
+  /** Trusted checkout identity function; must preserve path components and separators.
+   * Supply actual filesystem case/Unicode equivalence, never a guessed platform default. */
+  pathKey: (path: string) => string;
+  /** Exact complete argv arrays, already approved in Settings. */
   allowedCommands: readonly (readonly string[])[];
-  issue?: number;
+  issue: number;
 }
 export interface Validation { errors: Diagnostic[]; warnings: Diagnostic[] }
 export class PlanError extends Error {
@@ -45,6 +52,10 @@ export class PlanError extends Error {
   }
 }
 const ajv = new Ajv2020({ allErrors: true, strict: true });
+const v1 = registry.versions['1'];
+if (v1.validator !== 'v1' || v1.plan !== 'versions/1/plan.schema.json' ||
+    v1.edit !== 'versions/1/plan-edit.schema.json' || v1.semantics !== 'versions/1/semantics.md')
+  throw new Error('Unsupported v1 registry dispatch.');
 const planShape = ajv.compile<Plan>(planSchema);
 const replyShape = ajv.compile<EditReply>(editSchema);
 
@@ -68,7 +79,7 @@ export function isRepoPath(path: string): boolean {
 
 /** Small literal-argv grammar, deliberately not a shell parser. Never executes. */
 export function commandArgv(command: string): string[] {
-  if (/[\x00-\x1f\x7f]/u.test(command))
+  if (/[\\\x00-\x1f\x7f]/u.test(command))
     fail('command-syntax', 'Commands must contain literal arguments, not shell syntax.');
   const argv: string[] = [];
   let word = '', quote = '', started = false;
@@ -80,18 +91,35 @@ export function commandArgv(command: string): string[] {
     else if (char === ' ') {
       if (started) { argv.push(word); word = ''; started = false; }
     } else {
-      if (/[;&|<>`$\\*?{}~\[\]]/u.test(char)) fail('command-syntax', 'Shell syntax is not allowed.');
+      if (/[;&|<>`$\\*?{}~\[\]()!#]/u.test(char)) fail('command-syntax', 'Shell syntax is not allowed.');
       word += char; started = true;
     }
   }
   if (quote) fail('command-syntax', 'Unclosed quote in command.');
   if (started) argv.push(word);
-  if (!argv[0] || argv[0].includes('=') || argv[0].startsWith('-'))
+  if (!argv[0])
     fail('command-syntax', 'A command must start with an executable.');
   return argv;
 }
 export function commandAllowed(argv: readonly string[], allowed: PlanContext['allowedCommands']): boolean {
-  return allowed.some(prefix => prefix.length > 0 && prefix.every((part, i) => argv[i] === part));
+  return allowed.some(entry => entry.length > 0 && entry.length === argv.length && entry.every((part, i) => argv[i] === part));
+}
+
+function parents(path: string): string[] {
+  const parts = path.split('/'); return parts.slice(0, -1).map((_, i) => parts.slice(0, i + 1).join('/'));
+}
+function linkTarget(path: string, target: string, key: (path: string) => string, entries: ReadonlyMap<string, BaseEntry>): string | null {
+  if (!target || target.startsWith('/') || /[\\:\x00-\x1f\x7f]/u.test(target)) return null;
+  const parts = path.split('/').slice(0, -1);
+  for (const component of target.split('/')) {
+    if (component === '' || component === '.') continue;
+    if (component === '..') { if (!parts.length) return null; parts.pop(); }
+    else {
+      parts.push(component);
+      try { if (entries.get(key(parts.join('/')))?.kind === 'symlink') return null; } catch { return null; }
+    }
+  }
+  try { return parts.length ? key(parts.join('/')) : ''; } catch { return null; }
 }
 
 export function validatePlan(value: unknown, context: PlanContext): Validation {
@@ -99,15 +127,61 @@ export function validatePlan(value: unknown, context: PlanContext): Validation {
     if (error instanceof PlanError) return { errors: error.diagnostics, warnings: [] };
     throw error;
   }
+  const validators: Record<string, (value: Plan, context: PlanContext) => Validation> = { v1: validateV1 };
+  const validator = validators[registry.versions[value.schema_version].validator];
+  if (!validator) return { errors: [{ code: 'version', message: 'Unsupported semantic validator.' }], warnings: [] };
+  return validator(value, context);
+}
+
+function validateV1(value: Plan, context: PlanContext): Validation {
+  try { assertPlan(value); } catch (error) {
+    if (error instanceof PlanError) return { errors: error.diagnostics, warnings: [] };
+    throw error;
+  }
   const errors: Diagnostic[] = [], warnings: Diagnostic[] = [];
   const error = (code: string, message: string, item?: string) => errors.push({ code, message, item });
-  if (context.issue !== undefined && value.issue !== context.issue)
+  try { identityKey(context.identity); } catch (err) { error('context', (err as Error).message); }
+  if (!Number.isSafeInteger(context.issue) || context.issue < 1)
+    error('context', 'A selected issue is required.');
+  if (value.issue !== context.issue)
     error('issue', 'Plan issue does not match the selected issue.');
   if (![value.issue, value.revision].every(Number.isSafeInteger)) error('integer-range', 'Issue and revision must be safe integers.');
-  const paths = new Set(context.baseFiles);
+  if (typeof context.pathKey !== 'function' || !Array.isArray(context.baseEntries)) {
+    error('context', 'Known checkout path identity and typed base entries are required.');
+    return { errors, warnings };
+  }
+  let projectedPlan: Plan;
+  const entries = new Map<string, BaseEntry>();
+  const key = (path: string): string => {
+    if (!isRepoPath(path)) throw new Error(`Unsafe or non-canonical path: ${path}`);
+    const identity = context.pathKey(path);
+    if (!isRepoPath(identity) || identity.split('/').length !== path.split('/').length)
+      throw new Error(`Invalid filesystem identity for ${path}`);
+    return identity;
+  };
+  // Validate on identity keys only; preserve source spelling in the returned plan.
+  try {
+    for (const entry of context.baseEntries) {
+      if (!['file', 'symlink', 'gitlink'].includes(entry.kind) ||
+          (entry.kind === 'symlink' && typeof entry.target !== 'string')) throw new Error('Invalid base entry type.');
+      const path = key(entry.path);
+      if (entries.has(path)) throw new Error(`Colliding base entries: ${entry.path}`);
+      entries.set(path, { ...entry, path });
+    }
+    projectedPlan = { ...value, items: value.items.map(item => ({ ...item, files: item.files.map(file => ({
+      ...file, path: key(file.path), renamed_from: file.renamed_from === null ? null : key(file.renamed_from),
+    })) })) };
+  } catch (err) {
+    error('path', (err as Error).message); return { errors, warnings };
+  }
+  const paths = new Set(entries.keys());
+  for (const path of paths) {
+    if (parents(path).some(parent => paths.has(parent))) error('context', `Base leaf occupies a parent: ${path}`);
+  }
+  if (errors.some(e => e.code === 'context')) return { errors, warnings };
   const producers = new Map<string, string>();
   const ancestry = new Map<string, Set<string>>();
-  for (const item of value.items) {
+  for (const item of projectedPlan.items) {
     if (ancestry.has(item.id)) error('duplicate-id', `Duplicate item ID ${item.id}.`, item.id);
     const ancestors = new Set<string>();
     for (const dep of item.depends_on) {
@@ -138,17 +212,43 @@ export function validatePlan(value: unknown, context: PlanContext): Validation {
           error('dependency', `${path} depends on ${producer}.`, item.id);
       }
       const source = file.kind === 'rename' ? file.renamed_from! : file.path;
+      if (entries.get(source)?.kind === 'gitlink') error('gitlink', 'Gitlinks are review-only in v1.', item.id);
       if (file.kind !== 'add' && !paths.has(source)) error('missing-file', `Missing source: ${source}`, item.id);
       if ((file.kind === 'add' || file.kind === 'rename') &&
           (paths.has(file.path) || [...paths].some(path => path.startsWith(`${file.path}/`))))
         error('existing-file', `Destination is occupied: ${file.path}`, item.id);
     }
+    for (const file of item.files) {
+      const source = file.kind === 'rename' ? file.renamed_from! : file.path;
+      const entry = entries.get(source);
+      if (entry?.kind !== 'symlink') continue;
+      // New target values are intentionally not inferred from prose. Runtime must
+      // audit link lineage, old/new targets, and target mutations before commits.
+      for (const location of new Set([source, file.path])) {
+        const target = linkTarget(location, entry.target, key, entries);
+        const traversesLink = target !== null && [...parents(target), target].some(p => entries.get(p)?.kind === 'symlink');
+        if (target === null || traversesLink) {
+          if (file.kind !== 'delete' && file.kind !== 'edit') error('symlink-target', 'Retained link target is unsafe.', item.id);
+          continue; // Deletion or replacement may repair an unsafe old link.
+        }
+        for (const other of item.files) {
+          if (other === file) continue;
+          const otherPaths = other.kind === 'rename' ? [other.path, other.renamed_from!] : [other.path];
+          if (otherPaths.some(p => p === target || target === '' || p.startsWith(`${target}/`)))
+            error('symlink-target', 'A link and its writable target cannot share an invocation.', item.id);
+        }
+      }
+    }
     if (errors.length === beforeErrors) for (const file of item.files) {
+      const sourceEntry = entries.get(file.kind === 'rename' ? file.renamed_from! : file.path);
       if (file.kind === 'delete' || file.kind === 'rename') {
         const source = file.kind === 'rename' ? file.renamed_from! : file.path;
-        paths.delete(source); producers.set(source, item.id);
+        paths.delete(source); entries.delete(source); producers.set(source, item.id);
       }
-      if (file.kind === 'add' || file.kind === 'rename') { paths.add(file.path); producers.set(file.path, item.id); }
+      if (file.kind === 'add' || file.kind === 'rename') {
+        paths.add(file.path); producers.set(file.path, item.id);
+        entries.set(file.path, file.kind === 'rename' ? { ...sourceEntry!, path: file.path } : { path: file.path, kind: 'file' });
+      }
     }
     if (!item.acceptance.some(check => check.type === 'cmd'))
       warnings.push({ code: 'no-test-command', message: 'No test command.', item: item.id });
@@ -168,18 +268,11 @@ export function validatePlan(value: unknown, context: PlanContext): Validation {
   return { errors, warnings };
 }
 
-export function importPlan(source: string, format: 'json' | 'yaml', context: PlanContext, revision: number): { plan: Plan; warnings: Diagnostic[] } {
+export function importPlan(source: string | Uint8Array, format: 'json' | 'yaml', context: PlanContext, revision: number): { plan: Plan; warnings: Diagnostic[] } {
   if (!Number.isSafeInteger(revision) || revision < 1) fail('revision', 'Revision must be a positive safe integer.');
-  if (source.length > 1_000_000) fail('input-size', 'Plan input exceeds 1 MB.');
   let data: unknown;
-  try {
-    if (format === 'json') data = JSON.parse(source);
-    else {
-      const doc = parseDocument(source, { uniqueKeys: true, version: '1.2' });
-      if (doc.errors.length || doc.warnings.length) throw new Error([...doc.errors, ...doc.warnings].map(e => e.message).join('; '));
-      data = doc.toJS({ maxAliasCount: 0 });
-    }
-  } catch (error) { fail('parse', `Cannot parse plan: ${(error as Error).message}`); }
+  try { data = parseV1(source, format); }
+  catch (error) { fail('parse', `Cannot parse plan: ${(error as Error).message}`); }
   assertPlan(data); // No migrations exist yet: only released v1 is accepted.
   const result = validatePlan(data, context);
   if (result.errors.length) throw new PlanError(result.errors);
@@ -192,9 +285,19 @@ const used: Record<PlanEdit['op'], readonly typeof payloads[number][]> = {
   add_file: ['file'], update_file: ['file'], remove_file: ['value'],
   add_check: ['check'], remove_check: ['check_index'], set_depends: ['depends_on'],
 };
-/** Pure transformation. The future store must compare-and-swap revision when persisting. */
-export function applySuggestion(plan: Plan, reply: unknown, index: number, context: PlanContext): Plan {
+/** Captured by the trusted server when requesting suggestions, not when Apply is clicked. */
+export interface SuggestionBinding {
+  identity: PlanIdentity; schemaVersion: number; baseRevision: number; issue: number;
+}
+/** Pure transformation. The store must load this binding by opaque suggestion ID,
+ * verify cancellation/consumption, and CAS revision plus consume/invalidate IDs atomically.
+ * This function cannot provide persistence, replay prevention, or concurrency control. */
+export function applySuggestion(plan: Plan, reply: unknown, index: number, context: PlanContext, binding: SuggestionBinding): Plan {
   assertPlan(plan); assertEditReply(reply);
+  if (!binding || identityKey(binding.identity) !== identityKey(context.identity) ||
+      binding.schemaVersion !== plan.schema_version || binding.baseRevision !== reply.base_revision ||
+      binding.issue !== plan.issue || context.issue !== plan.issue)
+    fail('suggestion-identity', 'Suggestion does not belong to this plan context.');
   if (reply.base_revision !== plan.revision) fail('stale-revision', 'Suggestion was drafted against a different revision.');
   if (!Number.isInteger(index) || !reply.edits[index]) fail('edit-index', 'Suggestion index is out of range.');
   const edit = reply.edits[index]!;

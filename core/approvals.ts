@@ -1,3 +1,4 @@
+import { identityKey, type PlanIdentity } from './identity.ts';
 import type { Plan, PlanItem } from './plan.ts';
 import type { Segment } from './linking.ts';
 
@@ -11,16 +12,17 @@ function stable(value: unknown): string {
 const contentKey = (s: Segment) => stable({ path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation, content: s.content });
 export interface SegmentChoice { key: string; action: 'assign' | 'accept'; item: string | null }
 /** Position among identical segments and total copies prevent approval transfer. */
-export function choiceKeys(segments: readonly Segment[]): string[] {
+export function choiceKeys(segments: readonly Segment[], identity: PlanIdentity): string[] {
+  const identityValue = identityKey(identity);
   const counts = new Map<string, number>(), seen = new Map<string, number>();
   for (const segment of segments) { const key = contentKey(segment); counts.set(key, (counts.get(key) ?? 0) + 1); }
   return segments.map(segment => {
     const key = contentKey(segment), copy = (seen.get(key) ?? 0) + 1; seen.set(key, copy);
-    return stable([key, copy, counts.get(key)]);
+    return stable([identityValue, key, copy, counts.get(key)]);
   });
 }
-export function applyChoices(plan: Plan, segments: readonly Segment[], choices: readonly SegmentChoice[]): Segment[] {
-  const keys = choiceKeys(segments);
+export function applyChoices(plan: Plan, segments: readonly Segment[], choices: readonly SegmentChoice[], identity: PlanIdentity): Segment[] {
+  const keys = choiceKeys(segments, identity);
   const byKey = new Map(choices.map(choice => [choice.key, choice]));
   return segments.map((segment, i) => {
     const choice = byKey.get(keys[i]!);
@@ -31,23 +33,23 @@ export function applyChoices(plan: Plan, segments: readonly Segment[], choices: 
   });
 }
 export interface Approval { item: string; fingerprint: string }
-function fingerprint(item: PlanItem, segments: readonly Segment[]): string {
-  return stable({ item, segments: segments.filter(s => s.row === item.id).map(s => ({
+function fingerprint(item: PlanItem, segments: readonly Segment[], identity: PlanIdentity): string {
+  return stable({ identity: identityKey(identity), item, segments: segments.filter(s => s.row === item.id).map(s => ({
     path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
     content: s.content, context: s.context, owners: [...s.owners].sort(),
   })) });
 }
-export function approveItem(plan: Plan, segments: readonly Segment[], itemId: string, confirmNoChange = false): Approval {
+export function approveItem(plan: Plan, segments: readonly Segment[], itemId: string, identity: PlanIdentity, confirmNoChange = false): Approval {
   const item = plan.items.find(item => item.id === itemId);
   if (!item) throw new Error('Unknown item.');
   if (!segments.some(segment => segment.row === itemId) && !confirmNoChange) throw new Error('Confirm no change needed before approving.');
-  return { item: itemId, fingerprint: fingerprint(item, segments) };
+  return { item: itemId, fingerprint: fingerprint(item, segments, identity) };
 }
-export function approvalStates(plan: Plan, segments: readonly Segment[], approvals: readonly Approval[]): Record<string, 'unreviewed' | 'approved' | 'stale'> {
+export function approvalStates(plan: Plan, segments: readonly Segment[], approvals: readonly Approval[], identity: PlanIdentity): Record<string, 'unreviewed' | 'approved' | 'stale'> {
   const result: Record<string, 'unreviewed' | 'approved' | 'stale'> = Object.create(null);
   for (const item of plan.items) {
     const approval = approvals.find(approval => approval.item === item.id);
-    result[item.id] = !approval ? 'unreviewed' : approval.fingerprint !== fingerprint(item, segments) ||
+    result[item.id] = !approval ? 'unreviewed' : approval.fingerprint !== fingerprint(item, segments, identity) ||
       item.depends_on.some(dep => result[dep] === 'stale') ? 'stale' : 'approved';
   }
   return result;

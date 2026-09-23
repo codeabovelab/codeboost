@@ -5,7 +5,12 @@ import { execFileSync } from 'node:child_process';
 import { afterEach, expect, it } from 'vitest';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
-import { approveItem, approvalStates, applyChoices, choiceKeys } from '../core/approvals.ts';
+import { approveItem as approveBound, approvalStates as statesBound, applyChoices as choicesBound, choiceKeys as keysBound } from '../core/approvals.ts';
+const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+const approveItem = (plan: Parameters<typeof approveBound>[0], segments: Parameters<typeof approveBound>[1], id: string, confirm = false) => approveBound(plan, segments, id, identity, confirm);
+const approvalStates = (plan: Parameters<typeof statesBound>[0], segments: Parameters<typeof statesBound>[1], approvals: Parameters<typeof statesBound>[2]) => statesBound(plan, segments, approvals, identity);
+const applyChoices = (plan: Parameters<typeof choicesBound>[0], segments: Parameters<typeof choicesBound>[1], choices: Parameters<typeof choicesBound>[2]) => choicesBound(plan, segments, choices, identity);
+const choiceKeys = (segments: Parameters<typeof keysBound>[0]) => keysBound(segments, identity);
 import type { Plan } from '../core/plan.ts';
 
 const dirs: string[] = [];
@@ -22,7 +27,7 @@ function fixture(initial: Record<string, string> = { 'a.txt': 'one\ntwo\nthree\n
   const plan: Plan = { schema_version: 1, issue: 1, revision: 1, summary: 'Test', questions: [], items: ['P1', 'P2'].map(id => ({
     id, title: id, intent: 'Change', files: [{ path: 'a.txt', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [],
   })) };
-  const segments = () => linkHistory(plan, readHistory(dir, base), ledger);
+  const segments = () => linkHistory(plan, readHistory(dir, base), ledger, path => path);
   return { dir, git, write, commit, base, ledger, plan, segments };
 }
 it('splits a shared hunk by ledger owner; detects out-of-scope and forged trailers', () => {
@@ -73,7 +78,7 @@ it('keeps approvals after a clean rebase and remapped ledger, but stales changed
   const parts = f.segments(); const approvals = [approveItem(f.plan, parts, 'P1'), approveItem(f.plan, parts, 'P2', true)];
   f.git('switch', 'main'); f.write('unrelated', 'base update'); const newBase = f.commit(); f.git('switch', 'feature'); f.git('rebase', 'main');
   const newSha = f.git('rev-parse', 'HEAD'); f.ledger.delete(oldSha); f.ledger.set(newSha, 'P1');
-  const rebased = linkHistory(f.plan, readHistory(f.dir, newBase), f.ledger);
+  const rebased = linkHistory(f.plan, readHistory(f.dir, newBase), f.ledger, path => path);
   expect(approvalStates(f.plan, rebased, approvals)).toEqual({ P1: 'approved', P2: 'approved' });
   f.plan.items[1]!.depends_on = ['P1']; const p2 = approveItem(f.plan, rebased, 'P2', true);
   f.plan.items[0]!.acceptance[0]!.text = 'Different check';
@@ -133,7 +138,7 @@ it('reads the whole repository even when called from a subdirectory with relativ
   const f = fixture({ 'a.txt': 'before\n', 'sub/b.txt': 'before\n' });
   f.write('a.txt', 'after\n'); f.write('sub/b.txt', 'after\n'); f.commit('P1');
   f.git('config', 'diff.relative', 'true');
-  const parts = linkHistory(f.plan, readHistory(join(f.dir, 'sub'), f.base), f.ledger);
+  const parts = linkHistory(f.plan, readHistory(join(f.dir, 'sub'), f.base), f.ledger, path => path);
   expect(new Set(parts.map(s => s.path))).toEqual(new Set(['a.txt', 'sub/b.txt']));
 });
 it('checks scope at each owning commit, not against both ends of a final rename', () => {
@@ -233,4 +238,22 @@ it.each([
   const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
   expect(() => readHistory(f.dir, f.base, 'HEAD', limits)).toThrow(error);
   expect(readHistory(f.dir, f.base, 'HEAD', { maxFileEntries: 2 }).final).toHaveLength(1);
+});
+
+it('uses checkout identity for scope and treats explicit null ledger owners as foreign', () => {
+  const f = fixture(); f.plan.items[0]!.files[0]!.path = 'A.TXT';
+  f.write('a.txt', 'ONE\ntwo\nthree\n'); const sha = f.commit('P1');
+  const history = readHistory(f.dir, f.base);
+  const parts = linkHistory(f.plan, history, f.ledger, path => path.toLowerCase());
+  expect(parts.length).toBeGreaterThan(0);
+  expect(parts.every(s => s.scope === 'in-scope')).toBe(true);
+  expect(linkHistory(f.plan, history, new Map([[sha, null]]), path => path).every(s => s.row === 'Unplanned')).toBe(true);
+});
+it('records typed object identities on real mode-change cards', () => {
+  const f = fixture(); chmodSync(join(f.dir, 'a.txt'), 0o755); f.commit('P1');
+  const card = f.segments().find(s => s.kind === 'file'); expect(card).toBeDefined();
+  const metadata = JSON.parse(card!.content);
+  expect(metadata.oldObject.kind).toBe('blob'); expect(metadata.newObject.kind).toBe('blob');
+  expect(metadata.oldObject.oid).toBe(metadata.newObject.oid);
+  expect(metadata.oldMode).toBe('100644'); expect(metadata.newMode).toBe('100755');
 });
