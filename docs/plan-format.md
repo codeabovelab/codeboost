@@ -107,7 +107,7 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | `renamed_from` is set only for kind `rename`. | Failure |
 | The same path is not declared twice in one item. | Failure |
 | The item has at least one `cmd`. | Warning: "No test command" |
-| Each `cmd` is parsed as one executable and literal arguments, with the executable/subcommand matched exactly against the repo's allowed list. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
+| Each `cmd` is parsed as one executable and literal arguments, with the entire argv matched element-for-element against a repo-approved argv entry. Prefix matches, appended flags, extra arguments, and argument substitution are not allowed. An unlisted argv needs the person's explicit approval as a new exact allowlist entry; plan approval alone does not grant execution permission. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
 | A completed agent invocation changes a dependency or a script codeboost will run. | Before its own installation or script invocation, codeboost stops in "needs approval". This post-invocation gate cannot prevent an agent from executing a changed script during its invocation; container and network restrictions must already contain that execution. |
 | `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
 
