@@ -226,7 +226,10 @@ Nothing else from your computer is inside. So `~/.ssh`, `~/.config/gh`, `~/.npmr
 | Build caches point inside the scratch folders (for example `GOCACHE`, `npm_config_cache`). | Caches do not need a writable root. |
 | Runs as a non-root user; all Linux capabilities dropped (`--cap-drop=ALL`); `--security-opt=no-new-privileges` | The agent cannot become root or use privileged system calls. |
 | No `--privileged`, no `--device`, no host network, no Docker socket, and no host mounts other than `/work` and the read-only sign-in file | Nothing on the host is reachable through the container. |
-| Limits on processes, memory, and CPU (`--pids-limit`, `--memory`, `--cpus`) | A runaway agent cannot slow down your computer. |
+| Limits on processes, memory, and CPU (`--pids-limit`, `--memory`, `--cpus`) | Bound the agent's consumption of these resources; they do not guarantee zero host performance impact. |
+| `/work` lives on a dedicated size-limited task filesystem with hard byte and inode limits, allocated before the invocation; never an unbounded host-directory bind | Large output and many tiny files fail inside the task filesystem instead of growing without limit on the host. |
+
+**Disk enforcement.** The runner requires configured per-task byte/inode caps and a total task-storage pool cap. Allocate/reserve the backing storage before the agent starts, leaving configured host free-space headroom; do not use a grow-on-demand backing file that can exhaust the host. Refuse to start if the platform cannot enforce the caps. Scratch tmpfs mounts have their own size/inode limits. The startup/CI probe must attempt to exceed byte and inode limits and confirm writes fail without consuming storage beyond the allocated pool. Post-run checks alone are not a disk guard.
 
 So the only place an agent can change something that lasts is `/work`, and codeboost checks every change there against the declared files before it commits (see "Checks after import" and "After each run" in `docs/plan-format.md`).
 
@@ -1909,7 +1912,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T9 (P1, human: ~2 weeks / CC: ~3 hours)** — tests — Set up Vitest, real git, recorded gh and CLI outputs, the real-Docker CI suite, Playwright, and the hostile-issue eval
   - Surfaced by: T1 (D10: A)
   - Files: test/, .github/workflows/
-  - Verify: CI runs every suite; the Docker suite fails if isolation breaks, a read-only phase can write `/work`, or planning/questions can execute a process
+  - Verify: CI runs every suite; the Docker suite fails if isolation breaks, a read-only phase can write `/work`, planning/questions can execute a process, or task/scratch byte and inode caps can be exceeded
 - [ ] **T10 (P2, human: ~2 hours / CC: ~10 min)** — core — Duplicate-segment key: file, content, copy number, and copy count
   - Surfaced by: R4 (D5: A), O1 (D11: A)
   - Files: core/choices
