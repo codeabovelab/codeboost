@@ -1,0 +1,9 @@
+{
+  "compilerOptions": {
+    "target": "ES2024", "module": "NodeNext", "moduleResolution": "NodeNext",
+    "strict": true, "noUncheckedIndexedAccess": true, "resolveJsonModule": true,
+    "esModuleInterop": true, "skipLibCheck": true, "noEmit": true,
+    "allowImportingTsExtensions": true, "types": ["node"]
+  },
+  "include": ["core/**/*.ts", "git/**/*.ts", "test/**/*.ts"]
+}
