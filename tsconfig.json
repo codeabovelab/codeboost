@@ -1,9 +1,26 @@
 {
   "compilerOptions": {
-    "target": "ES2024", "module": "NodeNext", "moduleResolution": "NodeNext",
-    "strict": true, "noUncheckedIndexedAccess": true, "resolveJsonModule": true,
-    "esModuleInterop": true, "skipLibCheck": true, "noEmit": true,
-    "allowImportingTsExtensions": true, "types": ["node"]
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "resolveJsonModule": true,
+    "esModuleInterop": true,
+    "skipLibCheck": true,
+    "noEmit": true,
+    "allowImportingTsExtensions": true,
+    "types": [
+      "node"
+    ]
   },
-  "include": ["core/**/*.ts", "git/**/*.ts", "runner/**/*.ts", "test/**/*.ts"]
+  "include": [
+    "core/**/*.ts",
+    "git/**/*.ts",
+    "runner/**/*.ts",
+    "test/**/*.ts",
+    "web/**/*.ts",
+    "scripts/**/*.ts",
+    "playwright.config.ts"
+  ]
 }

@@ -328,3 +328,10 @@ it('rejects shallow parent rewriting before loading history', () => {
   f.write('.git/shallow', `${head}\n`);
   expect(() => readHistory(f.dir, f.base, head)).toThrow(/shallow/i);
 });
+it('omits raster previews with oversized declared dimensions', () => {
+ const f=fixture(); const base=f.git('rev-parse','HEAD');
+ const image=Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/lXsAAAAASUVORK5CYII=','base64');
+ image.writeUInt32BE(100000,16);image.writeUInt32BE(100000,20);
+ f.write('oversized.png',image);const head=f.commit();
+ expect(readHistory(f.dir,base,head).final.find(file=>file.newPath==='oversized.png')?.after?.preview).toBeUndefined();
+});
