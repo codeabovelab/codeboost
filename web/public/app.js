@@ -397,7 +397,7 @@ document.addEventListener("keydown", (event) => {
     event.metaKey ||
     event.altKey ||
     $("dialog").open ||
-    ["TEXTAREA", "INPUT", "SELECT", "BUTTON"].includes(
+    ["TEXTAREA", "INPUT", "SELECT"].includes(
       document.activeElement?.tagName,
     ) ||
     !data

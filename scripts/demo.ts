@@ -1,17 +1,30 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, lstatSync } from 'node:fs';
 import { resolve, join } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { Store } from '../runner/store.ts';
 import type { ReviewConfig } from '../runner/review.ts';
 import type { Plan } from '../core/plan.ts';
+import { isolatedGitEnvironment } from './git-environment.ts';
 /** Disposable fixture only. Never runs against the user's working repository. */
 export function createDemo(directory: string): ReviewConfig {
   const root = resolve(directory), configPath = join(root, 'review.json');
-  if (existsSync(configPath)) return JSON.parse(readFileSync(configPath, 'utf8')) as ReviewConfig;
+  if (existsSync(root) && lstatSync(root).isSymbolicLink()) throw new Error('Demo fixture root must not be a symlink.');
+  if (existsSync(configPath)) {
+    const check = (path: string, directory: boolean) => {
+      const stat = lstatSync(path);
+      if (stat.isSymbolicLink() || (directory ? !stat.isDirectory() : !stat.isFile())) throw new Error('Demo fixture paths must be ordinary local files and directories.');
+    };
+    check(configPath, false);
+    const config = JSON.parse(readFileSync(configPath, 'utf8')) as ReviewConfig;
+    if (config.demo !== true || config.repository !== join(root, 'retry-service') || config.database !== join(root, 'review.sqlite')) throw new Error('Demo configuration must refer to its own fixture.');
+    check(config.repository, true); check(join(config.repository, '.git'), true); check(config.database, false);
+    for (const suffix of ['-wal', '-shm']) if (existsSync(config.database + suffix)) check(config.database + suffix, false);
+    return config;
+  }
   if (existsSync(root)) throw new Error('Demo directory exists without a configuration. Choose a new empty path.');
   mkdirSync(root, { recursive: true }); const repository = join(root, 'retry-service'); mkdirSync(repository);
-  const git = (...args: string[]) => execFileSync('git', ['-c','core.hooksPath=/dev/null',...args], { cwd: repository, encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }).trim();
+  const git = (...args: string[]) => execFileSync('git', ['-c','core.hooksPath=/dev/null',...args], { cwd: repository, env: isolatedGitEnvironment(), encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }).trim();
   git('init','-b','main'); git('config','user.name','Codeboost Demo'); git('config','user.email','demo@example.invalid'); git('config','commit.gpgsign','false');
   const write = (path: string, text: string | Buffer) => writeFileSync(join(repository,path),text);
   const commit = (message: string) => { git('add','-A');git('commit','-m',message);return git('rev-parse','HEAD'); };

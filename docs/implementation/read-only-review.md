@@ -38,3 +38,7 @@ Reproduced and fixed no-change approval with item-owned ambiguous segments; the 
 ## Review round 2
 
 Extended the attribution guard to mixed items with both owned and ambiguous segments. The regression reproduced ordinary approval succeeding with unresolved attribution. Approval now rejects any item-specific ambiguity, previously approved affected items become stale, and the UI routes every such item to attribution resolution. Added browser coverage for this mixed case. No findings declined.
+
+A toolbar-focus browser regression reproduced review shortcuts being disabled while a button had focus. Only text-entry/select controls now suppress the single-letter shortcuts; native Enter/Space button behavior is unchanged. The plan-row click case already worked because rendering replaces the focused row.
+
+Review round 3 identified demo fixture config escapes and inherited Git environment redirection. Regression checks first reproduced the config, symlink, and environment failures. Existing demos now require exact fixture paths and ordinary config/database/repository objects (including `.git` and SQLite sidecars). Demo and plant Git commands share a case-insensitive environment scrub and disable inherited global/system Git configuration. Four helper tests cover these boundaries, including mixed-case variable names for Windows.

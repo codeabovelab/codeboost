@@ -74,3 +74,6 @@ test('routes mixed owned and ambiguous items to attribution resolution',async({p
  const head=execFileSync('git',['rev-parse','HEAD'],{cwd:repository,encoding:'utf8'}).trim(),snapshot=app.service.store.getSnapshot(identity);app.service.store.recordHistory(identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
  await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByRole('button',{name:'Resolve ambiguous changes',exact:true}).click();await expect(page.getByRole('heading',{name:'Ambiguous',exact:true})).toBeVisible();
 });
+test('keeps review shortcuts active while a toolbar button has focus',async({page})=>{
+ await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();await page.getByRole('button',{name:'Refresh',exact:true}).focus();await page.keyboard.press('n');await expect(page.getByRole('heading',{name:'Document retry behavior'})).toBeVisible();
+});

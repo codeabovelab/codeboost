@@ -1,3 +1,4 @@
+import { isolatedGitEnvironment } from './git-environment.ts';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, lstatSync, readFileSync } from 'node:fs';
 import { resolve, join, dirname } from 'node:path';
@@ -29,7 +30,7 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
   const declared=candidates[randomInt(candidates.length)]!;
   const owned=history.commits.map((commit,index)=>({index,owner:owners.get(commit.sha)})).filter(entry=>entry.owner&&plan!.items.some(item=>item.id===entry.owner));
   const outside=owned[randomInt(owned.length)]!;
-  const env={...Object.fromEntries(Object.entries(process.env).filter(([key])=>!key.startsWith('GIT_'))),GIT_CONFIG_NOSYSTEM:'1',GIT_CONFIG_GLOBAL:'/dev/null'};
+  const env=isolatedGitEnvironment();
   const gitRaw=(cwd:string,...args:string[])=>execFileSync('git',['-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false',...args],{cwd,env,encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:30000,maxBuffer:32*1024*1024});
   const git=(cwd:string,...args:string[])=>gitRaw(cwd,...args).trim();
   // Refuse existing paths, symlink targets, and unsupported declared-file transitions before creating output.
