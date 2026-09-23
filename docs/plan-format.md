@@ -61,7 +61,7 @@
 
 | Field | Type | Rule |
 |---|---|---|
-| `type` | `cmd` or `check` | `cmd` runs in the agent's container and passes when it exits with 0. `check` is a statement the review agent judges. |
+| `type` | `cmd` or `check` | `cmd` is one program and its literal arguments, such as `go test ./... -run TestRetry`. codeboost runs it in the agent's container without a shell, so pipes, redirects, `;`, `&&`, `$( )`, and variables are not allowed. It passes when it exits with 0. `check` is a statement the review agent judges. |
 | `text` | text | The command, or the statement. |
 
 **Every field is always present.** A field with nothing to say is `null` or `[]`, never left out. This is what lets the same schema work with both agents' strict answer modes.
@@ -100,6 +100,7 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | Item IDs are unique. | Failure |
 | Every `depends_on` ID exists, comes earlier in the list, and there is no loop. | Failure |
 | A path has no `..` part and stays inside the repo. | Failure |
+| No part of `path` or `renamed_from` is a symlink in the projected state, and neither points into `.git`. codeboost checks each folder and the file itself without following links. A plan that needs to change a symlink must declare the link itself; its target is never edited through it. | Failure |
 | File operations are valid in the projected repo state immediately before the item runs (see below). `edit` and `delete` need an existing path; `add` needs an unused path; `rename` needs an existing `renamed_from` and an unused destination `path`. | Failure |
 | `renamed_from` is set only for kind `rename`. | Failure |
 | The same path is not declared twice in one item. | Failure |
@@ -107,6 +108,8 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 | Each `cmd` is parsed as one executable and literal arguments, with the executable/subcommand matched exactly against the repo's allowed list. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
 | A `cmd` changes a dependency or a script codeboost runs. | The task stops in "needs approval" when it runs, as for any such change |
 | `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
+
+**After each run, codeboost checks the result too.** A plan check alone cannot stop an agent from creating a new symlink and writing through it. So after each invocation, before committing, codeboost: rejects any change outside the declared files (as today, out of scope); rejects a new or changed symlink that the item did not declare, and any symlink whose target leaves the repo or enters `.git`; and rejects any change to `.git` itself (config, hooks, refs, objects other than new ones). codeboost's own git commands on the task folder run with hooks turned off (`core.hooksPath=/dev/null`), so a planted hook never runs.
 
 **Projected file state.** Start with the paths at the plan's base commit, then walk items in their listed execution order. Check an item's file operations against the state before that item; after it passes, apply its declared additions, deletions, and renames to the projected state before checking the next item. No repo files change during validation. A path may participate in only one operation per item, counting both the source and destination of a rename. If an item uses a path created or renamed by an earlier item, it must depend on that item, directly or through other dependencies.
 

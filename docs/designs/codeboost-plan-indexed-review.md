@@ -212,10 +212,23 @@ It ignores this task's own PR, any draft PRs it opened earlier, and its own comm
 - Every invocation records which comments it was given.
 
 **The container (the real safety boundary).** Changed by the engineering review, R1 (answer D2: B). Every invocation, of every phase, runs inside a Docker or Podman container. The agent tool itself runs inside it. The container holds only:
-- the task's folder, including its own `.git` (O6), mounted as `/work`. This is the only folder the agent can write to;
+- the task's folder, including its own `.git` (O6), mounted as `/work`. This is the only project folder the agent can write to;
 - the agent's own sign-in. For Codex, that is its `auth.json` from `CODEX_HOME`, mounted read-only. For Claude, it is a long-lived token made with `claude setup-token`, passed as an environment variable. (On macOS, Claude keeps its normal sign-in in the keychain, which a container cannot read.)
 
 Nothing else from your computer is inside. So `~/.ssh`, `~/.config/gh`, `~/.npmrc`, `~/.aws`, `~/.docker`, and your git credential helper simply are not there. The container's `HOME` is its own empty folder.
+
+**How the container is locked down.** Docker and Podman leave a container's own files writable by default. So codeboost starts every agent container with these settings, and a start-up self-test fails the run if any is missing:
+
+| Setting | Why |
+|---|---|
+| Read-only root filesystem (`--read-only`) | The agent cannot change the tools in the image, such as `git`, `go`, or the agent CLI itself. |
+| Writable scratch only as size-limited in-memory folders (`--tmpfs`): `/tmp` and the empty `HOME`. Both are emptied when the container ends. | Tools that need scratch space still work, and nothing written there outlives the invocation or reaches the task's code. |
+| Build caches point inside the scratch folders (for example `GOCACHE`, `npm_config_cache`). | Caches do not need a writable root. |
+| Runs as a non-root user; all Linux capabilities dropped (`--cap-drop=ALL`); `--security-opt=no-new-privileges` | The agent cannot become root or use privileged system calls. |
+| No `--privileged`, no `--device`, no host network, no Docker socket, and no host mounts other than `/work` and the read-only sign-in file | Nothing on the host is reachable through the container. |
+| Limits on processes, memory, and CPU (`--pids-limit`, `--memory`, `--cpus`) | A runaway agent cannot slow down your computer. |
+
+So the only place an agent can change something that lasts is `/work`, and codeboost checks every change there against the declared files before it commits (see "Checks after import" and "After each run" in `docs/plan-format.md`).
 
 **Network (engineering review, R2, answer D3: A).** The container sits on an internal network. A small proxy lets it reach only the agent vendor's API hosts, and the host list is pinned with each image version. As a second layer, codeboost turns off the agent's own ways to reach the web: for Claude, `--disallowedTools WebFetch,WebSearch` and `--strict-mcp-config` with no servers; for Codex, web search is turned off. So a hostile issue cannot make the agent send your code to an outside server.
 
@@ -1552,7 +1565,7 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Bu
 
 State: approved
 Actual answer: A) Apply this change (answer to D18, 2026-09-22)
-Accepted scope: build step 2 is a read-only review screen (rows, segments, three checks, approvals, per-item conversation; no merging). The merge gate, pre-merge sequence, and `gh` merge become build step 4, right after the go/no-go check. Later steps renumber: running agents 5, planning 6, queue 7, issue list 8. Design sections amended: Build order and the go/no-go check.
+Accepted scope: build step 2 is a read-only review screen (rows, segments, four checks, approvals, per-item conversation; no merging). The merge gate, pre-merge sequence, and `gh` merge become build step 4, right after the go/no-go check. Later steps renumber: running agents 5, planning 6, queue 7, issue list 8. Design sections amended: Build order and the go/no-go check.
 History: an earlier draft of this record bundled the experiment design; it was split into O8 and O9 before being asked.
 
 ### O9: Writing the go/no-go experiment down before running it
@@ -1862,7 +1875,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T1 (P1, human: ~3 days / CC: ~1 hour)** — agents — Build the pinned agent container that mounts only `/work` (with its own `.git`) and the agent's sign-in
   - Surfaced by: R1 (D2: B), O6 (D16: A)
   - Files: agents/container/, git/clone
-  - Verify: real-Docker test shows only `/work` and sign-in; `git status` works inside; the main repo path is absent; changing a task-clone object in disposable repos leaves the source object unchanged
+  - Verify: real-Docker test shows only `/work` and sign-in; writing to `/`, `/usr/bin`, or the image's tools fails; `/tmp` and `HOME` are empty in each new container; the process is not root and has no capabilities; the start-up self-test refuses a container missing any lock-down setting; `git status` works inside; the main repo path is absent; changing a task-clone object in disposable repos leaves the source object unchanged
 - [ ] **T2 (P1, human: ~1 day / CC: ~30 min)** — agents — Add the vendor-only egress proxy and turn off web and MCP tools
   - Surfaced by: R2 (D3: A)
   - Files: agents/network/, agents/claude, agents/codex

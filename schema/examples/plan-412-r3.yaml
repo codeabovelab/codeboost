@@ -48,7 +48,7 @@ items:
         change: Add TestJitterStaysInBounds with a fixed seed.
     acceptance:
       - type: cmd
-        text: go test ./src/retry/... -run 'Jitter|Retry' -count=3
+        text: go test ./src/retry/... -count=3
       - type: check
         text: Delays stay within 75% to 125% of the base delay.
     depends_on: [P1]

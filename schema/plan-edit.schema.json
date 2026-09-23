@@ -275,7 +275,7 @@
       ],
       "properties": {
         "type": {
-          "description": "cmd: a shell command codeboost runs in the container; it passes when it exits 0. check: a statement the review agent judges against the code.",
+          "description": "cmd: one program and its literal arguments, for example go test ./... -run TestRetry. codeboost splits it into arguments and runs it in the container without a shell, so pipes, redirects, ;, &&, $(), backticks, and variables are not allowed; the program must be on the repo's allowed command list. It passes when it exits 0. check: a statement the review agent judges against the code.",
           "type": "string",
           "enum": [
             "cmd",
