@@ -5,5 +5,5 @@
     "esModuleInterop": true, "skipLibCheck": true, "noEmit": true,
     "allowImportingTsExtensions": true, "types": ["node"]
   },
-  "include": ["core/**/*.ts", "git/**/*.ts", "test/**/*.ts"]
+  "include": ["core/**/*.ts", "git/**/*.ts", "runner/**/*.ts", "test/**/*.ts"]
 }
