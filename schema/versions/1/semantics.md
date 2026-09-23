@@ -6,13 +6,13 @@
 ## Summary
 
 - A plan is a list of **plan items** for one GitHub issue. Each item says which files it will change, what changes in each file, and how to check the result.
-- One schema, [`schema/plan.schema.json`](../../../schema/plan.schema.json), defines the structure. It is the contract for three things:
+- One schema, [`schema/plan.schema.json`](./plan.schema.json), defines the structure. It is the contract for three things:
   1. **Generating.** codeboost gives the schema to Claude (`claude -p --json-schema`) or Codex (`codex exec --output-schema`), so the agent's answer always has the right shape.
   2. **Importing.** A plan in a YAML or JSON file, written by a person or another tool, is checked against the same schema.
-  3. **Suggesting.** The plan assistant's suggested edits follow a second schema, [`schema/plan-edit.schema.json`](../../../schema/plan-edit.schema.json).
+  3. **Suggesting.** The plan assistant's suggested edits follow a second schema, [`schema/plan-edit.schema.json`](./plan-edit.schema.json).
 - YAML and JSON have exactly the same structure. YAML is for people; JSON is what the agents return.
 - After the schema check, codeboost runs a second set of checks that a schema cannot express (see "Checks after import").
-- A full example: [`schema/examples/plan-412-r3.yaml`](../../../schema/examples/plan-412-r3.yaml).
+- A full example: [`schema/examples/plan-412-r3.yaml`](./examples/plan-412-r3.yaml).
 
 ## Terms
 
@@ -155,7 +155,7 @@ codeboost keeps the master copy in its own database. The copy in the PR descript
 
 ## Suggested edits (plan assistant)
 
-When you ask the plan assistant on the Plans screen for changes, it answers in the shape of [`schema/plan-edit.schema.json`](../../../schema/plan-edit.schema.json):
+When you ask the plan assistant on the Plans screen for changes, it answers in the shape of [`schema/plan-edit.schema.json`](./plan-edit.schema.json):
 
 - `reply`: its answer to you, in plain words;
 - `base_revision`: the revision it read. codeboost refuses edits made against an older revision;
@@ -177,7 +177,7 @@ When you ask the plan assistant on the Plans screen for changes, it answers in t
 
 To change a declared path or rename destination, import a complete replacement plan as a new revision and run all meaning checks. Separate add/remove suggestions are permitted only when each intermediate plan is valid; they are not an atomic path-change operation. Do not infer the old entry from prose or list position.
 
-Fields an operation does not use are `null`. The strict answer schema checks structure, not the relationship between `op` and its payload. Before showing an enabled Apply button, a semantic validator must enforce the operation table: required payloads are non-null, unused payloads are null, and `item` identifies an existing item except for `add_item`, where it matches the unique `new_item.id`. File updates/removals must target an existing entry; additions must not duplicate one; `check_index` must be in range; and `set_field` must satisfy the destination field's limits. Reject invalid suggestions with an explanation. Dry-run each edit on a copy and run both the plan schema and all meaning checks; repeat against the current revision atomically when Apply is clicked. Invalid edits never mutate the saved plan. An example: [`schema/examples/plan-edit-412-r3.json`](../../../schema/examples/plan-edit-412-r3.json).
+Fields an operation does not use are `null`. The strict answer schema checks structure, not the relationship between `op` and its payload. Before showing an enabled Apply button, a semantic validator must enforce the operation table: required payloads are non-null, unused payloads are null, and `item` identifies an existing item except for `add_item`, where it matches the unique `new_item.id`. File updates/removals must target an existing entry; additions must not duplicate one; `check_index` must be in range; and `set_field` must satisfy the destination field's limits. Reject invalid suggestions with an explanation. Dry-run each edit on a copy and run both the plan schema and all meaning checks; repeat against the current revision atomically when Apply is clicked. Invalid edits never mutate the saved plan. An example: [`schema/examples/plan-edit-412-r3.json`](./examples/plan-edit-412-r3.json).
 
 ## Versions
 

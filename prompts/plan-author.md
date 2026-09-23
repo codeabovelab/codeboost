@@ -1,10 +1,19 @@
 <!--
   codeboost prompt template: draft or revise a plan.
   Used for both Claude and Codex. codeboost fills every {{placeholder}} and passes
-  schema/plan.schema.json as the answer shape:
-    Claude: claude -p --json-schema "$(cat schema/plan.schema.json)" --output-format json
-    Codex:  codex exec --output-schema schema/plan.schema.json -o <file> < /dev/null
-  The agent runs in its container with no write access and no web access.
+  the registry-selected schema as the answer shape. Inside the phase container,
+  launch with the process API and an explicit environment (never a shell):
+    const schemaText = readFileSync(schemaPath, 'utf8');
+    const options = { cwd: workPath, env: phaseEnvironment,
+      shell: false, stdio: ['ignore', 'pipe', 'pipe'] };
+    execFileSync('claude', ['-p', promptText, '--json-schema', schemaText,
+      '--output-format', 'json'], options);
+    execFileSync('codex', ['exec', '--output-schema', schemaPath,
+      '-o', scratchOutputPath, promptText], options);
+  These are alternative vendor launches, not two calls for one request.
+  stdio 'ignore' closes stdin through the process API; schemaPath is selected
+  from the trusted registry and scratchOutputPath is runner-owned scratch.
+  The agent runs in its container with no project write access and no web access.
   Build issue_data_json with a JSON serializer from number, title, body, and
   comments; build previous_plan_json from the prior structured plan. Build
   repo_data_json as one object containing repo, base_ref, base_sha, repo_tree
