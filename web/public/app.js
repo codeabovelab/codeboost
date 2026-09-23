@@ -173,7 +173,7 @@ function render() {
           `<button class="plan-row ${row === selected ? "selected" : ""}" data-select="${row}"><span class="row-title ${row === "Unplanned" ? "bad" : row === "Ambiguous" ? "warn" : "muted"}">${row === "Unplanned" ? "✕" : row === "Ambiguous" ? "!" : "✓"} ${row}${row === "Unplanned" ? " changes" : ""}<span class="count">${data.segments.filter((s) => s.row === row).length}</span></span></button>`,
       )
       .join("") + retainedItems.map((id) =>
-        `<button class="plan-row ${id === selected ? "selected" : ""}" data-select="${esc(id)}"><span class="warn">! ${esc(id)} · Retained draft</span></button>`,
+        `<button class="plan-row ${id === selected ? "selected" : ""}" data-select="${esc(id)}" aria-current="${id === selected ? "true" : "false"}"><span class="warn">! ${esc(id)} · Retained draft</span></button>`,
       ).join("");
   document
     .querySelectorAll("[data-select]")

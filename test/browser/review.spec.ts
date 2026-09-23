@@ -288,8 +288,12 @@ for(const scenario of ['navigation','snapshot','removed item','failure']) test(`
  }
  if(scenario==='removed item'){
   await expect(page.locator('#item-details')).toContainText('no longer in the plan');await expect(page.locator('#save-note')).toBeDisabled();
+  await expect(page.getByRole('button',{name:'! P1 · Retained draft',exact:true})).toHaveAttribute('aria-current','true');
   await expect(page.getByRole('button',{name:/P1 Bound exponential retries/})).toHaveCount(0);
-  await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByRole('button',{name:'! P1 · Retained draft',exact:true}).click();
+  await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+  await expect(page.getByRole('button',{name:'! P1 · Retained draft',exact:true})).toHaveAttribute('aria-current','false');
+  await page.getByRole('button',{name:'! P1 · Retained draft',exact:true}).click();
+  await expect(page.getByRole('button',{name:'! P1 · Retained draft',exact:true})).toHaveAttribute('aria-current','true');
   await expect(page.locator('#message')).toHaveValue('Latest question');await expect(page.locator('#message')).toBeEnabled();
   expect(app.service.load().items.map(item=>item.id)).toEqual(['P2','P3']);
  }
