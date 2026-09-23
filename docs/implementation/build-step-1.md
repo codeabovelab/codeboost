@@ -41,6 +41,12 @@ Declined the claim that repository aliases can override `rev-parse`, `rev-list`,
 
 Fixed inherited Git environment redirection. A regression with `GIT_DIR` pointing at a second repository initially returned the foreign repository's content. The adapter now drops inherited `GIT_*` variables, ignores global/system Git configuration, and disables lazy fetch and transport access. The same regression now reads only the requested repository.
 
+## Review rounds 3–4
+
+Round 3 reviewed the pre-fix commit and repeated the environment finding; the existing fix resolved it. Round 4 exposed repository-local object alternates, reproduced by reading borrowed history from a second repository. The adapter now rejects an alternates file before resolving commits.
+
+Declined adding rename-only ownership to later text edits. The approved design represents a no-content rename as a separate file-change segment. A real-Git test confirms that a foreign rename remains an Unplanned file card while the later P2 text edit belongs to P2; the rename has not disappeared from review. Text edits before a rename still retain their line ancestry. Scope tests now explicitly require nonempty P2 rows.
+
 ## Remaining gates
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.

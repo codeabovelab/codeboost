@@ -43,7 +43,7 @@ Inputs such as `planText` and the ledger must come from the caller. The future `
 
 ## Current limits and safety
 
-- History must be linear and descend from the requested base. Merge histories are rejected with a rebase instruction. Reads are bounded to 500 commits, 32 MiB per Git response, and a 2-second budget per line diff; oversized work fails explicitly.
+- History must be linear and descend from the requested base. Merge histories are rejected with a rebase instruction; repositories using object alternates are rejected. Reads are bounded to 500 commits, 32 MiB per Git response, and a 2-second budget per line diff; oversized work fails explicitly.
 - Ownership uses line diffs, not semantic inference. Within one replacement block, new lines inherit all affected owners conservatively. Function context comes from Git hunk headers, not an AST.
 - The importer requires an accurate base-file list. It rejects path traversal, Git metadata paths, and traversal through a listed file/symlink/submodule. Runtime symlink and write-scope enforcement belong to the future container/runner; plan validation alone is not a sandbox.
 - Allowed commands restrict accidents, not hostile programs or changed scripts. Parsing returns argv and never executes it. An unlisted valid command is a warning and must not run until allowed.

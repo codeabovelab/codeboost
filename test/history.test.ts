@@ -142,6 +142,7 @@ it('checks scope at each owning commit, not against both ends of a final rename'
   f.plan.items[1]!.files = [{ path: 'b.txt', kind: 'edit', renamed_from: null, change: 'Edit new name' }];
   renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt')); f.commit('P1');
   f.write('b.txt', 'ONE\ntwo\nthree\n'); f.commit('P2');
+  expect(f.segments().some(s => s.row === 'P2')).toBe(true);
   expect(f.segments().filter(s => s.row === 'P2').every(s => s.scope === 'in-scope')).toBe(true);
   // Declaring only the old name must not authorize edits to the new one.
   f.plan.items[1]!.files[0]!.path = 'a.txt';
@@ -152,6 +153,7 @@ it('checks scope of deletion after a rename using the deleted current path', () 
   f.plan.items[1]!.files = [{ path: 'b.txt', kind: 'delete', renamed_from: null, change: 'Delete' }];
   renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt')); f.commit('P1');
   rmSync(join(f.dir, 'b.txt')); f.commit('P2');
+  expect(f.segments().some(s => s.row === 'P2')).toBe(true);
   expect(f.segments().filter(s => s.row === 'P2').every(s => s.scope === 'in-scope')).toBe(true);
 });
 
@@ -172,4 +174,22 @@ it('isolates repository selection from inherited Git environment variables', () 
   } finally {
     if (previous === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = previous;
   }
+});
+
+it('rejects repository-local object alternates before reading borrowed history', () => {
+  const source = fixture(); source.write('a.txt', 'borrowed content\n'); source.commit();
+  const borrower = fixture();
+  writeFileSync(join(borrower.dir, '.git/objects/info/alternates'), join(source.dir, '.git/objects') + '\n');
+  expect(() => readHistory(borrower.dir, source.base, source.git('rev-parse', 'HEAD'))).toThrow(/alternates/i);
+});
+it('keeps a foreign rename on its file card while attributing later text edits', () => {
+  const f = fixture();
+  renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt')); f.commit();
+  f.plan.items[1]!.files[0]!.path = 'b.txt';
+  f.write('b.txt', 'ONE\ntwo\nthree\n'); f.commit('P2');
+  const parts = f.segments();
+  expect(parts.find(s => s.kind === 'file')?.row).toBe('Unplanned');
+  const text = parts.filter(s => s.kind === 'text');
+  expect(text.length).toBeGreaterThan(0);
+  expect(text.every(s => s.row === 'P2' && s.scope === 'in-scope')).toBe(true);
 });

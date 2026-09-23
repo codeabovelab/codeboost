@@ -1,4 +1,6 @@
 import { execFileSync } from 'node:child_process';
+import { lstatSync } from 'node:fs';
+import { resolve as resolvePath } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
@@ -11,6 +13,8 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): Hi
       GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  const alternates = resolvePath(repo, run('rev-parse', '--git-path', 'objects/info/alternates').toString().trim());
+  if (lstatSync(alternates, { throwIfNoEntry: false })) throw new Error('Review repositories must not use object alternates.');
   const resolve = (ref: string) => run('rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`).toString().trim();
   const base = resolve(baseRef), head = resolve(headRef);
   const records = run('rev-list', '--reverse', '--parents', `${base}..${head}`).toString().trim().split('\n').filter(Boolean);
