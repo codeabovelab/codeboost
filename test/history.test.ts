@@ -208,3 +208,20 @@ it.each(['root', 'loose', 'pack'])('rejects symlinked %s object storage', kind =
   renameSync(storage, borrowed); symlinkSync(borrowed, storage);
   expect(() => readHistory(f.dir, f.base)).toThrow(/symlinked object storage/i);
 });
+
+it('enforces a caller-lowered object inspection entry limit', () => {
+  const f = fixture();
+  expect(() => readHistory(f.dir, f.base, 'HEAD', { maxObjectEntries: 1 })).toThrow(/inspection exceeds/i);
+});
+it('supports a caller-selected linked worktree gitdir', () => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
+  const worktree = mkdtempSync(join(tmpdir(), 'codeboost-linked-')); dirs.push(worktree);
+  f.git('worktree', 'add', '--detach', worktree, 'HEAD');
+  expect(readHistory(worktree, f.base).final[0]!.after!.text).toBe('changed\n');
+});
+it('supports a caller-selected symlinked gitdir with regular object storage', () => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); f.commit('P1');
+  const metadata = mkdtempSync(join(tmpdir(), 'codeboost-gitdir-')); dirs.push(metadata);
+  rmSync(metadata, { recursive: true }); renameSync(join(f.dir, '.git'), metadata); symlinkSync(metadata, join(f.dir, '.git'));
+  expect(readHistory(f.dir, f.base).final[0]!.after!.text).toBe('changed\n');
+});

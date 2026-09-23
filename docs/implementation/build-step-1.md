@@ -55,6 +55,14 @@ Fixed unbounded accumulation of unique blobs across a history. The adapter check
 
 Fixed symlinked object storage bypassing the alternates check. Root, loose-directory, and pack-directory symlink regressions all reproduced the problem. The adapter now inspects the object store without following symlinks, rejects links at any depth, and bounds inspection to 100,000 entries before resolving commits. The caller must keep storage stable during reads; concurrent filesystem isolation belongs to the runner.
 
+## Review round 7
+
+Fixed eager directory listing before the inspection limit: use incremental directory reads with a one-entry buffer and close handles on every exit. Callers may lower the entry budget; the regression first failed and now rejects explicitly.
+
+Declined the YAML finding: the pinned yaml 2.9.1 implementation and types explicitly define `maxAliasCount: 0` as rejecting all aliases (`-1` disables limits). An otherwise valid plan with an alias fails with “Alias resolution is disabled”.
+
+Clarified the gitdir policy rather than rejecting normal linked worktrees. The caller selects and trusts the repository and its administrative directory; gitfiles and symlinked gitdirs are supported, while object-storage symlinks and alternates within that gitdir are rejected. Real-Git fixtures exercise both administrative layouts. Filesystem containment of an untrusted repository root belongs to the runner, not this read-only library.
+
 ## Remaining gates
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.

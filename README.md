@@ -44,6 +44,7 @@ Inputs such as `planText` and the ledger must come from the caller. The future `
 ## Current limits and safety
 
 - History must be linear and descend from the requested base. Merge histories are rejected with a rebase instruction; repositories using object alternates or symlinked object storage are rejected (storage inspection is limited to 100,000 entries). Reads are bounded to 500 commits, 32 MiB per Git response, 64 MiB of unique blob bytes across the history (callers may lower `maxBlobBytes`), and a 2-second budget per line diff; oversized work fails explicitly.
+- The caller selects and trusts the repository and its Git administrative directory. Normal Git discovery, linked-worktree gitfiles, and symlinked gitdirs are supported; object-storage links and alternates inside that selected gitdir are rejected. This adapter is not a filesystem-containment boundary for untrusted repository roots.
 - Object storage must remain unchanged during a read; these library checks do not isolate a concurrently hostile filesystem.
 - Ownership uses line diffs, not semantic inference. Within one replacement block, new lines inherit all affected owners conservatively. Function context comes from Git hunk headers, not an AST.
 - The importer requires an accurate base-file list. It rejects path traversal, Git metadata paths, and traversal through a listed file/symlink/submodule. Runtime symlink and write-scope enforcement belong to the future container/runner; plan validation alone is not a sandbox.

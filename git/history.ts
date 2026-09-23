@@ -1,12 +1,14 @@
 import { execFileSync } from 'node:child_process';
-import { lstatSync, readdirSync } from 'node:fs';
+import { lstatSync, opendirSync } from 'node:fs';
 import { resolve as resolvePath, join } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
-export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number } = {}): History {
+export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number; maxObjectEntries?: number } = {}): History {
   const maxBlobBytes = limits.maxBlobBytes ?? 64 * 1024 * 1024;
   if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > 64 * 1024 * 1024) throw new Error('Blob byte budget must be a positive integer no larger than 64 MiB.');
+  const maxObjectEntries = limits.maxObjectEntries ?? 100_000;
+  if (!Number.isSafeInteger(maxObjectEntries) || maxObjectEntries < 1 || maxObjectEntries > 100_000) throw new Error('Object entry budget must be a positive integer no larger than 100000.');
   let blobBytes = 0;
   // Inherited Git variables can redirect repository, index, config, and object lookup.
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
@@ -22,12 +24,17 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
   let inspected = 0;
   while (pending.length) {
     const path = pending.pop()!;
-    if (++inspected > 100_000) throw new Error('Object storage inspection exceeds 100000 entries.');
+    if (++inspected > maxObjectEntries) throw new Error('Object storage inspection exceeds its entry budget.');
     const stat = lstatSync(path);
     if (stat.isSymbolicLink()) throw new Error('Review repositories must not use symlinked object storage.');
-    if (stat.isDirectory()) for (const entry of readdirSync(path)) {
-      if (pending.length + inspected >= 100_000) throw new Error('Object storage inspection exceeds 100000 entries.');
-      pending.push(join(path, entry));
+    if (stat.isDirectory()) {
+      const directory = opendirSync(path, { bufferSize: 1 });
+      try {
+        for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+          if (pending.length + inspected >= maxObjectEntries) throw new Error('Object storage inspection exceeds its entry budget.');
+          pending.push(join(path, entry.name));
+        }
+      } finally { directory.closeSync(); }
     }
   }
   const alternates = join(objects, 'info/alternates');

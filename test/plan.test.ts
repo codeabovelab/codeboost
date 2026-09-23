@@ -1,3 +1,4 @@
+import { stringify } from 'yaml';
 import { readFileSync } from 'node:fs';
 import { describe, expect, it } from 'vitest';
 import { applySuggestion, assertEditReply, commandArgv, commandAllowed, importPlan, isRepoPath, validatePlan, type Plan, type PlanContext } from '../core/plan.ts';
@@ -105,4 +106,12 @@ describe('suggestions', () => {
 it('rejects file/parent collisions declared within the same item', () => {
   const plan = basePlan(); plan.items[0]!.files = ['new', 'new/child'].map(path => ({ path, kind: 'add', renamed_from: null, change: 'Create' }));
   expect(validatePlan(plan, context).errors.some(e => e.code === 'path-parent')).toBe(true);
+});
+
+it('rejects an alias in an otherwise valid plan before schema validation', () => {
+  const source = stringify(basePlan());
+  expect(() => importPlan(source, 'yaml', context, 1)).not.toThrow();
+  const aliased = source.replace('summary: Change behavior.', 'summary: &summary Change behavior.').replace('title: Change', 'title: *summary');
+  expect(aliased).toContain('*summary');
+  expect(() => importPlan(aliased, 'yaml', context, 1)).toThrow(/Alias resolution is disabled/);
 });
