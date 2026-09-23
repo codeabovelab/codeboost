@@ -195,3 +195,20 @@ test('places selection actions beside code deep in a scrolled diff',async({page}
  await page.locator('#code').evaluate(element=>{element.scrollTop=0;});await expect(actions).toBeHidden();
  await line.scrollIntoViewIfNeeded();await expect(actions).toBeVisible();await page.getByRole('button',{name:'Clear selection',exact:true}).click();await expect(actions).toBeHidden();
 });
+test('Clear selection removes native text selection as well as selected lines',async({page})=>{
+ await page.goto(app.url);
+ await page.locator('.added .code-lines').first().evaluate(element=>{
+  const line=element.querySelector('[data-code-line]')!;
+  const range=document.createRange();range.selectNodeContents(line);
+  const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);
+  element.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));
+ });
+ await expect(page.locator('.selected-line').first()).toBeVisible();
+ expect(await page.evaluate(()=>window.getSelection()?.toString())).not.toBe('');
+ await page.getByRole('button',{name:'Clear selection',exact:true}).click();
+ await expect(page.getByRole('group',{name:'Selected code'})).toBeHidden();
+ await expect(page.locator('.selected-line')).toHaveCount(0);
+ expect(await page.evaluate(()=>window.getSelection()?.toString())).toBe('');
+ await page.locator('#code').press('ArrowRight');
+ await expect(page.getByRole('group',{name:'Selected code'})).toBeHidden();
+});

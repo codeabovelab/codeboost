@@ -525,7 +525,11 @@ function attachSelection(kind) {
 }
 $("snippet-ask").onclick = () => attachSelection("question");
 $("snippet-request").onclick = () => attachSelection("change");
-$("selection-clear").onclick = () => {snippetSelection=null;paintSelection();};
+$("selection-clear").onclick = () => {
+  window.getSelection()?.removeAllRanges();
+  snippetSelection = null;
+  paintSelection();
+};
 function captureHighlightedLines() {
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed || !selection.rangeCount) return;
