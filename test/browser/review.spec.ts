@@ -236,6 +236,69 @@ test('outdated questions explain how to continue without offering a broken retry
  await expect(page.getByText('This question refers to an earlier review. Ask again against the current code.',{exact:true})).toBeVisible();
  await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
 });
+for(const kind of ['question','change']) test(`preserves ${kind} edits and snippets during refresh`,async({page})=>{
+ await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
+ await page.locator('.added [data-line]').first().click();
+ await page.getByRole('button',{name:kind==='question'?'Ask about selection':'Request change to selection',exact:true}).click();
+ const composer=page.locator('#message');await composer.fill('Before refresh');
+ let release!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>release=resolve),started=new Promise<void>(resolve=>arrived=resolve);
+ await page.route('**/api/review',async route=>{arrived();await held;await route.continue();});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await started;
+ await composer.fill('Edited during refresh');
+ app.service.act({action:'approve',item:'P3',confirmNoChange:true,token:app.service.load().token});
+ release();await expect(page.getByText('1 of 3 approved')).toBeVisible();
+ await expect(composer).toHaveValue('Edited during refresh');
+ await expect(page.locator(kind==='question'?'#ask':'#request')).toHaveAttribute('aria-pressed','true');
+ await expect(page.locator('#attachment')).toContainText('retry.ts');await expect(page.locator('#attachment')).not.toContainText('Outdated');
+ await expect(page.locator('#save-note')).toBeEnabled();
+ expect(app.service.load().approved).toBe(1);expect(app.service.load().notes).toHaveLength(0);
+});
+for(const scenario of ['navigation','snapshot','removed item','failure']) test(`preserves drafts during refresh with ${scenario}`,async({page})=>{
+ await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
+ await page.locator('.added [data-line]').first().click();await page.getByRole('button',{name:'Ask about selection',exact:true}).click();
+ await page.locator('#message').fill('Before refresh');
+ let release!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>release=resolve),started=new Promise<void>(resolve=>arrived=resolve);
+ await page.route('**/api/review',async route=>{arrived();await held;if(scenario==='failure')await route.fulfill({status:500,json:{error:'Temporary read failure'}});else await route.continue();});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await started;
+ await page.locator('#message').fill('Latest question');
+ if(scenario==='navigation'){
+  await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+  await page.getByRole('button',{name:'Request change',exact:true}).click();await page.locator('#message').fill('Latest change request');
+ }
+ if(scenario==='snapshot')execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','New snapshot'],{cwd:app.service.config.repository,stdio:'pipe'});
+ if(scenario==='removed item'){
+  const service=app.service,identity=service.config.identity,plan=service.store.getPlan(identity);
+  service.store.importRevision(JSON.stringify({...plan,items:plan.items.filter(item=>item.id!=='P1').map(item=>({...item,depends_on:[]}))}),'json',{identity,issue:plan.issue,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},plan.revision);
+ }
+ release();
+ if(scenario==='failure'){
+  await expect(page.locator('#banner')).toContainText('Temporary read failure');await page.unroute('**/api/review');
+  await page.getByRole('button',{name:'Refresh',exact:true}).click();
+ }
+ await expect(page.locator('#banner')).not.toContainText('Linking changes');await expect(page.locator('#banner')).not.toContainText('Temporary read failure');
+ if(scenario==='navigation'){
+  await expect(page.getByRole('heading',{name:'Document retry behavior'})).toBeVisible();
+  await expect(page.locator('#message')).toHaveValue('Latest change request');await expect(page.locator('#request')).toHaveAttribute('aria-pressed','true');
+  await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await page.getByRole('button',{name:'Ask',exact:true}).click();
+ }
+ await expect(page.locator('#message')).toHaveValue('Latest question');
+ if(scenario==='snapshot'){
+  await expect(page.locator('#attachment')).toContainText('Outdated');await expect(page.locator('#save-note')).toBeDisabled();
+  expect(app.service.load().snapshot.head).toBe(execFileSync('git',['rev-parse','HEAD'],{cwd:app.service.config.repository,encoding:'utf8'}).trim());
+ }
+ if(scenario==='removed item'){
+  await expect(page.locator('#item-details')).toContainText('no longer in the plan');await expect(page.locator('#save-note')).toBeDisabled();
+  await expect(page.getByRole('button',{name:'! P1 · Retained draft',exact:true})).toHaveAttribute('aria-current','true');
+  await expect(page.getByRole('button',{name:/P1 Bound exponential retries/})).toHaveCount(0);
+  await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
+  await expect(page.getByRole('button',{name:'! P1 · Retained draft',exact:true})).toHaveAttribute('aria-current','false');
+  await page.getByRole('button',{name:'! P1 · Retained draft',exact:true}).click();
+  await expect(page.getByRole('button',{name:'! P1 · Retained draft',exact:true})).toHaveAttribute('aria-current','true');
+  await expect(page.locator('#message')).toHaveValue('Latest question');await expect(page.locator('#message')).toBeEnabled();
+  expect(app.service.load().items.map(item=>item.id)).toEqual(['P2','P3']);
+ }
+ expect(app.service.load().notes).toHaveLength(0);
+});
 for(const switchItem of [false,true]) test(`preserves edits made while a question submission is in flight (switch item: ${switchItem})`,async({page})=>{
  await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
  let release!:()=>void;const held=new Promise<void>(resolve=>release=resolve);

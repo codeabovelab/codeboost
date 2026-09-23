@@ -110,3 +110,13 @@ The documentation-only review after adding `AGENTS.md` exposed one more concrete
 The follow-up review exposed the same active-job marker missing from the initial review response. Reloading during provider settlement could therefore expose Retry and stop polling. Initial loads and action responses now include the marker used by question polling; the browser regression reloads during settlement and confirms Retry remains hidden until the invocation finishes.
 
 The next review made assignment drift concrete for item-level answers without snippet references. Each answer now records a hash of the changed segments supplied for its item. Moving code into or out of that item preserves the answer but labels it as earlier review context and rejects retrying the old question; a regression assigns new code without changing the snapshot or plan revision, checks the historical marker, and proves no second agent invocation starts.
+
+## Refresh draft preservation (#13)
+
+Held-response browser regressions reproduced Refresh replacing newer question/change text with the pre-request draft, losing text entered after switching items and modes, and hiding a draft when its item was removed. Five cases failed before the fix; the failed-refresh recovery case already passed. All six focused cases pass after capturing the current draft immediately before applying the response and on failure.
+
+The browser owns unsent text, mode, navigation, and attachments; the refreshed response owns the persisted plan, approvals, notes, and snapshot. Refresh remains serialized with review actions and invalidates older question polls through the existing generation counter. A valid attached snippet survives; changed snapshot or assignment context keeps the text and marks the attachment outdated, blocking submission until it is removed or reselected. Removed items with drafts remain accessible as retained-draft rows, with submission disabled and instructions to copy the text to a current item. These drafts remain page-local and do not survive a browser reload.
+
+The regression gate is `npm run test:browser -- --grep 'during refresh'`. It checks visible drafts and refreshed durable approval/snapshot/plan state, and confirms no draft was accidentally saved as a note. Issues #10 (review edge cases), #12 (polling efficiency), and #3 (human go/no-go experiment) remain separate work.
+
+PR #14 review round 1 found that retained-draft rows omitted the regular rows' `aria-current` state. A browser assertion reproduced the missing attribute. Retained rows now expose their selected state; the regression checks selection, navigation away, and selection again. No findings were declined.
