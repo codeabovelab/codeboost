@@ -178,3 +178,20 @@ test('resizes Conversation using its divider and keyboard',async({page})=>{
  await page.getByRole('button',{name:'Collapse conversation',exact:true}).click();await expect(divider).toBeHidden();
  await page.getByRole('button',{name:'Conversation',exact:true}).click();await expect(divider).toBeVisible();expect((await pane.boundingBox())!.width).toBe(480);
 });
+test('places selection actions beside code deep in a scrolled diff',async({page})=>{
+ const repository=app.service.config.repository;
+ writeFileSync(join(repository,'retry.ts'),Array.from({length:90},(_,i)=>`export const value${i} = ${i};`).join('\n')+'\n');
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Long diff'],{cwd:repository,stdio:'pipe'});
+ let view=app.service.load();
+ for(const key of view.segments.filter(s=>s.path==='retry.ts'&&['Unplanned','Ambiguous'].includes(s.row)).map(s=>s.key)) view=app.service.act({action:'assign',key,item:'P1',token:view.token});
+ await page.goto(app.url);
+ const line=page.locator('.added [data-line]').nth(60);await line.scrollIntoViewIfNeeded();await line.click();
+ const actions=page.getByRole('group',{name:'Selected code'});await expect(actions).toBeVisible();
+ const selection=(await line.boundingBox())!,toolbar=(await actions.boundingBox())!,code=(await page.locator('#code').boundingBox())!;
+ expect(Math.min(Math.abs(toolbar.y+toolbar.height-selection.y),Math.abs(toolbar.y-selection.y-selection.height))).toBeLessThan(40);
+ expect(toolbar.y).toBeGreaterThanOrEqual(code.y);expect(toolbar.y+toolbar.height).toBeLessThanOrEqual(code.y+code.height);
+ await page.screenshot({path:test.info().outputPath('selection-actions.png')});
+ await page.getByRole('button',{name:'Ask about selection',exact:true}).click();await expect(page.locator('#attachment')).toContainText('value60');
+ await page.locator('#code').evaluate(element=>{element.scrollTop=0;});await expect(actions).toBeHidden();
+ await line.scrollIntoViewIfNeeded();await expect(actions).toBeVisible();await page.getByRole('button',{name:'Clear selection',exact:true}).click();await expect(actions).toBeHidden();
+});

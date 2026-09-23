@@ -670,7 +670,9 @@ dialog::backdrop {
 .line-number { display: block; width: 100%; height: 18px; min-height: 0; padding: 0 8px 0 0; border: 0; border-radius: 0; background: transparent; color: var(--muted); font: inherit; line-height: 18px; text-align: right; }
 .code-lines [data-code-line] { display: inline-block; min-width: 100%; min-height: 18px; }
 .selected-line { background: var(--selected, #213448); }
-#selection-actions { position: sticky; top: 0; z-index: 2; padding: 8px 12px; background: var(--surface); border-bottom: 1px solid var(--line); }
+#selection-actions { position: fixed; z-index: 5; padding: 8px 12px; background: var(--raised); border: 1px solid var(--primary); border-radius: 4px; }
+#selection-actions button { margin: 4px 4px 0 0; }
+#snippet-ask { background: var(--primary); color: var(--on-primary); border-color: var(--primary); }
 #selection-label { display: block; overflow-wrap: anywhere; margin-bottom: 4px; }
 #attachment { border: 1px solid var(--line); padding: 8px; margin-bottom: 8px; overflow-wrap: anywhere; }
 #attachment small { display: block; color: var(--muted); }

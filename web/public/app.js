@@ -482,7 +482,30 @@ function paintSelection() {
     element.classList.toggle("selected-line",active);
     if (element.matches("button")) element.setAttribute("aria-pressed",String(active));
   });
+  positionSelectionActions();
 }
+function positionSelectionActions() {
+  const toolbar = $("selection-actions");
+  if (!snippetSelection) { toolbar.hidden = true; return; }
+  const bounds = $("code").getBoundingClientRect();
+  const visible = [...document.querySelectorAll("[data-code-line].selected-line")]
+    .map(line => line.getBoundingClientRect())
+    .filter(rect => rect.bottom > bounds.top && rect.top < bounds.bottom);
+  if (!visible.length || bounds.width < 1) { toolbar.hidden = true; return; }
+  const anchor = visible[visible.length - 1];
+  toolbar.hidden = false;
+  const inset = Math.min(140, bounds.width / 3);
+  toolbar.style.width = `${Math.min(440, bounds.width - inset - 8)}px`;
+  const height = toolbar.getBoundingClientRect().height;
+  const below = anchor.bottom + 8;
+  const top = below + height <= bounds.bottom - 8 ? below : anchor.top - height - 8;
+  toolbar.style.left = `${bounds.left + inset}px`;
+  toolbar.style.top = `${Math.max(bounds.top + 8, Math.min(top, bounds.bottom - height - 8))}px`;
+}
+$("code").addEventListener("scroll", positionSelectionActions);
+window.addEventListener("resize", positionSelectionActions);
+new ResizeObserver(positionSelectionActions).observe($("code"));
+
 function renderAttachment() {
   const ref = attachments.get(`${selected}:${mode}`);
   $("attachment").hidden = !ref;
