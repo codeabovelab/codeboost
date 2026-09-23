@@ -21,10 +21,16 @@ Store schema v2 adds the review counter and per-item notes through a transaction
 ## Known limits and remaining gates
 
 - No agent answers, test execution, AI findings ingestion, send-to-agent action, or merge control is included. These belong after the go/no-go gate. Four checks distinguish unavailable evidence from success.
-- File cards show mode/path/object IDs; binary/image previews and byte-size retrieval are not implemented and explicitly say unavailable. The pure history API does not expose binary bytes.
+- File cards show mode/path/object IDs and blob byte sizes. PNG/JPEG/GIF/WebP previews are bounded to 1 MiB each and 4 MiB across a history; unsupported/oversized images say unavailable. Gitlink byte sizes are not applicable. SVG/HTML is never embedded.
 - The protocol at `docs/experiments/review-protocol.md` must be filled with the real pairs and committed before the first timed review. The manual assignment, real paired PRs, human timing, and final result are pending. Do not mark issue #3 closed or claim the gate passed.
 - The planting helper is intentionally limited to disposable clones and supported regular top-level paths; it never publishes PRs.
 
 ## Validation
 
 Baseline before this slice: 157 tests. Run `npm run typecheck`, `npm test`, and `npm run test:browser`. Browser tests use real Git and SQLite with Chromium and cover persistence, assignments, metadata, no-change approval, stale views, unsafe origins, keyboard/breakpoints, error display, and untrusted text. A browser regression exposed false stale reasons from JSON field order; structural comparison replaced that check. The plant test verifies source HEAD stays unchanged and both plants retain ledger ownership.
+
+A large-change regression reproduced HTTP 413 when the browser sent the full content-based choice key for a 20 KB segment. Browser segment IDs are now bounded SHA-256 identifiers; the runner reconstructs the original identity/content/copy key before saving the choice. This retains choice expiry semantics without sending source content back in a review command.
+
+## Review round 1
+
+Reproduced and fixed no-change approval with item-owned ambiguous segments; the runner refuses it and the UI directs the user to resolve attribution first. Previously approved no-change items become stale if ambiguous work appears. Reproduced malformed non-ASCII credentials returning a generic conflict instead of unauthorized; credentials now require the expected ASCII hex shape before constant-time comparison. Reproduced stale item controls surviving a failed refresh; errors now discard the loaded view and require refresh. Added acceptance persistence and whole-plan empty-state browser coverage. No findings declined.

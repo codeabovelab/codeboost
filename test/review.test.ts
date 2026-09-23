@@ -1,10 +1,12 @@
-import { afterEach, it, expect } from 'vitest';
+import { afterEach, it, expect, vi } from 'vitest';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
+// Each integration case performs several bounded real-Git reads.
+vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
 afterEach(()=>{services.splice(0).forEach(service=>service.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));});
 function fixture(){const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const config=createDemo(join(root,'demo'));const service=new ReviewService(config);services.push(service);return {service,config};}
@@ -28,4 +30,13 @@ it('rejects a concurrent store review edit through the atomic review counter',()
  const {service,config}=fixture();const other=new ReviewService(config);services.push(other);const view=service.load();
  other.store.addReviewNote(config.identity,view.expected,'P1','change','Please explain');
  expect(()=>service.store.saveReview(config.identity,view.expected,[],[])).toThrow(/Stale/);
+});
+it('refuses no-change confirmation while the item still owns ambiguous changes',async()=>{
+ const {service,config}=fixture();const {writeFileSync}=await import('node:fs');const {execFileSync}=await import('node:child_process');
+ writeFileSync(join(config.repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','P2 changes retry'],{cwd:config.repository,stdio:'pipe'});
+ const head=execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();const snapshot=service.store.getSnapshot(config.identity);
+ service.store.recordHistory(config.identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
+ const view=service.load();expect(view.items[0]!.count).toBe(0);expect(view.segments.some(s=>s.row==='Ambiguous'&&s.owners.includes('P1'))).toBe(true);
+ expect(()=>service.act({action:'approve',item:'P1',confirmNoChange:true,token:view.token})).toThrow(/ambiguous/i);
 });

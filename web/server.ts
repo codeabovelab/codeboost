@@ -17,7 +17,7 @@ export async function startServer(config: ReviewConfig, port = 4318) {
       const path = new URL(req.url ?? '/', origin).pathname;
       if (path.startsWith('/api/')) {
         const supplied = req.headers['x-codeboost-token'];
-        if (typeof supplied !== 'string' || supplied.length !== token.length || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
+        if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, service.load()); return; }
         if (req.method !== 'POST' || path !== '/api/action' || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;

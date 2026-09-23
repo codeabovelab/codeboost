@@ -45,3 +45,27 @@ test('shows an honest history error and keeps markup in notes as text',async({pa
  const repository=app.service.config.repository;execFileSync('git',['checkout','--orphan','unrelated'],{cwd:repository,stdio:'pipe'});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Unrelated history'],{cwd:repository,stdio:'pipe'});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('Could not read this branch’s history.',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Approve P1',exact:true})).not.toBeVisible();
 });
+test('can assign a large foreign change without sending its content back in the command',async({request})=>{
+ const repository=app.service.config.repository;writeFileSync(join(repository,'debug.log'),'x'.repeat(20000)+'\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Large foreign change'],{cwd:repository,stdio:'pipe'});
+ const base=app.url.split('#')[0]!,headers={'x-codeboost-token':app.token};const view=await(await request.get(base+'api/review',{headers})).json();const segment=view.segments.find((s:{content:string;row:string})=>s.row==='Unplanned'&&s.content.length>19000);
+ const response=await request.post(base+'api/action',{headers:{...headers,'Content-Type':'application/json'},data:{action:'assign',item:'P1',key:segment.key,token:view.token}});
+ expect(response.status()).toBe(200);
+});
+test('shows bounded raster previews and byte sizes for file-change cards',async({page})=>{
+ const repository=app.service.config.repository;writeFileSync(join(repository,'pixel.png'),Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRHsAAAAASUVORK5CYII=','base64'));execFileSync('git',['add','pixel.png'],{cwd:repository});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Add image'],{cwd:repository,stdio:'pipe'});
+ await page.goto(app.url);await page.getByRole('button',{name:/Unplanned changes/}).click();await expect(page.getByRole('img',{name:'Current image in pixel.png'})).toBeVisible();await expect(page.getByRole('img',{name:'Current image in pixel.png'})).toHaveJSProperty('naturalWidth',1);await expect(page.getByText('Size: N/A → 68 bytes',{exact:true})).toBeVisible();
+});
+test('rejects malformed non-ASCII credentials consistently',async({request})=>{
+ const response=await request.get(app.url.split('#')[0]+'api/review',{headers:{'x-codeboost-token':'é'.repeat(64)}});expect(response.status()).toBe(403);
+});
+test('keeps stale item controls unavailable after a failed refresh',async({page})=>{
+ await page.goto(app.url);const repository=app.service.config.repository;execFileSync('git',['checkout','--orphan','unrelated'],{cwd:repository,stdio:'pipe'});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Other history'],{cwd:repository,stdio:'pipe'});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('Could not read this branch’s history.',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:/P3 Confirm API compatibility/})).toHaveCount(0);
+});
+test('accepts a foreign segment and keeps that choice across reload',async({page})=>{
+ await page.goto(app.url);await page.getByRole('button',{name:/Unplanned changes/}).click();await page.getByRole('button',{name:'Accept as is',exact:true}).first().click();await page.getByRole('button',{name:/Accepted 1/}).click();await expect(page.getByRole('article').first()).toBeVisible();await page.reload();await page.getByRole('button',{name:/Accepted 1/}).click();await expect(page.getByRole('article').first()).toBeVisible();
+});
+test('shows the whole-plan empty state without claiming checks passed',async({page})=>{
+ const {repository,identity}=app.service.config;const base=app.service.store.getSnapshot(identity).base;execFileSync('git',['reset','--hard',base],{cwd:repository,stdio:'pipe'});
+ await page.goto(app.url);await expect(page.getByRole('heading',{name:'No code changes yet'})).toBeVisible();await expect(page.getByRole('button',{name:'Confirm no change needed',exact:true})).toBeVisible();await expect(page.getByRole('button',{name:'AI review: – Not run',exact:true})).toBeVisible();
+});

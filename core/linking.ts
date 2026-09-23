@@ -1,7 +1,7 @@
 import { diffArrays } from 'diff';
 import type { Plan } from './plan.ts';
 
-export interface FileVersion { oid: string; mode: string; text: string | null }
+export interface FileVersion { oid: string; mode: string; text: string | null; byteSize?: number; preview?: string }
 export interface ContextRange { oldStart: number; oldCount: number; newStart: number; newCount: number; name: string }
 export interface FileDelta {
   oldPath: string | null; newPath: string | null;
