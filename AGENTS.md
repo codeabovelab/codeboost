@@ -1,0 +1,47 @@
+# Repository agent instructions
+
+Follow the repository conventions in `CLAUDE.md`. Read `DESIGN.md` before making visual or interaction changes.
+
+## Async jobs and polling
+
+For features with background jobs, polling, retries, cancellation, or shutdown:
+
+- Define the lifecycle states and ownership before implementation: pending, running, completed, failed, cancelled, stale, and closing.
+- Treat persisted state, in-memory jobs, subprocesses, HTTP requests, and rendered UI as separate state holders. Define how each transitions and settles.
+- Never apply a background response without proving it is still current. Use a generation, attempt ID, version, or guarded merge so older polling responses cannot overwrite newer actions.
+- Do not release a concurrency slot when cancellation is requested. Keep the job tracked until its underlying invocation or subprocess has terminated.
+- Do not let a retry replace a locally active job, even when its persisted lease has expired or wall-clock time changes.
+- Validate retry context against the current snapshot, plan revision, assignment, and referenced code. If any context is stale, disable retry and require a new request.
+- Preserve the original timeout, cancellation, and shutdown reason through every layer. Do not replace actionable errors with generic cancellation text.
+- Begin shutdown by rejecting new work at the outer admission boundary. Drain already-admitted HTTP requests, then cancel and await jobs, then close storage.
+- Polling endpoints should read only the state they need. Do not rebuild Git history or the full review merely to retrieve background-job status.
+
+## Async review UI
+
+- A background response must not erase text, selections, attachments, navigation changes, or other input made after the request started.
+- Clear a submitted draft only if its current value and attachment still match what was submitted. Treat this as compare-and-swap behavior.
+- Preserve completed historical results, but visibly mark them stale when their snapshot, plan revision, assignment, or referenced code no longer matches.
+- When polling updates one part of the screen, update only that state. Preserve scroll position unless the user was already following the bottom.
+
+## Required race regressions
+
+Before opening or updating a PR for asynchronous behavior, test every applicable interleaving with controllable promises, clocks, and partial requests:
+
+- Poll starts, then a user action completes, then the old poll returns.
+- A job lease expires, then retry is attempted while the original job still runs.
+- Timeout fires, then the provider remains unsettled temporarily, then retry is attempted.
+- Shutdown starts, then a new request arrives.
+- A request is partially received, then shutdown starts, then the request completes.
+- An abort error fires, then subprocess close arrives later.
+- Submit starts, then the user edits the composer or switches items, then the response returns.
+- Referenced code is reassigned or the snapshot changes, then retry or rendering occurs.
+
+Every reproduced race requires a failing-before and passing-after regression. Assert both the visible result and the durable state when they can diverge.
+
+## Review readiness
+
+- Run final validation against the exact pushed head after the last change.
+- Report current test counts separately from historical milestone counts.
+- Before requesting automated review, report the current head, CI state, mergeability, unresolved threads, and deferred follow-up issues.
+- Reproduce summary-only review concerns or turn them into a concrete follow-up issue. Do not repeatedly patch vague wording without a failure case.
+- For each review round, record what changed, what was declined and why, and the regression evidence. Re-request review until a round returns no new findings.
