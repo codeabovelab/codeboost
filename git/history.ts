@@ -3,9 +3,12 @@ import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
 export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): History {
-  const run = (...args: string[]) => execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', ...args], {
+  // Inherited Git variables can redirect repository, index, config, and object lookup.
+  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
+  const run = (...args: string[]) => execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
     cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout: 30_000,
-    env: { ...process.env, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0' },
+    env: { ...environment, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
+      GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   const resolve = (ref: string) => run('rev-parse', '--verify', '--end-of-options', `${ref}^{commit}`).toString().trim();

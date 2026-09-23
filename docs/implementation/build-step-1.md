@@ -37,6 +37,10 @@ Copilot reported two findings. Fixed scope after rename: scope now travels with 
 
 Declined the claim that repository aliases can override `rev-parse`, `rev-list`, `diff`, or `cat-file`: these are built-in commands, and Git ignores aliases that shadow them. A scratch probe and a permanent adapter regression confirmed the shell alias never ran. See [Git's alias documentation](https://git-scm.com/docs/git-config/2.54.0).
 
+## Review round 2
+
+Fixed inherited Git environment redirection. A regression with `GIT_DIR` pointing at a second repository initially returned the foreign repository's content. The adapter now drops inherited `GIT_*` variables, ignores global/system Git configuration, and disables lazy fetch and transport access. The same regression now reads only the requested repository.
+
 ## Remaining gates
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.

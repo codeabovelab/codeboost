@@ -161,3 +161,15 @@ it('Git built-ins cannot be overridden by repository shell aliases', () => {
   expect(f.segments().length).toBeGreaterThan(0);
   expect(existsSync(join(f.dir, 'alias-executed'))).toBe(false);
 });
+it('isolates repository selection from inherited Git environment variables', () => {
+  const expected = fixture(); expected.write('a.txt', 'expected repo\n'); expected.commit('P1');
+  const foreign = fixture(); foreign.write('a.txt', 'foreign repo\n'); foreign.commit();
+  const previous = process.env.GIT_DIR;
+  try {
+    process.env.GIT_DIR = join(foreign.dir, '.git');
+    const history = readHistory(expected.dir, 'HEAD~1');
+    expect(history.final[0]!.after!.text).toBe('expected repo\n');
+  } finally {
+    if (previous === undefined) delete process.env.GIT_DIR; else process.env.GIT_DIR = previous;
+  }
+});
