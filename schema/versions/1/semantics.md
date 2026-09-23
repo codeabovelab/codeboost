@@ -1,3 +1,4 @@
+<!-- Normative v1 semantic snapshot. Freeze at release; do not change accepted behavior without a new version. -->
 # The codeboost plan format (version 1)
 
 **Who this is for.** Anyone who writes, imports, or builds code around a codeboost plan: people, and the Claude and Codex agents that draft plans. **What it is for.** It defines the one structure every plan must follow, so codeboost can import a plan from any source and check it the same way. It is written in plain language (ISO 24495-1:2023).
@@ -5,13 +6,13 @@
 ## Summary
 
 - A plan is a list of **plan items** for one GitHub issue. Each item says which files it will change, what changes in each file, and how to check the result.
-- One schema, [`schema/plan.schema.json`](../schema/plan.schema.json), defines the structure. It is the contract for three things:
+- One schema, [`schema/plan.schema.json`](./plan.schema.json), defines the structure. It is the contract for three things:
   1. **Generating.** codeboost gives the schema to Claude (`claude -p --json-schema`) or Codex (`codex exec --output-schema`), so the agent's answer always has the right shape.
   2. **Importing.** A plan in a YAML or JSON file, written by a person or another tool, is checked against the same schema.
-  3. **Suggesting.** The plan assistant's suggested edits follow a second schema, [`schema/plan-edit.schema.json`](../schema/plan-edit.schema.json).
+  3. **Suggesting.** The plan assistant's suggested edits follow a second schema, [`schema/plan-edit.schema.json`](./plan-edit.schema.json).
 - YAML and JSON have exactly the same structure. YAML is for people; JSON is what the agents return.
 - After the schema check, codeboost runs a second set of checks that a schema cannot express (see "Checks after import").
-- A full example: [`schema/examples/plan-412-r3.yaml`](../schema/examples/plan-412-r3.yaml).
+- A full example: [`schema/examples/plan-412-r3.yaml`](./examples/plan-412-r3.yaml).
 
 ## Terms
 
@@ -148,7 +149,7 @@ Issue text and agent-produced plan fields remain untrusted. The prompt builder s
 
 | Source | What happens |
 |---|---|
-| **Claude or Codex drafts it** | codeboost runs the agent with the prompt in [`prompts/plan-author.md`](../prompts/plan-author.md) and passes the schema. The answer is a JSON plan. codeboost runs the checks after import and shows the plan on the Plans screen as a draft. |
+| **Claude or Codex drafts it** | codeboost runs the agent with the prompt in [`prompts/plan-author.md`](../../../prompts/plan-author.md) and passes the schema. The answer is a JSON plan. codeboost runs the checks after import and shows the plan on the Plans screen as a draft. |
 | **You import a file** | On the Plans screen, choose "Import plan" and pick a `.yaml`, `.yml`, or `.json` file, or paste one. codeboost reads it, runs the schema and the checks after import, and saves it as the next draft revision. The file's `revision` is replaced by the next free number. |
 | **You edit on the Plans screen** | Each change is checked as you type. Approving saves the revision. |
 
@@ -156,7 +157,7 @@ codeboost keeps the master copy in its own database. The copy in the PR descript
 
 ## Suggested edits (plan assistant)
 
-When you ask the plan assistant on the Plans screen for changes, it answers in the shape of [`schema/plan-edit.schema.json`](../schema/plan-edit.schema.json):
+When you ask the plan assistant on the Plans screen for changes, it answers in the shape of [`schema/plan-edit.schema.json`](./plan-edit.schema.json):
 
 - `reply`: its answer to you, in plain words;
 - `base_revision`: the revision it read. codeboost refuses edits made against an older revision;
@@ -180,7 +181,7 @@ When you ask the plan assistant on the Plans screen for changes, it answers in t
 
 To change a declared path or rename destination, import a complete replacement plan as a new revision and run all meaning checks. Separate add/remove suggestions are permitted only when each intermediate plan is valid; they are not an atomic path-change operation. Do not infer the old entry from prose or list position.
 
-Fields an operation does not use are `null`. The strict answer schema checks structure, not the relationship between `op` and its payload. Before showing an enabled Apply button, a semantic validator must enforce the operation table: required payloads are non-null, unused payloads are null, and `item` identifies an existing item except for `add_item`, where it matches the unique `new_item.id`. File updates/removals must target an existing entry; additions must not duplicate one; `check_index` must be in range; and `set_field` must satisfy the destination field's limits. Reject invalid suggestions with an explanation. Dry-run each edit on a copy and run both the plan schema and all meaning checks; repeat against the current revision atomically when Apply is clicked. Invalid edits never mutate the saved plan. An example: [`schema/examples/plan-edit-412-r3.json`](../schema/examples/plan-edit-412-r3.json).
+Fields an operation does not use are `null`. The strict answer schema checks structure, not the relationship between `op` and its payload. Before showing an enabled Apply button, a semantic validator must enforce the operation table: required payloads are non-null, unused payloads are null, and `item` identifies an existing item except for `add_item`, where it matches the unique `new_item.id`. File updates/removals must target an existing entry; additions must not duplicate one; `check_index` must be in range; and `set_field` must satisfy the destination field's limits. Reject invalid suggestions with an explanation. Dry-run each edit on a copy and run both the plan schema and all meaning checks; repeat against the current revision atomically when Apply is clicked. Invalid edits never mutate the saved plan. An example: [`schema/examples/plan-edit-412-r3.json`](./examples/plan-edit-412-r3.json).
 
 ## Versions
 
@@ -188,7 +189,7 @@ Fields an operation does not use are `null`. The strict answer schema checks str
 - Every plan carries `schema_version`. This document describes version 1.
 - Wording changes that do not change accepted data keep the same version. Changes to accepted data, including adding, renaming, or removing a field or changing a limit, require the next schema version. This applies to both plan and suggested-edit schemas.
 - A nullable field is still required. Adding one breaks old plans (the field is missing) and old readers (the field is unknown), so it must not be added under version 1.
-- [`schema/versions.json`](../schema/versions.json) is the version registry. Its `current` number selects the schema used for new drafts; its `versions` object maps exact decimal version numbers to plan/edit schema paths, a normative semantic-contract path, and a semantic-validator dispatch key. Paths are relative to `schema/`. Version 1 is retained at `schema/versions/1/plan.schema.json` and `schema/versions/1/plan-edit.schema.json`. Each snapshot has a unique version-qualified `$id` matching its registry path under `https://github.com/codeabovelab/codeboost/schema/` (for example `versions/1/plan.schema.json`). Future versions must use new IDs so all retained schemas can coexist in one validator. After release, snapshots are immutable, including descriptions. The unversioned `schema/plan.schema.json` and `schema/plan-edit.schema.json` are exact copies of the current snapshots for CLI compatibility; verification must check those copies against the registry.
+- [`schema/versions.json`](../../../schema/versions.json) is the version registry. Its `current` number selects the schema used for new drafts; its `versions` object maps exact decimal version numbers to plan/edit schema paths, a normative semantic-contract path, and a semantic-validator dispatch key. Paths are relative to `schema/`. Version 1 is retained at `schema/versions/1/plan.schema.json` and `schema/versions/1/plan-edit.schema.json`. Each snapshot has a unique version-qualified `$id` matching its registry path under `https://github.com/codeabovelab/codeboost/schema/` (for example `versions/1/plan.schema.json`). Future versions must use new IDs so all retained schemas can coexist in one validator. After release, snapshots are immutable, including descriptions. The unversioned `schema/plan.schema.json` and `schema/plan-edit.schema.json` are exact copies of the current snapshots for CLI compatibility; verification must check those copies against the registry.
 - Each released version also freezes its parser subset, command tokenizer, projected-state/path/symlink checks, and suggestion/identity semantics in the registered `semantics` document. The registry's `validator` key dispatches to a dedicated version-specific implementation and retained conformance fixtures; never apply the latest validator to an older version. For v1 the key is `v1` and the normative document is `versions/1/semantics.md`. Schema and semantic acceptance changes require a new version together. Bug fixes may restore conformance to a frozen contract, but may not silently redefine it. Treat a missing validator implementation as unsupported. The current guide may explain the contract, but cannot override a released snapshot.
 - Parse the input as data, require an integer `schema_version`, and look it up in the registry without constructing a path from user input. Reject missing or unsupported versions. A new version adds a new directory and registry entry; retain all earlier entries. With only version 1 registered there is no migration to run.
 - Keep released schemas unchanged. On import, read `schema_version`, validate against that version's schema, convert using an explicit version migration, then validate against the current schema and run the meaning checks. Reject unsupported versions with an explanation. Never validate an old plan against a newer schema before converting it. Suggested edits must use a supported schema version and still match the current plan revision; otherwise ask the assistant to regenerate them.

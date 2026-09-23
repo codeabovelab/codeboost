@@ -23,8 +23,8 @@ Writing standard: plain language, ISO 24495-1:2023
 - **What codeboost is.** A local app that takes GitHub issues, helps you write a detailed plan with Claude or Codex, runs the plan with an AI agent, and opens a pull request (PR).
 - **What makes it different.** You review the PR one **plan item** at a time. Pick a plan item on the left and see only its code on the right. Code that belongs to no plan item is flagged in a red "Unplanned changes" row.
 - **Why that matters.** Other tools make you read a raw diff and guess what the agent meant. In codeboost, the plan you approved is the index to the code.
-- **How it stays trustworthy.** codeboost makes every git commit itself, so it knows which plan item produced each line. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
-- **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. Dependency and script changes need your approval.
+- **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
+- **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
 - **What we build first.** The review screen, tested on real PRs. We build the rest (running agents, the queue, the issue list) only if the review screen proves its worth.
 
@@ -44,7 +44,7 @@ Writing standard: plain language, ISO 24495-1:2023
 | Unplanned change | A change that codeboost did not make for any plan item. |
 | Ambiguous change | A change that more than one plan item touched, so codeboost cannot say which one owns it. |
 | Approval | Your sign-off on one plan item. It records exactly which lines you saw. |
-| Stale approval | An approval whose lines have since changed. You must review that plan item again. |
+| Stale approval | An approval whose text, file-change metadata, item definition, or dependencies have since changed. You must review that plan item again. |
 | Run window | A time when codeboost may run tasks, such as weeknights 22:00–06:00. |
 | Sandbox | An operating-system limit on what an agent can read, write, and reach over the network. |
 | Lesson | A short rule codeboost learned from your feedback, such as "every retry change needs a test for the 5xx path." It is used only after you approve it. |
@@ -73,7 +73,7 @@ codeboost keeps your approved plan in control from start to finish. It follows t
 
 **It targets why agent PRs fail.** A 2026 study of 33,596 agent-made PRs, "Where Do AI Coding Agents Fail? An Empirical Study of Failed Agentic Pull Requests in GitHub" ([arXiv:2601.15195](https://arxiv.org/abs/2601.15195)), found that unmerged PRs tend to change more code and often don't match how the team works. Developers also report two other failures: agents change files the task did not need (scope creep), and agents fix issues that another PR already fixed. We treat all of these as ideas to test, not as proven rankings.
 
-**Approvals expire when the code changes.** This idea came from the outside reviewer. When you approve plan item P1, codeboost records the exact lines you saw. If a later revision changes those lines, the approval becomes stale. Next time, you see only what changed since you approved. So rejecting and revising stays quick. You never have to re-read everything.
+**Approvals expire when the code changes.** This idea came from the outside reviewer. When you approve plan item P1, codeboost records the exact text and file-change metadata you saw. If a later revision changes that fingerprint, the approval becomes stale. Next time, you see only what changed since you approved. So rejecting and revising stays quick. You never have to re-read everything.
 
 ## Limits we work within
 
@@ -85,7 +85,7 @@ codeboost keeps your approved plan in control from start to finish. It follows t
 ## Assumptions we agreed on
 
 1. **The value is in the review, not the queue.** Many tools already turn issues into PRs: issue-orchestrator, Agent Orchestrator, Bernstein, NEEDLE, no_human, and GitHub's own Copilot agent. So codeboost keeps its queue simple and puts its effort into steps 7 to 9.
-2. **Two separate signals link code to plan items.** This assumption was changed after the outside review. Signal 1 is the commit trailer. Signal 2 is the plan item's declared files. The review screen shows separate checks for each plan item: attributed, in scope, tests, and AI review (renamed from "correct" by design-review D21). Ambiguous changes are always shown as ambiguous. codeboost never guesses an owner. Neither signal can catch an unrelated edit inside a declared file. Only the review agent and you can catch that (engineering review, R3).
+2. **Two separate signals link code to plan items.** This assumption was changed after the outside review. Signal 1 is the runner-owned commit ledger (O5); trailers are informational and cannot establish ownership. A commit absent from the ledger is foreign even if its trailer names a plan item. Signal 2 is the plan item's declared files. The review screen shows separate checks for each plan item: attributed, in scope, tests, and AI review (renamed from "correct" by design-review D21). Ambiguous changes are always shown as ambiguous. codeboost never guesses an owner. Neither signal can catch an unrelated edit inside a declared file. Only the review agent and you can catch that (engineering review, R3).
 3. **Local and single-user.** You start codeboost from the command line. It opens in your browser.
 4. **Rejecting revises the same PR.** Your feedback attaches to plan items. The plan gets a new revision. The agent redoes only the affected plan items.
 
@@ -131,7 +131,7 @@ Changed by decision P1 (below, in the Decision ledger). The full rules are in [`
 - **YAML and JSON have the same structure.** People read and write YAML; agents return JSON. Every field is always present, with `null` or `[]` when it has nothing to say.
 - **Each declared file carries its own change.** A file entry has a path, a kind (`edit`, `add`, `delete`, or `rename`), the old path for a rename, and what changes in it. This keeps the plan file by file (step 3).
 - **Acceptance entries are typed.** `cmd` is a command codeboost runs. `check` is a statement the review agent judges.
-- **After the schema, codeboost checks meaning.** For example: unique IDs, `depends_on` only to earlier items, no `..` in paths, and declared files that exist. A failure blocks approval; a warning, such as "No test command", does not.
+- **After the schema, codeboost checks meaning.** For example: unique IDs, `depends_on` only to earlier items, no `..` in paths, and valid projected file operations: existing sources for edits/deletes/renames, unused destinations for adds/renames. A failure blocks approval; a warning, such as "No test command", does not.
 
 Each plan looks like this (shortened; the full example is [`schema/examples/plan-412-r3.yaml`](../../schema/examples/plan-412-r3.yaml)):
 
@@ -189,7 +189,7 @@ This keeps the plan out of the code, and there is only one master copy.
 4. waits for you to approve or edit the proposal on the planning screen. Your approval creates the next plan revision;
 5. puts the task back in the queue at its old position, and re-runs that plan item from the start.
 
-If an invocation finishes normally but edited an undeclared file anyway, codeboost still commits the change. The change shows on that plan item's row, marked out of scope.
+If an invocation finishes normally and passes the safety audit but edited an undeclared regular file within the task repository, codeboost still commits the change. Unsafe path, metadata, symlink, or submodule violations instead stop the invocation before any test or commit and move it to needs human. The change shows on that plan item's row, marked out of scope. Execution deliberately pauses in **needs amendment** before any later item or check invocation. A person must approve a revised plan and continuation; the runner reconciles the already-executed prefix with the audited current head, then validates remaining operations from that actual checkpoint. Do not silently add the file to scope or erase its original out-of-scope evidence.
 
 **Checking whether the issue is already fixed.** Before it opens the PR, and again before merging, codeboost checks:
 - whether something other than this task's PR closed the issue;
@@ -212,8 +212,9 @@ It ignores this task's own PR, any draft PRs it opened earlier, and its own comm
 - Every invocation records which comments it was given.
 
 **The container (the real safety boundary).** Changed by the engineering review, R1 (answer D2: B). Every invocation, of every phase, runs inside a Docker or Podman container. The agent tool itself runs inside it. The container holds only:
-- the task's folder, including its own `.git` (O6), mounted as `/work`. This is the only project folder the agent can write to;
-- the agent's own sign-in. For Codex, that is its `auth.json` from `CODEX_HOME`, mounted read-only. For Claude, it is a long-lived token made with `claude setup-token`, passed as an environment variable. (On macOS, Claude keeps its normal sign-in in the keychain, which a container cannot read.)
+- the task's folder, including its own `.git` (O6), mounted as `/work`: writable only for carrying out/fixing, read-only for planning/questions/review; its `.git` is stored on a separate runner-owned filesystem and exposed only at the read-only `/work/.git` mount in every agent phase. No writable inode aliases exist; the worktree backing directory contains only an empty mountpoint. Only the runner updates metadata. Startup must reject layouts without this separation; a nested read-only bind on the writable task filesystem is insufficient. This is the only project folder an execution-phase agent can write to;
+- a dedicated read-only `/run/codeboost-input` mount containing only the registry-selected schema copied by the runner; Codex output is written to a runner-created directory in bounded `/tmp` scratch and collected before teardown, using container-visible paths and no-follow bounded regular-file reads; Claude output uses bounded stdout instead;
+- the agent's own sign-in. For Codex, that is its `auth.json` from `CODEX_HOME`, mounted read-only at `/run/codeboost-auth/codex/auth.json`, with `CODEX_HOME=/run/codeboost-auth/codex` explicitly set inside the container. The CODEX_HOME directory itself is a writable size/inode-limited tmpfs for ephemeral CLI state; only its `auth.json` file is bind-mounted read-only. This location is separate from the empty `HOME`; the startup probe must run the actual authenticated `codex exec` path and confirm output/state creation without printing credentials. If the pinned CLI cannot use this credential layout, refuse the invocation rather than making the host credential writable. For Claude, it is a long-lived token made with `claude setup-token`, passed as an environment variable. (On macOS, Claude keeps its normal sign-in in the keychain, which a container cannot read.)
 
 Nothing else from your computer is inside. So `~/.ssh`, `~/.config/gh`, `~/.npmrc`, `~/.aws`, `~/.docker`, and your git credential helper simply are not there. The container's `HOME` is its own empty folder.
 
@@ -222,11 +223,16 @@ Nothing else from your computer is inside. So `~/.ssh`, `~/.config/gh`, `~/.npmr
 | Setting | Why |
 |---|---|
 | Read-only root filesystem (`--read-only`) | The agent cannot change the tools in the image, such as `git`, `go`, or the agent CLI itself. |
-| Writable scratch only as size-limited in-memory folders (`--tmpfs`): `/tmp` and the empty `HOME`. Both are emptied when the container ends. | Tools that need scratch space still work, and nothing written there outlives the invocation or reaches the task's code. |
+| Writable scratch only as size-limited in-memory folders (`--tmpfs`): `/tmp`, the empty `HOME`, and the Codex `CODEX_HOME` state directory when selected (its auth file remains read-only). All are emptied when the container ends. | Tools that need scratch space still work, and nothing written there outlives the invocation or reaches the task's code. |
 | Build caches point inside the scratch folders (for example `GOCACHE`, `npm_config_cache`). | Caches do not need a writable root. |
 | Runs as a non-root user; all Linux capabilities dropped (`--cap-drop=ALL`); `--security-opt=no-new-privileges` | The agent cannot become root or use privileged system calls. |
-| No `--privileged`, no `--device`, no host network, no Docker socket, and no host mounts other than `/work` and the read-only sign-in file | Nothing on the host is reachable through the container. |
-| Limits on processes, memory, and CPU (`--pids-limit`, `--memory`, `--cpus`) | A runaway agent cannot slow down your computer. |
+| No `--privileged`, no `--device`, no host network, no Docker socket, and no host mounts other than the bounded worktree, separate read-only Git metadata, runner-prepared read-only schema input, and read-only sign-in file | Nothing on the host is reachable through the container. |
+| Limits on processes, memory, and CPU (`--pids-limit`, `--memory`, `--cpus`) | Bound the agent's consumption of these resources; they do not guarantee zero host performance impact. |
+| `/work` lives on a dedicated size-limited task filesystem with hard byte and inode limits, allocated before the invocation; never an unbounded host-directory bind | Large output and many tiny files fail inside the task filesystem instead of growing without limit on the host. |
+
+**Output and time enforcement.** A trusted supervisor outside the invocation container incrementally captures every agent/check command with hard limits of 16 MiB stdout, 4 MiB stderr, and 20 MiB combined, including protocol envelopes. Host buffers, persisted logs, and UI forwarding obey the same per-invocation limits; task-log retention has a configured total byte cap and never accumulates unbounded output across retries. Before launch, require a finite wall deadline (default 10 minutes, capped by the remaining task budget; configured overrides must also be finite). On overflow/deadline or capture failure, stop consuming into retained buffers, terminate the entire container including descendants, escalate to forced container kill if graceful termination fails, and record a bounded failure diagnostic. Never wait indefinitely for EOF from an orphan child, silently treat truncated output as success, or run tests/commit after this failure. Container tests must exercise infinite stdout, infinite stderr, mixed streams, and a child ignoring SIGTERM, while measuring bounded host capture and completed termination. For structured vendor output, the transport cap includes envelope headroom; separately enforce the 1 MiB plan-document limit after extraction.
+
+**Disk enforcement.** The runner requires configured per-task byte/inode caps and a total task-storage pool cap. Allocate/reserve the backing storage before the agent starts, leaving configured host free-space headroom; do not use a grow-on-demand backing file that can exhaust the host. Refuse to start if the platform cannot enforce the caps. Scratch tmpfs mounts have their own size/inode limits. The startup/CI probe must attempt to exceed byte and inode limits and confirm writes fail without consuming storage beyond the allocated pool. Post-run checks alone are not a disk guard.
 
 So the only place an agent can change something that lasts is `/work`, and codeboost checks every change there against the declared files before it commits (see "Checks after import" and "After each run" in `docs/plan-format.md`).
 
@@ -236,7 +242,7 @@ If Docker or Podman is missing or not running, codeboost runs no agents and tell
 
 **Changes that need your approval.**
 - **Dependencies.** Only codeboost installs them, as a separate step with the network on. If a task changed a package manifest or lock file, codeboost first stops and shows you the change. It waits in **needs approval**.
-- **Scripts.** If a task changed a script that codeboost is about to run (`package.json` scripts, a Makefile, CI settings, or test settings), codeboost stops in **needs approval** before running it.
+- **Scripts.** If a task changed a script that codeboost is about to run (`package.json` scripts, a Makefile, CI settings, or test settings), codeboost stops in **needs approval** before its own invocation. This gate applies to codeboost-run commands after the agent invocation; it does not intercept commands the agent runs during that invocation.
 
 **Permissions by phase.**
 
@@ -246,9 +252,11 @@ If Docker or Podman is missing or not running, codeboost runs no agents and tell
 | Carrying out and fixing | Worktree only | Allowed list only (test, lint, build) | Agent vendor's API only |
 | Reviewing | No | `cmd:` checks only | Agent vendor's API only |
 
-All phases run in the container (R1). The allowed list comes from your repo's scripts, and you can edit it. It stops accidents. It does not stop a hostile agent: an agent could edit a script and then run it. The container, the network rule, and the approval step are what stop that.
+**Phase enforcement.** The runner selects the mount and tool profile before launching the agent. Planning/questions expose read/list/search tools only; the dispatcher denies process execution, shell, write, and edit tools. Review uses the same read-only `/work` mount and cannot invoke arbitrary processes: it may request only the exact approved `cmd:` argv through a runner-controlled dispatcher. Those checks use the read-only project mount and writable scratch; a check that requires writing project files fails explicitly rather than weakening the mount. Carrying-out/fixing uses a writable `/work` and the command allowlist. Every dispatched command must match an approved argv array element-for-element, including all flags and arguments; executable/subcommand prefixes are insufficient. Changed argv requires explicit approval of a new allowlist entry, separately from approving the plan. These are enforced permissions, not prompt requests; if an adapter cannot enforce a phase profile, refuse that phase. Container tests must attempt file writes and forbidden process/tool calls in every phase and confirm refusal.
 
-**Credentials.** codeboost also removes `GH_TOKEN`, `GITHUB_TOKEN`, and other secret-looking variables from the agent's environment. Only codeboost itself is signed in to GitHub.
+All phases run in the container (R1). The allowed list comes from your repo's scripts, and you can edit it. It limits accidental commands; it is not a hostile-code boundary. A carrying-out agent can edit an allowed script and execute the changed script in the same invocation, before codeboost gets control back. The container and network restrictions must therefore contain arbitrary code from the start. Script approval protects codeboost's later invocation only; it does not prevent that earlier agent execution. The real-container suite must exercise this edit-then-execute case and confirm that host access and disallowed network access remain blocked.
+
+**Credentials.** Build the agent environment from an explicit allowlist, not by inheriting the host environment and guessing secret names. Remove `GH_TOKEN`, `GITHUB_TOKEN`, and unrelated credentials. Add only the selected CLI's required sign-in: the configured Codex auth mount and `CODEX_HOME`, or Claude's configured long-lived token variable. Preserve that selected credential through environment filtering; never add both vendors' credentials. Test authentication for each profile and absence of unrelated secret sentinels. Only codeboost itself is signed in to GitHub.
 
 **Known limits.** The README states these plainly:
 - The agent tool can always reach its own sign-in (your Claude or Codex account), because it is mounted into the container.
@@ -262,11 +270,11 @@ All phases run in the container (R1). The allowed list comes from your repo's sc
 - A removed line belongs to the commit that removed it. So even changes that only delete code have an owner.
 - A line changed by commits from two or more plan items is marked **multi-item**.
 
-**It trusts its own commit ledger, not commit messages** (engineering review, O5). `runner/store` keeps a ledger of every commit codeboost creates. When codeboost rebases, it also records which old commit became which new one. Only ledger commits count as a plan item's work. A commit that is not in the ledger is foreign, even if its message carries a `Plan-Item` trailer, so its lines go to the Unplanned row. Trailers stay in history as a readable label, not as proof.
+**It trusts its own commit ledger, not commit messages** (engineering review, O5). `runner/store` keeps a ledger of every commit codeboost creates, with SHA, nullable plan-item owner, and origin classification. Rewriting a foreign commit records a new entry with owner `null` and origin `foreign`; creating the rewritten commit does not assign it to a plan item. When codeboost rebases, it also records which old commit became which new one. Only ledger entries with an explicit non-null plan-item owner count as that item's work; entries marked unowned/foreign remain Unplanned. A commit that is not in the ledger is foreign, even if its message carries a `Plan-Item` trailer, so its lines go to the Unplanned row. Trailers stay in history as a readable label, not as proof.
 
 **It shows segments, not whole hunks.** codeboost splits each hunk wherever the owner changes. For example, a hunk with some lines from P1 and some from P2 becomes two segments: one on P1's row, one on P2's row. Both carry a "shares a hunk with P1/P2" label.
 
-**Changes with no text lines** (engineering review, O7). Some changes have no lines: binary content, file mode (such as the executable bit), empty files added or deleted, renames without content change, symlinks, and submodule pointers. Each one becomes a **file-change segment**. It is owned through the commit ledger and placed by the same table below. Its approval records the old and new path, the old and new mode, and the old and new content id (git blob id). On the review screen it shows as a card, for example "binary changed (12 KB → 14 KB)", "made executable", or "renamed from x". The merge gate treats it like any other segment.
+**Changes with no text lines** (engineering review, O7). V1 can review externally produced gitlink changes, but cannot author submodule-pointer changes; a future typed target-commit operation is required before enabling that execution path. Some changes have no lines: binary content, file mode (such as the executable bit), empty files added or deleted, renames without content change, symlinks, and submodule pointers. Each one becomes a **file-change segment**. It is owned through the commit ledger and placed by the same table below. Its approval records the old and new path, the old and new mode, and the old and new typed object IDs: `{kind: blob, oid}` for regular files/symlinks, `{kind: commit, oid}` for mode-160000 gitlinks, and `null` for an absent side. On the review screen it shows as a card, for example "binary changed (12 KB → 14 KB)", "made executable", or "renamed from x". The merge gate treats it like any other segment.
 
 **Where each segment goes.** First find who made the segment (rows). Then find whose declared files it is in (columns).
 
@@ -289,12 +297,12 @@ So the red "Unplanned changes" row holds only changes codeboost did not make. Wh
 
 A plan item with no changes can be approved only if you confirm "no change needed." codeboost records that.
 
-**What an approval records.** When you approve a plan item, codeboost saves its changes: for each file, the added and removed lines in order. It leaves out line numbers and surrounding lines. The only thing it adjusts is line endings (Windows to Unix). Spaces and tabs count. So:
+**What an approval records.** When you approve a plan item, codeboost saves its changes: for each file, the added and removed lines in order. It leaves out line numbers and surrounding lines. The only thing it adjusts is line endings (Windows to Unix). Spaces and tabs count. For every non-line file-change segment it also stores the operation kind, old/new paths, old/new modes, and old/new typed object IDs (blob/commit or null), as defined above. This metadata is part of the approval fingerprint, not an empty text snapshot. Segment addition/removal and changes to any metadata field invalidate the owning approval and any standalone acceptance of that segment, propagating to dependents. Immediately before merge, recompute and compare both text and metadata fingerprints against the current base/head pair. So:
 - a whitespace-only change to approved code makes the approval stale. This matters in Python, YAML, Makefiles, and text strings;
 - code that only moved up or down, because of other plan items or a rebase, keeps its approval.
 
 **An approval also covers the job, the place, and the dependencies** (engineering review, O2). Besides the lines, an approval records:
-- a fingerprint of the plan item itself: its title, intent, changes, declared files, acceptance checks, and `depends_on` list. If any of these changes, the approval becomes stale;
+- a fingerprint bound to the stable repository/task/plan IDs and plan-item `id`, including its title, intent, changes, declared files, acceptance checks, and `depends_on` list. If any of these changes, the approval becomes stale; an ID-only import is a different ownership key and cannot inherit the old approval, even when all text matches;
 - for each segment, the name of the function it sits in, taken from git's hunk header (not a line number). If the same lines move into a different function, the approval becomes stale. Line shifts and clean rebases still keep it;
 - its dependencies. If a plan item becomes stale, every plan item that lists it in `depends_on` becomes stale too.
 
@@ -472,24 +480,24 @@ Approvals on other plan items stay valid, as long as their code did not change.
 The top of the screen lists anything that is not yet true. You can still use "Merge anyway." It asks you to confirm, and codeboost records it.
 
 **What happens when you click "Approve & merge".**
-1. codeboost fetches the latest base branch.
-2. If the base has not moved since GitHub's checks last passed, it goes straight to step 5.
-3. If the base has moved, codeboost rebases the PR branch (see below) and pushes it. If the rebase changed any plan item's code, codeboost stops and sends you back to review those plan items. Otherwise it re-runs every plan item's `cmd:` checks on the rebased code, in the container. If any check fails, merging stops and you go back to review (engineering review, O3). Test results are tied to the commit they ran on. Results for any other commit are shown as out of date.
-4. codeboost waits for GitHub's required checks on the new code. It reads which checks are required from the branch's rules at that moment (rulesets first, then classic protection). If there are none, this step passes at once. Code reviews, such as Copilot code review, are not checks and do not count. The screen shows the checks' progress. If they take longer than 30 minutes, the task moves to **approved, merge blocked** (engineering review, R6).
-5. codeboost runs the "already fixed" check again, then merges with `gh pr merge --match-head-commit <sha>`. The sha is the commit whose approvals, `cmd:` results, and required checks all passed. If anyone pushed after that, GitHub refuses the merge. codeboost then reloads the PR, recomputes the links, and sends you back to review, with the changed plan items stale (engineering review, O4).
+1. codeboost fetches the latest base branch and PR head, recording both SHAs.
+2. Compare both SHAs with the base/head used for attribution, approvals, and validation. If the head changed even when the base did not, reload the history and ledger, recompute links and approval staleness, and return changed or unplanned items to review. Re-run all `cmd:` checks for any head without current passing results. Continue only after the current head satisfies review and validation; do not skip the rule refresh in step 4 even when both SHAs match.
+3. If the base has moved, codeboost rebases the PR branch (see below) and pushes it. After every rebase, recompute attribution, segment choices, approval staleness, and all merge blockers for the resulting head. If any item is stale or any foreign/ambiguous segment is new, changed, or still unaccepted/unassigned, stop and return to review even when no owned item's code changed. Only after those blockers are cleared, re-run every plan item's `cmd:` checks on the rebased code, in the container. If the base did not move, keep the current head and the validation requirements from step 2. If any check fails, merging stops and you go back to review (engineering review, O3). Test results are tied to the commit they ran on. Results for any other commit are shown as out of date.
+4. codeboost waits for GitHub's required checks on the new code. It reads which checks are required from the branch's rules at that moment (the union of all applicable active rulesets and classic branch protection, preserving check context and required app identity). Only a successfully read, explicitly empty union passes at once; an unreadable or ambiguous source blocks merging as unknown. Code reviews, such as Copilot code review, are not checks and do not count. The screen shows the checks' progress. If they take longer than 30 minutes, the task moves to **approved, merge blocked** (engineering review, R6).
+5. Immediately before merging, re-fetch both head and base; if either differs from the validated pair, restart attribution/rebase/checks instead of merging. Run the "already fixed" check again. The merge backend must also enforce the validated base/head pair atomically on the server (or validate the final merge candidate in a protected server-side merge queue). A final client-side fetch alone cannot close the race. If the repository/backend cannot provide that guarantee, automatic merging is blocked and the person must use GitHub's manual workflow; "Merge anyway" does not bypass this guard. Zero required checks still passes step 4, but does not waive this merge requirement. For a backend that provides the base guard, also pin the head with `gh pr merge --match-head-commit <sha>`. The sha is the commit whose approvals, `cmd:` results, and required checks all passed. If anyone pushed after that, GitHub refuses the merge. codeboost then reloads the PR, recomputes the links, and sends you back to review, with the changed plan items stale (engineering review, O4).
 
 codeboost also rebases before it first shows you the review. So you always review code that sits on the latest base.
 
-**How rebasing works.** A rebase that goes cleanly keeps your approvals, because approvals ignore line numbers. If there is a conflict:
-1. Git stops on one commit. Every commit belongs to exactly one plan item, say Px.
-2. codeboost runs a sandboxed invocation to fix the conflict. The agent sees Px's plan item, the conflicting files, and the base commits that caused the conflict. It may edit only the conflicting files.
+**How rebasing works.** A clean rebase keeps approvals only if the recomputed text, file-change metadata, item definitions, and context still match; ignoring line numbers alone is not enough. If there is a conflict:
+1. Git stops on one commit. Before assigning any plan item or launching an invocation, look up its ledger entry. A missing entry or an explicit null owner takes the foreign/unowned branch below; do not infer an owner from trailers. Only an entry with a non-null owner enters the following owned-commit steps, with that owner as Px.
+2. For an owned commit, codeboost runs a sandboxed invocation to fix the conflict. The agent sees Px's plan item, the conflicting files, and the base commits that caused the conflict. It may edit only the conflicting files.
 3. The fixed commit keeps Px's trailers.
 4. If the fix needs another file, or the invocation fails, codeboost cancels the rebase (`git rebase --abort`). That puts the branch back as it was. The task moves to **needs human**.
 5. Any plan item whose code changed in the fix gets a stale approval.
 
-**A conflict on a commit codeboost did not make** (engineering review, R5, answer D6: B). A person may push a commit to the PR branch. That commit is not in codeboost's commit ledger (O5), whatever its message says. If git stops on it:
+**The foreign/unowned conflict branch** (engineering review, R5, answer D6: B). Step 1 above routes both missing-ledger commits (such as a person's push) and explicitly unowned ledger entries here, regardless of their trailers. Do not run the Px-specific steps for this branch:
 1. codeboost runs a conflict-resolution invocation in the same container, with the same network rule. The agent sees the conflicting files, that commit, and the base commits that caused the conflict. It may edit only the conflicting files.
-2. The resolved commit keeps its original author and gets no `Plan-Item` trailer. So its lines stay in the red Unplanned row, marked "conflict resolved by agent," for you to review.
+2. The resolved commit keeps its original author and gets no `Plan-Item` trailer. The runner records it as an explicitly unowned ledger entry (owner `null`, origin `foreign`, plus its source SHA) and maps the old SHA to the new SHA while preserving that classification. Its lines therefore stay in the red Unplanned row, marked "conflict resolved by agent," regardless of whether any trailer is present.
 3. If the fix needs another file, or the invocation fails, codeboost cancels the rebase and moves the task to **needs human**, as for any other conflict.
 
 If codeboost is stopped or crashes during a rebase, it always cancels the rebase first when it recovers.
@@ -498,7 +506,7 @@ If codeboost is stopped or crashes during a rebase, it always cancels the rebase
 
 **When GitHub refuses the merge.** For example, a rule may require a second reviewer, a check may be blocked, or there may be a conflict. Then codeboost shows GitHub's exact error, and the task moves to **approved, merge blocked**.
 
-**Checking branch rules.** When you add a repo, codeboost reads its branch rules through GitHub's rulesets API. That needs only read access. If that fails, it tries the older branch-protection API. If both are refused, the rules show as "unknown," and codeboost learns them from the first merge. codeboost 1.0 does not support rules that require a second human reviewer, and it warns you about them when you add the repo.
+**Checking branch rules.** At repository setup and again before merging, read both all applicable active rulesets (including inherited organization rules) and classic branch protection, following pagination. Combine required checks from both sources; one never replaces the other. Preserve each required check's context and app identity, and require every applicable condition. Permission errors, incomplete responses, and ambiguous not-found responses mean "unknown" and block merging; only a confirmed absence of protection counts as an empty source. Do not learn unknown rules by attempting a merge. codeboost 1.0 does not support rules that require a second human reviewer, and it warns you about them when you add the repo. Acceptance cases include rulesets with no checks plus a classic required check, checks required by both, and either source unreadable.
 
 ### The queue, stopping, and recovery (steps 4 and 5)
 
@@ -508,9 +516,9 @@ If codeboost is stopped or crashes during a rebase, it always cancels the rebase
 
 **Time and round limits.** Each task has limits so that "finishing" cannot run forever. The defaults are 2 hours and 3 review rounds, and you can change them. When a task hits a limit, it moves to **needs human**.
 
-**Stopping right now.** "Hard stop" ends the agent at once. codeboost cancels any rebase, then resets the worktree to its last commit. Later, the task continues from the next unfinished plan item.
+**Stopping right now.** "Hard stop" ends the agent at once. The runner cancels any rebase and preserves partial output separately for diagnosis, then discards the execution filesystem. Before continuation it materializes a fresh filesystem from the trusted recorded head and validates actual occupancy/types; a reset or reuse of the interrupted checkout is insufficient. Later, the task continues from the next unfinished plan item under the normal queue/run-window rules.
 
-**After a crash, sleep, or restart.** When codeboost starts, any task that was running is reset to its last commit and put first in the queue. codeboost reuses the task's worktree if it is intact, and otherwise rebuilds it from the branch.
+**After a crash, sleep, or restart.** When codeboost starts, recover the ledger/checkpoint and cancel any interrupted rebase through the runner. Preserve partial output only for diagnosis; never reuse or merely reset the previous execution filesystem. Rebuild from the trusted recorded head, recheck actual entry types/occupancy and phase protection, then put eligible unfinished work first in the queue. No invocation starts until these checks pass and the queue/run window permits it.
 
 **Needs human.** codeboost opens a draft PR with the plan in its description. The review screen shows the open problems on their plan items. You can:
 - review it anyway, treating the problems as known;
@@ -570,7 +578,9 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 - one hunk with lines from two plan items. Expected: split into two segments, each labeled as sharing a hunk;
 - a new revision that changes one approved plan item. Expected: only that approval goes stale;
 - a rebase that only moves lines. Expected: no approval goes stale;
+- an import that changes only a plan-item ID. Expected: the old approval cannot transfer; the new item requires review and merge blocks until ownership and approvals are reconciled;
 - a whitespace-only change to approved code. Expected: that approval goes stale;
+- approve each non-line segment type, then independently change its content/object ID, path, mode, operation, or presence without adding text lines. Expected: approval and dependent approvals become stale and merge blocks; an unchanged fingerprint survives line shifts;
 - assigning an Unplanned segment to a plan item. Expected: that plan item goes stale, and the assignment survives an unrelated revision;
 - the "already fixed" check run against the task's own PR. Expected: no match.
 
@@ -598,7 +608,7 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 **Unattended runs.** Queue 3 issues, set a run window, and walk away. When you come back, each task has either a PR ready for review or a clear state (needs human, needs amendment, or possibly already fixed). This holds even if the laptop slept during the run.
 
-**Rejecting.** Reject with feedback on one plan item. The next revision changes only that plan item's code, and every other approval stays valid.
+**Rejecting.** Reject with feedback on one plan item. The next revision targets that plan item. Recompute approval fingerprints after its changes: its approval and all transitive dependents become stale as required by the dependency rule. Only unaffected, non-dependent items whose definitions, content, and context remain unchanged keep their approvals. The UI must show those propagated stale states before another merge attempt.
 
 ## How people will install it
 
@@ -1145,7 +1155,7 @@ Comparison grid:
 
 | Choice | Current | A | B | C |
 |---|---|---|---|---|
-| Source of "required" | not stated | the branch's rules (rulesets API, then classic protection), read at merge time | every check reported on the PR, required or not | not stated |
+| Source of "required" | not stated | the branch's rules (all applicable rulesets plus classic protection, unioned; unreadable sources block), read at merge time | every check reported on the PR, required or not | not stated |
 | Zero required checks | undefined (may wait 30 min, then block) | passes immediately | passes if no checks are reported at all | undefined |
 | Copilot code review (a review, not a check) | not stated | ignored by the merge gate | ignored by the merge gate | not stated |
 
@@ -1168,7 +1178,7 @@ Leave "required checks" undefined. ✅ No change. ✅ Nothing to build now. ❌ 
 
 State: approved
 Actual answer: A) Follow branch rules (answer to D7, 2026-09-22)
-Accepted scope: at merge time, codeboost reads the branch's required checks from its rules (rulesets API, then classic protection). Zero required checks passes immediately. Reviews such as Copilot code review are not checks and are ignored by the merge gate. Optional checks do not block. Add test cases: zero required checks, one required check pending then passing, and a timeout. Design sections amended: Approving and merging, pre-merge step 4.
+Accepted scope: at merge time, codeboost reads the branch's required checks from its rules (all applicable rulesets plus classic protection, unioned; unreadable sources block). Zero required checks passes immediately. Reviews such as Copilot code review are not checks and are ignored by the merge gate. Optional checks do not block. Add test cases: zero required checks, one required check pending then passing, and a timeout. Design sections amended: Approving and merging, pre-merge step 4.
 History: none
 
 ### R7: Whether to keep the `sql.js` storage fallback
@@ -1274,7 +1284,7 @@ Vitest unit tests with git, gh, Docker, and agents mocked. ✅ Fast and simple C
 
 State: approved
 Actual answer: A) Real git, Docker, evals (answer to D10, 2026-09-22)
-Accepted scope: Vitest for unit and integration tests; real git in temporary folders (no git mocks); recorded `gh` outputs and agent CLI transcripts; a real-Docker end-to-end suite in CI proving the container shows only `/work` and sign-in, a vendor host is reachable, and another host is blocked; Playwright for the review screen flows; a small eval set of hostile issue texts that the agent must not follow. Includes all previously approved test cases (build step 1 list, R4 to R7 cases). CI needs Docker.
+Accepted scope: Vitest for unit and integration tests; real git in temporary folders (no git mocks); recorded `gh` outputs and agent CLI transcripts; a real-Docker end-to-end suite in CI proving the container shows only `/work` and sign-in, a vendor host is reachable, and another host is blocked; Playwright for the review screen flows; a small eval set of hostile issue texts that the agent must not follow. Includes all previously approved test cases (build step 1 list, R4 to R7 cases). CI needs Docker. Include an agent that changes and immediately executes an allowed script: containment must still block host and disallowed network access, and codeboost must require approval before its own later invocation of that changed script.
 History: none
 
 ### O1: Duplicate-segment choices after a copy is removed (reopens R4)
@@ -1444,7 +1454,7 @@ Net: a ledger codeboost controls (A), or labels anyone can forge (B, C, D).
 Header: Commit ledger
 Options:
 A) Apply this change (recommended)
-Record every commit sha codeboost creates, and the old-to-new sha mapping for each rebase it runs. Only ledger commits count as a plan item's work; any other commit is foreign, whatever its message says. The R3 plant script also records its amended commits in the ledger, so the go/no-go test still measures the hard case. ✅ Plan-item labels can no longer be forged. ✅ Cheap, since codeboost already makes every commit. ❌ Commits rewritten outside codeboost lose their attribution. (human: ~4 hours / CC: ~20 min)
+Record every commit sha codeboost creates, and the old-to-new sha mapping for each rebase it runs. Only ledger entries with a non-null plan-item owner count as that item's work; explicitly unowned entries stay Unplanned; any other commit is foreign, whatever its message says. The R3 plant script also records its amended commits in the ledger, so the go/no-go test still measures the hard case. ✅ Plan-item labels can no longer be forged. ✅ Cheap, since codeboost already makes every commit. ❌ Commits rewritten outside codeboost lose their attribution. (human: ~4 hours / CC: ~20 min)
 B) Keep this row's current value
 Keep using the trailer as proof. ✅ No change. ✅ Survives any history rewriting. ❌ Anyone who can push can make code look planned. (human: 0 / CC: 0)
 C) Investigate before choosing
@@ -1454,7 +1464,7 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Th
 
 State: approved
 Actual answer: A) Apply this change (answer to D15, 2026-09-22)
-Accepted scope: `runner/store` keeps a ledger of every commit sha codeboost creates and old-to-new sha mappings for every rebase it runs. Only ledger commits count as a plan item's work; a commit not in the ledger is foreign regardless of its trailer (lines to Unplanned, conflicts per R5). Trailers remain as readable labels. The R3 plant script records its amended commits in the ledger. Test cases: forged trailer on a pushed commit lands in Unplanned; rebased ledger commits keep their attribution through the mapping. Design sections amended: How codeboost links code to plan items; A conflict on a commit codeboost did not make; How we will know it works (plant step).
+Accepted scope: `runner/store` keeps a ledger of every commit sha codeboost creates and old-to-new sha mappings for every rebase it runs. Only ledger entries with a non-null plan-item owner count as that item's work; explicitly unowned entries stay Unplanned; a commit not in the ledger is foreign regardless of its trailer (lines to Unplanned, conflicts per R5). Trailers remain as readable labels. The R3 plant script records its amended commits in the ledger. Test cases: forged trailer on a pushed commit lands in Unplanned; rebased owned ledger commits keep their attribution through the mapping; a missing/null-owner conflict enters the foreign branch before any Px lookup, stays unowned through resolution, and maps to Unplanned. Design sections amended: How codeboost links code to plan items; A conflict on a commit codeboost did not make; How we will know it works (plant step).
 History: none
 
 ### O6: Giving the container a working git without exposing your main repo
@@ -1504,7 +1514,7 @@ Comparison grid:
 | Choice | Current | A | B | C | D |
 |---|---|---|---|---|---|
 | Binary, mode, empty-file, rename, symlink, submodule changes | not represented | each becomes a "file change" segment, owned through the commit ledger (O5) and placed by the same classification table | not represented | not represented, investigate | not represented, deferred |
-| Approval snapshot for a file change | none | old and new path, old and new mode, and old and new blob id | none | none | none |
+| Approval snapshot for a file change | none | old and new path, old and new mode, and old and new typed object ID (blob for files/links, commit for gitlinks) | none | none | none |
 | Review screen | nothing shown | a file-change card: "binary changed (size a → b)", "made executable", "renamed from x", and so on | nothing shown | nothing shown | nothing shown |
 | Merge gate | ignores them | treats them like any other segment | ignores them | ignores them | ignores them |
 
@@ -1519,7 +1529,7 @@ Net: every change visible and gated (A), or some changes invisible (B, C, D).
 Header: Non-text changes
 Options:
 A) Apply this change (recommended)
-Treat binary, mode, empty-file, rename, symlink and submodule changes as "file change" segments, placed by the same table, approved by path, mode and content id, and shown as a card on the review screen. ✅ No change can bypass review or the merge gate. ✅ Reuses the existing rules. ❌ One more segment kind to build and test. (human: ~1 day / CC: ~30 min)
+Treat binary, mode, empty-file, rename, symlink and submodule changes as "file change" segments, placed by the same table, approved by path, mode and typed object ID, and shown as a card on the review screen. ✅ No change can bypass review or the merge gate. ✅ Reuses the existing rules. ❌ One more segment kind to build and test. (human: ~1 day / CC: ~30 min)
 B) Keep this row's current value
 Leave non-text changes out of the model. ✅ No change. ✅ Simpler engine. ❌ Binary and permission changes merge unseen. (human: 0 / CC: 0)
 C) Investigate before choosing
@@ -1529,7 +1539,7 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Th
 
 State: approved
 Actual answer: A) Apply this change (answer to D17, 2026-09-22)
-Accepted scope: binary, mode, empty-file, rename, symlink, and submodule changes become file-change segments, owned via the commit ledger (O5), placed by the classification table, approved by old/new path, mode, and blob id, shown as cards, and gated like any segment. Test cases: one of each of the six kinds lands in the correct row and blocks merge until approved. Design sections amended: How codeboost links code to plan items.
+Accepted scope: binary, mode, empty-file, rename, symlink, and submodule changes become file-change segments, owned via the commit ledger (O5), placed by the classification table, approved by old/new path, mode, and typed object ID (blob for files/links, commit for gitlinks), shown as cards, and gated like any segment. Test cases: one of each of the six kinds lands in the correct row and blocks merge until approved. Design sections amended: How codeboost links code to plan items.
 History: none
 
 ### O8: Narrowing build step 2 to a read-only review screen
@@ -1761,7 +1771,7 @@ Comparison grid:
 | How agents answer | not defined | JSON that must match one schema, enforced by the CLI flag | Markdown or YAML text that codeboost parses | free text that a second agent converts |
 | Importing a plan file | not possible | YAML or JSON, checked by the same schema | YAML only, with a hand-written parser | not possible |
 | Plan assistant suggestions | not defined | typed edit operations (second schema); Apply is exact | free text; the person edits by hand | free text; an agent applies it |
-| Checks after the schema | none | unique IDs, earlier-only dependencies, safe paths, files exist; failures block approval | same | same |
+| Checks after the schema | none | unique IDs, earlier-only dependencies, safe paths, valid projected source/destination state; failures block approval | same | same |
 | Versioning | none | `schema_version` in every plan | none | none |
 
 Question: asked in conversation, not as a numbered question. Claude recommended A.
@@ -1895,11 +1905,11 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T6 (P1, human: ~3 hours / CC: ~15 min)** — runner — Re-run `cmd:` checks after a pre-merge rebase; tie results to the head
   - Surfaced by: O3 (D13: A)
   - Files: runner/merge
-  - Verify: a rebase onto a breaking main blocks the merge
+  - Verify: a rebase onto a breaking main blocks the merge; a head-only collaborator push recomputes review and reruns checks; matching SHAs still refresh both rule sources
 - [ ] **T7 (P1, human: ~2 hours / CC: ~10 min)** — github — Merge with `--match-head-commit` and reload on refusal
   - Surfaced by: O4 (D14: A)
   - Files: github/merge
-  - Verify: a push between the check and the merge is refused and returns to review
+  - Verify: a head or base push between validation and merge is refused or revalidated by the server-side guarded merge; a backend without atomic base protection blocks automatic merge, including with zero required checks
 - [ ] **T8 (P1, human: ~2 days / CC: ~30 min)** — process — Commit the go/no-go rules and build the ledger-aware plant script
   - Surfaced by: R3 (D4: A), O5, O9 (D19: A)
   - Files: scripts/plant.ts, docs/go-no-go.md
@@ -1907,7 +1917,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T9 (P1, human: ~2 weeks / CC: ~3 hours)** — tests — Set up Vitest, real git, recorded gh and CLI outputs, the real-Docker CI suite, Playwright, and the hostile-issue eval
   - Surfaced by: T1 (D10: A)
   - Files: test/, .github/workflows/
-  - Verify: CI runs every suite; the Docker suite fails if isolation breaks
+  - Verify: CI runs every suite; the Docker suite fails if isolation breaks, a read-only phase can write `/work`, planning/questions can execute a process, or task/scratch byte and inode caps can be exceeded; hard-link and alias-write attempts from `.git/config` and objects into `/work` or scratch, and mountpoint replacement, must fail with metadata unchanged; both vendor startup probes must read the container schema and return bounded valid output through their documented file/stdout channel
 - [ ] **T10 (P2, human: ~2 hours / CC: ~10 min)** — core — Duplicate-segment key: file, content, copy number, and copy count
   - Surfaced by: R4 (D5: A), O1 (D11: A)
   - Files: core/choices
@@ -1944,7 +1954,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T18 (P2, human: ~2 days / CC: ~45 min)** — core, agents, web — Plan schema: draft plans with either agent, import YAML or JSON, apply typed suggestions
   - Surfaced by: P1 (approved 2026-09-22)
   - Files: schema/, docs/plan-format.md, prompts/plan-author.md, core/plan (schema and meaning checks), agents/claude, agents/codex, web/plans (Import plan, suggestion cards)
-  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate before conversion; malformed edit payloads and invalid resulting plans cannot be applied; command chains and delimiter-escape payloads are rejected or remain data; `codex exec` runs with stdin closed
+  - Verify: both examples pass and 8 broken plans fail; JSON-compatible YAML parsing is deterministic and rejects duplicate decoded keys, anchors/aliases, merge keys, tags, non-JSON scalars, excessive depth/size, and extra documents before validation; recorded Claude and Codex answers pass; an imported plan for #412 is rejected when the selected task is #413 without silently changing either issue; a declared final symlink can be deleted or safely retargeted while symlink parents and escaping targets are rejected; writes through declared links to undeclared files, directory children, or dangling targets fail the target snapshot audit before out-of-scope classification, tests, or commit; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate against the immutable registry-selected snapshot before conversion; registry paths exist, snapshot IDs are version-qualified and unique, and unversioned CLI schemas exactly match the current snapshots; directory/root declarations and children beneath a file or submodule are rejected; malformed edit payloads and invalid resulting plans cannot be applied; a delayed suggestion captured for plan A at revision 3 with P1 cannot apply to plan B with the same revision/item IDs, and B remains unchanged; applying one card increments the revision and disables all old sibling cards until the person refreshes and reviews regenerated suggestions; concurrent/replayed Apply cannot create duplicate mutations; command chains and delimiter-escape payloads are rejected or remain data; appended flags such as `go test -exec` do not match a shorter allowlist entry and cannot execute; hostile filenames, branch names, script-derived argv values, approved lessons, and revision feedback remain escaped JSON data in the authoring prompt and cannot break its delimiters; `codex exec` runs with stdin closed
 
 ### Unresolved decisions
 
