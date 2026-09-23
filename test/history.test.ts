@@ -53,6 +53,7 @@ it('represents binary, executable, empty, rename, symlink and submodule changes'
   renameSync(join(f.dir, 'rename.txt'), join(f.dir, 'renamed.txt')); symlinkSync('a.txt', join(f.dir, 'link'));
   f.git('add', '-A'); f.git('update-index', '--add', '--cacheinfo', `160000,${f.base},submodule`);
   f.git('commit', '-m', 'File changes'); f.ledger.set(f.git('rev-parse', 'HEAD'), 'P1');
+  f.git('config', 'diff.ignoreSubmodules', 'all');
   const cards = f.segments().filter(s => s.kind === 'file');
   expect(cards.map(s => s.path).sort()).toEqual(['a.txt', 'binary.dat', 'empty', 'link', 'renamed.txt', 'submodule']);
   expect(cards.every(s => s.row === 'P1')).toBe(true);
@@ -127,4 +128,11 @@ it('attributes unchanged moved lines when final rename detection is lost', () =>
 it('does not hide a UTF-8 byte-order-mark-only change', () => {
   const f = fixture(); f.write('a.txt', '\uFEFFone\ntwo\nthree\n'); f.commit('P1');
   expect(f.segments().some(s => s.operation === '+' && s.content.startsWith('\uFEFF'))).toBe(true);
+});
+it('reads the whole repository even when called from a subdirectory with relative diffs configured', () => {
+  const f = fixture({ 'a.txt': 'before\n', 'sub/b.txt': 'before\n' });
+  f.write('a.txt', 'after\n'); f.write('sub/b.txt', 'after\n'); f.commit('P1');
+  f.git('config', 'diff.relative', 'true');
+  const parts = linkHistory(f.plan, readHistory(join(f.dir, 'sub'), f.base), f.ledger);
+  expect(new Set(parts.map(s => s.path))).toEqual(new Set(['a.txt', 'sub/b.txt']));
 });

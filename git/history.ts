@@ -33,7 +33,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): Hi
     return { oid, mode, text: blobs.get(oid)! };
   };
   const diff = (from: string, to: string, contexts: boolean): FileDelta[] => {
-    const raw = run('diff', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--');
+    const raw = run('diff', '--ignore-submodules=none', '--no-relative', '--raw', '-z', '--no-abbrev', '--no-ext-diff', '--no-textconv', '-M', from, to, '--');
     const fields = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(raw).split('\0');
     const result: FileDelta[] = [];
     for (let i = 0; i < fields.length && fields[i];) {
@@ -48,7 +48,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): Hi
       if (contexts && (before?.text !== null || after?.text !== null)) {
         const paths = [...new Set([oldPath, newPath].filter((path): path is string => path !== null))];
         // Literal pathspecs preserve filenames containing Git pathspec metacharacters.
-        const patch = run('diff', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', '-M', from, to, '--', ...paths.map(path => `:(literal)${path}`)).toString();
+        const patch = run('diff', '--ignore-submodules=none', '--no-relative', '--no-ext-diff', '--no-textconv', '--no-color', '--unified=0', '-M', from, to, '--', ...paths.map(path => `:(literal)${path}`)).toString();
         for (const line of patch.split('\n')) {
           const hunk = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@(.*)$/.exec(line);
           if (hunk) ranges.push({ oldStart: +hunk[1]!, oldCount: +(hunk[2] ?? 1), newStart: +hunk[3]!, newCount: +(hunk[4] ?? 1), name: hunk[5]!.trim() });
