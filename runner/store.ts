@@ -49,7 +49,7 @@ export class Store {
           CREATE TABLE approvals (key TEXT NOT NULL REFERENCES plans(key), item TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,item));
           CREATE TABLE choices (key TEXT NOT NULL REFERENCES plans(key), choice_key TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,choice_key));
           CREATE TABLE checkpoints (key TEXT NOT NULL REFERENCES plans(key), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,id));
-          CREATE TABLE continuations (key TEXT NOT NULL REFERENCES plans(key), checkpoint_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,checkpoint_id));
+          CREATE TABLE continuations (key TEXT NOT NULL REFERENCES plans(key), checkpoint_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,checkpoint_id,revision));
           PRAGMA user_version=1;
         `);
       });
@@ -255,11 +255,11 @@ export class Store {
     this.#transaction(() => {
       this.#expect(key, expected); const checkpoint = this.getCheckpoint(identity, checkpointId);
       if (!checkpoint.outOfScopePaths.length || checkpoint.snapshotId !== expected.snapshotId || expected.revision <= checkpoint.revision) throw new Error('Continuation requires an amended plan at the audited checkpoint.');
-      this.#run('INSERT INTO continuations VALUES (?,?,?)', key, checkpointId, expected.revision);
+      this.#run('INSERT INTO continuations VALUES (?,?,?) ON CONFLICT(key,checkpoint_id,revision) DO NOTHING', key, checkpointId, expected.revision);
     });
   }
   continuationRevision(identity: PlanIdentity, checkpointId: string): number | null {
     this.getCheckpoint(identity, checkpointId);
-    return (this.#get('SELECT revision FROM continuations WHERE key=? AND checkpoint_id=?', identityKey(identity), checkpointId)?.revision as number | undefined) ?? null;
+    return (this.#get('SELECT MAX(revision) AS revision FROM continuations WHERE key=? AND checkpoint_id=?', identityKey(identity), checkpointId)?.revision as number | null) ?? null;
   }
 }

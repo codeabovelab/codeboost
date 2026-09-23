@@ -37,3 +37,9 @@ Copilot's summary identified two findings (no inline threads). Both were reprodu
 ## Review round 2
 
 Reproduced a historical-owner retry failure after an amendment removed the owning item. Normal history writes now apply current-item validation only to new ledger entries; existing SHAs still pass the immutable field comparison. The regression also checks that new commits cannot claim the removed owner and that rebases retain historical ownership. No findings declined. Final suite: 152 tests.
+
+## Review round 3
+
+Reproduced continuation reapproval failing after a second plan amendment. Continuation records now include revision in their immutable primary key; the getter returns the latest approved revision, leaving earlier approvals intact. Repeating approval for the same revision is idempotent, with a separately reproduced regression. This changes the unreleased schema introduced by this PR, not a released database format.
+
+Declined the duplicate-source-mapping finding as a correctness issue: the rewrites primary key already rejects a repeated source within a snapshot, and the surrounding transaction rolls back its new snapshot and all ledger writes. A new regression passed before any implementation change and confirms the unchanged snapshot, empty ledger, and absence of mappings after rejection. Final suite: 154 tests.

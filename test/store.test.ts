@@ -185,3 +185,18 @@ it('allows historical ledger retries after the owning item is removed, but rejec
   store.recordRebase(identity, state(store), oid(4), oid(5), [{ oldSha: oid(2), newSha: oid(5) }]);
   expect(store.ownership(identity).get(oid(5))).toBe('P1');
 });
+it('allows a later amended revision to receive a fresh continuation approval', () => {
+  const { store } = fixture(); const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  store.importRevision(JSON.stringify(plan()), 'json', context, 1); store.approveContinuation(identity, checkpoint.id, state(store));
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).not.toThrow();
+  store.importRevision(JSON.stringify(plan()), 'json', context, 2);
+  expect(store.continuationRevision(identity, checkpoint.id)).toBe(2);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).not.toThrow();
+  expect(store.continuationRevision(identity, checkpoint.id)).toBe(3);
+});
+it('rejects duplicate source SHA mappings and rolls back every resulting ledger/snapshot write', () => {
+  const { store } = fixture(); const before = store.getSnapshot(identity);
+  expect(() => store.recordRebase(identity, state(store), oid(3), oid(5), [{ oldSha: oid(2), newSha: oid(4) }, { oldSha: oid(2), newSha: oid(5) }])).toThrow();
+  expect(store.getSnapshot(identity)).toEqual(before); expect(store.getLedger(identity)).toEqual([]);
+  expect(store.getRewrites(identity, before.id)).toEqual([]);
+});
