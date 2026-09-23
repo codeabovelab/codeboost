@@ -144,9 +144,10 @@ test('acknowledges the first Ask agent click immediately and prevents duplicate 
   await page.getByLabel('Question about this item').fill('Does one click submit this?');
   await page.getByRole('button',{name:'Ask agent',exact:true}).click();
   await expect(page.locator('#save-note')).toBeDisabled();
-  await expect(page.locator('#saved')).toHaveText('Saving question…');
+  await expect(page.locator('#saved')).toHaveText('Asking agent…');
  } finally {release();}
  await expect(page.getByText('Does one click submit this?',{exact:true})).toBeVisible();
+ await expect(page.locator('#saved')).toHaveText('Question submitted. Follow the agent’s response in Conversation.');
  await expect(page.getByText('Single-click answer',{exact:true})).toBeVisible({timeout:10000});
  await expect(page.getByRole('button',{name:'Ask agent',exact:true})).toBeEnabled();
  expect(submissions).toBe(1);expect(calls).toBe(1);expect(app.service.store.getReviewNotes(config.identity)).toHaveLength(1);

@@ -364,7 +364,7 @@ $("composer").onsubmit = async (event) => {
     kind = mode;
   const attached = attachments.get(`${item}:${kind}`);
   if (attached && (attached.head !== data.snapshot.head || attached.base !== data.snapshot.base)) return;
-  $("saved").textContent = kind === "change" ? "Saving change request…" : "Saving question…";
+  $("saved").textContent = kind === "change" ? "Saving change request…" : "Asking agent…";
   if (await act({ action: "note", item, kind, text: $("message").value, ...(attached ? {reference:{key:attached.key,start:attached.start,end:attached.end}} : {}) })) {
     $("notes").lastElementChild?.scrollIntoView({ block: "nearest" });
     drafts.delete(`${item}:${kind}`);
@@ -374,9 +374,11 @@ $("composer").onsubmit = async (event) => {
     $("saved").textContent =
       kind === "change"
         ? "Saved for the next revision."
-        : "Question saved. See agent status in Conversation.";
+        : "Question submitted. Follow the agent’s response in Conversation.";
   } else {
-    $("saved").textContent = "Could not save. Your draft is preserved; refresh and try again.";
+    $("saved").textContent = kind === "change"
+      ? "Could not save. Your draft is preserved; refresh and try again."
+      : "Could not ask the agent. Your question is preserved; refresh and try again.";
   }
 };
 $("conversation-toggle").onclick = () => {
