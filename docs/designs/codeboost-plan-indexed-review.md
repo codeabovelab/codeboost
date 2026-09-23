@@ -486,13 +486,13 @@ The top of the screen lists anything that is not yet true. You can still use "Me
 codeboost also rebases before it first shows you the review. So you always review code that sits on the latest base.
 
 **How rebasing works.** A rebase that goes cleanly keeps your approvals, because approvals ignore line numbers. If there is a conflict:
-1. Git stops on one commit. Every commit belongs to exactly one plan item, say Px.
-2. codeboost runs a sandboxed invocation to fix the conflict. The agent sees Px's plan item, the conflicting files, and the base commits that caused the conflict. It may edit only the conflicting files.
+1. Git stops on one commit. Before assigning any plan item or launching an invocation, look up its ledger entry. A missing entry or an explicit null owner takes the foreign/unowned branch below; do not infer an owner from trailers. Only an entry with a non-null owner enters the following owned-commit steps, with that owner as Px.
+2. For an owned commit, codeboost runs a sandboxed invocation to fix the conflict. The agent sees Px's plan item, the conflicting files, and the base commits that caused the conflict. It may edit only the conflicting files.
 3. The fixed commit keeps Px's trailers.
 4. If the fix needs another file, or the invocation fails, codeboost cancels the rebase (`git rebase --abort`). That puts the branch back as it was. The task moves to **needs human**.
 5. Any plan item whose code changed in the fix gets a stale approval.
 
-**A conflict on a commit codeboost did not make** (engineering review, R5, answer D6: B). A person may push a commit to the PR branch. That commit is not in codeboost's commit ledger (O5), whatever its message says. If git stops on it:
+**The foreign/unowned conflict branch** (engineering review, R5, answer D6: B). Step 1 above routes both missing-ledger commits (such as a person's push) and explicitly unowned ledger entries here, regardless of their trailers. Do not run the Px-specific steps for this branch:
 1. codeboost runs a conflict-resolution invocation in the same container, with the same network rule. The agent sees the conflicting files, that commit, and the base commits that caused the conflict. It may edit only the conflicting files.
 2. The resolved commit keeps its original author and gets no `Plan-Item` trailer. The runner records it as an explicitly unowned ledger entry (owner `null`, origin `foreign`, plus its source SHA) and maps the old SHA to the new SHA while preserving that classification. Its lines therefore stay in the red Unplanned row, marked "conflict resolved by agent," regardless of whether any trailer is present.
 3. If the fix needs another file, or the invocation fails, codeboost cancels the rebase and moves the task to **needs human**, as for any other conflict.
@@ -1459,7 +1459,7 @@ Leave this finding open. ✅ No work now. ✅ Listed as an open decision. ❌ Th
 
 State: approved
 Actual answer: A) Apply this change (answer to D15, 2026-09-22)
-Accepted scope: `runner/store` keeps a ledger of every commit sha codeboost creates and old-to-new sha mappings for every rebase it runs. Only ledger entries with a non-null plan-item owner count as that item's work; explicitly unowned entries stay Unplanned; a commit not in the ledger is foreign regardless of its trailer (lines to Unplanned, conflicts per R5). Trailers remain as readable labels. The R3 plant script records its amended commits in the ledger. Test cases: forged trailer on a pushed commit lands in Unplanned; rebased ledger commits keep their attribution through the mapping. Design sections amended: How codeboost links code to plan items; A conflict on a commit codeboost did not make; How we will know it works (plant step).
+Accepted scope: `runner/store` keeps a ledger of every commit sha codeboost creates and old-to-new sha mappings for every rebase it runs. Only ledger entries with a non-null plan-item owner count as that item's work; explicitly unowned entries stay Unplanned; a commit not in the ledger is foreign regardless of its trailer (lines to Unplanned, conflicts per R5). Trailers remain as readable labels. The R3 plant script records its amended commits in the ledger. Test cases: forged trailer on a pushed commit lands in Unplanned; rebased owned ledger commits keep their attribution through the mapping; a missing/null-owner conflict enters the foreign branch before any Px lookup, stays unowned through resolution, and maps to Unplanned. Design sections amended: How codeboost links code to plan items; A conflict on a commit codeboost did not make; How we will know it works (plant step).
 History: none
 
 ### O6: Giving the container a working git without exposing your main repo
