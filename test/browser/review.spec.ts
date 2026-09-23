@@ -233,3 +233,15 @@ test('outdated questions explain how to continue without offering a broken retry
  await expect(page.getByText('This question refers to an earlier review. Ask again against the current code.',{exact:true})).toBeVisible();
  await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
 });
+for(const switchItem of [false,true]) test(`preserves edits made while a question submission is in flight (switch item: ${switchItem})`,async({page})=>{
+ await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
+ let release!:()=>void;const held=new Promise<void>(resolve=>release=resolve);
+ await page.route('**/api/action',async route=>{await held;await route.continue();});
+ await page.getByLabel('Question about this item').fill('Submitted question');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
+ await page.getByLabel('Question about this item').fill('New unsent draft');
+ if(switchItem){await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByLabel('Question about this item').fill('Other item draft');}
+ release();
+ if(switchItem){await expect(page.locator('#saved')).toContainText('Question submitted');await expect(page.getByLabel('Question about this item')).toHaveValue('Other item draft');await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();}
+ await expect(page.getByText('Submitted question',{exact:true})).toBeVisible();
+ await expect(page.getByLabel('Question about this item')).toHaveValue('New unsent draft');
+});

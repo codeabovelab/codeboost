@@ -5,6 +5,7 @@ import { join } from 'node:path';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { Questions } from '../runner/questions.ts';
+import { choiceKeys } from '../core/approvals.ts';
 import { agentArguments } from '../runner/question-agent.ts';
 // Real-Git context reads match the existing review integration suite budget.
 vi.setConfig({testTimeout:15000});
@@ -81,4 +82,16 @@ it('keeps cancelled invocations tracked until they settle',async()=>{
   settle('Late answer');await closing;expect(closed).toBe(true);
   expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.status).toBe('failed');
  } finally {settle('Cleanup');vi.useRealTimers();}
+});
+it('rejects questions whose snippet was reassigned without changing the snapshot',()=>{
+ const service=fixture();const initial=service.load(),foreign=initial.segments.find(s=>s.row==='Unplanned'&&s.operation==='+')!;
+ const assigned=service.act({action:'assign',item:'P1',key:foreign.key,token:initial.token});
+ const asked=service.act({action:'note',item:'P1',kind:'question',text:'Explain this',reference:{key:foreign.key,start:foreign.newLine,end:foreign.newLine},token:assigned.token});
+ const note=asked.notes.find(note=>note.id===asked.createdNoteId)!;
+ const index=initial.segments.findIndex(segment=>segment.key===foreign.key);
+ service.store.saveReview(service.config.identity,asked.expected,[],[{action:'assign',item:'P2',key:choiceKeys(initial.segments,service.config.identity)[index]!}]);
+ const moved=service.load();
+ expect(moved.snapshot.id).toBe(asked.snapshot.id);expect(moved.notes.find(n=>n.id===note.id)?.outdated).toBe(true);
+ const agent=vi.fn(async()=>'Should not run');const manager=new Questions(service,agent);managers.push(manager);
+ expect(()=>manager.start(note.id,moved)).toThrow(/older review|outdated/);expect(agent).not.toHaveBeenCalled();
 });

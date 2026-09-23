@@ -102,10 +102,13 @@ async function act(command) {
   renderAttachment();
   try {
     rememberDraft();
-    data = await api("/api/action", { ...command, token: data.token });
+    const updated = await api("/api/action", { ...command, token: data.token });
+    rememberDraft();
+    data = updated;
     render();
     return true;
   } catch (error) {
+    rememberDraft();
     showFailure(`${error.message} Refresh to review the latest state.`);
     return false;
   } finally {
@@ -365,15 +368,19 @@ $("composer").onsubmit = async (event) => {
   if (busy || !data) return;
   const item = selected,
     kind = mode;
+  const submittedText = $("message").value;
   const attached = attachments.get(`${item}:${kind}`);
   if (attached && (attached.head !== data.snapshot.head || attached.base !== data.snapshot.base)) return;
   $("saved").textContent = kind === "change" ? "Saving change request…" : "Asking agent…";
-  if (await act({ action: "note", item, kind, text: $("message").value, ...(attached ? {reference:{key:attached.key,start:attached.start,end:attached.end}} : {}) })) {
-    $("notes").lastElementChild?.scrollIntoView({ block: "nearest" });
-    drafts.delete(`${item}:${kind}`);
-    attachments.delete(`${item}:${kind}`);
+  if (await act({ action: "note", item, kind, text: submittedText, ...(attached ? {reference:{key:attached.key,start:attached.start,end:attached.end}} : {}) })) {
+    if (selected === item) $("notes").lastElementChild?.scrollIntoView({ block: "nearest" });
+    const unchanged = drafts.get(`${item}:${kind}`) === submittedText && attachments.get(`${item}:${kind}`) === attached;
+    if (unchanged) {
+      drafts.delete(`${item}:${kind}`);
+      attachments.delete(`${item}:${kind}`);
+    }
     renderAttachment();
-    $("message").value = "";
+    $("message").value = drafts.get(`${selected}:${mode}`) || "";
     $("saved").textContent =
       kind === "change"
         ? "Saved for the next revision."
@@ -558,7 +565,7 @@ function answerMarkup(note) {
   if(note.kind!=="question") return "";
   const answer=note.answer;
   if(answer?.status==="complete") return `<section class="agent-answer"><strong>${answer.provider === "claude" ? "Claude Code" : answer.provider === "codex" ? "Codex" : "Agent"}</strong><p>${esc(answer.text)}</p>${note.answerOutdated ? '<small>! Answer refers to an earlier review snapshot.</small>' : ""}</section>`;
-  if(note.answerOutdated) return '<p class="warn">This question refers to an earlier review. Ask again against the current code.</p>';
+  if(note.answerOutdated || note.outdated) return '<p class="warn">This question refers to an earlier review. Ask again against the current code.</p>';
   if(answer?.status==="pending" && answer.expiresAt>Date.now()) return '<p role="status">Agent · Answering…</p>';
   const error=answer?.status==="failed"?answer.error:answer?.status==="pending"?"Agent was interrupted or timed out.":"Answer not started. Choose an agent in Settings or retry when capacity is available.";
   return `<p class="warn">! ${esc(error)}</p><button data-retry-question="${esc(note.id)}">Retry answer</button>`;
