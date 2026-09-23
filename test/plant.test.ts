@@ -1,5 +1,5 @@
-import { it,expect,afterEach } from 'vitest';
-import { mkdtempSync,readFileSync,rmSync } from 'node:fs';
+import { it,expect,afterEach,vi } from 'vitest';
+import { mkdtempSync,readFileSync,rmSync,symlinkSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -24,4 +24,19 @@ it('rejects canonical declared and existing path collisions before creating a cl
  const root=mkdtempSync(join(tmpdir(),'codeboost-plant-collision-'));roots.push(root);
  const config=createDemo(join(root,'source'));config.pathIdentity.caseSensitive=false;
  for (const path of ['RETRY.TS','RUN.SH']) expect(()=>plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:path})).toThrow(/outside every declared file|already exists/);
+},15000);
+
+it('rejects experiment destinations inside the source, including symlink aliases', () => {
+ const root=mkdtempSync(join(tmpdir(),'codeboost-plant-destination-'));roots.push(root);
+ const config=createDemo(join(root,'source'));symlinkSync(config.repository,join(root,'alias'));
+ for(const destination of [join(config.repository,'experiment'),join(config.repository,'.git','experiment'),join(root,'alias','nested','experiment')]) {
+   expect(()=>plant(config,destination,{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'})).toThrow(/outside the source repository/);
+ }
+},15000);
+it('passes its isolated environment to every planting Git process', () => {
+ const root=mkdtempSync(join(tmpdir(),'codeboost-plant-env-'));roots.push(root);
+ const config=createDemo(join(root,'source'));
+ vi.stubEnv('GIT_DIR',join(root,'outside.git'));vi.stubEnv('GIT_WORK_TREE',join(root,'outside'));
+ try {expect(plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'extra.txt'})).toBe(join(root,'experiment','review.json'));}
+ finally {vi.unstubAllEnvs();}
 },15000);

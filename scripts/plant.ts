@@ -1,7 +1,7 @@
 import { isolatedGitEnvironment } from './git-environment.ts';
 import { execFileSync } from 'node:child_process';
-import { existsSync, mkdirSync, writeFileSync, appendFileSync, lstatSync, readFileSync } from 'node:fs';
-import { resolve, join, dirname } from 'node:path';
+import { existsSync, mkdirSync, writeFileSync, appendFileSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
+import { resolve, join, dirname, basename, relative, isAbsolute } from 'node:path';
 import { randomInt, randomUUID } from 'node:crypto';
 import { pathToFileURL } from 'node:url';
 import { Store } from '../runner/store.ts';
@@ -15,6 +15,11 @@ export interface PlantInput { declaredText: string; undeclaredText: string; unde
 export function plant(config: ReviewConfig, destination: string, input: PlantInput): string {
   const root=resolve(destination);
   if(existsSync(root))throw new Error('Experiment destination must not exist.');
+  let parent=root; const missing:string[]=[];
+  while(!lstatSync(parent,{throwIfNoEntry:false})) { missing.unshift(basename(parent)); parent=dirname(parent); }
+  const canonicalDestination=resolve(realpathSync(parent),...missing);
+  const sourceRelative=relative(realpathSync(config.repository),canonicalDestination);
+  if(sourceRelative===''||(!sourceRelative.startsWith('..'+(process.platform==='win32'?'\\':'/'))&&sourceRelative!=='..'&&!isAbsolute(sourceRelative))) throw new Error('Experiment destination must be outside the source repository.');
   if((!isRepoPath(input.undeclaredPath)||input.undeclaredPath.includes('/'))||!input.declaredText?.trim()||!input.undeclaredText?.trim()||input.declaredText.length>4000||input.undeclaredText.length>4000)throw new Error('Invalid plant input.');
   const pathKey=(path:string)=>{
     if(!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
