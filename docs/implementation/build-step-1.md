@@ -104,3 +104,7 @@ File metadata retains the whole rename path lineage, so a later deletion include
 ## Merged-contract review round 4
 
 The review had no inline findings, but its summary identified lost metadata after deleting and recreating a path. A real binary-file regression reproduced only the recreating owner being retained. Metadata updates now combine existing path evidence before storing/propagating it, so prior deletion owners survive reuse and subsequent renames. Owned deletion plus recreation is Ambiguous; foreign deletion plus recreation stays Unplanned. Both regressions pass.
+
+## Merged-contract review round 5
+
+Reproduced a repository-local graft making an unrelated root commit appear descended from the selected base. The adapter now rejects Git-resolved graft and shallow metadata before object/ancestry reads and pins the child graft file to `/dev/null` as defense in depth. Git resolves administrative paths so linked worktrees share the same check. Caller isolation must keep all Git metadata, not just blobs, stable during a read. Full shallow-clone support is deliberately outside this linear immutable-history slice.

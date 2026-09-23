@@ -315,3 +315,16 @@ it.each(['P1', undefined])('retains deletion and recreation owners on reused-pat
   expect(card.owners).toEqual([owner ?? null, 'P2']);
   expect(card.row).toBe(owner ? 'Ambiguous' : 'Unplanned');
 });
+
+it('rejects local grafts that make an unrelated commit appear descended from the base', () => {
+  const f = fixture(); f.git('checkout', '--orphan', 'unrelated'); f.git('rm', '-rf', '.');
+  f.write('a.txt', 'unrelated history\n'); const head = f.commit('P1');
+  f.write('.git/info/grafts', `${head} ${f.base}\n`);
+  expect(() => readHistory(f.dir, f.base, head)).toThrow(/graft/i);
+});
+
+it('rejects shallow parent rewriting before loading history', () => {
+  const f = fixture(); f.write('a.txt', 'changed\n'); const head = f.commit('P1');
+  f.write('.git/shallow', `${head}\n`);
+  expect(() => readHistory(f.dir, f.base, head)).toThrow(/shallow/i);
+});

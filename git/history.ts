@@ -36,7 +36,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
       result = execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
         cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout, killSignal: 'SIGKILL',
         env: { ...environment, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
-          GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null' },
+          GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/dev/null' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });
     } catch (error) {
@@ -46,6 +46,14 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     remaining();
     return result;
   };
+  // Parent-rewriting files are not immutable commit ancestry. Resolve via Git so
+  // linked worktrees use the common administrative directory as well.
+  const commonDirectory = resolvePath(repo, run('rev-parse', '--git-common-dir').toString().trim());
+  for (const name of ['info/grafts', 'shallow']) {
+    const path = join(commonDirectory, name);
+    if (lstatSync(path, { throwIfNoEntry: false }))
+      throw new Error(`Review repositories must not use graft or shallow ancestry metadata (${name}).`);
+  }
   // Inspect storage without following links before any object-resolving command.
   const objects = resolvePath(repo, run('rev-parse', '--git-path', 'objects').toString().trim());
   const pending = [objects];
