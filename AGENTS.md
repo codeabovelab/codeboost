@@ -46,4 +46,4 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Before requesting automated review, report the current head, CI state, mergeability, unresolved threads, and deferred follow-up issues.
 - Reproduce summary-only review concerns or turn them into a concrete follow-up issue. Do not repeatedly patch vague wording without a failure case.
 - For each review round, record what changed, what was declined and why, and the regression evidence. Re-request review until a round returns no new findings.
-- Before closing or merging a PR, extract the highest-value, broadly reusable lessons from its review and add concise rules to this file. Omit one-off implementation details and rules already covered here.
+- Treat review-lesson extraction as a merge gate. Before invoking merge, classify every review finding in the PR body as: covered by an existing rule (cite it), captured by a new rule in this branch (cite it), or one-off (record why). Do not merge until this audit is complete and every required `AGENTS.md` update is included in the reviewed head. Omit rules that merely repeat existing guidance.
