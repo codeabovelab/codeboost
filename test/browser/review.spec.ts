@@ -77,3 +77,32 @@ test('routes mixed owned and ambiguous items to attribution resolution',async({p
 test('keeps review shortcuts active while a toolbar button has focus',async({page})=>{
  await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();await page.getByRole('button',{name:'Refresh',exact:true}).focus();await page.keyboard.press('n');await expect(page.getByRole('heading',{name:'Document retry behavior'})).toBeVisible();
 });
+test('attaches clicked lines to a question, persists and navigates the reference, and shows archived evidence',async({page})=>{
+ await page.goto(app.url);
+ const line=page.locator('.added [data-line]').first();await line.click();
+ await page.getByRole('button',{name:'Ask about selection',exact:true}).click();
+ await expect(page.locator('#attachment')).toContainText('retry.ts');
+ await page.getByLabel('Question about this item').fill('Why this exact line?');await page.getByRole('button',{name:'Save question',exact:true}).click();
+ await page.reload();await page.locator('.note-reference').click();await expect(page.locator('.selected-line').first()).toBeVisible();
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','another revision'],{cwd:app.service.config.repository,stdio:'pipe'});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.locator('.note-reference')).toContainText('Outdated');await page.locator('.note-reference').click();await expect(page.getByRole('heading',{name:'! Outdated code reference'})).toBeVisible();await expect(page.locator('#dialog-body pre')).toContainText('Math.min');
+});
+test('supports shift ranges, highlighted lines, and independent snippet drafts',async({page})=>{
+ const repository=app.service.config.repository;
+ writeFileSync(join(repository,'retry.ts'),'export const cap = 5000;\nexport const base = 100;\nexport const delay = (n: number) => Math.min(cap, base * 2 ** n);\n');
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','rewrite retry'],{cwd:repository,stdio:'pipe'});
+ let view=app.service.load();
+ for(const key of view.segments.filter(s=>s.path==='retry.ts'&&['Unplanned','Ambiguous'].includes(s.row)).map(s=>s.key)) view=app.service.act({action:'assign',key,item:'P1',token:view.token});
+ await page.goto(app.url);
+ const block=page.locator('.added[data-segment]').filter({hasText:'export const cap'});
+ await block.locator('[data-line]').nth(0).click();await block.locator('[data-line]').nth(2).click({modifiers:['Shift']});
+ await expect(page.locator('#selection-label')).toContainText('L1–3');
+ await page.getByRole('button',{name:'Request change to selection',exact:true}).click();await expect(page.locator('#attachment pre')).toContainText('export const delay');
+ await page.getByLabel('Change to request').fill('Please explain these constants.');
+ await page.getByRole('button',{name:'Ask',exact:true}).click();await expect(page.locator('#attachment')).toBeHidden();
+ await block.locator('.code-lines').evaluate(element=>{const lines=element.querySelectorAll('[data-code-line]');const range=document.createRange();range.setStart(lines[0]!.firstChild!,0);range.setEnd(lines[1]!.firstChild!,6);const selection=window.getSelection()!;selection.removeAllRanges();selection.addRange(range);element.dispatchEvent(new MouseEvent('mouseup',{bubbles:true}));});
+ await expect(page.locator('#selection-label')).toContainText('L1–2');await page.getByRole('button',{name:'Ask about selection',exact:true}).click();await expect(page.locator('#attachment pre')).not.toContainText('export const delay');
+ await page.getByRole('button',{name:'Remove snippet',exact:true}).click();await expect(page.locator('#attachment')).toBeHidden();
+ await page.getByRole('button',{name:'Request change',exact:true}).click();await expect(page.locator('#attachment pre')).toContainText('export const delay');
+ await page.getByRole('button',{name:'Save change request',exact:true}).click();await expect(page.locator('.note-reference')).toContainText('L1–3');
+});

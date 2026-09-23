@@ -12,7 +12,8 @@ export function requireSupportedNode(version = process.versions.node): void {
 }
 export interface Snapshot { id: string; base: string; head: string }
 export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
-export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; createdAt: string; revision: number; snapshotId: string }
+export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
+export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; createdAt: string; revision: number; snapshotId: string }
 export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
 export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
@@ -246,12 +247,12 @@ export class Store {
     });
   }
   reviewVersion(identity: PlanIdentity): number { return this.#current(identityKey(identity)).review_version as number; }
-  addReviewNote(identity: PlanIdentity, expected: ReviewState, item: string, kind: ReviewNote['kind'], text: string): ReviewNote {
+  addReviewNote(identity: PlanIdentity, expected: ReviewState, item: string, kind: ReviewNote['kind'], text: string, reference?: SnippetReference): ReviewNote {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
       if (!this.getPlan(identity).items.some(entry => entry.id === item) || !['question', 'change'].includes(kind) || typeof text !== 'string' || !text.trim() || text.length > 4000) throw new Error('Invalid review note.');
-      const note = { id: randomUUID(), item, kind, text: text.trim(), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
+      const note = { id: randomUUID(), item, kind, text: text.trim(), ...(reference ? { reference } : {}), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
       this.#run('INSERT INTO review_notes VALUES (?,?,?)', key, note.id, encode(note));
       this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
       return note;

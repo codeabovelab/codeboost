@@ -20,6 +20,8 @@ let data,
   since = false,
   busy = false;
 const drafts = new Map();
+const attachments = new Map();
+let snippetSelection = null;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -46,6 +48,9 @@ function rememberDraft() {
 }
 function showFailure(message) {
   data = null;
+  snippetSelection = null;
+  $("selection-actions").hidden = true;
+  $("attachment").hidden = true;
   $("banner").textContent = message;
   $("progress").textContent = "Review unavailable";
   $("item-title").textContent = "Review unavailable";
@@ -74,6 +79,7 @@ async function refresh() {
   try {
     rememberDraft();
     data = await api("/api/review");
+    snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
     since = data.items.find((item) => item.id === selected)?.state === "stale";
     render();
@@ -103,6 +109,7 @@ async function act(command) {
 function select(id) {
   rememberDraft();
   selected = id;
+  snippetSelection = null;
   change = 0;
   since = data.items.find((item) => item.id === id)?.state === "stale";
   render();
@@ -201,7 +208,7 @@ function render() {
         .filter((note) => note.item === selected)
         .map(
           (note) =>
-            `<div class="note"><strong>You · ${note.kind === "change" ? "Change requested" : "Question"}</strong><p>${esc(note.text)}</p><small>r${note.revision} · ${esc(new Date(note.createdAt).toLocaleString())}${note.kind === "change" ? " · Pending" : " · Awaiting discussion"}</small></div>`,
+            `<div class="note"><strong>You · ${note.kind === "change" ? "Change requested" : "Question"}</strong><p>${esc(note.text)}</p>${note.reference ? `<button class="note-reference" data-note="${esc(note.id)}">${esc(note.reference.path)} · ${note.reference.side === "new" ? "Added" : "Removed"} L${note.reference.start}–${note.reference.end}${note.outdated ? " · ! Outdated" : ""}</button><pre class="snippet-preview">${esc(note.reference.text)}</pre>` : ""}<small>r${note.revision} · ${esc(new Date(note.createdAt).toLocaleString())}${note.kind === "change" ? " · Pending" : " · Awaiting discussion"}</small></div>`,
         )
         .join("") ||
       '<p class="muted">No conversation yet. Keep questions and requested changes beside the evidence.</p>'
@@ -210,6 +217,19 @@ function render() {
   $("save-note").disabled = !item;
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
   renderCode();
+  renderAttachment();
+  document.querySelectorAll("[data-note]").forEach(button => button.onclick = () => {
+    const note = data.notes.find(note => note.id === button.dataset.note);
+    const ref = note.reference;
+    if (note.outdated) {
+      showDialog(`<h2>! Outdated code reference</h2><p>${esc(ref.path)} · ${ref.side} L${ref.start}–${ref.end}</p><p>Reviewed commit ${esc(ref.head)} · base ${esc(ref.base)}</p><pre>${esc(ref.text)}</pre>`);
+      return;
+    }
+    select(note.item);
+    const segment = data.segments.find(s => s.key === ref.key);
+    chooseSnippet(segment, ref.start, ref.end);
+    document.querySelector(`[data-segment="${ref.key}"]`)?.scrollIntoView({block:"center"});
+  });
 }
 function renderCode() {
   const item = data.items.find((item) => item.id === selected),
@@ -263,7 +283,7 @@ function renderCode() {
           if (lines.at(-1) === "") lines.pop();
           const start =
             segment.operation === "+" ? segment.newLine : segment.oldLine;
-          content = `<div class="diff ${segment.operation === "+" ? "added" : "removed"}"><div class="provenance ${provenance === "Unplanned" ? "unplanned" : ""}">${esc(provenance)}</div><pre class="line-numbers">${lines.map((_, i) => (start === null ? "" : start + i)).join("\n")}</pre><div class="sign">${esc(segment.operation)}</div><pre>${esc(segment.content)}</pre></div>`;
+          content = `<div class="diff ${segment.operation === "+" ? "added" : "removed"}" data-segment="${segment.key}"><div class="provenance ${provenance === "Unplanned" ? "unplanned" : ""}">${esc(provenance)}</div><div class="line-numbers">${lines.map((_, i) => `<button type="button" class="line-number" data-line="${start + i}" aria-label="Select ${segment.operation === "+" ? "added" : "removed"} line ${start + i}">${start + i}</button>`).join("")}</div><div class="sign">${esc(segment.operation)}</div><pre class="code-lines">${lines.map((line,i) => `<span data-code-line="${start+i}">${esc(line) || "&#8203;"}</span>`).join("\n")}</pre></div>`;
         }
         const choices = ["Unplanned", "Ambiguous"].includes(segment.row)
           ? `<div class="choice-controls"><p>Assigning this change makes the selected item’s approval stale.</p><select aria-label="Assign change ${index + 1} to" data-target="${index}"><option value="">Assign to…</option>${data.items.map((p) => `<option value="${esc(p.id)}">${esc(p.id)} · ${esc(p.title)}</option>`).join("")}</select><button data-assign="${index}">Assign</button><button data-accept="${index}">Accept as is</button></div>`
@@ -274,6 +294,14 @@ function renderCode() {
       (data.segments.length
         ? '<div class="empty"><h2>No changes in this row</h2><p>There are no current segments here. An item with no changes requires explicit confirmation before approval.</p></div>'
         : '<div class="empty"><h2>No code changes yet</h2><p>This branch has no changes against the selected base. Open task shows the compared commits.</p></div>'));
+  paintSelection();
+  document.querySelectorAll("[data-line]").forEach(button => button.onclick = event => {
+    const key = button.closest("[data-segment]").dataset.segment;
+    const segment = data.segments.find(s => s.key === key);
+    const line = Number(button.dataset.line);
+    const anchor = event.shiftKey && snippetSelection?.key === key ? snippetSelection.anchor : line;
+    chooseSnippet(segment, Math.min(anchor,line), Math.max(anchor,line), anchor);
+  });
   document.querySelectorAll("[data-assign]").forEach((button) =>
     button.addEventListener("click", () => {
       const index = Number(button.dataset.assign);
@@ -317,6 +345,7 @@ function setMode(value) {
   $("save-note").textContent =
     mode === "change" ? "Save change request" : "Save question";
   $("message").value = drafts.get(`${selected}:${mode}`) || "";
+  renderAttachment();
 }
 function showDialog(html) {
   $("dialog-body").innerHTML = html;
@@ -348,8 +377,12 @@ $("composer").onsubmit = async (event) => {
   event.preventDefault();
   const item = selected,
     kind = mode;
-  if (await act({ action: "note", item, kind, text: $("message").value })) {
+  const attached = attachments.get(`${item}:${kind}`);
+  if (attached && (attached.head !== data.snapshot.head || attached.base !== data.snapshot.base)) return;
+  if (await act({ action: "note", item, kind, text: $("message").value, ...(attached ? {reference:{key:attached.key,start:attached.start,end:attached.end}} : {}) })) {
     drafts.delete(`${item}:${kind}`);
+    attachments.delete(`${item}:${kind}`);
+    renderAttachment();
     $("message").value = "";
     $("saved").textContent =
       kind === "change"
@@ -431,3 +464,72 @@ document.addEventListener("keydown", (event) => {
   if (event.key === "?") $("help").click();
 });
 await refresh();
+
+function chooseSnippet(segment, start, end, anchor = start) {
+  if (!data.items.some(item => item.id === selected)) {
+    $("saved").textContent = "Assign this change to a plan item before adding feedback.";
+    return;
+  }
+  const first = segment.operation === "+" ? segment.newLine : segment.oldLine;
+  const text = segment.content.split("\n").slice(start-first,end-first+1).join("\n");
+  if (end-start >= 200 || text.length > 16000) {
+    $("saved").textContent = "Select at most 200 lines and 16000 characters.";
+    return;
+  }
+  snippetSelection = {key:segment.key,start,end,anchor,text,path:segment.operation === "-" ? segment.oldPath || segment.path : segment.path,side:segment.operation === "+" ? "new" : "old",head:data.snapshot.head,base:data.snapshot.base};
+  paintSelection();
+}
+function referenceLabel(ref) {
+  return `${ref.path} · ${ref.side === "new" ? "Added" : "Removed"} L${ref.start}–${ref.end}`;
+}
+function paintSelection() {
+  const ref = snippetSelection;
+  $("selection-actions").hidden = !ref;
+  $("selection-label").textContent = ref ? referenceLabel(ref) : "";
+  document.querySelectorAll("[data-code-line], [data-line]").forEach(element => {
+    const line = Number(element.dataset.codeLine ?? element.dataset.line);
+    const active = !!ref && element.closest("[data-segment]").dataset.segment === ref.key && line >= ref.start && line <= ref.end;
+    element.classList.toggle("selected-line",active);
+    if (element.matches("button")) element.setAttribute("aria-pressed",String(active));
+  });
+}
+function renderAttachment() {
+  const ref = attachments.get(`${selected}:${mode}`);
+  $("attachment").hidden = !ref;
+  const stale = ref && (!data || ref.head !== data.snapshot.head || ref.base !== data.snapshot.base || !data.segments.some(s => s.key === ref.key && s.row === selected));
+  $("attachment").innerHTML = ref ? `<strong>${esc(referenceLabel(ref))}</strong><small>Commit ${esc(ref.head.slice(0,8))}${stale ? " · ! Outdated — remove and select again" : ""}</small><pre class="snippet-preview">${esc(ref.text)}</pre><button type="button" id="remove-reference">Remove snippet</button>` : "";
+  $("save-note").disabled = !!stale || !data?.items.some(item=>item.id === selected);
+  if (ref) $("remove-reference").onclick = () => {attachments.delete(`${selected}:${mode}`);renderAttachment();};
+}
+function attachSelection(kind) {
+  if (!snippetSelection) return;
+  setMode(kind);
+  attachments.set(`${selected}:${mode}`, {...snippetSelection});
+  document.body.classList.add("conversation-open");
+  document.body.classList.remove("conversation-closed");
+  renderAttachment();
+  $("message").focus();
+}
+$("snippet-ask").onclick = () => attachSelection("question");
+$("snippet-request").onclick = () => attachSelection("change");
+$("selection-clear").onclick = () => {snippetSelection=null;paintSelection();};
+function captureHighlightedLines() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || !selection.rangeCount) return;
+  const range = selection.getRangeAt(0);
+  const element = node => node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+  const first = element(range.startContainer)?.closest("[data-code-line]");
+  const last = element(range.endContainer)?.closest("[data-code-line]");
+  if (!first || !last) return;
+  const block = first.closest("[data-segment]");
+  if (block !== last.closest("[data-segment]")) {
+    snippetSelection=null;paintSelection();
+    $("saved").textContent="Select lines within one changed block and diff side.";
+    return;
+  }
+  let end=Number(last.dataset.codeLine);
+  if (range.endOffset===0 && last!==first) end--;
+  chooseSnippet(data.segments.find(s=>s.key===block.dataset.segment),Number(first.dataset.codeLine),end);
+}
+$("code").addEventListener("mouseup",captureHighlightedLines);
+$("code").addEventListener("keyup",captureHighlightedLines);

@@ -81,6 +81,7 @@
             ><button id="previous" aria-label="Previous change">←</button
             ><button id="next" aria-label="Next change">→</button>
           </div>
+          <div id="selection-actions" hidden role="group" aria-label="Selected code"><span id="selection-label"></span><button id="snippet-ask">Ask about selection</button><button id="snippet-request">Request change to selection</button><button id="selection-clear">Clear selection</button></div>
           <div id="code" tabindex="0"></div>
           <div id="checks" class="check-strip"></div>
         </section>
@@ -103,6 +104,7 @@
           </p>
           <div id="notes"></div>
           <form id="composer">
+            <div id="attachment" hidden></div>
             <label for="message" id="composer-label"
               >Question about this item</label
             ><textarea
