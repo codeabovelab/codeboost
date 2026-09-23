@@ -159,10 +159,10 @@ function render() {
     ? `<p>${esc(item.intent)}</p>${item.reasons.map((reason) => `<p class="warn">! Stale: ${esc(reason)}</p>`).join("")}`
     : "";
   $("approve").hidden = !item;
-  $("approve").textContent = item?.count
-    ? `Approve ${item.id}`
-    : item?.ambiguousCount
-      ? "Resolve ambiguous changes"
+  $("approve").textContent = item?.ambiguousCount
+    ? "Resolve ambiguous changes"
+    : item?.count
+      ? `Approve ${item.id}`
       : "Confirm no change needed";
   $("approve").disabled = item?.state === "approved";
   $("view-toggle").innerHTML =
@@ -324,7 +324,7 @@ function showDialog(html) {
 }
 $("approve").onclick = () => {
   const item = data?.items.find((item) => item.id === selected);
-  if (item?.count === 0 && item.ambiguousCount > 0) {
+  if (item?.ambiguousCount > 0) {
     select("Ambiguous");
     return;
   }

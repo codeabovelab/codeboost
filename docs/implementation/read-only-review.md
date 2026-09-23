@@ -34,3 +34,7 @@ A large-change regression reproduced HTTP 413 when the browser sent the full con
 ## Review round 1
 
 Reproduced and fixed no-change approval with item-owned ambiguous segments; the runner refuses it and the UI directs the user to resolve attribution first. Previously approved no-change items become stale if ambiguous work appears. Reproduced malformed non-ASCII credentials returning a generic conflict instead of unauthorized; credentials now require the expected ASCII hex shape before constant-time comparison. Reproduced stale item controls surviving a failed refresh; errors now discard the loaded view and require refresh. Added acceptance persistence and whole-plan empty-state browser coverage. No findings declined.
+
+## Review round 2
+
+Extended the attribution guard to mixed items with both owned and ambiguous segments. The regression reproduced ordinary approval succeeding with unresolved attribution. Approval now rejects any item-specific ambiguity, previously approved affected items become stale, and the UI routes every such item to attribution resolution. Added browser coverage for this mixed case. No findings declined.

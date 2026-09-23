@@ -39,4 +39,6 @@ it('refuses no-change confirmation while the item still owns ambiguous changes',
  service.store.recordHistory(config.identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
  const view=service.load();expect(view.items[0]!.count).toBe(0);expect(view.segments.some(s=>s.row==='Ambiguous'&&s.owners.includes('P1'))).toBe(true);
  expect(()=>service.act({action:'approve',item:'P1',confirmNoChange:true,token:view.token})).toThrow(/ambiguous/i);
+ expect(view.items[1]!.count).toBeGreaterThan(0);
+ expect(()=>service.act({action:'approve',item:'P2',token:view.token})).toThrow(/ambiguous/i);
 });

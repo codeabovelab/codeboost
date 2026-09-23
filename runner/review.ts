@@ -49,7 +49,7 @@ export class ReviewService {
     });
     const states = approvalStates(plan, segments, saved.approvals, identity);
     for (const item of plan.items) {
-      if (states[item.id] === 'approved' && ((!segments.some(segment => segment.row === item.id) && segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id))) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
+      if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
     }
     const expected: ReviewState = { revision: plan.revision, snapshotId: snapshot.id, reviewVersion };
     const notes = this.store.getReviewNotes(identity);
@@ -82,7 +82,7 @@ export class ReviewService {
     const { identity } = this.config;
     if (command.action === 'approve' && typeof command.item === 'string') {
       const item = view.items.find(item => item.id === command.item);
-      if (item && item.count === 0 && item.ambiguousCount > 0) throw new Error('Resolve this item’s ambiguous changes before confirming no change is needed.');
+      if (item && item.ambiguousCount > 0) throw new Error('Resolve this item’s ambiguous changes before approval.');
       const approval = approveItem(view.plan, view.segments, command.item, identity, command.confirmNoChange === true);
       this.store.saveReview(identity, view.expected, [approval], []);
     } else if ((command.action === 'assign' || command.action === 'accept') && typeof command.key === 'string') {

@@ -69,3 +69,8 @@ test('shows the whole-plan empty state without claiming checks passed',async({pa
  const {repository,identity}=app.service.config;const base=app.service.store.getSnapshot(identity).base;execFileSync('git',['reset','--hard',base],{cwd:repository,stdio:'pipe'});
  await page.goto(app.url);await expect(page.getByRole('heading',{name:'No code changes yet'})).toBeVisible();await expect(page.getByRole('button',{name:'Confirm no change needed',exact:true})).toBeVisible();await expect(page.getByRole('button',{name:'AI review: – Not run',exact:true})).toBeVisible();
 });
+test('routes mixed owned and ambiguous items to attribution resolution',async({page})=>{
+ const {repository,identity}=app.service.config;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','P2 changes retry'],{cwd:repository,stdio:'pipe'});
+ const head=execFileSync('git',['rev-parse','HEAD'],{cwd:repository,encoding:'utf8'}).trim(),snapshot=app.service.store.getSnapshot(identity);app.service.store.recordHistory(identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
+ await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByRole('button',{name:'Resolve ambiguous changes',exact:true}).click();await expect(page.getByRole('heading',{name:'Ambiguous',exact:true})).toBeVisible();
+});
