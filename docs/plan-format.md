@@ -91,6 +91,14 @@ items:
 questions: []
 ```
 
+## Deterministic input parsing
+
+Import accepts UTF-8 JSON or one YAML 1.2 document representing JSON-compatible data. Reject invalid UTF-8, input above 1 MiB, and nesting deeper than 50 containers before producing a plan. Parse into an intermediate syntax tree with duplicate-key detection; do not convert an unchecked YAML graph into application objects.
+
+For both formats, object keys must be strings and unique after decoding at every level; reject duplicates rather than choosing the first or last value. JSON follows RFC 8259 syntax. YAML allows mappings, sequences, strings (including quoted and block strings), the exact plain literals `true`, `false`, and `null`, and numbers spelled using the JSON number grammar. Reject empty implicit values, non-finite values (`.nan`/`.inf`), non-JSON number spellings such as hex/octal or numeric separators, complex/non-string keys, every anchor and alias, merge keys (`<<`), explicit tags (including custom tags), extra documents, and parser warnings/errors before schema validation. Ordinary YAML 1.2 plain strings remain strings; do not infer dates, functions, or application-specific types. Integers used for issue, revision, or indexes must also be exactly representable safe integers in the implementation.
+
+Only after these checks convert to JSON-compatible values, select the registered schema, and validate. Never enable alias expansion or custom object construction. Required fixtures: equivalent JSON/YAML produce identical structured plans; duplicate decoded keys in either format, anchors/aliases, merge keys, tags, non-finite/non-JSON numbers, empty values, complex keys, multiple documents, excessive depth, and oversized input all fail before schema validation. An ordinary quoted string containing `<<` or `&` as part of its text is data, not YAML syntax.
+
 ## Command tokenization (version 1)
 
 `cmd` is parsed by one deterministic tokenizer, never a shell. Only ASCII space separates arguments outside quotes. Single or double quotes delimit a literal part of an argument; remove the delimiters and concatenate adjacent parts (`ab" cd"` becomes one argument `ab cd`). Empty quoted strings produce an empty argument. There are no escapes: reject every backslash, unmatched quote, newline, tab, NUL, or other control character. Outside quotes reject shell metacharacters `;`, `&`, `|`, `<`, `>`, `$`, backticks, parentheses, glob characters (`*`, `?`, `[` and `]`), braces, `!`, `#`, and `~`; inside quotes they are ordinary literal characters. Reject an empty command or executable. Do not expand variables, globs, substitutions, or home paths. Match the resulting complete argv against the approved array exactly. Implementations must share fixtures for empty arguments, spaces inside quotes, adjacent quoted parts, rejected backslashes/unclosed quotes, and quoted literal punctuation.
