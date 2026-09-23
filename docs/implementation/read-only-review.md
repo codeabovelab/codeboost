@@ -90,3 +90,5 @@ PR #11 review round 2 confirmed the poll fix and raised an outdated-retry issue 
 PR #11 review round 3 reproduced retrying a locally active job after its persisted lease expires (for example after a clock jump). The manager now rejects a retry while that note is in its running map, before touching the persisted attempt. The regression advances wall time without advancing the deadline timer and checks the original attempt, single invocation, and shutdown cancellation remain intact.
 
 PR #11 review round 4 reproduced new question work entering during shutdown. Questions now marks itself closing synchronously before cancelling/draining jobs; start rejects before any store write or agent invocation, during and after shutdown. The regression failed before the guard and checks that the unstarted note has no attempt recorded.
+
+PR #11 round 5 confirmed the shutdown fix and made the timeout-summary concern concrete: the CLI adapter replaced the abort reason with generic cancellation. Direct adapter regressions reproduced this for timeout and shutdown reasons. The adapter now preserves Error-valued abort reasons; provider launch errors remain sanitized.
