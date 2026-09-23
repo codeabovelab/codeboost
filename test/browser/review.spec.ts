@@ -3,8 +3,10 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { request as httpRequest } from 'node:http';
 import { createDemo } from '../../scripts/demo.ts';
 import { choiceKeys } from '../../core/approvals.ts';
+import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
@@ -257,4 +259,26 @@ test('warns on completed answers when a snippet assignment changes',async({page}
  await page.goto(app.url);
  await expect(page.locator('.agent-answer')).toContainText('Historical answer');
  await expect(page.locator('.agent-answer')).toContainText('Answer refers to earlier code or review context.');
+});
+test('drains an in-flight question request before closing its agent manager',async()=>{
+ const config=app.service.config;await app.close();let calls=0;
+ app=await startServer(config,0,(_prompt,signal)=>{calls++;return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));});
+ const view=app.service.load(),body=JSON.stringify({action:'note',item:'P1',kind:'question',text:'Question during shutdown',token:view.token});
+ const endpoint=new URL('/api/action',app.url);
+ let response='';
+ const completed=new Promise<void>((resolve,reject)=>{
+  const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{
+   res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);
+  });
+  req.on('error',reject);req.write(body.slice(0,1));
+  setTimeout(()=>req.end(body.slice(1)),50);
+ });
+ await new Promise(resolve=>setTimeout(resolve,10));
+ await Promise.all([app.close(),completed]);
+ const reopened=new ReviewService(config);
+ try {
+  const note=reopened.load().notes.find(note=>note.text==='Question during shutdown');
+  expect(calls).toBe(1);expect(note?.answer?.status).toBe('failed');expect(note?.answer?.error).toMatch(/Server stopped/);
+  expect(JSON.parse(response).notes.some((candidate:{text:string})=>candidate.text==='Question during shutdown')).toBe(true);
+ } finally {reopened.close();app=await startServer(config,0);}
 });
