@@ -34,19 +34,24 @@ export class Questions {
     this.service.store.beginAnswer(this.service.config.identity,id,attempt,provider??undefined);
     if(this.running.size>=2){this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:'Two questions are already running. Retry when one finishes.'});return;}
     const timeout=setTimeout(()=>controller.abort(new Error('Agent timed out. Try again.')),120_000);
+    let invocation: Promise<string> | undefined;
     const done=(async()=>{
       try {
         if(!agent) throw new Error('Choose a question agent in Settings, then retry.');
         const aborted = new Promise<never>((_,reject)=>controller.signal.addEventListener('abort',()=>reject(controller.signal.reason),{once:true}));
-        const text=await Promise.race([agent(questionPrompt(view,note),controller.signal),aborted]);
+        invocation = agent(questionPrompt(view,note),controller.signal);
+        const text=await Promise.race([invocation,aborted]);
         if(typeof text!=='string'||!text.trim()||text.length>24000) throw new Error('Agent returned an empty or oversized answer.');
         this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'complete',text:text.trim()});
       } catch(error) {
         this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)});
       } finally {clearTimeout(timeout);}
     })();
-    this.running.set(id,{controller,done});
-    void done.finally(()=>this.running.delete(id));
+    const settled = done.finally(async () => {
+      await invocation?.catch(() => {});
+      this.running.delete(id);
+    });
+    this.running.set(id,{controller,done:settled});
   }
   async close() {this.closing = true;for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));await Promise.all([...this.running.values()].map(job=>job.done));}
 }

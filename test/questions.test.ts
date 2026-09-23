@@ -10,6 +10,7 @@ import { agentArguments } from '../runner/question-agent.ts';
 vi.setConfig({testTimeout:15000});
 const roots:string[]=[], services:ReviewService[]=[], managers:Questions[]=[];
 afterEach(async()=>{for(const manager of managers.splice(0))await manager.close();services.splice(0).forEach(s=>s.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));vi.restoreAllMocks();});
+function waitForAbort(_prompt:string,signal:AbortSignal):Promise<string>{return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));}
 function fixture(){const root=mkdtempSync(join(tmpdir(),'codeboost-answers-'));roots.push(root);const service=new ReviewService(createDemo(join(root,'demo')));services.push(service);return service;}
 function question(service:ReviewService){const view=service.load();const segment=view.segments.find(s=>s.row==='P1'&&s.operation==='+')!;return service.act({action:'note',item:'P1',kind:'question',text:'Why cap the retry delay?',reference:{key:segment.key,start:segment.newLine,end:segment.newLine},token:view.token});}
 it('persists answers with plan, code, selected snippet and prior conversation context',async()=>{
@@ -30,7 +31,7 @@ it('fails visibly and retries without duplicating the question or accepting stal
  expect(service.store.getReviewNotes(service.config.identity)).toHaveLength(1);expect(service.store.getReviewNotes(service.config.identity)[0]!.answer!.text).toBe('Recovered answer');
 });
 it('prevents duplicate invocations and records interruption when the server stops',async()=>{
- const service=fixture(),asked=question(service);const manager=new Questions(service,()=>new Promise(()=>{}));managers.push(manager);manager.start(asked.createdNoteId!,asked);
+ const service=fixture(),asked=question(service);const manager=new Questions(service,waitForAbort);managers.push(manager);manager.start(asked.createdNoteId!,asked);
  expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow(/already answering/);await manager.close();
  expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/Server stopped/);
 });
@@ -40,7 +41,7 @@ it('persists provider selection and restricts commands to fixed provider launch 
  const codex=agentArguments('codex');expect(codex).toContain('read-only');expect(codex).toContain('features.shell_tool=false');expect(codex).toContain('features.plugins=false');
 });
 it('times out an unresponsive agent and allows expired pending attempts to be recovered',async()=>{
- const service=fixture(),asked=question(service);const manager=new Questions(service,()=>new Promise(()=>{}));managers.push(manager);
+ const service=fixture(),asked=question(service);const manager=new Questions(service,waitForAbort);managers.push(manager);
  vi.useFakeTimers();
  try {manager.start(asked.createdNoteId!,asked);await vi.advanceTimersByTimeAsync(120001);expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/timed out/);
  service.store.beginAnswer(service.config.identity,asked.createdNoteId!,'interrupted');await vi.advanceTimersByTimeAsync(125001);service.store.beginAnswer(service.config.identity,asked.createdNoteId!,'replacement');service.store.finishAnswer(service.config.identity,asked.createdNoteId!,'interrupted',{status:'complete',text:'Old answer'});expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.attempt).toBe('replacement');
@@ -48,7 +49,7 @@ it('times out an unresponsive agent and allows expired pending attempts to be re
 });
 it('does not replace a locally running job when its persisted lease expires',async()=>{
  const service=fixture(),asked=question(service);let calls=0,signal:AbortSignal|undefined;
- const manager=new Questions(service,(_prompt,currentSignal)=>{calls++;signal=currentSignal;return new Promise(()=>{});});managers.push(manager);
+ const manager=new Questions(service,(_prompt,currentSignal)=>{calls++;signal=currentSignal;return waitForAbort(_prompt,currentSignal);});managers.push(manager);
  manager.start(asked.createdNoteId!,asked);
  const original=service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt;
  const later=Date.now()+130000;vi.spyOn(Date,'now').mockReturnValue(later);
@@ -58,7 +59,7 @@ it('does not replace a locally running job when its persisted lease expires',asy
 });
 it('rejects new work as soon as shutdown begins',async()=>{
  const service=fixture(),first=question(service),second=question(service);let calls=0;
- const manager=new Questions(service,()=>{calls++;return new Promise(()=>{});});managers.push(manager);
+ const manager=new Questions(service,(prompt,signal)=>{calls++;return waitForAbort(prompt,signal);});managers.push(manager);
  manager.start(first.createdNoteId!,first);
  const closing=manager.close();
  expect(()=>manager.start(second.createdNoteId!,second)).toThrow(/stopping/);
@@ -66,4 +67,18 @@ it('rejects new work as soon as shutdown begins',async()=>{
  expect(()=>manager.start(second.createdNoteId!,second)).toThrow(/stopping/);
  expect(calls).toBe(1);
  expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===second.createdNoteId)?.answer).toBeUndefined();
+});
+it('keeps cancelled invocations tracked until they settle',async()=>{
+ const service=fixture(),asked=question(service);let settle!:(value:string)=>void;
+ const manager=new Questions(service,()=>new Promise(resolve=>settle=resolve));managers.push(manager);
+ vi.useFakeTimers();
+ try {
+  manager.start(asked.createdNoteId!,asked);await vi.advanceTimersByTimeAsync(120001);
+  expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.status).toBe('failed');
+  expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow(/already answering/);
+  let closed=false;const closing=manager.close().then(()=>{closed=true;});
+  await Promise.resolve();await Promise.resolve();expect(closed).toBe(false);
+  settle('Late answer');await closing;expect(closed).toBe(true);
+  expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.status).toBe('failed');
+ } finally {settle('Cleanup');vi.useRealTimers();}
 });

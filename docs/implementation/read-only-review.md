@@ -92,3 +92,7 @@ PR #11 review round 3 reproduced retrying a locally active job after its persist
 PR #11 review round 4 reproduced new question work entering during shutdown. Questions now marks itself closing synchronously before cancelling/draining jobs; start rejects before any store write or agent invocation, during and after shutdown. The regression failed before the guard and checks that the unstarted note has no attempt recorded.
 
 PR #11 round 5 confirmed the shutdown fix and made the timeout-summary concern concrete: the CLI adapter replaced the abort reason with generic cancellation. Direct adapter regressions reproduced this for timeout and shutdown reasons. The adapter now preserves Error-valued abort reasons; provider launch errors remain sanitized.
+
+PR #11 round 6 reproduced releasing a concurrency slot while a cancelled invocation was still unsettled. Cancellation now persists the visible failure promptly but retains the job until the invocation settles; retries remain blocked and shutdown awaits it. The CLI adapter defers rejection and temporary-directory cleanup until child close, including abort and output-limit failures. Regressions cover late settlement and abort-error-before-close ordering. Injected agents must settle after cancellation; production adapters terminate with SIGKILL and await closure.
+
+The review's polling-efficiency observation is tracked separately in issue #12: answer polling currently rebuilds the full review, and the follow-up will measure and remove that work while preserving snapshot metadata and stale-response protection.

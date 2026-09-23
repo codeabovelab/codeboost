@@ -213,7 +213,7 @@ test('Clear selection removes native text selection as well as selected lines',a
  await expect(page.getByRole('group',{name:'Selected code'})).toBeHidden();
 });
 test('ignores question polls started before a newer submission',async({page})=>{
- const config=app.service.config;await app.close();app=await startServer(config,0,()=>new Promise(()=>{}));
+ const config=app.service.config;await app.close();app=await startServer(config,0,(_prompt,signal)=>new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true})));
  await page.goto(app.url);await page.getByLabel('Question about this item').fill('First question');await page.getByRole('button',{name:'Ask agent',exact:true}).click();await expect(page.getByText('Agent · Answering…',{exact:true})).toBeVisible();
  let release!:()=>void,arrived!:()=>void;const held=new Promise<void>(r=>release=r),captured=new Promise<void>(r=>arrived=r);
  await page.route('**/api/questions',async route=>{const response=await route.fetch();arrived();await held;await route.fulfill({response});});

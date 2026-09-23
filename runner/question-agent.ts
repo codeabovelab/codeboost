@@ -18,11 +18,11 @@ export function cliQuestionAgent(provider: Provider): QuestionAgent {
       const stdout=await new Promise<string>((resolve,reject)=>{
         const env={...process.env};delete env.CLAUDECODE;delete env.NODE_OPTIONS;
         const child=spawn(provider,agentArguments(provider),{cwd,env,stdio:['pipe','pipe','pipe'],signal,killSignal:'SIGKILL'});
-        const chunks:Buffer[]=[];let bytes=0,diagnostic='';
-        child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>1024*1024){child.kill('SIGKILL');reject(new Error('Agent output exceeded its limit.'));}else chunks.push(chunk);});
+        const chunks:Buffer[]=[];let bytes=0,diagnostic='';let failure:Error|undefined;
+        child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>1024*1024){failure ??= new Error('Agent output exceeded its limit.');child.kill('SIGKILL');}else chunks.push(chunk);});
         child.stderr.on('data',(chunk:Buffer)=>{diagnostic=(diagnostic+chunk.toString()).slice(-2000);});
-        child.on('error',error=>reject(signal.aborted && signal.reason instanceof Error ? signal.reason : new Error(signal.aborted?'Agent cancelled.':`Could not start ${provider}. Check that its CLI is installed and signed in. (${error.name})`)));
-        child.on('close',code=>code===0?resolve(Buffer.concat(chunks).toString('utf8')):reject(new Error(`${provider} exited with status ${code}. Check its login and usage limits.${/auth|login|sign.in/i.test(diagnostic)?' Authentication may be required.':''}`)));
+        child.on('error',error=>{failure = signal.aborted && signal.reason instanceof Error ? signal.reason : new Error(signal.aborted?'Agent cancelled.':`Could not start ${provider}. Check that its CLI is installed and signed in. (${error.name})`);});
+        child.on('close',code=>failure?reject(failure):code===0?resolve(Buffer.concat(chunks).toString('utf8')):reject(new Error(`${provider} exited with status ${code}. Check its login and usage limits.${/auth|login|sign.in/i.test(diagnostic)?' Authentication may be required.':''}`)));
         child.stdin.on('error',()=>{});child.stdin.end(prompt);
       });
       if(provider==='claude') {
