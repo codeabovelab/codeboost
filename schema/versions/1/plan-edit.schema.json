@@ -275,7 +275,7 @@
       ],
       "properties": {
         "type": {
-          "description": "cmd: one program and its literal arguments, for example go test ./... -run TestRetry. codeboost splits it into arguments and runs it in the container without a shell, so pipes, redirects, ;, &&, $(), backticks, and variables are not allowed; the complete parsed argv must exactly match an entry on the repo's approved command list, including every flag and argument. Prefix matching and appended arguments are not allowed. An unlisted argv cannot execute until the person explicitly approves that exact allowlist entry. It passes when it exits 0. check: a statement the review agent judges against the code.",
+          "description": "cmd: one program and its literal arguments, for example go test ./... -run TestRetry. codeboost splits it into arguments and runs it in the container without a shell, using the strict quoting/tokenization grammar in docs/plan-format.md; shell syntax outside quoted literal arguments and all expansions are forbidden; the complete parsed argv must exactly match an entry on the repo's approved command list, including every flag and argument. Prefix matching and appended arguments are not allowed. An unlisted argv cannot execute until the person explicitly approves that exact allowlist entry. It passes when it exits 0. check: a statement the review agent judges against the code.",
           "type": "string",
           "enum": [
             "cmd",
