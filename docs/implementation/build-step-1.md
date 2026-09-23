@@ -1,0 +1,36 @@
+# Build step 1: plan format and linking foundation
+
+Started from PR #1 and updated to its design commit `2229e88`. Work follows the approved build order; the user explicitly chose it over prioritizing plan drafting in the UI.
+
+## Delivered in this slice
+
+- A single private TypeScript package with pinned dependencies, Vitest, strict typechecking, and CI on Node 26.7.0.
+- Draft 2020-12 validation against the existing v1 schemas. Imports assign the caller's next revision; unsupported versions fail instead of being silently converted.
+- Projected file operations, dependency checks, path restrictions, command argv parsing, warnings, and safe individual suggestion transformations.
+- A read-only Git adapter and a pure attribution engine. Ownership comes only from a supplied ledger, never a trailer. Line edits retain earlier owners; changes involving a foreign commit conservatively remain Unplanned.
+- Text segments, shared-hunk labels, and evidence cards for path/mode/binary/empty/symlink/submodule changes.
+- Approval fingerprints include item data, exact changed content (CRLF normalized), and Git function context. They ignore line numbers and commit IDs, and staleness propagates through dependencies. Duplicate-segment choices expire if copy count changes.
+
+## Decisions
+
+**Reuse.** Inspected AgentDiff's `agentdiff/plan_validator.py` and `agentdiff/diff_parser.py` on 2026-09-22. Its file grouping and plan format do not provide the ledger-backed line ancestry needed here. No AgentDiff code was copied. Use Ajv for JSON Schema, `yaml` for YAML, and `diff` for bounded Myers line comparison.
+
+**Module boundaries.** `core` has no runtime I/O. `git` reads repository objects, never the worktree's file targets. Future `runner/store` remains the sole persistent writer. Empty scaffolds for agents/github/web are intentionally not shipped.
+
+**History scope.** Linear histories only in this slice. Reject merges and non-ancestor bases rather than guessing ownership. Keep rename provenance so a later edit that defeats final rename detection cannot erase the move's owner.
+
+**Command grammar.** One executable with literal argv. Space-separated arguments and single/double quotes are supported; shell syntax outside quotes is rejected. Quoted punctuation (for example a test regex) is literal data. The library never executes a command.
+
+**Persistence.** Caller supplies the immutable base-file list and trusted ledger. Suggested edits return a new revision; atomic compare-and-swap and revision allocation are requirements for the later store integration.
+
+## Validation
+
+`npm test` runs schema fixtures and real Git repositories: the documented invalid plans; projected add/edit/rename/delete chains; bad dependencies/paths; malformed suggestions; stale revisions; two owners in one hunk; forged trailers; out-of-scope changes; pure deletions; overlapping edits; reverted work; all six non-text change kinds; literal filenames; clean rebases with remapped ledger; stale checks/dependents; whitespace/context changes; assignment and duplicate-copy expiry; and rename provenance when final rename detection is lost.
+
+The rename case first failed (moved lines became Unplanned), then passed after the provenance fix. `npm run typecheck` checks all source and tests. The public examples and shared schema definitions are checked on every test run.
+
+## Remaining gates
+
+This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.
+
+The design's manual real-issue assignment and timed go/no-go experiment have not been performed. Disposable Git histories are engineering tests, not evidence that plan-indexed review beats raw review. Write and commit the experiment protocol before using the real review screen for that comparison. Do not proceed to merging, agent execution, planning UI, queue, or learning until the documented gate passes.
