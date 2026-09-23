@@ -20,3 +20,8 @@ it('refuses non-ASCII plants on case-insensitive filesystems pending an identity
  const config=createDemo(join(root,'source'));config.pathIdentity.caseSensitive=false;
  expect(()=>plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:'café.txt'})).toThrow(/filesystem-specific identity adapter/);
 },15000);
+it('rejects canonical declared and existing path collisions before creating a clone', () => {
+ const root=mkdtempSync(join(tmpdir(),'codeboost-plant-collision-'));roots.push(root);
+ const config=createDemo(join(root,'source'));config.pathIdentity.caseSensitive=false;
+ for (const path of ['RETRY.TS','RUN.SH']) expect(()=>plant(config,join(root,'experiment'),{declaredText:'// extra',undeclaredText:'diagnostic',undeclaredPath:path})).toThrow(/outside every declared file|already exists/);
+},15000);

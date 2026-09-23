@@ -25,7 +25,7 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
   const source=new Store(config.database);
   let plan, snapshot, entries;
   try{plan=source.getPlan(config.identity);snapshot=source.getSnapshot(config.identity);entries=source.getLedger(config.identity);}finally{source.close();}
-  if(plan.items.some(item=>item.files.some(file=>file.path===input.undeclaredPath||file.renamed_from===input.undeclaredPath)))throw new Error('Undeclared plant must be outside every declared file.');
+  if(plan.items.some(item=>item.files.some(file=>pathKey(file.path)===pathKey(input.undeclaredPath)||(file.renamed_from!==null&&pathKey(file.renamed_from)===pathKey(input.undeclaredPath)))))throw new Error('Undeclared plant must be outside every declared file.');
   for(const item of plan.items) for(const file of item.files) { pathKey(file.path); if(file.renamed_from) pathKey(file.renamed_from); }
   const history=readHistory(config.repository,snapshot.base,snapshot.head);
   const owners=new Map(entries.map(entry=>[entry.sha,entry.owner]));
@@ -41,9 +41,9 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
   const gitRaw=(cwd:string,...args:string[])=>execFileSync('git',['-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false',...args],{cwd,env,encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:30000,maxBuffer:32*1024*1024});
   const git=(cwd:string,...args:string[])=>gitRaw(cwd,...args).trim();
   // Refuse existing paths, symlink targets, and unsupported declared-file transitions before creating output.
-  for(const commit of history.commits){
-    const tree=git(config.repository,'ls-tree','-r',commit.sha,'--',input.undeclaredPath);
-    if(tree)throw new Error('Undeclared plant path already exists in the source history.');
+  for(const sha of [snapshot.base,...history.commits.map(commit=>commit.sha)]){
+    const paths=gitRaw(config.repository,'ls-tree','-rz','--name-only',sha).split('\0').filter(Boolean);
+    if(paths.some(path=>pathKey(path)===pathKey(input.undeclaredPath)))throw new Error('Undeclared plant path already exists in the source history.');
   }
   for(const commit of history.commits.slice(declared.index)){
     if(!/^100(?:644|755) blob /.test(git(config.repository,'ls-tree',commit.sha,'--',declared.path)))throw new Error('Declared plant needs a regular file retained through the remaining history.');

@@ -44,3 +44,7 @@ it('scrubs Git environment names case-insensitively for Windows', () => {
   expect(env).not.toHaveProperty('git_dir'); expect(env).not.toHaveProperty('Git_Work_Tree');
   expect(env.GIT_CONFIG_NOSYSTEM).toBe('1');
 });
+it('rejects symlinked ancestors before creating a demo', () => {
+  const base = root(); symlinkSync(base, join(base, 'alias'));
+  expect(() => createDemo(join(base, 'alias', 'nested', 'demo'))).toThrow(/fixture/i);
+});

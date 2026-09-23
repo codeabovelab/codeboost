@@ -1,5 +1,6 @@
-import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, lstatSync } from 'node:fs';
-import { resolve, join } from 'node:path';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, readFileSync, writeFileSync, chmodSync, lstatSync, realpathSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { resolve, join, relative, isAbsolute, dirname } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { Store } from '../runner/store.ts';
@@ -8,7 +9,17 @@ import type { Plan } from '../core/plan.ts';
 import { isolatedGitEnvironment } from './git-environment.ts';
 /** Disposable fixture only. Never runs against the user's working repository. */
 export function createDemo(directory: string): ReviewConfig {
-  const root = resolve(directory), configPath = join(root, 'review.json');
+  const requested = resolve(directory), temporary = resolve(tmpdir());
+  const tempRelative = relative(temporary, requested);
+  // The OS temp directory may itself use a system alias (e.g. /var on macOS).
+  // Canonicalize that trusted prefix only; reject user-created symlinks below it.
+  const root = !tempRelative.startsWith('..') && !isAbsolute(tempRelative) ? resolve(realpathSync(temporary), tempRelative) : requested;
+  for (let path = root; ; path = dirname(path)) {
+    const stat = lstatSync(path, { throwIfNoEntry: false });
+    if (stat?.isSymbolicLink()) throw new Error('Demo fixture ancestors must not be symlinks.');
+    if (dirname(path) === path) break;
+  }
+  const configPath = join(root, 'review.json');
   if (existsSync(root) && lstatSync(root).isSymbolicLink()) throw new Error('Demo fixture root must not be a symlink.');
   if (existsSync(configPath)) {
     const check = (path: string, directory: boolean) => {
