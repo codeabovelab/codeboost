@@ -13,7 +13,7 @@ export function requireSupportedNode(version = process.versions.node): void {
 export interface Snapshot { id: string; base: string; head: string }
 export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
 export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
-export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
+export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
 export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
 export interface Checkpoint {
@@ -268,7 +268,7 @@ export class Store {
       return note;
     });
   }
-  beginAnswer(identity: PlanIdentity, id: string, attempt: string, provider?: 'claude' | 'codex'): void {
+  beginAnswer(identity: PlanIdentity, id: string, attempt: string, provider?: 'claude' | 'codex', contextId?: string): void {
     const key=identityKey(identity);
     this.#transaction(()=>{
       const row=this.#get('SELECT data FROM review_notes WHERE key=? AND id=?',key,id);
@@ -276,7 +276,7 @@ export class Store {
       const note=decode<ReviewNote>(row.data);
       if(note.kind!=='question' || note.answer?.status==='complete') throw new Error('Question already answered.');
       if(note.answer?.status==='pending' && note.answer.expiresAt>Date.now()) throw new Error('Agent is already answering this question.');
-      note.answer={attempt,status:'pending',expiresAt:Date.now()+125000,...(provider?{provider}:{})};
+      note.answer={attempt,status:'pending',expiresAt:Date.now()+125000,...(provider?{provider}:{}),...(contextId?{contextId}:{})};
       this.#run('UPDATE review_notes SET data=? WHERE key=? AND id=?',encode(note),key,id);
     });
   }

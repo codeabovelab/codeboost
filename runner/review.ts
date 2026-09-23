@@ -52,7 +52,8 @@ export class ReviewService {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
     }
     const expected: ReviewState = { revision: plan.revision, snapshotId: snapshot.id, reviewVersion };
-    const notes = this.store.getReviewNotes(identity).map(note => ({ ...note, answerOutdated: note.snapshotId!==snapshot.id || note.revision!==plan.revision, outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) }));
+    const contextIds = new Map(plan.items.map(item => [item.id,createHash('sha256').update(JSON.stringify(segments.filter(segment=>segment.row===item.id).map(segment=>segment.key))).digest('hex')]));
+    const notes = this.store.getReviewNotes(identity).map(note => {const contextId=contextIds.get(note.item)!;return { ...note, contextId, answerOutdated: note.snapshotId!==snapshot.id || note.revision!==plan.revision || (!!note.answer?.contextId && note.answer.contextId!==contextId), outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) };});
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
     const items = plan.items.map(item => {
       const owned = segments.filter(segment => segment.row === item.id);

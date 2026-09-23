@@ -32,7 +32,7 @@ export class Questions {
     const provider=this.service.store.questionProvider();
     const agent=this.agent ?? (provider ? cliQuestionAgent(provider) : undefined);
     const attempt=randomUUID(), controller=new AbortController();
-    this.service.store.beginAnswer(this.service.config.identity,id,attempt,provider??undefined);
+    this.service.store.beginAnswer(this.service.config.identity,id,attempt,provider??undefined,note.contextId);
     if(this.running.size>=2){this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:'Two questions are already running. Retry when one finishes.'});return;}
     const timeout=setTimeout(()=>controller.abort(new Error('Agent timed out. Try again.')),120_000);
     let invocation: Promise<string> | undefined;

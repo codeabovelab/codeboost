@@ -95,3 +95,13 @@ it('rejects questions whose snippet was reassigned without changing the snapshot
  const agent=vi.fn(async()=>'Should not run');const manager=new Questions(service,agent);managers.push(manager);
  expect(()=>manager.start(note.id,moved)).toThrow(/older review|outdated/);expect(agent).not.toHaveBeenCalled();
 });
+it('marks an item-level answer historical when assigned code changes',async()=>{
+ const service=fixture(),initial=service.load(),foreign=initial.segments.find(s=>s.row==='Unplanned')!;
+ const asked=service.act({action:'note',item:'P1',kind:'question',text:'Is this item complete?',token:initial.token});
+ const manager=new Questions(service,async()=>'It is complete for the supplied changes.');managers.push(manager);
+ manager.start(asked.createdNoteId!,asked);await vi.waitFor(()=>expect(service.store.getReviewNotes(service.config.identity)[0]?.answer?.status).toBe('complete'));
+ const index=initial.segments.findIndex(segment=>segment.key===foreign.key);
+ service.store.saveReview(service.config.identity,asked.expected,[],[{action:'assign',item:'P1',key:choiceKeys(initial.segments,service.config.identity)[index]!}]);
+ const changed=service.load(),note=changed.notes.find(note=>note.id===asked.createdNoteId)!;
+ expect(changed.snapshot.id).toBe(asked.snapshot.id);expect(note.answer?.text).toContain('complete');expect(note.answerOutdated).toBe(true);
+});
