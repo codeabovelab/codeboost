@@ -47,6 +47,10 @@ Round 3 reviewed the pre-fix commit and repeated the environment finding; the ex
 
 Declined adding rename-only ownership to later text edits. The approved design represents a no-content rename as a separate file-change segment. A real-Git test confirms that a foreign rename remains an Unplanned file card while the later P2 text edit belongs to P2; the rename has not disappeared from review. Text edits before a rename still retain their line ancestry. Scope tests now explicitly require nonempty P2 rows.
 
+## Review round 5
+
+Fixed unbounded accumulation of unique blobs across a history. The adapter checks object size before loading it and enforces a cumulative 64 MiB byte budget; callers can choose a smaller positive limit. A small-budget fixture failed before the fix, then passed with explicit rejection below the required total and success at the exact total. Repeated references to the same blob do not count twice.
+
 ## Remaining gates
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.

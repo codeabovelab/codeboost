@@ -4,7 +4,10 @@ import { resolve as resolvePath } from 'node:path';
 import type { FileDelta, FileVersion, History } from '../core/linking.ts';
 
 /** Read-only Git adapter. Never follows working-tree symlinks or runs diff helpers. */
-export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): History {
+export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', limits: { maxBlobBytes?: number } = {}): History {
+  const maxBlobBytes = limits.maxBlobBytes ?? 64 * 1024 * 1024;
+  if (!Number.isSafeInteger(maxBlobBytes) || maxBlobBytes < 1 || maxBlobBytes > 64 * 1024 * 1024) throw new Error('Blob byte budget must be a positive integer no larger than 64 MiB.');
+  let blobBytes = 0;
   // Inherited Git variables can redirect repository, index, config, and object lookup.
   const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
   const run = (...args: string[]) => execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
@@ -32,7 +35,10 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD'): Hi
     if (/^0+$/.test(oid)) return null;
     if (mode === '160000') return { oid, mode, text: null }; // gitlink is not a local blob
     if (!blobs.has(oid)) {
+      const size = Number(run('cat-file', '-s', oid).toString().trim());
+      if (!Number.isSafeInteger(size) || size < 0 || size > maxBlobBytes - blobBytes) throw new Error('Review history exceeds the cumulative blob byte budget; choose a narrower base.');
       const data = run('cat-file', 'blob', oid);
+      blobBytes += data.length;
       let text: string | null = null;
       if (!data.includes(0)) { try { text = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(data); } catch { /* binary */ } }
       blobs.set(oid, text);

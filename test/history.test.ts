@@ -193,3 +193,9 @@ it('keeps a foreign rename on its file card while attributing later text edits',
   expect(text.length).toBeGreaterThan(0);
   expect(text.every(s => s.row === 'P2' && s.scope === 'in-scope')).toBe(true);
 });
+
+it('fails explicitly when cumulative unique blob bytes exceed the history budget', () => {
+  const f = fixture(); f.write('a.txt', 'changed text\n'); f.commit('P1');
+  expect(() => readHistory(f.dir, f.base, 'HEAD', { maxBlobBytes: 20 })).toThrow(/blob byte budget/i);
+  expect(readHistory(f.dir, f.base, 'HEAD', { maxBlobBytes: 27 }).final).toHaveLength(1);
+});
