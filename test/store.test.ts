@@ -6,7 +6,7 @@ import { once } from 'node:events';
 import { afterEach, expect, it } from 'vitest';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
-import { approveItem, approvalStates, choiceKeys } from '../core/approvals.ts';
+import { approveItem, approvalStates, choiceKeys, applyChoices } from '../core/approvals.ts';
 import { linkHistory, type Segment } from '../core/linking.ts';
 import { readHistory } from '../git/history.ts';
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
@@ -199,4 +199,14 @@ it('rejects duplicate source SHA mappings and rolls back every resulting ledger/
   expect(() => store.recordRebase(identity, state(store), oid(3), oid(5), [{ oldSha: oid(2), newSha: oid(4) }, { oldSha: oid(2), newSha: oid(5) }])).toThrow();
   expect(store.getSnapshot(identity)).toEqual(before); expect(store.getLedger(identity)).toEqual([]);
   expect(store.getRewrites(identity, before.id)).toEqual([]);
+});
+it('expires assignments to removed plan items atomically with the amendment', () => {
+  const { store } = fixture();
+  const segment: Segment = { path: 'a', oldPath: 'a', kind: 'text', operation: '+', content: 'after\n', context: '', owners: [null], row: 'Unplanned', scope: 'unplanned', oldLine: null, newLine: 1, hunk: 0, sharesHunkWith: [] };
+  store.saveReview(identity, state(store), [], [{ key: choiceKeys([segment], identity)[0]!, action: 'assign', item: 'P1' }]);
+  const next = plan(); next.items[0]!.id = 'P2'; store.importRevision(JSON.stringify(next), 'json', context, 1);
+  expect(() => applyChoices(store.getPlan(identity), [segment], store.getReview(identity).choices, identity)).not.toThrow();
+  expect(store.getReview(identity).choices).toEqual([]);
+  store.importRevision(JSON.stringify(plan()), 'json', context, 2);
+  expect(store.getReview(identity).choices).toEqual([]);
 });

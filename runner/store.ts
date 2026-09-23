@@ -79,6 +79,12 @@ export class Store {
     if (this.#run('UPDATE plans SET revision=? WHERE key=? AND revision=?', plan.revision, key, expected).changes !== 1) throw new Error('Stale plan revision.');
     this.#run('INSERT INTO revisions VALUES (?,?,?)', key, plan.revision, encode(plan));
     this.#run("UPDATE requests SET state='invalidated' WHERE key=? AND state IN ('pending','ready')", key);
+    const items = new Set(plan.items.map(item => item.id));
+    for (const row of this.#db.prepare('SELECT choice_key,data FROM choices WHERE key=?').all(key)) {
+      const choice = decode<SegmentChoice>(row.data);
+      if (choice.action === 'assign' && !items.has(choice.item!))
+        this.#run('DELETE FROM choices WHERE key=? AND choice_key=?', key, row.choice_key!);
+    }
   }
   createPlan(source: string | Uint8Array, format: 'json' | 'yaml', context: PlanContext, base: string, head: string): Plan {
     sha(base); sha(head);

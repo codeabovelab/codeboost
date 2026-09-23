@@ -43,3 +43,7 @@ Reproduced a historical-owner retry failure after an amendment removed the ownin
 Reproduced continuation reapproval failing after a second plan amendment. Continuation records now include revision in their immutable primary key; the getter returns the latest approved revision, leaving earlier approvals intact. Repeating approval for the same revision is idempotent, with a separately reproduced regression. This changes the unreleased schema introduced by this PR, not a released database format.
 
 Declined the duplicate-source-mapping finding as a correctness issue: the rewrites primary key already rejects a repeated source within a snapshot, and the surrounding transaction rolls back its new snapshot and all ledger writes. A new regression passed before any implementation change and confirms the unchanged snapshot, empty ledger, and absence of mappings after rejection. Final suite: 154 tests.
+
+## Review round 4
+
+Reproduced a saved assignment throwing in `applyChoices` after its target item was removed by amendment. Revision commits now discard assignments whose targets no longer exist, in the same transaction as the revision and request invalidation. Unrelated assignments and standalone acceptances remain. Removed assignments cannot reactivate if an ID is later reintroduced. No finding declined this round. Final suite: 155 tests.
