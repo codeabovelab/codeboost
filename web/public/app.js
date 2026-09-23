@@ -558,6 +558,7 @@ function answerMarkup(note) {
   if(note.kind!=="question") return "";
   const answer=note.answer;
   if(answer?.status==="complete") return `<section class="agent-answer"><strong>${answer.provider === "claude" ? "Claude Code" : answer.provider === "codex" ? "Codex" : "Agent"}</strong><p>${esc(answer.text)}</p>${note.answerOutdated ? '<small>! Answer refers to an earlier review snapshot.</small>' : ""}</section>`;
+  if(note.answerOutdated) return '<p class="warn">This question refers to an earlier review. Ask again against the current code.</p>';
   if(answer?.status==="pending" && answer.expiresAt>Date.now()) return '<p role="status">Agent · Answering…</p>';
   const error=answer?.status==="failed"?answer.error:answer?.status==="pending"?"Agent was interrupted or timed out.":"Answer not started. Choose an agent in Settings or retry when capacity is available.";
   return `<p class="warn">! ${esc(error)}</p><button data-retry-question="${esc(note.id)}">Retry answer</button>`;

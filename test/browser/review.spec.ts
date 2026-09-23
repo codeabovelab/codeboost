@@ -223,3 +223,13 @@ test('ignores question polls started before a newer submission',async({page})=>{
  await page.waitForTimeout(100);
  expect(await page.locator('#notes .note').count()).toBe(2);
 });
+test('outdated questions explain how to continue without offering a broken retry',async({page})=>{
+ const service=app.service;
+ service.act({action:'note',item:'P1',kind:'question',text:'Old question',token:service.load().token});
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','New snapshot'],{cwd:service.config.repository,stdio:'pipe'});
+ await page.goto(app.url);
+ await expect(page.getByText('Old question',{exact:true})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toHaveCount(0);
+ await expect(page.getByText('This question refers to an earlier review. Ask again against the current code.',{exact:true})).toBeVisible();
+ await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
+});
