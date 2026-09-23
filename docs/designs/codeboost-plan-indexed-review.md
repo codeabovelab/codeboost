@@ -44,7 +44,7 @@ Writing standard: plain language, ISO 24495-1:2023
 | Unplanned change | A change that codeboost did not make for any plan item. |
 | Ambiguous change | A change that more than one plan item touched, so codeboost cannot say which one owns it. |
 | Approval | Your sign-off on one plan item. It records exactly which lines you saw. |
-| Stale approval | An approval whose lines have since changed. You must review that plan item again. |
+| Stale approval | An approval whose text, file-change metadata, item definition, or dependencies have since changed. You must review that plan item again. |
 | Run window | A time when codeboost may run tasks, such as weeknights 22:00–06:00. |
 | Sandbox | An operating-system limit on what an agent can read, write, and reach over the network. |
 | Lesson | A short rule codeboost learned from your feedback, such as "every retry change needs a test for the 5xx path." It is used only after you approve it. |
@@ -73,7 +73,7 @@ codeboost keeps your approved plan in control from start to finish. It follows t
 
 **It targets why agent PRs fail.** A 2026 study of 33,596 agent-made PRs, "Where Do AI Coding Agents Fail? An Empirical Study of Failed Agentic Pull Requests in GitHub" ([arXiv:2601.15195](https://arxiv.org/abs/2601.15195)), found that unmerged PRs tend to change more code and often don't match how the team works. Developers also report two other failures: agents change files the task did not need (scope creep), and agents fix issues that another PR already fixed. We treat all of these as ideas to test, not as proven rankings.
 
-**Approvals expire when the code changes.** This idea came from the outside reviewer. When you approve plan item P1, codeboost records the exact lines you saw. If a later revision changes those lines, the approval becomes stale. Next time, you see only what changed since you approved. So rejecting and revising stays quick. You never have to re-read everything.
+**Approvals expire when the code changes.** This idea came from the outside reviewer. When you approve plan item P1, codeboost records the exact text and file-change metadata you saw. If a later revision changes that fingerprint, the approval becomes stale. Next time, you see only what changed since you approved. So rejecting and revising stays quick. You never have to re-read everything.
 
 ## Limits we work within
 
@@ -295,7 +295,7 @@ So the red "Unplanned changes" row holds only changes codeboost did not make. Wh
 
 A plan item with no changes can be approved only if you confirm "no change needed." codeboost records that.
 
-**What an approval records.** When you approve a plan item, codeboost saves its changes: for each file, the added and removed lines in order. It leaves out line numbers and surrounding lines. The only thing it adjusts is line endings (Windows to Unix). Spaces and tabs count. So:
+**What an approval records.** When you approve a plan item, codeboost saves its changes: for each file, the added and removed lines in order. It leaves out line numbers and surrounding lines. The only thing it adjusts is line endings (Windows to Unix). Spaces and tabs count. For every non-line file-change segment it also stores the operation kind, old/new paths, old/new modes, and old/new typed object IDs (blob/commit or null), as defined above. This metadata is part of the approval fingerprint, not an empty text snapshot. Segment addition/removal and changes to any metadata field invalidate the owning approval and any standalone acceptance of that segment, propagating to dependents. Immediately before merge, recompute and compare both text and metadata fingerprints against the current base/head pair. So:
 - a whitespace-only change to approved code makes the approval stale. This matters in Python, YAML, Makefiles, and text strings;
 - code that only moved up or down, because of other plan items or a rebase, keeps its approval.
 
@@ -486,7 +486,7 @@ The top of the screen lists anything that is not yet true. You can still use "Me
 
 codeboost also rebases before it first shows you the review. So you always review code that sits on the latest base.
 
-**How rebasing works.** A rebase that goes cleanly keeps your approvals, because approvals ignore line numbers. If there is a conflict:
+**How rebasing works.** A clean rebase keeps approvals only if the recomputed text, file-change metadata, item definitions, and context still match; ignoring line numbers alone is not enough. If there is a conflict:
 1. Git stops on one commit. Before assigning any plan item or launching an invocation, look up its ledger entry. A missing entry or an explicit null owner takes the foreign/unowned branch below; do not infer an owner from trailers. Only an entry with a non-null owner enters the following owned-commit steps, with that owner as Px.
 2. For an owned commit, codeboost runs a sandboxed invocation to fix the conflict. The agent sees Px's plan item, the conflicting files, and the base commits that caused the conflict. It may edit only the conflicting files.
 3. The fixed commit keeps Px's trailers.
@@ -577,6 +577,7 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 - a new revision that changes one approved plan item. Expected: only that approval goes stale;
 - a rebase that only moves lines. Expected: no approval goes stale;
 - a whitespace-only change to approved code. Expected: that approval goes stale;
+- approve each non-line segment type, then independently change its content/object ID, path, mode, operation, or presence without adding text lines. Expected: approval and dependent approvals become stale and merge blocks; an unchanged fingerprint survives line shifts;
 - assigning an Unplanned segment to a plan item. Expected: that plan item goes stale, and the assignment survives an unrelated revision;
 - the "already fixed" check run against the task's own PR. Expected: no match.
 
