@@ -75,6 +75,7 @@ function showFailure(message) {
 async function refresh() {
   if (busy) return;
   busy = true;
+  renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
   try {
     rememberDraft();
@@ -89,11 +90,13 @@ async function refresh() {
     );
   } finally {
     busy = false;
+    renderAttachment();
   }
 }
 async function act(command) {
   if (busy || !data) return false;
   busy = true;
+  renderAttachment();
   try {
     rememberDraft();
     data = await api("/api/action", { ...command, token: data.token });
@@ -104,6 +107,7 @@ async function act(command) {
     return false;
   } finally {
     busy = false;
+    renderAttachment();
   }
 }
 function select(id) {
@@ -355,11 +359,14 @@ $("ask").onclick = () => setMode("question");
 $("request").onclick = () => setMode("change");
 $("composer").onsubmit = async (event) => {
   event.preventDefault();
+  if (busy || !data) return;
   const item = selected,
     kind = mode;
   const attached = attachments.get(`${item}:${kind}`);
   if (attached && (attached.head !== data.snapshot.head || attached.base !== data.snapshot.base)) return;
+  $("saved").textContent = kind === "change" ? "Saving change request…" : "Saving question…";
   if (await act({ action: "note", item, kind, text: $("message").value, ...(attached ? {reference:{key:attached.key,start:attached.start,end:attached.end}} : {}) })) {
+    $("notes").lastElementChild?.scrollIntoView({ block: "nearest" });
     drafts.delete(`${item}:${kind}`);
     attachments.delete(`${item}:${kind}`);
     renderAttachment();
@@ -368,6 +375,8 @@ $("composer").onsubmit = async (event) => {
       kind === "change"
         ? "Saved for the next revision."
         : "Question saved. See agent status in Conversation.";
+  } else {
+    $("saved").textContent = "Could not save. Your draft is preserved; refresh and try again.";
   }
 };
 $("conversation-toggle").onclick = () => {
@@ -477,7 +486,7 @@ function renderAttachment() {
   $("attachment").hidden = !ref;
   const stale = ref && (!data || ref.head !== data.snapshot.head || ref.base !== data.snapshot.base || !data.segments.some(s => s.key === ref.key && s.row === selected));
   $("attachment").innerHTML = ref ? `<strong>${esc(referenceLabel(ref))}</strong><small>Commit ${esc(ref.head.slice(0,8))}${stale ? " · ! Outdated — remove and select again" : ""}</small><pre class="snippet-preview">${esc(ref.text)}</pre><button type="button" id="remove-reference">Remove snippet</button>` : "";
-  $("save-note").disabled = !!stale || !data?.items.some(item=>item.id === selected);
+  $("save-note").disabled = busy || !!stale || !data?.items.some(item=>item.id === selected);
   if (ref) $("remove-reference").onclick = () => {attachments.delete(`${selected}:${mode}`);renderAttachment();};
 }
 function attachSelection(kind) {

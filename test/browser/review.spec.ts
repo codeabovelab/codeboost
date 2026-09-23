@@ -134,3 +134,20 @@ test('opens Settings while the initial review is still loading',async({page})=>{
   await expect(page.getByLabel('Question agent',{exact:true})).toBeVisible();
  } finally {release();}
 });
+test('acknowledges the first Ask agent click immediately and prevents duplicate submissions',async({page})=>{
+ const config=app.service.config;await app.close();let calls=0;
+ app=await startServer(config,0,async()=>{calls++;return 'Single-click answer';});
+ await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
+ let release!:()=>void;const pending=new Promise<void>(resolve=>{release=resolve;});let submissions=0;
+ await page.route('**/api/action',async route=>{submissions++;await pending;await route.continue();});
+ try {
+  await page.getByLabel('Question about this item').fill('Does one click submit this?');
+  await page.getByRole('button',{name:'Ask agent',exact:true}).click();
+  await expect(page.locator('#save-note')).toBeDisabled();
+  await expect(page.locator('#saved')).toHaveText('Saving question…');
+ } finally {release();}
+ await expect(page.getByText('Does one click submit this?',{exact:true})).toBeVisible();
+ await expect(page.getByText('Single-click answer',{exact:true})).toBeVisible({timeout:10000});
+ await expect(page.getByRole('button',{name:'Ask agent',exact:true})).toBeEnabled();
+ expect(submissions).toBe(1);expect(calls).toBe(1);expect(app.service.store.getReviewNotes(config.identity)).toHaveLength(1);
+});
