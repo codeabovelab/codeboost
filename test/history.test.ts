@@ -257,3 +257,16 @@ it('records typed object identities on real mode-change cards', () => {
   expect(metadata.oldObject.oid).toBe(metadata.newObject.oid);
   expect(metadata.oldMode).toBe('100644'); expect(metadata.newMode).toBe('100755');
 });
+
+it('parses scored renames and consumes both paths before the next raw record', () => {
+  const initial = Array.from({ length: 100 }, (_, i) => `line ${i}\n`).join('');
+  const f = fixture({ 'a.txt': initial });
+  renameSync(join(f.dir, 'a.txt'), join(f.dir, 'b.txt'));
+  f.write('b.txt', initial.replace('line 50\n', 'changed 50\n'));
+  f.write('z.txt', 'another record\n'); const head = f.commit('P1');
+  const raw = f.git('diff', '--raw', '-z', '-M', f.base, head);
+  expect(raw).toMatch(/ R\d+\0a\.txt\0b\.txt\0/u);
+  const history = readHistory(f.dir, f.base);
+  expect(history.final.some(d => d.oldPath === 'a.txt' && d.newPath === 'b.txt')).toBe(true);
+  expect(history.final.some(d => d.oldPath === null && d.newPath === 'z.txt')).toBe(true);
+});

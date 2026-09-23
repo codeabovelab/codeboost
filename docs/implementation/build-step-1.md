@@ -90,3 +90,7 @@ Validation began with 60 passing tests. The added v1 regressions reproduced 18 f
 ### Explicit remaining work
 
 Issue #6 remains open for runner/store integration: obtain typed base entries and actual filesystem identity from a trusted checkout; audit actual occupancy, new symlinks/conversions, link targets and target mutations after execution; provide persistent request IDs, cancellation, replay prevention and concurrent CAS; enforce prompt budgets/profiles, output limits, container mounts, and process termination. The library only checks declared/projected state and trusted supplied context. In particular an edit may repair an unsafe existing link, but only the future runtime audit can validate its new target and accepted filesystem state. No application, runtime safety boundary, or concurrent store has been added here. Issues #2 and #3 remain the next approved build steps.
+
+## Merged-contract review round 1
+
+Updated README import/linking examples to supply the new required context. Declined the scored-rename report: the raw-diff regex captures only `([A-Z])` and consumes the score separately with `\d*`, so the existing branch receives `R`, not `R100`. A focused real-Git test observed a scored rename followed by an added-file record and loaded both correctly before any parser change. Retained that regression. A separate locally discovered C1-control regression failed first, then passed after using the complete Unicode control category for commands/paths.
