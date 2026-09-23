@@ -97,16 +97,17 @@ The schema checks the shape. codeboost then checks the meaning. A **failure** bl
 
 | Check | Result if it fails |
 |---|---|
+| `issue` exactly matches the selected task's GitHub issue number in the selected repository. Require a selected task before import; a mismatch fails without changing the task or rewriting the plan. | Failure |
 | Item IDs are unique. | Failure |
 | Every `depends_on` ID exists, comes earlier in the list, and there is no loop. | Failure |
 | A path has no `..` part and stays inside the repo. | Failure |
-| No part of `path` or `renamed_from` is a symlink in the projected state, and neither points into `.git`. codeboost checks each folder and the file itself without following links. A plan that needs to change a symlink must declare the link itself; its target is never edited through it. | Failure |
+| No parent component of `path` or `renamed_from` is a symlink in the projected state, and neither path points into `.git`. Inspect components without following links. The final component may be an explicitly declared symlink: edits, deletes, and renames operate on the link itself, never its target. Inspect the stored target text without following it; any new or retained target must resolve within the repo, outside `.git`, without traversing another symlink. Deleting or replacing an unsafe existing link is allowed if the resulting state satisfies these rules. Recheck the actual target after the run, before committing. | Failure |
 | File operations are valid in the projected repo state immediately before the item runs (see below). `edit` and `delete` need an existing path; `add` needs an unused path; `rename` needs an existing `renamed_from` and an unused destination `path`. | Failure |
 | `renamed_from` is set only for kind `rename`. | Failure |
 | The same path is not declared twice in one item. | Failure |
 | The item has at least one `cmd`. | Warning: "No test command" |
 | Each `cmd` is parsed as one executable and literal arguments, with the executable/subcommand matched exactly against the repo's allowed list. Shell operators, pipelines, redirects, substitutions, and expansions are rejected. Execute the resulting argv without a shell. | Invalid syntax blocks approval; a valid but unlisted command warns and cannot run until allowed |
-| A `cmd` changes a dependency or a script codeboost runs. | The task stops in "needs approval" when it runs, as for any such change |
+| A completed agent invocation changes a dependency or a script codeboost will run. | Before its own installation or script invocation, codeboost stops in "needs approval". This post-invocation gate cannot prevent an agent from executing a changed script during its invocation; container and network restrictions must already contain that execution. |
 | `questions` is not empty. | The plan shows the questions at the top; answer them or approve anyway |
 
 **After each run, codeboost checks the result too.** A plan check alone cannot stop an agent from creating a new symlink and writing through it. So after each invocation, before committing, codeboost: rejects any change outside the declared files (as today, out of scope); rejects a new or changed symlink that the item did not declare, and any symlink whose target leaves the repo or enters `.git`; and rejects any change to `.git` itself (config, hooks, refs, objects other than new ones). codeboost's own git commands on the task folder run with hooks turned off (`core.hooksPath=/dev/null`), so a planted hook never runs.
@@ -156,6 +157,10 @@ Fields an operation does not use are `null`. The strict answer schema checks str
 - Keep released schemas unchanged. On import, read `schema_version`, validate against that version's schema, convert using an explicit version migration, then validate against the current schema and run the meaning checks. Reject unsupported versions with an explanation. Never validate an old plan against a newer schema before converting it. Suggested edits must use a supported schema version and still match the current plan revision; otherwise ask the assistant to regenerate them.
 
 **PR #1 review decisions.** File validation uses projected state so dependent items can work on new or renamed files. Version changes are explicit because every field is required and unknown fields are rejected. T18 includes regression checks for both rules.
+
+## PR #1 feedback dispositions
+
+The script approval gate covers codeboost-run commands, while container and network isolation must contain an agent that edits and immediately executes a script. Symlink parent components are prohibited; declared final links are supported with target checks. Imported plans must match the already-selected issue and repository context. These are semantic/runtime requirements, not guarantees supplied by JSON Schema alone.
 
 ## Notes for builders
 

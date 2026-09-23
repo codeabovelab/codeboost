@@ -21,7 +21,7 @@
       ]
     },
     "issue": {
-      "description": "The GitHub issue number this plan fixes.",
+      "description": "The GitHub issue number this plan fixes. Import must reject a mismatch with the selected task issue in the selected repository; JSON Schema alone cannot enforce this context-dependent check.",
       "type": "integer",
       "minimum": 1
     },

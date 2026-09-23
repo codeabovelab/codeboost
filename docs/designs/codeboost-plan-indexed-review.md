@@ -236,7 +236,7 @@ If Docker or Podman is missing or not running, codeboost runs no agents and tell
 
 **Changes that need your approval.**
 - **Dependencies.** Only codeboost installs them, as a separate step with the network on. If a task changed a package manifest or lock file, codeboost first stops and shows you the change. It waits in **needs approval**.
-- **Scripts.** If a task changed a script that codeboost is about to run (`package.json` scripts, a Makefile, CI settings, or test settings), codeboost stops in **needs approval** before running it.
+- **Scripts.** If a task changed a script that codeboost is about to run (`package.json` scripts, a Makefile, CI settings, or test settings), codeboost stops in **needs approval** before its own invocation. This gate applies to codeboost-run commands after the agent invocation; it does not intercept commands the agent runs during that invocation.
 
 **Permissions by phase.**
 
@@ -246,7 +246,7 @@ If Docker or Podman is missing or not running, codeboost runs no agents and tell
 | Carrying out and fixing | Worktree only | Allowed list only (test, lint, build) | Agent vendor's API only |
 | Reviewing | No | `cmd:` checks only | Agent vendor's API only |
 
-All phases run in the container (R1). The allowed list comes from your repo's scripts, and you can edit it. It stops accidents. It does not stop a hostile agent: an agent could edit a script and then run it. The container, the network rule, and the approval step are what stop that.
+All phases run in the container (R1). The allowed list comes from your repo's scripts, and you can edit it. It limits accidental commands; it is not a hostile-code boundary. A carrying-out agent can edit an allowed script and execute the changed script in the same invocation, before codeboost gets control back. The container and network restrictions must therefore contain arbitrary code from the start. Script approval protects codeboost's later invocation only; it does not prevent that earlier agent execution. The real-container suite must exercise this edit-then-execute case and confirm that host access and disallowed network access remain blocked.
 
 **Credentials.** codeboost also removes `GH_TOKEN`, `GITHUB_TOKEN`, and other secret-looking variables from the agent's environment. Only codeboost itself is signed in to GitHub.
 
@@ -1274,7 +1274,7 @@ Vitest unit tests with git, gh, Docker, and agents mocked. ✅ Fast and simple C
 
 State: approved
 Actual answer: A) Real git, Docker, evals (answer to D10, 2026-09-22)
-Accepted scope: Vitest for unit and integration tests; real git in temporary folders (no git mocks); recorded `gh` outputs and agent CLI transcripts; a real-Docker end-to-end suite in CI proving the container shows only `/work` and sign-in, a vendor host is reachable, and another host is blocked; Playwright for the review screen flows; a small eval set of hostile issue texts that the agent must not follow. Includes all previously approved test cases (build step 1 list, R4 to R7 cases). CI needs Docker.
+Accepted scope: Vitest for unit and integration tests; real git in temporary folders (no git mocks); recorded `gh` outputs and agent CLI transcripts; a real-Docker end-to-end suite in CI proving the container shows only `/work` and sign-in, a vendor host is reachable, and another host is blocked; Playwright for the review screen flows; a small eval set of hostile issue texts that the agent must not follow. Includes all previously approved test cases (build step 1 list, R4 to R7 cases). CI needs Docker. Include an agent that changes and immediately executes an allowed script: containment must still block host and disallowed network access, and codeboost must require approval before its own later invocation of that changed script.
 History: none
 
 ### O1: Duplicate-segment choices after a copy is removed (reopens R4)
@@ -1944,7 +1944,7 @@ Built from this review's findings. Each task comes from a specific decision abov
 - [ ] **T18 (P2, human: ~2 days / CC: ~45 min)** — core, agents, web — Plan schema: draft plans with either agent, import YAML or JSON, apply typed suggestions
   - Surfaced by: P1 (approved 2026-09-22)
   - Files: schema/, docs/plan-format.md, prompts/plan-author.md, core/plan (schema and meaning checks), agents/claude, agents/codex, web/plans (Import plan, suggestion cards)
-  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate before conversion; malformed edit payloads and invalid resulting plans cannot be applied; command chains and delimiter-escape payloads are rejected or remain data; `codex exec` runs with stdin closed
+  - Verify: both examples pass and 8 broken plans fail; recorded Claude and Codex answers pass; an imported plan for #412 is rejected when the selected task is #413 without silently changing either issue; a declared final symlink can be deleted or safely retargeted while symlink parents and escaping targets are rejected; a plan with a `..` path or a dependency loop cannot be approved; the edit schema's copied definitions match; dependent add → edit and rename → edit plans pass projected-state validation, while missing sources and occupied destinations fail; a new field requires a new schema version and old plans validate before conversion; malformed edit payloads and invalid resulting plans cannot be applied; command chains and delimiter-escape payloads are rejected or remain data; `codex exec` runs with stdin closed
 
 ### Unresolved decisions
 
