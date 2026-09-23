@@ -30,7 +30,7 @@ export function createDemo(directory: string): ReviewConfig {
     const config = JSON.parse(readFileSync(configPath, 'utf8')) as ReviewConfig;
     if (config.demo !== true || config.repository !== join(root, 'retry-service') || config.database !== join(root, 'review.sqlite')) throw new Error('Demo configuration must refer to its own fixture.');
     check(config.repository, true); check(join(config.repository, '.git'), true); check(config.database, false);
-    for (const suffix of ['-wal', '-shm']) if (existsSync(config.database + suffix)) check(config.database + suffix, false);
+    for (const suffix of ['-wal', '-shm']) if (lstatSync(config.database + suffix, { throwIfNoEntry: false })) check(config.database + suffix, false);
     return config;
   }
   if (existsSync(root)) throw new Error('Demo directory exists without a configuration. Choose a new empty path.');

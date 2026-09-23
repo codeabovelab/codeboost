@@ -1,3 +1,4 @@
+import { imageSize } from 'image-size';
 import { execFileSync } from 'node:child_process';
 import { lstatSync, opendirSync } from 'node:fs';
 import { resolve as resolvePath, join } from 'node:path';
@@ -90,7 +91,7 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
   });
   if (expectedParent !== head) throw new Error('The base must be an ancestor of the head.');
   const blobs = new Map<string, { text: string | null; byteSize: number; preview?: string }>();
-  let previewBytes = 0;
+  let previewBytes = 0, previewPixels = 0;
   const version = (oid: string, mode: string): FileVersion | null => {
     if (/^0+$/.test(oid)) return null;
     if (mode === '160000') return { oid, mode, text: null }; // gitlink is not a local blob
@@ -108,7 +109,14 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
         /^GIF8[79]a$/.test(data.subarray(0,6).toString('ascii')) ? 'image/gif' :
         data.subarray(0,4).toString('ascii') === 'RIFF' && data.subarray(8,12).toString('ascii') === 'WEBP' ? 'image/webp' : null;
       if (mime && data.length <= 1024 * 1024 && previewBytes + data.length <= 4 * 1024 * 1024) {
-        preview = `data:${mime};base64,${data.toString('base64')}`; previewBytes += data.length;
+        try {
+          // Parse metadata from the already bounded buffer; never allocate decoded pixels.
+          const { width, height } = imageSize(data), pixels = width * height;
+          if (Number.isSafeInteger(pixels) && width > 0 && height > 0 && width <= 8192 && height <= 8192 && pixels <= 4_000_000 && previewPixels + pixels <= 16_000_000) {
+            preview = `data:${mime};base64,${data.toString('base64')}`;
+            previewBytes += data.length; previewPixels += pixels;
+          }
+        } catch { /* Unknown or malformed dimensions: metadata card only. */ }
       }
       blobs.set(oid, { text, byteSize: data.length, ...(preview ? { preview } : {}) });
     }

@@ -48,3 +48,10 @@ it('rejects symlinked ancestors before creating a demo', () => {
   const base = root(); symlinkSync(base, join(base, 'alias'));
   expect(() => createDemo(join(base, 'alias', 'nested', 'demo'))).toThrow(/fixture/i);
 });
+it('rejects dangling SQLite sidecar symlinks', () => {
+ const base=root(),directory=join(base,'demo');const config=createDemo(directory);
+ for(const suffix of ['-wal','-shm']) {
+   const path=config.database+suffix;rmSync(path,{force:true});symlinkSync(join(base,'missing'+suffix),path);
+   expect(()=>createDemo(directory)).toThrow(/fixture/i);rmSync(path);
+ }
+});
