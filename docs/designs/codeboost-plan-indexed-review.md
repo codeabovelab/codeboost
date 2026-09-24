@@ -554,12 +554,29 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 1. **Plan format and linking engine.** A code library, tested with sample git histories.
 2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
 3. **Optional validation.** A future real-PR comparison may test the assumptions in "How we will know it works," but it is non-blocking under the superseding decision above.
-4. **Merge gate and merging** (step 9): the merge rules, the pre-merge sequence, and merging through `gh`.
+4. **Merge gate and merging** (product workflow step 9): the merge rules, the pre-merge sequence, and merging through `gh`. In progress in increments; see the scope and completion criteria below.
 5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6).
 6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3).
 7. **Queue, schedule, and recovery** (steps 4 and 5).
 8. **Issue list, sorted by how critical each issue is** (step 1).
 9. **Learning from your feedback** (step 10): lessons, the Lessons inbox, and the Learning screen. It needs the reject loop from steps 4 to 7.
+
+### Build step 4: scope and progress
+
+**Numbering.** Build steps above describe delivery order. Product workflow steps describe the user journey. Implementation task IDs (`T1`–`T18`) below identify individual engineering requirements, not delivery order. In particular, **build step 4 is merge gate and merging; T4 is approval fingerprints and dependent staleness**. Use “Build step 4, increment 1” when referring to the current work, rather than “Task 4.”
+
+**Increment 1 — guarded merge gate (in progress, [#21](https://github.com/codeabovelab/codeboost/issues/21)).** Add blockers derived from the current review snapshot, trusted GitHub base/head and required-check reads, branch-rule refresh, server-enforced base protection, a head-pinned merge command, and the review UI action. Cover stale or missing approvals, unresolved changes, open change requests, missing or stale acceptance evidence, GitHub refusals, and stale/double submission. Zero required checks does not waive atomic base protection. This increment implements parts of T6, T7, and T12; it does not complete the full build step.
+
+Until automated rebase and containerized `cmd:` execution exist, a moved base or missing command result **blocks merging and returns to review**. Increment 1 does not automatically rebase, execute acceptance commands, or bypass unavailable evidence.
+
+**Remaining work before build step 4 is complete:**
+
+- [ ] Deliver and validate increment 1 against its final head, including unit/integration and browser regressions, typecheck, and the required review loop.
+- [ ] Add the automated pre-merge rebase path and preserve ledger mappings and attribution. Resolve foreign-commit conflicts under the approved agent policy (T3, T11); return conflicts requiring human action to review.
+- [ ] Integrate runner-controlled, containerized execution of approved `cmd:` argv and bind results to the resulting head (T6; depends on the agent isolation and phase enforcement work in build step 5, including T1, T2, and T9).
+- [ ] Validate the complete pre-merge sequence, including the already-fixed check, approval freshness, refreshed required checks, guarded merge, and races involving either base or head changes (T6, T7, T12).
+
+**Sequencing decision.** The guarded gate can land before the agent runner. Build step 5 supplies the execution prerequisites for the remaining pre-merge automation; integrate them before marking build step 4 complete. A safe refusal in increment 1 is an intentional interim behavior, not evidence that the deferred automation has shipped. Optional human validation in #19 remains non-blocking.
 
 ## Open questions
 
@@ -1882,6 +1899,8 @@ Critical gaps (no test, no handling, and silent): 0.
 ## Implementation Tasks
 
 Built from this review's findings. Each task comes from a specific decision above. Run with Claude Code or Codex, and tick each one as you ship it. Effort ratios assumed: features about 30x, tests about 50x, architecture about 5x.
+
+These `T` IDs are requirement identifiers, not the build-order numbers. Current merge-gate work is **build step 4, increment 1 (#21)** and spans parts of T6, T7, and T12; it is unrelated to the numbering of T4. See “Build step 4: scope and progress” for the current increment and remaining milestone criteria. An increment must not mark a broader requirement complete while any of its acceptance criteria remain deferred.
 
 - [ ] **T1 (P1, human: ~3 days / CC: ~1 hour)** — agents — Build the pinned agent container that mounts only `/work` (with its own `.git`) and the agent's sign-in
   - Surfaced by: R1 (D2: B), O6 (D16: A)
