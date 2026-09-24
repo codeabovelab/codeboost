@@ -22,4 +22,4 @@ Result: no defect reproduced. The summary supplied no expected color, state toke
 
 ## Gate result
 
-All three concerns are resolved as validated behavior. No issue supplied a failing case that justified a production patch. Issue #3's manual assignment and paired human go/no-go experiment remain pending and must use the frozen protocol in `review-protocol.md`.
+All three concerns are resolved as validated behavior. No issue supplied a failing case that justified a production patch. Issue #3's manual assignment is recorded in `manual-assignment.md`; its paired human go/no-go experiment remains pending and must use the frozen protocol in `review-protocol.md`.

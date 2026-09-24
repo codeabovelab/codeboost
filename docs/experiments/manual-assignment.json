@@ -1,0 +1,18 @@
+{
+  "base": "5a2685cc709ca8f9f384e35e4d733012c7290d69",
+  "head": "442147d1bc9a33edeca1a605c9de3ada13f397f1",
+  "segments": [
+    { "choice_id": "96c76cee6518b177f272d8dba1f8db83314d0c09b62f036c6d6f41de40227d5c", "kind": "text", "operation": "+", "path": "AGENTS.md", "before_row": "Unplanned", "item": "P4", "scope": "in-scope" },
+    { "choice_id": "6000e022cb5f2c7fb602ba9dbd6b590cdf0672b1bdc984c036bf563423a86afd", "kind": "text", "operation": "+", "path": "AGENTS.md", "before_row": "Unplanned", "item": "P4", "scope": "in-scope" },
+    { "choice_id": "aa5dbe642c11d5f5f6f1630c0f979006b8e0e3182da3e0aeee8485fa997784d1", "kind": "file", "operation": null, "path": "docs/experiments/review-summary-edge-cases.md", "before_row": "Unplanned", "item": "P3", "scope": "in-scope" },
+    { "choice_id": "dfcf7097d83b6d55df0e4959f111370a96976b1c25f327e9d51838fc8224ceaf", "kind": "text", "operation": "+", "path": "docs/experiments/review-summary-edge-cases.md", "before_row": "Unplanned", "item": "P3", "scope": "in-scope" },
+    { "choice_id": "7a5227f9a6be94d6c16d1ea058ae3a5d956a5b53f93333a15d3b778222a90218", "kind": "text", "operation": "-", "path": "test/plant.test.ts", "before_row": "Unplanned", "item": "P2", "scope": "in-scope" },
+    { "choice_id": "142cf07bee22dbe7cf281b0d97efa49f9a502fed62701de8ec0c94500a94c788", "kind": "text", "operation": "+", "path": "test/plant.test.ts", "before_row": "Unplanned", "item": "P2", "scope": "in-scope" },
+    { "choice_id": "36cb67aa87587c9159f19ce0bac78a4d67f1348f55108f99e1fed99e5273a414", "kind": "text", "operation": "+", "path": "test/plant.test.ts", "before_row": "Unplanned", "item": "P2", "scope": "in-scope" },
+    { "choice_id": "88fada2e5b9a307f6db4fa6ccdbbf9e5bfbf00f26cbcacb33ac5bc141d74b85e", "kind": "text", "operation": "+", "path": "test/plant.test.ts", "before_row": "Unplanned", "item": "P2", "scope": "in-scope" },
+    { "choice_id": "9f010f7ae66fd80d72c5d78d45d4effbcdac76ebb6dfadc4efd4e66ac4af9f86", "kind": "text", "operation": "-", "path": "test/review.test.ts", "before_row": "Unplanned", "item": "P1", "scope": "in-scope" },
+    { "choice_id": "987cbec380909ee199bbe4df04a7d700c6f2a1f284c52f08120c159f8e92c35d", "kind": "text", "operation": "+", "path": "test/review.test.ts", "before_row": "Unplanned", "item": "P1", "scope": "in-scope" },
+    { "choice_id": "6b276597aa7294f44e5a549e38d423876266fe6a9a502bb5be089db2223a8976", "kind": "text", "operation": "+", "path": "test/review.test.ts", "before_row": "Unplanned", "item": "P1", "scope": "in-scope" },
+    { "choice_id": "c9379939cb69513a37cbb385440217283975294a2f8b340839d5f9d09ea126df", "kind": "text", "operation": "+", "path": "test/review.test.ts", "before_row": "Unplanned", "item": "P1", "scope": "in-scope" }
+  ]
+}
