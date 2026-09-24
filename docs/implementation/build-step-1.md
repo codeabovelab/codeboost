@@ -69,7 +69,7 @@ Fixed aggregate diff retention outside the blob budget. The adapter limits total
 
 ## Remaining gates
 
-This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.
+This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core was present in this slice. Persistence, rebase mappings, the read-only review screen, and its read-only question adapters were implemented later under #2 and #3; the import UI and code-writing agents remain pending. The already-fixed GitHub check belongs to the later GitHub/runner integration.
 
 The design's timed go/no-go experiment was cancelled by product decision before results were recorded. Disposable Git histories are engineering tests, not evidence that plan-indexed review beats raw review. The cancelled experiment does not block merging, agent execution, planning UI, queue, or learning work. Optional future validation is tracked in #19, and product claims must not imply that the cancelled gate passed.
 
@@ -89,7 +89,7 @@ Validation began with 60 passing tests. The added v1 regressions reproduced 18 f
 
 ### Explicit remaining work
 
-Issue #6 remains open for runner/store integration: obtain typed base entries and actual filesystem identity from a trusted checkout; audit actual occupancy, new symlinks/conversions, link targets and target mutations after execution; provide persistent request IDs, cancellation, replay prevention and concurrent CAS; enforce prompt budgets/profiles, output limits, container mounts, and process termination. The library only checks declared/projected state and trusted supplied context. In particular an edit may repair an unsafe existing link, but only the future runtime audit can validate its new target and accepted filesystem state. No application, runtime safety boundary, or concurrent store has been added here. Issues #2 and #3 remain the next approved build steps.
+Issue #6 remains open for the library and runner contract it tracks. Remaining runner work must obtain typed base entries and actual filesystem identity from a trusted checkout; audit actual occupancy, new symlinks/conversions, link targets and target mutations after execution; and enforce prompt budgets/profiles, output limits, container mounts, and process termination. The library only checks declared/projected state and trusted supplied context. In particular an edit may repair an unsafe existing link, but only the future runtime audit can validate its new target and accepted filesystem state. This original library slice did not add an application or runtime safety boundary; persistent request IDs, cancellation, replay prevention, concurrent CAS, and the review screen were implemented later under #2 and #3.
 
 ## Merged-contract review round 1
 
