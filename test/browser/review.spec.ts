@@ -382,6 +382,17 @@ test('drains an in-flight question request before closing its agent manager',asy
   expect(JSON.parse(response).notes.some((candidate:{text:string})=>candidate.text==='Question during shutdown')).toBe(true);
  } finally {reopened.close();app=await startServer(config,0);}
 });
+test('blocks a partially received merge request when shutdown starts',async()=>{
+ const config={...app.service.config,demo:false};await app.close();let mergeCalls=0;let appRef:typeof app;
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{mergeCalls++;return {url:''};}};
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();
+ for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});
+ for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const body=JSON.stringify({action:'merge',token:view.token}),endpoint=new URL('/api/action',app.url);let status=0,response='';
+ const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);});req.on('error',reject);req.write(body.slice(0,1));setTimeout(()=>req.end(body.slice(1)),50);});
+ await new Promise(resolve=>setTimeout(resolve,10));await Promise.all([app.close(),completed]);
+ expect(status).toBe(503);expect(JSON.parse(response).error).toMatch(/shutting down/i);expect(mergeCalls).toBe(0);app=await startServer(config,0);
+});
 test('hides Retry until a timed-out invocation has actually settled',async({page})=>{
  const config=app.service.config;await app.close();let settle!:(answer:string)=>void;
  app=await startServer(config,0,()=>new Promise(resolve=>settle=resolve));

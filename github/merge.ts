@@ -91,7 +91,8 @@ export class GhMergeGateway implements MergeGateway {
       if (!numbers.length) return 'clear';
       const [owner, name] = this.config.repository.split('/') as [string, string];
       const selections = numbers.map((number, index) => `p${index}: pullRequest(number:${number}) { state mergedAt }`).join(' ');
-      const response = await this.#json(['api','graphql','-f',`query=query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { ${selections} } }`], signal) as { data?: { repository?: Record<string, { state?: unknown; mergedAt?: unknown } | null> } };
+      const response = await this.#json(['api','graphql','-f',`query=query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { ${selections} } }`], signal) as { data?: { repository?: Record<string, { state?: unknown; mergedAt?: unknown } | null> }; errors?: unknown };
+      if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) return 'unknown';
       const pulls = response.data?.repository;
       if (!pulls || Object.keys(pulls).length !== numbers.length) return 'unknown';
       for (let index = 0; index < numbers.length; index++) {
@@ -144,7 +145,7 @@ export class GhMergeGateway implements MergeGateway {
         if (value.type !== 'required_status_checks') continue;
         const parameters = value.parameters;
         if (!parameters || !Array.isArray(parameters.required_status_checks)) { rulesKnown = false; break; }
-        if (parameters.strict_required_status_checks_policy === true) atomicBaseGuard = true;
+        if (parameters.strict_required_status_checks_policy === true && parameters.required_status_checks.length > 0) atomicBaseGuard = true;
         for (const check of parameters.required_status_checks) {
           if (!check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string') { rulesKnown = false; break; }
           const context = (check as { context: string }).context;
@@ -166,8 +167,8 @@ export class GhMergeGateway implements MergeGateway {
           const fromContexts = new Set(contexts as string[]), fromChecks = new Set(suppliedChecks.map(check => (check as { context: string }).context));
           if (fromContexts.size !== fromChecks.size || [...fromContexts].some(context => !fromChecks.has(context))) rulesKnown = false;
         }
-        if (rulesKnown && value.strict) atomicBaseGuard = true;
         const checks = hasChecks ? suppliedChecks : contexts.map(context => ({ context, app_id: null }));
+        if (rulesKnown && value.strict && checks.length > 0) atomicBaseGuard = true;
         if (rulesKnown) for (const check of checks) {
           if (!check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string') { rulesKnown = false; break; }
           const context = (check as { context: string }).context;

@@ -19,6 +19,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
+  let stopping = false;
   const server = createServer(async (req, res) => {
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
@@ -31,6 +32,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (path.startsWith('/api/')) {
         const supplied = req.headers['x-codeboost-token'];
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
+        if (stopping && req.method === 'POST') { json(503, { error: 'The review server is shutting down.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, await load()); return; }
@@ -39,6 +41,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
+        if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
@@ -75,6 +78,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Cannot determine local address.');
   return { server, service, token, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
+    stopping = true;
     const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     await merges?.close();
     await closing;

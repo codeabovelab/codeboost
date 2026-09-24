@@ -9,6 +9,7 @@ export interface MergeUnavailableStatus { available: true; ready: false; blocker
 export class MergeCoordinator {
   #active: Promise<{ status: MergeStatus; result: MergeResult }> | null = null;
   #abort: AbortController | null = null;
+  #closing = false;
   readonly service: ReviewService;
   readonly gateway: MergeGateway;
   constructor(service: ReviewService, gateway: MergeGateway) { this.service = service; this.gateway = gateway; }
@@ -45,6 +46,7 @@ export class MergeCoordinator {
   }
 
   async merge(token: unknown): Promise<{ status: MergeStatus; result: MergeResult }> {
+    if (this.#closing) throw new Error('Merge coordinator is shutting down.');
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();
@@ -79,6 +81,7 @@ export class MergeCoordinator {
   }
 
   async close(): Promise<void> {
+    this.#closing = true;
     const active = this.#active;
     if (!active) return;
     this.#abort?.abort(new Error('Merge cancelled during shutdown.'));

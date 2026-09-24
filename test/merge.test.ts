@@ -123,6 +123,7 @@ it('aborts and awaits an active merge command during shutdown', async () => {
   await coordinator.close();
   await expect(merging).rejects.toThrow(/shutdown/i);
   expect(commandSettled).toBe(true);
+  await expect(coordinator.merge(view.token)).rejects.toThrow(/shutting down/i);
 });
 
 it('parses required checks from both rule sources and pins the gh merge head', async () => {
@@ -268,6 +269,35 @@ it('fails closed for a ruleset entry without a type', async () => {
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
   expect(state.rulesKnown).toBe(false);
+});
+
+it('does not treat empty strict check policies as an atomic base guard', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [] } }]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: true, checks: [], contexts: [] } });
+    if (joined.includes('/timeline')) return JSON.stringify([[]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state).toMatchObject({ rulesKnown: true, atomicBaseGuard: false, requiredChecks: [] });
+});
+
+it('fails closed when GraphQL returns referenced PR data with errors', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('api graphql')) return JSON.stringify({ data: { repository: { p0: { state: 'CLOSED', mergedAt: null } } }, errors: [{ message: 'partial' }] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 8, pull_request: {} } } }]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
 });
 
 it('does not let an inspection started before merge repopulate the cache', async () => {
