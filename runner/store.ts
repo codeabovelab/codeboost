@@ -20,6 +20,7 @@ export interface ReviewNote { id: string; item: string; kind: 'question' | 'chan
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
 export interface MergeAttempt {
   id: string; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
+  queueWatermark?: string | null;
   url: string | null; reason: string | null; requiresFreshReview: boolean; entryId: string | null;
   phase: 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED' | null; position: number | null;
   occurredAt: string | null; createdAt: string; updatedAt: string;
@@ -192,8 +193,9 @@ export class Store {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
-  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string): MergeAttempt {
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null): MergeAttempt {
     sha(reviewedHead);
+    if (queueWatermark !== null && (typeof queueWatermark !== 'string' || !queueWatermark || queueWatermark.length > 512)) throw new Error('Invalid merge-queue event cursor.');
     if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for merging.');
     const key = identityKey(identity);
     return this.#transaction(() => {
@@ -204,7 +206,7 @@ export class Store {
       const now = new Date().toISOString();
       const attempt: MergeAttempt = {
         id: randomUUID(), state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
-        reviewVersion: expected.reviewVersion, reviewedHead, url: null, reason: null, requiresFreshReview: false,
+        reviewVersion: expected.reviewVersion, reviewedHead, queueWatermark, url: null, reason: null, requiresFreshReview: false,
         entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now,
       };
       this.#run('INSERT INTO merge_attempts VALUES (?,?,?)', attempt.id, key, encode(attempt));

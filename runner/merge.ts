@@ -17,7 +17,8 @@ export interface MergeStatus {
 export interface MergeUnavailableStatus { available: true; ready: false; action: null; blockers: MergeBlocker[]; remote: null; queue: MergeQueueStatus | null; }
 
 function queueGateway(gateway: MergeGateway): gateway is QueueGateway {
-  return typeof (gateway as Partial<MergeQueueGateway>).inspectQueue === 'function';
+  const queue = gateway as Partial<MergeQueueGateway>;
+  return typeof queue.inspectQueue === 'function' && typeof queue.queueWatermark === 'function';
 }
 
 export class MergeCoordinator {
@@ -132,13 +133,15 @@ export class MergeCoordinator {
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head) throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (finalStatus.remote.mergeQueue !== status.remote.mergeQueue) throw new Error('Merge-queue requirements changed during validation. Refresh before merging.');
       if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
-      if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
-      if (signal.aborted) throw signal.reason;
+      let queueWatermark: string | null = null;
       if (status.remote.mergeQueue) {
         if (!queueGateway(this.gateway)) throw new Error('This GitHub adapter cannot verify the merge-queue lifecycle.');
         if (view.expected.reviewVersion === undefined) throw new Error('A current review version is required for merging.');
-        queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion }, status.remote.head);
+        queueWatermark = await this.gateway.queueWatermark(status.remote.head, { signal, timeoutMs: 6_000 });
       }
+      if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
+      if (signal.aborted) throw signal.reason;
+      if (status.remote.mergeQueue) queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion! }, status.remote.head, queueWatermark);
       const result = await this.gateway.merge(status.remote.head, { signal });
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not
@@ -178,7 +181,7 @@ export class MergeCoordinator {
 
   async #pollQueue(attempt: MergeAttempt, signal: AbortSignal): Promise<MergeQueueStatus | null> {
     try {
-      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, notBefore: attempt.createdAt });
+      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, afterEventId: attempt.queueWatermark ?? null });
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {

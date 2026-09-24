@@ -77,13 +77,13 @@ it('retains cancellation reasons across restart and never revives cancelled work
 it('persists the merge-queue lifecycle and terminal reason across restart', () => {
   const { store, path } = fixture();
   const expected = { ...state(store), reviewVersion: store.reviewVersion(identity) };
-  const attempt = store.beginMergeAttempt(identity, expected, oid(2));
+  const attempt = store.beginMergeAttempt(identity, expected, oid(2), 'MQEV_before');
   expect(store.queueMergeAttempt(identity, attempt.id, 'https://github.example/pr/1')).toBe(true);
   expect(store.observeQueuedMerge(identity, attempt.id, { entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2 })).toBe(true);
   expect(store.finishMergeAttempt(identity, attempt.id, { state: 'removed', reason: 'Checks failed.', occurredAt: '2026-09-24T08:05:00Z' })).toBe(true);
   close(store);
   expect(open(path).getMergeAttempt(identity)).toMatchObject({
-    id: attempt.id, state: 'removed', reviewedHead: oid(2), reason: 'Checks failed.', entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2,
+    id: attempt.id, state: 'removed', reviewedHead: oid(2), queueWatermark: 'MQEV_before', reason: 'Checks failed.', entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2,
   });
 });
 it('prevents a stale queue observation from overwriting a retry attempt', () => {
