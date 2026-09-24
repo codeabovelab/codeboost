@@ -22,7 +22,7 @@ Store schema v2 adds the review counter and per-item notes through a transaction
 
 - No agent answers, test execution, AI findings ingestion, send-to-agent action, or merge control is included. These belong after the go/no-go gate. Four checks distinguish unavailable evidence from success.
 - File cards show mode/path/object IDs and blob byte sizes. PNG/JPEG/GIF/WebP previews are bounded to 1 MiB each and 4 MiB across a history; unsupported/oversized images say unavailable. Gitlink byte sizes are not applicable. SVG/HTML is never embedded.
-- The real issue pairs are frozen in `docs/experiments/review-protocol.md`, and the completed manual assignment is recorded in `docs/experiments/manual-assignment.md`. The paired PRs, exact review revision, human timing, and final result remain pending. Do not mark issue #3 closed or claim the gate passed.
+- The real issue pairs are frozen in `docs/experiments/review-protocol.md`, and the completed manual assignment is recorded in `docs/experiments/manual-assignment.md`. Pair 1 is prepared at its exact PR revisions; pairs 2–4, human timing, and the final result remain pending. Do not mark issue #3 closed or claim the gate passed.
 - The planting helper is intentionally limited to disposable clones and supported regular top-level paths; it never publishes PRs.
 
 ## Validation
