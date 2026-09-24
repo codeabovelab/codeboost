@@ -54,6 +54,19 @@ describe('GitHub issue retrieval', () => {
     expect(snapshot.issues[0]).toMatchObject({ number: 8, trust: 'requires-approval' });
   });
 
+  it('accepts canonical URL casing without relaxing repository identity or URL shape', async () => {
+    const run = vi.fn(async () => JSON.stringify([
+      rawIssue(),
+      rawIssue({
+        number: 8,
+        html_url: 'https://github.com/owner/repo/issues/8',
+        pull_request: { url: 'https://api.github.com/repos/owner/repo/pulls/8' },
+      }),
+    ]));
+    const snapshot = await new GhIssueGateway('Owner/Repo', run).fetch();
+    expect(snapshot).toMatchObject({ repository: 'Owner/Repo', issues: [{ repository: 'Owner/Repo', number: 7 }] });
+  });
+
   it('accepts the maximum bounded issue body', async () => {
     const gateway = new GhIssueGateway('owner/repo', async () => JSON.stringify([
       rawIssue({ body: 'x'.repeat(65_536) }),

@@ -67,6 +67,12 @@ function repositoryName(value: string): boolean {
   return value.split('/').every(part => part !== '.' && part !== '..' && part.length <= 100);
 }
 
+function sameGithubUrl(value: unknown, expected: string, field: string): string {
+  const url = boundedString(value, field, 2048);
+  if (url.toLowerCase() !== expected.toLowerCase()) throw new Error(`GitHub returned an invalid issue ${field}.`);
+  return url;
+}
+
 function timestamp(value: unknown, field: string): string {
   const text = boundedString(value, field, 64);
   const parsed = Date.parse(text);
@@ -83,13 +89,11 @@ function normalizeIssue(repository: string, value: unknown): RepositoryIssue | n
   const number = issue.number as number;
   if (Object.hasOwn(issue, 'pull_request')) {
     const marker = object(issue.pull_request, 'GitHub returned an invalid pull request marker.');
-    if (marker.url !== `https://api.github.com/repos/${repository}/pulls/${number}`)
-      throw new Error('GitHub returned an invalid pull request marker.');
+    sameGithubUrl(marker.url, `https://api.github.com/repos/${repository}/pulls/${number}`, 'pull request marker');
     return null;
   }
   if (issue.state !== 'open') throw new Error('GitHub returned a non-open issue.');
-  const url = boundedString(issue.html_url, 'URL', 2048);
-  if (url !== `https://github.com/${repository}/issues/${number}`) throw new Error('GitHub returned an issue URL for another repository.');
+  const url = sameGithubUrl(issue.html_url, `https://github.com/${repository}/issues/${number}`, 'URL');
   const createdAt = timestamp(issue.created_at, 'creation time');
   const updatedAt = timestamp(issue.updated_at, 'update time');
   if (Date.parse(updatedAt) < Date.parse(createdAt)) throw new Error('GitHub returned an issue update before its creation.');
