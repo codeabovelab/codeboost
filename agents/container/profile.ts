@@ -21,6 +21,7 @@ export interface ContainerProfile {
   readonly ownershipId: string;
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
+  readonly deferredOutput: boolean;
 }
 export interface ProfileOptions {
   readonly invocation: InvocationInput;
@@ -32,6 +33,7 @@ export interface ProfileOptions {
   readonly claudeToken?: string;
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
+  readonly deferredOutput?: boolean;
 }
 
 interface FileIdentity {
@@ -229,6 +231,10 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       '--mount', mount({ type: 'volume', source: filesystems.workVolume, target: '/work', readonly: readOnlyWork }),
       '--mount', mount({ type: 'volume', source: filesystems.metadataVolume, target: '/work/.git', readonly: true }),
       '--mount', mount({ type: 'bind', source: inputIdentity.inputDirectory, target: '/run/codeboost-input', readonly: true })];
+    if (options.deferredOutput) {
+      if (invocation.vendor !== 'codex') throw new Error('Deferred output is available only for Codex.');
+      args.push('--env', 'CODEBOOST_DEFERRED_OUTPUT=1');
+    }
     if (invocation.vendor === 'codex') {
       args.push('--env', 'CODEX_HOME=/run/codeboost-auth/codex',
         '--tmpfs', '/run/codeboost-auth/codex:rw,nosuid,nodev,size=4194304,nr_inodes=256,uid=10001,gid=10001,mode=0700',
@@ -239,7 +245,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
       phase: invocation.phase, vendor: invocation.vendor,
       filesystems: capturedFilesystems, inputDirectory: inputIdentity.inputDirectory, codexAuthFile,
-      command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy });
+      command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy,
+      deferredOutput: options.deferredOutput === true });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,

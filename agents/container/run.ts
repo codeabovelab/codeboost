@@ -88,6 +88,11 @@ const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = fal
   disposeContainerProfile(profile);
 };
 
+/** Remove a validated invocation container, then its profile-owned staging and network resources. */
+export function disposeValidatedContainer(profile: ContainerProfile): void {
+  removeContainerOrThrow(profile);
+}
+
 type Inspect = {
   Image: string;
   Config: { Image: string; User: string; Env: string[]; Entrypoint: string[] | null; Cmd: string[] | null;
@@ -239,6 +244,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   const allowedEnvironment = new Set(['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'CODEBOOST_PHASE', 'CODEBOOST_VENDOR',
     'CODEBOOST_WORK_BYTES', 'CODEBOOST_WORK_INODES', 'CODEBOOST_METADATA_BYTES', 'CODEBOOST_METADATA_INODES',
     'npm_config_cache', 'XDG_CACHE_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
+    ...(profile.deferredOutput ? ['CODEBOOST_DEFERRED_OUTPUT'] : []),
     ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
   if (new Set(names).size !== names.length || names.some(name => !allowedEnvironment.has(name)))
     throw new Error('Container includes an unexpected environment variable.');
@@ -255,6 +261,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || environment.get('HTTP_PROXY') !== profile.network.proxyUrl
     || environment.get('NO_PROXY') !== 'localhost,127.0.0.1')
     throw new Error('Container isolation environment changed.');
+  if (profile.deferredOutput && environment.get('CODEBOOST_DEFERRED_OUTPUT') !== '1')
+    throw new Error('Container deferred-output protocol changed.');
   if (profile.vendor === 'codex' && (names.includes('CLAUDE_CODE_OAUTH_TOKEN')
     || environment.get('CODEX_HOME') !== '/run/codeboost-auth/codex'))
     throw new Error('Credential profiles must not be combined or redirected.');
