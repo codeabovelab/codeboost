@@ -1,7 +1,8 @@
 import { afterEach, it, expect, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
@@ -15,6 +16,18 @@ it('expires a browser token after another view assigns a segment and recomputes 
  const next=service.act({action:'assign',key:foreign.key,item:'P1',token:view.token});
  expect(next.items[0]!.checks.scope).toContain('out of scope');
  expect(()=>service.act({action:'approve',item:'P1',token:view.token})).toThrow(/Stale/);
+});
+it('keeps both sides of a declared rename in scope after manual reassignment',()=>{
+ const {service,config}=fixture(),identity=config.identity,plan=service.store.getPlan(identity);
+ plan.items=[{...plan.items[0]!,files:[{path:'renamed.ts',kind:'rename',renamed_from:'retry.ts',change:'Rename the implementation.'}],depends_on:[]}];
+ service.store.importRevision(JSON.stringify(plan),'json',{identity,issue:plan.issue,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},plan.revision);
+ renameSync(join(config.repository,'retry.ts'),join(config.repository,'renamed.ts'));
+ writeFileSync(join(config.repository,'renamed.ts'),'export function delay(attempt: number) {\n  return Math.min(5000, 200 * 2 ** attempt);\n}\n');
+ execFileSync('git',['-c','core.hooksPath=/dev/null','add','-A'],{cwd:config.repository});
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Rename retry implementation'],{cwd:config.repository,stdio:'pipe'});
+ let view=service.load();const candidates=view.segments.filter(segment=>segment.row==='Unplanned'&&['retry.ts','renamed.ts'].includes(segment.path));
+ expect(new Set(candidates.map(segment=>segment.path))).toEqual(new Set(['retry.ts','renamed.ts']));
+ for(const candidate of candidates){view=service.act({action:'assign',key:candidate.key,item:'P1',token:view.token});expect(view.segments.find(segment=>segment.key===candidate.key)?.scope).toBe('in-scope');}
 });
 it('persists bounded per-item notes without creating a plan revision',()=>{
  const {service,config}=fixture();const view=service.load();service.act({action:'note',item:'P1',kind:'question',text:'Why this limit?',token:view.token});
