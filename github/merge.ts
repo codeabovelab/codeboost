@@ -22,6 +22,15 @@ export interface RemoteMergeState {
 }
 
 export interface MergeResult { url: string; }
+export type MergeQueueEntryPhase = 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED';
+export type MergeQueueObservation =
+  | { state: 'queued'; reviewedHead: string; entryId: string; phase: MergeQueueEntryPhase; position: number; enqueuedAt: string; queueHead: string }
+  | { state: 'removed'; reviewedHead: string; removedAt: string; reason: string }
+  | { state: 'failed'; reviewedHead: string; entryId: string; reason: string }
+  | { state: 'merged'; reviewedHead: string; mergedAt: string };
+export interface MergeQueueGateway {
+  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<MergeQueueObservation>;
+}
 export interface MergeGateway {
   inspect(options?: { fresh?: boolean; timeoutMs?: number }): Promise<RemoteMergeState>;
   merge(expectedHead: string, options?: { signal?: AbortSignal }): Promise<MergeResult>;
@@ -46,8 +55,13 @@ function flattenPages(value: unknown): unknown[] {
   return value.flat();
 }
 
+function timestamp(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/.test(value) || !Number.isFinite(Date.parse(value))) throw new Error(`GitHub returned an invalid ${label}.`);
+  return value;
+}
+
 /** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
-export class GhMergeGateway implements MergeGateway {
+export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
   #cache: { expiresAt: number; state: RemoteMergeState } | null = null;
@@ -226,6 +240,74 @@ export class GhMergeGateway implements MergeGateway {
     }).finally(() => { clearTimeout(timer); if (this.#inflight?.promise === attempt) this.#inflight = null; });
     if (!options.fresh) this.#inflight = { generation, promise: attempt };
     return attempt;
+  }
+
+  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<MergeQueueObservation> {
+    fullSha(expectedHead, 'expected head SHA');
+    const timeoutMs = options.timeoutMs ?? 12_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue inspection timeout.');
+    const [owner, name] = this.config.repository.split('/') as [string, string];
+    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}`;
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-queue inspection timed out.')), timeoutMs);
+    const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
+    try {
+      if (options.signal?.aborted) throw options.signal.reason;
+      const response = await this.#json(['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${this.config.pullRequest}`], signal) as {
+        data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null };
+        errors?: unknown;
+      };
+      if (signal.aborted) throw signal.reason;
+      if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue data with errors.');
+      const pull = response.data?.repository?.pullRequest;
+      if (!pull || pull.number !== this.config.pullRequest) throw new Error('GitHub returned an incomplete merge-queue pull request.');
+      const reviewedHead = fullSha(pull.headRefOid, 'queue pull request head SHA');
+      if (reviewedHead !== expectedHead) throw new Error('The pull request head changed after review.');
+      if (!['OPEN','CLOSED','MERGED'].includes(String(pull.state))) throw new Error('GitHub returned an invalid queue pull request state.');
+      if (!Object.hasOwn(pull, 'mergedAt') || (pull.mergedAt !== null && typeof pull.mergedAt !== 'string')) throw new Error('GitHub returned invalid merge completion data.');
+      if (!Object.hasOwn(pull, 'mergeQueueEntry') || !Object.hasOwn(pull, 'timelineItems')) throw new Error('GitHub returned incomplete merge-queue data.');
+      const entry = pull.mergeQueueEntry;
+      const timeline = pull.timelineItems;
+      if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline) || !Array.isArray((timeline as { nodes?: unknown }).nodes)) throw new Error('GitHub returned incomplete merge-queue history.');
+      const events = (timeline as { nodes: unknown[] }).nodes.map(event => {
+        if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed merge-queue event.');
+        const value = event as { __typename?: unknown; createdAt?: unknown; reason?: unknown; beforeCommit?: { oid?: unknown } | null };
+        if (!['AddedToMergeQueueEvent','RemovedFromMergeQueueEvent'].includes(String(value.__typename))) throw new Error('GitHub returned an unknown merge-queue event.');
+        const createdAt = timestamp(value.createdAt, 'merge-queue event time');
+        if (value.__typename === 'RemovedFromMergeQueueEvent' && (typeof value.reason !== 'string' || !value.reason.trim())) throw new Error('GitHub returned a merge-queue removal without a reason.');
+        const beforeHead = value.__typename === 'RemovedFromMergeQueueEvent' ? fullSha(value.beforeCommit?.oid, 'removed merge-queue head SHA') : undefined;
+        return { type: value.__typename, createdAt, reason: value.reason as string | undefined, beforeHead };
+      });
+      if (pull.state === 'MERGED') {
+        if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');
+        return { state: 'merged', reviewedHead, mergedAt: timestamp(pull.mergedAt, 'merge completion time') };
+      }
+      if (pull.mergedAt !== null) throw new Error('GitHub returned inconsistent merge completion data.');
+
+      if (entry !== null) {
+        if (pull.state !== 'OPEN' || !entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('GitHub returned an invalid merge-queue entry.');
+        const value = entry as { id?: unknown; state?: unknown; position?: unknown; enqueuedAt?: unknown; headCommit?: { oid?: unknown } | null; pullRequest?: { number?: unknown; headRefOid?: unknown } | null };
+        if (typeof value.id !== 'string' || !value.id || !['AWAITING_CHECKS','LOCKED','MERGEABLE','QUEUED','UNMERGEABLE'].includes(String(value.state)) || !Number.isSafeInteger(value.position) || (value.position as number) < 0)
+          throw new Error('GitHub returned an invalid merge-queue entry.');
+        timestamp(value.enqueuedAt, 'merge-queue entry time');
+        const queueHead = fullSha(value.headCommit?.oid, 'merge-queue head SHA');
+        const entryHead = fullSha(value.pullRequest?.headRefOid, 'merge-queue entry pull request head SHA');
+        if (value.pullRequest?.number !== this.config.pullRequest || queueHead !== expectedHead || entryHead !== expectedHead) throw new Error('The merge-queue entry does not match the reviewed pull request head.');
+        if (value.state === 'UNMERGEABLE') return { state: 'failed', reviewedHead, entryId: value.id, reason: 'GitHub reported the merge queue entry as unmergeable.' };
+        return {
+          state: 'queued', reviewedHead, entryId: value.id, phase: value.state as MergeQueueEntryPhase,
+          position: value.position as number, enqueuedAt: value.enqueuedAt as string, queueHead,
+        };
+      }
+      const last = events.at(-1);
+      if (!last || last.type !== 'RemovedFromMergeQueueEvent') throw new Error('GitHub did not confirm a queued, removed, failed, or merged state.');
+      if (last.beforeHead !== expectedHead) throw new Error('The merge-queue removal does not match the reviewed pull request head.');
+      return { state: 'removed', reviewedHead, removedAt: last.createdAt, reason: last.reason! };
+    } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
+      if (timeout.signal.aborted && !options.signal?.aborted) throw new Error('GitHub merge-queue inspection timed out.');
+      throw error;
+    } finally { clearTimeout(timer); }
   }
 
   async merge(expectedHead: string, options: { signal?: AbortSignal } = {}): Promise<MergeResult> {
