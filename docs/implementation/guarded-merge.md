@@ -2,6 +2,8 @@
 
 The review screen can now turn a fully approved snapshot into a GitHub merge without trusting browser-supplied SHAs or check results. The browser sends only the current review token. The trusted coordinator reloads the plan, snapshot, approvals, choices, and notes; reads GitHub state itself; and pins the merge to the reviewed head.
 
+Derived planted-review configurations clear the source GitHub binding because their repository and review identity point at a disposable clone.
+
 ## Gate
 
 Merging blocks when any plan item is unreviewed or stale, an Ambiguous or Unplanned segment remains, a current change request is open, or a `cmd:` acceptance check lacks a passing result for the current head. Historical change requests from an earlier revision or snapshot remain visible but do not block the current revision.

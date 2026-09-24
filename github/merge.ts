@@ -80,7 +80,7 @@ export class GhMergeGateway implements MergeGateway {
       const timeline = flattenPages(await this.#json(['api','--paginate','--slurp','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/issues/${this.config.issue}/timeline`], signal));
       const referenced = new Set<number>();
       for (const event of timeline) {
-        if (!event || typeof event !== 'object') continue;
+        if (!event || typeof event !== 'object') throw new Error('GitHub returned a malformed timeline event.');
         const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown } } }).source?.issue;
         if (!source?.pull_request) continue;
         if (!Number.isSafeInteger(source.number) || (source.number as number) < 1) throw new Error('GitHub returned an invalid pull request reference.');
@@ -157,10 +157,18 @@ export class GhMergeGateway implements MergeGateway {
       }
       if (classic && typeof classic === 'object') {
         const value = classic as { strict?: unknown; checks?: unknown; contexts?: unknown };
-        if (value.strict === true) atomicBaseGuard = true;
-        const checks = Array.isArray(value.checks) ? value.checks : Array.isArray(value.contexts) ? value.contexts.map(context => ({ context, app_id: null })) : null;
-        if (!checks) rulesKnown = false;
-        else for (const check of checks) {
+        const hasChecks = Object.hasOwn(value, 'checks'), hasContexts = Object.hasOwn(value, 'contexts');
+        if (typeof value.strict !== 'boolean' || (hasChecks && !Array.isArray(value.checks)) || (hasContexts && !Array.isArray(value.contexts)) || (!hasChecks && !hasContexts)) rulesKnown = false;
+        const contexts = Array.isArray(value.contexts) ? value.contexts : [];
+        const suppliedChecks = Array.isArray(value.checks) ? value.checks : [];
+        if (contexts.some(context => typeof context !== 'string') || suppliedChecks.some(check => !check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string')) rulesKnown = false;
+        if (rulesKnown && hasChecks && hasContexts) {
+          const fromContexts = new Set(contexts as string[]), fromChecks = new Set(suppliedChecks.map(check => (check as { context: string }).context));
+          if (fromContexts.size !== fromChecks.size || [...fromContexts].some(context => !fromChecks.has(context))) rulesKnown = false;
+        }
+        if (rulesKnown && value.strict) atomicBaseGuard = true;
+        const checks = hasChecks ? suppliedChecks : contexts.map(context => ({ context, app_id: null }));
+        if (rulesKnown) for (const check of checks) {
           if (!check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string') { rulesKnown = false; break; }
           const context = (check as { context: string }).context;
           if (!Object.hasOwn(check, 'app_id')) { rulesKnown = false; break; }

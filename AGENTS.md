@@ -63,6 +63,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Treat a successful external command as the transition it actually performed. If it can enqueue or schedule work, model and verify that lifecycle before reporting the final action as complete.
 - Once an irreversible external command succeeds, do not convert later refresh or rendering failures into action failure. Return the committed result, keep repeat controls disabled, and require fresh confirmation of terminal state.
 - When startup acquires a store, process, listener, or other resource before later dependency construction, close that resource on every construction failure. Prefer validating dependencies before acquisition when possible.
+- When deriving a review configuration for a clone, experiment, fork, or new identity, clear external action bindings unless they are re-established and validated for the derived target.
 - A deadline must abort and await the underlying operation before releasing its in-flight ownership; rejecting only the caller can leave untracked work running.
 - Invalidate pre-action status caches after both successful and refused external mutations before rendering or fetching status again. Use a generation guard so reads started before or during the mutation cannot repopulate the cache afterward.
 - Keep irreversible integrations disabled in demo mode even when configuration or an injected dependency is present. After a stale or refused irreversible action, keep its control disabled until fresh state is loaded.

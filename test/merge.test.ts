@@ -321,3 +321,36 @@ it('fails closed when a timeline pull request reference has no valid number', as
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
   expect(state.alreadyFixed).toBe('unknown');
 });
+
+it('fails closed when a timeline contains a non-object event', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([[null]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
+});
+
+it.each([
+  { strict: true, checks: 'bad', contexts: [] },
+  { strict: true, checks: [], contexts: ['test'] },
+  { strict: true, checks: [{ context: 'test', app_id: null }], contexts: [] },
+  { strict: 'true', checks: [], contexts: [] },
+])('fails closed for inconsistent classic protection fields: %j', async requiredStatusChecks => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });
+    if (joined.includes('/timeline')) return JSON.stringify([[]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(false);
+});
