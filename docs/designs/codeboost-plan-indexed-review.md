@@ -26,7 +26,7 @@ Writing standard: plain language, ISO 24495-1:2023
 - **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
 - **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
-- **What we build first.** The review screen, tested on real PRs. We build the rest (running agents, the queue, the issue list) only if the review screen proves its worth.
+- **What we build first.** The review screen was built first. The remaining roadmap can proceed; optional real-PR validation is tracked separately in #19 and is not a prerequisite.
 
 ## Terms used
 
@@ -110,7 +110,7 @@ Where we disagreed: the plan format is what makes code-to-item links possible. S
 
 ## What we will build
 
-We build all 9 steps as one local app. We start with the review screen. After the first two build steps, we stop and check whether the review screen works (see "Build order and the go/no-go check").
+We build all 9 steps as one local app. We started with the review screen. Optional human validation may check whether it works, but the cancelled experiment no longer stops the remaining roadmap (see "Build order and optional validation").
 
 ### Tools and storage
 
@@ -547,11 +547,13 @@ Added by the engineering review (L1 to L4). The agent tools cannot be retrained,
 
 A lesson whose feedback keeps repeating is flagged for rewording or removal.
 
-### Build order and the go/no-go check
+### Build order and optional validation
+
+**Superseding product decision (2026-09-23).** The paired human go/no-go experiment was cancelled before timed results were recorded. It did not pass and provides no comparative review evidence. The cancellation removes it as a prerequisite for later roadmap steps. Optional future validation is tracked in #19 and must use fresh blinded packages and a freshly committed protocol. Historical experiment decisions and review records below remain as design history.
 
 1. **Plan format and linking engine.** A code library, tested with sample git histories.
 2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
-3. **Go/no-go check.** Run the real-PR test in "How we will know it works." Continue only if reviewing by plan item wins. If it does not, change the linking design, or switch to option C, before building anything more.
+3. **Optional validation.** A future real-PR comparison may test the assumptions in "How we will know it works," but it is non-blocking under the superseding decision above.
 4. **Merge gate and merging** (step 9): the merge rules, the pre-merge sequence, and merging through `gh`.
 5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6).
 6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3).
@@ -584,7 +586,8 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 - assigning an Unplanned segment to a plan item. Expected: that plan item goes stale, and the assignment survives an unrelated revision;
 - the "already fixed" check run against the task's own PR. Expected: no match.
 
-**The real-PR test (the go/no-go check).**
+**Historical cancelled real-PR test.** The following procedure is retained as design history. It was not completed, produced no result, and is not a roadmap prerequisite; #19 tracks any fresh optional validation.
+
 0. **Write the rules down first** (engineering review, O9). Commit this test's pairs, pass rule, and stopping rule to the repo before the first review. Do not change them afterwards.
 1. Pick at least 4 pairs of similar small issues in a repo you own.
 2. Make every PR by hand, using the method in "The assignment" below. (Build step 5, running agents, does not exist yet.)
@@ -620,15 +623,13 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## What to do next
 
-1. Done: the repo exists at codeabovelab/codeboost with an MIT license. Still to do: write a README that explains reviewing by plan item and lists the known safety limits.
-2. Do the assignment below.
-3. Build step 1, with all its test cases.
-4. Build step 2: the read-only review screen from mockup B.
-5. Commit the go/no-go rules, then run the go/no-go check.
-6. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before build step 5 if anything in those areas changes.
-7. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
+1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen.
+2. Continue the remaining roadmap from the current open issues; the cancelled experiment is not a prerequisite.
+3. Optionally run the non-blocking human validation tracked in #19.
+4. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before implementing code-writing agents if anything in those areas changes.
+5. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
 
-**The assignment.** Do this before you write any codeboost code:
+**Historical assignment.** This was completed before the initial implementation and is retained as design history:
 1. Pick one real, small issue in a repo you own.
 2. Write a plan for it by hand, in the format above.
 3. Run Claude on one plan item at a time. Tell it not to commit.
@@ -873,7 +874,7 @@ Stop: CONVERGENCE
 
 ### Scope record
 
-- Feature answers: no cuts proposed. The 9 steps stay, gated by the go/no-go check.
+- Feature answers: no cuts proposed. The 9 steps stay; the cancelled go/no-go experiment no longer gates them under the superseding product decision.
 - Structure: **B, Smaller arrangement** (answer D1). One npm package, 6 modules: `core` (plan format and linking engine, no I/O), `git` (worktree, commit, diff walk, rebase), `agents` (adapter interface, claude, codex, permission profiles), `runner` (one task state machine: run, review rounds, queue, schedule, recovery), `github` (gh wrapper), `web` (server and screen).
 - Accepted scope: all features in this document, in the 6-module layout.
 - Storage access lives inside `runner` (`runner/store`), which alone writes task state; `web` reads and sends commands through `runner`. The command-line entry lives in `web` (`web/cli`). Answer D9 (R8).
@@ -1788,7 +1789,7 @@ Codex (outside voice, completed, 2026-09-22) raised 8 findings. Claude checked e
 
 ### Not in scope
 
-- **Issue ranking weights, parallel tasks, and a different agent per phase.** These stay in Open questions. They sit after the go/no-go check and do not affect the review idea.
+- **Issue ranking weights, parallel tasks, and a different agent per phase.** These stay in Open questions and do not affect the review idea. The cancelled experiment is not a phase boundary.
 - **Reusing AgentDiff code.** Still an open question. Read its code before build step 1.
 - **Windows support.** The container and sign-in design was checked for macOS and Linux only.
 
@@ -1866,15 +1867,15 @@ Critical gaps (no test, no handling, and silent): 0.
 | Linking engine | core | — |
 | Git helpers and ledger | git, runner/store | — |
 | Read-only review screen | web | linking engine, git helpers |
-| Go/no-go check | (process) | read-only review screen |
-| Merge gate and merging | github, runner | go/no-go pass |
-| Agent container and network | agents | go/no-go pass |
+| Optional human validation | (process) | read-only review screen |
+| Merge gate and merging | github, runner | read-only review screen |
+| Agent container and network | agents | read-only review screen |
 | Runner state machine | runner | merge gate, agent container |
 | Learning (lessons, inbox, Learning screen) | runner, agents, web | runner state machine (needs the reject loop) |
 
 - **Lane A:** linking engine (independent). **Lane B:** git helpers and ledger (independent).
-- Launch A and B in parallel worktrees. Merge both. Then build the review screen. Then run the go/no-go check.
-- After a pass, **Lane C** (merge gate) and **Lane D** (agent container) can run in parallel. The runner follows both.
+- Launch A and B in parallel worktrees. Merge both, then build the review screen. Optional human validation may run later without blocking implementation.
+- After the review screen, **Lane C** (merge gate) and **Lane D** (agent container) can run in parallel. The runner follows both.
 - **Conflict flag:** Lane C and the runner both touch `runner`. Sequence the runner after Lane C merges.
 - Learning comes last and is sequential, because it touches `runner`, `agents`, and `web` and needs the reject loop.
 
@@ -1910,10 +1911,10 @@ Built from this review's findings. Each task comes from a specific decision abov
   - Surfaced by: O4 (D14: A)
   - Files: github/merge
   - Verify: a head or base push between validation and merge is refused or revalidated by the server-side guarded merge; a backend without atomic base protection blocks automatic merge, including with zero required checks
-- [ ] **T8 (P1, human: ~2 days / CC: ~30 min)** — process — Commit the go/no-go rules and build the ledger-aware plant script
+- [x] **T8 (P1, historical estimate: human ~2 days / CC ~30 min)** — process — Cancelled before timed results; optional future validation moved to #19
   - Surfaced by: R3 (D4: A), O5, O9 (D19: A)
-  - Files: scripts/plant.ts, docs/go-no-go.md
-  - Verify: plants land in ledger commits; the rules file is committed before the first review
+  - Files: scripts/plant.ts, docs/experiments/review-protocol.md
+  - Outcome: no experimental result or product claim; future work must start with a fresh protocol and fresh blinded packages
 - [ ] **T9 (P1, human: ~2 weeks / CC: ~3 hours)** — tests — Set up Vitest, real git, recorded gh and CLI outputs, the real-Docker CI suite, Playwright, and the hostile-issue eval
   - Surfaced by: T1 (D10: A)
   - Files: test/, .github/workflows/
@@ -1974,7 +1975,7 @@ None in this review.
 - New requirement during review: learning from your feedback, decided in 4 parts (L1 to L4)
 - Unresolved decisions: 0 in this review
 - Outside voice: Codex, completed, 8 findings (split into 9 decisions, all resolved)
-- Parallelization: 4 lanes, 2 parallel before the go/no-go check and 2 after; the runner and learning are sequential
+- Historical parallelization plan: 4 lanes, originally split around the go/no-go check; the cancelled experiment no longer divides or blocks roadmap work
 - Lake score: 12/20
 - Suppressed findings (appendix): none
 

@@ -1,6 +1,8 @@
 # Plan-indexed review: go/no-go protocol
 
-Status: **not started; issue pairs and human reviewer still required**. This document does not claim a passed gate. Complete the pair table and commit its exact revision before any timed review. No pair or threshold may change once the first review begins.
+Status: **cancelled by product decision before timed results were recorded**. This document is retained as historical experiment design and does not claim a passed gate. Optional future validation is tracked in #19 and must start from a fresh committed protocol and fresh blinded packages.
+
+The cancelled experiment no longer blocks subsequent roadmap work. No speed, catch-rate, or comparative product claim may be inferred from its preparation work.
 
 ## Pair selection and order
 
@@ -33,8 +35,8 @@ Pass only when all are true:
 - median codeboost time is no slower than median raw-diff time;
 - no change is left unexplained.
 
-Report declared-file catch rate for both methods without a pass threshold. Stop after four pairs. If within one catch of the bar, perform four more preselected pairs once, then decide. Do not add further trials. Record the outcome in a committed results document before merge/agent/planning/queue/learning implementation begins.
+For any future optional run, report declared-file catch rate for both methods without a pass threshold. Stop after four pairs. If within one catch of the bar, perform four more preselected pairs once, then decide. Do not add further trials. Record the outcome in a committed results document before making comparative product claims. A future run does not gate merge, agent, planning, queue, or learning implementation.
 
 ## Current evidence
 
-Engineering tests prove browser interactions, persistence, attribution, and planting mechanics. They do **not** establish human review speed or catch rates. No real issue pairs, timed decisions, or catch-rate results exist yet.
+Engineering tests prove browser interactions, persistence, attribution, and planting mechanics. They do **not** establish human review speed or catch rates. The experiment was cancelled without a result.

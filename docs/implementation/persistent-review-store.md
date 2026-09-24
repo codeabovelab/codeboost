@@ -1,6 +1,6 @@
 # Persistent review store (#2)
 
-This slice follows the library foundation merged at `550340a`. The next approved step is the read-only review screen (#3). It uses Node's built-in SQLite through `runner/store.ts`; no additional runtime dependency is required.
+This slice follows the library foundation merged at `550340a`. The read-only review screen tracked in #3 was implemented after this store. The store uses Node's built-in SQLite through `runner/store.ts`; no additional runtime dependency is required.
 
 ## Contract and decisions
 
@@ -28,7 +28,7 @@ Baseline: 136 tests. Final counts and CI evidence are recorded in the PR.
 
 The store does not read Git or execute agents. The runner remains responsible for obtaining immutable typed tree entries and actual filesystem identity; keeping metadata stable; auditing paths, links, and occupancy; reconciling execution prefixes; and phase/container enforcement (#6). Checkpoint persistence is not an implemented execution state machine. This slice adds neither UI nor an HTTP endpoint. No migration against a shared environment is performed.
 
-Build the review screen under #3 next. The real-issue assignment, experiment protocol, planted-change script, and paired go/no-go experiment remain prerequisites to proceeding beyond that screen.
+The review screen tracked in #3 is implemented. The later paired go/no-go experiment was cancelled before results were recorded and no longer blocks subsequent roadmap work; optional future validation is tracked in #19.
 
 ## Review round 1
 

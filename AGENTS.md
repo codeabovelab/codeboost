@@ -49,3 +49,8 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - A validation fixture for a summary-only concern must assert the disputed intermediate representation or state before using a downstream outcome as evidence that the concern was exercised.
 - For each review round, record what changed, what was declined and why, and the regression evidence. Re-request review until a round returns no new findings.
 - Treat review-lesson extraction as a merge gate. Before invoking merge, classify every review finding in the PR body as: covered by an existing rule (cite it), captured by a new rule in this branch (cite it), or one-off (record why). Do not merge until this audit is complete and every required `AGENTS.md` update is included in the reviewed head. Omit rules that merely repeat existing guidance.
+
+## Blinded experiments
+
+- Keep experimental PRs as drafts with automated review disabled until the assigned human decision is recorded. An automated review invalidates reviewer blindness; replace the affected package rather than reusing it.
+- If an experiment is cancelled, record it as cancelled rather than passed, remove it from roadmap prerequisites, and track any future validation as explicitly non-blocking. Do not infer product claims from preparation work or incomplete trials.

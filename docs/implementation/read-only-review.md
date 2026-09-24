@@ -1,6 +1,6 @@
 # Read-only review screen (#3)
 
-Started from `dd6a1e7`, after merging the SQLite store PR. This delivers the local review surface and experiment tooling; issue #3 remains open until the human go/no-go work is complete.
+Started from `dd6a1e7`, after merging the SQLite store PR. This delivers the local review surface and experiment tooling. The paired human go/no-go experiment was later cancelled before results were recorded; optional future validation is tracked in #19 and does not block roadmap work.
 
 ## Run it
 
@@ -18,11 +18,11 @@ The server binds only 127.0.0.1 and requires its random private token for APIs. 
 
 Store schema v2 adds the review counter and per-item notes through a transactional v1 migration. The test suite verifies existing revisions and ledger entries survive. This is an automatic local SQLite migration, not a migration against a shared environment.
 
-## Known limits and remaining gates
+## Known limits
 
-- No agent answers, test execution, AI findings ingestion, send-to-agent action, or merge control is included. These belong after the go/no-go gate. Four checks distinguish unavailable evidence from success.
+- No test execution, AI findings ingestion, send-to-agent action, or merge control is included. These remain later roadmap work. Four checks distinguish unavailable evidence from success.
 - File cards show mode/path/object IDs and blob byte sizes. PNG/JPEG/GIF/WebP previews are bounded to 1 MiB each and 4 MiB across a history; unsupported/oversized images say unavailable. Gitlink byte sizes are not applicable. SVG/HTML is never embedded.
-- The protocol at `docs/experiments/review-protocol.md` must be filled with the real pairs and committed before the first timed review. The manual assignment, real paired PRs, human timing, and final result are pending. Do not mark issue #3 closed or claim the gate passed.
+- The paired human review experiment was cancelled by product decision before any timed result. This is not a passed gate and supplies no comparative speed or catch-rate evidence. Future validation is optional and tracked in #19.
 - The planting helper is intentionally limited to disposable clones and supported regular top-level paths; it never publishes PRs.
 
 ## Validation
@@ -63,7 +63,7 @@ Snippet-feedback validation: 176 unit/integration tests and 15 browser tests pas
 
 ## Agent answers and Settings
 
-Scope update requested during the PR #597 walkthrough: Ask now invokes a read-only question agent before the broader implementation/queue go/no-go gate. This supersedes the earlier “no agent answers” limitation only for questions. Request change still saves feedback without running edits, and answering never changes a plan revision or approval.
+Scope update requested during the PR #597 walkthrough: Ask now invokes a read-only question agent. This supersedes the earlier “no agent answers” limitation only for questions. Request change still saves feedback without running edits, and answering never changes a plan revision or approval.
 
 Open Settings and choose Claude Code or Codex. The choice persists in this review database (schema v3 adds app_settings); existing notes and snippet references survive migration. No provider is selected automatically. The installed CLI must already be signed in. The question, selected snippet, plan item, changed code, checks and bounded prior conversation are sent to the selected provider. Truncation and absent evidence are part of the context; the agent must not claim unrun tests passed.
 
@@ -117,7 +117,7 @@ Held-response browser regressions reproduced Refresh replacing newer question/ch
 
 The browser owns unsent text, mode, navigation, and attachments; the refreshed response owns the persisted plan, approvals, notes, and snapshot. Refresh remains serialized with review actions and invalidates older question polls through the existing generation counter. A valid attached snippet survives; changed snapshot or assignment context keeps the text and marks the attachment outdated, blocking submission until it is removed or reselected. Removed items with drafts remain accessible as retained-draft rows, with submission disabled and instructions to copy the text to a current item. These drafts remain page-local and do not survive a browser reload.
 
-The regression gate is `npm run test:browser -- --grep 'during refresh'`. It checks visible drafts and refreshed durable approval/snapshot/plan state, and confirms no draft was accidentally saved as a note. Issues #10 (review edge cases), #12 (polling efficiency), and #3 (human go/no-go experiment) remain separate work.
+The regression gate is `npm run test:browser -- --grep 'during refresh'`. It checks visible drafts and refreshed durable approval/snapshot/plan state, and confirms no draft was accidentally saved as a note. Issue #12 (polling efficiency) remains separate work; optional human validation is tracked in #19.
 
 PR #14 review round 1 found that retained-draft rows omitted the regular rows' `aria-current` state. A browser assertion reproduced the missing attribute. Retained rows now expose their selected state; the regression checks selection, navigation away, and selection again. No findings were declined.
 
