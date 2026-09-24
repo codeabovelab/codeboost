@@ -18,6 +18,13 @@ const issue = (number: number, overrides: Partial<RepositoryIssue> = {}): Reposi
   ...overrides,
 });
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((res, rej) => { resolve = res; reject = rej; });
+  return { promise, resolve, reject };
+}
+
 describe('issue ranking', () => {
   it('applies the recorded weights, caps, and highest priority label only', () => {
     const ranked = rankIssues([issue(1, {
@@ -159,5 +166,45 @@ describe('priority refresh state', () => {
     const prioritizer = new IssuePrioritizer(gateway, () => new Date('2026-02-02T00:00:00Z'));
     await expect(prioritizer.refresh({ signal: controller.signal })).rejects.toBe(cancelled);
     await expect(prioritizer.refresh()).resolves.toMatchObject({ state: 'unavailable', issues: [] });
+  });
+
+  it('rejects a late successful refresh and preserves the newer snapshot', async () => {
+    const older = deferred<Awaited<ReturnType<IssueGateway['fetch']>>>();
+    const newer = deferred<Awaited<ReturnType<IssueGateway['fetch']>>>();
+    let attempt = 0;
+    const gateway: IssueGateway = {
+      repository: 'owner/repo',
+      fetch: async () => {
+        attempt++;
+        if (attempt === 1) return older.promise;
+        if (attempt === 2) return newer.promise;
+        throw new Error('offline');
+      },
+    };
+    const prioritizer = new IssuePrioritizer(gateway, () => new Date('2026-02-03T00:00:00Z'));
+    const first = prioritizer.refresh();
+    const second = prioritizer.refresh();
+    newer.resolve({ repository: 'owner/repo', retrievedAt: '2026-02-02T00:00:00Z', issues: [issue(2, { labels: ['P0'] })] });
+    await expect(second).resolves.toMatchObject({ state: 'fresh', issues: [{ number: 2, score: 101 }] });
+    older.resolve({ repository: 'owner/repo', retrievedAt: '2026-02-01T00:00:00Z', issues: [issue(1, { labels: ['P3'] })] });
+    await expect(first).rejects.toThrow('superseded');
+    await expect(prioritizer.refresh()).resolves.toMatchObject({ state: 'stale', issues: [{ number: 2, score: 101 }] });
+  });
+
+  it('rejects a late failed refresh instead of returning stale state over a newer result', async () => {
+    const older = deferred<Awaited<ReturnType<IssueGateway['fetch']>>>();
+    const newer = deferred<Awaited<ReturnType<IssueGateway['fetch']>>>();
+    let attempt = 0;
+    const gateway: IssueGateway = {
+      repository: 'owner/repo',
+      fetch: async () => (++attempt === 1 ? older.promise : newer.promise),
+    };
+    const prioritizer = new IssuePrioritizer(gateway);
+    const first = prioritizer.refresh();
+    const second = prioritizer.refresh();
+    newer.resolve({ repository: 'owner/repo', retrievedAt: '2026-02-02T00:00:00Z', issues: [issue(2)] });
+    await expect(second).resolves.toMatchObject({ state: 'fresh', issues: [{ number: 2 }] });
+    older.reject(new Error('older request failed'));
+    await expect(first).rejects.toThrow('superseded');
   });
 });

@@ -61,10 +61,15 @@ function copyIssues(issues: readonly RankedIssue[]): RankedIssue[] {
   return issues.map(issue => ({ ...issue, labels: [...issue.labels], reasons: [...issue.reasons] }));
 }
 
+class SupersededIssueRefreshError extends Error {
+  constructor() { super('Issue refresh was superseded by a newer request.'); }
+}
+
 export class IssuePrioritizer {
   readonly gateway: IssueGateway;
   readonly now: () => Date;
   #last: Extract<IssuePriorityState, { state: 'fresh' }> | null = null;
+  #generation = 0;
 
   constructor(gateway: IssueGateway, now: () => Date = () => new Date()) {
     this.gateway = gateway;
@@ -73,6 +78,7 @@ export class IssuePrioritizer {
 
   async refresh(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssuePriorityState> {
     options.signal?.throwIfAborted();
+    const generation = ++this.#generation;
     try {
       const snapshot: IssueSnapshot = await this.gateway.fetch(options);
       options.signal?.throwIfAborted();
@@ -85,10 +91,13 @@ export class IssuePrioritizer {
         retrievedAt: snapshot.retrievedAt,
         issues: rankIssues(snapshot.issues, new Date(snapshot.retrievedAt)),
       };
+      if (generation !== this.#generation) throw new SupersededIssueRefreshError();
       this.#last = { ...result, issues: copyIssues(result.issues) };
       return result;
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
+      if (error instanceof SupersededIssueRefreshError || generation !== this.#generation)
+        throw new SupersededIssueRefreshError();
       const attemptedAt = clock(this.now());
       if (!this.#last) return { state: 'unavailable', repository: this.gateway.repository, attemptedAt, error: failure(error), issues: [] };
       return {
