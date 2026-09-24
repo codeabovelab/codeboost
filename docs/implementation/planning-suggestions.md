@@ -34,6 +34,8 @@ Before publication, compare the current plan revision and snapshot with the capt
 ones, validate every card via E2, then call Store.completeSuggestions, whose CAS
 also checks the request is still pending. JavaScript has no await between these
 checks and publication; the injected Store must implement transactional request CAS.
+If publication CAS refuses a concurrent cancellation or revision advance, read the
+durable state and return cancelled/stale instead of mislabeling it a provider failure.
 Store's current contract binds request identity/revision, not cross-process snapshot
 CAS. Production F integration must supply that stronger boundary if another process
 can change snapshots concurrently. E is not a multi-process scheduler.

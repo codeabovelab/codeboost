@@ -157,3 +157,18 @@ it('rejects invalid admission before allocating a request or calling the provide
   expect(() => f.coordinator.start(f.value)).toThrow(/NUL/);
   expect(begin).not.toHaveBeenCalled(); expect(f.calls).toHaveLength(0); await f.coordinator.close();
 });
+it.each(['cancelled', 'stale'] as const)('classifies a publication CAS race as %s using durable state', async expected => {
+  const f = fixture(), complete = f.store.completeSuggestions.bind(f.store);
+  vi.spyOn(f.store, 'completeSuggestions').mockImplementationOnce((identity, id, reply) => {
+    if (expected === 'cancelled') f.store.cancelSuggestions(identity, id);
+    else f.store.importRevision(JSON.stringify({ ...plan(), summary: 'New draft before publication' }), 'json', f.value.context, 1);
+    // Assert the disputed state at the actual publication boundary, not just the outcome.
+    expect(f.store.getSuggestions(identity, id).state).toBe(expected === 'cancelled' ? 'cancelled' : 'invalidated');
+    complete(identity, id, reply);
+  });
+  const request = f.coordinator.start(f.value); f.pending.resolve(JSON.stringify(reply()));
+  expect(await request.result).toMatchObject({ state: expected });
+  expect(f.store.getSuggestions(f.identity, request.id)).toMatchObject({ reply: null, state: expected === 'cancelled' ? 'cancelled' : 'invalidated' });
+  expect(f.store.getPlan(f.identity).revision).toBe(expected === 'cancelled' ? 1 : 2);
+  await f.coordinator.close();
+});
