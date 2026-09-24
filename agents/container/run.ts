@@ -79,7 +79,13 @@ type Inspect = {
   HostConfig: { ReadonlyRootfs: boolean; Privileged: boolean; CapDrop: string[] | null; SecurityOpt: string[] | null;
     CapAdd: string[] | null;
     NetworkMode: string; PidMode: string; IpcMode: string; UTSMode: string; UsernsMode: string; CgroupnsMode: string;
-    PidsLimit: number; Memory: number; NanoCpus: number;
+    PidsLimit: number; Memory: number; MemorySwap: number; MemoryReservation: number; MemorySwappiness: number | null;
+    OomKillDisable: boolean; OomScoreAdj: number; NanoCpus: number; CpuShares: number; CpuPeriod: number; CpuQuota: number;
+    CpuRealtimePeriod: number; CpuRealtimeRuntime: number; CpusetCpus: string; CpusetMems: string; ShmSize: number;
+    BlkioWeight: number; BlkioWeightDevice: unknown[]; BlkioDeviceReadBps: unknown[]; BlkioDeviceWriteBps: unknown[];
+    BlkioDeviceReadIOps: unknown[]; BlkioDeviceWriteIOps: unknown[]; Ulimits: unknown[]; CpuCount: number;
+    CpuPercent: number; IOMaximumBandwidth: number; IOMaximumIOps: number; DeviceCgroupRules: unknown[] | null;
+    StorageOpt?: Record<string, string> | null; CgroupParent: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
@@ -114,7 +120,15 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
     || host.UTSMode !== '' || host.UsernsMode !== '' || host.CgroupnsMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
-    || host.Memory !== 512 * 1024 * 1024 || host.NanoCpus !== 1_000_000_000)
+    || host.Memory !== 512 * 1024 * 1024 || host.MemorySwap !== 512 * 1024 * 1024
+    || host.MemoryReservation !== 0 || host.MemorySwappiness !== null || host.OomKillDisable || host.OomScoreAdj !== 0
+    || host.NanoCpus !== 1_000_000_000 || host.CpuShares !== 0 || host.CpuPeriod !== 0 || host.CpuQuota !== 0
+    || host.CpuRealtimePeriod !== 0 || host.CpuRealtimeRuntime !== 0 || host.CpusetCpus !== '' || host.CpusetMems !== ''
+    || host.ShmSize !== 16 * 1024 * 1024 || host.BlkioWeight !== 0
+    || host.BlkioWeightDevice.length || host.BlkioDeviceReadBps.length || host.BlkioDeviceWriteBps.length
+    || host.BlkioDeviceReadIOps.length || host.BlkioDeviceWriteIOps.length || host.Ulimits.length
+    || host.CpuCount !== 0 || host.CpuPercent !== 0 || host.IOMaximumBandwidth !== 0 || host.IOMaximumIOps !== 0
+    || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== '')
     throw new Error('Container daemon configuration is missing required lockdown.');
   const tmpfs = host.Tmpfs ?? {};
   const expectedTmpfs = new Map([

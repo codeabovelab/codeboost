@@ -4,6 +4,12 @@ import { lstatSync, mkdtempSync, opendirSync, realpathSync, rmSync } from 'node:
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { TaskClone } from '../agents/contract.ts';
 
+const trustedClones = new WeakSet<TaskClone>();
+
+export function assertTaskClone(clone: TaskClone): void {
+  if (!trustedClones.has(clone)) throw new Error('Task clone was not created by the trusted clone builder.');
+}
+
 /**
  * Prepare an independent committed snapshot. This is trusted staging, not the
  * writable execution filesystem: D2 must reserve bounded storage and separate
@@ -79,7 +85,9 @@ export function createTaskClone(options: {
     run(directory, 'remote', 'remove', 'origin');
     run(directory, 'checkout', '--detach', options.head);
     if (run(directory, 'rev-parse', 'HEAD') !== options.head) throw new Error('Task head changed during clone.');
-    return Object.freeze({ id: randomUUID(), taskId: options.taskId, directory, head: options.head });
+    const clone = Object.freeze({ id: randomUUID(), taskId: options.taskId, directory, head: options.head });
+    trustedClones.add(clone);
+    return clone;
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });
     throw error;

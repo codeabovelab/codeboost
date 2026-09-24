@@ -176,8 +176,9 @@ describe('real Docker agent isolation', () => {
     } finally { spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore' }); }
   }, 60_000);
 
-  it('rejects cloned profiles and host inputs changed after capture', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+  it('rejects cloned profiles while sealed snapshots ignore later host changes', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['sh', '-c',
+      'set -eu; grep -q codeboost-schema-marker /run/codeboost-input/schema.json; test ! -e /run/codeboost-input/extra.json']);
     const forged = Object.freeze({ ...valid, inputDirectory: '/',
       args: Object.freeze(valid.args.map(value => value.includes(`source=${data.input},`)
         ? value.replace(`source=${data.input},`, 'source=/,') : value)) });
@@ -198,8 +199,11 @@ describe('real Docker agent isolation', () => {
     expect(statSync(valid.codexAuthFile!).mode & 0o777).toBe(0o444);
     writeFileSync(data.fakeAuth, '{}');
 
-    chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
-    expect(() => createValidatedContainer(valid)).toThrow('only one bounded');
+    chmodSync(data.input, 0o755); chmodSync(join(data.input, 'schema.json'), 0o644);
+    writeFileSync(join(data.input, 'schema.json'), '{"probe":"changed"}\n');
+    writeFileSync(join(data.input, 'extra.json'), '{}');
+    chmodSync(join(data.input, 'schema.json'), 0o444); chmodSync(data.input, 0o555);
+    expect(runContainer(valid)).toBe('');
     chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
   }, 60_000);
 
@@ -270,6 +274,11 @@ describe('real Docker agent isolation', () => {
     docker(...namespaceArgs); containers.add(valid.name);
     expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
+
+    const resourceArgs = [...valid.args.slice(0, imageIndex), '--memory-swap=-1', ...valid.args.slice(imageIndex)];
+    docker(...resourceArgs); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
   it('creates containers from the captured immutable image rather than its mutable tag', () => {
@@ -285,6 +294,9 @@ describe('real Docker agent isolation', () => {
     expect(() => prepareTaskFilesystems(data.clone, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
     }, AGENT_IMAGE)).toThrow('immutable built image ID');
+    expect(() => prepareTaskFilesystems({ ...data.clone }, {
+      workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
+    }, imageId)).toThrow('trusted clone builder');
   });
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {

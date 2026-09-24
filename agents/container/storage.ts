@@ -2,6 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import type { TaskClone } from '../contract.ts';
+import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 
 export interface TaskFilesystems {
@@ -101,6 +102,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   for (const [name, value] of Object.entries(limits)) validLimit(value, name);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('Task filesystems require the immutable built image ID.');
   assertBuiltAgentImage(imageId);
+  assertTaskClone(clone);
   const remaining = createDeadline(timeoutMs), staging = realpathSync(clone.directory);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
