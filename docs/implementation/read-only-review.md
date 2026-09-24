@@ -120,3 +120,11 @@ The browser owns unsent text, mode, navigation, and attachments; the refreshed r
 The regression gate is `npm run test:browser -- --grep 'during refresh'`. It checks visible drafts and refreshed durable approval/snapshot/plan state, and confirms no draft was accidentally saved as a note. Issues #10 (review edge cases), #12 (polling efficiency), and #3 (human go/no-go experiment) remain separate work.
 
 PR #14 review round 1 found that retained-draft rows omitted the regular rows' `aria-current` state. A browser assertion reproduced the missing attribute. Retained rows now expose their selected state; the regression checks selection, navigation away, and selection again. No findings were declined.
+
+## Lightweight answer polling (#12)
+
+The answer polling endpoint previously called `ReviewService.load()` every two seconds while a question was pending. A browser regression measured one full review load for a single poll before the fix. Polling now reads persisted question attempts directly from SQLite and adds only the in-memory active marker. The endpoint returns each question's ID, answer state, and active state; it does not rebuild Git history, linkage, previews, or the review token.
+
+The displayed review remains the owner of note text, ordering, snapshot, plan revision, assignment, and reference-validity metadata. Poll responses update only `answer` and `answerActive` for IDs already displayed. The existing generation guard rejects responses started before an action or Refresh, and unknown note IDs are ignored. Explicit Refresh and mutating actions still call the full review service to validate current repository state.
+
+The focused browser regression observes a completed answer and its durable SQLite state with zero review loads, verifies that the status payload omits note text, then proves explicit Refresh still performs a full load. Existing regressions continue to cover a poll returning after a newer submission and cancellation remaining active after a persisted attempt fails.

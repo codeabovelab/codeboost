@@ -9,6 +9,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   const questions=new Questions(service,questionAgent);
   const load=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
+  const answerStatuses=()=>service.store.getReviewNotes(config.identity)
+    .filter(note=>note.kind==='question')
+    .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   const server = createServer(async (req, res) => {
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
@@ -22,7 +25,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const supplied = req.headers['x-codeboost-token'];
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
-        if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:load().notes});return; }
+        if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, load()); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
