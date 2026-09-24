@@ -51,6 +51,28 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - For each review round, record what changed, what was declined and why, and the regression evidence. Re-request review until a round returns no new findings.
 - Treat review-lesson extraction as a merge gate. Before invoking merge, classify every review finding in the PR body as: covered by an existing rule (cite it), captured by a new rule in this branch (cite it), or one-off (record why). Do not merge until this audit is complete and every required `AGENTS.md` update is included in the reviewed head. Omit rules that merely repeat existing guidance.
 
+## Guarded external actions
+
+- A bounded safety scan must fail closed when its limit is exceeded. Never truncate evidence and report the result as clear.
+- Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
+- Preserve repository identity with pull request numbers in cross-reference scans. Never resolve or exclude a repository-qualified reference by number alone.
+- After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
+- Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
+- Budget a multi-stage validation across all sequential stages; giving each stage the full request allowance does not create an overall deadline.
+- Preserve the distinction between an explicit unbound identity and missing or malformed authorization metadata. Missing or malformed identities must fail closed.
+- Validate every field used to classify an external record as clear, including enum values and required nullable fields. Partial records and malformed policy objects must fail closed.
+- Validate coupled lifecycle fields as allowed combinations. A terminal-looking conclusion must not override an active or unknown status.
+- Treat a successful external command as the transition it actually performed. If it can enqueue or schedule work, model and verify that lifecycle before reporting the final action as complete.
+- Once an irreversible external command succeeds, do not convert later refresh or rendering failures into action failure. Return the committed result, keep repeat controls disabled, and require fresh confirmation of terminal state.
+- Track an in-flight irreversible subprocess as part of server shutdown. Abort it, await its settlement, and only then close the state it depends on.
+- Set the shutdown admission flag before snapshotting active work, and enforce it again at the irreversible action boundary for requests admitted before shutdown began.
+- An approval must not override server-computed plan-scope violations. Irreversible gates must block attributed out-of-scope files until the plan is amended.
+- When startup acquires a store, process, listener, or other resource before later dependency construction, close that resource on every construction failure. Prefer validating dependencies before acquisition when possible.
+- When deriving a review configuration for a clone, experiment, fork, or new identity, clear external action bindings unless they are re-established and validated for the derived target.
+- A deadline must abort and await the underlying operation before releasing its in-flight ownership; rejecting only the caller can leave untracked work running.
+- Invalidate pre-action status caches after both successful and refused external mutations before rendering or fetching status again. Use a generation guard so reads started before or during the mutation cannot repopulate the cache afterward.
+- Keep irreversible integrations disabled in demo mode even when configuration or an injected dependency is present. After a stale or refused irreversible action, keep its control disabled until fresh state is loaded.
+
 ## Blinded experiments
 
 - Keep experimental PRs as drafts with automated review disabled until the assigned human decision is recorded. An automated review invalidates reviewer blindness; replace the affected package rather than reusing it.

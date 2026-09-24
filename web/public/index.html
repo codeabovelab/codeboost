@@ -49,7 +49,9 @@
       <div class="review-strip">
         <div><strong>Review</strong> <span id="issue">Loading…</span></div>
         <div id="progress" aria-live="polite"></div>
-        <button id="reload">Refresh</button><button id="task">Open task</button>
+        <button id="merge-details" hidden>Review blockers</button
+        ><button id="merge" hidden>Merge PR</button
+        ><button id="reload">Refresh</button><button id="task">Open task</button>
       </div>
       <div id="banner" role="status"></div>
       <main class="workspace">
@@ -127,7 +129,7 @@
         ><span>a <span class="muted">approve</span></span
         ><span>r <span class="muted">request change</span></span
         ><button id="help">? Keyboard shortcuts</button
-        ><span class="muted">Review only · source files stay unchanged</span>
+        ><span class="muted">Local source files stay unchanged</span>
       </footer>
     </div>
     <dialog id="dialog">
