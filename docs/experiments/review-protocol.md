@@ -35,7 +35,7 @@ Pass only when all are true:
 - median codeboost time is no slower than median raw-diff time;
 - no change is left unexplained.
 
-Report declared-file catch rate for both methods without a pass threshold. Stop after four pairs. If within one catch of the bar, perform four more preselected pairs once, then decide. Do not add further trials. Record the outcome in a committed results document before merge/agent/planning/queue/learning implementation begins.
+For any future optional run, report declared-file catch rate for both methods without a pass threshold. Stop after four pairs. If within one catch of the bar, perform four more preselected pairs once, then decide. Do not add further trials. Record the outcome in a committed results document before making comparative product claims. A future run does not gate merge, agent, planning, queue, or learning implementation.
 
 ## Current evidence
 

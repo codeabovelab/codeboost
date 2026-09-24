@@ -110,7 +110,7 @@ Where we disagreed: the plan format is what makes code-to-item links possible. S
 
 ## What we will build
 
-We build all 9 steps as one local app. We start with the review screen. After the first two build steps, we stop and check whether the review screen works (see "Build order and the go/no-go check").
+We build all 9 steps as one local app. We start with the review screen. After the first two build steps, optional human validation may check whether the review screen works, but the cancelled experiment no longer stops the remaining roadmap (see "Build order and the go/no-go check").
 
 ### Tools and storage
 
@@ -875,7 +875,7 @@ Stop: CONVERGENCE
 
 ### Scope record
 
-- Feature answers: no cuts proposed. The 9 steps stay, gated by the go/no-go check.
+- Feature answers: no cuts proposed. The 9 steps stay; the cancelled go/no-go experiment no longer gates them under the superseding product decision.
 - Structure: **B, Smaller arrangement** (answer D1). One npm package, 6 modules: `core` (plan format and linking engine, no I/O), `git` (worktree, commit, diff walk, rebase), `agents` (adapter interface, claude, codex, permission profiles), `runner` (one task state machine: run, review rounds, queue, schedule, recovery), `github` (gh wrapper), `web` (server and screen).
 - Accepted scope: all features in this document, in the 6-module layout.
 - Storage access lives inside `runner` (`runner/store`), which alone writes task state; `web` reads and sends commands through `runner`. The command-line entry lives in `web` (`web/cli`). Answer D9 (R8).
