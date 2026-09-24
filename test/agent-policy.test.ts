@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
-import { assertAgentTool, codexBaseArguments, createClaudeCommand, createPhasePolicy,
-  dispatchApprovedCommand } from '../agents/policy.ts';
+import { assertAgentCommand, assertAgentTool, codexBaseArguments, createClaudeCommand, createCodexCommand,
+  createPhasePolicy, dispatchApprovedCommand } from '../agents/policy.ts';
 
 const request = (phase: Phase): InvocationInput => captureInvocation({
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tmp/task', head: 'a'.repeat(40) },
@@ -38,13 +38,17 @@ describe('agent phase policy', () => {
 
   it('builds Claude and Codex controls with web, MCP and direct shell disabled', () => {
     const readonly = createPhasePolicy(request('planning'));
-    const claude = createClaudeCommand(readonly, 'Inspect the schema.');
+    const claude = createClaudeCommand(readonly, 'Inspect the schema.').argv;
     expect(claude).toContain('--strict-mcp-config');
     expect(claude).toContain('{"mcpServers":{}}');
+    expect(claude).toContain('--tools');
     expect(claude).toContain('Read,Glob,Grep');
     expect(claude).toContain('Bash,WebFetch,WebSearch,NotebookEdit');
     expect(claude).not.toContain('Edit');
     expect(codexBaseArguments(readonly)).toEqual(['codex', '--strict-config', '--config', 'web_search="disabled"',
-      '--config', 'mcp_servers={}', '--ask-for-approval', 'never']);
+      '--config', 'mcp_servers={}', '--config', 'features.shell_tool=false', '--ask-for-approval', 'never']);
+    const codex = createCodexCommand(readonly, 'Inspect the schema.');
+    expect(codex.argv).toContain('features.shell_tool=false');
+    expect(() => assertAgentCommand({ argv: codex.argv }, readonly)).toThrow('not generated');
   });
 });

@@ -1,9 +1,17 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS, type VendorNetwork } from '../agents/network/network.ts';
+import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS,
+  type VendorNetwork } from '../agents/network/network.ts';
+import { captureInvocation } from '../agents/contract.ts';
 
 let imageId = '', network: VendorNetwork;
+const invocation = captureInvocation({
+  clone: { id: 'clone-network', taskId: 'task-network', directory: '/tmp/network', head: 'a'.repeat(40) },
+  vendor: 'claude', phase: 'planning', approvedArgv: [], deadline: Date.now() + 60_000, attemptId: 'network-probe',
+  context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
+});
 const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
@@ -14,7 +22,7 @@ const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm'
 
 beforeAll(() => {
   imageId = buildAgentImage();
-  network = createVendorNetwork('claude', imageId);
+  network = createVendorNetwork(invocation, imageId);
 }, 10 * 60_000);
 afterAll(() => removeVendorNetwork(network), 60_000);
 
@@ -42,7 +50,27 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('rejects a copied network capability', () => {
-    expect(() => createVendorNetwork('claude', imageId, 0)).toThrow('positive integer');
+    expect(() => createVendorNetwork(invocation, imageId, 0)).toThrow('positive integer');
     expect(() => removeVendorNetwork({ ...network })).toThrow('trusted network builder');
+    const otherInvocation = captureInvocation({ ...invocation, attemptId: 'other-network-probe',
+      deadline: Date.now() + 60_000 });
+    expect(() => assertVendorNetwork(network, otherInvocation)).toThrow('does not belong');
   });
+
+  it('keeps concurrent invocations on separate internal networks', () => {
+    const otherInvocation = captureInvocation({ ...invocation, attemptId: 'concurrent-network-probe',
+      deadline: Date.now() + 60_000 });
+    const other = createVendorNetwork(otherInvocation, imageId), peer = `codeboost-peer-${randomUUID()}`;
+    try {
+      docker('run', '--detach', '--name', peer, `--network=${network.name}`, '--network-alias', 'codeboost-peer',
+        '--entrypoint', 'node', imageId, '-e', "require('node:net').createServer(()=>{}).listen(4567,'0.0.0.0');setInterval(()=>{},1000)");
+      const result = spawnSync('docker', ['run', '--rm', `--network=${other.name}`, '--entrypoint', 'node', imageId,
+        '-e', "const s=require('node:net').connect(4567,'codeboost-peer');s.on('connect',()=>process.exit(0));s.on('error',()=>process.exit(1));setTimeout(()=>process.exit(2),3000)"],
+      { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+      expect(result.status).not.toBe(0);
+    } finally {
+      spawnSync('docker', ['rm', '--force', peer], { stdio: 'ignore' });
+      removeVendorNetwork(other);
+    }
+  }, 60_000);
 });

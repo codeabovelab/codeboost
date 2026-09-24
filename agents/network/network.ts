@@ -14,7 +14,8 @@ export interface VendorNetwork {
   readonly proxyUrl: string;
   readonly vendor: InvocationInput['vendor'];
 }
-interface NetworkIdentity { readonly allocationId: string; readonly imageId: string }
+interface NetworkIdentity { readonly allocationId: string; readonly imageId: string; readonly invocation: InvocationInput;
+  readonly subnet: string }
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const deadline = (timeoutMs: number) => {
@@ -30,7 +31,7 @@ const docker = (args: readonly string[], timeout: number) => execFileSync('docke
   encoding: 'utf8', timeout, killSignal: 'SIGKILL', env: environment(), stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
 const absent = (result: ReturnType<typeof spawnSync>) => result.status !== 0 && !result.error
-  && /No such (?:object|container|network)/i.test(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
+  && /(?:No such (?:object|container|network)|network .* not found)/i.test(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
 const remove = (args: readonly string[], inspect: readonly string[], remaining: () => number, kind: string,
   allocationId: string) => {
   const before = spawnSync('docker', [...inspect], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
@@ -51,23 +52,56 @@ const remove = (args: readonly string[], inspect: readonly string[], remaining: 
   if (!absent(check)) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
 
-export function assertVendorNetwork(network: VendorNetwork, vendor?: InvocationInput['vendor']): void {
+export function assertVendorNetwork(network: VendorNetwork, invocation?: InvocationInput, agentName?: string): void {
   const identity = identities.get(network);
   if (!identity) throw new Error('Vendor network was not created by the trusted network builder.');
-  if (vendor && network.vendor !== vendor) throw new Error('Vendor network does not match the invocation vendor.');
+  if (invocation && (identity.invocation !== invocation || network.vendor !== invocation.vendor))
+    throw new Error('Vendor network does not belong to this invocation.');
   assertBuiltAgentImage(identity.imageId);
+  const inspect = JSON.parse(docker(['container', 'inspect', network.proxyContainer], 30_000))[0] as
+    { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string>; Env?: string[];
+      Entrypoint?: string[] | null; Cmd?: string[] | null };
+      HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; CapDrop?: string[]; CapAdd?: string[] | null;
+        SecurityOpt?: string[]; Memory?: number; MemorySwap?: number; NanoCpus?: number; PidsLimit?: number };
+      NetworkSettings?: { Networks?: Record<string, unknown> }; Mounts?: unknown[] } | undefined;
+  const inspectedNetwork = JSON.parse(docker(['network', 'inspect', network.name], 30_000))[0] as
+    { Internal?: boolean; Driver?: string; Labels?: Record<string, string>; IPAM?: { Config?: Array<{ Subnet?: string }> };
+      Containers?: Record<string, { Name?: string }> } | undefined;
+  const networks = Object.keys(inspect?.NetworkSettings?.Networks ?? {}).sort();
+  const endpoints = Object.values(inspectedNetwork?.Containers ?? {}).map(value => value.Name).sort();
+  const allowedEndpoints = [network.proxyContainer, ...(agentName ? [agentName] : [])];
+  if (!inspect?.State?.Running || inspect.Config?.Image !== identity.imageId || inspect.Config?.User !== '10001:10001'
+    || inspect.Config?.Labels?.['io.codeboost.egress'] !== identity.allocationId || !inspect.HostConfig?.ReadonlyRootfs
+    || inspect.HostConfig.Privileged || !inspect.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
+    || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 1
+    || !['no-new-privileges', 'no-new-privileges:true'].includes(inspect.HostConfig.SecurityOpt[0] ?? '')
+    || inspect.HostConfig.PidsLimit !== 64 || inspect.HostConfig.Memory !== 64 * 1024 * 1024
+    || inspect.HostConfig.MemorySwap !== 64 * 1024 * 1024 || inspect.HostConfig.NanoCpus !== 250_000_000
+    || JSON.stringify(networks) !== JSON.stringify(['bridge', network.name].sort()) || inspect.Mounts?.length
+    || inspect.Config?.Entrypoint?.[0] !== 'node'
+    || JSON.stringify(inspect.Config?.Cmd) !== JSON.stringify(['/usr/local/lib/codeboost-egress-proxy.mjs'])
+    || inspect.Config.Env?.filter(value => value.startsWith('CODEBOOST_ALLOWED_HOSTS=')).length !== 1
+    || !inspect.Config.Env?.includes(`CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[network.vendor].join(',')}`)
+    || !inspectedNetwork?.Internal || inspectedNetwork.Driver !== 'bridge'
+    || inspectedNetwork.Labels?.['io.codeboost.egress'] !== identity.allocationId
+    || inspectedNetwork.IPAM?.Config?.length !== 1 || inspectedNetwork.IPAM.Config[0]?.Subnet !== identity.subnet
+    || !endpoints.includes(network.proxyContainer) || endpoints.some(name => !name || !allowedEndpoints.includes(name)))
+    throw new Error('Vendor network or proxy changed after allocation.');
 }
 
-export function createVendorNetwork(vendor: InvocationInput['vendor'], imageId: string,
+export function createVendorNetwork(invocation: InvocationInput, imageId: string,
   timeoutMs = 60_000): VendorNetwork {
   assertBuiltAgentImage(imageId);
+  const vendor = invocation.vendor;
   const remaining = deadline(timeoutMs), allocationId = randomUUID();
   const name = `codeboost-egress-${vendor}-${randomUUID()}`;
   const proxyContainer = `codeboost-proxy-${vendor}-${randomUUID()}`;
+  const subnetSeed = randomUUID().replaceAll('-', '');
+  const subnet = `10.254.${parseInt(subnetSeed.slice(0, 2), 16)}.${parseInt(subnetSeed.slice(2, 4), 16) & 0xf8}/29`;
   let networkPlanned = false, proxyPlanned = false;
   try {
     networkPlanned = true;
-    docker(['network', 'create', '--internal', '--driver', 'bridge',
+    docker(['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
       '--label', `io.codeboost.egress=${allocationId}`, name], remaining());
     proxyPlanned = true;
     docker(['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
@@ -82,29 +116,10 @@ export function createVendorNetwork(vendor: InvocationInput['vendor'], imageId: 
       "socket.once('connect',()=>{socket.destroy();process.exit(0)});",
       "socket.once('error',()=>{socket.destroy();if(++attempts===50)process.exit(1);setTimeout(check,20)})};check();",
     ].join('')], remaining());
-    const inspect = JSON.parse(docker(['container', 'inspect', proxyContainer], remaining()))[0] as
-      { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string>; Env?: string[] };
-        HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; CapDrop?: string[]; CapAdd?: string[] | null;
-          SecurityOpt?: string[]; Memory?: number; MemorySwap?: number; NanoCpus?: number };
-        NetworkSettings?: { Networks?: Record<string, unknown> }; Mounts?: unknown[] } | undefined;
-    const inspectedNetwork = JSON.parse(docker(['network', 'inspect', name], remaining()))[0] as
-      { Internal?: boolean; Driver?: string; Labels?: Record<string, string> } | undefined;
-    const networks = Object.keys(inspect?.NetworkSettings?.Networks ?? {}).sort();
-    if (!inspect?.State?.Running || inspect.Config?.Image !== imageId || inspect.Config?.User !== '10001:10001'
-      || inspect.Config?.Labels?.['io.codeboost.egress'] !== allocationId || !inspect.HostConfig?.ReadonlyRootfs
-      || inspect.HostConfig.Privileged || !inspect.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
-      || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 1
-      || !['no-new-privileges', 'no-new-privileges:true'].includes(inspect.HostConfig.SecurityOpt[0] ?? '')
-      || inspect.HostConfig.Memory !== 64 * 1024 * 1024
-      || inspect.HostConfig.MemorySwap !== 64 * 1024 * 1024 || inspect.HostConfig.NanoCpus !== 250_000_000
-      || JSON.stringify(networks) !== JSON.stringify(['bridge', name].sort())
-      || inspect.Mounts?.length || !inspect.Config.Env?.includes(`CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`)
-      || !inspectedNetwork?.Internal || inspectedNetwork.Driver !== 'bridge'
-      || inspectedNetwork.Labels?.['io.codeboost.egress'] !== allocationId)
-      throw new Error('Vendor proxy does not match its pinned isolation profile.');
-    remaining();
     const network = Object.freeze({ name, proxyContainer, proxyUrl: 'http://codeboost-proxy:3128', vendor });
-    identities.set(network, Object.freeze({ allocationId, imageId }));
+    identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet }));
+    assertVendorNetwork(network, invocation);
+    remaining();
     return network;
   } catch (error) {
     const failures: unknown[] = [];
@@ -118,8 +133,10 @@ export function createVendorNetwork(vendor: InvocationInput['vendor'], imageId: 
 }
 
 export function removeVendorNetwork(network: VendorNetwork): void {
-  assertVendorNetwork(network);
-  const allocationId = identities.get(network)!.allocationId;
+  const identity = identities.get(network);
+  if (!identity) throw new Error('Vendor network was not created by the trusted network builder.');
+  assertBuiltAgentImage(identity.imageId);
+  const allocationId = identity.allocationId;
   const remaining = deadline(30_000), failures: unknown[] = [];
   try { remove(['rm', '--force', network.proxyContainer], ['container', 'inspect', network.proxyContainer],
     remaining, 'vendor proxy', allocationId); } catch (error) { failures.push(error); }

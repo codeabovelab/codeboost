@@ -3,7 +3,7 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
@@ -11,14 +11,15 @@ import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems
   hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { createVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../agents/network/network.ts';
-import { codexBaseArguments, createClaudeCommand, createPhasePolicy } from '../agents/policy.ts';
+import { createClaudeCommand, createCodexCommand, createIsolationProbeCommand, createPhasePolicy,
+  type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
 
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
 const profiles: ReturnType<typeof createContainerProfile>[] = [];
 let imageId = '';
-let vendorNetworks: Record<'claude' | 'codex', VendorNetwork>;
+const vendorNetworks: VendorNetwork[] = [];
 const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
   { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 const docker = (...args: string[]) => execFileSync('docker', args, {
@@ -55,16 +56,23 @@ function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, ven
     context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
       referencedCodeHash: 'code-1', stateVersion: 1 } });
 }
-const governed = (captured: InvocationInput) => ({ invocation: captured, policy: createPhasePolicy(captured) });
+const governed = (captured: InvocationInput, probe: IsolationProbe = 'noop') => {
+  const policy = createPhasePolicy(captured), network = createVendorNetwork(captured, imageId);
+  vendorNetworks.push(network);
+  return { invocation: captured, policy, network, command: createIsolationProbeCommand(policy, probe) };
+};
 
-function profile(data: ReturnType<typeof fixture>, phase: Phase, command: string[], options: {
+function profile(data: ReturnType<typeof fixture>, phase: Phase,
+  command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
   vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor);
-  const base = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
-    inputDirectory: data.input, command,
-    imageId, network: vendorNetworks[vendor],
+  const policy = createPhasePolicy(captured), network = createVendorNetwork(captured, imageId);
+  vendorNetworks.push(network);
+  const trustedCommand = typeof command === 'string' ? createIsolationProbeCommand(policy, command) : command(policy);
+  const base = createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
+    inputDirectory: data.input, command: trustedCommand, imageId,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
   profiles.push(base);
@@ -73,13 +81,15 @@ function profile(data: ReturnType<typeof fixture>, phase: Phase, command: string
 
 beforeAll(() => {
   imageId = buildAgentImage();
-  vendorNetworks = { claude: createVendorNetwork('claude', imageId), codex: createVendorNetwork('codex', imageId) };
 }, 10 * 60_000);
+afterEach(() => {
+  for (const network of vendorNetworks.splice(0).reverse()) removeVendorNetwork(network);
+}, 120_000);
 afterAll(() => {
   for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
   for (const filesystems of taskFilesystems.reverse()) removeTaskFilesystems(filesystems);
   for (const profile of profiles) disposeContainerProfile(profile);
-  for (const network of Object.values(vendorNetworks).reverse()) removeVendorNetwork(network);
+  for (const network of vendorNetworks.splice(0).reverse()) removeVendorNetwork(network);
   for (const root of roots.reverse()) {
     chmodSync(join(root, 'input'), 0o700);
     rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -89,27 +99,15 @@ afterAll(() => {
 describe('real Docker agent isolation', () => {
   it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(
     '%s applies its enforced worktree access profile', phase => {
-      const data = fixture(), writable = phase === 'execute' || phase === 'fix';
-      const command = writable
-        ? ['sh', '-c', `set -eu; printf ${phase} > /work/${phase}.txt; test -f /work/${phase}.txt`]
-        : ['sh', '-c', `set -eu; ! touch /work/${phase}.txt 2>/dev/null; test ! -e /work/${phase}.txt`];
-      expect(runContainer(profile(data, phase, command))).toBe('');
+      const data = fixture();
+      expect(runContainer(profile(data, phase, 'phase-worktree'))).toBe('');
     }, 60_000);
 
   it('runs read-only with no root capabilities, host paths, inherited secrets, or writable tools', () => {
     const data = fixture();
     process.env.HOST_SECRET_SENTINEL = 'must-not-reach-container';
     try {
-      const output = runContainer(profile(data, 'planning', ['sh', '-c', ['set -eu',
-        'test "$(id -u)" = 10001',
-        'test "$(git status --porcelain)" = ""',
-        'test ! -e "$1"',
-        'test -z "${HOST_SECRET_SENTINEL:-}"',
-        '! touch /work/forbidden',
-        '! touch /usr/bin/forbidden',
-        'touch /tmp/allowed "$HOME/allowed"',
-        'printf isolated',
-      ].join('; '), 'probe', data.source]));
+      const output = runContainer(profile(data, 'planning', 'read-only-isolation'));
       expect(output).toBe('isolated');
     } finally { delete process.env.HOST_SECRET_SENTINEL; }
   }, 60_000);
@@ -137,43 +135,26 @@ describe('real Docker agent isolation', () => {
 
   it('persists execution changes while replacing HOME and scratch for each invocation', () => {
     const data = fixture();
-    expect(runContainer(profile(data, 'execute', ['sh', '-c',
-      'set -eu; printf generated > /work/generated.txt; touch /tmp/old "$HOME/old"; printf first']))).toBe('first');
-    const output = runContainer(profile(data, 'execute', ['sh', '-c',
-      'set -eu; test -f /work/generated.txt; test ! -e /tmp/old; test ! -e "$HOME/old"; git status --porcelain']));
+    expect(runContainer(profile(data, 'execute', 'persist-write'))).toBe('first');
+    const output = runContainer(profile(data, 'execute', 'persist-read'));
     expect(output).toContain('?? generated.txt');
   }, 60_000);
 
   it('enforces work byte and inode ceilings before writes can exceed the allocation', () => {
     const data = fixture();
-    const output = runContainer(profile(data, 'execute', ['sh', '-c', ['set -eu',
-      '! dd if=/dev/zero of=/work/overflow bs=1M count=32 2>/dev/null',
-      'rm -f /work/overflow',
-      'mkdir /work/many',
-      'i=0; while touch "/work/many/$i" 2>/dev/null; do i=$((i+1)); test "$i" -lt 2000; done',
-      'test "$i" -lt 2000',
-      'test "$(find /work/many -type f | wc -l)" -eq "$i"',
-      'rm -rf /work/many',
-      'printf bounded',
-    ].join('; ')]));
+    const output = runContainer(profile(data, 'execute', 'capacity'));
     expect(output).toBe('bounded');
   }, 60_000);
 
   it('keeps Git metadata read-only, on another filesystem, and mounted against replacement', () => {
     const data = fixture();
-    const output = runContainer(profile(data, 'execute', ['sh', '-c', ['set -eu',
-      '! touch /work/.git/forbidden 2>/dev/null',
-      '! ln /work/.git/HEAD /work/metadata-link 2>/dev/null',
-      '! mv /work/.git /work/replaced 2>/dev/null',
-      'git status --porcelain',
-      'printf metadata-safe',
-    ].join('; ')]));
+    const output = runContainer(profile(data, 'execute', 'metadata'));
     expect(output).toBe('metadata-safe');
   }, 60_000);
 
   it('refuses a container missing read-only root before its command runs', () => {
     const data = fixture();
-    const valid = profile(data, 'planning', ['sh', '-c', 'touch /tmp/command-ran']);
+    const valid = profile(data, 'planning', 'must-not-run');
     const args = valid.args.filter(value => value !== '--read-only');
     docker(...args);
     containers.add(valid.name);
@@ -186,28 +167,26 @@ describe('real Docker agent isolation', () => {
   it('rejects mixed credentials and unsupported command/profile inputs', () => {
     const data = fixture();
     expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning', 'codex')),
-      filesystems: data.filesystems, inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth,
-      claudeToken: 'must-not-combine', imageId, network: vendorNetworks.codex })).toThrow('only');
+      filesystems: data.filesystems, inputDirectory: data.input, codexAuthFile: data.fakeAuth,
+      claudeToken: 'must-not-combine', imageId })).toThrow('only');
     expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning', 'claude')),
-      filesystems: data.filesystems, inputDirectory: data.input, command: ['true'], imageId,
-      network: vendorNetworks.claude })).toThrow('OAuth');
+      filesystems: data.filesystems, inputDirectory: data.input, imageId })).toThrow('OAuth');
     const claudeProfile = createContainerProfile({ ...governed(invocation(data.clone, 'planning', 'claude')),
-      filesystems: data.filesystems, inputDirectory: data.input, command: ['true'], imageId,
-      claudeToken: 'serialization-sentinel', network: vendorNetworks.claude });
+      filesystems: data.filesystems, inputDirectory: data.input, imageId, claudeToken: 'serialization-sentinel' });
     expect(JSON.stringify(claudeProfile)).not.toContain('serialization-sentinel');
     expect(() => createValidatedContainer(claudeProfile)).toThrow('OAuth environment credential');
+    const untrusted = governed(invocation(data.clone, 'planning'));
+    expect(() => createContainerProfile({ ...untrusted, command: { argv: ['true'] }, filesystems: data.filesystems,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).toThrow('not generated');
     expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning')),
-      filesystems: data.filesystems, inputDirectory: data.input, command: [], imageId,
-      network: vendorNetworks.codex })).toThrow('argv');
-    expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning')),
-      filesystems: data.filesystems, inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth,
-      imageId: AGENT_IMAGE, network: vendorNetworks.codex })).toThrow('immutable built image ID');
+      filesystems: data.filesystems, inputDirectory: data.input, codexAuthFile: data.fakeAuth,
+      imageId: AGENT_IMAGE })).toThrow('immutable built image ID');
     chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
-    expect(() => profile(data, 'planning', ['true'])).toThrow('only one bounded');
+    expect(() => profile(data, 'planning', 'noop')).toThrow('only one bounded');
   });
 
   it('rejects unexpected host mounts and unbounded task volumes after Docker resolves them', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     const extraMountArgs = [...valid.args.slice(0, imageIndex), '--mount',
       'type=bind,source=/tmp,target=/unexpected,readonly', ...valid.args.slice(imageIndex)];
@@ -225,21 +204,20 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects cloned profiles while sealed snapshots ignore later host changes', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['sh', '-c',
-      'set -eu; grep -q codeboost-schema-marker /run/codeboost-input/schema.json; test ! -e /run/codeboost-input/extra.json']);
+    const data = fixture(), valid = profile(data, 'planning', 'input-marker');
     const forged = Object.freeze({ ...valid, inputDirectory: '/',
       args: Object.freeze(valid.args.map(value => value.includes(`source=${data.input},`)
         ? value.replace(`source=${data.input},`, 'source=/,') : value)) });
     expect(() => createValidatedContainer(forged)).toThrow('trusted profile builder');
 
     expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning')),
-      filesystems: { ...data.filesystems }, inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth,
-      imageId, network: vendorNetworks.codex })).toThrow('trusted allocator');
+      filesystems: { ...data.filesystems }, inputDirectory: data.input, codexAuthFile: data.fakeAuth,
+      imageId })).toThrow('trusted allocator');
 
     const other = fixture();
     expect(() => createContainerProfile({ ...governed(invocation(other.clone, 'planning')),
-      filesystems: data.filesystems, inputDirectory: other.input, command: ['true'], codexAuthFile: other.fakeAuth,
-      imageId, network: vendorNetworks.codex })).toThrow('do not belong to the invocation clone');
+      filesystems: data.filesystems, inputDirectory: other.input, codexAuthFile: other.fakeAuth,
+      imageId })).toThrow('do not belong to the invocation clone');
 
     writeFileSync(data.fakeAuth, '{"changed":true}');
     expect(valid.codexAuthFile).not.toBe(data.fakeAuth);
@@ -256,7 +234,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects extra security policies and environment paths that can escape bounded storage', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     const securityArgs = [...valid.args.slice(0, imageIndex), '--security-opt', 'seccomp=unconfined',
       ...valid.args.slice(imageIndex)];
@@ -280,10 +258,11 @@ describe('real Docker agent isolation', () => {
 
   it('does not remove an active container when a duplicate attempt name collides', () => {
     const data = fixture(), captured = invocation(data.clone, 'planning');
-    const first = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
-      inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId, network: vendorNetworks.codex });
-    const duplicate = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
-      inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId, network: vendorNetworks.codex });
+    const common = governed(captured);
+    const first = createContainerProfile({ ...common, filesystems: data.filesystems,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
+    const duplicate = createContainerProfile({ ...common, filesystems: data.filesystems,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
     expect(() => createValidatedContainer(duplicate)).toThrow('Container creation failed and cleanup did not settle.');
@@ -411,7 +390,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects added capabilities and conflicting or duplicate filesystem options', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     const args = [...valid.args.slice(0, imageIndex), '--cap-add=SYS_ADMIN', ...valid.args.slice(imageIndex)];
     docker(...args); containers.add(valid.name);
@@ -428,7 +407,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects an unauthorized network before the container can start', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     const args = valid.args.map(value => value.startsWith('--network=') ? '--network=bridge' : value);
     docker(...args); containers.add(valid.name);
     expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
@@ -448,8 +427,20 @@ describe('real Docker agent isolation', () => {
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
+  it('rejects a new endpoint attached to the invocation network before launch', () => {
+    const data = fixture(), valid = profile(data, 'planning', 'must-not-run');
+    const rogue = `codeboost-rogue-${randomUUID()}`;
+    try {
+      docker('run', '--detach', '--name', rogue, `--network=${valid.network.name}`, '--entrypoint', 'node', imageId,
+        '-e', 'setInterval(()=>{},1000)');
+      expect(() => createValidatedContainer(valid)).toThrow('network or proxy changed');
+      const absent = spawnSync('docker', ['container', 'inspect', valid.name], { encoding: 'utf8' });
+      expect(absent.status).not.toBe(0);
+    } finally { spawnSync('docker', ['rm', '--force', rogue], { stdio: 'ignore' }); }
+  }, 60_000);
+
   it('creates containers from the captured immutable image rather than its mutable tag', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     expect(valid.expectedImage).toBe(imageId);
     expect(valid.args).toContain(imageId);
     expect(valid.args).not.toContain(AGENT_IMAGE);
@@ -470,10 +461,9 @@ describe('real Docker agent isolation', () => {
     it('runs the authenticated Codex startup path with isolated writable state', () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
-      const policy = createPhasePolicy(invocation(data.clone, 'planning', 'codex'));
-      const command = [...codexBaseArguments(policy), 'exec', '--sandbox', 'read-only', '--skip-git-repo-check',
-        'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field.'];
-      const authProfile = profile(data, 'planning', command, { authProbe: true, codexAuthFile: authFile });
+      const authProfile = profile(data, 'planning', policy => createCodexCommand(policy,
+        'Reply only with this exact marker: codeboost-schema-marker'),
+      { authProbe: true, codexAuthFile: authFile });
       docker(...authProfile.args); containers.add(authProfile.name);
       const output = docker('start', '--attach', authProfile.name);
       docker('rm', '--force', authProfile.name); containers.delete(authProfile.name);
@@ -483,10 +473,8 @@ describe('real Docker agent isolation', () => {
     it('runs the authenticated Claude startup path with only its OAuth token', () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
-      const policy = createPhasePolicy(invocation(data.clone, 'planning', 'claude'));
-      const command = createClaudeCommand(policy,
-        'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.');
-      const authProfile = profile(data, 'planning', [...command],
+      const authProfile = profile(data, 'planning', policy => createClaudeCommand(policy,
+        'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
         { vendor: 'claude', authProbe: true, claudeToken: token });
       const result = execFileSync('docker', authProfile.args, { encoding: 'utf8', timeout: 60_000,
         env: { PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST, CLAUDE_CODE_OAUTH_TOKEN: token } });

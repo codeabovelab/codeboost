@@ -7,7 +7,7 @@ import { assertCapturedInvocation, type InvocationInput, type Phase } from '../c
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
 import { assertVendorNetwork, type VendorNetwork } from '../network/network.ts';
-import { assertPhasePolicy, type PhasePolicy } from '../policy.ts';
+import { assertAgentCommand, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
 export interface ContainerProfile {
   readonly name: string;
   readonly args: readonly string[];
@@ -26,7 +26,7 @@ export interface ProfileOptions {
   readonly invocation: InvocationInput;
   readonly filesystems: TaskFilesystems;
   readonly inputDirectory: string;
-  readonly command: readonly string[];
+  readonly command: AgentCommand;
   readonly imageId: string;
   readonly codexAuthFile?: string;
   readonly claudeToken?: string;
@@ -116,7 +116,7 @@ export function assertContainerProfile(profile: ContainerProfile): void {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
   assertTaskFilesystems(expected.filesystems, expected.clone);
-  assertVendorNetwork(expected.network, profile.vendor);
+  assertVendorNetwork(expected.network, expected.invocation, profile.name);
   assertPhasePolicy(expected.policy, expected.invocation);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
@@ -159,14 +159,13 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   const { invocation, filesystems } = options;
   // Phase, vendor and deadline drive mount modes and credentials, so they must come from a captured request.
   assertCapturedInvocation(invocation);
-  if (!options.command.length || options.command.some(value => typeof value !== 'string' || value.includes('\0')))
-    throw new Error('Container command must be a complete literal argv array.');
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId))
     throw new Error('Container profile requires the immutable built image ID.');
   assertBuiltAgentImage(options.imageId);
   assertTaskFilesystems(filesystems, invocation.clone);
-  assertVendorNetwork(options.network, invocation.vendor);
+  assertVendorNetwork(options.network, invocation);
   assertPhasePolicy(options.policy, invocation);
+  const command = assertAgentCommand(options.command, options.policy);
   const sourceInput = captureInput(options.inputDirectory);
   if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
     throw new Error('Codex requires only its auth file.');
@@ -220,12 +219,12 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
         '--tmpfs', '/run/codeboost-auth/codex:rw,nosuid,nodev,size=4194304,nr_inodes=256,uid=10001,gid=10001,mode=0700',
         '--mount', mount({ type: 'bind', source: codexAuthFile!, target: '/run/codeboost-auth/codex/auth.json', readonly: true }));
     } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
-    args.push(options.imageId, ...options.command);
+    args.push(options.imageId, ...command);
     const capturedFilesystems = filesystems;
     const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
       phase: invocation.phase, vendor: invocation.vendor,
       filesystems: capturedFilesystems, inputDirectory: inputIdentity.inputDirectory, codexAuthFile,
-      command: Object.freeze([...options.command]), ownershipId, network: options.network, policy: options.policy });
+      command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,

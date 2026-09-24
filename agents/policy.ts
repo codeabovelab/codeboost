@@ -9,8 +9,22 @@ export interface PhasePolicy {
   readonly web: false;
   readonly mcp: false;
 }
+export interface AgentCommand { readonly argv: readonly string[] }
 interface PolicyIdentity { readonly invocation: InvocationInput }
 const identities = new WeakMap<PhasePolicy, PolicyIdentity>();
+const commands = new WeakMap<AgentCommand, PhasePolicy>();
+
+const command = (policy: PhasePolicy, argv: readonly string[]): AgentCommand => {
+  assertPhasePolicy(policy);
+  const value = Object.freeze({ argv: Object.freeze([...argv]) });
+  commands.set(value, policy);
+  return value;
+};
+
+export function assertAgentCommand(value: AgentCommand, policy: PhasePolicy): readonly string[] {
+  if (commands.get(value) !== policy) throw new Error('Container command was not generated for this phase policy.');
+  return value.argv;
+}
 
 export function createPhasePolicy(invocation: InvocationInput): PhasePolicy {
   const writable = invocation.phase === 'execute' || invocation.phase === 'fix';
@@ -43,19 +57,53 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
   return execute(Object.freeze([...argv]));
 }
 
-export function createClaudeCommand(policy: PhasePolicy, prompt: string): readonly string[] {
+export function createClaudeCommand(policy: PhasePolicy, prompt: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Claude prompt must be nonempty and contain no NUL.');
   assertPhasePolicy(policy);
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
-  return Object.freeze(['claude', '--print', prompt, '--output-format', 'json', '--restricted', '--strict-mcp-config',
+  return command(policy, ['claude', '--print', prompt, '--output-format', 'json', '--restricted', '--strict-mcp-config',
     '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome', '--permission-prompts', 'none',
-    '--permission-mode', writable ? 'acceptEdits' : 'plan', '--allowedTools', allowed,
+    '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed, '--allowedTools', allowed,
     '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input']);
 }
 
 export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
   assertPhasePolicy(policy);
   return Object.freeze(['codex', '--strict-config', '--config', 'web_search="disabled"',
-    '--config', 'mcp_servers={}', '--ask-for-approval', 'never']);
+    '--config', 'mcp_servers={}', '--config', 'features.shell_tool=false', '--ask-for-approval', 'never']);
+}
+
+export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCommand {
+  if (!prompt || prompt.includes('\0')) throw new Error('Codex prompt must be nonempty and contain no NUL.');
+  const sandbox = policy.worktree === 'read-write' ? 'workspace-write' : 'read-only';
+  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check', prompt]);
+}
+
+export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'
+  | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker';
+
+/** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
+export function createIsolationProbeCommand(policy: PhasePolicy, probe: IsolationProbe): AgentCommand {
+  assertPhasePolicy(policy);
+  const phase = policy.phase;
+  const scripts: Record<Exclude<IsolationProbe, 'noop'>, string> = {
+    'phase-worktree': policy.worktree === 'read-write'
+      ? `set -eu; printf ${phase} > /work/${phase}.txt; test -f /work/${phase}.txt`
+      : `set -eu; ! touch /work/${phase}.txt 2>/dev/null; test ! -e /work/${phase}.txt`,
+    'read-only-isolation': 'set -eu; test "$(id -u)" = 10001; test "$(git status --porcelain)" = ""; '
+      + 'test -z "${HOST_SECRET_SENTINEL:-}"; ! touch /work/forbidden; ! touch /usr/bin/forbidden; '
+      + 'touch /tmp/allowed "$HOME/allowed"; printf isolated',
+    'persist-write': 'set -eu; printf generated > /work/generated.txt; touch /tmp/old "$HOME/old"; printf first',
+    'persist-read': 'set -eu; test -f /work/generated.txt; test ! -e /tmp/old; test ! -e "$HOME/old"; git status --porcelain',
+    capacity: 'set -eu; ! dd if=/dev/zero of=/work/overflow bs=1M count=32 2>/dev/null; rm -f /work/overflow; '
+      + 'mkdir /work/many; i=0; while touch "/work/many/$i" 2>/dev/null; do i=$((i+1)); test "$i" -lt 2000; done; '
+      + 'test "$i" -lt 2000; test "$(find /work/many -type f | wc -l)" -eq "$i"; rm -rf /work/many; printf bounded',
+    metadata: 'set -eu; ! touch /work/.git/forbidden 2>/dev/null; ! ln /work/.git/HEAD /work/metadata-link 2>/dev/null; '
+      + '! mv /work/.git /work/replaced 2>/dev/null; git status --porcelain; printf metadata-safe',
+    'must-not-run': 'touch /tmp/command-ran',
+    'input-marker': 'set -eu; grep -q codeboost-schema-marker /run/codeboost-input/schema.json; '
+      + 'test ! -e /run/codeboost-input/extra.json',
+  };
+  return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }
