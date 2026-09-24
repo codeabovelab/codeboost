@@ -174,16 +174,16 @@ it.each([
 ] as const)('maps the recorded %s merge-queue entry to %s', async (entryState, expectedState) => {
   const run = async () => queueFixture({
     state: 'OPEN', mergedAt: null, timelineItems: { nodes: [{ __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' }] },
-    mergeQueueEntry: { id: 'MQE_1', state: entryState, position: 2, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('c') } },
+    mergeQueueEntry: { id: 'MQE_1', state: entryState, position: 2, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('b') }, pullRequest: { number: 7, headRefOid: sha('b') } },
   });
   const observation = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'));
-  expect(observation).toEqual({ state: expectedState, reviewedHead: sha('b'), entryId: 'MQE_1', phase: entryState, position: 2, enqueuedAt: '2026-09-24T08:00:00Z', queueHead: sha('c') });
+  expect(observation).toEqual({ state: expectedState, reviewedHead: sha('b'), entryId: 'MQE_1', phase: entryState, position: 2, enqueuedAt: '2026-09-24T08:00:00Z', queueHead: sha('b') });
 });
 
 it('maps a recorded unmergeable queue entry to a failed terminal state', async () => {
   const run = async () => queueFixture({
     state: 'OPEN', mergedAt: null, timelineItems: { nodes: [{ __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' }] },
-    mergeQueueEntry: { id: 'MQE_1', state: 'UNMERGEABLE', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('c') } },
+    mergeQueueEntry: { id: 'MQE_1', state: 'UNMERGEABLE', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('b') }, pullRequest: { number: 7, headRefOid: sha('b') } },
   });
   await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
     state: 'failed', reviewedHead: sha('b'), entryId: 'MQE_1', reason: 'GitHub reported the merge queue entry as unmergeable.',
@@ -194,7 +194,7 @@ it('preserves the recorded reason when GitHub removes a pull request from the me
   const run = async () => queueFixture({
     state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [
       { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' },
-      { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: 'Checks failed' },
+      { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: 'Checks failed', beforeCommit: { oid: sha('b') } },
     ] },
   });
   await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
@@ -213,15 +213,17 @@ it('reports merged only when GitHub confirms the reviewed head was merged', asyn
   });
   expect(call).toEqual([
     'api', 'graphql', '-f',
-    'query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason}}}}}}',
+    'query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}',
     '-f', 'owner=owner', '-f', 'name=repo', '-F', 'number=7',
   ]);
 });
 
 it.each([
-  ['a replaced reviewed head', queueFixture({ state: 'OPEN', mergedAt: null, headRefOid: sha('d'), mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('c') } }, timelineItems: { nodes: [] } })],
+  ['a replaced reviewed head', queueFixture({ state: 'OPEN', mergedAt: null, headRefOid: sha('d'), mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('d') }, pullRequest: { number: 7, headRefOid: sha('d') } }, timelineItems: { nodes: [] } })],
+  ['a queue entry for another head', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('d') }, pullRequest: { number: 7, headRefOid: sha('b') } }, timelineItems: { nodes: [] } })],
+  ['a stale removal from another head', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: 'Checks failed', beforeCommit: { oid: sha('d') } }] } })],
   ['an absent queue entry without a removal event', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [] } })],
-  ['a removal without a reason', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: null }] } })],
+  ['a removal without a reason', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: null, beforeCommit: { oid: sha('b') } }] } })],
   ['an omitted mergeQueueEntry field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', timelineItems: { nodes: [] } })],
   ['an omitted timelineItems field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null })],
   ['a malformed timeline node on a merged response', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [null] } })],

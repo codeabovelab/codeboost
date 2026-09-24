@@ -247,7 +247,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const timeoutMs = options.timeoutMs ?? 12_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue inspection timeout.');
     const [owner, name] = this.config.repository.split('/') as [string, string];
-    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason}}}}}}`;
+    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}`;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-queue inspection timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
@@ -271,11 +271,12 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline) || !Array.isArray((timeline as { nodes?: unknown }).nodes)) throw new Error('GitHub returned incomplete merge-queue history.');
       const events = (timeline as { nodes: unknown[] }).nodes.map(event => {
         if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed merge-queue event.');
-        const value = event as { __typename?: unknown; createdAt?: unknown; reason?: unknown };
+        const value = event as { __typename?: unknown; createdAt?: unknown; reason?: unknown; beforeCommit?: { oid?: unknown } | null };
         if (!['AddedToMergeQueueEvent','RemovedFromMergeQueueEvent'].includes(String(value.__typename))) throw new Error('GitHub returned an unknown merge-queue event.');
         const createdAt = timestamp(value.createdAt, 'merge-queue event time');
         if (value.__typename === 'RemovedFromMergeQueueEvent' && (typeof value.reason !== 'string' || !value.reason.trim())) throw new Error('GitHub returned a merge-queue removal without a reason.');
-        return { type: value.__typename, createdAt, reason: value.reason as string | undefined };
+        const beforeHead = value.__typename === 'RemovedFromMergeQueueEvent' ? fullSha(value.beforeCommit?.oid, 'removed merge-queue head SHA') : undefined;
+        return { type: value.__typename, createdAt, reason: value.reason as string | undefined, beforeHead };
       });
       if (pull.state === 'MERGED') {
         if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');
@@ -285,11 +286,13 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
 
       if (entry !== null) {
         if (pull.state !== 'OPEN' || !entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('GitHub returned an invalid merge-queue entry.');
-        const value = entry as { id?: unknown; state?: unknown; position?: unknown; enqueuedAt?: unknown; headCommit?: { oid?: unknown } | null };
+        const value = entry as { id?: unknown; state?: unknown; position?: unknown; enqueuedAt?: unknown; headCommit?: { oid?: unknown } | null; pullRequest?: { number?: unknown; headRefOid?: unknown } | null };
         if (typeof value.id !== 'string' || !value.id || !['AWAITING_CHECKS','LOCKED','MERGEABLE','QUEUED','UNMERGEABLE'].includes(String(value.state)) || !Number.isSafeInteger(value.position) || (value.position as number) < 0)
           throw new Error('GitHub returned an invalid merge-queue entry.');
         timestamp(value.enqueuedAt, 'merge-queue entry time');
         const queueHead = fullSha(value.headCommit?.oid, 'merge-queue head SHA');
+        const entryHead = fullSha(value.pullRequest?.headRefOid, 'merge-queue entry pull request head SHA');
+        if (value.pullRequest?.number !== this.config.pullRequest || queueHead !== expectedHead || entryHead !== expectedHead) throw new Error('The merge-queue entry does not match the reviewed pull request head.');
         if (value.state === 'UNMERGEABLE') return { state: 'failed', reviewedHead, entryId: value.id, reason: 'GitHub reported the merge queue entry as unmergeable.' };
         return {
           state: 'queued', reviewedHead, entryId: value.id, phase: value.state as MergeQueueEntryPhase,
@@ -298,6 +301,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       }
       const last = events.at(-1);
       if (!last || last.type !== 'RemovedFromMergeQueueEvent') throw new Error('GitHub did not confirm a queued, removed, failed, or merged state.');
+      if (last.beforeHead !== expectedHead) throw new Error('The merge-queue removal does not match the reviewed pull request head.');
       return { state: 'removed', reviewedHead, removedAt: last.createdAt, reason: last.reason! };
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
