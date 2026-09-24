@@ -22,7 +22,7 @@ export interface RemoteMergeState {
 
 export interface MergeResult { url: string; }
 export interface MergeGateway {
-  inspect(): Promise<RemoteMergeState>;
+  inspect(options?: { fresh?: boolean }): Promise<RemoteMergeState>;
   merge(expectedHead: string): Promise<MergeResult>;
 }
 
@@ -49,6 +49,8 @@ function flattenPages(value: unknown): unknown[] {
 export class GhMergeGateway implements MergeGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
+  #cache: { expiresAt: number; state: RemoteMergeState } | null = null;
+  #inflight: Promise<RemoteMergeState> | null = null;
   constructor(config: GhMergeConfig, run?: RunGh) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
@@ -70,24 +72,31 @@ export class GhMergeGateway implements MergeGateway {
     }
   }
 
-  async #alreadyFixed(currentBranch: string): Promise<'clear' | 'found' | 'unknown'> {
+  async #alreadyFixed(): Promise<'clear' | 'found' | 'unknown'> {
     try {
       const timeline = flattenPages(await this.#json(['api','--paginate','--slurp','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/issues/${this.config.issue}/timeline`]));
       const numbers = [...new Set(timeline.flatMap(event => {
         if (!event || typeof event !== 'object') return [];
         const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown } } }).source?.issue;
         return source?.pull_request && Number.isSafeInteger(source.number) && source.number !== this.config.pullRequest ? [source.number as number] : [];
-      }))].slice(0, 100);
-      for (const number of numbers) {
-        const pr = await this.#json(['pr','view',String(number),'--repo',this.config.repository,'--json','state,mergedAt,headRefName']) as { state?: unknown; mergedAt?: unknown; headRefName?: unknown };
-        if (pr.headRefName === currentBranch) continue;
+      }))];
+      if (numbers.length > 100) return 'unknown';
+      if (!numbers.length) return 'clear';
+      const [owner, name] = this.config.repository.split('/') as [string, string];
+      const selections = numbers.map((number, index) => `p${index}: pullRequest(number:${number}) { state mergedAt }`).join(' ');
+      const response = await this.#json(['api','graphql','-f',`query=query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { ${selections} } }`]) as { data?: { repository?: Record<string, { state?: unknown; mergedAt?: unknown } | null> } };
+      const pulls = response.data?.repository;
+      if (!pulls || Object.keys(pulls).length !== numbers.length) return 'unknown';
+      for (let index = 0; index < numbers.length; index++) {
+        const pr = pulls[`p${index}`];
+        if (!pr) return 'unknown';
         if (pr.state === 'OPEN' || typeof pr.mergedAt === 'string') return 'found';
       }
       return 'clear';
     } catch { return 'unknown'; }
   }
 
-  async inspect(): Promise<RemoteMergeState> {
+  async #inspectNow(): Promise<RemoteMergeState> {
     const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup']) as Record<string, unknown>;
     if (typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || !['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !['MERGEABLE','CONFLICTING','UNKNOWN'].includes(String(pr.mergeable)) || !Array.isArray(pr.statusCheckRollup))
       throw new Error('GitHub returned an incomplete pull request state.');
@@ -155,8 +164,21 @@ export class GhMergeGateway implements MergeGateway {
     return {
       base: fullSha(pr.baseRefOid, 'base SHA'), head: fullSha(pr.headRefOid, 'head SHA'),
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
-      rulesKnown, atomicBaseGuard, requiredChecks, alreadyFixed: await this.#alreadyFixed(pr.headRefName),
+      rulesKnown, atomicBaseGuard, requiredChecks, alreadyFixed: await this.#alreadyFixed(),
     };
+  }
+
+  async inspect(options: { fresh?: boolean } = {}): Promise<RemoteMergeState> {
+    if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
+    if (!options.fresh && this.#inflight) return this.#inflight;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('GitHub merge-state inspection timed out.')), 12_000); });
+    const attempt = Promise.race([this.#inspectNow(), deadline]).then(state => {
+      this.#cache = { expiresAt: Date.now() + 5_000, state };
+      return state;
+    }).finally(() => { if (timer) clearTimeout(timer); if (this.#inflight === attempt) this.#inflight = null; });
+    if (!options.fresh) this.#inflight = attempt;
+    return attempt;
   }
 
   async merge(expectedHead: string): Promise<MergeResult> {

@@ -50,6 +50,14 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - For each review round, record what changed, what was declined and why, and the regression evidence. Re-request review until a round returns no new findings.
 - Treat review-lesson extraction as a merge gate. Before invoking merge, classify every review finding in the PR body as: covered by an existing rule (cite it), captured by a new rule in this branch (cite it), or one-off (record why). Do not merge until this audit is complete and every required `AGENTS.md` update is included in the reviewed head. Omit rules that merely repeat existing guidance.
 
+## Guarded external actions
+
+- A bounded safety scan must fail closed when its limit is exceeded. Never truncate evidence and report the result as clear.
+- Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
+- After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
+- Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
+- Keep irreversible integrations disabled in demo mode even when configuration or an injected dependency is present. After a stale or refused irreversible action, keep its control disabled until fresh state is loaded.
+
 ## Blinded experiments
 
 - Keep experimental PRs as drafts with automated review disabled until the assigned human decision is recorded. An automated review invalidates reviewer blindness; replace the affected package rather than reusing it.

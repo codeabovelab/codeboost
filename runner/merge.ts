@@ -12,7 +12,7 @@ export class MergeCoordinator {
   readonly gateway: MergeGateway;
   constructor(service: ReviewService, gateway: MergeGateway) { this.service = service; this.gateway = gateway; }
 
-  async status(view = this.service.load()): Promise<MergeStatus> {
+  async status(view = this.service.load(), fresh = false): Promise<MergeStatus> {
     const blockers: MergeBlocker[] = [];
     for (const item of view.items) {
       if (item.state !== 'approved') blockers.push({ code: 'approval', message: `${item.id} is ${item.state}.` });
@@ -24,7 +24,7 @@ export class MergeCoordinator {
     if (unplanned) blockers.push({ code: 'unplanned', message: `${unplanned} unplanned change${unplanned === 1 ? '' : 's'} remain.` });
     const changes = view.notes.filter(note => note.kind === 'change' && note.revision === view.plan.revision && note.snapshotId === view.snapshot.id).length;
     if (changes) blockers.push({ code: 'changes', message: `${changes} change request${changes === 1 ? '' : 's'} remain open.` });
-    const remote = await this.gateway.inspect();
+    const remote = await this.gateway.inspect({ fresh });
     if (remote.pullRequestState !== 'OPEN') blockers.push({ code: 'pr-state', message: `Pull request is ${remote.pullRequestState.toLowerCase()}.` });
     if (remote.base !== view.snapshot.base) blockers.push({ code: 'base', message: 'The base branch moved. Rebase and review the resulting snapshot.' });
     if (remote.head !== view.snapshot.head) blockers.push({ code: 'head', message: 'The pull request head moved. Refresh the review.' });
@@ -49,13 +49,14 @@ export class MergeCoordinator {
     try {
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
-      const status = await this.status(view);
+      const status = await this.status(view, true);
       if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
       view = this.service.load();
       if (view.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
-      const finalStatus = await this.status(view);
+      const finalStatus = await this.status(view, true);
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head) throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
+      if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       const result = await this.gateway.merge(status.remote.head);
       return { status, result };
     } finally { this.#active = false; }

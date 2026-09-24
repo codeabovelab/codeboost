@@ -45,7 +45,7 @@ test('requires private credentials and rejects foreign origins',async({request})
   expect((await request.get(base+'api/review',{headers:{'x-codeboost-token':app.token}})).status()).toBe(200);
 });
 test('shows merge blockers and submits one exact-head merge',async({page})=>{
- const config=app.service.config;await app.close();let mergeCalls:string[]=[];let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
+ const config={...app.service.config,demo:false};await app.close();let mergeCalls:string[]=[];let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  const gateway:MergeGateway={
   inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,requiredChecks:[],alreadyFixed:'clear'};},
   merge:async head=>{mergeCalls.push(head);await held;return {url:'https://github.com/example/repo/pull/21'};},
@@ -55,6 +55,14 @@ test('shows merge blockers and submits one exact-head merge',async({page})=>{
  let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();const expectedHead=view.snapshot.head;await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();page.on('dialog',dialog=>dialog.accept());
  await page.locator('#merge').evaluate((button:HTMLButtonElement)=>{button.click();button.click();});await expect.poll(()=>mergeCalls.length).toBe(1);await expect(page.locator('#merge')).toBeDisabled();release();await expect(page.locator('#banner')).toContainText('Merged pull request.');expect(mergeCalls).toEqual([expectedHead]);
+});
+test('keeps stale merge failures disabled until refresh',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();let appRef:typeof app;const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('head changed');}};app=appRef=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('Merge blocked. head changed');await expect(page.locator('#merge')).toBeDisabled();
+});
+test('never enables merging for a demo even with an injected gateway',async({page})=>{
+ const config=app.service.config;await app.close();let inspections=0;const gateway:MergeGateway={inspect:async()=>{inspections++;throw new Error('must not run');},merge:async()=>({url:''})};app=await startServer(config,0,undefined,gateway);await page.goto(app.url);await expect(page.locator('#merge')).toBeHidden();expect(inspections).toBe(0);
 });
 test('shows an honest history error and keeps markup in notes as text',async({page})=>{
  await page.goto(app.url);await page.getByLabel('Question about this item').fill('<img src=x onerror=alert(1)>');await page.getByRole('button',{name:'Ask agent'}).click();await expect(page.getByText('<img src=x onerror=alert(1)>',{exact:true})).toBeVisible();await expect(page.locator('#notes img')).toHaveCount(0);

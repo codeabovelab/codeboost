@@ -83,6 +83,15 @@ it('refuses a requirement that changes after the initial validation', async () =
   expect(client.heads).toEqual([]);
 });
 
+it('revalidates the store generation after the final asynchronous status check', async () => {
+  const view = readyView(), changed = { ...view, token: 'new-review-token' };
+  let loads = 0;
+  const service = { load: vi.fn(() => ++loads < 3 ? view : changed) } as unknown as ReviewService;
+  const client = gateway([remote(view), remote(view)]);
+  await expect(new MergeCoordinator(service, client).merge(view.token)).rejects.toThrow(/Review changed during merge validation/);
+  expect(client.heads).toEqual([]);
+});
+
 it('preserves the GitHub merge refusal', async () => {
   const view = readyView(), service = serviceFor(view), state = remote(view);
   const client: MergeGateway = { inspect: vi.fn(async () => state), merge: async () => { throw new Error('Required review is missing.'); } };
@@ -130,11 +139,11 @@ it.each([[false, true], [true, false]])('treats a protection 404 with protected=
   expect(state.requiredChecks).toEqual([]);
 });
 
-it.each([['feature', 'clear'], ['other-branch', 'found']] as const)('classifies a referenced PR on %s as %s', async (referencedBranch, expected) => {
+it.each([['feature', 'found'], ['other-branch', 'found']] as const)('classifies a referenced PR on %s as %s', async (referencedBranch, expected) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
-    if (joined.startsWith('pr view 8')) return JSON.stringify({ state: 'OPEN', mergedAt: null, headRefName: referencedBranch });
+    if (joined.startsWith('api graphql')) return JSON.stringify({ data: { repository: { p0: { state: 'OPEN', mergedAt: null, headRefName: referencedBranch } } } });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
@@ -143,4 +152,22 @@ it.each([['feature', 'clear'], ['other-branch', 'found']] as const)('classifies 
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
   expect(state.alreadyFixed).toBe(expected);
+});
+
+it('blocks the already-fixed check instead of truncating more than 100 references', async () => {
+  const references = Array.from({ length: 101 }, (_, index) => ({ source: { issue: { number: index + 8, pull_request: {} } } }));
+  let referencedViews = 0;
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) { referencedViews++; return JSON.stringify({ state: 'CLOSED', mergedAt: null, headRefName: 'other' }); }
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([references]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
+  expect(referencedViews).toBe(0);
 });

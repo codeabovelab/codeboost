@@ -9,9 +9,9 @@ import { MergeCoordinator } from '../runner/merge.ts';
 const publicRoot = new URL('./public/', import.meta.url);
 export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway) {
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
-  if (config.github && config.github.issue !== service.store.getPlan(config.identity).issue) { service.close(); throw new Error('The GitHub merge issue must match the stored plan issue.'); }
+  if (!config.demo && config.github && config.github.issue !== service.store.getPlan(config.identity).issue) { service.close(); throw new Error('The GitHub merge issue must match the stored plan issue.'); }
   const questions=new Questions(service,questionAgent);
-  const merges = mergeGateway || config.github ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
+  const merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
   const load=async()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)})),merge:merges?await merges.displayStatus(view):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')

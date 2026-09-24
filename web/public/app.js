@@ -393,6 +393,7 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `Merged pull request. ${updated.mergeResult.url}`;
   } catch (error) {
+    data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
   } finally {
