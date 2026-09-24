@@ -100,12 +100,13 @@ it('preserves the GitHub merge refusal', async () => {
 
 it('parses required checks from both rule sources and pins the gh merge head', async () => {
   const calls: string[][] = [];
+  let pullReads = 0;
   const run = async (args: readonly string[]) => {
     calls.push([...args]); const joined = args.join(' ');
-    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+    if (joined.startsWith('pr view 7')) { pullReads++; return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } },
       { context: 'lint', state: 'SUCCESS' },
-    ] });
+    ] }); }
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.includes('/protection')) return JSON.stringify({ required_status_checks: { strict: false, checks: [{ context: 'lint', app_id: null }] } });
@@ -122,6 +123,44 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   ]);
   await client.merge(sha('b'));
   expect(calls.at(-1)).toEqual(['pr','merge','7','--repo','owner/repo','--merge','--match-head-commit',sha('b')]);
+  await client.inspect();
+  expect(pullReads).toBe(2);
+});
+
+it.each([
+  ['ruleset', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: '10' }] } }], { strict: false, checks: [] }],
+  ['classic', [], { strict: true, checks: [{ context: 'test' }] }],
+] as const)('fails closed for an invalid %s check app identity', async (_source, rules, requiredStatusChecks) => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } }] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([rules]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });
+    if (joined.includes('/timeline')) return JSON.stringify([[]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(false);
+});
+
+it('aborts one shared status inspection at its overall deadline', async () => {
+  vi.useFakeTimers();
+  try {
+    let calls = 0, aborts = 0;
+    const run = async (_args: readonly string[], options?: { signal?: AbortSignal }) => new Promise<string>((_resolve, reject) => {
+      calls++;
+      options?.signal?.addEventListener('abort', () => { aborts++; reject(options.signal?.reason); }, { once: true });
+    });
+    const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run);
+    const first = client.inspect(), second = client.inspect();
+    const resultsPromise = Promise.allSettled([first, second]);
+    expect(calls).toBe(1);
+    await vi.advanceTimersByTimeAsync(12_000);
+    const results = await resultsPromise;
+    expect(results.every(result => result.status === 'rejected' && /timed out/i.test(String(result.reason)))).toBe(true);
+    expect(aborts).toBe(1);
+  } finally { vi.useRealTimers(); }
 });
 
 it.each([[false, true], [true, false]])('treats a protection 404 with protected=%s as rulesKnown=%s', async (protectedBranch, expectedKnown) => {

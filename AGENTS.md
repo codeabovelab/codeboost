@@ -56,6 +56,9 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
 - After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
 - Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
+- Preserve the distinction between an explicit unbound identity and missing or malformed authorization metadata. Missing or malformed identities must fail closed.
+- A deadline must abort and await the underlying operation before releasing its in-flight ownership; rejecting only the caller can leave untracked work running.
+- Invalidate pre-action status caches after both successful and refused external mutations before rendering or fetching status again.
 - Keep irreversible integrations disabled in demo mode even when configuration or an injected dependency is present. After a stale or refused irreversible action, keep its control disabled until fresh state is loaded.
 
 ## Blinded experiments

@@ -33,7 +33,7 @@ export interface GhMergeConfig {
   method?: 'merge' | 'squash' | 'rebase';
 }
 
-type RunGh = (args: readonly string[]) => Promise<string>;
+type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
 
 function fullSha(value: unknown, label: string): string {
   if (typeof value !== 'string' || !/^[a-f0-9]{40}$/.test(value)) throw new Error(`GitHub returned an invalid ${label}.`);
@@ -55,26 +55,26 @@ export class GhMergeGateway implements MergeGateway {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
     this.config = config;
-    this.run = run ?? (async args => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024 })).stdout);
+    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
   }
 
-  async #json(args: readonly string[]): Promise<unknown> {
-    const output = await this.run(args);
+  async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
+    const output = await this.run(args, { signal });
     try { return JSON.parse(output); }
     catch { throw new Error('GitHub returned invalid JSON.'); }
   }
 
-  async #optionalJson(args: readonly string[]): Promise<unknown | null> {
-    try { return await this.#json(args); }
+  async #optionalJson(args: readonly string[], signal?: AbortSignal): Promise<unknown | null> {
+    try { return await this.#json(args, signal); }
     catch (error) {
       if (error instanceof Error && /HTTP 404|not found/i.test(error.message)) return null;
       throw error;
     }
   }
 
-  async #alreadyFixed(): Promise<'clear' | 'found' | 'unknown'> {
+  async #alreadyFixed(signal?: AbortSignal): Promise<'clear' | 'found' | 'unknown'> {
     try {
-      const timeline = flattenPages(await this.#json(['api','--paginate','--slurp','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/issues/${this.config.issue}/timeline`]));
+      const timeline = flattenPages(await this.#json(['api','--paginate','--slurp','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/issues/${this.config.issue}/timeline`], signal));
       const numbers = [...new Set(timeline.flatMap(event => {
         if (!event || typeof event !== 'object') return [];
         const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown } } }).source?.issue;
@@ -84,7 +84,7 @@ export class GhMergeGateway implements MergeGateway {
       if (!numbers.length) return 'clear';
       const [owner, name] = this.config.repository.split('/') as [string, string];
       const selections = numbers.map((number, index) => `p${index}: pullRequest(number:${number}) { state mergedAt }`).join(' ');
-      const response = await this.#json(['api','graphql','-f',`query=query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { ${selections} } }`]) as { data?: { repository?: Record<string, { state?: unknown; mergedAt?: unknown } | null> } };
+      const response = await this.#json(['api','graphql','-f',`query=query { repository(owner:${JSON.stringify(owner)}, name:${JSON.stringify(name)}) { ${selections} } }`], signal) as { data?: { repository?: Record<string, { state?: unknown; mergedAt?: unknown } | null> } };
       const pulls = response.data?.repository;
       if (!pulls || Object.keys(pulls).length !== numbers.length) return 'unknown';
       for (let index = 0; index < numbers.length; index++) {
@@ -93,11 +93,14 @@ export class GhMergeGateway implements MergeGateway {
         if (pr.state === 'OPEN' || typeof pr.mergedAt === 'string') return 'found';
       }
       return 'clear';
-    } catch { return 'unknown'; }
+    } catch (error) {
+      if (signal?.aborted) throw error;
+      return 'unknown';
+    }
   }
 
-  async #inspectNow(): Promise<RemoteMergeState> {
-    const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup']) as Record<string, unknown>;
+  async #inspectNow(signal?: AbortSignal): Promise<RemoteMergeState> {
+    const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup'], signal) as Record<string, unknown>;
     if (typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || !['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !['MERGEABLE','CONFLICTING','UNKNOWN'].includes(String(pr.mergeable)) || !Array.isArray(pr.statusCheckRollup))
       throw new Error('GitHub returned an incomplete pull request state.');
     const branch = encodeURIComponent(pr.baseRefName);
@@ -105,10 +108,10 @@ export class GhMergeGateway implements MergeGateway {
     let rules: unknown[] = [];
     let classic: unknown | null = null;
     try {
-      rules = flattenPages(await this.#json(['api','--paginate','--slurp',`repos/${this.config.repository}/rules/branches/${branch}`]));
-      const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`]) as { protected?: unknown };
+      rules = flattenPages(await this.#json(['api','--paginate','--slurp',`repos/${this.config.repository}/rules/branches/${branch}`], signal));
+      const branchState = await this.#json(['api',`repos/${this.config.repository}/branches/${branch}`], signal) as { protected?: unknown };
       if (typeof branchState.protected !== 'boolean') throw new Error('GitHub returned an incomplete branch state.');
-      const protection = await this.#optionalJson(['api',`repos/${this.config.repository}/branches/${branch}/protection`]);
+      const protection = await this.#optionalJson(['api',`repos/${this.config.repository}/branches/${branch}/protection`], signal);
       if (protection === null) {
         if (branchState.protected) throw new Error('Branch protection is present but unreadable.');
       } else if (!protection || typeof protection !== 'object' || !('required_status_checks' in protection)) {
@@ -129,21 +132,25 @@ export class GhMergeGateway implements MergeGateway {
         for (const check of parameters.required_status_checks) {
           if (!check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string') { rulesKnown = false; break; }
           const context = (check as { context: string }).context;
-          const app = (check as { integration_id?: unknown }).integration_id;
-          const appId = typeof app === 'number' ? app : null;
+          if (!Object.hasOwn(check, 'integration_id')) { rulesKnown = false; break; }
+          const app = (check as { integration_id: unknown }).integration_id;
+          if (app !== null && (!Number.isSafeInteger(app) || (app as number) < 1)) { rulesKnown = false; break; }
+          const appId = app as number | null;
           requirements.set(`${context}\0${appId ?? ''}`, { context, appId });
         }
       }
       if (classic && typeof classic === 'object') {
         const value = classic as { strict?: unknown; checks?: unknown; contexts?: unknown };
         if (value.strict === true) atomicBaseGuard = true;
-        const checks = Array.isArray(value.checks) ? value.checks : Array.isArray(value.contexts) ? value.contexts.map(context => ({ context })) : null;
+        const checks = Array.isArray(value.checks) ? value.checks : Array.isArray(value.contexts) ? value.contexts.map(context => ({ context, app_id: null })) : null;
         if (!checks) rulesKnown = false;
         else for (const check of checks) {
           if (!check || typeof check !== 'object' || typeof (check as { context?: unknown }).context !== 'string') { rulesKnown = false; break; }
           const context = (check as { context: string }).context;
-          const app = (check as { app_id?: unknown }).app_id;
-          const appId = typeof app === 'number' ? app : null;
+          if (!Object.hasOwn(check, 'app_id')) { rulesKnown = false; break; }
+          const app = (check as { app_id: unknown }).app_id;
+          if (app !== null && (!Number.isSafeInteger(app) || (app as number) < 1)) { rulesKnown = false; break; }
+          const appId = app as number | null;
           requirements.set(`${context}\0${appId ?? ''}`, { context, appId });
         }
       }
@@ -164,19 +171,22 @@ export class GhMergeGateway implements MergeGateway {
     return {
       base: fullSha(pr.baseRefOid, 'base SHA'), head: fullSha(pr.headRefOid, 'head SHA'),
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
-      rulesKnown, atomicBaseGuard, requiredChecks, alreadyFixed: await this.#alreadyFixed(),
+      rulesKnown, atomicBaseGuard, requiredChecks, alreadyFixed: await this.#alreadyFixed(signal),
     };
   }
 
   async inspect(options: { fresh?: boolean } = {}): Promise<RemoteMergeState> {
     if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
     if (!options.fresh && this.#inflight) return this.#inflight;
-    let timer: ReturnType<typeof setTimeout> | undefined;
-    const deadline = new Promise<never>((_, reject) => { timer = setTimeout(() => reject(new Error('GitHub merge-state inspection timed out.')), 12_000); });
-    const attempt = Promise.race([this.#inspectNow(), deadline]).then(state => {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(new Error('GitHub merge-state inspection timed out.')), 12_000);
+    const attempt = this.#inspectNow(controller.signal).catch(error => {
+      if (controller.signal.aborted) throw new Error('GitHub merge-state inspection timed out.');
+      throw error;
+    }).then(state => {
       this.#cache = { expiresAt: Date.now() + 5_000, state };
       return state;
-    }).finally(() => { if (timer) clearTimeout(timer); if (this.#inflight === attempt) this.#inflight = null; });
+    }).finally(() => { clearTimeout(timer); if (this.#inflight === attempt) this.#inflight = null; });
     if (!options.fresh) this.#inflight = attempt;
     return attempt;
   }
@@ -184,7 +194,10 @@ export class GhMergeGateway implements MergeGateway {
   async merge(expectedHead: string): Promise<MergeResult> {
     fullSha(expectedHead, 'expected head SHA');
     const flag = this.config.method === 'squash' ? '--squash' : this.config.method === 'rebase' ? '--rebase' : '--merge';
-    await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead]);
-    return { url: `https://github.com/${this.config.repository}/pull/${this.config.pullRequest}` };
+    this.#cache = null;
+    try {
+      await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead]);
+      return { url: `https://github.com/${this.config.repository}/pull/${this.config.pullRequest}` };
+    } finally { this.#cache = null; }
   }
 }
