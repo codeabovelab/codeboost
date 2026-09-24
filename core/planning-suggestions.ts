@@ -70,7 +70,6 @@ export class SuggestionCoordinator {
     // Defer invocation until the handle owns its slot, including synchronous provider errors.
     void Promise.resolve().then(async () => {
       let outcome: SuggestionOutcome;
-      let publishing = false;
       try {
         if (stopped) outcome = { id, ...stopped };
         else {
@@ -86,7 +85,6 @@ export class SuggestionCoordinator {
               outcome = { id, state: current.state === 'cancelled' ? 'cancelled' : 'stale', reason: `Suggestion request is ${current.state}.` };
             } else {
               const validated = prepared.validate(source);
-              publishing = true;
               this.#store.completeSuggestions(identity, id, validated.value);
               outcome = { id, state: 'completed', warnings: validated.warnings };
             }
@@ -94,16 +92,16 @@ export class SuggestionCoordinator {
         }
       } catch (error) {
         outcome = { id, ...(stopped ?? { state: 'failed' as const, reason: error instanceof Error ? error.message : String(error) }) };
-        // A different Store connection may cancel or advance the revision between
-        // the local read and publication CAS. Preserve that terminal classification.
-        if (!stopped && publishing) {
+        // A different Store connection may cancel or advance the revision while
+        // the provider runs or before publication CAS. Keep the original error too.
+        if (!stopped) {
           try {
             const current = this.#store.getSuggestions(identity, id);
             if (current.state === 'invalidated' || this.#store.getPlan(identity).revision !== request.revision ||
                 this.#store.getSnapshot(identity).id !== snapshot.id)
-              outcome = { id, state: 'stale', reason: 'Plan revision or snapshot changed before publication.' };
+              outcome = { id, state: 'stale', reason: `Plan revision or snapshot changed before publication. ${outcome.reason}` };
             else if (current.state === 'cancelled')
-              outcome = { id, state: 'cancelled', reason: 'Suggestion request was cancelled before publication.' };
+              outcome = { id, state: 'cancelled', reason: `Suggestion request was cancelled before publication. ${outcome.reason}` };
           } catch { /* Preserve the original error if durable state cannot be read. */ }
         }
       }
