@@ -73,7 +73,7 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
       mappings.push({oldSha:commit.sha,newSha:git(repository,'rev-parse','HEAD')});
     }
     const identity={repositoryId:config.identity.repositoryId,taskId:randomUUID(),planId:randomUUID()};
-    const output:ReviewConfig={...config,repository,database:join(root,'review.sqlite'),identity,demo:false};
+    const output:ReviewConfig={...config,repository,database:join(root,'review.sqlite'),identity,demo:false,github:undefined};
     const store=new Store(output.database);
     try{
       store.createPlan(JSON.stringify(plan),'json',{identity,issue:plan.issue,baseEntries,pathKey,allowedCommands:[]},snapshot.base,snapshot.head);
