@@ -82,6 +82,21 @@ test('surfaces queue removal and retries only the same reviewed head',async({pag
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('Removed from merge queue. Required check failed.',{timeout:10000});await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toBeEnabled();
  await page.getByRole('button',{name:'Retry merge',exact:true}).click();await expect.poll(()=>mergeCalls).toBe(2);await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({state:'queued',reviewedHead:view.snapshot.head});
 });
+test('ignores a merge poll started before a newer review action',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  queueWatermark:async()=>null,
+  merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
+  inspectQueue:async head=>({state:'removed',reviewedHead:head,removedAt:'2026-09-24T08:05:00Z',reason:'Old poll result.'}),
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ let release!:()=>void,releaseNew!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>release=resolve),heldNew=new Promise<void>(resolve=>releaseNew=resolve),started=new Promise<void>(resolve=>arrived=resolve);let polls=0;
+ await page.route('**/api/merge',async route=>{polls++;if(polls===1){arrived();await held;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:{state:'removed',reviewedHead:view.snapshot.head,url:null,reason:'Old poll result.',phase:null,position:null,occurredAt:'2026-09-24T08:05:00Z',retryable:true}})});return;}await heldNew;await route.continue();});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await started;
+ await page.getByRole('button',{name:'Request change',exact:true}).click();await page.getByLabel('Change to request').fill('New review decision.');await page.getByRole('button',{name:'Save change request'}).click();await expect(page.getByText('New review decision.',{exact:true})).toBeVisible();
+ const staleResponse=page.waitForResponse(response=>response.url().endsWith('/api/merge'));release();try{await staleResponse;await page.waitForTimeout(100);await expect(page.locator('#banner')).not.toContainText('Old poll result.');await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toHaveCount(0);await expect(page.locator('#merge')).toBeDisabled();}finally{releaseNew();}
+});
 test('requires fresh review instead of retry when GitHub replaces the queued head',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;
  const gateway:MergeGateway&MergeQueueGateway={

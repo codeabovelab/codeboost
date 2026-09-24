@@ -162,6 +162,7 @@ async function act(command) {
   if (busy || !data) return false;
   busy = true;
   reviewGeneration++;
+  mergeGeneration++;
   renderAttachment();
   try {
     rememberDraft();
