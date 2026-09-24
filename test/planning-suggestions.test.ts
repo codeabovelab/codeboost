@@ -97,9 +97,12 @@ it('closes admission first, aborts all jobs and waits for unsettled providers be
   const other = input(); other.context.identity.planId = 'other';
   f.store.createPlan(JSON.stringify(plan()), 'json', other.context, 'a'.repeat(40), 'b'.repeat(40));
   const second = f.coordinator.start(other); await Promise.resolve();
+  const fresh = input(); fresh.context.identity.planId = 'not-yet-running';
+  f.store.createPlan(JSON.stringify(plan()), 'json', fresh.context, 'a'.repeat(40), 'b'.repeat(40));
   let closed = false; const closing = f.coordinator.close(); void closing.then(() => { closed = true; });
   expect(f.coordinator.close()).toBe(closing);
   expect(() => f.coordinator.start(f.value)).toThrow(/closing/);
+  expect(() => f.coordinator.start(fresh)).toThrow(/closing/);
   expect(f.calls.every(call => call.signal.aborted)).toBe(true);
   await Promise.resolve(); expect(closed).toBe(false);
   f.pending.reject(new Error('Provider abort'));
