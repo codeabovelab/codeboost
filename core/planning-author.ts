@@ -96,6 +96,7 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
     if (result.errors.length) throw new PlanError(result.errors);
     if (input.revision !== previous.revision + (mode === 'draft' ? 1 : 0)) throw new Error('Previous plan revision mismatch.');
   } else if (mode === 'suggest') throw new Error('Suggestions require a previous plan.');
+  else if (input.revision !== 1) throw new Error('Initial draft must use revision one.');
   const schemaPath = registry.versions['1'][mode === 'draft' ? 'plan' : 'edit'];
   const schemaText = boundedText(readFileSync(new URL('../schema/' + schemaPath, import.meta.url), 'utf8'), 'Schema');
   const slots: Record<string, string> = {
@@ -107,7 +108,8 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
     issue_number: String(context.issue), previous_revision: String(previous?.revision ?? 0),
     repo_data_json: dataJSON({ repo: input.repo.name, base_ref: input.repo.baseRef, base_sha: input.repo.baseSha,
       repo_tree: input.repo.paths, allowed_commands: context.allowedCommands }, 'Repository data'),
-    issue_data_json: dataJSON(input.issue, 'Issue data'),
+    issue_data_json: dataJSON({ number: input.issue.number, title: input.issue.title,
+      body: input.issue.body, comments: input.issue.comments }, 'Issue data'),
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
     feedback_data_json: dataJSON(input.feedback, 'Feedback'),
     previous_plan_json: dataJSON(previous ?? null, 'Previous plan'),

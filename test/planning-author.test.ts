@@ -102,3 +102,14 @@ it('validates cards independently and rejects a batch with even one dependent in
   const value = reply(); value.edits.push({ ...value.edits[0]!, item: 'P2' });
   expect(() => prepareSuggestions({ ...input(), previousPlan: plan() }).validate(JSON.stringify(value))).toThrow(/Target item/);
 });
+it('serializes only the four issue contract fields, excluding API metadata', () => {
+  const value = input();
+  value.issue = { ...value.issue, privateMetadata: 'must not reach provider' } as typeof value.issue;
+  const prompt = prepareDraft(value).request.prompt;
+  const block = JSON.parse(prompt.match(/<issue_data>\n([^\n]*)\n<\/issue_data>/u)![1]!);
+  expect(Object.keys(block).sort()).toEqual(['body', 'comments', 'number', 'title']);
+  expect(block).not.toHaveProperty('privateMetadata');
+});
+it('requires revision one for an initial draft with no prior plan', () => {
+  expect(() => prepareDraft({ ...input(), revision: 9 })).toThrow(/Initial draft/);
+});
