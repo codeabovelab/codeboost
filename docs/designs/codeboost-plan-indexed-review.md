@@ -549,9 +549,11 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 
 ### Build order and the go/no-go check
 
+**Superseding product decision (2026-09-23).** The paired human go/no-go experiment was cancelled before timed results were recorded. It did not pass and provides no comparative review evidence. The cancellation removes it as a prerequisite for later roadmap steps. Optional future validation is tracked in #19 and must use fresh blinded packages and a freshly committed protocol. Historical experiment decisions and review records below remain as design history.
+
 1. **Plan format and linking engine.** A code library, tested with sample git histories.
 2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
-3. **Go/no-go check.** Run the real-PR test in "How we will know it works." Continue only if reviewing by plan item wins. If it does not, change the linking design, or switch to option C, before building anything more.
+3. **Optional validation.** A future real-PR comparison may test the assumptions in "How we will know it works," but it is non-blocking under the superseding decision above.
 4. **Merge gate and merging** (step 9): the merge rules, the pre-merge sequence, and merging through `gh`.
 5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6).
 6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3).
@@ -624,7 +626,7 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 2. Do the assignment below.
 3. Build step 1, with all its test cases.
 4. Build step 2: the read-only review screen from mockup B.
-5. Commit the go/no-go rules, then run the go/no-go check.
+5. Optionally run the non-blocking human validation tracked in #19.
 6. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before build step 5 if anything in those areas changes.
 7. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
 
@@ -1866,15 +1868,15 @@ Critical gaps (no test, no handling, and silent): 0.
 | Linking engine | core | — |
 | Git helpers and ledger | git, runner/store | — |
 | Read-only review screen | web | linking engine, git helpers |
-| Go/no-go check | (process) | read-only review screen |
-| Merge gate and merging | github, runner | go/no-go pass |
-| Agent container and network | agents | go/no-go pass |
+| Optional human validation | (process) | read-only review screen |
+| Merge gate and merging | github, runner | read-only review screen |
+| Agent container and network | agents | read-only review screen |
 | Runner state machine | runner | merge gate, agent container |
 | Learning (lessons, inbox, Learning screen) | runner, agents, web | runner state machine (needs the reject loop) |
 
 - **Lane A:** linking engine (independent). **Lane B:** git helpers and ledger (independent).
-- Launch A and B in parallel worktrees. Merge both. Then build the review screen. Then run the go/no-go check.
-- After a pass, **Lane C** (merge gate) and **Lane D** (agent container) can run in parallel. The runner follows both.
+- Launch A and B in parallel worktrees. Merge both, then build the review screen. Optional human validation may run later without blocking implementation.
+- After the review screen, **Lane C** (merge gate) and **Lane D** (agent container) can run in parallel. The runner follows both.
 - **Conflict flag:** Lane C and the runner both touch `runner`. Sequence the runner after Lane C merges.
 - Learning comes last and is sequential, because it touches `runner`, `agents`, and `web` and needs the reject loop.
 

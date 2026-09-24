@@ -71,7 +71,7 @@ Fixed aggregate diff retention outside the blob budget. The adapter limits total
 
 This is a working foundation, not a completed application or a claim that all implementation tasks are done. T18's pure validation/edit core is present; its agent adapters, import UI, and persistence are pending. Ledger storage, rebase mappings, and the read-only review screen remain next. The already-fixed GitHub check belongs to the later GitHub/runner integration.
 
-The design's manual real-issue assignment and timed go/no-go experiment have not been performed. Disposable Git histories are engineering tests, not evidence that plan-indexed review beats raw review. Write and commit the experiment protocol before using the real review screen for that comparison. Do not proceed to merging, agent execution, planning UI, queue, or learning until the documented gate passes.
+The design's timed go/no-go experiment was cancelled by product decision before results were recorded. Disposable Git histories are engineering tests, not evidence that plan-indexed review beats raw review. The cancelled experiment does not block merging, agent execution, planning UI, queue, or learning work. Optional future validation is tracked in #19, and product claims must not imply that the cancelled gate passed.
 
 ## Alignment with the merged v1 contract (#6)
 

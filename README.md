@@ -2,7 +2,7 @@
 
 Review agent-made Git changes one plan item at a time. The approved plan lists each item's files and acceptance checks; the review engine shows which item produced each change and flags foreign or overlapping work.
 
-**Status:** the plan/linking library, SQLite store, and local read-only review screen are implemented. Run `npm run demo` and open its private local URL. Ask can invoke Claude Code or Codex for read-only answers; choose the provider in Settings. Code-writing agents and merge commands are not implemented. The human go/no-go experiment is still pending; see [the local review guide](docs/implementation/read-only-review.md).
+**Status:** the plan/linking library, SQLite store, and local read-only review screen are implemented. Run `npm run demo` and open its private local URL. Ask can invoke Claude Code or Codex for read-only answers; choose the provider in Settings. Code-writing agents and merge commands are not implemented. The paired human review experiment was cancelled before results were recorded and no longer blocks roadmap work; optional future validation is tracked in [#19](https://github.com/codeabovelab/codeboost/issues/19).
 
 ## Development
 

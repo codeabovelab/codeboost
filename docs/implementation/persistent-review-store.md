@@ -28,7 +28,7 @@ Baseline: 136 tests. Final counts and CI evidence are recorded in the PR.
 
 The store does not read Git or execute agents. The runner remains responsible for obtaining immutable typed tree entries and actual filesystem identity; keeping metadata stable; auditing paths, links, and occupancy; reconciling execution prefixes; and phase/container enforcement (#6). Checkpoint persistence is not an implemented execution state machine. This slice adds neither UI nor an HTTP endpoint. No migration against a shared environment is performed.
 
-Build the review screen under #3 next. The real-issue assignment, experiment protocol, planted-change script, and paired go/no-go experiment remain prerequisites to proceeding beyond that screen.
+Build the review screen under #3 next. The later paired go/no-go experiment was cancelled before results were recorded and no longer blocks work beyond the review screen; optional future validation is tracked in #19.
 
 ## Review round 1
 
