@@ -56,6 +56,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
 - After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
 - Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
+- Budget a multi-stage validation across all sequential stages; giving each stage the full request allowance does not create an overall deadline.
 - Preserve the distinction between an explicit unbound identity and missing or malformed authorization metadata. Missing or malformed identities must fail closed.
 - Validate every field used to classify an external record as clear, including enum values and required nullable fields. Partial records and malformed policy objects must fail closed.
 - Treat a successful external command as the transition it actually performed. If it can enqueue or schedule work, model and verify that lifecycle before reporting the final action as complete.

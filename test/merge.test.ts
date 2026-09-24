@@ -70,6 +70,13 @@ it('rechecks the exact base and head, then invokes the guarded head merge', asyn
   expect(merged.result.url).toContain('/pr/1');
 });
 
+it('budgets both fresh validation passes below the serving deadline', async () => {
+  const view = readyView(), service = serviceFor(view), options: Array<{ fresh?: boolean; timeoutMs?: number } | undefined> = [];
+  const client: MergeGateway = { inspect: vi.fn(async value => { options.push(value); return remote(view); }), merge: vi.fn(async () => ({ url: 'https://github.example/pr/1' })) };
+  await new MergeCoordinator(service, client).merge(view.token);
+  expect(options).toEqual([{ fresh: true, timeoutMs: 6_000 }, { fresh: true, timeoutMs: 6_000 }]);
+});
+
 it('refuses a base or head race after the initial validation', async () => {
   const view = readyView(), service = serviceFor(view);
   const client = gateway([remote(view), remote(view, { head: 'c'.repeat(40) })]);
@@ -283,4 +290,18 @@ it('blocks the already-fixed check instead of truncating more than 100 reference
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
   expect(state.alreadyFixed).toBe('unknown');
   expect(referencedViews).toBe(0);
+});
+
+it('fails closed when a paginated timeline contains a malformed page', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([{ source: { issue: { number: 8, pull_request: {} } } }]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
 });

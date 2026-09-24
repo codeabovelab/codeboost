@@ -23,7 +23,7 @@ export interface RemoteMergeState {
 
 export interface MergeResult { url: string; }
 export interface MergeGateway {
-  inspect(options?: { fresh?: boolean }): Promise<RemoteMergeState>;
+  inspect(options?: { fresh?: boolean; timeoutMs?: number }): Promise<RemoteMergeState>;
   merge(expectedHead: string): Promise<MergeResult>;
 }
 
@@ -42,8 +42,8 @@ function fullSha(value: unknown, label: string): string {
 }
 
 function flattenPages(value: unknown): unknown[] {
-  if (!Array.isArray(value)) throw new Error('GitHub returned an invalid paginated response.');
-  return value.flatMap(page => Array.isArray(page) ? page : [page]);
+  if (!Array.isArray(value) || value.some(page => !Array.isArray(page))) throw new Error('GitHub returned an invalid paginated response.');
+  return value.flat();
 }
 
 /** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
@@ -185,12 +185,14 @@ export class GhMergeGateway implements MergeGateway {
     };
   }
 
-  async inspect(options: { fresh?: boolean } = {}): Promise<RemoteMergeState> {
+  async inspect(options: { fresh?: boolean; timeoutMs?: number } = {}): Promise<RemoteMergeState> {
+    const timeoutMs = options.timeoutMs ?? 12_000;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub inspection timeout.');
     if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
     const generation = this.#generation;
     if (!options.fresh && this.#inflight?.generation === generation) return this.#inflight.promise;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('GitHub merge-state inspection timed out.')), 12_000);
+    const timer = setTimeout(() => controller.abort(new Error('GitHub merge-state inspection timed out.')), timeoutMs);
     const attempt = this.#inspectNow(controller.signal).catch(error => {
       if (controller.signal.aborted) throw new Error('GitHub merge-state inspection timed out.');
       throw error;
