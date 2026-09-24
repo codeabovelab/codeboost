@@ -7,6 +7,9 @@ pass inserts escaped JSON after resolving conditionals. Inputs and final prompts
 are bounded to 32 KiB; source is never truncated. Provider output is an extracted
 JSON document subject to the retained parser's 1 MiB/depth/UTF-8 limits.
 
+Only the issue's number, title, body and comments enter the prompt; structural
+TypeScript compatibility does not grant authority to extra API metadata. Initial
+drafts require revision one; revised drafts require the previous plan's revision + 1.
 Draft replies must match the selected issue and requested revision. Suggestions
 must match the captured base revision, and every independent card must produce a
 valid plan against the original captured context. A single bad card rejects the
