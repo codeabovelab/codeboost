@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { dirname } from 'node:path';
+import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 export const AGENT_IMAGE = 'codeboost-agent:node26-codex0.153.4-claude2.1.281';
@@ -7,7 +7,8 @@ export const BASE_IMAGE = 'docker.io/library/node:26.7.0-bookworm@sha256:e929171
 export const CODEX_VERSION = '0.153.4';
 export const CLAUDE_VERSION = '2.1.281';
 
-const context = dirname(fileURLToPath(import.meta.url));
+const containerDirectory = dirname(fileURLToPath(import.meta.url));
+const context = dirname(containerDirectory);
 const trustedImages = new Set<string>();
 
 export function assertBuiltAgentImage(imageId: string): void {
@@ -22,7 +23,8 @@ export function buildAgentImage(timeoutMs = 10 * 60_000): string {
     if (value <= 0) throw new Error('Agent image build exceeded its overall deadline.');
     return value;
   };
-  execFileSync('docker', ['build', '--pull=false', '--tag', AGENT_IMAGE, context], {
+  execFileSync('docker', ['build', '--pull=false', '--file', join(containerDirectory, 'Dockerfile'),
+    '--tag', AGENT_IMAGE, context], {
     timeout: remaining(), killSignal: 'SIGKILL', stdio: ['ignore', 'inherit', 'inherit'],
   });
   const inspect = JSON.parse(execFileSync('docker', ['image', 'inspect', AGENT_IMAGE], {

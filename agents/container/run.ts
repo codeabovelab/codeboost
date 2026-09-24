@@ -103,6 +103,7 @@ type Inspect = {
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
+  NetworkSettings: { Networks: Record<string, unknown> };
 };
 
 /** Validate daemon-resolved configuration before starting an agent. */
@@ -131,7 +132,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactSecurityOptions(host.SecurityOpt)
-    || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
+    || host.NetworkMode !== profile.network.name || host.PidMode !== '' || host.IpcMode !== 'private'
     || host.UTSMode !== '' || host.UsernsMode !== '' || host.CgroupnsMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
     || host.Memory !== 512 * 1024 * 1024 || host.MemorySwap !== 512 * 1024 * 1024
@@ -146,6 +147,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
     || host.Runtime !== 'runc')
     throw new Error('Container daemon configuration is missing required lockdown.');
+  if (JSON.stringify(Object.keys(inspect.NetworkSettings.Networks)) !== JSON.stringify([profile.network.name]))
+    throw new Error('Container network attachment changed.');
   const tmpfs = host.Tmpfs ?? {};
   const expectedTmpfs = new Map([
     ['/tmp', ['rw', 'nosuid', 'nodev', 'size=33554432', 'nr_inodes=4096', 'mode=1777']],
@@ -223,7 +226,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   const imageEnvironment = new Map((image?.Config?.Env ?? []).map(value => [value.slice(0, value.indexOf('=')), value.slice(value.indexOf('=') + 1)]));
   const allowedEnvironment = new Set(['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'CODEBOOST_PHASE', 'CODEBOOST_VENDOR',
     'CODEBOOST_WORK_BYTES', 'CODEBOOST_WORK_INODES', 'CODEBOOST_METADATA_BYTES', 'CODEBOOST_METADATA_INODES',
-    'npm_config_cache', 'XDG_CACHE_HOME', ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
+    'npm_config_cache', 'XDG_CACHE_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
+    ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
   if (new Set(names).size !== names.length || names.some(name => !allowedEnvironment.has(name)))
     throw new Error('Container includes an unexpected environment variable.');
   if (environment.get('PATH') !== imageEnvironment.get('PATH')
@@ -234,7 +238,10 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || environment.get('CODEBOOST_METADATA_BYTES') !== String(profile.filesystems.metadataBytes)
     || environment.get('CODEBOOST_METADATA_INODES') !== String(profile.filesystems.metadataInodes)
     || environment.get('npm_config_cache') !== '/tmp/npm-cache'
-    || environment.get('XDG_CACHE_HOME') !== '/tmp/xdg-cache')
+    || environment.get('XDG_CACHE_HOME') !== '/tmp/xdg-cache'
+    || environment.get('HTTPS_PROXY') !== profile.network.proxyUrl
+    || environment.get('HTTP_PROXY') !== profile.network.proxyUrl
+    || environment.get('NO_PROXY') !== 'localhost,127.0.0.1')
     throw new Error('Container isolation environment changed.');
   if (profile.vendor === 'codex' && (names.includes('CLAUDE_CODE_OAUTH_TOKEN')
     || environment.get('CODEX_HOME') !== '/run/codeboost-auth/codex'))

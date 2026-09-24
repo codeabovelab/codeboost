@@ -6,6 +6,8 @@ import { join } from 'node:path';
 import { assertCapturedInvocation, type InvocationInput, type Phase } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
+import { assertVendorNetwork, type VendorNetwork } from '../network/network.ts';
+import { assertPhasePolicy, type PhasePolicy } from '../policy.ts';
 export interface ContainerProfile {
   readonly name: string;
   readonly args: readonly string[];
@@ -17,6 +19,8 @@ export interface ContainerProfile {
   readonly codexAuthFile?: string;
   readonly command: readonly string[];
   readonly ownershipId: string;
+  readonly network: VendorNetwork;
+  readonly policy: PhasePolicy;
 }
 export interface ProfileOptions {
   readonly invocation: InvocationInput;
@@ -26,6 +30,8 @@ export interface ProfileOptions {
   readonly imageId: string;
   readonly codexAuthFile?: string;
   readonly claudeToken?: string;
+  readonly network: VendorNetwork;
+  readonly policy: PhasePolicy;
 }
 
 interface FileIdentity {
@@ -40,7 +46,8 @@ interface FileIdentity {
 }
 interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity;
   readonly cleanupDirectories: readonly string[]; readonly filesystems: TaskFilesystems;
-  readonly clone: InvocationInput['clone']; readonly deadline: number }
+  readonly clone: InvocationInput['clone']; readonly deadline: number; readonly network: VendorNetwork;
+  readonly policy: PhasePolicy; readonly invocation: InvocationInput }
 type InputIdentity = Pick<ProfileIdentity, 'inputDirectory' | 'schema'>;
 interface InputCapture extends InputIdentity { readonly content: Buffer }
 const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
@@ -109,6 +116,8 @@ export function assertContainerProfile(profile: ContainerProfile): void {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
   assertTaskFilesystems(expected.filesystems, expected.clone);
+  assertVendorNetwork(expected.network, profile.vendor);
+  assertPhasePolicy(expected.policy, expected.invocation);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
     throw new Error('Schema input changed after the profile was captured.');
@@ -156,6 +165,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     throw new Error('Container profile requires the immutable built image ID.');
   assertBuiltAgentImage(options.imageId);
   assertTaskFilesystems(filesystems, invocation.clone);
+  assertVendorNetwork(options.network, invocation.vendor);
+  assertPhasePolicy(options.policy, invocation);
   const sourceInput = captureInput(options.inputDirectory);
   if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
     throw new Error('Codex requires only its auth file.');
@@ -191,9 +202,11 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=128', '--memory=512m', '--memory-swap=512m',
       '--cpus=1', '--shm-size=16m', '--ipc=private', '--cgroupns=private',
-      '--network=none', '--env', 'HOME=/home/codeboost', '--env', `CODEBOOST_PHASE=${invocation.phase}`,
+      `--network=${options.network.name}`, '--env', 'HOME=/home/codeboost', '--env', `CODEBOOST_PHASE=${invocation.phase}`,
       '--label', `io.codeboost.invocation=${ownershipId}`,
       '--env', `CODEBOOST_VENDOR=${invocation.vendor}`, '--env', 'npm_config_cache=/tmp/npm-cache',
+      '--env', `HTTPS_PROXY=${options.network.proxyUrl}`, '--env', `HTTP_PROXY=${options.network.proxyUrl}`,
+      '--env', 'NO_PROXY=localhost,127.0.0.1',
       '--env', `CODEBOOST_WORK_BYTES=${filesystems.workBytes}`, '--env', `CODEBOOST_WORK_INODES=${filesystems.workInodes}`,
       '--env', `CODEBOOST_METADATA_BYTES=${filesystems.metadataBytes}`, '--env', `CODEBOOST_METADATA_INODES=${filesystems.metadataInodes}`,
       '--env', 'XDG_CACHE_HOME=/tmp/xdg-cache',
@@ -212,11 +225,11 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
       phase: invocation.phase, vendor: invocation.vendor,
       filesystems: capturedFilesystems, inputDirectory: inputIdentity.inputDirectory, codexAuthFile,
-      command: Object.freeze([...options.command]), ownershipId });
+      command: Object.freeze([...options.command]), ownershipId, network: options.network, policy: options.policy });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,
-      deadline: invocation.deadline }));
+      deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
     try { removeOwnedDirectories(cleanupDirectories); }
