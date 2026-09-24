@@ -228,6 +228,20 @@ it.each([false, 'required', []])('fails closed for malformed classic protection 
   expect(state.rulesKnown).toBe(false);
 });
 
+it('fails closed for a ruleset entry without a type', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{}]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: true, checks: [] } });
+    if (joined.includes('/timeline')) return JSON.stringify([[]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(false);
+});
+
 it('does not let an inspection started before merge repopulate the cache', async () => {
   let pullReads = 0, releaseTimeline!: (value: string) => void, markTimelineStarted!: () => void;
   const timelineStarted = new Promise<void>(resolve => { markTimelineStarted = resolve; });

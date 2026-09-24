@@ -6,11 +6,19 @@ import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
+import { startServer } from '../web/server.ts';
 // Each integration case performs several bounded real-Git reads.
 vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
 afterEach(()=>{services.splice(0).forEach(service=>service.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));});
 function fixture(){const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const config=createDemo(join(root,'demo'));const service=new ReviewService(config);services.push(service);return {service,config};}
+it('closes the review service when merge gateway construction fails', async()=>{
+ const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const demo=createDemo(join(root,'demo'));
+ const close=vi.spyOn(ReviewService.prototype,'close');
+ const config={...demo,demo:false,github:{repository:'owner/repo',pullRequest:7,issue:3,method:'invalid' as 'merge'}};
+ await expect(startServer(config,0)).rejects.toThrow(/merge method/i);
+ expect(close).toHaveBeenCalledTimes(1);close.mockRestore();
+});
 it('expires a browser token after another view assigns a segment and recomputes scope honestly',()=>{
  const {service}=fixture();const view=service.load();const foreign=view.segments.find(s=>s.row==='Unplanned')!;
  const next=service.act({action:'assign',key:foreign.key,item:'P1',token:view.token});
