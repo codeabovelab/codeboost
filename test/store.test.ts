@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
 import { once } from 'node:events';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it } from 'vitest';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
@@ -18,9 +19,10 @@ const dirs: string[] = [], stores: Store[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function directory() { const dir = mkdtempSync(join(tmpdir(), 'codeboost-store-')); dirs.push(dir); return dir; }
 function open(path: string) { const store = new Store(path); stores.push(store); return store; }
+function close(store: Store) { store.close(); stores.splice(stores.indexOf(store), 1); }
 function fixture() { const path = join(directory(), 'state.sqlite'); const store = open(path); store.createPlan(JSON.stringify(plan()), 'json', context, oid(1), oid(2)); return { path, store }; }
 const state = (store: Store) => ({ revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id });
-function ready(store: Store) { const id = store.beginSuggestions(identity, 1); store.completeSuggestions(identity, id, reply()); return id; }
+function ready(store: Store) { const id = store.beginSuggestions(identity, state(store)); store.completeSuggestions(identity, id, reply()); return id; }
 it('allocates revisions in SQLite, survives reopen, and keeps old revisions and snapshots immutable', () => {
   const { store, path } = fixture(); const first = store.getSnapshot(identity);
   expect(store.getPlan(identity).revision).toBe(1);
@@ -36,13 +38,61 @@ it('binds suggestion requests before the reply and rejects cross-plan, cancelled
   const { store } = fixture(); const id = ready(store), sibling = ready(store);
   const other = { ...identity, planId: 'other' }; store.createPlan(JSON.stringify(plan()), 'json', { ...context, identity: other }, oid(1), oid(2));
   expect(() => store.applySuggestion(other, id, 0, { ...context, identity: other })).toThrow(/unavailable/);
-  const cancelled = store.beginSuggestions(identity, 1); store.cancelSuggestions(identity, cancelled);
+  const cancelled = store.beginSuggestions(identity, state(store)); store.cancelSuggestions(identity, cancelled);
+  expect(store.getSuggestions(identity, cancelled)).toMatchObject({ state: 'cancelled', reason: 'Suggestion cancelled.' });
   expect(() => store.completeSuggestions(identity, cancelled, reply())).toThrow(/stale|cancelled/);
-  const delayed = store.beginSuggestions(identity, 1);
+  const delayed = store.beginSuggestions(identity, state(store));
   expect(store.applySuggestion(identity, id, 0, context).revision).toBe(2);
   expect(() => store.applySuggestion(identity, id, 0, context)).toThrow(/unavailable/);
   expect(() => store.applySuggestion(identity, sibling, 0, context)).toThrow(/unavailable/);
+  expect(store.getSuggestions(identity, sibling)).toMatchObject({ state: 'invalidated', reason: 'Plan revision changed.', reply: reply() });
   expect(() => store.completeSuggestions(identity, delayed, reply())).toThrow(/stale/);
+});
+it('preserves a completed request when stale pending cleanup loses the race', () => {
+  const { store, path } = fixture(); const other = open(path), expected = state(store);
+  const id = store.beginSuggestions(identity, expected);
+  other.completeSuggestions(identity, id, reply());
+  expect(store.settleSuggestion(identity, id, expected, { state: 'failed', reason: 'Provider failed.' })).toBe(false);
+  expect(store.getSuggestions(identity, id)).toMatchObject({ state: 'ready', snapshotId: expected.snapshotId, reason: null, reply: reply() });
+  expect(store.applySuggestion(identity, id, 0, context).revision).toBe(2);
+});
+it('persists the winning terminal reason and prevents a late completion from reviving it', () => {
+  const { store, path } = fixture(); const other = open(path), expected = state(store);
+  const id = store.beginSuggestions(identity, expected);
+  expect(store.settleSuggestion(identity, id, expected, { state: 'failed', reason: 'Provider exited.' })).toBe(true);
+  expect(() => other.completeSuggestions(identity, id, reply())).toThrow(/stale|cancelled|complete/);
+  const recovered = open(path);
+  expect(recovered.getSuggestions(identity, id)).toMatchObject({ state: 'failed', snapshotId: expected.snapshotId, reason: 'Provider exited.', reply: null });
+  expect(() => recovered.applySuggestion(identity, id, 0, context)).toThrow(/unavailable/);
+});
+it('retains cancellation reasons across restart and never revives cancelled work', () => {
+  const { store, path } = fixture(), expected = state(store);
+  const id = store.beginSuggestions(identity, expected);
+  expect(store.settleSuggestion(identity, id, expected, { state: 'cancelled', reason: 'Runner shut down.' })).toBe(true);
+  close(store);
+  const recovered = open(path);
+  expect(recovered.getSuggestions(identity, id)).toMatchObject({ state: 'cancelled', reason: 'Runner shut down.', snapshotId: expected.snapshotId });
+  expect(() => recovered.completeSuggestions(identity, id, reply())).toThrow(/stale|cancelled|complete/);
+});
+it('migrates unbound active requests to terminal history instead of reviving them', () => {
+  const { store, path } = fixture(); const id = ready(store);
+  close(store);
+  const legacy = new DatabaseSync(path);
+  legacy.exec('ALTER TABLE requests DROP COLUMN reason; ALTER TABLE requests DROP COLUMN snapshot_id; PRAGMA user_version=3;');
+  legacy.close();
+  const recovered = open(path);
+  expect(recovered.getSuggestions(identity, id)).toEqual({ state: 'invalidated', revision: 1, snapshotId: null, reply: reply(), reason: 'Request predates snapshot binding.' });
+  expect(() => recovered.applySuggestion(identity, id, 0, context)).toThrow(/unavailable/);
+});
+it('invalidates pending and ready requests when another connection advances the snapshot', () => {
+  const { store, path } = fixture(); const other = open(path), expected = state(store);
+  const pending = store.beginSuggestions(identity, expected), completed = store.beginSuggestions(identity, expected);
+  store.completeSuggestions(identity, completed, reply());
+  other.recordHistory(identity, expected, oid(1), oid(3), []);
+  expect(store.getSuggestions(identity, pending)).toMatchObject({ state: 'invalidated', snapshotId: expected.snapshotId, reason: 'Repository snapshot changed.', reply: null });
+  expect(store.getSuggestions(identity, completed)).toMatchObject({ state: 'invalidated', snapshotId: expected.snapshotId, reason: 'Repository snapshot changed.', reply: reply() });
+  expect(() => store.completeSuggestions(identity, pending, reply())).toThrow(/stale|cancelled|complete/);
+  expect(() => store.applySuggestion(identity, completed, 0, context)).toThrow(/unavailable/);
 });
 it('rolls back invalid edits without consuming the request or allocating a revision', () => {
   const { store } = fixture(); const id = ready(store);
@@ -139,7 +189,7 @@ it('recovers a committed suggestion after abrupt process exit and discards an in
     const store = new Store(process.argv[1]);
     const context = {...${JSON.stringify(context)}, pathKey: p => p};
     store.createPlan(${JSON.stringify(JSON.stringify(plan()))}, 'json', context, '${oid(1)}', '${oid(2)}');
-    const id = store.beginSuggestions(context.identity, 1);
+    const id = store.beginSuggestions(context.identity, {revision: 1, snapshotId: store.getSnapshot(context.identity).id});
     store.completeSuggestions(context.identity, id, ${JSON.stringify(reply())});
     process.stdout.write(id); process.exit(0);`;
   const id = execFileSync(process.execPath, ['--input-type=module', '-e', source, path], { encoding: 'utf8' });
