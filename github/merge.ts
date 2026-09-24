@@ -300,6 +300,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (!last || last.type !== 'RemovedFromMergeQueueEvent') throw new Error('GitHub did not confirm a queued, removed, failed, or merged state.');
       return { state: 'removed', reviewedHead, removedAt: last.createdAt, reason: last.reason! };
     } catch (error) {
+      if (options.signal?.aborted) throw options.signal.reason;
       if (timeout.signal.aborted && !options.signal?.aborted) throw new Error('GitHub merge-queue inspection timed out.');
       throw error;
     } finally { clearTimeout(timer); }

@@ -240,7 +240,7 @@ it('bounds merge-queue reads with one overall deadline', async () => {
 it('preserves caller cancellation while reading merge-queue state', async () => {
   const controller = new AbortController();
   const run = async (_args: readonly string[], options?: { signal?: AbortSignal }) => new Promise<string>((_resolve, reject) => {
-    options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true });
+    options?.signal?.addEventListener('abort', () => reject(new Error('generic runner abort')), { once: true });
   });
   const pending = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'), { signal: controller.signal });
   controller.abort(new Error('closing queue watcher'));
