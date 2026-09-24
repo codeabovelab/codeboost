@@ -54,10 +54,9 @@ export class MergeCoordinator {
   }
 
   #freshReviewComplete(attempt: MergeAttempt): boolean {
-    if (!attempt.requiresFreshReview) return true;
     const { store, config } = this.service;
     const plan = store.getPlan(config.identity), snapshot = store.getSnapshot(config.identity);
-    if (snapshot.id === attempt.snapshotId) return false;
+    if (snapshot.id === attempt.snapshotId) return !attempt.requiresFreshReview;
     const approvals = store.getReview(config.identity).approvals;
     return plan.items.every(item => approvals.some(approval => approval.item === item.id && approval.revision === plan.revision && approval.snapshotId === snapshot.id));
   }
@@ -92,8 +91,8 @@ export class MergeCoordinator {
       blockers.unshift({ code: 'queue-active', message: attempt.state === 'submitting' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' });
     } else if (attempt?.state === 'merged') {
       blockers.unshift({ code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' });
-    } else if (attempt?.requiresFreshReview && !this.#freshReviewComplete(attempt)) {
-      blockers.unshift({ code: 'queue-head', message: attempt.reason ?? 'The pull request head changed. Refresh and review the replacement head.' });
+    } else if (attempt && !this.#freshReviewComplete(attempt)) {
+      blockers.unshift({ code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' });
     }
     const active = attempt?.state === 'submitting' || attempt?.state === 'queued' || attempt?.state === 'merged';
     const retry = !!queue?.retryable;

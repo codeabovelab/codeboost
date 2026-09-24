@@ -348,10 +348,12 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (!Object.hasOwn(pull, 'mergeQueueEntry')) throw new Error('GitHub returned incomplete merge-queue data.');
       const entry = pull.mergeQueueEntry;
       const attemptEvents = events;
-      const hasCurrentAdd = attemptEvents.some(event => event.type === 'AddedToMergeQueueEvent');
+      const addCount = attemptEvents.filter(event => event.type === 'AddedToMergeQueueEvent').length;
+      const hasCurrentAdd = addCount === 1 && attemptEvents[0]?.type === 'AddedToMergeQueueEvent';
+      const singleSequence = hasCurrentAdd && (attemptEvents.length === 1 || (attemptEvents.length === 2 && attemptEvents[1]?.type === 'RemovedFromMergeQueueEvent'));
+      if (correlated && !singleSequence) throw new Error(addCount > 1 ? 'GitHub returned multiple enqueue sequences after the current attempt cursor.' : 'GitHub did not return one complete enqueue sequence for the current attempt.');
       if (pull.state === 'MERGED') {
         if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');
-        if (correlated && !hasCurrentAdd) throw new Error('GitHub did not return a merged event sequence for the current enqueue attempt.');
         return { state: 'merged', reviewedHead, mergedAt: timestamp(pull.mergedAt, 'merge completion time') };
       }
       if (pull.mergedAt !== null) throw new Error('GitHub returned inconsistent merge completion data.');
@@ -362,7 +364,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         if (typeof value.id !== 'string' || !value.id || !['AWAITING_CHECKS','LOCKED','MERGEABLE','QUEUED','UNMERGEABLE'].includes(String(value.state)) || !Number.isSafeInteger(value.position) || (value.position as number) < 0)
           throw new Error('GitHub returned an invalid merge-queue entry.');
         const enqueuedAt = timestamp(value.enqueuedAt, 'merge-queue entry time');
-        if (correlated && !hasCurrentAdd) throw new Error('GitHub did not return a queue entry for the current enqueue attempt.');
+        if (correlated && attemptEvents.length !== 1) throw new Error('GitHub returned an ambiguous active event sequence for the current enqueue attempt.');
         const queueHead = fullSha(value.headCommit?.oid, 'merge-queue head SHA');
         const entryHead = fullSha(value.pullRequest?.headRefOid, 'merge-queue entry pull request head SHA');
         if (value.pullRequest?.number !== this.config.pullRequest || queueHead !== expectedHead || entryHead !== expectedHead) throw new Error('The merge-queue entry does not match the reviewed pull request head.');
@@ -376,7 +378,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       const last = (correlated ? attemptEvents : events).at(-1);
       if (!last || last.type !== 'RemovedFromMergeQueueEvent') throw new Error('GitHub did not confirm a queued, removed, failed, or merged state.');
       if (last.beforeHead !== expectedHead) throw new Error('The merge-queue removal does not match the reviewed pull request head.');
-      if (correlated && !hasCurrentAdd) throw new Error('GitHub did not return a terminal event for the current enqueue attempt.');
+      if (correlated && (attemptEvents.length !== 2 || attemptEvents[1]?.type !== 'RemovedFromMergeQueueEvent')) throw new Error('GitHub returned an ambiguous terminal event sequence for the current enqueue attempt.');
       return { state: 'removed', reviewedHead, removedAt: last.createdAt, reason: last.reason! };
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;

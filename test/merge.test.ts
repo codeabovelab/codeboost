@@ -189,6 +189,18 @@ it.each([
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('requires current-snapshot approvals after an ordinary queue removal and force-push', async () => {
+  const h = queueHarness([{ state: 'removed', reviewedHead: sha('b'), removedAt: '2026-09-24T08:05:00Z', reason: 'Checks failed.' }]);
+  try {
+    await h.coordinator.merge(h.view().token);
+    await h.coordinator.pollQueue();
+    h.replaceHead(sha('c'));
+    expect((await h.coordinator.status(h.view())).action).toBeNull();
+    h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'replacement-review' }], []);
+    expect((await h.coordinator.status(h.view())).action).toBe('merge');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('requires a fresh review after the queued head is replaced', async () => {
   const h = queueHarness([new Error('The pull request head changed after review.')]);
   try {
@@ -416,7 +428,7 @@ it('rejects a removal event at the pre-enqueue timeline cursor', async () => {
     state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [] },
   });
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
-  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_removed_old' })).rejects.toThrow(/current enqueue attempt/i);
+  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_removed_old' })).rejects.toThrow(/current attempt/i);
 });
 
 it('recovers terminal state after the stored cursor falls outside the recent event window', async () => {
@@ -450,6 +462,19 @@ it('paginates forward from the stored cursor to the terminal event', async () =>
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
   await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before' })).resolves.toMatchObject({ state: 'removed', reason: 'Checks failed' });
   expect(calls).toBe(2);
+});
+
+it('fails closed when multiple enqueue sequences follow the stored cursor', async () => {
+  const run = async () => queueFixture({
+    state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [
+      { id: 'MQEV_add_1', __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T09:00:00Z' },
+      { id: 'MQEV_remove_1', __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T09:01:00Z', reason: 'First removal', beforeCommit: { oid: sha('b') } },
+      { id: 'MQEV_add_2', __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T09:02:00Z' },
+      { id: 'MQEV_remove_2', __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T09:03:00Z', reason: 'Second removal', beforeCommit: { oid: sha('b') } },
+    ] },
+  });
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
+  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before' })).rejects.toThrow(/multiple|current enqueue attempt/i);
 });
 
 it('reports merged only when GitHub confirms the reviewed head was merged', async () => {
