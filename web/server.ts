@@ -4,11 +4,15 @@ import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
+import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
+import { MergeCoordinator } from '../runner/merge.ts';
 const publicRoot = new URL('./public/', import.meta.url);
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent) {
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway) {
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
+  if (config.github && config.github.issue !== service.store.getPlan(config.identity).issue) { service.close(); throw new Error('The GitHub merge issue must match the stored plan issue.'); }
   const questions=new Questions(service,questionAgent);
-  const load=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
+  const merges = mergeGateway || config.github ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
+  const load=async()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)})),merge:merges?await merges.displayStatus(view):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
@@ -26,7 +30,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
-        if (req.method === 'GET' && path === '/api/review') { json(200, load()); return; }
+        if (req.method === 'GET' && path === '/api/review') { json(200, await load()); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
         for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
@@ -35,7 +39,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
-          questions.start(input.id,view);json(200,load());return;
+          questions.start(input.id,view);json(200,await load());return;
+        }
+        if(input.action==='merge') {
+          if(!merges)throw new Error('Merging is not configured for this review.');
+          const merged=await merges.merge(input.token);json(200,{...(await load()),mergeResult:merged.result});return;
         }
         const view=service.act(input);
         if(view.createdNoteId && input.kind==='question') {
@@ -43,7 +51,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             // The saved question remains visible and retryable when capacity is reached.
           }
         }
-        json(200,load());return;
+        json(200,await load());return;
       }
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };

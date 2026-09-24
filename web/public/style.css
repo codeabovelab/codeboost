@@ -84,12 +84,14 @@ button:disabled {
   outline-offset: 2px;
 }
 button.primary,
-#approve {
+#approve,
+#merge:not(:disabled) {
   background: var(--primary);
   color: var(--on-primary);
   border-color: var(--primary);
 }
-#approve:hover {
+#approve:hover,
+#merge:not(:disabled):hover {
   background: var(--hover);
 }
 [hidden] {

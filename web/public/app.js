@@ -66,6 +66,8 @@ function showFailure(message) {
   ])
     $(id).innerHTML = "";
   $("approve").hidden = true;
+  $("merge").hidden = true;
+  $("merge-details").hidden = true;
   $("message").disabled = true;
   $("save-note").disabled = true;
   $("previous").disabled = true;
@@ -143,6 +145,16 @@ function render() {
     `#${data.plan.issue} ${data.plan.summary} · r${data.plan.revision}`;
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
+  const merge = data.merge;
+  $("merge").hidden = !merge?.available;
+  $("merge-details").hidden = !merge?.available || merge.ready;
+  if (merge?.available) {
+    $("merge").disabled = !merge.ready;
+    $("merge").textContent = merge.ready
+      ? "Merge PR"
+      : `${merge.blockers.length} blocker${merge.blockers.length === 1 ? "" : "s"}`;
+    $("merge-details").textContent = "Review blockers";
+  }
   $("banner").textContent = data.demo
     ? "Demo repository · real Git changes and local SQLite storage. No tests or AI review have been run for this demo."
     : "";
@@ -365,6 +377,28 @@ $("approve").onclick = () => {
     });
 };
 $("reload").onclick = refresh;
+$("merge-details").onclick = () => {
+  if (!data?.merge?.available) return;
+  showDialog(
+    `<h2>Merge blockers</h2><ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
+  );
+};
+$("merge").onclick = async () => {
+  if (busy || !data?.merge?.ready || !window.confirm("Merge this reviewed pull request?")) return;
+  busy = true;
+  $("merge").disabled = true;
+  try {
+    const updated = await api("/api/action", { action: "merge", token: data.token });
+    data = updated;
+    render();
+    $("banner").textContent = `Merged pull request. ${updated.mergeResult.url}`;
+  } catch (error) {
+    render();
+    $("banner").textContent = `Merge blocked. ${error.message}`;
+  } finally {
+    busy = false;
+  }
+};
 $("review-link").onclick = (event) => {
   event.preventDefault();
   refresh();

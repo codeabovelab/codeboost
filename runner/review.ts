@@ -6,8 +6,9 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys } from '../core/approvals.ts';
+import type { GhMergeConfig } from '../github/merge.ts';
 
-export interface ReviewConfig { database: string; repository: string; identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean }
+export interface ReviewConfig { database: string; repository: string; identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
 export class ReviewService {
   store: Store;
   config: ReviewConfig;
