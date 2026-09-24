@@ -113,3 +113,15 @@ it('serializes only the four issue contract fields, excluding API metadata', () 
 it('requires revision one for an initial draft with no prior plan', () => {
   expect(() => prepareDraft({ ...input(), revision: 9 })).toThrow(/Initial draft/);
 });
+it('copies only stable identity fields into the immutable provider request', () => {
+  const value = input(), extra = { secret: 'must not reach provider' };
+  Object.assign(value.context.identity, { metadata: extra });
+  const prepared = prepareDraft(value);
+  expect(Object.keys(prepared.request.identity).sort()).toEqual(['planId', 'repositoryId', 'taskId']);
+  expect(prepared.request.identity).not.toHaveProperty('metadata');
+});
+it('rejects cyclic prompt data before serialization without overflowing the stack', () => {
+  const value = input(), cycle: any[] = []; cycle.push(cycle);
+  value.approvedLessons = cycle;
+  expect(() => prepareDraft(value)).toThrow(/too deep/);
+});
