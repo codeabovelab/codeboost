@@ -415,6 +415,11 @@ describe('real Docker agent isolation', () => {
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
+    const dnsArgs = valid.args.map(value => value === '--dns=127.0.0.1' ? '--dns=8.8.8.8' : value);
+    docker(...dnsArgs); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('DNS configuration');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+
     const imageIndex = valid.args.indexOf(imageId);
     const namespaceArgs = [...valid.args.slice(0, imageIndex), '--uts=host', ...valid.args.slice(imageIndex)];
     docker(...namespaceArgs); containers.add(valid.name);

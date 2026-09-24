@@ -7,8 +7,8 @@ import { ReviewService } from '../runner/review.ts';
 import { Questions } from '../runner/questions.ts';
 import { choiceKeys } from '../core/approvals.ts';
 import { agentArguments } from '../runner/question-agent.ts';
-// Real-Git context reads match the existing review integration suite budget.
-vi.setConfig({testTimeout:15000});
+// Real-Git context reads can overlap the Docker-backed isolation suite in a full run.
+vi.setConfig({testTimeout:30000});
 const roots:string[]=[], services:ReviewService[]=[], managers:Questions[]=[];
 afterEach(async()=>{for(const manager of managers.splice(0))await manager.close();services.splice(0).forEach(s=>s.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));vi.restoreAllMocks();});
 function waitForAbort(_prompt:string,signal:AbortSignal):Promise<string>{return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));}

@@ -101,7 +101,7 @@ type Inspect = {
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
-    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
+    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null; Dns: string[] };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
   NetworkSettings: { Networks: Record<string, unknown> };
 };
@@ -147,6 +147,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
     || host.Runtime !== 'runc')
     throw new Error('Container daemon configuration is missing required lockdown.');
+  if (JSON.stringify(host.Dns) !== JSON.stringify(['127.0.0.1']))
+    throw new Error('Container DNS configuration changed.');
   if (JSON.stringify(Object.keys(inspect.NetworkSettings.Networks)) !== JSON.stringify([profile.network.name]))
     throw new Error('Container network attachment changed.');
   const tmpfs = host.Tmpfs ?? {};

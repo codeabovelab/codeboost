@@ -49,6 +49,16 @@ describe('vendor-only egress', () => {
     expect(direct.stdout).toBe('000');
   }, 60_000);
 
+  it('does not forward arbitrary DNS even when the embedded resolver is addressed directly', () => {
+    const result = spawnSync('docker', ['run', '--rm', `--network=${network.name}`, '--dns=127.0.0.1',
+      '--entrypoint', 'node', imageId, '-e', [
+        "const dns=require('node:dns');dns.setServers(['127.0.0.11']);",
+        "dns.resolve4('example.com',(error)=>process.exit(error?0:1));",
+        'setTimeout(()=>process.exit(0),3000);',
+      ].join('')], { encoding: 'utf8', timeout: 10_000, stdio: ['ignore', 'pipe', 'pipe'] });
+    expect(result.status).toBe(0);
+  }, 30_000);
+
   it('rejects a copied network capability', () => {
     expect(() => createVendorNetwork(invocation, imageId, 0)).toThrow('positive integer');
     expect(() => assertVendorNetwork(network, invocation, undefined, 0)).toThrow('positive integer');
@@ -75,7 +85,10 @@ describe('vendor-only egress', () => {
     }
   }, 60_000);
 
-  it('rejects a proxy replaced with a host namespace before launch', () => {
+  it.each([
+    ['host namespace', ['--pid=host']],
+    ['extra Node environment', ['--env', 'NODE_OPTIONS=--trace-warnings']],
+  ] as const)('rejects a proxy replaced with %s before launch', (_label, extra) => {
     const replacementInvocation = captureInvocation({ ...invocation, attemptId: 'mutated-proxy-probe',
       deadline: Date.now() + 60_000 });
     const replacement = createVendorNetwork(replacementInvocation, imageId);
@@ -86,7 +99,7 @@ describe('vendor-only egress', () => {
       docker('rm', '--force', replacement.proxyContainer);
       docker('run', '--detach', '--name', replacement.proxyContainer, '--read-only', '--user', '10001:10001',
         '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
-        '--cpus=.25', '--pid=host', '--network', replacement.name, '--network-alias', 'codeboost-proxy',
+        '--cpus=.25', ...extra, '--network', replacement.name, '--network-alias', 'codeboost-proxy',
         '--label', `io.codeboost.egress=${allocation}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS.claude.join(',')}`,
         '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs');
       docker('network', 'connect', 'bridge', replacement.proxyContainer);

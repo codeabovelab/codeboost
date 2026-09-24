@@ -15,7 +15,7 @@ export interface VendorNetwork {
   readonly vendor: InvocationInput['vendor'];
 }
 interface NetworkIdentity { readonly allocationId: string; readonly imageId: string; readonly invocation: InvocationInput;
-  readonly subnet: string }
+  readonly subnet: string; readonly proxyIp: string }
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const deadline = (timeoutMs: number) => {
@@ -66,13 +66,17 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
         SecurityOpt?: string[]; Memory?: number; MemorySwap?: number; NanoCpus?: number; PidsLimit?: number;
         NetworkMode?: string; PidMode?: string; IpcMode?: string; UTSMode?: string; UsernsMode?: string;
         CgroupnsMode?: string; Devices?: unknown[] | null; DeviceRequests?: unknown[] | null };
-      NetworkSettings?: { Networks?: Record<string, unknown> }; Mounts?: unknown[] } | undefined;
+      NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }> }; Mounts?: unknown[] } | undefined;
+  const image = JSON.parse(docker(['image', 'inspect', identity.imageId], remaining()))[0] as
+    { Config?: { Env?: string[] } } | undefined;
   const inspectedNetwork = JSON.parse(docker(['network', 'inspect', network.name], remaining()))[0] as
     { Internal?: boolean; Driver?: string; Labels?: Record<string, string>; IPAM?: { Config?: Array<{ Subnet?: string }> };
       Containers?: Record<string, { Name?: string }> } | undefined;
   const networks = Object.keys(inspect?.NetworkSettings?.Networks ?? {}).sort();
   const endpoints = Object.values(inspectedNetwork?.Containers ?? {}).map(value => value.Name).sort();
   const allowedEndpoints = [network.proxyContainer, ...(agentName ? [agentName] : [])];
+  const expectedEnvironment = [...(image?.Config?.Env ?? []),
+    `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[network.vendor].join(',')}`].sort();
   if (!inspect?.State?.Running || inspect.Config?.Image !== identity.imageId || inspect.Config?.User !== '10001:10001'
     || inspect.Config?.Labels?.['io.codeboost.egress'] !== identity.allocationId || !inspect.HostConfig?.ReadonlyRootfs
     || inspect.HostConfig.Privileged || !inspect.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
@@ -85,10 +89,10 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
     || inspect.HostConfig.UsernsMode !== '' || inspect.HostConfig.CgroupnsMode !== 'private'
     || (inspect.HostConfig.Devices?.length ?? 0) !== 0 || (inspect.HostConfig.DeviceRequests?.length ?? 0) !== 0
     || JSON.stringify(networks) !== JSON.stringify(['bridge', network.name].sort()) || inspect.Mounts?.length
-    || inspect.Config?.Entrypoint?.[0] !== 'node'
+    || JSON.stringify(inspect.Config?.Entrypoint) !== JSON.stringify(['node'])
     || JSON.stringify(inspect.Config?.Cmd) !== JSON.stringify(['/usr/local/lib/codeboost-egress-proxy.mjs'])
-    || inspect.Config.Env?.filter(value => value.startsWith('CODEBOOST_ALLOWED_HOSTS=')).length !== 1
-    || !inspect.Config.Env?.includes(`CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[network.vendor].join(',')}`)
+    || JSON.stringify([...(inspect.Config.Env ?? [])].sort()) !== JSON.stringify(expectedEnvironment)
+    || inspect.NetworkSettings?.Networks?.[network.name]?.IPAddress !== identity.proxyIp
     || !inspectedNetwork?.Internal || inspectedNetwork.Driver !== 'bridge'
     || inspectedNetwork.Labels?.['io.codeboost.egress'] !== identity.allocationId
     || inspectedNetwork.IPAM?.Config?.length !== 1 || inspectedNetwork.IPAM.Config[0]?.Subnet !== identity.subnet
@@ -129,8 +133,13 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       "socket.once('connect',()=>{socket.destroy();process.exit(0)});",
       "socket.once('error',()=>{socket.destroy();if(++attempts===50)process.exit(1);setTimeout(check,20)})};check();",
     ].join('')], remaining());
-    const network = Object.freeze({ name, proxyContainer, proxyUrl: 'http://codeboost-proxy:3128', vendor });
-    identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet }));
+    const proxyInspect = JSON.parse(docker(['container', 'inspect', proxyContainer], remaining()))[0] as
+      { NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }> } } | undefined;
+    const proxyIp = proxyInspect?.NetworkSettings?.Networks?.[name]?.IPAddress;
+    if (!proxyIp || !/^10\.254\.\d{1,3}\.\d{1,3}$/.test(proxyIp))
+      throw new Error('Vendor proxy did not receive its expected internal address.');
+    const network = Object.freeze({ name, proxyContainer, proxyUrl: `http://${proxyIp}:3128`, vendor });
+    identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet, proxyIp }));
     validateVendorNetwork(network, invocation, undefined, remaining);
     remaining();
     return network;
