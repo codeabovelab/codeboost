@@ -15,6 +15,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Preserve the original timeout, cancellation, and shutdown reason through every layer. Do not replace actionable errors with generic cancellation text.
 - Begin shutdown by rejecting new work at the outer admission boundary. Drain already-admitted HTTP requests, then cancel and await jobs, then close storage.
 - Polling endpoints should read only the state they need. Do not rebuild Git history or the full review merely to retrieve background-job status.
+- Back off recurring external-status polling to a bounded cap. Reset the interval only after a meaningful lifecycle change or explicit user action.
 
 ## Async review UI
 

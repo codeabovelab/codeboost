@@ -21,7 +21,10 @@ let data,
   busy = false;
 let reviewGeneration = 0;
 let mergeGeneration = 0,
-  mergePollTimer = null;
+  mergePollTimer = null,
+  mergePollState = null,
+  mergePollDelay = 2000;
+const mergePollMaximumDelay = 30000;
 const drafts = new Map();
 const attachments = new Map();
 let snippetSelection = null;
@@ -53,6 +56,8 @@ function showFailure(message) {
   mergeGeneration++;
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
+  mergePollState = null;
+  mergePollDelay = 2000;
   data = null;
   snippetSelection = null;
   $("selection-actions").hidden = true;
@@ -85,6 +90,8 @@ async function refresh() {
   busy = true;
   reviewGeneration++;
   mergeGeneration++;
+  mergePollState = null;
+  mergePollDelay = 2000;
   renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
   try {
@@ -129,10 +136,21 @@ function renderMerge() {
 function scheduleMergePoll() {
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
-  if (["submitting", "queued"].includes(data?.merge?.queue?.state)) {
+  const state = data?.merge?.queue?.state;
+  if (["submitting", "queued"].includes(state)) {
+    if (state !== mergePollState) {
+      mergePollState = state;
+      mergePollDelay = 2000;
+    }
     const generation = mergeGeneration;
-    mergePollTimer = setTimeout(() => pollMergeQueue(generation), 500);
+    mergePollTimer = setTimeout(() => pollMergeQueue(generation), mergePollDelay);
+  } else {
+    mergePollState = null;
+    mergePollDelay = 2000;
   }
+}
+function backOffMergePoll() {
+  mergePollDelay = Math.min(mergePollDelay * 2, mergePollMaximumDelay);
 }
 async function pollMergeQueue(generation) {
   try {
@@ -144,17 +162,19 @@ async function pollMergeQueue(generation) {
       data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." }] };
       $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
     } else if (queue?.state === "removed" || queue?.state === "failed") {
-      data.merge = { ...data.merge, ready: queue.retryable, action: queue.retryable ? "retry" : null, blockers: queue.retryable ? [] : [{ code: "queue-terminal", message: queue.reason }] };
-      $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason}`;
+      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` }] };
+      $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
     } else if (queue?.observationError) {
       $("banner").textContent = `Merge remains queued. ${queue.observationError}`;
     } else if (queue?.state === "queued") {
       $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
     }
+    if (queue?.state === mergePollState) backOffMergePoll();
     renderMerge();
   } catch (error) {
     if (generation !== mergeGeneration || !data?.merge?.available) return;
     $("banner").textContent = `Could not refresh merge-queue status. ${error.message}`;
+    backOffMergePoll();
     scheduleMergePoll();
   }
 }
@@ -163,6 +183,8 @@ async function act(command) {
   busy = true;
   reviewGeneration++;
   mergeGeneration++;
+  mergePollState = null;
+  mergePollDelay = 2000;
   renderAttachment();
   try {
     rememberDraft();
@@ -438,6 +460,8 @@ $("merge").onclick = async () => {
   if (busy || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
   busy = true;
   mergeGeneration++;
+  mergePollState = null;
+  mergePollDelay = 2000;
   $("merge").disabled = true;
   try {
     rememberDraft();
