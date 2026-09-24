@@ -63,6 +63,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Validate every field used to classify an external record as clear, including enum values and required nullable fields. Partial records and malformed policy objects must fail closed.
 - Validate coupled lifecycle fields as allowed combinations. A terminal-looking conclusion must not override an active or unknown status.
 - Treat a successful external command as the transition it actually performed. If it can enqueue or schedule work, model and verify that lifecycle before reporting the final action as complete.
+- For safety-critical API responses, require and validate every requested field before any early return, including terminal-success paths. Treat an omitted field differently from an explicit `null` allowed by the API contract.
 - Once an irreversible external command succeeds, do not convert later refresh or rendering failures into action failure. Return the committed result, keep repeat controls disabled, and require fresh confirmation of terminal state.
 - Track an in-flight irreversible subprocess as part of server shutdown. Abort it, await its settlement, and only then close the state it depends on.
 - Set the shutdown admission flag before snapshotting active work, and enforce it again at the irreversible action boundary for requests admitted before shutdown began.

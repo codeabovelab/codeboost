@@ -162,6 +162,113 @@ it('rejects an unsupported runtime merge method', () => {
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21, method: 'typo' as 'merge' })).toThrow(/merge method/i);
 });
 
+const queueFixture = (pullRequest: Record<string, unknown>) => JSON.stringify({
+  data: { repository: { pullRequest: { number: 7, headRefOid: sha('b'), ...pullRequest } } },
+});
+
+it.each([
+  ['QUEUED', 'queued'],
+  ['AWAITING_CHECKS', 'queued'],
+  ['LOCKED', 'queued'],
+  ['MERGEABLE', 'queued'],
+] as const)('maps the recorded %s merge-queue entry to %s', async (entryState, expectedState) => {
+  const run = async () => queueFixture({
+    state: 'OPEN', mergedAt: null, timelineItems: { nodes: [{ __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' }] },
+    mergeQueueEntry: { id: 'MQE_1', state: entryState, position: 2, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('b') }, pullRequest: { number: 7, headRefOid: sha('b') } },
+  });
+  const observation = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'));
+  expect(observation).toEqual({ state: expectedState, reviewedHead: sha('b'), entryId: 'MQE_1', phase: entryState, position: 2, enqueuedAt: '2026-09-24T08:00:00Z', queueHead: sha('b') });
+});
+
+it('maps a recorded unmergeable queue entry to a failed terminal state', async () => {
+  const run = async () => queueFixture({
+    state: 'OPEN', mergedAt: null, timelineItems: { nodes: [{ __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' }] },
+    mergeQueueEntry: { id: 'MQE_1', state: 'UNMERGEABLE', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('b') }, pullRequest: { number: 7, headRefOid: sha('b') } },
+  });
+  await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
+    state: 'failed', reviewedHead: sha('b'), entryId: 'MQE_1', reason: 'GitHub reported the merge queue entry as unmergeable.',
+  });
+});
+
+it('preserves the recorded reason when GitHub removes a pull request from the merge queue', async () => {
+  const run = async () => queueFixture({
+    state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [
+      { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' },
+      { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: 'Checks failed', beforeCommit: { oid: sha('b') } },
+    ] },
+  });
+  await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
+    state: 'removed', reviewedHead: sha('b'), removedAt: '2026-09-24T08:05:00Z', reason: 'Checks failed',
+  });
+});
+
+it('reports merged only when GitHub confirms the reviewed head was merged', async () => {
+  let call: readonly string[] = [];
+  const run = async (args: readonly string[]) => {
+    call = args;
+    return queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } });
+  };
+  await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
+    state: 'merged', reviewedHead: sha('b'), mergedAt: '2026-09-24T08:10:00Z',
+  });
+  expect(call).toEqual([
+    'api', 'graphql', '-f',
+    'query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}',
+    '-f', 'owner=owner', '-f', 'name=repo', '-F', 'number=7',
+  ]);
+});
+
+it.each([
+  ['a replaced reviewed head', queueFixture({ state: 'OPEN', mergedAt: null, headRefOid: sha('d'), mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('d') }, pullRequest: { number: 7, headRefOid: sha('d') } }, timelineItems: { nodes: [] } })],
+  ['a queue entry for another head', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('d') }, pullRequest: { number: 7, headRefOid: sha('b') } }, timelineItems: { nodes: [] } })],
+  ['a stale removal from another head', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: 'Checks failed', beforeCommit: { oid: sha('d') } }] } })],
+  ['an absent queue entry without a removal event', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [] } })],
+  ['a removal without a reason', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: null, beforeCommit: { oid: sha('b') } }] } })],
+  ['an omitted mergeQueueEntry field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', timelineItems: { nodes: [] } })],
+  ['an omitted timelineItems field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null })],
+  ['a malformed timeline node on a merged response', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [null] } })],
+  ['GraphQL errors alongside data', JSON.stringify({ data: { repository: { pullRequest: { number: 7, headRefOid: sha('b'), state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } } } }, errors: [{ message: 'partial' }] })],
+] as const)('fails closed for %s', async (_case, fixture) => {
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => fixture);
+  await expect(client.inspectQueue(sha('b'))).rejects.toThrow();
+});
+
+it('bounds merge-queue reads with one overall deadline', async () => {
+  vi.useFakeTimers();
+  try {
+    let aborts = 0;
+    const run = async (_args: readonly string[], options?: { signal?: AbortSignal }) => new Promise<string>((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => { aborts++; reject(options.signal?.reason); }, { once: true });
+    });
+    const pending = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'), { timeoutMs: 25 });
+    const outcome = pending.catch(error => error);
+    await vi.advanceTimersByTimeAsync(25);
+    await expect(outcome).resolves.toMatchObject({ message: 'GitHub merge-queue inspection timed out.' });
+    expect(aborts).toBe(1);
+  } finally { vi.useRealTimers(); }
+});
+
+it('preserves caller cancellation while reading merge-queue state', async () => {
+  const controller = new AbortController();
+  const run = async (_args: readonly string[], options?: { signal?: AbortSignal }) => new Promise<string>((_resolve, reject) => {
+    options?.signal?.addEventListener('abort', () => reject(new Error('generic runner abort')), { once: true });
+  });
+  const pending = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'), { signal: controller.signal });
+  controller.abort(new Error('closing queue watcher'));
+  await expect(pending).rejects.toThrow('closing queue watcher');
+});
+
+it('discards a GraphQL response that resolves after caller cancellation', async () => {
+  let release!: (value: string) => void;
+  const response = new Promise<string>(resolve => { release = resolve; });
+  const controller = new AbortController();
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => response);
+  const pending = client.inspectQueue(sha('b'), { signal: controller.signal });
+  controller.abort(new Error('closing queue watcher'));
+  release(queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } }));
+  await expect(pending).rejects.toThrow('closing queue watcher');
+});
+
 it.each([
   ['ruleset', [{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: '10' }] } }], { strict: false, checks: [] }],
   ['classic', [], { strict: true, checks: [{ context: 'test' }] }],
