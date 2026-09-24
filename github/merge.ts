@@ -50,7 +50,8 @@ export class GhMergeGateway implements MergeGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
   #cache: { expiresAt: number; state: RemoteMergeState } | null = null;
-  #inflight: Promise<RemoteMergeState> | null = null;
+  #generation = 0;
+  #inflight: { generation: number; promise: Promise<RemoteMergeState> } | null = null;
   constructor(config: GhMergeConfig, run?: RunGh) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
@@ -90,6 +91,7 @@ export class GhMergeGateway implements MergeGateway {
       for (let index = 0; index < numbers.length; index++) {
         const pr = pulls[`p${index}`];
         if (!pr) return 'unknown';
+        if (!['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !Object.hasOwn(pr, 'mergedAt') || (pr.mergedAt !== null && typeof pr.mergedAt !== 'string')) return 'unknown';
         if (pr.state === 'OPEN' || typeof pr.mergedAt === 'string') return 'found';
       }
       return 'clear';
@@ -116,7 +118,11 @@ export class GhMergeGateway implements MergeGateway {
         if (branchState.protected) throw new Error('Branch protection is present but unreadable.');
       } else if (!protection || typeof protection !== 'object' || !('required_status_checks' in protection)) {
         throw new Error('GitHub returned incomplete branch protection.');
-      } else classic = (protection as { required_status_checks: unknown }).required_status_checks;
+      } else {
+        const required = (protection as { required_status_checks: unknown }).required_status_checks;
+        if (required !== null && (typeof required !== 'object' || Array.isArray(required))) throw new Error('GitHub returned malformed branch protection.');
+        classic = required;
+      }
     } catch { rulesKnown = false; }
     const requirements = new Map<string, { context: string; appId: number | null }>();
     let atomicBaseGuard = false;
@@ -177,27 +183,29 @@ export class GhMergeGateway implements MergeGateway {
 
   async inspect(options: { fresh?: boolean } = {}): Promise<RemoteMergeState> {
     if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
-    if (!options.fresh && this.#inflight) return this.#inflight;
+    const generation = this.#generation;
+    if (!options.fresh && this.#inflight?.generation === generation) return this.#inflight.promise;
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(new Error('GitHub merge-state inspection timed out.')), 12_000);
     const attempt = this.#inspectNow(controller.signal).catch(error => {
       if (controller.signal.aborted) throw new Error('GitHub merge-state inspection timed out.');
       throw error;
     }).then(state => {
-      this.#cache = { expiresAt: Date.now() + 5_000, state };
+      if (this.#generation === generation) this.#cache = { expiresAt: Date.now() + 5_000, state };
       return state;
-    }).finally(() => { clearTimeout(timer); if (this.#inflight === attempt) this.#inflight = null; });
-    if (!options.fresh) this.#inflight = attempt;
+    }).finally(() => { clearTimeout(timer); if (this.#inflight?.promise === attempt) this.#inflight = null; });
+    if (!options.fresh) this.#inflight = { generation, promise: attempt };
     return attempt;
   }
 
   async merge(expectedHead: string): Promise<MergeResult> {
     fullSha(expectedHead, 'expected head SHA');
     const flag = this.config.method === 'squash' ? '--squash' : this.config.method === 'rebase' ? '--rebase' : '--merge';
+    this.#generation++;
     this.#cache = null;
     try {
       await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead]);
       return { url: `https://github.com/${this.config.repository}/pull/${this.config.pullRequest}` };
-    } finally { this.#cache = null; }
+    } finally { this.#generation++; this.#cache = null; }
   }
 }

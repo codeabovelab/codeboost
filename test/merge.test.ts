@@ -193,6 +193,60 @@ it.each([['feature', 'found'], ['other-branch', 'found']] as const)('classifies 
   expect(state.alreadyFixed).toBe(expected);
 });
 
+it.each([{}, { state: 'CLOSED' }, { state: 'BOGUS', mergedAt: null }, { state: 'CLOSED', mergedAt: 42 }])('fails closed for malformed referenced PR data: %j', async referencedPull => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('api graphql')) return JSON.stringify({ data: { repository: { p0: referencedPull } } });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 8, pull_request: {} } } }]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
+});
+
+it.each([false, 'required', []])('fails closed for malformed classic protection metadata: %j', async requiredStatusChecks => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
+    if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });
+    if (joined.includes('/timeline')) return JSON.stringify([[]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.rulesKnown).toBe(false);
+});
+
+it('does not let an inspection started before merge repopulate the cache', async () => {
+  let pullReads = 0, releaseTimeline!: (value: string) => void, markTimelineStarted!: () => void;
+  const timelineStarted = new Promise<void>(resolve => { markTimelineStarted = resolve; });
+  const delayedTimeline = new Promise<string>(resolve => { releaseTimeline = resolve; });
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) { pullReads++; return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] }); }
+    if (joined.startsWith('pr merge')) return '';
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline') && pullReads === 1) { markTimelineStarted(); return delayedTimeline; }
+    if (joined.includes('/timeline')) return JSON.stringify([[]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run);
+  const staleInspection = client.inspect();
+  await timelineStarted;
+  await client.merge(sha('b'));
+  releaseTimeline(JSON.stringify([[]]));
+  await staleInspection;
+  await client.inspect();
+  expect(pullReads).toBe(2);
+});
+
 it('blocks the already-fixed check instead of truncating more than 100 references', async () => {
   const references = Array.from({ length: 101 }, (_, index) => ({ source: { issue: { number: index + 8, pull_request: {} } } }));
   let referencedViews = 0;
