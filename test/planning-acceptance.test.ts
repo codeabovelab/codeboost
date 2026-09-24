@@ -132,9 +132,14 @@ it('does not grant command approval to appended flags in an otherwise valid sugg
 });
 it('validates a generated draft before importing it and preserves the original fixture revision', () => {
   const f = fixture(), source = plan(); source.revision = 2;
+  source.summary = 'Generated replacement summary';
   const prepared = prepareDraft({ ...f.input, revision: 2, requestId: 'draft-request', previousPlan: f.store.getPlan(f.context.identity) });
   const validated = prepared.validate(JSON.stringify(source));
   expect(validated.value.revision).toBe(2);
   expect(f.store.importRevision(JSON.stringify(validated.value), 'json', f.context, 1).revision).toBe(2);
+  expect(f.store.getPlan(f.context.identity)).toEqual(validated.value);
+  const reopened = f.open();
+  expect(reopened.getPlan(f.context.identity)).toEqual(validated.value);
+  expect(reopened.getPlan(f.context.identity, 1)).toEqual({ ...plan(), revision: 1 });
   expect(plan().revision).toBe(3);
 });
