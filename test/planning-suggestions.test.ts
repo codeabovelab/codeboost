@@ -32,7 +32,7 @@ function fixture(provider?: AuthorProvider) {
   store.createPlan(JSON.stringify(plan()), 'json', value.context, value.repo.baseSha, 'b'.repeat(40));
   const pending = deferred(), calls: { request: AuthorRequest; signal: AbortSignal }[] = [];
   const coordinator = new SuggestionCoordinator(store, provider ?? { invoke(request, signal) { calls.push({ request, signal }); return pending.promise; } }, 100);
-  return { store, value, identity, pending, calls, coordinator };
+  return { store, path: join(dir, 'state.sqlite'), value, identity, pending, calls, coordinator };
 }
 it('binds the store request before invocation and publishes only valid replies', async () => {
   const f = fixture(); const handle = f.coordinator.start(f.value);
@@ -61,7 +61,7 @@ it('rejects a changed snapshot even if the plan revision is unchanged', async ()
   f.store.recordHistory(f.identity, { revision: 1, snapshotId: f.store.getSnapshot(f.identity).id }, 'a'.repeat(40), 'c'.repeat(40), []);
   f.pending.resolve(JSON.stringify(reply()));
   expect(await handle.result).toMatchObject({ state: 'stale' });
-  expect(f.store.getSuggestions(f.identity, handle.id)).toMatchObject({ state: 'cancelled', reply: null });
+  expect(f.store.getSuggestions(f.identity, handle.id)).toMatchObject({ state: 'invalidated', reason: 'Repository snapshot changed.', reply: null });
   expect(f.store.getPlan(f.identity).revision).toBe(1);
   await f.coordinator.close();
 });
@@ -71,7 +71,7 @@ it('retains ownership after timeout until provider termination, even across cloc
   await vi.advanceTimersByTimeAsync(100);
   expect(f.calls[0]!.signal.aborted).toBe(true);
   expect(f.calls[0]!.signal.reason.message).toBe('Suggestion invocation timed out.');
-  expect(f.store.getSuggestions(f.identity, handle.id).state).toBe('cancelled');
+  expect(f.store.getSuggestions(f.identity, handle.id)).toMatchObject({ state: 'failed', reason: 'Suggestion invocation timed out.' });
   expect(settled).toBe(false);
   vi.setSystemTime(new Date('2099-01-01'));
   expect(() => f.coordinator.start(f.value)).toThrow(/still active/);
@@ -127,7 +127,7 @@ it('does not publish externally cancelled requests', async () => {
 it.each(['{}', '{"schema_version":1,"base_revision":2,"reply":"late","edits":[]}'])('fails malformed or stale output without making it applicable: %s', async output => {
   const f = fixture(), handle = f.coordinator.start(f.value); f.pending.resolve(output);
   expect((await handle.result).state).toBe('failed');
-  expect(f.store.getSuggestions(f.identity, handle.id)).toMatchObject({ state: 'cancelled', reply: null });
+  expect(f.store.getSuggestions(f.identity, handle.id)).toMatchObject({ state: 'failed', reply: null, reason: expect.any(String) });
   expect(f.store.getPlan(f.identity).revision).toBe(1); await f.coordinator.close();
 });
 it('captures caller input before edits or navigation and cannot target another plan', async () => {
@@ -145,9 +145,16 @@ it('preserves provider errors and permits a new attempt only after rejection set
   const f = fixture({ invoke() { throw new Error('Vendor quota exhausted'); } });
   const first = f.coordinator.start(f.value);
   expect(await first.result).toMatchObject({ state: 'failed', reason: 'Vendor quota exhausted' });
-  expect(f.store.getSuggestions(f.identity, first.id).state).toBe('cancelled');
+  expect(f.store.getSuggestions(f.identity, first.id)).toMatchObject({ state: 'failed', reason: 'Vendor quota exhausted' });
   const second = f.coordinator.start(f.value); expect(second.id).not.toBe(first.id);
   await second.result; await f.coordinator.close();
+});
+it('bounds the durable provider reason without leaving the request pending', async () => {
+  const reason = 'x'.repeat(5000), f = fixture({ invoke() { throw new Error(reason); } });
+  const request = f.coordinator.start(f.value);
+  expect(await request.result).toMatchObject({ state: 'failed', reason });
+  expect(f.store.getSuggestions(f.identity, request.id)).toMatchObject({ state: 'failed', reason: 'x'.repeat(4000) });
+  await f.coordinator.close();
 });
 it('rejects invalid admission before allocating a request or calling the provider', async () => {
   const f = fixture(); const begin = vi.spyOn(f.store, 'beginSuggestions');
@@ -180,5 +187,19 @@ it.each(['cancelled', 'stale'] as const)('preserves durable %s state when the pr
   f.pending.reject(new Error('Provider transport disconnected'));
   expect(await request.result).toMatchObject({ state: expected, reason: expect.stringContaining('Provider transport disconnected') });
   expect(f.store.getSuggestions(f.identity, request.id).reply).toBeNull();
+  await f.coordinator.close();
+});
+it('does not erase a result completed by another connection during failure cleanup', async () => {
+  const f = fixture(), request = f.coordinator.start(f.value); await Promise.resolve();
+  const other = new Store(f.path); cleanup.push(() => other.close());
+  const settle = f.store.settleSuggestion.bind(f.store);
+  vi.spyOn(f.store, 'settleSuggestion').mockImplementationOnce((identity, id, expected, outcome) => {
+    other.completeSuggestions(identity, id, reply());
+    return settle(identity, id, expected, outcome);
+  });
+  f.pending.reject(new Error('Provider transport disconnected'));
+  expect(await request.result).toMatchObject({ state: 'failed', reason: 'Provider transport disconnected' });
+  expect(f.store.getSuggestions(f.identity, request.id)).toMatchObject({ state: 'ready', reply: reply(), reason: null });
+  expect(f.store.applySuggestion(f.identity, request.id, 0, f.value.context).revision).toBe(2);
   await f.coordinator.close();
 });

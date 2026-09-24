@@ -6,10 +6,10 @@ import type { Diagnostic, EditReply, Plan } from './plan.ts';
 export interface SuggestionStore {
   getPlan(identity: PlanIdentity): Plan;
   getSnapshot(identity: PlanIdentity): { id: string; base: string; head: string };
-  beginSuggestions(identity: PlanIdentity, expectedRevision: number): string;
+  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }): string;
   completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void;
-  cancelSuggestions(identity: PlanIdentity, id: string): void;
-  getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; reply: EditReply | null };
+  settleSuggestion(identity: PlanIdentity, id: string, expected: { revision: number; snapshotId: string }, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean;
+  getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null };
 }
 export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'>;
 export type SuggestionOutcome =
@@ -23,6 +23,9 @@ export interface SuggestionHandle {
 interface Active {
   handle: SuggestionHandle;
   stop: (state: 'failed' | 'cancelled', reason: string) => void;
+}
+function persistentReason(reason: string): string {
+  return (reason.trim() || 'Suggestion invocation ended without a reason.').slice(0, 4000);
 }
 
 /** One instance per runner. Close it before closing Store. Not a cross-process scheduler. */
@@ -47,7 +50,8 @@ export class SuggestionCoordinator {
     if (snapshot.base !== input.repo.baseSha) throw new Error('Stale base snapshot.');
     // Validate before allocating a durable request; no await permits local state changes.
     const prepared = prepareSuggestions({ ...input, requestId: 'pending', previousPlan });
-    const id = this.#store.beginSuggestions(identity, input.revision);
+    const expected = Object.freeze({ revision: input.revision, snapshotId: snapshot.id });
+    const id = this.#store.beginSuggestions(identity, expected);
     const request = Object.freeze({ ...prepared.request, requestId: id });
     const controller = new AbortController();
     let stopped: { state: 'failed' | 'cancelled'; reason: string } | undefined;
@@ -57,7 +61,7 @@ export class SuggestionCoordinator {
       if (stopped || settled) return;
       stopped = { state, reason };
       // Even if storage fails, deliver cancellation to the invocation and retain its slot.
-      try { this.#store.cancelSuggestions(identity, id); }
+      try { this.#store.settleSuggestion(identity, id, expected, { state, reason: persistentReason(reason) }); }
       catch (error) { stopped.reason += ` Request cleanup failed: ${String(error)}`; }
       finally { controller.abort(new Error(reason)); }
     };
@@ -106,7 +110,8 @@ export class SuggestionCoordinator {
         }
       }
       if (outcome.state !== 'completed') {
-        try { this.#store.cancelSuggestions(identity, id); }
+        const terminal = outcome.state === 'stale' ? 'invalidated' : outcome.state;
+        try { this.#store.settleSuggestion(identity, id, expected, { state: terminal, reason: persistentReason(outcome.reason) }); }
         catch (error) {
           // Keep the original provider/timeout reason, but surface cleanup failure too.
           outcome = { ...outcome, reason: `${outcome.reason} Request cleanup failed: ${String(error)}` };

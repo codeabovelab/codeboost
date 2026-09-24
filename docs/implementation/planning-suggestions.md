@@ -11,17 +11,19 @@ and store-generated request ID before invocation. Input containers are copied.
 | Coordinator | open → closing; closing rejects new starts synchronously | Runner-owned coordinator |
 | Invocation | pending → running → completed/failed/cancelled/stale; pending may cancel before launch | Coordinator until provider settles |
 | Cancellation | first reason retained; request abort while invocation remains tracked; terminal cancelled/failed only after provider settlement | Coordinator and D adapter |
-| Durable request | pending → ready; pending/ready → cancelled or invalidated; ready → consumed on Apply | Existing Store transactions |
+| Durable request | pending → ready → consumed, or pending → failed/cancelled/invalidated; plan or snapshot changes invalidate pending/ready while retaining completed history | Existing Store transactions |
 | Durable plan | revision advances only through Store import/Apply; advancing invalidates sibling/pending requests | Store |
 | Subprocess/container | abort requested → terminating → terminated; promise settles after final termination | D adapter |
 | HTTP and UI | not created by E; F rejects admission/drains admitted requests before coordinator close, then closes Store; G preserves drafts and ignores stale responses | F/G |
 
-The existing request table has no failed/stale reason fields. Failed or aborted E
-invocations cancel the durable request to make Apply unavailable; the returned
-outcome retains the precise reason and distinguishes failed/cancelled/stale.
-Revision changes already invalidate durable requests. Snapshot-only changes cancel
-them at settlement. F owns any future durable failure-reason or snapshot-binding
-schema additions. Completed historical provider results are not silently rewritten.
+The Store persists each request's plan revision, snapshot ID, and terminal reason.
+Failed, cancelled, and stale E outcomes use `settleSuggestion`, which can transition
+only the exact pending attempt at its captured revision and snapshot. If another
+process completed the request first, cleanup loses without changing the ready result.
+Revision and snapshot changes invalidate durable requests with their cause while
+retaining completed replies as stale history. Durable reasons use the Store's bounded
+format even when a provider returns an oversized diagnostic. Restart therefore
+preserves both the terminal classification and its actionable reason.
 
 There is one active invocation per plan identity. A new start (including a retry)
 cannot replace it, regardless of elapsed time, cancellation, or persisted state.
@@ -32,14 +34,14 @@ runner must additionally enforce its global task limit.
 
 Before publication, compare the current plan revision and snapshot with the captured
 ones, validate every card via E2, then call Store.completeSuggestions, whose CAS
-also checks the request is still pending. JavaScript has no await between these
-checks and publication; the injected Store must implement transactional request CAS.
+also checks the request is still pending and bound to the current revision/snapshot.
+JavaScript has no await between these checks and publication; Store provides the
+transactional request CAS across independent processes.
 If the provider rejects or publication CAS refuses after external cancellation or
 revision advance, read durable state and return cancelled/stale instead of a provider
 failure. Retain the original provider/Store diagnostic alongside that classification.
-Store's current contract binds request identity/revision, not cross-process snapshot
-CAS. Production F integration must supply that stronger boundary if another process
-can change snapshots concurrently. E is not a multi-process scheduler.
+Automatic cleanup uses the same captured binding and pending-state guard. Explicit
+user dismissal remains a separate Store operation. E is not a multi-process scheduler.
 
 `close()` flips admission to closing before aborting invocations and waits for all
 providers to settle. It does not close storage. There is no HTTP server, polling,
@@ -47,7 +49,8 @@ browser input, retry endpoint or subprocess implementation in this lane.
 
 Checks use controllable promises and timers with real SQLite to assert both returned
 outcomes and durable state. Required cases include import before late completion,
-snapshot change, external cancellation, timeout followed by an unsettled provider,
+snapshot change, completion racing failure cleanup, external cancellation, bounded
+provider errors, timeout followed by an unsettled provider,
 retry while cancellation is pending, shutdown admission, and post-submit mutation
 of caller-owned input. Apply/replay/independent-process serialization remain Store's
 existing acceptance boundary; E4 adds integrated fixtures.
