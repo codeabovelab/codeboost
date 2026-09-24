@@ -112,11 +112,11 @@ const captureInput = (directory: string): InputCapture => {
 };
 
 /** Internal authenticity and host-file revalidation used at every launch boundary. */
-export function assertContainerProfile(profile: ContainerProfile): void {
+export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000): void {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
   assertTaskFilesystems(expected.filesystems, expected.clone);
-  assertVendorNetwork(expected.network, expected.invocation, profile.name);
+  assertVendorNetwork(expected.network, expected.invocation, profile.name, timeoutMs);
   assertPhasePolicy(expected.policy, expected.invocation);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
@@ -165,7 +165,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   assertTaskFilesystems(filesystems, invocation.clone);
   assertVendorNetwork(options.network, invocation);
   assertPhasePolicy(options.policy, invocation);
-  const command = assertAgentCommand(options.command, options.policy);
+  const command = assertAgentCommand(options.command, options.policy, invocation.vendor);
   const sourceInput = captureInput(options.inputDirectory);
   if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
     throw new Error('Codex requires only its auth file.');

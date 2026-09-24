@@ -12,17 +12,20 @@ export interface PhasePolicy {
 export interface AgentCommand { readonly argv: readonly string[] }
 interface PolicyIdentity { readonly invocation: InvocationInput }
 const identities = new WeakMap<PhasePolicy, PolicyIdentity>();
-const commands = new WeakMap<AgentCommand, PhasePolicy>();
+const commands = new WeakMap<AgentCommand, { readonly policy: PhasePolicy; readonly vendor: InvocationInput['vendor'] }>();
 
 const command = (policy: PhasePolicy, argv: readonly string[]): AgentCommand => {
   assertPhasePolicy(policy);
   const value = Object.freeze({ argv: Object.freeze([...argv]) });
-  commands.set(value, policy);
+  commands.set(value, Object.freeze({ policy, vendor: assertPhasePolicy(policy).vendor }));
   return value;
 };
 
-export function assertAgentCommand(value: AgentCommand, policy: PhasePolicy): readonly string[] {
-  if (commands.get(value) !== policy) throw new Error('Container command was not generated for this phase policy.');
+export function assertAgentCommand(value: AgentCommand, policy: PhasePolicy,
+  vendor?: InvocationInput['vendor']): readonly string[] {
+  const identity = commands.get(value);
+  if (identity?.policy !== policy || (vendor && identity.vendor !== vendor))
+    throw new Error('Container command was not generated for this phase policy and vendor.');
   return value.argv;
 }
 
@@ -59,7 +62,7 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
 
 export function createClaudeCommand(policy: PhasePolicy, prompt: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Claude prompt must be nonempty and contain no NUL.');
-  assertPhasePolicy(policy);
+  if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   return command(policy, ['claude', '--print', prompt, '--output-format', 'json', '--restricted', '--strict-mcp-config',
@@ -69,7 +72,7 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string): AgentC
 }
 
 export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
-  assertPhasePolicy(policy);
+  if (assertPhasePolicy(policy).vendor !== 'codex') throw new Error('Codex command requires a Codex invocation policy.');
   return Object.freeze(['codex', '--strict-config', '--config', 'web_search="disabled"',
     '--config', 'mcp_servers={}', '--config', 'features.shell_tool=false', '--ask-for-approval', 'never']);
 }

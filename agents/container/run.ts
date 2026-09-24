@@ -109,7 +109,7 @@ type Inspect = {
 /** Validate daemon-resolved configuration before starting an agent. */
 export function validateContainer(container: string, profile: ContainerProfile, timeoutMs = 30_000): void {
   const remaining = createDeadline(timeoutMs);
-  assertContainerProfile(profile);
+  assertContainerProfile(profile, remaining());
   const inspect = JSON.parse(docker(['container', 'inspect', container], { timeoutMs: remaining() }))[0] as Inspect | undefined;
   if (!inspect) throw new Error('Docker did not return the created container.');
   const image = JSON.parse(docker(['image', 'inspect', profile.expectedImage], { timeoutMs: remaining() }))[0] as
@@ -248,7 +248,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     throw new Error('Credential profiles must not be combined or redirected.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
     throw new Error('Credential profiles must not be combined.');
-  assertContainerProfile(profile);
+  assertContainerProfile(profile, remaining());
   remaining();
 }
 
@@ -258,7 +258,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
   let createUnsettled = false;
   try {
     validateSecrets(profile, secrets);
-    assertContainerProfile(profile);
+    assertContainerProfile(profile, remaining());
     const createTimeout = remaining();
     createUnsettled = true;
     try { docker(profile.args, { timeoutMs: createTimeout, secrets }); }
@@ -269,7 +269,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     }
     createUnsettled = false;
     validateContainer(profile.name, profile, remaining());
-    assertContainerProfile(profile);
+    assertContainerProfile(profile, remaining());
     remaining();
     return profile.name;
   } catch (error) {
@@ -285,7 +285,7 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
   const container = createValidatedContainer(profile, remaining(), secrets);
   let failure: unknown;
   try {
-    assertContainerProfile(profile);
+    assertContainerProfile(profile, remaining());
     const output = docker(['start', '--attach', container], { timeoutMs: remaining(), secrets });
     remaining();
     return output;

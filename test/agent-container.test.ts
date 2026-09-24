@@ -183,7 +183,7 @@ describe('real Docker agent isolation', () => {
       imageId: AGENT_IMAGE })).toThrow('immutable built image ID');
     chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
     expect(() => profile(data, 'planning', 'noop')).toThrow('only one bounded');
-  });
+  }, 60_000);
 
   it('rejects unexpected host mounts and unbounded task volumes after Docker resolves them', () => {
     const data = fixture(), valid = profile(data, 'planning', 'noop');

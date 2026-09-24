@@ -51,6 +51,7 @@ describe('vendor-only egress', () => {
 
   it('rejects a copied network capability', () => {
     expect(() => createVendorNetwork(invocation, imageId, 0)).toThrow('positive integer');
+    expect(() => assertVendorNetwork(network, invocation, undefined, 0)).toThrow('positive integer');
     expect(() => removeVendorNetwork({ ...network })).toThrow('trusted network builder');
     const otherInvocation = captureInvocation({ ...invocation, attemptId: 'other-network-probe',
       deadline: Date.now() + 60_000 });
@@ -72,5 +73,24 @@ describe('vendor-only egress', () => {
       spawnSync('docker', ['rm', '--force', peer], { stdio: 'ignore' });
       removeVendorNetwork(other);
     }
+  }, 60_000);
+
+  it('rejects a proxy replaced with a host namespace before launch', () => {
+    const replacementInvocation = captureInvocation({ ...invocation, attemptId: 'mutated-proxy-probe',
+      deadline: Date.now() + 60_000 });
+    const replacement = createVendorNetwork(replacementInvocation, imageId);
+    const inspected = JSON.parse(docker('container', 'inspect', replacement.proxyContainer))[0] as
+      { Config: { Labels: Record<string, string> } };
+    const allocation = inspected.Config.Labels['io.codeboost.egress'];
+    try {
+      docker('rm', '--force', replacement.proxyContainer);
+      docker('run', '--detach', '--name', replacement.proxyContainer, '--read-only', '--user', '10001:10001',
+        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
+        '--cpus=.25', '--pid=host', '--network', replacement.name, '--network-alias', 'codeboost-proxy',
+        '--label', `io.codeboost.egress=${allocation}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS.claude.join(',')}`,
+        '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs');
+      docker('network', 'connect', 'bridge', replacement.proxyContainer);
+      expect(() => assertVendorNetwork(replacement, replacementInvocation)).toThrow('network or proxy changed');
+    } finally { removeVendorNetwork(replacement); }
   }, 60_000);
 });
