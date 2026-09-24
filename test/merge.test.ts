@@ -208,7 +208,7 @@ it.each([['feature', 'found'], ['other-branch', 'found']] as const)('classifies 
   expect(state.alreadyFixed).toBe(expected);
 });
 
-it.each([{}, { state: 'CLOSED' }, { state: 'BOGUS', mergedAt: null }, { state: 'CLOSED', mergedAt: 42 }])('fails closed for malformed referenced PR data: %j', async referencedPull => {
+it.each([{}, { state: 'CLOSED' }, { state: 'BOGUS', mergedAt: null }, { state: 'CLOSED', mergedAt: 42 }, { state: 'MERGED', mergedAt: null }, { state: 'OPEN', mergedAt: '2026-01-01' }, { state: 'CLOSED', mergedAt: '2026-01-01' }])('fails closed for malformed referenced PR data: %j', async referencedPull => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });

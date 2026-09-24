@@ -98,7 +98,9 @@ export class GhMergeGateway implements MergeGateway {
         const pr = pulls[`p${index}`];
         if (!pr) return 'unknown';
         if (!['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !Object.hasOwn(pr, 'mergedAt') || (pr.mergedAt !== null && typeof pr.mergedAt !== 'string')) return 'unknown';
-        if (pr.state === 'OPEN' || typeof pr.mergedAt === 'string') return 'found';
+        if ((pr.state === 'OPEN' || pr.state === 'CLOSED') && pr.mergedAt !== null) return 'unknown';
+        if (pr.state === 'MERGED' && typeof pr.mergedAt !== 'string') return 'unknown';
+        if (pr.state === 'OPEN' || pr.state === 'MERGED') return 'found';
       }
       return 'clear';
     } catch (error) {

@@ -389,9 +389,12 @@ $("merge").onclick = async () => {
   $("merge").disabled = true;
   try {
     const updated = await api("/api/action", { action: "merge", token: data.token });
-    data = updated;
+    const blocker = { code: "merge-submitted", message: "Merge was submitted. Refresh to confirm GitHub state." };
+    data = updated.mergeRefreshRequired
+      ? { ...data, merge: { ...data.merge, ready: false, blockers: [blocker] } }
+      : { ...updated, merge: { ...updated.merge, ready: false, blockers: [blocker] } };
     render();
-    $("banner").textContent = `Merged pull request. ${updated.mergeResult.url}`;
+    $("banner").textContent = `Merge submitted. ${updated.mergeResult.url}`;
   } catch (error) {
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();

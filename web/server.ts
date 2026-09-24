@@ -46,7 +46,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         }
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
-          const merged=await merges.merge(input.token);json(200,{...(await load()),mergeResult:merged.result});return;
+          const merged=await merges.merge(input.token);
+          try { json(200,{...(await load()),mergeResult:merged.result,mergeRefreshRequired:false}); }
+          catch { json(200,{mergeResult:merged.result,mergeRefreshRequired:true}); }
+          return;
         }
         const view=service.act(input);
         if(view.createdNoteId && input.kind==='question') {
