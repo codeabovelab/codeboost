@@ -9,6 +9,9 @@ JSON document subject to the retained parser's 1 MiB/depth/UTF-8 limits.
 
 Only the issue's number, title, body and comments enter the prompt; structural
 TypeScript compatibility does not grant authority to extra API metadata. Initial
+provider identity contains only repositoryId, taskId and planId; extra caller
+properties are not part of the trusted boundary. Cyclic prompt data fails the
+bounded traversal before serialization. Initial
 drafts require revision one; revised drafts require the previous plan's revision + 1.
 Draft replies must match the selected issue and requested revision. Suggestions
 must match the captured base revision, and every independent card must produce a

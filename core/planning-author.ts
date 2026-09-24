@@ -88,7 +88,8 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
   if (!input.requestId) throw new Error('Request ID is required.');
   if (input.issue.number !== input.context.issue) throw new Error('Selected issue mismatch.');
   // Capture caller-owned mutable containers before asynchronous invocation.
-  const context: PlanContext = { ...input.context, identity: { ...input.context.identity },
+  const { repositoryId, taskId, planId } = input.context.identity;
+  const context: PlanContext = { ...input.context, identity: { repositoryId, taskId, planId },
     baseEntries: structuredClone(input.context.baseEntries), allowedCommands: structuredClone(input.context.allowedCommands) };
   const previous = input.previousPlan ? structuredClone(input.previousPlan) : undefined;
   if (previous) {
