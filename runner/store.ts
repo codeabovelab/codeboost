@@ -17,6 +17,13 @@ export interface SuggestionRequest { state: SuggestionState; revision: number; s
 export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
 export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
+export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
+export interface MergeAttempt {
+  id: string; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
+  url: string | null; reason: string | null; requiresFreshReview: boolean; entryId: string | null;
+  phase: 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED' | null; position: number | null;
+  occurredAt: string | null; createdAt: string; updatedAt: string;
+}
 export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
 export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
@@ -42,8 +49,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version;
-        if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4) throw new Error('Unsupported store schema version.');
-        if (version === 4) return;
+        if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5) throw new Error('Unsupported store schema version.');
+        if (version === 5) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -65,6 +72,12 @@ export class Store {
             ALTER TABLE requests ADD COLUMN reason TEXT;
             UPDATE requests SET state='invalidated', reason='Request predates snapshot binding.' WHERE state IN ('pending','ready');
             PRAGMA user_version=4;`);
+        if (version < 5) this.#db.exec(`CREATE TABLE IF NOT EXISTS merge_attempts (
+            id TEXT PRIMARY KEY,
+            key TEXT NOT NULL REFERENCES plans(key),
+            data TEXT NOT NULL
+          );
+          PRAGMA user_version=5;`);
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -178,6 +191,64 @@ export class Store {
   cancelSuggestions(identity: PlanIdentity, id: string, reason = 'Suggestion cancelled.'): void {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
+  }
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string): MergeAttempt {
+    sha(reviewedHead);
+    if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for merging.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#expect(key, expected);
+      const current = this.getMergeAttempt(identity);
+      if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
+      if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');
+      const now = new Date().toISOString();
+      const attempt: MergeAttempt = {
+        id: randomUUID(), state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
+        reviewVersion: expected.reviewVersion, reviewedHead, url: null, reason: null, requiresFreshReview: false,
+        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now,
+      };
+      this.#run('INSERT INTO merge_attempts VALUES (?,?,?)', attempt.id, key, encode(attempt));
+      return attempt;
+    });
+  }
+  #changeMergeAttempt(identity: PlanIdentity, id: string, allowed: readonly MergeAttemptState[], change: (attempt: MergeAttempt) => MergeAttempt): boolean {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const latest = this.#get('SELECT id,data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', key);
+      if (!latest || latest.id !== id) return false;
+      const attempt = decode<MergeAttempt>(latest.data);
+      if (!allowed.includes(attempt.state)) return false;
+      const next = change(attempt);
+      return this.#run('UPDATE merge_attempts SET data=? WHERE id=? AND key=?', encode({ ...next, updatedAt: new Date().toISOString() }), id, key).changes === 1;
+    });
+  }
+  queueMergeAttempt(identity: PlanIdentity, id: string, url: string): boolean {
+    if (typeof url !== 'string' || url.length > 2048 || !/^https:\/\//.test(url)) throw new Error('Invalid merge result URL.');
+    return this.#changeMergeAttempt(identity, id, ['submitting'], attempt => ({ ...attempt, state: 'queued', url, reason: null }));
+  }
+  observeQueuedMerge(identity: PlanIdentity, id: string, observation: { entryId: string; phase: MergeAttempt['phase']; position: number }): boolean {
+    if (typeof observation.entryId !== 'string' || !observation.entryId || observation.entryId.length > 512 ||
+        !['AWAITING_CHECKS','LOCKED','MERGEABLE','QUEUED'].includes(String(observation.phase)) ||
+        !Number.isSafeInteger(observation.position) || observation.position < 0) throw new Error('Invalid merge-queue observation.');
+    return this.#changeMergeAttempt(identity, id, ['submitting','queued'], attempt => ({
+      ...attempt, state: 'queued', entryId: observation.entryId, phase: observation.phase, position: observation.position,
+    }));
+  }
+  finishMergeAttempt(identity: PlanIdentity, id: string, outcome: {
+    state: 'merged' | 'removed' | 'failed'; reason?: string; occurredAt?: string; requiresFreshReview?: boolean;
+  }): boolean {
+    if (!['merged','removed','failed'].includes(outcome.state)) throw new Error('Invalid merge-queue outcome.');
+    if (outcome.state !== 'merged' && (typeof outcome.reason !== 'string' || !outcome.reason.trim() || outcome.reason.length > 4000)) throw new Error('A bounded terminal merge reason is required.');
+    if (outcome.occurredAt !== undefined && (!Number.isFinite(Date.parse(outcome.occurredAt)) || outcome.occurredAt.length > 64)) throw new Error('Invalid merge-queue timestamp.');
+    return this.#changeMergeAttempt(identity, id, ['submitting','queued'], attempt => ({
+      ...attempt, state: outcome.state, reason: outcome.state === 'merged' ? null : outcome.reason!.trim(),
+      occurredAt: outcome.occurredAt ?? null, requiresFreshReview: outcome.requiresFreshReview === true,
+    }));
+  }
+  getMergeAttempt(identity: PlanIdentity): MergeAttempt | null {
+    this.#current(identityKey(identity));
+    const row = this.#get('SELECT data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
+    return row ? decode<MergeAttempt>(row.data) : null;
   }
   getSuggestions(identity: PlanIdentity, id: string): SuggestionRequest {
     const row = this.#get('SELECT * FROM requests WHERE key=? AND id=?', identityKey(identity), id);

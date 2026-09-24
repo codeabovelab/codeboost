@@ -33,8 +33,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const supplied = req.headers['x-codeboost-token'];
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
         if (stopping && req.method === 'POST') { json(503, { error: 'The review server is shutting down.' }); return; }
+        if (stopping && path === '/api/merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
+        if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, await load()); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
@@ -50,8 +52,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
           const merged=await merges.merge(input.token);
-          try { json(200,{...(await load()),mergeResult:merged.result,mergeRefreshRequired:false}); }
-          catch { json(200,{mergeResult:merged.result,mergeRefreshRequired:true}); }
+          try { json(200,{...(await load()),mergeResult:merged.result,mergeQueue:merges.queueSnapshot(),mergeRefreshRequired:false}); }
+          catch { json(200,{mergeResult:merged.result,mergeQueue:merges.queueSnapshot(),mergeRefreshRequired:true}); }
           return;
         }
         const view=service.act(input);

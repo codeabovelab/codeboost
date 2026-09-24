@@ -8,7 +8,7 @@ import { createDemo } from '../../scripts/demo.ts';
 import { choiceKeys } from '../../core/approvals.ts';
 import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
-import type { MergeGateway } from '../../github/merge.ts';
+import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
 function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
@@ -56,6 +56,38 @@ test('shows merge blockers and submits one exact-head merge',async({page})=>{
  let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();const expectedHead=view.snapshot.head;await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();page.on('dialog',dialog=>dialog.accept());
  await page.locator('#merge').evaluate((button:HTMLButtonElement)=>{button.click();button.click();});await expect.poll(()=>mergeCalls.length).toBe(1);await expect(page.locator('#merge')).toBeDisabled();release();await expect(page.locator('#banner')).toContainText('Merge submitted.');await expect(page.locator('#merge')).toBeDisabled();await page.locator('#merge').evaluate((button:HTMLButtonElement)=>button.click());expect(mergeCalls).toEqual([expectedHead]);
+});
+test('keeps the reviewed head queued until confirmed merged and preserves current input',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,phase:'queued'|'merged'='queued',queueReads=0;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
+  inspectQueue:async head=>{queueReads++;return phase==='queued'?{state:'queued',reviewedHead:head,entryId:'MQE_1',phase:'AWAITING_CHECKS',position:2,enqueuedAt:'2026-09-24T08:00:00Z',queueHead:head}:{state:'merged',reviewedHead:head,mergedAt:'2026-09-24T08:10:00Z'};},
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByLabel('Question about this item').fill('Keep this draft while polling.');page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();await expect(page.getByLabel('Question about this item')).toHaveValue('Keep this draft while polling.');await expect.poll(()=>queueReads).toBeGreaterThan(0);
+ phase='merged';await expect(page.getByRole('button',{name:'Merged',exact:true})).toBeDisabled({timeout:10000});await expect(page.locator('#banner')).toContainText('GitHub confirmed the reviewed head was merged.');await expect(page.getByRole('heading',{name:'Document retry behavior'})).toBeVisible();await expect(page.getByLabel('Question about this item')).toHaveValue('Keep this draft while polling.');
+});
+test('surfaces queue removal and retries only the same reviewed head',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,mergeCalls=0;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  merge:async()=>{mergeCalls++;return {url:'https://github.com/example/repo/pull/24'};},
+  inspectQueue:async head=>mergeCalls===1?{state:'removed',reviewedHead:head,removedAt:'2026-09-24T08:05:00Z',reason:'Required check failed.'}:{state:'queued',reviewedHead:head,entryId:'MQE_2',phase:'QUEUED',position:1,enqueuedAt:'2026-09-24T08:06:00Z',queueHead:head},
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('Removed from merge queue. Required check failed.',{timeout:10000});await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();await expect.poll(()=>mergeCalls).toBe(2);await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({state:'queued',reviewedHead:view.snapshot.head});
+});
+test('requires fresh review instead of retry when GitHub replaces the queued head',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  merge:async()=>({url:'https://github.com/example/repo/pull/24'}),inspectQueue:async()=>{throw new Error('The pull request head changed after review.');},
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('The pull request head changed after review.',{timeout:10000});await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toHaveCount(0);await expect(page.locator('#merge')).toBeDisabled();
 });
 test('keeps stale merge failures disabled until refresh',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('head changed');}};app=appRef=await startServer(config,0,undefined,gateway);

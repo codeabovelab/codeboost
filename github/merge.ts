@@ -156,7 +156,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         if (!rule || typeof rule !== 'object') { rulesKnown = false; break; }
         const value = rule as { type?: unknown; parameters?: Record<string, unknown> };
         if (typeof value.type !== 'string') { rulesKnown = false; break; }
-        if (value.type === 'merge_queue') mergeQueue = true;
+        if (value.type === 'merge_queue') { mergeQueue = true; atomicBaseGuard = true; }
         if (value.type !== 'required_status_checks') continue;
         const parameters = value.parameters;
         if (!parameters || !Array.isArray(parameters.required_status_checks)) { rulesKnown = false; break; }

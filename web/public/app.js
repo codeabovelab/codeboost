@@ -20,6 +20,8 @@ let data,
   since = false,
   busy = false;
 let reviewGeneration = 0;
+let mergeGeneration = 0,
+  mergePollTimer = null;
 const drafts = new Map();
 const attachments = new Map();
 let snippetSelection = null;
@@ -48,6 +50,9 @@ function rememberDraft() {
   if (selected) drafts.set(`${selected}:${mode}`, $("message").value);
 }
 function showFailure(message) {
+  mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
   data = null;
   snippetSelection = null;
   $("selection-actions").hidden = true;
@@ -79,6 +84,7 @@ async function refresh() {
   if (busy) return;
   busy = true;
   reviewGeneration++;
+  mergeGeneration++;
   renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
   try {
@@ -98,6 +104,58 @@ async function refresh() {
   } finally {
     busy = false;
     renderAttachment();
+  }
+}
+function renderMerge() {
+  const merge = data?.merge;
+  $("merge").hidden = !merge?.available;
+  $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
+  if (!merge?.available) return;
+  $("merge").disabled = !merge.ready;
+  $("merge").textContent = merge.action === "retry"
+    ? "Retry merge"
+    : merge.queue?.state === "submitting"
+      ? "Submitting…"
+      : merge.queue?.state === "queued"
+        ? "Merge queued"
+        : merge.queue?.state === "merged"
+          ? "Merged"
+          : merge.ready
+            ? "Merge PR"
+            : `${merge.blockers.length} blocker${merge.blockers.length === 1 ? "" : "s"}`;
+  $("merge-details").textContent = merge.queue ? "Merge status" : "Review blockers";
+  scheduleMergePoll();
+}
+function scheduleMergePoll() {
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
+  if (["submitting", "queued"].includes(data?.merge?.queue?.state)) {
+    const generation = mergeGeneration;
+    mergePollTimer = setTimeout(() => pollMergeQueue(generation), 500);
+  }
+}
+async function pollMergeQueue(generation) {
+  try {
+    const update = await api("/api/merge");
+    if (generation !== mergeGeneration || !data?.merge?.available) return;
+    data = { ...data, merge: { ...data.merge, queue: update.queue } };
+    const queue = update.queue;
+    if (queue?.state === "merged") {
+      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." }] };
+      $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
+    } else if (queue?.state === "removed" || queue?.state === "failed") {
+      data.merge = { ...data.merge, ready: queue.retryable, action: queue.retryable ? "retry" : null, blockers: queue.retryable ? [] : [{ code: "queue-terminal", message: queue.reason }] };
+      $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason}`;
+    } else if (queue?.observationError) {
+      $("banner").textContent = `Merge remains queued. ${queue.observationError}`;
+    } else if (queue?.state === "queued") {
+      $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
+    }
+    renderMerge();
+  } catch (error) {
+    if (generation !== mergeGeneration || !data?.merge?.available) return;
+    $("banner").textContent = `Could not refresh merge-queue status. ${error.message}`;
+    scheduleMergePoll();
   }
 }
 async function act(command) {
@@ -145,16 +203,7 @@ function render() {
     `#${data.plan.issue} ${data.plan.summary} · r${data.plan.revision}`;
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
-  const merge = data.merge;
-  $("merge").hidden = !merge?.available;
-  $("merge-details").hidden = !merge?.available || merge.ready;
-  if (merge?.available) {
-    $("merge").disabled = !merge.ready;
-    $("merge").textContent = merge.ready
-      ? "Merge PR"
-      : `${merge.blockers.length} blocker${merge.blockers.length === 1 ? "" : "s"}`;
-    $("merge-details").textContent = "Review blockers";
-  }
+  renderMerge();
   $("banner").textContent = data.demo
     ? "Demo repository · real Git changes and local SQLite storage. No tests or AI review have been run for this demo."
     : "";
@@ -379,22 +428,26 @@ $("approve").onclick = () => {
 $("reload").onclick = refresh;
 $("merge-details").onclick = () => {
   if (!data?.merge?.available) return;
+  const queue = data.merge.queue;
   showDialog(
-    `<h2>Merge blockers</h2><ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
+    `<h2>${queue ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
   );
 };
 $("merge").onclick = async () => {
-  if (busy || !data?.merge?.ready || !window.confirm("Merge this reviewed pull request?")) return;
+  if (busy || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
   busy = true;
+  mergeGeneration++;
   $("merge").disabled = true;
   try {
+    rememberDraft();
     const updated = await api("/api/action", { action: "merge", token: data.token });
-    const blocker = { code: "merge-submitted", message: "Merge was submitted. Refresh to confirm GitHub state." };
+    const queued = updated.mergeQueue?.state === "queued" || updated.mergeQueue?.state === "submitting";
+    const blocker = { code: queued ? "queue-active" : "merge-submitted", message: queued ? "The reviewed head is queued. Waiting for GitHub to confirm the outcome." : "Merge was submitted. Refresh to confirm GitHub state." };
     data = updated.mergeRefreshRequired
-      ? { ...data, merge: { ...data.merge, ready: false, blockers: [blocker] } }
-      : { ...updated, merge: { ...updated.merge, ready: false, blockers: [blocker] } };
+      ? { ...data, merge: { ...data.merge, ready: false, action: null, queue: updated.mergeQueue ?? null, blockers: [blocker] } }
+      : { ...updated, merge: { ...updated.merge, ready: false, action: null, blockers: [blocker] } };
     render();
-    $("banner").textContent = `Merge submitted. ${updated.mergeResult.url}`;
+    $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
