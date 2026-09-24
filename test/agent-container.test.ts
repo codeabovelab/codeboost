@@ -31,7 +31,7 @@ function fixture() {
   writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-schema-marker"}\n');
   chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
   const clone = createTaskClone({ source, parent: staging, taskId: 'task-1', head: git(source, 'rev-parse', 'HEAD') });
-  const filesystems = prepareTaskFilesystems(clone.directory, {
+  const filesystems = prepareTaskFilesystems(clone, {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
   }, imageId);
   taskFilesystems.push(filesystems);
@@ -68,7 +68,7 @@ afterAll(() => {
     chmodSync(join(root, 'input'), 0o700);
     rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
   }
-});
+}, 120_000);
 
 describe('real Docker agent isolation', () => {
   it('runs read-only with no root capabilities, host paths, inherited secrets, or writable tools', () => {
@@ -183,6 +183,15 @@ describe('real Docker agent isolation', () => {
         ? value.replace(`source=${data.input},`, 'source=/,') : value)) });
     expect(() => createValidatedContainer(forged)).toThrow('trusted profile builder');
 
+    expect(() => createContainerProfile({ invocation: invocation(data.clone, 'planning'),
+      filesystems: { ...data.filesystems }, inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth,
+      imageId })).toThrow('trusted allocator');
+
+    const other = fixture();
+    expect(() => createContainerProfile({ invocation: invocation(other.clone, 'planning'),
+      filesystems: data.filesystems, inputDirectory: other.input, command: ['true'], codexAuthFile: other.fakeAuth,
+      imageId })).toThrow('do not belong to the invocation clone');
+
     writeFileSync(data.fakeAuth, '{"changed":true}');
     expect(valid.codexAuthFile).not.toBe(data.fakeAuth);
     expect(readFileSync(valid.codexAuthFile!, 'utf8')).toBe('{}');
@@ -214,6 +223,20 @@ describe('real Docker agent isolation', () => {
       expect(() => validateContainer(valid.name, valid)).toThrow('isolation environment');
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     }
+  }, 60_000);
+
+  it('does not remove an active container when a duplicate attempt name collides', () => {
+    const data = fixture(), captured = invocation(data.clone, 'planning');
+    const first = createContainerProfile({ invocation: captured, filesystems: data.filesystems,
+      inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId });
+    const duplicate = createContainerProfile({ invocation: captured, filesystems: data.filesystems,
+      inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId });
+    profiles.push(first, duplicate);
+    docker(...first.args); containers.add(first.name);
+    expect(() => createValidatedContainer(duplicate)).toThrow();
+    const state = JSON.parse(docker('container', 'inspect', first.name))[0] as { State: { Status: string } };
+    expect(state.State.Status).toBe('created');
+    docker('rm', '--force', first.name); containers.delete(first.name);
   }, 60_000);
 
   it('rejects added capabilities and conflicting or duplicate filesystem options', () => {
@@ -250,10 +273,10 @@ describe('real Docker agent isolation', () => {
     expect(valid.args).not.toContain(AGENT_IMAGE);
     const untrustedDigest = `sha256:${'0'.repeat(64)}`;
     expect(() => assertBuiltAgentImage(untrustedDigest)).toThrow('trusted validated builder');
-    expect(() => prepareTaskFilesystems(data.clone.directory, {
+    expect(() => prepareTaskFilesystems(data.clone, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
     }, untrustedDigest)).toThrow('trusted validated builder');
-    expect(() => prepareTaskFilesystems(data.clone.directory, {
+    expect(() => prepareTaskFilesystems(data.clone, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
     }, AGENT_IMAGE)).toThrow('immutable built image ID');
   });

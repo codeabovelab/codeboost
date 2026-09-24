@@ -1,8 +1,10 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
-import { lstatSync, realpathSync } from 'node:fs';
-import { assertContainerProfile, disposeContainerProfile, type ContainerProfile, type TaskFilesystems } from './profile.ts';
-import { assertBuiltAgentImage, BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
+import { realpathSync } from 'node:fs';
+import { assertContainerProfile, disposeContainerProfile, type ContainerProfile } from './profile.ts';
+import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
+import { taskFilesystemAllocationId } from './storage.ts';
+export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
+export type { TaskFilesystems, TaskStorageLimits } from './storage.ts';
 
 const dockerEnvironment = (secrets: Readonly<Record<string, string>> = {}) => ({
   PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST, ...secrets,
@@ -29,7 +31,6 @@ const createDeadline = (timeoutMs: number) => {
     return value;
   };
 };
-const resourceName = (kind: string) => `codeboost-${kind}-${randomUUID()}`;
 const exactNoNewPrivileges = (options: string[] | null | undefined) => options?.length === 1
   && (options[0] === 'no-new-privileges' || options[0] === 'no-new-privileges:true');
 export const hasExactOptions = (value: string | undefined, expected: readonly string[]) => {
@@ -42,80 +43,39 @@ const canonicalDockerBindSource = (source: string) => {
   try { return realpathSync(desktopHostPath); } catch { return source; }
 };
 const removeContainerOrThrow = (profile: ContainerProfile) => {
+  const remaining = createDeadline(30_000);
+  const before = spawnSync('docker', ['container', 'inspect', profile.name], {
+    encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (before.status !== 0) {
+    const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
+    if (!missing) throw new Error('Failed to establish ownership of the agent container; staged credentials were retained.');
+    disposeContainerProfile(profile);
+    return;
+  }
+  const inspected = JSON.parse(before.stdout || '[]')[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
+  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId) {
+    disposeContainerProfile(profile);
+    return;
+  }
   const result = spawnSync('docker', ['rm', '--force', profile.name], {
-    encoding: 'utf8', timeout: 30_000, env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
     const inspect = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: 30_000, env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
     });
-    const absent = inspect.status !== 0 && !inspect.error && /No such (?:object|container)/i.test(inspect.stderr ?? '');
+    const absent = inspect.status !== 0 && !inspect.error
+      && /No such (?:object|container)/i.test(`${inspect.stdout ?? ''}\n${inspect.stderr ?? ''}`);
     if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
   }
   disposeContainerProfile(profile);
 };
 
-export interface TaskStorageLimits {
-  readonly workBytes: number;
-  readonly workInodes: number;
-  readonly metadataBytes: number;
-  readonly metadataInodes: number;
-}
-
-/** Allocate bounded, engine-owned task filesystems and keep them mounted. */
-export function prepareTaskFilesystems(stagingDirectory: string, limits: TaskStorageLimits,
-  imageId: string, timeoutMs = 60_000): TaskFilesystems {
-  for (const [name, value] of Object.entries(limits)) validLimit(value, name);
-  if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('Task filesystems require the immutable built image ID.');
-  assertBuiltAgentImage(imageId);
-  const remaining = createDeadline(timeoutMs);
-  const staging = realpathSync(stagingDirectory);
-  if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
-  if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
-  const workVolume = resourceName('work'), metadataVolume = resourceName('metadata'), keeper = resourceName('keeper');
-  const createdVolumes: string[] = [];
-  try {
-    for (const [kind, name, bytes, inodes] of [['work', workVolume, limits.workBytes, limits.workInodes],
-      ['metadata', metadataVolume, limits.metadataBytes, limits.metadataInodes]] as const) {
-      docker(['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
-        '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
-        '--label', `io.codeboost.task-storage=${kind}`, name], { timeoutMs: remaining() });
-      createdVolumes.push(name);
-    }
-    const seed = [
-      'set -eu',
-      'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/. /work/',
-      'cp -a --no-preserve=ownership,timestamps /work/.git/. /metadata/',
-      'rm -rf /work/.git',
-      'mkdir /work/.git',
-      'chown -R 10001:10001 /work /metadata',
-    ].join('; ');
-    docker(['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
-      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=32', '--memory=128m', '--cpus=.25',
-      '--mount', `type=volume,source=${workVolume},target=/work`,
-      '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
-      '--label', 'io.codeboost.task-storage=keeper', '--entrypoint', 'sleep', imageId, 'infinity'],
-    { timeoutMs: remaining() });
-    docker(['run', '--rm', '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL',
-      '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--pids-limit=32',
-      '--memory=128m', '--cpus=.25',
-      '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
-      '--mount', `type=volume,source=${workVolume},target=/work`,
-      '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
-      '--entrypoint', 'sh', imageId, '-c', seed], { timeoutMs: remaining() });
-    remaining();
-    return Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
-  } catch (error) {
-    spawnSync('docker', ['rm', '--force', keeper], { env: dockerEnvironment(), stdio: 'ignore' });
-    for (const volume of createdVolumes.reverse())
-      spawnSync('docker', ['volume', 'rm', '--force', volume], { env: dockerEnvironment(), stdio: 'ignore' });
-    throw error;
-  }
-}
-
 type Inspect = {
   Image: string;
-  Config: { Image: string; User: string; Env: string[]; Entrypoint: string[] | null; Cmd: string[] | null; WorkingDir: string };
+  Config: { Image: string; User: string; Env: string[]; Entrypoint: string[] | null; Cmd: string[] | null;
+    WorkingDir: string; Labels: Record<string, string> | null };
   HostConfig: { ReadonlyRootfs: boolean; Privileged: boolean; CapDrop: string[] | null; SecurityOpt: string[] | null;
     CapAdd: string[] | null;
     NetworkMode: string; PidMode: string; IpcMode: string; PidsLimit: number; Memory: number; NanoCpus: number;
@@ -146,6 +106,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   if (inspect.Config.User !== '10001:10001' || inspect.Config.WorkingDir !== '/work'
     || JSON.stringify(inspect.Config.Entrypoint) !== JSON.stringify(['/usr/local/bin/codeboost-container-probe'])
     || JSON.stringify(inspect.Config.Cmd) !== JSON.stringify(profile.command)
+    || inspect.Config.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactNoNewPrivileges(host.SecurityOpt)
@@ -182,6 +143,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   if (work.Source === metadata.Source) throw new Error('Worktree and Git metadata must use separate filesystems.');
   const volumes = JSON.parse(docker(['volume', 'inspect', work.Name!, metadata.Name!], { timeoutMs: remaining() })) as
     Array<{ Name: string; Driver: string; Labels: Record<string, string> | null; Options: Record<string, string> | null }>;
+  const allocationId = taskFilesystemAllocationId(profile.filesystems);
   const expectedVolumes = new Map([
     [work.Name!, ['work', String(profile.filesystems.workBytes), String(profile.filesystems.workInodes)]],
     [metadata.Name!, ['metadata', String(profile.filesystems.metadataBytes), String(profile.filesystems.metadataInodes)]],
@@ -190,6 +152,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     const expected = expectedVolumes.get(volume.Name), options = volume.Options ?? {}, optionString = options.o ?? '';
     if (!expected || volume.Driver !== 'local' || options.type !== 'tmpfs' || options.device !== 'tmpfs'
       || volume.Labels?.['io.codeboost.task-storage'] !== expected[0]
+      || volume.Labels?.['io.codeboost.allocation'] !== allocationId
       || !hasExactOptions(optionString, [`size=${expected[1]}`, `nr_inodes=${expected[2]}`,
         'uid=10001', 'gid=10001', 'mode=0755', 'nosuid', 'nodev']))
       throw new Error('Task volume does not match its bounded tmpfs allocation.');
@@ -201,7 +164,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
       Mounts?: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }> } | undefined;
   const keeperVolumes = new Map((keeper?.Mounts ?? []).filter(item => item.Type === 'volume').map(item => [item.Destination, item]));
   if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
-    || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper' || !keeper.HostConfig?.ReadonlyRootfs
+    || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper'
+    || keeper.Config?.Labels?.['io.codeboost.allocation'] !== allocationId || !keeper.HostConfig?.ReadonlyRootfs
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
@@ -279,10 +243,4 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
       throw cleanupError;
     }
   }
-}
-
-export function removeTaskFilesystems(filesystems: TaskFilesystems): void {
-  spawnSync('docker', ['rm', '--force', filesystems.keeper], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
-  for (const volume of [filesystems.metadataVolume, filesystems.workVolume])
-    spawnSync('docker', ['volume', 'rm', '--force', volume], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
 }

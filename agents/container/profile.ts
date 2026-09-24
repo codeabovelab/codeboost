@@ -1,20 +1,11 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync,
   readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { InvocationInput, Phase } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
-
-export interface TaskFilesystems {
-  readonly keeper: string;
-  readonly workVolume: string;
-  readonly metadataVolume: string;
-  readonly workBytes: number;
-  readonly workInodes: number;
-  readonly metadataBytes: number;
-  readonly metadataInodes: number;
-}
+import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
 export interface ContainerProfile {
   readonly name: string;
   readonly args: readonly string[];
@@ -25,6 +16,7 @@ export interface ContainerProfile {
   readonly inputDirectory: string;
   readonly codexAuthFile?: string;
   readonly command: readonly string[];
+  readonly ownershipId: string;
 }
 export interface ProfileOptions {
   readonly invocation: InvocationInput;
@@ -47,7 +39,8 @@ interface FileIdentity {
   readonly digest: string;
 }
 interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity;
-  readonly cleanupDirectory?: string }
+  readonly cleanupDirectory?: string; readonly filesystems: TaskFilesystems; readonly clone: InvocationInput['clone'] }
+type InputIdentity = Pick<ProfileIdentity, 'inputDirectory' | 'schema'>;
 const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
 
 const readCapturedFile = (path: string, kind: string): { identity: FileIdentity; content: Buffer } => {
@@ -72,7 +65,7 @@ const sameFile = (actual: FileIdentity, expected: FileIdentity) => actual.path =
   && actual.dev === expected.dev && actual.ino === expected.ino && actual.mode === expected.mode
   && actual.nlink === expected.nlink && actual.size === expected.size && actual.mtimeMs === expected.mtimeMs
   && actual.digest === expected.digest;
-const captureInput = (directory: string): ProfileIdentity => {
+const captureInput = (directory: string): InputIdentity => {
   const stat = lstatSync(directory);
   if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o005) !== 0o005)
     throw new Error('Schema input directory must be a container-readable real directory.');
@@ -89,6 +82,7 @@ const captureInput = (directory: string): ProfileIdentity => {
 export function assertContainerProfile(profile: ContainerProfile): void {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
+  assertTaskFilesystems(expected.filesystems, expected.clone);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
     throw new Error('Schema input changed after the profile was captured.');
@@ -124,6 +118,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId))
     throw new Error('Container profile requires the immutable built image ID.');
   assertBuiltAgentImage(options.imageId);
+  assertTaskFilesystems(filesystems, invocation.clone);
   const inputIdentity = captureInput(options.inputDirectory);
   const inputDirectory = inputIdentity.inputDirectory;
   if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
@@ -151,11 +146,12 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       throw error;
     }
   }
-  const name = `codeboost-agent-${safeName(invocation.attemptId)}`;
+  const name = `codeboost-agent-${safeName(invocation.attemptId)}`, ownershipId = randomUUID();
   const readOnlyWork = ['planning', 'questions', 'review'].includes(invocation.phase);
   const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
     '--security-opt=no-new-privileges', '--pids-limit=128', '--memory=512m', '--cpus=1',
     '--network=none', '--env', 'HOME=/home/codeboost', '--env', `CODEBOOST_PHASE=${invocation.phase}`,
+    '--label', `io.codeboost.invocation=${ownershipId}`,
     '--env', `CODEBOOST_VENDOR=${invocation.vendor}`, '--env', 'npm_config_cache=/tmp/npm-cache',
     '--env', `CODEBOOST_WORK_BYTES=${filesystems.workBytes}`, '--env', `CODEBOOST_WORK_INODES=${filesystems.workInodes}`,
     '--env', `CODEBOOST_METADATA_BYTES=${filesystems.metadataBytes}`, '--env', `CODEBOOST_METADATA_INODES=${filesystems.metadataInodes}`,
@@ -171,11 +167,12 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       '--mount', mount({ type: 'bind', source: codexAuthFile!, target: '/run/codeboost-auth/codex/auth.json', readonly: true }));
   } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
   args.push(options.imageId, ...options.command);
-  const capturedFilesystems = Object.freeze({ ...filesystems });
+  const capturedFilesystems = filesystems;
   const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
     phase: invocation.phase, vendor: invocation.vendor,
     filesystems: capturedFilesystems, inputDirectory, codexAuthFile,
-    command: Object.freeze([...options.command]) });
-  identities.set(profile, Object.freeze({ ...inputIdentity, auth: authIdentity, cleanupDirectory }));
+    command: Object.freeze([...options.command]), ownershipId });
+  identities.set(profile, Object.freeze({ ...inputIdentity, auth: authIdentity, cleanupDirectory,
+    filesystems, clone: invocation.clone }));
   return profile;
 }
