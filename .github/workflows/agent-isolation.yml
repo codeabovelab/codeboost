@@ -1,0 +1,25 @@
+name: Agent isolation
+on:
+  push:
+    branches: ['codex/agent-isolation-d2']
+  pull_request:
+    paths:
+      - 'agents/**'
+      - 'git/clone.ts'
+      - 'test/agent-*.test.ts'
+      - '.github/workflows/agent-isolation.yml'
+permissions:
+  contents: read
+jobs:
+  real-docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '26.7.0'
+          cache: npm
+      - run: npm ci --ignore-scripts
+      - run: npm run typecheck
+      - run: npx vitest run test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts
