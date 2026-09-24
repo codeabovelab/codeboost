@@ -203,10 +203,19 @@ it('preserves the recorded reason when GitHub removes a pull request from the me
 });
 
 it('reports merged only when GitHub confirms the reviewed head was merged', async () => {
-  const run = async () => queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } });
+  let call: readonly string[] = [];
+  const run = async (args: readonly string[]) => {
+    call = args;
+    return queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } });
+  };
   await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
     state: 'merged', reviewedHead: sha('b'), mergedAt: '2026-09-24T08:10:00Z',
   });
+  expect(call).toEqual([
+    'api', 'graphql', '-f',
+    'query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason}}}}}}',
+    '-f', 'owner=owner', '-f', 'name=repo', '-F', 'number=7',
+  ]);
 });
 
 it.each([
