@@ -110,6 +110,14 @@ describe('GitHub issue retrieval', () => {
     expect(snapshot.issues[0]).toMatchObject({ authorLogin: null, trust: 'requires-approval' });
   });
 
+  it('fails closed on collaborator-access failure even when every author is deleted', async () => {
+    const gateway = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) throw new Error('Collaborators unavailable.');
+      return JSON.stringify([rawIssue({ user: null, author_association: 'OWNER' })]);
+    });
+    await expect(gateway.fetch()).rejects.toThrow('Collaborators unavailable.');
+  });
+
   it('budgets for a maximum page of JSON-escaped control-character bodies', () => {
     const body = '\0'.repeat(65_536);
     const page = Array.from({ length: 100 }, (_, index) => rawIssue({

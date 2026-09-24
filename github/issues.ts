@@ -211,7 +211,7 @@ export class GhIssueGateway implements IssueGateway {
 
   async #load(signal: AbortSignal): Promise<RepositoryIssue[]> {
     const issues = await this.#loadIssues(signal);
-    if (!issues.some(issue => issue.authorLogin !== null)) return issues;
+    if (issues.length === 0) return issues;
     signal.throwIfAborted();
     const collaborators = await this.#loadCollaborators(signal);
     return issues.map(issue => ({
