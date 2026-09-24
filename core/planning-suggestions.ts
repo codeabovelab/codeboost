@@ -6,12 +6,12 @@ import type { Diagnostic, EditReply, Plan } from './plan.ts';
 export interface SuggestionStore {
   getPlan(identity: PlanIdentity): Plan;
   getSnapshot(identity: PlanIdentity): { id: string; base: string; head: string };
-  beginSuggestions(identity: PlanIdentity, expectedRevision: number): string;
+  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }): string;
   completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void;
-  cancelSuggestions(identity: PlanIdentity, id: string): void;
-  getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; reply: EditReply | null };
+  settleSuggestion(identity: PlanIdentity, id: string, expected: { revision: number; snapshotId: string }, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean;
+  getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null };
 }
-export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'>;
+export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'> & { snapshotId: string };
 export type SuggestionOutcome =
   | { state: 'completed'; id: string; warnings: Diagnostic[] }
   | { state: 'failed' | 'cancelled' | 'stale'; id: string; reason: string };
@@ -23,6 +23,13 @@ export interface SuggestionHandle {
 interface Active {
   handle: SuggestionHandle;
   stop: (state: 'failed' | 'cancelled', reason: string) => void;
+}
+type TerminalOutcome = Extract<SuggestionOutcome, { reason: string }>;
+function persistentReason(reason: string): string {
+  return (reason.trim() || 'Suggestion invocation ended without a reason.').slice(0, 4000);
+}
+function retainDiagnostic(reason: string | null, diagnostic: string): string {
+  return reason && reason !== diagnostic ? `${reason} ${diagnostic}` : diagnostic;
 }
 
 /** One instance per runner. Close it before closing Store. Not a cross-process scheduler. */
@@ -42,22 +49,38 @@ export class SuggestionCoordinator {
     if (this.#closing) throw new Error('Suggestion coordinator is closing.');
     const identity = { ...input.context.identity }, key = identityKey(identity);
     if (this.#active.has(key)) throw new Error('A suggestion invocation is still active for this plan.');
+    const snapshotId = input.snapshotId;
     const previousPlan = this.#store.getPlan(identity), snapshot = this.#store.getSnapshot(identity);
     if (previousPlan.revision !== input.revision) throw new Error('Stale plan revision.');
-    if (snapshot.base !== input.repo.baseSha) throw new Error('Stale base snapshot.');
+    if (snapshot.id !== snapshotId || snapshot.base !== input.repo.baseSha) throw new Error('Stale repository snapshot.');
     // Validate before allocating a durable request; no await permits local state changes.
     const prepared = prepareSuggestions({ ...input, requestId: 'pending', previousPlan });
-    const id = this.#store.beginSuggestions(identity, input.revision);
+    const expected = Object.freeze({ revision: input.revision, snapshotId });
+    const id = this.#store.beginSuggestions(identity, expected);
     const request = Object.freeze({ ...prepared.request, requestId: id });
     const controller = new AbortController();
-    let stopped: { state: 'failed' | 'cancelled'; reason: string } | undefined;
+    let stopped: Omit<TerminalOutcome, 'id'> | undefined;
     const cancellation = () => stopped;
     let settled = false;
+    const reconcile = (outcome: TerminalOutcome): TerminalOutcome => {
+      const current = this.#store.getSuggestions(identity, id);
+      if (current.state === 'cancelled') return { id, state: 'cancelled', reason: retainDiagnostic(current.reason, outcome.reason) };
+      if (current.state === 'invalidated') return { id, state: 'stale', reason: retainDiagnostic(current.reason, outcome.reason) };
+      if (current.state === 'failed') return { id, state: 'failed', reason: retainDiagnostic(current.reason, outcome.reason) };
+      if (this.#store.getPlan(identity).revision !== expected.revision || this.#store.getSnapshot(identity).id !== expected.snapshotId)
+        return { id, state: 'stale', reason: retainDiagnostic(current.reason, outcome.reason) };
+      return outcome;
+    };
     const stop = (state: 'failed' | 'cancelled', reason: string) => {
       if (stopped || settled) return;
       stopped = { state, reason };
       // Even if storage fails, deliver cancellation to the invocation and retain its slot.
-      try { this.#store.cancelSuggestions(identity, id); }
+      try {
+        if (!this.#store.settleSuggestion(identity, id, expected, { state, reason: persistentReason(reason) })) {
+          const reconciled = reconcile({ id, state, reason });
+          stopped = { state: reconciled.state, reason: reconciled.reason };
+        }
+      }
       catch (error) { stopped.reason += ` Request cleanup failed: ${String(error)}`; }
       finally { controller.abort(new Error(reason)); }
     };
@@ -106,7 +129,11 @@ export class SuggestionCoordinator {
         }
       }
       if (outcome.state !== 'completed') {
-        try { this.#store.cancelSuggestions(identity, id); }
+        const terminal = outcome.state === 'stale' ? 'invalidated' : outcome.state;
+        try {
+          if (!this.#store.settleSuggestion(identity, id, expected, { state: terminal, reason: persistentReason(outcome.reason) }))
+            outcome = reconcile(outcome);
+        }
         catch (error) {
           // Keep the original provider/timeout reason, but surface cleanup failure too.
           outcome = { ...outcome, reason: `${outcome.reason} Request cleanup failed: ${String(error)}` };
