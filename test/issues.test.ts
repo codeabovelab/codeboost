@@ -118,6 +118,14 @@ describe('GitHub issue retrieval', () => {
     await expect(gateway.fetch()).rejects.toThrow('Collaborators unavailable.');
   });
 
+  it('fails closed on collaborator-access failure even when no issues are open', async () => {
+    const gateway = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) throw new Error('Collaborators unavailable.');
+      return '[]';
+    });
+    await expect(gateway.fetch()).rejects.toThrow('Collaborators unavailable.');
+  });
+
   it('budgets for a maximum page of JSON-escaped control-character bodies', () => {
     const body = '\0'.repeat(65_536);
     const page = Array.from({ length: 100 }, (_, index) => rawIssue({
