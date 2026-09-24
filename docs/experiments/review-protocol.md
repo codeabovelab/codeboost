@@ -1,6 +1,6 @@
 # Plan-indexed review: go/no-go protocol
 
-Status: **pair selection frozen; implementations and reviews not started**. Max Hwang (`mchwang`) is the blinded reviewer and Codex is the experiment operator. This document does not claim a passed gate. Complete each row's PR and SHA fields and commit that exact revision before the first timed review. No issue, assignment, order, or threshold may change once the first review begins.
+Status: **pair selection frozen; pair 1 prepared; reviews not started**. Max Hwang (`mchwang`) is the blinded reviewer and Codex is the experiment operator. This document does not claim a passed gate. Complete each row's PR and SHA fields and commit that exact revision before the first timed review. No issue, assignment, order, or threshold may change once the first review begins.
 
 ## Pair selection and order
 
@@ -10,7 +10,7 @@ All eight issues are in `codeabovelab/guardyx-gstack`. A/B placement within each
 
 | Pair | Real issue A / PR / base..head | Real issue B / PR / base..head | A method | B method |
 |---|---|---|---|---|
-| 1 — companion documentation | [#493](https://github.com/codeabovelab/guardyx-gstack/issues/493) / PR pending / SHA pending | [#176](https://github.com/codeabovelab/guardyx-gstack/issues/176) / PR pending / SHA pending | Raw GitHub diff | codeboost |
+| 1 — companion documentation | [#493](https://github.com/codeabovelab/guardyx-gstack/issues/493) / [PR #600](https://github.com/codeabovelab/guardyx-gstack/pull/600) / `f95a7eba..6a273dab` | [#176](https://github.com/codeabovelab/guardyx-gstack/issues/176) / [PR #601](https://github.com/codeabovelab/guardyx-gstack/pull/601) / `f95a7eba..f61a793e` | Raw GitHub diff | codeboost |
 | 2 — agent-key security | [#506](https://github.com/codeabovelab/guardyx-gstack/issues/506) / PR pending / SHA pending | [#443](https://github.com/codeabovelab/guardyx-gstack/issues/443) / PR pending / SHA pending | codeboost | Raw GitHub diff |
 | 3 — asynchronous notifications | [#13](https://github.com/codeabovelab/guardyx-gstack/issues/13) / PR pending / SHA pending | [#429](https://github.com/codeabovelab/guardyx-gstack/issues/429) / PR pending / SHA pending | Raw GitHub diff | codeboost |
 | 4 — compliance evidence | [#504](https://github.com/codeabovelab/guardyx-gstack/issues/504) / PR pending / SHA pending | [#507](https://github.com/codeabovelab/guardyx-gstack/issues/507) / PR pending / SHA pending | codeboost | Raw GitHub diff |
@@ -43,4 +43,4 @@ Report declared-file catch rate for both methods without a pass threshold. Stop 
 
 ## Current evidence
 
-Engineering tests prove browser interactions, persistence, attribution, and planting mechanics. The separate manual assignment proves that one real merged issue can be completely classified through stored review choices. Neither establishes human review speed or catch rates. Four Guardyx issue pairs are selected, but no paired implementation, timed decision, or catch-rate result exists yet.
+Engineering tests prove browser interactions, persistence, attribution, and planting mechanics. The separate manual assignment proves that one real merged issue can be completely classified through stored review choices. Neither establishes human review speed or catch rates. Pair 1 is prepared at the exact PR revisions above and passed the repository preflight; the other three pairs remain in preparation. No timed decision or catch-rate result exists yet.
