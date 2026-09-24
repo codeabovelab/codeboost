@@ -203,7 +203,9 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || environment.get('npm_config_cache') !== '/tmp/npm-cache'
     || environment.get('XDG_CACHE_HOME') !== '/tmp/xdg-cache')
     throw new Error('Container isolation environment changed.');
-  if (profile.vendor === 'codex' && names.includes('CLAUDE_CODE_OAUTH_TOKEN')) throw new Error('Credential profiles must not be combined.');
+  if (profile.vendor === 'codex' && (names.includes('CLAUDE_CODE_OAUTH_TOKEN')
+    || environment.get('CODEX_HOME') !== '/run/codeboost-auth/codex'))
+    throw new Error('Credential profiles must not be combined or redirected.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
     throw new Error('Credential profiles must not be combined.');
   assertContainerProfile(profile);

@@ -217,10 +217,10 @@ describe('real Docker agent isolation', () => {
     expect(() => validateContainer(valid.name, valid)).toThrow(/environment|PATH/);
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
-    for (const changedCache of ['npm_config_cache=/work/npm-cache', 'XDG_CACHE_HOME=/work/xdg-cache']) {
-      const cacheArgs = [...valid.args.slice(0, imageIndex), '--env', changedCache, ...valid.args.slice(imageIndex)];
-      docker(...cacheArgs); containers.add(valid.name);
-      expect(() => validateContainer(valid.name, valid)).toThrow('isolation environment');
+    for (const changedPath of ['npm_config_cache=/work/npm-cache', 'XDG_CACHE_HOME=/work/xdg-cache', 'CODEX_HOME=/work']) {
+      const changedArgs = [...valid.args.slice(0, imageIndex), '--env', changedPath, ...valid.args.slice(imageIndex)];
+      docker(...changedArgs); containers.add(valid.name);
+      expect(() => validateContainer(valid.name, valid)).toThrow(/isolation environment|Credential profiles/);
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     }
   }, 60_000);
