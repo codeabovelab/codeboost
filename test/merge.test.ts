@@ -106,6 +106,25 @@ it('preserves the GitHub merge refusal', async () => {
   await expect(new MergeCoordinator(service, client).merge(view.token)).rejects.toThrow('Required review is missing.');
 });
 
+it('aborts and awaits an active merge command during shutdown', async () => {
+  const view = readyView(), service = serviceFor(view);
+  let commandStarted!: () => void, commandSettled = false;
+  const started = new Promise<void>(resolve => { commandStarted = resolve; });
+  const client: MergeGateway = {
+    inspect: vi.fn(async () => remote(view)),
+    merge: vi.fn(async (_head, options) => new Promise<never>((_resolve, reject) => {
+      commandStarted();
+      options?.signal?.addEventListener('abort', () => { commandSettled = true; reject(options.signal?.reason); }, { once: true });
+    })),
+  };
+  const coordinator = new MergeCoordinator(service, client);
+  const merging = coordinator.merge(view.token);
+  await started;
+  await coordinator.close();
+  await expect(merging).rejects.toThrow(/shutdown/i);
+  expect(commandSettled).toBe(true);
+});
+
 it('parses required checks from both rule sources and pins the gh merge head', async () => {
   const calls: string[][] = [];
   let pullReads = 0;
@@ -330,6 +349,20 @@ it('fails closed when a timeline contains a non-object event', async () => {
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
     if (joined.includes('/timeline')) return JSON.stringify([[null]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
+});
+
+it('fails closed when a timeline contains an array event', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([[[]]]);
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();

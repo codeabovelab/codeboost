@@ -75,7 +75,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Cannot determine local address.');
   return { server, service, token, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
-    await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    await merges?.close();
+    await closing;
     await questions.close();
     service.close();
   } };

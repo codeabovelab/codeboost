@@ -7,7 +7,8 @@ export interface MergeStatus { available: true; ready: boolean; blockers: MergeB
 export interface MergeUnavailableStatus { available: true; ready: false; blockers: MergeBlocker[]; remote: null; }
 
 export class MergeCoordinator {
-  #active = false;
+  #active: Promise<{ status: MergeStatus; result: MergeResult }> | null = null;
+  #abort: AbortController | null = null;
   readonly service: ReviewService;
   readonly gateway: MergeGateway;
   constructor(service: ReviewService, gateway: MergeGateway) { this.service = service; this.gateway = gateway; }
@@ -46,7 +47,17 @@ export class MergeCoordinator {
   async merge(token: unknown): Promise<{ status: MergeStatus; result: MergeResult }> {
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
-    this.#active = true;
+    const abort = new AbortController();
+    this.#abort = abort;
+    const attempt = this.#merge(token, abort.signal).finally(() => {
+      if (this.#active === attempt) this.#active = null;
+      if (this.#abort === abort) this.#abort = null;
+    });
+    this.#active = attempt;
+    return attempt;
+  }
+
+  async #merge(token: string, signal: AbortSignal): Promise<{ status: MergeStatus; result: MergeResult }> {
     try {
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
@@ -58,8 +69,19 @@ export class MergeCoordinator {
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head) throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
-      const result = await this.gateway.merge(status.remote.head);
+      if (signal.aborted) throw signal.reason;
+      const result = await this.gateway.merge(status.remote.head, { signal });
       return { status, result };
-    } finally { this.#active = false; }
+    } catch (error) {
+      if (signal.aborted && signal.reason instanceof Error) throw signal.reason;
+      throw error;
+    }
+  }
+
+  async close(): Promise<void> {
+    const active = this.#active;
+    if (!active) return;
+    this.#abort?.abort(new Error('Merge cancelled during shutdown.'));
+    try { await active; } catch {}
   }
 }

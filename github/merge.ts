@@ -24,7 +24,7 @@ export interface RemoteMergeState {
 export interface MergeResult { url: string; }
 export interface MergeGateway {
   inspect(options?: { fresh?: boolean; timeoutMs?: number }): Promise<RemoteMergeState>;
-  merge(expectedHead: string): Promise<MergeResult>;
+  merge(expectedHead: string, options?: { signal?: AbortSignal }): Promise<MergeResult>;
 }
 
 export interface GhMergeConfig {
@@ -80,7 +80,7 @@ export class GhMergeGateway implements MergeGateway {
       const timeline = flattenPages(await this.#json(['api','--paginate','--slurp','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/issues/${this.config.issue}/timeline`], signal));
       const referenced = new Set<number>();
       for (const event of timeline) {
-        if (!event || typeof event !== 'object') throw new Error('GitHub returned a malformed timeline event.');
+        if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed timeline event.');
         const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown } } }).source?.issue;
         if (!source?.pull_request) continue;
         if (!Number.isSafeInteger(source.number) || (source.number as number) < 1) throw new Error('GitHub returned an invalid pull request reference.');
@@ -226,13 +226,14 @@ export class GhMergeGateway implements MergeGateway {
     return attempt;
   }
 
-  async merge(expectedHead: string): Promise<MergeResult> {
+  async merge(expectedHead: string, options: { signal?: AbortSignal } = {}): Promise<MergeResult> {
     fullSha(expectedHead, 'expected head SHA');
     const flag = this.config.method === 'squash' ? '--squash' : this.config.method === 'rebase' ? '--rebase' : '--merge';
     this.#generation++;
     this.#cache = null;
     try {
-      await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead]);
+      if (options.signal?.aborted) throw options.signal.reason;
+      await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead], { signal: options.signal });
       return { url: `https://github.com/${this.config.repository}/pull/${this.config.pullRequest}` };
     } finally { this.#generation++; this.#cache = null; }
   }
