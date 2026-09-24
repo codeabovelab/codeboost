@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import { lstatSync, readdirSync, realpathSync } from 'node:fs';
 import type { InvocationInput, Phase } from '../contract.ts';
-import { AGENT_IMAGE } from './image.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -18,7 +17,6 @@ export interface ContainerProfile {
   readonly expectedImage: string;
   readonly phase: Phase;
   readonly vendor: 'claude' | 'codex';
-  readonly networkMode: 'none' | 'bridge';
   readonly filesystems: TaskFilesystems;
   readonly inputDirectory: string;
   readonly codexAuthFile?: string;
@@ -29,6 +27,7 @@ export interface ProfileOptions {
   readonly filesystems: TaskFilesystems;
   readonly inputDirectory: string;
   readonly command: readonly string[];
+  readonly imageId: string;
   readonly codexAuthFile?: string;
   readonly claudeToken?: string;
 }
@@ -48,6 +47,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   const { invocation, filesystems } = options;
   if (!options.command.length || options.command.some(value => typeof value !== 'string' || value.includes('\0')))
     throw new Error('Container command must be a complete literal argv array.');
+  if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId))
+    throw new Error('Container profile requires the immutable built image ID.');
   const inputStat = options.inputDirectory ? lstatSync(options.inputDirectory) : undefined;
   if (!inputStat?.isDirectory() || (inputStat.mode & 0o005) !== 0o005) throw new Error('Schema input directory must be container-readable.');
   const inputDirectory = mountSource(realpathSync(options.inputDirectory), 'Schema input');
@@ -73,10 +74,9 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   }
   const name = `codeboost-agent-${safeName(invocation.attemptId)}`;
   const readOnlyWork = ['planning', 'questions', 'review'].includes(invocation.phase);
-  const networkMode = 'none';
   const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
     '--security-opt=no-new-privileges', '--pids-limit=128', '--memory=512m', '--cpus=1',
-    `--network=${networkMode}`, '--env', 'HOME=/home/codeboost', '--env', `CODEBOOST_PHASE=${invocation.phase}`,
+    '--network=none', '--env', 'HOME=/home/codeboost', '--env', `CODEBOOST_PHASE=${invocation.phase}`,
     '--env', `CODEBOOST_VENDOR=${invocation.vendor}`, '--env', 'npm_config_cache=/tmp/npm-cache',
     '--env', `CODEBOOST_WORK_BYTES=${filesystems.workBytes}`, '--env', `CODEBOOST_WORK_INODES=${filesystems.workInodes}`,
     '--env', `CODEBOOST_METADATA_BYTES=${filesystems.metadataBytes}`, '--env', `CODEBOOST_METADATA_INODES=${filesystems.metadataInodes}`,
@@ -91,10 +91,10 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       '--tmpfs', '/run/codeboost-auth/codex:rw,nosuid,nodev,size=4194304,nr_inodes=256,uid=10001,gid=10001,mode=0700',
       '--mount', mount({ type: 'bind', source: codexAuthFile!, target: '/run/codeboost-auth/codex/auth.json', readonly: true }));
   } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
-  args.push(AGENT_IMAGE, ...options.command);
+  args.push(options.imageId, ...options.command);
   const capturedFilesystems = Object.freeze({ ...filesystems });
-  return Object.freeze({ name, args: Object.freeze(args), expectedImage: AGENT_IMAGE,
-    phase: invocation.phase, vendor: invocation.vendor, networkMode,
+  return Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
+    phase: invocation.phase, vendor: invocation.vendor,
     filesystems: capturedFilesystems, inputDirectory, codexAuthFile,
     command: Object.freeze([...options.command]) });
 }

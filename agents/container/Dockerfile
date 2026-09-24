@@ -8,7 +8,8 @@ RUN npm install --global --allow-scripts=@anthropic-ai/claude-code \
       "@anthropic-ai/claude-code@${CLAUDE_VERSION}" \
     && npm cache clean --force \
     && useradd --uid 10001 --user-group --no-create-home --shell /usr/sbin/nologin codeboost \
-    && install --directory --owner=10001 --group=10001 --mode=0700 /home/codeboost
+    && install --directory --owner=10001 --group=10001 --mode=0700 /home/codeboost \
+    && install --directory --owner=10001 --group=10001 --mode=0755 /work /work/.git
 
 COPY --chmod=0555 probe.sh /usr/local/bin/codeboost-container-probe
 

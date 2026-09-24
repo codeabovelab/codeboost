@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import type { ContainerProfile, TaskFilesystems } from './profile.ts';
-import { AGENT_IMAGE, BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
+import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 
 const dockerEnvironment = (secrets: Readonly<Record<string, string>> = {}) => ({
   PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST, ...secrets,
@@ -44,8 +44,9 @@ export interface TaskStorageLimits {
 
 /** Allocate bounded, engine-owned task filesystems and keep them mounted. */
 export function prepareTaskFilesystems(stagingDirectory: string, limits: TaskStorageLimits,
-  timeoutMs = 60_000): TaskFilesystems {
+  imageId: string, timeoutMs = 60_000): TaskFilesystems {
   for (const [name, value] of Object.entries(limits)) validLimit(value, name);
+  if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('Task filesystems require the immutable built image ID.');
   const remaining = createDeadline(timeoutMs);
   const staging = realpathSync(stagingDirectory);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
@@ -62,29 +63,25 @@ export function prepareTaskFilesystems(stagingDirectory: string, limits: TaskSto
     }
     const seed = [
       'set -eu',
-      'cp -a /run/codeboost-staging/. /work/',
-      'cp -a /work/.git/. /metadata/',
+      'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/. /work/',
+      'cp -a --no-preserve=ownership,timestamps /work/.git/. /metadata/',
       'rm -rf /work/.git',
       'mkdir /work/.git',
-      'touch /metadata/.codeboost-ready',
-      'exec sleep infinity',
+      'chown -R 10001:10001 /work /metadata',
     ].join('; ');
     docker(['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=32', '--memory=128m', '--cpus=.25',
+      '--mount', `type=volume,source=${workVolume},target=/work`,
+      '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
+      '--label', 'io.codeboost.task-storage=keeper', '--entrypoint', 'sleep', imageId, 'infinity'],
+    { timeoutMs: remaining() });
+    docker(['run', '--rm', '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL',
+      '--cap-add=CHOWN', '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--pids-limit=32',
+      '--memory=128m', '--cpus=.25',
       '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`,
       '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
-      '--label', 'io.codeboost.task-storage=keeper', '--entrypoint', 'sh', AGENT_IMAGE, '-c', seed], { timeoutMs: remaining() });
-    while (true) {
-      const ready = spawnSync('docker', ['exec', keeper, 'sh', '-c',
-        'test -f /metadata/.codeboost-ready && rm /metadata/.codeboost-ready'], {
-        timeout: remaining(), env: dockerEnvironment(),
-        stdio: ['ignore', 'ignore', 'ignore'],
-      });
-      if (ready.status === 0) break;
-      if (ready.error) throw new Error('Timed out preparing bounded task filesystems.');
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 25);
-    }
+      '--entrypoint', 'sh', imageId, '-c', seed], { timeoutMs: remaining() });
     return Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
   } catch (error) {
     spawnSync('docker', ['rm', '--force', keeper], { env: dockerEnvironment(), stdio: 'ignore' });
@@ -113,7 +110,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     { Id?: string; Config?: { User?: string; Entrypoint?: string[]; Labels?: Record<string, string> } } | undefined;
   const imageId = image?.Id, labels = image?.Config?.Labels ?? {};
   const host = inspect.HostConfig;
-  if (!imageId || inspect.Image !== imageId || inspect.Config.Image !== profile.expectedImage
+  if (!imageId || imageId !== profile.expectedImage || inspect.Image !== profile.expectedImage
+    || inspect.Config.Image !== profile.expectedImage
     || image?.Config?.User !== '10001:10001'
     || JSON.stringify(image.Config?.Entrypoint) !== JSON.stringify(['/usr/local/bin/codeboost-container-probe'])
     || labels['org.opencontainers.image.base.name'] !== BASE_IMAGE
@@ -127,15 +125,22 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || !host.SecurityOpt?.some(value => value.startsWith('no-new-privileges'))
-    || host.NetworkMode !== profile.networkMode || host.PidMode === 'host' || host.IpcMode === 'host'
+    || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
     || host.Memory !== 512 * 1024 * 1024 || host.NanoCpus !== 1_000_000_000)
     throw new Error('Container daemon configuration is missing required lockdown.');
   const tmpfs = host.Tmpfs ?? {};
-  for (const path of ['/tmp', '/home/codeboost']) if (!tmpfs[path]?.includes('size='))
-    throw new Error(`Container is missing bounded tmpfs ${path}.`);
-  if (profile.vendor === 'codex' && !tmpfs['/run/codeboost-auth/codex']?.includes('size='))
-    throw new Error('Codex state directory must be bounded tmpfs.');
+  const expectedTmpfs = new Map([
+    ['/tmp', ['rw', 'nosuid', 'nodev', 'size=33554432', 'nr_inodes=4096', 'mode=1777']],
+    ['/home/codeboost', ['rw', 'nosuid', 'nodev', 'size=1048576', 'nr_inodes=128', 'uid=10001', 'gid=10001', 'mode=0700']],
+    ...(profile.vendor === 'codex' ? [['/run/codeboost-auth/codex',
+      ['rw', 'nosuid', 'nodev', 'size=4194304', 'nr_inodes=256', 'uid=10001', 'gid=10001', 'mode=0700']] as const] : []),
+  ]);
+  if (Object.keys(tmpfs).length !== expectedTmpfs.size) throw new Error('Container tmpfs mount set changed.');
+  for (const [path, expected] of expectedTmpfs) {
+    const actual = new Set((tmpfs[path] ?? '').split(','));
+    if (expected.some(option => !actual.has(option))) throw new Error(`Container tmpfs ${path} is missing required options.`);
+  }
   const mounts = new Map(inspect.Mounts.map(item => [item.Destination, item]));
   const allowedMounts = new Set(['/work', '/work/.git', '/run/codeboost-input',
     ...(profile.vendor === 'codex' ? ['/run/codeboost-auth/codex/auth.json'] : [])]);
@@ -164,7 +169,9 @@ export function validateContainer(container: string, profile: ContainerProfile, 
       || volume.Labels?.['io.codeboost.task-storage'] !== expected[0]
       || !optionString.split(',').includes(`size=${expected[1]}`)
       || !optionString.split(',').includes(`nr_inodes=${expected[2]}`)
-      || !optionString.split(',').includes('nosuid') || !optionString.split(',').includes('nodev'))
+      || !optionString.split(',').includes('uid=10001') || !optionString.split(',').includes('gid=10001')
+      || !optionString.split(',').includes('mode=0755') || !optionString.split(',').includes('nosuid')
+      || !optionString.split(',').includes('nodev'))
       throw new Error('Task volume does not match its bounded tmpfs allocation.');
   }
   const keeper = JSON.parse(docker(['container', 'inspect', profile.filesystems.keeper], { timeoutMs: remaining() }))[0] as
@@ -172,7 +179,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; NetworkMode?: string; CapDrop?: string[] | null;
         SecurityOpt?: string[] | null }; Mounts?: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }> } | undefined;
   const keeperVolumes = new Map((keeper?.Mounts ?? []).filter(item => item.Type === 'volume').map(item => [item.Destination, item]));
-  if (!keeper?.State?.Running || keeper.Config?.Image !== AGENT_IMAGE || keeper.Config?.User !== '10001:10001'
+  if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
     || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper' || !keeper.HostConfig?.ReadonlyRootfs
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
