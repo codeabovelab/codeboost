@@ -172,3 +172,13 @@ it.each(['cancelled', 'stale'] as const)('classifies a publication CAS race as %
   expect(f.store.getPlan(f.identity).revision).toBe(expected === 'cancelled' ? 1 : 2);
   await f.coordinator.close();
 });
+it.each(['cancelled', 'stale'] as const)('preserves durable %s state when the provider rejects after an external action', async expected => {
+  const f = fixture(), request = f.coordinator.start(f.value); await Promise.resolve();
+  if (expected === 'cancelled') f.store.cancelSuggestions(f.identity, request.id);
+  else f.store.importRevision(JSON.stringify(plan()), 'json', f.value.context, 1);
+  expect(f.store.getSuggestions(f.identity, request.id).state).toBe(expected === 'cancelled' ? 'cancelled' : 'invalidated');
+  f.pending.reject(new Error('Provider transport disconnected'));
+  expect(await request.result).toMatchObject({ state: expected, reason: expect.stringContaining('Provider transport disconnected') });
+  expect(f.store.getSuggestions(f.identity, request.id).reply).toBeNull();
+  await f.coordinator.close();
+});
