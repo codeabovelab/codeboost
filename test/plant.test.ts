@@ -40,6 +40,8 @@ it('treats metacharacters literally when checking declared-file transitions',()=
  const config={database:join(root,'review.sqlite'),repository,identity,pathIdentity:{caseSensitive:true as const,unicodeNormalization:'none' as const},demo:false};
  const store=new Store(config.database);
  try{store.createPlan(JSON.stringify(plan),'json',{identity,issue:10,baseEntries:['*.txt','a.txt'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},base,head);store.recordHistory(identity,{revision:1,snapshotId:store.getSnapshot(identity).id},base,head,[{sha:owned,owner:'P1',origin:'owned',sourceSha:null}]);}finally{store.close();}
+ expect(git('ls-tree','--name-only',head,'--','*.txt')).toBe('');
+ expect(()=>git('ls-tree','--name-only',head,'--',':(glob)*.txt')).toThrow(/pathspec magic not supported/);
  expect(()=>plant(config,join(root,'experiment'),{declaredText:'planted',undeclaredText:'outside',undeclaredPath:'extra.txt'})).toThrow(/Declared plant needs a regular file retained/);
 },15000);
 

@@ -4,13 +4,13 @@ Validated on 2026-09-23 from `5a2685c`, before selecting real issues for the pla
 
 ## Renamed-file reassignment
 
-A real-Git fixture declares `retry.ts` → `renamed.ts`, then creates an unplanned rename with a content edit. The review exposes unplanned segments on both the removed old path and added new path. Manually assigning every segment to the rename item leaves each segment in scope.
+A real-Git fixture declares `retry.ts` → `renamed.ts`, then creates an unplanned rename with a content edit. The review exposes removed and added text segments with `-` and `+` operations. The fixture resolves the removed side through `oldPath` and the added side through `path`, verifies both declared names, then manually assigns both segments. Each remains in scope.
 
 Result: no defect reproduced. `ReviewService` evaluates a manual assignment against both `path` and `renamed_from`. The integration fixture remains as coverage.
 
 ## Literal pathspec metacharacters
 
-A planting fixture uses the literal declared filename `*.txt` beside a decoy `a.txt`. An owned commit edits the literal file; a later commit removes it while retaining the decoy. The plant helper rejects the history at its declared-file transition check with `Declared plant needs a regular file retained through the remaining history.`
+A planting fixture uses the literal declared filename `*.txt` beside a decoy `a.txt`. An owned commit edits the literal file; a later commit removes it while retaining the decoy. Direct controls prove `git ls-tree ... -- '*.txt'` returns no match and that `ls-tree` rejects `:(glob)` pathspec magic as unsupported. The plant helper then rejects the history at its declared-file transition check with `Declared plant needs a regular file retained through the remaining history.`
 
 Result: no defect reproduced. The decoy does not satisfy the literal transition check. The fixture remains as coverage for Git pathspec metacharacters.
 

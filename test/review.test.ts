@@ -25,8 +25,9 @@ it('keeps both sides of a declared rename in scope after manual reassignment',()
  writeFileSync(join(config.repository,'renamed.ts'),'export function delay(attempt: number) {\n  return Math.min(5000, 200 * 2 ** attempt);\n}\n');
  execFileSync('git',['-c','core.hooksPath=/dev/null','add','-A'],{cwd:config.repository});
  execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Rename retry implementation'],{cwd:config.repository,stdio:'pipe'});
- let view=service.load();const candidates=view.segments.filter(segment=>segment.row==='Unplanned'&&['retry.ts','renamed.ts'].includes(segment.path));
- expect(new Set(candidates.map(segment=>segment.path))).toEqual(new Set(['retry.ts','renamed.ts']));
+ let view=service.load();const candidates=view.segments.filter(segment=>segment.row==='Unplanned'&&segment.kind==='text'&&['-','+'].includes(segment.operation)&&['retry.ts','renamed.ts'].includes(segment.operation==='-'?segment.oldPath??segment.path:segment.path));
+ expect(new Set(candidates.map(segment=>segment.operation))).toEqual(new Set(['-','+']));
+ expect(new Set(candidates.map(segment=>segment.operation==='-'?segment.oldPath??segment.path:segment.path))).toEqual(new Set(['retry.ts','renamed.ts']));
  for(const candidate of candidates){view=service.act({action:'assign',key:candidate.key,item:'P1',token:view.token});expect(view.segments.find(segment=>segment.key===candidate.key)?.scope).toBe('in-scope');}
 });
 it('persists bounded per-item notes without creating a plan revision',()=>{
