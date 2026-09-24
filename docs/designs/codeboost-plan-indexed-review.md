@@ -547,9 +547,11 @@ Added by the engineering review (L1 to L4). The agent tools cannot be retrained,
 
 A lesson whose feedback keeps repeating is flagged for rewording or removal.
 
-### Build order and optional validation
+### Delivery milestones and optional validation
 
 **Superseding product decision (2026-09-23).** The paired human go/no-go experiment was cancelled before timed results were recorded. It did not pass and provides no comparative review evidence. The cancellation removes it as a prerequisite for later roadmap steps. Optional future validation is tracked in #19 and must use fresh blinded packages and a freshly committed protocol. Historical experiment decisions and review records below remain as design history.
+
+The numbers below identify delivery milestones, not a requirement to implement them serially. Use the parallel lanes below to schedule work; milestone completion still requires all of its acceptance criteria. Development can proceed in separate worktrees while the product continues to run one task at a time.
 
 1. **Plan format and linking engine.** A code library, tested with sample git histories.
 2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
@@ -563,13 +565,13 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 
 ### Build step 4: scope and progress
 
-**Numbering.** Build steps above describe delivery order. Product workflow steps describe the user journey. Implementation task IDs (`T1`–`T18`) below identify individual engineering requirements, not delivery order. In particular, **build step 4 is merge gate and merging; T4 is approval fingerprints and dependent staleness**. Use “Build step 4, increment 1” when referring to the current work, rather than “Task 4.”
+**Numbering.** Build steps above identify delivery milestones; the parallel lanes define execution order. Product workflow steps describe the user journey. Implementation task IDs (`T1`–`T18`) below identify individual engineering requirements, not delivery order. In particular, **build step 4 is merge gate and merging; T4 is approval fingerprints and dependent staleness**. Use “Build step 4, increment 1” when referring to the current work, rather than “Task 4.”
 
-**Increment 1 — guarded merge gate (in progress, [#21](https://github.com/codeabovelab/codeboost/issues/21)).** Add blockers derived from the current review snapshot, trusted GitHub base/head and required-check reads, branch-rule refresh, server-enforced base protection, a head-pinned merge command, and the review UI action. Cover stale or missing approvals, unresolved changes, open change requests, missing or stale acceptance evidence, GitHub refusals, and stale/double submission. Zero required checks does not waive atomic base protection. This increment implements parts of T6, T7, and T12; it does not complete the full build step.
+**Increment 1 — guarded merge gate (in review, [#21](https://github.com/codeabovelab/codeboost/issues/21), [PR #23](https://github.com/codeabovelab/codeboost/pull/23); status checked 2026-09-24).** Add blockers derived from the current review snapshot, trusted GitHub base/head and required-check reads, branch-rule refresh, server-enforced base protection, a head-pinned merge command, and the review UI action. Cover stale or missing approvals, unresolved changes, open change requests, missing or stale acceptance evidence, GitHub refusals, and stale/double submission. Zero required checks does not waive atomic base protection. This increment implements parts of T6, T7, and T12; it does not complete the full build step.
 
 Until automated rebase and containerized `cmd:` execution exist, a moved base or missing command result **blocks merging and returns to review**. Increment 1 does not automatically rebase, execute acceptance commands, or bypass unavailable evidence.
 
-**Remaining work before build step 4 is complete:**
+**Remaining work before build step 4 is complete** (pre-merge automation tracked in [#22](https://github.com/codeabovelab/codeboost/issues/22)):
 
 - [ ] Deliver and validate increment 1 against its final head, including unit/integration and browser regressions, typecheck, and the required review loop.
 - [ ] Add the automated pre-merge rebase path and preserve ledger mappings and attribution. Resolve foreign-commit conflicts under the approved agent policy (T3, T11); return conflicts requiring human action to review.
@@ -1879,22 +1881,51 @@ Critical gaps (no test, no handling, and silent): 0.
 
 ### Parallel build lanes
 
-| Step | Modules touched | Depends on |
-|---|---|---|
-| Linking engine | core | — |
-| Git helpers and ledger | git, runner/store | — |
-| Read-only review screen | web | linking engine, git helpers |
-| Optional human validation | (process) | read-only review screen |
-| Merge gate and merging | github, runner | read-only review screen |
-| Agent container and network | agents | read-only review screen |
-| Runner state machine | runner | merge gate, agent container |
-| Learning (lessons, inbox, Learning screen) | runner, agents, web | runner state machine (needs the reject loop) |
+**Scheduling decision (2026-09-24).** Run up to three implementation tasks concurrently in separate feature branches and worktrees. The foundation and review screen are the baseline, not new assignments. Recheck current main, open PRs, and existing implementations before taking a lane; unchecked historical T-items are not proof that their code is missing. These lanes authorize a development schedule, not simultaneous task execution in the shipped runner.
 
-- **Lane A:** linking engine (independent). **Lane B:** git helpers and ledger (independent).
-- Launch A and B in parallel worktrees. Merge both, then build the review screen. Optional human validation may run later without blocking implementation.
-- After the review screen, **Lane C** (merge gate) and **Lane D** (agent container) can run in parallel. The runner follows both.
-- **Conflict flag:** Lane C and the runner both touch `runner`. Sequence the runner after Lane C merges.
-- Learning comes last and is sequential, because it touches `runner`, `agents`, and `web` and needs the reject loop.
+#### Wave 1: independent work now
+
+| Lane | Scope and requirement mapping | Owned files | Start condition and completion check |
+|---|---|---|---|
+| C — guarded merge gate | Build step 4 increment 1; parts of T6, T7, T12. Continue #21 / PR #23 without starting a duplicate implementation. | `github/`, `runner/merge.ts`, merge tests; temporary integration ownership of shared review/UI files already changed by PR #23 | In progress. Complete issue #21 acceptance, exact-head validation, and the review loop. Missing execution evidence continues to block merge. |
+| D — agent isolation | Build step 5 foundation; T1, T2 and the isolation portion of T9. Task clones, pinned container, vendor egress, phase permissions, cancellation and process settlement. | New `agents/` modules, a dedicated clone helper under `git/`, dedicated container/adapter tests and isolated Docker workflow | Can start alongside C. Real-Docker tests prove filesystem/network isolation and phase restrictions; controlled tests prove cancellation keeps ownership until the process terminates. No runner/store or existing question-provider rewiring in this lane. |
+| E — planning logic | Build step 6 preparation; remaining T18 authoring/import/suggestion requirements. Reuse existing schema/parser/store behavior; add missing prompt construction, response validation, and revision-bound suggestion orchestration. | Dedicated new planning modules under `core/`, `prompts/plan-author.md`, planning fixtures and dedicated tests | Can start alongside C and D using an injected provider interface. Tests cover plan identity, revision and replay guards, hostile input, and invalid responses. Production agent invocation and UI Apply remain blocked until integration; fake-provider tests do not satisfy live adapter acceptance. |
+
+**Before the first edit in D or E:** record the assigned owner, branch, exact file list, done-when command, and interface contract in that lane's issue or PR. New module paths above are proposed ownership boundaries, not claims that those files exist. Compare the assignment against C's current diff. If a shared file is needed, request its integration owner to make the edit or queue it after that owner's PR lands.
+
+#### Contracts between lanes
+
+- D exposes invocation input containing the task-clone identity, phase, approved argv, deadline and attempt ID. Results preserve exit status and the original timeout/cancellation reason. Cancellation requests and subprocess termination are separate events; the caller may not reuse a slot before termination. The interface must not grant arbitrary command execution to planning/questions.
+- E takes a read-only provider abstraction and captures repository/task/plan identity plus revision and request ID with every suggestion. Persistence and Apply use the existing runner/store authority and compare-and-swap rules; E cannot create a second writer or bypass validation.
+- C accepts only trusted evidence bound to the reviewed base/head and current plan. D's process result alone is not approval evidence: the integration owner validates context and persists acceptance results before C consumes them.
+- Publish shared TypeScript contracts and representative fixtures in a small prerequisite change before another lane imports them. Until that change lands, lanes may use injected local test interfaces. Changes to an agreed contract require updating its consumers and contract tests before integration.
+
+#### Wave 2: integrate after prerequisites land
+
+| Lane | Prerequisites | Scope / ownership | Completion check |
+|---|---|---|---|
+| F — runner and pre-merge automation | C and D merged; invocation contract available | Build step 5 runner plus #22 / remaining build step 4; T3, T6, T11. Own `runner/`, rebase helpers and shared acceptance persistence during this wave. | Preserve ledger attribution through rebase; recompute approval staleness; execute and persist head-bound checks; cover timeout, cancellation, shutdown and collaborator-push races; complete #22 acceptance. |
+| G — planning screen | E merged; C releases shared UI files | Build step 6 UI and T18 integration. Own `web/` and dedicated browser tests during this wave. Route persistence changes through F. UI work can use controlled provider fixtures until D is available. | Import, generation and Apply preserve user drafts and attachments and reject stale/replayed suggestions. Final completion requires real D-backed invocation and integration with F/store, not fixtures alone. |
+| H — issue prioritization | Existing issue-access contract inspected; ranking weights decided and recorded before implementation | Build step 8: issue-fetch/normalization and ranking modules with dedicated tests. Shared shell/navigation integration waits for G. | Stable ranking with a visible reason per issue; unavailable/stale data has explicit states. Ranking policy is an unresolved design input, not a silently chosen default. |
+
+F, G and H can proceed together within these ownership boundaries. If F and G need an incompatible shared storage/API change, land that small prerequisite first; neither edits the other's files in parallel. Merge independent backend modules first, then their shared integration, and rerun checks on the combined head.
+
+#### Wave 3: lifecycle features and learning
+
+- **Queue, scheduling and recovery (build step 7):** starts after F establishes persisted task lifecycle and shutdown ownership. One owner controls the runner/store changes and recovery regressions.
+- **Lessons pipeline (build step 9; T15):** can proceed alongside queue work after F's reject-loop and feedback-event contract lands. Own dedicated lesson modules and tests; inject storage/provider interfaces and queue shared schema or runner wiring behind the queue owner.
+- **Lessons inbox and Learning screen (T16, T17):** follow the lesson persistence/metrics contracts and G's release of shared UI ownership. Require a working reject-to-lesson-to-approved-prompt path before marking the learning milestone complete.
+- **Merge queue support (#24):** remains a separate compatibility follow-up. Its GitHub adapter/fixture work can use a free lane after C; runner/UI lifecycle integration waits for those files' owners. Keep queue-based merging blocked until queued, removed, failed and confirmed-merged states are implemented and tested. Enqueue success is not merge completion.
+- **Optional human validation (#19):** may run separately with fresh blinded packages; it is never a dependency for these lanes. Schema extensions #5 and #7 remain separate follow-ups unless a lane explicitly needs them; do not silently expand T18 or duplicate #6 alignment work.
+
+#### Ownership and integration rules
+
+1. Each task uses its own branch/worktree from current remote main or a documented prerequisite branch. Record its issue, milestone, T-IDs, dependencies, owner and exact files in the PR. Delegated reviewers report findings; the implementation task's main agent owns its writes.
+2. One integration owner controls `runner/store.ts`, shared runner/review wiring, `web/server.ts`, `web/cli.ts`, `web/public/app.js`, `web/public/index.html`, `web/public/style.css`, shared browser fixtures, package manifests/lockfiles, schema registry and common CI configuration. C holds this ownership first; in wave 2 F owns runner/storage and G owns web. Common configuration remains with one named owner. Separate worktrees do not remove this constraint.
+3. Keep this plan under one documentation owner. Lane owners record detailed progress and review rounds in their own issues/PRs; the documentation owner updates milestone status after integration. Never check off a milestone because only one parallel increment landed.
+4. A blocked integration does not block disjoint modules or fixture work, but those tasks must report the missing production integration. No stub provider, skipped Docker test or mocked merge outcome counts as completed production behavior.
+5. Every lane runs its targeted acceptance checks and required regressions. After its final integration change, rerun typecheck, unit/integration tests and applicable browser/Docker checks against the exact pushed head. Complete automated review and the review-lesson audit before an authorized merge. Revalidate downstream work after prerequisite changes.
+6. Parallel development does not grant deployment or merge permission. Keep each merge subject to the existing approval and CI/review gates. Record newly discovered deferred work as issues before closing the implementing task.
 
 ## Implementation Tasks
 
