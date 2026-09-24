@@ -44,6 +44,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Run final validation against the exact pushed head after the last change.
 - Report current test counts separately from historical milestone counts.
 - Before requesting automated review, report the current head, CI state, mergeability, unresolved threads, and deferred follow-up issues.
+- In evidence records, label cited commits as baselines, intermediate checkpoints, or validated heads. Keep final exact-head results in a place that can name the resulting commit, such as the PR body or CI record.
 - Reproduce summary-only review concerns or turn them into a concrete follow-up issue. Do not repeatedly patch vague wording without a failure case.
 - A validation fixture for a summary-only concern must assert the disputed intermediate representation or state before using a downstream outcome as evidence that the concern was exercised.
 - For each review round, record what changed, what was declined and why, and the regression evidence. Re-request review until a round returns no new findings.

@@ -1,6 +1,6 @@
 # Review-summary edge-case validation (#10)
 
-Validated on 2026-09-23 from `5a2685c`, before selecting real issues for the plan-indexed review experiment. These were summary-only concerns from PR #9, not reproduced defects. No production behavior changed during this validation.
+Validated on 2026-09-23 before selecting real issues for the plan-indexed review experiment. The validation branch started from baseline `5a2685c`; final exact-head results are recorded in PR #17. These were summary-only concerns from PR #9, not reproduced defects. No production behavior changed during this validation.
 
 ## Renamed-file reassignment
 
