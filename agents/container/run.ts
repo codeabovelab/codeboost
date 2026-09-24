@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
-import type { ContainerProfile, TaskFilesystems } from './profile.ts';
+import { assertContainerProfile, type ContainerProfile, type TaskFilesystems } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 
 const dockerEnvironment = (secrets: Readonly<Record<string, string>> = {}) => ({
@@ -30,6 +30,8 @@ const createDeadline = (timeoutMs: number) => {
   };
 };
 const resourceName = (kind: string) => `codeboost-${kind}-${randomUUID()}`;
+const exactNoNewPrivileges = (options: string[] | null | undefined) => options?.length === 1
+  && (options[0] === 'no-new-privileges' || options[0] === 'no-new-privileges:true');
 const canonicalDockerBindSource = (source: string) => {
   const desktopHostPath = source.startsWith('/host_mnt/') ? source.slice('/host_mnt'.length) : source;
   try { return realpathSync(desktopHostPath); } catch { return source; }
@@ -82,6 +84,7 @@ export function prepareTaskFilesystems(stagingDirectory: string, limits: TaskSto
       '--mount', `type=volume,source=${workVolume},target=/work`,
       '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--entrypoint', 'sh', imageId, '-c', seed], { timeoutMs: remaining() });
+    remaining();
     return Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
   } catch (error) {
     spawnSync('docker', ['rm', '--force', keeper], { env: dockerEnvironment(), stdio: 'ignore' });
@@ -104,10 +107,11 @@ type Inspect = {
 /** Validate daemon-resolved configuration before starting an agent. */
 export function validateContainer(container: string, profile: ContainerProfile, timeoutMs = 30_000): void {
   const remaining = createDeadline(timeoutMs);
+  assertContainerProfile(profile);
   const inspect = JSON.parse(docker(['container', 'inspect', container], { timeoutMs: remaining() }))[0] as Inspect | undefined;
   if (!inspect) throw new Error('Docker did not return the created container.');
   const image = JSON.parse(docker(['image', 'inspect', profile.expectedImage], { timeoutMs: remaining() }))[0] as
-    { Id?: string; Config?: { User?: string; Entrypoint?: string[]; Labels?: Record<string, string> } } | undefined;
+    { Id?: string; Config?: { User?: string; Env?: string[]; Entrypoint?: string[]; Labels?: Record<string, string> } } | undefined;
   const imageId = image?.Id, labels = image?.Config?.Labels ?? {};
   const host = inspect.HostConfig;
   if (!imageId || imageId !== profile.expectedImage || inspect.Image !== profile.expectedImage
@@ -124,7 +128,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || JSON.stringify(inspect.Config.Cmd) !== JSON.stringify(profile.command)
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
-    || !host.SecurityOpt?.some(value => value.startsWith('no-new-privileges'))
+    || !exactNoNewPrivileges(host.SecurityOpt)
     || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
     || host.Memory !== 512 * 1024 * 1024 || host.NanoCpus !== 1_000_000_000)
@@ -183,7 +187,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper' || !keeper.HostConfig?.ReadonlyRootfs
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
-    || !keeper.HostConfig.SecurityOpt?.some(value => value.startsWith('no-new-privileges'))
+    || !exactNoNewPrivileges(keeper.HostConfig.SecurityOpt)
     || keeperVolumes.get('/work')?.Name !== profile.filesystems.workVolume
     || keeperVolumes.get('/metadata')?.Name !== profile.filesystems.metadataVolume)
     throw new Error('Task filesystems must remain owned by their trusted keeper.');
@@ -197,12 +201,14 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   if (inspect.Config.Env.some(value => value.indexOf('=') < 1)) throw new Error('Container environment is malformed.');
   const names = inspect.Config.Env.map(value => value.slice(0, value.indexOf('=')));
   const environment = new Map(inspect.Config.Env.map(value => [value.slice(0, value.indexOf('=')), value.slice(value.indexOf('=') + 1)]));
+  const imageEnvironment = new Map((image?.Config?.Env ?? []).map(value => [value.slice(0, value.indexOf('=')), value.slice(value.indexOf('=') + 1)]));
   const allowedEnvironment = new Set(['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'CODEBOOST_PHASE', 'CODEBOOST_VENDOR',
     'CODEBOOST_WORK_BYTES', 'CODEBOOST_WORK_INODES', 'CODEBOOST_METADATA_BYTES', 'CODEBOOST_METADATA_INODES',
     'npm_config_cache', 'XDG_CACHE_HOME', ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
   if (new Set(names).size !== names.length || names.some(name => !allowedEnvironment.has(name)))
     throw new Error('Container includes an unexpected environment variable.');
-  if (environment.get('HOME') !== '/home/codeboost' || environment.get('CODEBOOST_PHASE') !== profile.phase
+  if (environment.get('PATH') !== imageEnvironment.get('PATH')
+    || environment.get('HOME') !== '/home/codeboost' || environment.get('CODEBOOST_PHASE') !== profile.phase
     || environment.get('CODEBOOST_VENDOR') !== profile.vendor
     || environment.get('CODEBOOST_WORK_BYTES') !== String(profile.filesystems.workBytes)
     || environment.get('CODEBOOST_WORK_INODES') !== String(profile.filesystems.workInodes)
@@ -212,15 +218,20 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   if (profile.vendor === 'codex' && names.includes('CLAUDE_CODE_OAUTH_TOKEN')) throw new Error('Credential profiles must not be combined.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
     throw new Error('Credential profiles must not be combined.');
+  assertContainerProfile(profile);
+  remaining();
 }
 
 export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(timeoutMs);
   validateSecrets(profile, secrets);
+  assertContainerProfile(profile);
   try {
     docker(profile.args, { timeoutMs: remaining(), secrets });
     validateContainer(profile.name, profile, remaining());
+    assertContainerProfile(profile);
+    remaining();
     return profile.name;
   } catch (error) {
     spawnSync('docker', ['rm', '--force', profile.name], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
@@ -232,7 +243,12 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(timeoutMs);
   const container = createValidatedContainer(profile, remaining(), secrets);
-  try { return docker(['start', '--attach', container], { timeoutMs: remaining(), secrets }); }
+  try {
+    assertContainerProfile(profile);
+    const output = docker(['start', '--attach', container], { timeoutMs: remaining(), secrets });
+    remaining();
+    return output;
+  }
   finally { spawnSync('docker', ['rm', '--force', container], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' }); }
 }
 

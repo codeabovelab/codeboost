@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+export PATH
 
 fail() { printf 'codeboost isolation probe: %s\n' "$1" >&2; exit 78; }
 mount_options() { findmnt --noheadings --output OPTIONS --target "$1" 2>/dev/null || fail "missing mount: $1"; }

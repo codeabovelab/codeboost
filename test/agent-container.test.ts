@@ -167,12 +167,41 @@ describe('real Docker agent isolation', () => {
     const rogue = `codeboost-work-${randomUUID()}`; docker('volume', 'create', rogue);
     try {
       const rogueArgs = valid.args.map(value => value.replace(data.filesystems.workVolume, rogue));
-      const rogueProfile = Object.freeze({ ...valid, args: Object.freeze(rogueArgs),
-        filesystems: Object.freeze({ ...valid.filesystems, workVolume: rogue }) });
       docker(...rogueArgs); containers.add(valid.name);
-      expect(() => validateContainer(valid.name, rogueProfile)).toThrow('bounded tmpfs allocation');
+      expect(() => validateContainer(valid.name, valid)).toThrow('captured identity');
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     } finally { spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('rejects cloned profiles and host inputs changed after capture', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const forged = Object.freeze({ ...valid, inputDirectory: '/',
+      args: Object.freeze(valid.args.map(value => value.includes(`source=${data.input},`)
+        ? value.replace(`source=${data.input},`, 'source=/,') : value)) });
+    expect(() => createValidatedContainer(forged)).toThrow('trusted profile builder');
+
+    chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
+    expect(() => createValidatedContainer(valid)).toThrow('only one bounded');
+    chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
+
+    writeFileSync(data.fakeAuth, '{"changed":true}');
+    expect(() => createValidatedContainer(valid)).toThrow('Codex auth changed');
+    writeFileSync(data.fakeAuth, '{}');
+  });
+
+  it('rejects extra security policies and a PATH that can shadow the startup probe', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const imageIndex = valid.args.indexOf(imageId);
+    const securityArgs = [...valid.args.slice(0, imageIndex), '--security-opt', 'seccomp=unconfined',
+      ...valid.args.slice(imageIndex)];
+    docker(...securityArgs); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+
+    const pathArgs = [...valid.args.slice(0, imageIndex), '--env', 'PATH=/work', ...valid.args.slice(imageIndex)];
+    docker(...pathArgs); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow(/environment|PATH/);
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
   it('rejects a caller-mutated network before the container can start', () => {

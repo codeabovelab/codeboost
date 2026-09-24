@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { lstatSync, readdirSync, realpathSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
 import type { InvocationInput, Phase } from '../contract.ts';
 
 export interface TaskFilesystems {
@@ -32,6 +32,65 @@ export interface ProfileOptions {
   readonly claudeToken?: string;
 }
 
+interface FileIdentity {
+  readonly path: string;
+  readonly dev: number;
+  readonly ino: number;
+  readonly mode: number;
+  readonly nlink: number;
+  readonly size: number;
+  readonly mtimeMs: number;
+  readonly digest: string;
+}
+interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity }
+const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
+
+const captureFile = (path: string, kind: string): FileIdentity => {
+  let fd: number | undefined;
+  try {
+    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    const before = fstatSync(fd);
+    if (!before.isFile() || before.nlink !== 1 || before.size > 1024 * 1024)
+      throw new Error(`${kind} must be a bounded, unlinked regular file.`);
+    const content = readFileSync(fd);
+    const after = fstatSync(fd);
+    if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
+      || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs)
+      throw new Error(`${kind} changed while its identity was captured.`);
+    return Object.freeze({ path, dev: after.dev, ino: after.ino, mode: after.mode, nlink: after.nlink,
+      size: after.size, mtimeMs: after.mtimeMs, digest: createHash('sha256').update(content).digest('hex') });
+  } finally { if (fd !== undefined) closeSync(fd); }
+};
+const sameFile = (actual: FileIdentity, expected: FileIdentity) => actual.path === expected.path
+  && actual.dev === expected.dev && actual.ino === expected.ino && actual.mode === expected.mode
+  && actual.nlink === expected.nlink && actual.size === expected.size && actual.mtimeMs === expected.mtimeMs
+  && actual.digest === expected.digest;
+const captureInput = (directory: string): ProfileIdentity => {
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (stat.mode & 0o005) !== 0o005)
+    throw new Error('Schema input directory must be a container-readable real directory.');
+  const canonical = mountSource(realpathSync(directory), 'Schema input');
+  const entries = readdirSync(canonical);
+  if (entries.length !== 1 || entries[0] !== 'schema.json')
+    throw new Error('Schema input must contain only one bounded, unlinked regular schema.json file.');
+  const schema = captureFile(`${canonical}/schema.json`, 'Schema input');
+  if ((schema.mode & 0o004) === 0) throw new Error('Schema input must be container-readable.');
+  return Object.freeze({ inputDirectory: canonical, schema });
+};
+
+/** Internal authenticity and host-file revalidation used at every launch boundary. */
+export function assertContainerProfile(profile: ContainerProfile): void {
+  const expected = identities.get(profile);
+  if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
+  const actual = captureInput(expected.inputDirectory);
+  if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
+    throw new Error('Schema input changed after the profile was captured.');
+  if (expected.auth) {
+    const auth = captureFile(expected.auth.path, 'Codex auth');
+    if (!sameFile(auth, expected.auth)) throw new Error('Codex auth changed after the profile was captured.');
+  }
+}
+
 const safeName = (value: string) => {
   const prefix = value.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 24);
   return `${prefix}-${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
@@ -49,14 +108,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     throw new Error('Container command must be a complete literal argv array.');
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId))
     throw new Error('Container profile requires the immutable built image ID.');
-  const inputStat = options.inputDirectory ? lstatSync(options.inputDirectory) : undefined;
-  if (!inputStat?.isDirectory() || (inputStat.mode & 0o005) !== 0o005) throw new Error('Schema input directory must be container-readable.');
-  const inputDirectory = mountSource(realpathSync(options.inputDirectory), 'Schema input');
-  const entries = readdirSync(inputDirectory);
-  const schema = entries.length === 1 && entries[0] === 'schema.json' ? lstatSync(`${inputDirectory}/schema.json`) : undefined;
-  if (!schema?.isFile() || schema.isSymbolicLink() || schema.nlink !== 1 || schema.size > 1024 * 1024
-    || (schema.mode & 0o004) === 0)
-    throw new Error('Schema input must contain only one bounded, unlinked regular schema.json file.');
+  const inputIdentity = captureInput(options.inputDirectory);
+  const inputDirectory = inputIdentity.inputDirectory;
   if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
     throw new Error('Codex requires only its auth file.');
   if (invocation.vendor === 'claude' && (!options.claudeToken || options.codexAuthFile))
@@ -68,10 +121,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   if (options.codexAuthFile && !lstatSync(options.codexAuthFile).isFile())
     throw new Error('Codex auth must be a direct regular file, not a link.');
   const codexAuthFile = options.codexAuthFile ? mountSource(realpathSync(options.codexAuthFile), 'Codex auth') : undefined;
-  if (codexAuthFile) {
-    const auth = lstatSync(codexAuthFile);
-    if (!auth.isFile() || auth.isSymbolicLink() || auth.size > 1024 * 1024) throw new Error('Codex auth must be a bounded regular file.');
-  }
+  const authIdentity = codexAuthFile ? captureFile(codexAuthFile, 'Codex auth') : undefined;
   const name = `codeboost-agent-${safeName(invocation.attemptId)}`;
   const readOnlyWork = ['planning', 'questions', 'review'].includes(invocation.phase);
   const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
@@ -93,8 +143,10 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
   args.push(options.imageId, ...options.command);
   const capturedFilesystems = Object.freeze({ ...filesystems });
-  return Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
+  const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
     phase: invocation.phase, vendor: invocation.vendor,
     filesystems: capturedFilesystems, inputDirectory, codexAuthFile,
     command: Object.freeze([...options.command]) });
+  identities.set(profile, Object.freeze({ ...inputIdentity, auth: authIdentity }));
+  return profile;
 }

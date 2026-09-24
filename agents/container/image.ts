@@ -23,6 +23,7 @@ export function buildAgentImage(timeoutMs = 10 * 60_000): string {
   const inspect = JSON.parse(execFileSync('docker', ['image', 'inspect', AGENT_IMAGE], {
     encoding: 'utf8', timeout: remaining(), stdio: ['ignore', 'pipe', 'pipe'],
   }))[0] as { Id?: string; Config?: { User?: string; Labels?: Record<string, string> } };
+  remaining();
   const labels = inspect.Config?.Labels ?? {};
   if (!inspect.Id?.startsWith('sha256:') || inspect.Config?.User !== '10001:10001'
     || labels['org.opencontainers.image.base.name'] !== BASE_IMAGE
