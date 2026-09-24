@@ -1,4 +1,4 @@
-import { execFileSync, spawn, type ChildProcess } from 'node:child_process';
+import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationResult, StopReason } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
@@ -28,9 +28,11 @@ export interface SupervisorOptions {
   readonly secrets?: Readonly<Record<string, string>>;
   readonly timeoutMs?: number;
   readonly limits?: Partial<CaptureLimits>;
-  readonly decode?: (profile: ContainerProfile, rawStdout: Buffer, maximumBytes: number) => DecodedOutput;
+  readonly decode?: (profile: ContainerProfile, rawStdout: Buffer, maximumBytes: number,
+    timeoutMs: number) => DecodedOutput | Promise<DecodedOutput>;
 }
 export class OutputLimitError extends Error {}
+export class CaptureDeadlineError extends Error {}
 
 const dockerEnvironment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const positiveInteger = (value: number, name: string) => {
@@ -55,42 +57,42 @@ const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason,
   if (maximum <= diagnostic.length) return diagnostic.subarray(0, maximum);
   return Buffer.concat([stderr.subarray(0, maximum - diagnostic.length), diagnostic]);
 };
-const runControl = (args: readonly string[], timeoutMs = 5_000): ChildProcess => {
-  const child = spawn('docker', [...args], { env: dockerEnvironment(), stdio: 'ignore' });
-  const timer = setTimeout(() => child.kill('SIGKILL'), timeoutMs);
-  timer.unref();
-  child.once('close', () => clearTimeout(timer));
-  child.once('error', () => clearTimeout(timer));
-  return child;
-};
-
 /** Read a running container's tmpfs file with a pinned no-follow bounded reader. */
-export function readBoundedContainerFile(container: string, source: string, maximumBytes: number): Buffer {
+export function readBoundedContainerFile(container: string, source: string, maximumBytes: number,
+  timeoutMs = 30_000): Promise<Buffer> {
   positiveInteger(maximumBytes, 'maximumBytes');
-  if (!source.startsWith('/tmp/codeboost-output/') || source.includes('\0'))
+  positiveInteger(timeoutMs, 'timeoutMs');
+  if (!/^\/tmp\/codeboost-output\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(source))
     throw new Error('Adapter output must come from the bounded output directory.');
-  try {
-    const reader = [
-      "const fs=require('node:fs'),path=process.argv[1],maximum=Number(process.argv[2]);",
-      'let fd;try{fd=fs.openSync(path,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW);',
-      "const before=fs.fstatSync(fd);if(before.size>maximum)throw new Error('OUTPUT_LIMIT');",
-      "if(!before.isFile()||before.nlink!==1)throw new Error('UNSAFE_FILE');",
-      'const output=Buffer.allocUnsafe(maximum+1);let length=0,count=0;',
-      'do{count=fs.readSync(fd,output,length,output.length-length,null);length+=count}',
-      "while(count>0&&length<output.length);if(length>maximum)throw new Error('OUTPUT_LIMIT');",
-      'const after=fs.fstatSync(fd);if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size',
-      "||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs)throw new Error('CHANGED_FILE');",
-      'process.stdout.write(output.subarray(0,length))}finally{if(fd!==undefined)fs.closeSync(fd)}',
-    ].join('');
-    return execFileSync('docker', ['exec', container, 'node', '-e', reader, source, String(maximumBytes)], {
-      env: dockerEnvironment(), timeout: 30_000, killSignal: 'SIGKILL', maxBuffer: maximumBytes + 1,
-      stdio: ['ignore', 'pipe', 'pipe'],
+  const reader = [
+    "const fs=require('node:fs'),path=process.argv[1],maximum=Number(process.argv[2]);",
+    'let fd;try{fd=fs.openSync(path,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);',
+    "const before=fs.fstatSync(fd);if(before.size>maximum)throw new Error('OUTPUT_LIMIT');",
+    "if(!before.isFile()||before.nlink!==1)throw new Error('UNSAFE_FILE');",
+    'const output=Buffer.allocUnsafe(maximum+1);let length=0,count=0;',
+    'do{count=fs.readSync(fd,output,length,output.length-length,null);length+=count}',
+    "while(count>0&&length<output.length);if(length>maximum)throw new Error('OUTPUT_LIMIT');",
+    'const after=fs.fstatSync(fd);if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size',
+    '||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs||after.nlink!==1',
+    "||!after.isFile())throw new Error('CHANGED_FILE');",
+    "process.stdout.write(output.subarray(0,length))}catch(error){process.exitCode=error.message==='OUTPUT_LIMIT'?42:43}",
+    'finally{if(fd!==undefined)fs.closeSync(fd)}',
+  ].join('');
+  return new Promise((resolve, reject) => {
+    execFile('docker', ['exec', container, 'node', '-e', reader, source, String(maximumBytes)], {
+      env: dockerEnvironment(), timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: maximumBytes + 1,
+      encoding: 'buffer',
+    }, (error, stdout, stderr) => {
+      if (!error) { resolve(stdout); return; }
+      if (error.code === 42) {
+        reject(new OutputLimitError('Adapter output exceeds its capture limit.')); return;
+      }
+      if ('killed' in error && error.killed) {
+        reject(new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.')); return;
+      }
+      reject(new Error('Adapter output is not a stable bounded unlinked regular file.'));
     });
-  } catch (error) {
-    const diagnostic = error && typeof error === 'object' && 'stderr' in error ? String(error.stderr) : String(error);
-    if (diagnostic.includes('OUTPUT_LIMIT')) throw new OutputLimitError('Adapter output exceeds its capture limit.');
-    throw new Error('Adapter output is not a stable bounded unlinked regular file.');
-  }
+  });
 }
 
 export function isInvocationActive(attemptId: string): boolean {
@@ -133,12 +135,27 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   const stdoutChunks: Buffer[] = [], stderrChunks: Buffer[] = [];
   let stdoutBytes = 0, stderrBytes = 0, combinedBytes = 0;
   let stopReason: StopReason | undefined, failureDetail: string | undefined, closed = false, terminating = false;
-  let decodedOutput: DecodedOutput | undefined, protocolToken: string | undefined;
+  let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
+  let protocolToken: string | undefined;
   let protocolBuffer = Buffer.alloc(0);
   const child = spawn('docker', ['start', '--attach', profile.name], {
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
   });
   const timers = new Set<ReturnType<typeof setTimeout>>();
+  const controls = new Set<Promise<void>>();
+  const runControl = (args: readonly string[], timeoutMs = 5_000) => {
+    const operation = new Promise<void>(resolve => {
+      const control = spawn('docker', [...args], { env: dockerEnvironment(), stdio: 'ignore' });
+      const timer = setTimeout(() => control.kill('SIGKILL'), timeoutMs);
+      timer.unref();
+      const done = () => { clearTimeout(timer); resolve(); };
+      control.once('close', done);
+      control.once('error', done);
+    });
+    controls.add(operation);
+    void operation.finally(() => controls.delete(operation));
+    return operation;
+  };
   const later = (callback: () => void, delay: number) => {
     const timer = setTimeout(() => { timers.delete(timer); callback(); }, delay);
     timer.unref(); timers.add(timer); return timer;
@@ -147,11 +164,11 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     if (terminating || closed) return;
     terminating = true;
     child.stdout?.resume(); child.stderr?.resume();
-    runControl(['stop', '--signal=TERM', '--time=1', profile.name]);
-    later(() => { if (!closed) runControl(['kill', '--signal=KILL', profile.name]); }, 1_500);
+    void runControl(['stop', '--signal=TERM', '--time=1', profile.name]);
+    later(() => { if (!closed) void runControl(['kill', '--signal=KILL', profile.name]); }, 1_500);
     later(() => {
       if (!closed) {
-        runControl(['rm', '--force', profile.name]);
+        void runControl(['rm', '--force', profile.name]);
         child.kill('SIGKILL');
       }
     }, 4_000);
@@ -177,24 +194,35 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     if (chunk.length > available) stop('output-limit');
   };
   const decodeOutput = () => {
-    if (!options.decode || decodedOutput || stopReason) return;
-    try {
-      const raw = Buffer.concat(stdoutChunks, stdoutBytes);
-      const decoded = options.decode(profile, raw,
-        Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)));
-      const additional = decoded.additionalBytes ?? 0;
-      if (!Number.isSafeInteger(additional) || additional < 0) throw new Error('Adapter returned an invalid byte count.');
-      if (stdoutBytes + additional > limits.stdoutBytes || combinedBytes + additional > limits.combinedBytes)
-        throw new OutputLimitError('Adapter output exceeds its capture limit.');
-      decodedOutput = decoded;
-    } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      const reason = error instanceof OutputLimitError || /exceeds its capture limit/i.test(message)
-        ? 'output-limit' : 'capture-failure';
-      failureDetail ??= message;
-      if (closed) stopReason ??= reason;
-      else stop(reason);
-    }
+    if (decodePromise) return decodePromise;
+    if (!options.decode || decodedOutput || stopReason) return Promise.resolve();
+    decodePromise = (async () => {
+      try {
+        const budget = deadline - Date.now();
+        if (budget < 1) throw new CaptureDeadlineError('Invocation deadline expired before output capture.');
+        const raw = Buffer.concat(stdoutChunks, stdoutBytes);
+        const decoded = await options.decode!(profile, raw,
+          Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)), budget);
+        const additional = decoded.additionalBytes ?? 0;
+        const textBytes = Buffer.byteLength(decoded.text);
+        if (!Number.isSafeInteger(additional) || additional < 0)
+          throw new Error('Adapter returned an invalid byte count.');
+        if ((additional > 0 && additional < textBytes) || textBytes > limits.stdoutBytes
+          || textBytes + stderrBytes > limits.combinedBytes)
+          throw new OutputLimitError('Decoded adapter output exceeds its capture limit.');
+        if (stdoutBytes + additional > limits.stdoutBytes || combinedBytes + additional > limits.combinedBytes)
+          throw new OutputLimitError('Adapter output exceeds its capture limit.');
+        decodedOutput = decoded;
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        const reason = error instanceof OutputLimitError || /exceeds its capture limit/i.test(message)
+          ? 'output-limit' : error instanceof CaptureDeadlineError ? 'timeout' : 'capture-failure';
+        failureDetail ??= message;
+        if (closed) stopReason ??= reason;
+        else stop(reason);
+      }
+    })();
+    return decodePromise;
   };
   const protocolLine = (line: Buffer) => {
     const text = line.toString('utf8').trim();
@@ -206,8 +234,10 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     }
     const ready = /^\x1eCODEBOOST_READY:([0-9a-f-]{36}):([0-9]+)\x1e$/.exec(text);
     if (!ready || ready[1] !== protocolToken) return false;
-    decodeOutput();
-    if (decodedOutput) runControl(['exec', profile.name, 'touch', `/tmp/codeboost-output/collected-${ready[1]}`]);
+    void decodeOutput().then(() => {
+      if (decodedOutput && !stopReason)
+        void runControl(['exec', profile.name, 'touch', `/tmp/codeboost-output/collected-${ready[1]}`]);
+    });
     return true;
   };
   const captureStderr = (value: Buffer | string) => {
@@ -242,7 +272,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   });
   active.set(invocation.attemptId, handle);
 
-  child.once('close', (code, signal) => {
+  child.once('close', async (code, signal) => {
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
     if (protocolBuffer.length) {
@@ -252,7 +282,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     closed = true;
     let finalStdout = Buffer.concat(stdoutChunks, stdoutBytes), finalStderr = Buffer.concat(stderrChunks, stderrBytes);
     let exitCode = code, finalSignal = signal;
-    if (!stopReason && code === 0 && options.decode && !profile.deferredOutput) decodeOutput();
+    if (!stopReason && code === 0 && options.decode && !profile.deferredOutput) await decodeOutput();
+    if (decodePromise) await decodePromise;
     if (!stopReason && code === 0 && profile.deferredOutput && !decodedOutput) {
       stopReason = 'capture-failure'; failureDetail ??= 'Deferred output protocol did not complete.';
     }
@@ -260,6 +291,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       finalStdout = Buffer.from(decodedOutput.text);
       if (decodedOutput.providerFailed) exitCode = exitCode === 0 ? 1 : exitCode;
     }
+    await Promise.all([...controls]);
     try {
       disposeValidatedContainer(profile);
     } catch {

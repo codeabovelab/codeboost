@@ -7,9 +7,10 @@ import type { AgentAdapterOptions, AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/tmp/codeboost-output/final.txt';
 
-export function readCodexOutput(container: string, maximumBytes: number) {
-  const output = readBoundedContainerFile(container, CODEX_OUTPUT_FILE, maximumBytes);
-  return Object.freeze({ text: output.toString('utf8'), additionalBytes: output.length });
+export async function readCodexOutput(container: string, maximumBytes: number, timeoutMs = 30_000) {
+  const output = await readBoundedContainerFile(container, CODEX_OUTPUT_FILE, maximumBytes, timeoutMs);
+  const text = new TextDecoder('utf-8', { fatal: true }).decode(output);
+  return Object.freeze({ text, additionalBytes: output.length });
 }
 
 export function startCodexInvocation(request: AgentAdapterRequest,
@@ -21,7 +22,7 @@ export function startCodexInvocation(request: AgentAdapterRequest,
     const profile = createContainerProfile({ ...request, policy, network,
       command: createCodexCommand(policy, request.prompt), codexAuthFile: authFile, deferredOutput: true });
     return startProfileInvocation(profile, { ...options,
-      decode: (current, _raw, maximum) => readCodexOutput(current.name, maximum) });
+      decode: (current, _raw, maximum, timeoutMs) => readCodexOutput(current.name, maximum, timeoutMs) });
   } catch (error) {
     removeVendorNetwork(network);
     throw error;

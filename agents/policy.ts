@@ -91,7 +91,7 @@ export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCo
 export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'
   | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker' | 'finite-output'
   | 'infinite-stdout' | 'infinite-stderr' | 'infinite-mixed' | 'ignore-term' | 'symlink-output'
-  | 'oversized-output';
+  | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output';
 
 /** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
 export function createIsolationProbeCommand(policy: PhasePolicy, probe: IsolationProbe): AgentCommand {
@@ -121,6 +121,8 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
     'ignore-term': "trap '' TERM; while :; do sleep 1; done",
     'symlink-output': 'ln -s /etc/passwd /tmp/codeboost-output/final.txt',
     'oversized-output': 'head -c 131072 /dev/zero > /tmp/codeboost-output/final.txt',
+    'fifo-output': 'mkfifo /tmp/codeboost-output/final.txt',
+    'invalid-utf8-output': "printf '\\377' > /tmp/codeboost-output/final.txt",
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }

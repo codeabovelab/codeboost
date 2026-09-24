@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
-import { isInvocationActive, startProfileInvocation } from '../agents/adapters/supervisor.ts';
+import { isInvocationActive, readBoundedContainerFile, startProfileInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile, type ContainerProfile } from '../agents/container/profile.ts';
@@ -130,13 +130,28 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('capture-failure')).toBe(false);
   }, 60_000);
 
+  it('bounds decoded text independently of adapter byte accounting', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'decoded-limit'), {
+      limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },
+      decode: () => ({ text: 'x'.repeat(64 * 1024 + 1), additionalBytes: 0 }),
+    });
+    expect((await handle.settled).stopReason).toBe('output-limit');
+  }, 60_000);
+
+  it('rejects traversal before starting an output read', () => {
+    expect(() => readBoundedContainerFile('unused',
+      '/tmp/codeboost-output/../../run/codeboost-auth/codex/auth.json', 1024)).toThrow('bounded output directory');
+  });
+
   it.each([
     ['symlink-output', 'capture-failure'],
     ['oversized-output', 'output-limit'],
+    ['fifo-output', 'capture-failure'],
+    ['invalid-utf8-output', 'capture-failure'],
   ] as const)('rejects unsafe Codex output from %s', async (probe, reason) => {
     const handle = startProfileInvocation(profile(fixture(), probe, `file-${probe}`, 2 * 60_000, true), {
       limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },
-      decode: (current, _raw, maximum) => readCodexOutput(current.name, maximum),
+      decode: (current, _raw, maximum, timeoutMs) => readCodexOutput(current.name, maximum, timeoutMs),
     });
     const result = await handle.settled;
     expect(result.stopReason, result.stderr).toBe(reason);
