@@ -10,7 +10,7 @@ import type { EditReply, Plan } from '../core/plan.ts';
 const plan = (): Plan => ({ schema_version: 1, issue: 1, revision: 1, summary: 'Example', questions: [],
   items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }],
     acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
-const input = (): SuggestionInput => ({ context: { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' },
+const input = (): SuggestionInput => ({ snapshotId: 'unbound', context: { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' },
   issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] },
   revision: 1, repo: { name: 'repo', baseRef: 'main', baseSha: 'a'.repeat(40), paths: ['a'] },
   issue: { number: 1, title: 'Fix', body: '', comments: [] }, approvedLessons: [], feedback: '' });
@@ -30,6 +30,7 @@ function fixture(provider?: AuthorProvider) {
   const store = new Store(join(dir, 'state.sqlite')); cleanup.push(() => store.close());
   const value = input(), identity = value.context.identity;
   store.createPlan(JSON.stringify(plan()), 'json', value.context, value.repo.baseSha, 'b'.repeat(40));
+  value.snapshotId = store.getSnapshot(identity).id;
   const pending = deferred(), calls: { request: AuthorRequest; signal: AbortSignal }[] = [];
   const coordinator = new SuggestionCoordinator(store, provider ?? { invoke(request, signal) { calls.push({ request, signal }); return pending.promise; } }, 100);
   return { store, path: join(dir, 'state.sqlite'), value, identity, pending, calls, coordinator };
@@ -96,9 +97,11 @@ it('closes admission first, aborts all jobs and waits for unsettled providers be
   const f = fixture(), first = f.coordinator.start(f.value);
   const other = input(); other.context.identity.planId = 'other';
   f.store.createPlan(JSON.stringify(plan()), 'json', other.context, 'a'.repeat(40), 'b'.repeat(40));
+  other.snapshotId = f.store.getSnapshot(other.context.identity).id;
   const second = f.coordinator.start(other); await Promise.resolve();
   const fresh = input(); fresh.context.identity.planId = 'not-yet-running';
   f.store.createPlan(JSON.stringify(plan()), 'json', fresh.context, 'a'.repeat(40), 'b'.repeat(40));
+  fresh.snapshotId = f.store.getSnapshot(fresh.context.identity).id;
   let closed = false; const closing = f.coordinator.close(); void closing.then(() => { closed = true; });
   expect(f.coordinator.close()).toBe(closing);
   expect(() => f.coordinator.start(f.value)).toThrow(/closing/);
@@ -163,6 +166,17 @@ it('rejects invalid admission before allocating a request or calling the provide
   f.value.repo.baseSha = 'a'.repeat(40); f.value.feedback = '\0';
   expect(() => f.coordinator.start(f.value)).toThrow(/NUL/);
   expect(begin).not.toHaveBeenCalled(); expect(f.calls).toHaveLength(0); await f.coordinator.close();
+});
+it('rejects a snapshot advanced between plan and snapshot reads before admission', async () => {
+  const f = fixture(), other = new Store(f.path); cleanup.push(() => other.close());
+  const getSnapshot = f.store.getSnapshot.bind(f.store), begin = vi.spyOn(f.store, 'beginSuggestions');
+  vi.spyOn(f.store, 'getSnapshot').mockImplementationOnce(identity => {
+    other.recordHistory(identity, { revision: 1, snapshotId: f.value.snapshotId }, 'a'.repeat(40), 'c'.repeat(40), []);
+    return getSnapshot(identity);
+  });
+  expect(() => f.coordinator.start(f.value)).toThrow(/Stale repository snapshot/);
+  expect(begin).not.toHaveBeenCalled(); expect(f.calls).toHaveLength(0);
+  await f.coordinator.close();
 });
 it.each(['cancelled', 'stale'] as const)('classifies a publication CAS race as %s using durable state', async expected => {
   const f = fixture(), complete = f.store.completeSuggestions.bind(f.store);

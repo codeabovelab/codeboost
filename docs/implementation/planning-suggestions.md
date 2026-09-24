@@ -4,13 +4,15 @@ The coordinator is a single in-process owner per runner/store. Construct one ins
 not one per HTTP request. The existing `Store` remains the only durable writer and
 the only Apply authority. The coordinator does not allocate plan revisions or trust
 provider-supplied identity. It captures the identity, revision, immutable base snapshot
-and store-generated request ID before invocation. Input containers are copied.
+and store-generated request ID before invocation. The caller supplies the snapshot ID
+that owns its repository data; admission compares that complete identity before the
+Store atomically allocates the request. Input containers are copied.
 
 | Holder | States and legal transitions | Owner |
 | --- | --- | --- |
 | Coordinator | open → closing; closing rejects new starts synchronously | Runner-owned coordinator |
 | Invocation | pending → running → completed/failed/cancelled/stale; pending may cancel before launch | Coordinator until provider settles |
-| Cancellation | first reason retained; request abort while invocation remains tracked; terminal cancelled/failed only after provider settlement | Coordinator and D adapter |
+| Cancellation | first reason retained; durable request settles and abort is requested immediately; invocation remains tracked and its result stays pending until provider termination | Coordinator and D adapter |
 | Durable request | pending → ready → consumed, or pending → failed/cancelled/invalidated; plan or snapshot changes invalidate pending/ready while retaining completed history | Existing Store transactions |
 | Durable plan | revision advances only through Store import/Apply; advancing invalidates sibling/pending requests | Store |
 | Subprocess/container | abort requested → terminating → terminated; promise settles after final termination | D adapter |

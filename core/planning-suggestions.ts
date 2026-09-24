@@ -11,7 +11,7 @@ export interface SuggestionStore {
   settleSuggestion(identity: PlanIdentity, id: string, expected: { revision: number; snapshotId: string }, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean;
   getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null };
 }
-export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'>;
+export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'> & { snapshotId: string };
 export type SuggestionOutcome =
   | { state: 'completed'; id: string; warnings: Diagnostic[] }
   | { state: 'failed' | 'cancelled' | 'stale'; id: string; reason: string };
@@ -49,12 +49,13 @@ export class SuggestionCoordinator {
     if (this.#closing) throw new Error('Suggestion coordinator is closing.');
     const identity = { ...input.context.identity }, key = identityKey(identity);
     if (this.#active.has(key)) throw new Error('A suggestion invocation is still active for this plan.');
+    const snapshotId = input.snapshotId;
     const previousPlan = this.#store.getPlan(identity), snapshot = this.#store.getSnapshot(identity);
     if (previousPlan.revision !== input.revision) throw new Error('Stale plan revision.');
-    if (snapshot.base !== input.repo.baseSha) throw new Error('Stale base snapshot.');
+    if (snapshot.id !== snapshotId || snapshot.base !== input.repo.baseSha) throw new Error('Stale repository snapshot.');
     // Validate before allocating a durable request; no await permits local state changes.
     const prepared = prepareSuggestions({ ...input, requestId: 'pending', previousPlan });
-    const expected = Object.freeze({ revision: input.revision, snapshotId: snapshot.id });
+    const expected = Object.freeze({ revision: input.revision, snapshotId });
     const id = this.#store.beginSuggestions(identity, expected);
     const request = Object.freeze({ ...prepared.request, requestId: id });
     const controller = new AbortController();
