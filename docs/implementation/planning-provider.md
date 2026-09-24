@@ -22,7 +22,7 @@ requires D5's immutable profile, read/list/search-only tools, disabled web/MCP,
 closed stdin, isolated clone, vendor egress, launch/token budgets, bounded vendor
 envelopes and safe output extraction. This module does not implement a live adapter.
 
-E3 owns request coordination through the existing store interface. Only ReviewStore
+E3 owns request coordination through the existing store interface. Only `Store`
 may publish suggestions or apply a card with its identity/revision transaction.
 G/F integrate API, UI draft preservation and persistence; no second writer is added.
 
