@@ -20,6 +20,8 @@ The Store persists each request's plan revision, snapshot ID, and terminal reaso
 Failed, cancelled, and stale E outcomes use `settleSuggestion`, which can transition
 only the exact pending attempt at its captured revision and snapshot. If another
 process completed the request first, cleanup loses without changing the ready result.
+If another process cancelled or invalidated it first, E rereads the durable state and
+reconciles its returned classification while retaining the original diagnostic.
 Revision and snapshot changes invalidate durable requests with their cause while
 retaining completed replies as stale history. Durable reasons use the Store's bounded
 format even when a provider returns an oversized diagnostic. Restart therefore

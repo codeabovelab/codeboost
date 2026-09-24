@@ -203,3 +203,20 @@ it('does not erase a result completed by another connection during failure clean
   expect(f.store.applySuggestion(f.identity, request.id, 0, f.value.context).revision).toBe(2);
   await f.coordinator.close();
 });
+it.each(['cancelled', 'stale'] as const)('reconciles %s when another connection wins terminal settlement', async expected => {
+  const f = fixture(), request = f.coordinator.start(f.value); await Promise.resolve();
+  const other = new Store(f.path); cleanup.push(() => other.close());
+  const settle = f.store.settleSuggestion.bind(f.store);
+  vi.spyOn(f.store, 'settleSuggestion').mockImplementationOnce((identity, id, binding, outcome) => {
+    if (expected === 'cancelled') other.cancelSuggestions(identity, id, 'Cancelled elsewhere.');
+    else other.recordHistory(identity, binding, 'a'.repeat(40), 'c'.repeat(40), []);
+    return settle(identity, id, binding, outcome);
+  });
+  f.pending.reject(new Error('Provider transport disconnected'));
+  expect(await request.result).toMatchObject({ state: expected, reason: expect.stringContaining('Provider transport disconnected') });
+  expect(f.store.getSuggestions(f.identity, request.id)).toMatchObject({
+    state: expected === 'cancelled' ? 'cancelled' : 'invalidated',
+    reason: expected === 'cancelled' ? 'Cancelled elsewhere.' : 'Repository snapshot changed.',
+  });
+  await f.coordinator.close();
+});
