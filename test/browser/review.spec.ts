@@ -226,6 +226,22 @@ test('ignores question polls started before a newer submission',async({page})=>{
  await page.waitForTimeout(100);
  expect(await page.locator('#notes .note').count()).toBe(2);
 });
+test('polls persisted answer status without rebuilding the review',async({page})=>{
+ const config=app.service.config;await app.close();let settle!:(answer:string)=>void;
+ app=await startServer(config,0,()=>new Promise(resolve=>settle=resolve));
+ await page.goto(app.url);await page.getByLabel('Question about this item').fill('Why is this bounded?');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
+ await expect(page.getByText('Agent · Answering…',{exact:true})).toBeVisible();
+ const service=app.service,load=service.load.bind(service);let reviewLoads=0;
+ service.load=()=>{reviewLoads++;return load();};
+ const polled=page.waitForResponse(response=>response.url().endsWith('/api/questions'));
+ settle('The cap bounds retry latency.');
+ const statusResponse=await polled,statusBody=await statusResponse.json();
+ await expect(page.getByText('The cap bounds retry latency.',{exact:true})).toBeVisible({timeout:10000});
+ expect(reviewLoads).toBe(0);
+ expect(statusBody.notes.find((note:{id:string})=>note.id)).not.toHaveProperty('text');
+ expect(service.store.getReviewNotes(config.identity).find(note=>note.text==='Why is this bounded?')?.answer?.status).toBe('complete');
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect.poll(()=>reviewLoads).toBeGreaterThan(0);
+});
 test('outdated questions explain how to continue without offering a broken retry',async({page})=>{
  const service=app.service;
  service.act({action:'note',item:'P1',kind:'question',text:'Old question',token:service.load().token});

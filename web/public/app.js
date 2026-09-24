@@ -616,7 +616,7 @@ setInterval(async()=>{
   if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending" || n.answerActive)) return;
   pollingQuestions=true;
   const generation = reviewGeneration;
-  try {const response=await api("/api/questions");if(data && generation === reviewGeneration){data.notes=response.notes.map(note=>note.answer?.status==="pending" && note.answer.expiresAt<=Date.now() && !note.answerActive ? {...note,answer:{...note.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."}} : note);renderNotes({ follow: true });}}
+  try {const response=await api("/api/questions");if(data && generation === reviewGeneration){const statuses=new Map(response.notes.map(note=>[note.id,note]));data.notes=data.notes.map(note=>{const status=statuses.get(note.id);if(!status)return note;const answer=status.answer?.status==="pending" && status.answer.expiresAt<=Date.now() && !status.answerActive ? {...status.answer,status:"failed",error:"Agent was interrupted or timed out. Retry the question."} : status.answer;return {...note,answer,answerActive:status.answerActive};});renderNotes({ follow: true });}}
   catch { if (generation === reviewGeneration) $("saved").textContent="Could not refresh agent answers. Use Refresh to reconnect."; }
   finally {pollingQuestions=false;}
 },2000);
