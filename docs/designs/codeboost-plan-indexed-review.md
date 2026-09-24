@@ -26,7 +26,7 @@ Writing standard: plain language, ISO 24495-1:2023
 - **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
 - **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
-- **What we build first.** The review screen, tested on real PRs. We build the rest (running agents, the queue, the issue list) only if the review screen proves its worth.
+- **What we build first.** The review screen was built first. The remaining roadmap can proceed; optional real-PR validation is tracked separately in #19 and is not a prerequisite.
 
 ## Terms used
 
@@ -110,7 +110,7 @@ Where we disagreed: the plan format is what makes code-to-item links possible. S
 
 ## What we will build
 
-We build all 9 steps as one local app. We start with the review screen. After the first two build steps, optional human validation may check whether the review screen works, but the cancelled experiment no longer stops the remaining roadmap (see "Build order and the go/no-go check").
+We build all 9 steps as one local app. We started with the review screen. Optional human validation may check whether it works, but the cancelled experiment no longer stops the remaining roadmap (see "Build order and optional validation").
 
 ### Tools and storage
 
@@ -547,7 +547,7 @@ Added by the engineering review (L1 to L4). The agent tools cannot be retrained,
 
 A lesson whose feedback keeps repeating is flagged for rewording or removal.
 
-### Build order and the go/no-go check
+### Build order and optional validation
 
 **Superseding product decision (2026-09-23).** The paired human go/no-go experiment was cancelled before timed results were recorded. It did not pass and provides no comparative review evidence. The cancellation removes it as a prerequisite for later roadmap steps. Optional future validation is tracked in #19 and must use fresh blinded packages and a freshly committed protocol. Historical experiment decisions and review records below remain as design history.
 
@@ -586,7 +586,8 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 - assigning an Unplanned segment to a plan item. Expected: that plan item goes stale, and the assignment survives an unrelated revision;
 - the "already fixed" check run against the task's own PR. Expected: no match.
 
-**The real-PR test (the go/no-go check).**
+**Historical cancelled real-PR test.** The following procedure is retained as design history. It was not completed, produced no result, and is not a roadmap prerequisite; #19 tracks any fresh optional validation.
+
 0. **Write the rules down first** (engineering review, O9). Commit this test's pairs, pass rule, and stopping rule to the repo before the first review. Do not change them afterwards.
 1. Pick at least 4 pairs of similar small issues in a repo you own.
 2. Make every PR by hand, using the method in "The assignment" below. (Build step 5, running agents, does not exist yet.)
@@ -1790,7 +1791,7 @@ Codex (outside voice, completed, 2026-09-22) raised 8 findings. Claude checked e
 
 ### Not in scope
 
-- **Issue ranking weights, parallel tasks, and a different agent per phase.** These stay in Open questions. They sit after the go/no-go check and do not affect the review idea.
+- **Issue ranking weights, parallel tasks, and a different agent per phase.** These stay in Open questions and do not affect the review idea. The cancelled experiment is not a phase boundary.
 - **Reusing AgentDiff code.** Still an open question. Read its code before build step 1.
 - **Windows support.** The container and sign-in design was checked for macOS and Linux only.
 
@@ -1912,10 +1913,10 @@ Built from this review's findings. Each task comes from a specific decision abov
   - Surfaced by: O4 (D14: A)
   - Files: github/merge
   - Verify: a head or base push between validation and merge is refused or revalidated by the server-side guarded merge; a backend without atomic base protection blocks automatic merge, including with zero required checks
-- [ ] **T8 (P1, human: ~2 days / CC: ~30 min)** — process — Commit the go/no-go rules and build the ledger-aware plant script
+- [x] **T8 (P1, historical estimate: human ~2 days / CC ~30 min)** — process — Cancelled before timed results; optional future validation moved to #19
   - Surfaced by: R3 (D4: A), O5, O9 (D19: A)
   - Files: scripts/plant.ts, docs/go-no-go.md
-  - Verify: plants land in ledger commits; the rules file is committed before the first review
+  - Outcome: no experimental result or product claim; future work must start with a fresh protocol and fresh blinded packages
 - [ ] **T9 (P1, human: ~2 weeks / CC: ~3 hours)** — tests — Set up Vitest, real git, recorded gh and CLI outputs, the real-Docker CI suite, Playwright, and the hostile-issue eval
   - Surfaced by: T1 (D10: A)
   - Files: test/, .github/workflows/
@@ -1976,7 +1977,7 @@ None in this review.
 - New requirement during review: learning from your feedback, decided in 4 parts (L1 to L4)
 - Unresolved decisions: 0 in this review
 - Outside voice: Codex, completed, 8 findings (split into 9 decisions, all resolved)
-- Parallelization: 4 lanes, 2 parallel before the go/no-go check and 2 after; the runner and learning are sequential
+- Historical parallelization plan: 4 lanes, originally split around the go/no-go check; the cancelled experiment no longer divides or blocks roadmap work
 - Lake score: 12/20
 - Suppressed findings (appendix): none
 
