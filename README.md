@@ -2,7 +2,7 @@
 
 Review agent-made Git changes one plan item at a time. The approved plan lists each item's files and acceptance checks; the review engine shows which item produced each change and flags foreign or overlapping work.
 
-**Status:** the plan/linking library, SQLite store, and local read-only review screen are implemented. Run `npm run demo` and open its private local URL. Ask can invoke Claude Code or Codex for read-only answers; choose the provider in Settings. Code-writing agents and merge commands are not implemented. The paired human review experiment was cancelled before results were recorded and no longer blocks roadmap work; optional future validation is tracked in [#19](https://github.com/codeabovelab/codeboost/issues/19).
+**Status:** the plan/linking library, SQLite store, and local review screen are implemented. Run `npm run demo` and open its private local URL. Ask can invoke Claude Code or Codex for read-only answers; choose the provider in Settings. A configured GitHub review can merge only after the guarded exact-head gate passes. Automated rebasing, plan command execution, and code-writing agents are not implemented. The paired human review experiment was cancelled before results were recorded and no longer blocks roadmap work; optional future validation is tracked in [#19](https://github.com/codeabovelab/codeboost/issues/19).
 
 ## Development
 
@@ -15,6 +15,23 @@ npm test
 ```
 
 Tests create disposable local repositories. They do not invoke agents, access GitHub, or execute plan acceptance commands.
+
+## Guarded GitHub merge
+
+An existing-store configuration may add a trusted GitHub binding:
+
+```json
+{
+  "github": {
+    "repository": "owner/repository",
+    "pullRequest": 123,
+    "issue": 456,
+    "method": "merge"
+  }
+}
+```
+
+The issue must match the stored plan. The authenticated `gh` account must be able to read the pull request, issue timeline, applicable rulesets, and classic branch protection, and to merge the PR. Codeboost unions required checks from both rule sources, requires strict server-enforced current-base checks, rechecks the base and head immediately before merging, and passes the reviewed head to `gh pr merge --match-head-commit`. Missing permissions, ambiguous rule responses, and merge queues block the merge. A moved base and any unexecuted `cmd:` acceptance check remain blocked until [#22](https://github.com/codeabovelab/codeboost/issues/22) adds the runner path.
 
 ## Library
 
