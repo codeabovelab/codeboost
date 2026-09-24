@@ -221,11 +221,28 @@ it.each([['feature', 'found'], ['other-branch', 'found']] as const)('classifies 
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 7, pull_request: {} } } }, { source: { issue: { number: 8, pull_request: {} } } }]]);
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 7, pull_request: {}, repository_url: 'https://api.github.com/repos/owner/repo' } } }, { source: { issue: { number: 8, pull_request: {}, repository_url: 'https://api.github.com/repos/owner/repo' } } }]]);
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
   expect(state.alreadyFixed).toBe(expected);
+});
+
+it('fails closed for a pull request reference from another repository', async () => {
+  let graphReads = 0;
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('api graphql')) { graphReads++; return JSON.stringify({ data: { repository: {} } }); }
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 7, pull_request: {}, repository_url: 'https://api.github.com/repos/other/repo' } } }]]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
+  expect(graphReads).toBe(0);
 });
 
 it.each([{}, { state: 'CLOSED' }, { state: 'BOGUS', mergedAt: null }, { state: 'CLOSED', mergedAt: 42 }, { state: 'MERGED', mergedAt: null }, { state: 'OPEN', mergedAt: '2026-01-01' }, { state: 'CLOSED', mergedAt: '2026-01-01' }])('fails closed for malformed referenced PR data: %j', async referencedPull => {
@@ -236,7 +253,7 @@ it.each([{}, { state: 'CLOSED' }, { state: 'BOGUS', mergedAt: null }, { state: '
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 8, pull_request: {} } } }]]);
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 8, pull_request: {}, repository_url: 'https://api.github.com/repos/owner/repo' } } }]]);
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
@@ -293,7 +310,7 @@ it('fails closed when GraphQL returns referenced PR data with errors', async () 
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 8, pull_request: {} } } }]]);
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: 8, pull_request: {}, repository_url: 'https://api.github.com/repos/owner/repo' } } }]]);
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
@@ -326,7 +343,7 @@ it('does not let an inspection started before merge repopulate the cache', async
 });
 
 it('blocks the already-fixed check instead of truncating more than 100 references', async () => {
-  const references = Array.from({ length: 101 }, (_, index) => ({ source: { issue: { number: index + 8, pull_request: {} } } }));
+  const references = Array.from({ length: 101 }, (_, index) => ({ source: { issue: { number: index + 8, pull_request: {}, repository_url: 'https://api.github.com/repos/owner/repo' } } }));
   let referencedViews = 0;
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
@@ -364,7 +381,7 @@ it('fails closed when a timeline pull request reference has no valid number', as
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: '8', pull_request: {} } } }]]);
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: '8', pull_request: {}, repository_url: 'https://api.github.com/repos/owner/repo' } } }]]);
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();

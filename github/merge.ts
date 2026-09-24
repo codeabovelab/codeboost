@@ -81,8 +81,9 @@ export class GhMergeGateway implements MergeGateway {
       const referenced = new Set<number>();
       for (const event of timeline) {
         if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed timeline event.');
-        const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown } } }).source?.issue;
+        const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown; repository_url?: unknown } } }).source?.issue;
         if (!source?.pull_request) continue;
+        if (source.repository_url !== `https://api.github.com/repos/${this.config.repository}`) throw new Error('GitHub returned a cross-repository or incomplete pull request reference.');
         if (!Number.isSafeInteger(source.number) || (source.number as number) < 1) throw new Error('GitHub returned an invalid pull request reference.');
         if (source.number !== this.config.pullRequest) referenced.add(source.number as number);
       }
