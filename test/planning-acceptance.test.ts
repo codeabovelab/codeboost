@@ -23,7 +23,8 @@ function fixture() {
   const context: PlanContext = { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, issue: 412,
     baseEntries: [{ path: 'src/example.ts', kind: 'file' }], pathKey: path => path, allowedCommands: [['npm', 'test']] };
   store.createPlan(planSource, 'json', context, 'a'.repeat(40), 'b'.repeat(40));
-  const input: SuggestionInput = { context, revision: 1, repo: { name: 'repo', baseRef: 'main', baseSha: 'a'.repeat(40), paths: ['src/example.ts'] },
+  const input: SuggestionInput = { context, revision: 1, snapshotId: store.getSnapshot(context.identity).id,
+    repo: { name: 'repo', baseRef: 'main', baseSha: 'a'.repeat(40), paths: ['src/example.ts'] },
     issue: { number: 412, title: 'Example', body: '', comments: [] }, approvedLessons: [], feedback: '' };
   const calls: AuthorRequest[] = [];
   function provider(source = editsSource) {
@@ -42,7 +43,8 @@ it.each(['json', 'yaml'] as const)('imports %s as the next revision and invalida
   await coordinator.close();
 });
 it('rejects an import for another selected issue without changing the plan or pending request', async () => {
-  const f = fixture(), before = f.store.getPlan(f.context.identity), id = f.store.beginSuggestions(f.context.identity, 1);
+  const f = fixture(), before = f.store.getPlan(f.context.identity);
+  const id = f.store.beginSuggestions(f.context.identity, { revision: 1, snapshotId: f.input.snapshotId });
   expect(() => f.store.importRevision(JSON.stringify({ ...plan(), issue: 413 }), 'json', f.context, 1)).toThrow(/issue/);
   expect(f.store.getPlan(f.context.identity)).toEqual(before);
   expect(f.store.getSuggestions(f.context.identity, id)).toMatchObject({ state: 'pending', revision: 1, reply: null });
@@ -96,7 +98,7 @@ it.each([
 ] as const)('does not publish %s or allocate a plan revision', async (_, source) => {
   const f = fixture(), coordinator = f.provider(source()), request = coordinator.start(f.input);
   expect((await request.result).state).toBe('failed');
-  expect(f.store.getSuggestions(f.context.identity, request.id)).toMatchObject({ state: 'cancelled', reply: null });
+  expect(f.store.getSuggestions(f.context.identity, request.id)).toMatchObject({ state: 'failed', reply: null, reason: expect.any(String) });
   expect(f.store.getPlan(f.context.identity).revision).toBe(1);
   expect(() => f.store.applySuggestion(f.context.identity, request.id, 0, f.context)).toThrow(/unavailable/);
   await coordinator.close();
