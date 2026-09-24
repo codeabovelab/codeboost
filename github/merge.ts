@@ -257,6 +257,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null };
         errors?: unknown;
       };
+      if (signal.aborted) throw signal.reason;
       if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue data with errors.');
       const pull = response.data?.repository?.pullRequest;
       if (!pull || pull.number !== this.config.pullRequest) throw new Error('GitHub returned an incomplete merge-queue pull request.');
@@ -268,12 +269,6 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       const entry = pull.mergeQueueEntry;
       const timeline = pull.timelineItems;
       if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline) || !Array.isArray((timeline as { nodes?: unknown }).nodes)) throw new Error('GitHub returned incomplete merge-queue history.');
-      if (pull.state === 'MERGED') {
-        if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');
-        return { state: 'merged', reviewedHead, mergedAt: timestamp(pull.mergedAt, 'merge completion time') };
-      }
-      if (pull.mergedAt !== null) throw new Error('GitHub returned inconsistent merge completion data.');
-
       const events = (timeline as { nodes: unknown[] }).nodes.map(event => {
         if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed merge-queue event.');
         const value = event as { __typename?: unknown; createdAt?: unknown; reason?: unknown };
@@ -282,6 +277,11 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         if (value.__typename === 'RemovedFromMergeQueueEvent' && (typeof value.reason !== 'string' || !value.reason.trim())) throw new Error('GitHub returned a merge-queue removal without a reason.');
         return { type: value.__typename, createdAt, reason: value.reason as string | undefined };
       });
+      if (pull.state === 'MERGED') {
+        if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');
+        return { state: 'merged', reviewedHead, mergedAt: timestamp(pull.mergedAt, 'merge completion time') };
+      }
+      if (pull.mergedAt !== null) throw new Error('GitHub returned inconsistent merge completion data.');
 
       if (entry !== null) {
         if (pull.state !== 'OPEN' || !entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('GitHub returned an invalid merge-queue entry.');

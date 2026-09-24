@@ -215,6 +215,7 @@ it.each([
   ['a removal without a reason', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: null }] } })],
   ['an omitted mergeQueueEntry field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', timelineItems: { nodes: [] } })],
   ['an omitted timelineItems field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null })],
+  ['a malformed timeline node on a merged response', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [null] } })],
   ['GraphQL errors alongside data', JSON.stringify({ data: { repository: { pullRequest: { number: 7, headRefOid: sha('b'), state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } } } }, errors: [{ message: 'partial' }] })],
 ] as const)('fails closed for %s', async (_case, fixture) => {
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => fixture);
@@ -243,6 +244,17 @@ it('preserves caller cancellation while reading merge-queue state', async () => 
   });
   const pending = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'), { signal: controller.signal });
   controller.abort(new Error('closing queue watcher'));
+  await expect(pending).rejects.toThrow('closing queue watcher');
+});
+
+it('discards a GraphQL response that resolves after caller cancellation', async () => {
+  let release!: (value: string) => void;
+  const response = new Promise<string>(resolve => { release = resolve; });
+  const controller = new AbortController();
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => response);
+  const pending = client.inspectQueue(sha('b'), { signal: controller.signal });
+  controller.abort(new Error('closing queue watcher'));
+  release(queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } }));
   await expect(pending).rejects.toThrow('closing queue watcher');
 });
 
