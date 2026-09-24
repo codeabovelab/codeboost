@@ -186,7 +186,7 @@ export class MergeCoordinator {
 
   async #pollQueue(attempt: MergeAttempt, signal: AbortSignal): Promise<MergeQueueStatus | null> {
     try {
-      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, afterEventId: attempt.queueWatermark ?? null });
+      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, afterCursor: attempt.queueWatermark ?? null });
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {

@@ -38,7 +38,7 @@ export type MergeQueueObservation =
   | { state: 'merged'; reviewedHead: string; mergedAt: string };
 export interface MergeQueueGateway {
   queueWatermark(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string | null>;
-  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; afterEventId?: string | null }): Promise<MergeQueueObservation>;
+  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null }): Promise<MergeQueueObservation>;
 }
 export interface MergeGateway {
   inspect(options?: { fresh?: boolean; timeoutMs?: number }): Promise<RemoteMergeState>;
@@ -260,28 +260,30 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const timeoutMs = options.timeoutMs ?? 6_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue watermark timeout.');
     const [owner, name] = this.config.repository.split('/') as [string, string];
-    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid timelineItems(last:1,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{id}}}}}`;
+    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid timelineItems(last:1,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id}}}}}}`;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-queue watermark timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     try {
       if (options.signal?.aborted) throw options.signal.reason;
       const response = await this.#json(['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${this.config.pullRequest}`], signal) as {
-        data?: { repository?: { pullRequest?: { number?: unknown; headRefOid?: unknown; timelineItems?: { nodes?: unknown } } | null } | null };
+        data?: { repository?: { pullRequest?: { number?: unknown; headRefOid?: unknown; timelineItems?: { edges?: unknown } } | null } | null };
         errors?: unknown;
       };
       if (signal.aborted) throw signal.reason;
       if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue watermark data with errors.');
       const pull = response.data?.repository?.pullRequest;
-      if (!pull || pull.number !== this.config.pullRequest || fullSha(pull.headRefOid, 'queue watermark head SHA') !== expectedHead || !Array.isArray(pull.timelineItems?.nodes))
+      if (!pull || pull.number !== this.config.pullRequest || fullSha(pull.headRefOid, 'queue watermark head SHA') !== expectedHead || !Array.isArray(pull.timelineItems?.edges))
         throw new Error('GitHub returned an incomplete merge-queue watermark.');
-      const nodes = pull.timelineItems.nodes;
-      if (nodes.length > 1) throw new Error('GitHub returned an invalid merge-queue watermark.');
-      const node = nodes[0];
-      if (node === undefined) return null;
-      if (!node || typeof node !== 'object' || Array.isArray(node) || typeof (node as { id?: unknown }).id !== 'string' || !(node as { id: string }).id)
+      const edges = pull.timelineItems.edges;
+      if (edges.length > 1) throw new Error('GitHub returned an invalid merge-queue watermark.');
+      const edge = edges[0];
+      if (edge === undefined) return null;
+      if (!edge || typeof edge !== 'object' || Array.isArray(edge) || typeof (edge as { cursor?: unknown }).cursor !== 'string' || !(edge as { cursor: string }).cursor ||
+          !(edge as { node?: unknown }).node || typeof (edge as { node: unknown }).node !== 'object' || Array.isArray((edge as { node: unknown }).node) ||
+          typeof ((edge as { node: { id?: unknown } }).node.id) !== 'string' || !(edge as { node: { id: string } }).node.id)
         throw new Error('GitHub returned an invalid merge-queue watermark.');
-      return (node as { id: string }).id;
+      return (edge as { cursor: string }).cursor;
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
       if (timeout.signal.aborted && !options.signal?.aborted) throw new Error('GitHub merge-queue watermark timed out.');
@@ -289,49 +291,63 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     } finally { clearTimeout(timer); }
   }
 
-  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; afterEventId?: string | null } = {}): Promise<MergeQueueObservation> {
+  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null } = {}): Promise<MergeQueueObservation> {
     fullSha(expectedHead, 'expected head SHA');
     const timeoutMs = options.timeoutMs ?? 12_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue inspection timeout.');
-    const correlated = Object.hasOwn(options, 'afterEventId');
-    if (options.afterEventId !== undefined && options.afterEventId !== null && (typeof options.afterEventId !== 'string' || !options.afterEventId || options.afterEventId.length > 512))
+    const correlated = Object.hasOwn(options, 'afterCursor');
+    if (options.afterCursor !== undefined && options.afterCursor !== null && (typeof options.afterCursor !== 'string' || !options.afterCursor || options.afterCursor.length > 512))
       throw new Error('Invalid merge-queue event cursor.');
     const [owner, name] = this.config.repository.split('/') as [string, string];
-    const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{id __typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}`;
+    const query = `query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(first:100,after:$after,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id __typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}} pageInfo{hasNextPage endCursor}}}}}`;
     const timeout = new AbortController();
     const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-queue inspection timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     try {
       if (options.signal?.aborted) throw options.signal.reason;
-      const response = await this.#json(['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${this.config.pullRequest}`], signal) as {
-        data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null };
-        errors?: unknown;
-      };
-      if (signal.aborted) throw signal.reason;
-      if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue data with errors.');
-      const pull = response.data?.repository?.pullRequest;
+      let cursor = options.afterCursor ?? null, pull: Record<string, unknown> | null = null, stable = '', page = 0;
+      const events: Array<{ id: string; type: unknown; createdAt: string; reason: string | undefined; beforeHead: string | undefined }> = [];
+      while (page++ < 10) {
+        const args = ['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${this.config.pullRequest}`];
+        if (cursor !== null) args.push('-f', `after=${cursor}`);
+        const response = await this.#json(args, signal) as { data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null }; errors?: unknown };
+        if (signal.aborted) throw signal.reason;
+        if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue data with errors.');
+        const nextPull = response.data?.repository?.pullRequest;
+        if (!nextPull || nextPull.number !== this.config.pullRequest) throw new Error('GitHub returned an incomplete merge-queue pull request.');
+        const current = JSON.stringify({ number: nextPull.number, headRefOid: nextPull.headRefOid, state: nextPull.state, mergedAt: nextPull.mergedAt, mergeQueueEntry: nextPull.mergeQueueEntry });
+        if (stable && current !== stable) throw new Error('GitHub merge-queue state changed during paginated inspection.');
+        stable = current; pull = nextPull;
+        const timeline = nextPull.timelineItems;
+        if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline)) throw new Error('GitHub returned incomplete merge-queue history.');
+        const value = timeline as { edges?: unknown; pageInfo?: { hasNextPage?: unknown; endCursor?: unknown } };
+        if (!Array.isArray(value.edges) || !value.pageInfo || typeof value.pageInfo.hasNextPage !== 'boolean' ||
+            (value.pageInfo.endCursor !== null && typeof value.pageInfo.endCursor !== 'string')) throw new Error('GitHub returned incomplete merge-queue pagination.');
+        for (const edge of value.edges) {
+          if (!edge || typeof edge !== 'object' || Array.isArray(edge) || typeof (edge as { cursor?: unknown }).cursor !== 'string' || !(edge as { cursor: string }).cursor)
+            throw new Error('GitHub returned a malformed merge-queue edge.');
+          const event = (edge as { node?: unknown }).node;
+          if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed merge-queue event.');
+          const node = event as { id?: unknown; __typename?: unknown; createdAt?: unknown; reason?: unknown; beforeCommit?: { oid?: unknown } | null };
+          if (typeof node.id !== 'string' || !node.id || node.id.length > 512) throw new Error('GitHub returned a merge-queue event without stable identity.');
+          if (!['AddedToMergeQueueEvent','RemovedFromMergeQueueEvent'].includes(String(node.__typename))) throw new Error('GitHub returned an unknown merge-queue event.');
+          const createdAt = timestamp(node.createdAt, 'merge-queue event time');
+          if (node.__typename === 'RemovedFromMergeQueueEvent' && (typeof node.reason !== 'string' || !node.reason.trim())) throw new Error('GitHub returned a merge-queue removal without a reason.');
+          const beforeHead = node.__typename === 'RemovedFromMergeQueueEvent' ? fullSha(node.beforeCommit?.oid, 'removed merge-queue head SHA') : undefined;
+          events.push({ id: node.id, type: node.__typename, createdAt, reason: node.reason as string | undefined, beforeHead });
+        }
+        if (!value.pageInfo.hasNextPage) break;
+        if (page === 10 || typeof value.pageInfo.endCursor !== 'string' || !value.pageInfo.endCursor) throw new Error('GitHub merge-queue history exceeded the inspection limit.');
+        cursor = value.pageInfo.endCursor;
+      }
       if (!pull || pull.number !== this.config.pullRequest) throw new Error('GitHub returned an incomplete merge-queue pull request.');
       const reviewedHead = fullSha(pull.headRefOid, 'queue pull request head SHA');
       if (reviewedHead !== expectedHead) throw new Error('The pull request head changed after review.');
       if (!['OPEN','CLOSED','MERGED'].includes(String(pull.state))) throw new Error('GitHub returned an invalid queue pull request state.');
       if (!Object.hasOwn(pull, 'mergedAt') || (pull.mergedAt !== null && typeof pull.mergedAt !== 'string')) throw new Error('GitHub returned invalid merge completion data.');
-      if (!Object.hasOwn(pull, 'mergeQueueEntry') || !Object.hasOwn(pull, 'timelineItems')) throw new Error('GitHub returned incomplete merge-queue data.');
+      if (!Object.hasOwn(pull, 'mergeQueueEntry')) throw new Error('GitHub returned incomplete merge-queue data.');
       const entry = pull.mergeQueueEntry;
-      const timeline = pull.timelineItems;
-      if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline) || !Array.isArray((timeline as { nodes?: unknown }).nodes)) throw new Error('GitHub returned incomplete merge-queue history.');
-      const events = (timeline as { nodes: unknown[] }).nodes.map(event => {
-        if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed merge-queue event.');
-        const value = event as { id?: unknown; __typename?: unknown; createdAt?: unknown; reason?: unknown; beforeCommit?: { oid?: unknown } | null };
-        if (typeof value.id !== 'string' || !value.id || value.id.length > 512) throw new Error('GitHub returned a merge-queue event without stable identity.');
-        if (!['AddedToMergeQueueEvent','RemovedFromMergeQueueEvent'].includes(String(value.__typename))) throw new Error('GitHub returned an unknown merge-queue event.');
-        const createdAt = timestamp(value.createdAt, 'merge-queue event time');
-        if (value.__typename === 'RemovedFromMergeQueueEvent' && (typeof value.reason !== 'string' || !value.reason.trim())) throw new Error('GitHub returned a merge-queue removal without a reason.');
-        const beforeHead = value.__typename === 'RemovedFromMergeQueueEvent' ? fullSha(value.beforeCommit?.oid, 'removed merge-queue head SHA') : undefined;
-        return { id: value.id, type: value.__typename, createdAt, reason: value.reason as string | undefined, beforeHead };
-      });
-      const boundary = options.afterEventId === null || options.afterEventId === undefined ? -1 : events.findIndex(event => event.id === options.afterEventId);
-      if (correlated && options.afterEventId !== null && boundary < 0) throw new Error('GitHub no longer exposes the pre-enqueue event cursor.');
-      const attemptEvents = events.slice(boundary + 1);
+      const attemptEvents = events;
       const hasCurrentAdd = attemptEvents.some(event => event.type === 'AddedToMergeQueueEvent');
       if (pull.state === 'MERGED') {
         if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');

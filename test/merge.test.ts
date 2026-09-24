@@ -33,7 +33,7 @@ function queueHarness(observations: Array<MergeQueueObservation | Error>) {
   const merges: string[] = [];
   const client: MergeGateway & MergeQueueGateway = {
     inspect: vi.fn(async () => remote(view, { mergeQueue: true })),
-    queueWatermark: vi.fn(async () => 'MQEV_before'),
+    queueWatermark: vi.fn(async () => 'CURSOR_before'),
     merge: vi.fn(async head => { merges.push(head); return { url: 'https://github.example/pr/1' }; }),
     inspectQueue: vi.fn(async () => { const next = observations.shift(); if (next instanceof Error) throw next; if (!next) throw new Error('No queue observation.'); return next; }),
   };
@@ -157,7 +157,7 @@ it('persists enqueue success as queued and waits for a separate confirmed merge'
     await h.coordinator.merge(h.view().token);
     expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'queued', reviewedHead: sha('b') });
     expect((await h.coordinator.pollQueue())).toMatchObject({ state: 'queued', phase: 'AWAITING_CHECKS', position: 2 });
-    expect(h.client.inspectQueue).toHaveBeenCalledWith(sha('b'), expect.objectContaining({ afterEventId: 'MQEV_before' }));
+    expect(h.client.inspectQueue).toHaveBeenCalledWith(sha('b'), expect.objectContaining({ afterCursor: 'CURSOR_before' }));
     expect((await h.coordinator.pollQueue())).toMatchObject({ state: 'merged', occurredAt: '2026-09-24T08:10:00Z', retryable: false });
   } finally { await h.coordinator.close(); h.store.close(); }
 });
@@ -228,7 +228,7 @@ it('refuses a merge-queue mode change between validation passes', async () => {
 
 it('revalidates the review generation after reading the queue watermark', async () => {
   const h = queueHarness([]);
-  h.client.queueWatermark = vi.fn(async () => { h.changeToken('new-review-token'); return 'MQEV_before'; });
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('new-review-token'); return 'CURSOR_before'; });
   try {
     await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/review changed during merge validation/i);
     expect(h.merges).toEqual([]);
@@ -354,13 +354,25 @@ it('rejects an unsupported runtime merge method', () => {
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21, method: 'typo' as 'merge' })).toThrow(/merge method/i);
 });
 
-const queueFixture = (pullRequest: Record<string, unknown>) => JSON.stringify({
-  data: { repository: { pullRequest: { number: 7, headRefOid: sha('b'), ...pullRequest } } },
-});
+const queueFixture = (pullRequest: Record<string, unknown>) => {
+  const timeline = pullRequest.timelineItems as { nodes?: unknown[] } | undefined;
+  const normalized = timeline && Array.isArray(timeline.nodes) ? {
+    ...pullRequest,
+    timelineItems: {
+      edges: timeline.nodes.map((node, index) => ({
+        cursor: node && typeof node === 'object' && !Array.isArray(node) && typeof (node as { cursor?: unknown }).cursor === 'string'
+          ? (node as { cursor: string }).cursor : `CURSOR_${index}`,
+        node,
+      })),
+      pageInfo: { hasNextPage: false, endCursor: timeline.nodes.length ? `CURSOR_${timeline.nodes.length - 1}` : null },
+    },
+  } : pullRequest;
+  return JSON.stringify({ data: { repository: { pullRequest: { number: 7, headRefOid: sha('b'), ...normalized } } } });
+};
 
 it('captures the stable queue timeline cursor before enqueue', async () => {
-  const run = async () => queueFixture({ timelineItems: { nodes: [{ id: 'MQEV_before' }] } });
-  await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).queueWatermark(sha('b'))).resolves.toBe('MQEV_before');
+  const run = async () => queueFixture({ timelineItems: { nodes: [{ id: 'MQEV_before', cursor: 'CURSOR_before' }] } });
+  await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).queueWatermark(sha('b'))).resolves.toBe('CURSOR_before');
 });
 
 it.each([
@@ -401,13 +413,43 @@ it('preserves the recorded reason when GitHub removes a pull request from the me
 
 it('rejects a removal event at the pre-enqueue timeline cursor', async () => {
   const run = async () => queueFixture({
+    state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [] },
+  });
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
+  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_removed_old' })).rejects.toThrow(/current enqueue attempt/i);
+});
+
+it('recovers terminal state after the stored cursor falls outside the recent event window', async () => {
+  const run = async () => queueFixture({
     state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [
-      { id: 'MQEV_added_old', __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:01Z' },
-      { id: 'MQEV_removed_old', __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:00:01Z', reason: 'Previous attempt failed', beforeCommit: { oid: sha('b') } },
+      { id: 'MQEV_added_current', __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T09:00:00Z' },
+      { id: 'MQEV_removed_current', __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T09:05:00Z', reason: 'Current attempt failed', beforeCommit: { oid: sha('b') } },
     ] },
   });
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
-  await expect(client.inspectQueue(sha('b'), { afterEventId: 'MQEV_removed_old' })).rejects.toThrow(/current enqueue attempt/i);
+  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before_outside_window' })).resolves.toMatchObject({
+    state: 'removed', reason: 'Current attempt failed', removedAt: '2026-09-24T09:05:00Z',
+  });
+});
+
+it('paginates forward from the stored cursor to the terminal event', async () => {
+  let calls = 0;
+  const response = (edge: Record<string, unknown>, hasNextPage: boolean, endCursor: string | null) => JSON.stringify({ data: { repository: { pullRequest: {
+    number: 7, headRefOid: sha('b'), state: 'OPEN', mergedAt: null, mergeQueueEntry: null,
+    timelineItems: { edges: [edge], pageInfo: { hasNextPage, endCursor } },
+  } } } });
+  const run = async (args: readonly string[]) => {
+    calls++;
+    if (calls === 1) {
+      expect(args).toContain('after=CURSOR_before');
+      return response({ cursor: 'CURSOR_added', node: { id: 'MQEV_added', __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T09:00:00Z' } }, true, 'CURSOR_added');
+    }
+    expect(args).toContain('after=CURSOR_added');
+    return response({ cursor: 'CURSOR_removed', node: { id: 'MQEV_removed', __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T09:05:00Z', reason: 'Checks failed', beforeCommit: { oid: sha('b') } } }, false, 'CURSOR_removed');
+  };
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
+  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before' })).resolves.toMatchObject({ state: 'removed', reason: 'Checks failed' });
+  expect(calls).toBe(2);
 });
 
 it('reports merged only when GitHub confirms the reviewed head was merged', async () => {
@@ -421,7 +463,7 @@ it('reports merged only when GitHub confirms the reviewed head was merged', asyn
   });
   expect(call).toEqual([
     'api', 'graphql', '-f',
-    'query=query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{id __typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}',
+    'query=query($owner:String!,$name:String!,$number:Int!,$after:String){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(first:100,after:$after,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id __typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}} pageInfo{hasNextPage endCursor}}}}}',
     '-f', 'owner=owner', '-f', 'name=repo', '-F', 'number=7',
   ]);
 });
