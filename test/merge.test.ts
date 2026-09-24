@@ -113,9 +113,10 @@ it('parses required checks from both rule sources and pins the gh merge head', a
     calls.push([...args]); const joined = args.join(' ');
     if (joined.startsWith('pr view 7')) { pullReads++; return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } },
+      { name: 'race', status: 'IN_PROGRESS', conclusion: 'SUCCESS' },
       { context: 'lint', state: 'SUCCESS' },
     ] }); }
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'merge_queue' }, { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'merge_queue' }, { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }, { context: 'race', integration_id: null }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.includes('/protection')) return JSON.stringify({ required_status_checks: { strict: false, checks: [{ context: 'lint', app_id: null }] } });
     if (joined.includes('/timeline')) return JSON.stringify([[]]);
@@ -128,6 +129,7 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   expect(state.mergeQueue).toBe(true);
   expect(state.requiredChecks).toEqual([
     { context: 'test', appId: 10, state: 'success' },
+    { context: 'race', appId: null, state: 'pending' },
     { context: 'lint', appId: null, state: 'success' },
   ]);
   await client.merge(sha('b'));
@@ -300,6 +302,20 @@ it('fails closed when a paginated timeline contains a malformed page', async () 
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
     if (joined.includes('/timeline')) return JSON.stringify([{ source: { issue: { number: 8, pull_request: {} } } }]);
+    throw new Error(`Unexpected gh call: ${joined}`);
+  };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();
+  expect(state.alreadyFixed).toBe('unknown');
+});
+
+it('fails closed when a timeline pull request reference has no valid number', async () => {
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+    if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    if (joined.includes('/timeline')) return JSON.stringify([[{ source: { issue: { number: '8', pull_request: {} } } }]]);
     throw new Error(`Unexpected gh call: ${joined}`);
   };
   const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect();

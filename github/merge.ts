@@ -78,11 +78,15 @@ export class GhMergeGateway implements MergeGateway {
   async #alreadyFixed(signal?: AbortSignal): Promise<'clear' | 'found' | 'unknown'> {
     try {
       const timeline = flattenPages(await this.#json(['api','--paginate','--slurp','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/issues/${this.config.issue}/timeline`], signal));
-      const numbers = [...new Set(timeline.flatMap(event => {
-        if (!event || typeof event !== 'object') return [];
+      const referenced = new Set<number>();
+      for (const event of timeline) {
+        if (!event || typeof event !== 'object') continue;
         const source = (event as { source?: { issue?: { number?: unknown; pull_request?: unknown } } }).source?.issue;
-        return source?.pull_request && Number.isSafeInteger(source.number) && source.number !== this.config.pullRequest ? [source.number as number] : [];
-      }))];
+        if (!source?.pull_request) continue;
+        if (!Number.isSafeInteger(source.number) || (source.number as number) < 1) throw new Error('GitHub returned an invalid pull request reference.');
+        if (source.number !== this.config.pullRequest) referenced.add(source.number as number);
+      }
+      const numbers = [...referenced];
       if (numbers.length > 100) return 'unknown';
       if (!numbers.length) return 'clear';
       const [owner, name] = this.config.repository.split('/') as [string, string];
@@ -173,9 +177,17 @@ export class GhMergeGateway implements MergeGateway {
         return context === required.context && (required.appId === null || app === required.appId);
       });
       if (!match) return { ...required, state: 'missing' as const };
-      const conclusion = String(match.conclusion ?? match.state ?? '').toUpperCase();
-      const status = String(match.status ?? '').toUpperCase();
-      const state: RequiredCheck['state'] = conclusion === 'SUCCESS' ? 'success' : ['FAILURE','ERROR','CANCELLED','TIMED_OUT','ACTION_REQUIRED'].includes(conclusion) ? 'failure' : status === 'COMPLETED' && conclusion ? 'failure' : 'pending';
+      let state: RequiredCheck['state'];
+      if (typeof match.name === 'string') {
+        const status = String(match.status ?? '').toUpperCase();
+        const conclusion = String(match.conclusion ?? '').toUpperCase();
+        if (['QUEUED','IN_PROGRESS','WAITING','PENDING','REQUESTED'].includes(status)) state = 'pending';
+        else if (status === 'COMPLETED') state = conclusion === 'SUCCESS' ? 'success' : 'failure';
+        else state = 'failure';
+      } else {
+        const status = String(match.state ?? '').toUpperCase();
+        state = status === 'SUCCESS' ? 'success' : ['PENDING','EXPECTED'].includes(status) ? 'pending' : 'failure';
+      }
       return { ...required, state };
     });
     return {
