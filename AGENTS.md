@@ -41,6 +41,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 
 ## Review readiness
 
+- Before requesting or re-requesting an automated Copilot review, self-review the full current diff, fix every issue found, and repeat the self-review and fix cycle until a complete pass finds no new issues. Re-run the relevant validation after fixes; only then request Copilot review.
 - Run final validation against the exact pushed head after the last change.
 - Report current test counts separately from historical milestone counts.
 - Before requesting automated review, report the current head, CI state, mergeability, unresolved threads, and deferred follow-up issues.
