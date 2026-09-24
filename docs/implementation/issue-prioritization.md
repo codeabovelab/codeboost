@@ -1,6 +1,6 @@
 # Lane H: issue prioritization
 
-Baseline: `b181d152ed522cf0ea6179d0ab7f0b45b00a6a4f` (`origin/main`,
+Baseline: `0ae71a503592de90926063fa563c1f7c715db22b` (`origin/main`,
 2026-09-24).
 
 ## H1 decision: ranking policy
