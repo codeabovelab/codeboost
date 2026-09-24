@@ -1,0 +1,9 @@
+{
+  "schema_version": 1,
+  "base_revision": 1,
+  "reply": "Synthetic independent suggestion cards, not recorded vendor output.",
+  "edits": [
+    { "op": "set_field", "item": "P1", "summary": "Clarify title", "reason": "Use a concrete behavior.", "field": "title", "value": "Return a predictable example", "file": null, "check": null, "check_index": null, "depends_on": null, "new_item": null },
+    { "op": "set_field", "item": "P1", "summary": "Clarify intent", "reason": "Describe the expected result.", "field": "intent", "value": "Return the same result for the same input.", "file": null, "check": null, "check_index": null, "depends_on": null, "new_item": null }
+  ]
+}
