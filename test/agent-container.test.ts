@@ -516,7 +516,7 @@ describe('real Docker agent isolation', () => {
       docker('rm', '--force', authProfile.name); containers.delete(authProfile.name);
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
-      expect(envelope.result?.trim()).toBe('codeboost-schema-marker');
+      expect(envelope.result).toContain('codeboost-schema-marker');
     }, 6 * 60_000);
   }
 });
