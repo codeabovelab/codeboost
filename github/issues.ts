@@ -5,6 +5,7 @@ const runFile = promisify(execFile);
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
+const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
@@ -24,6 +25,7 @@ export interface RepositoryIssue {
   readonly comments: number;
   readonly positiveReactions: number;
   readonly labels: readonly string[];
+  readonly authorLogin: string | null;
   readonly authorAssociation: IssueAuthorAssociation;
   readonly trust: 'trusted' | 'requires-approval';
 }
@@ -60,6 +62,12 @@ function boundedString(value: unknown, field: string, maximum: number, nullable 
 function count(value: unknown, field: string): number {
   if (!Number.isSafeInteger(value) || (value as number) < 0) throw new Error(`GitHub returned an invalid issue ${field}.`);
   return value as number;
+}
+
+function login(value: unknown, context: 'issue author' | 'collaborator'): string {
+  if (typeof value !== 'string' || !value || value.length > 100 || /[\s\u0000-\u001f\u007f]/u.test(value))
+    throw new Error(`GitHub returned an invalid ${context} login.`);
+  return value;
 }
 
 function repositoryName(value: string): boolean {
@@ -113,6 +121,10 @@ function normalizeIssue(repository: string, value: unknown): RepositoryIssue | n
   if (typeof authorAssociation !== 'string' || !associations.has(authorAssociation as IssueAuthorAssociation))
     throw new Error('GitHub returned an unknown issue author association.');
   const association = authorAssociation as IssueAuthorAssociation;
+  if (!Object.hasOwn(issue, 'user')) throw new Error('GitHub omitted the issue author.');
+  const authorLogin = issue.user === null
+    ? null
+    : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
   const title = boundedString(issue.title, 'title', 4096);
   if (!title.trim()) throw new Error('GitHub returned an empty issue title.');
   return {
@@ -126,8 +138,9 @@ function normalizeIssue(repository: string, value: unknown): RepositoryIssue | n
     comments: count(issue.comments, 'comment count'),
     positiveReactions,
     labels,
+    authorLogin,
     authorAssociation: association,
-    trust: ['OWNER', 'MEMBER', 'COLLABORATOR'].includes(association) ? 'trusted' : 'requires-approval',
+    trust: 'requires-approval',
   };
 }
 
@@ -147,7 +160,7 @@ export class GhIssueGateway implements IssueGateway {
     this.now = now;
   }
 
-  async #load(signal: AbortSignal): Promise<RepositoryIssue[]> {
+  async #loadIssues(signal: AbortSignal): Promise<RepositoryIssue[]> {
     const issues: RepositoryIssue[] = [];
     const numbers = new Set<number>();
     for (let page = 1; page <= MAX_PAGES; page++) {
@@ -170,6 +183,42 @@ export class GhIssueGateway implements IssueGateway {
       if (decoded.length < PAGE_SIZE) return issues;
     }
     throw new Error(`Issue retrieval exceeded the ${MAX_ISSUES}-record safety limit.`);
+  }
+
+  async #loadCollaborators(signal: AbortSignal): Promise<Set<string>> {
+    const collaborators = new Set<string>();
+    for (let page = 1; page <= MAX_PAGES; page++) {
+      const output = await this.run([
+        'api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
+        `repos/${this.repository}/collaborators`, '-f', 'affiliation=all',
+        '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`,
+      ], { signal });
+      let decoded: unknown;
+      try { decoded = JSON.parse(output); }
+      catch { throw new Error('GitHub returned invalid collaborator JSON.'); }
+      if (!Array.isArray(decoded)) throw new Error('GitHub returned an invalid collaborator page.');
+      if (decoded.length > PAGE_SIZE) throw new Error('GitHub returned an oversized collaborator page.');
+      for (const value of decoded) {
+        const author = object(value, 'GitHub returned an invalid collaborator.');
+        const key = login(author.login, 'collaborator').toLocaleLowerCase('en-US');
+        if (collaborators.has(key)) throw new Error('GitHub returned a duplicate collaborator.');
+        collaborators.add(key);
+      }
+      if (decoded.length < PAGE_SIZE) return collaborators;
+    }
+    throw new Error(`Collaborator retrieval exceeded the ${MAX_COLLABORATORS}-record safety limit.`);
+  }
+
+  async #load(signal: AbortSignal): Promise<RepositoryIssue[]> {
+    const issues = await this.#loadIssues(signal);
+    signal.throwIfAborted();
+    const collaborators = await this.#loadCollaborators(signal);
+    return issues.map(issue => ({
+      ...issue,
+      trust: issue.authorLogin !== null && collaborators.has(issue.authorLogin.toLocaleLowerCase('en-US'))
+        ? 'trusted'
+        : 'requires-approval',
+    }));
   }
 
   async fetch(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueSnapshot> {

@@ -13,6 +13,7 @@ const issue = (number: number, overrides: Partial<RepositoryIssue> = {}): Reposi
   comments: 0,
   positiveReactions: 0,
   labels: [],
+  authorLogin: 'member',
   authorAssociation: 'MEMBER',
   trust: 'trusted',
   ...overrides,
