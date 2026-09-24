@@ -1,6 +1,6 @@
 import type { ReviewService } from './review.ts';
 import type { MergeAttempt } from './store.ts';
-import type { MergeGateway, MergeQueueGateway, MergeQueueObservation, MergeResult, RemoteMergeState } from '../github/merge.ts';
+import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
@@ -147,10 +147,10 @@ export class MergeCoordinator {
       }
       return { status, result };
     } catch (error) {
-      if (queueAttempt) try {
+      if (queueAttempt && error instanceof MergeSubmissionError && error.outcome === 'refused') try {
         this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, {
-          state: 'failed', reason: error instanceof Error ? error.message : 'GitHub refused the merge-queue submission.',
-          requiresFreshReview: /head changed|stale review/i.test(error instanceof Error ? error.message : ''),
+          state: 'failed', reason: error.message,
+          requiresFreshReview: /head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|stale review/i.test(error.message),
         });
       } catch {}
       if (signal.aborted && signal.reason instanceof Error) throw signal.reason;

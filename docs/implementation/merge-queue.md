@@ -12,7 +12,7 @@ submitting -> queued -> merged
                     -> failed
 ```
 
-An observation may settle `submitting` after a process restart, because the enqueue command may have completed before the local queued update. Enqueue command success is never recorded as merged. Once the external command succeeds, a later local refresh failure does not turn that committed action into a command failure; the persisted `submitting` record remains disabled and recoverable through queue inspection.
+An observation may settle `submitting` after a process restart, because the enqueue command may have completed before the local queued update. Enqueue command success is never recorded as merged. Once submission begins, cancellation, timeout, transport failure, or another ambiguous command outcome leaves the persisted `submitting` record disabled and recoverable through queue inspection. Only a confirmed GitHub refusal becomes a retryable `failed` attempt. Once the external command succeeds, a later local refresh failure likewise does not turn that committed action into a command failure.
 
 Every update compares the current attempt ID and legal source state. A delayed poll for an older attempt therefore cannot overwrite a retry. Removed and failed attempts retain GitHub's terminal reason. Retry creates a new attempt only when the same revision, snapshot, review version, and reviewed head are still current. A replaced head marks the old attempt as requiring fresh review. That gate remains through snapshot replacement until every plan item has a new approval bound to the replacement snapshot; context mismatch alone does not clear it. After those approvals are recorded, the old attempt is historical rather than retryable.
 

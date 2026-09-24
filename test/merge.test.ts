@@ -1,7 +1,7 @@
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
-import { GhMergeGateway, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
+import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
 import { Store } from '../runner/store.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -234,6 +234,51 @@ it('aborts and awaits an active queue inspection during shutdown', async () => {
     await expect(polling).rejects.toThrow(/shutdown/i);
     expect(settled).toBe(true);
   } finally { h.store.close(); }
+});
+
+it('keeps an aborted enqueue submitting until queue inspection recovers its outcome', async () => {
+  const h = queueHarness([{ state: 'queued', reviewedHead: sha('b'), entryId: 'MQE_1', phase: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', queueHead: sha('b') }]);
+  let started!: () => void;
+  const commandStarted = new Promise<void>(resolve => { started = resolve; });
+  h.client.merge = vi.fn(async (_head, options) => new Promise<never>((_resolve, reject) => {
+    started(); options?.signal?.addEventListener('abort', () => reject(options.signal?.reason), { once: true });
+  }));
+  const merging = h.coordinator.merge(h.view().token);
+  await commandStarted;
+  await h.coordinator.close();
+  await expect(merging).rejects.toThrow(/shutdown/i);
+  expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'submitting', reviewedHead: sha('b') });
+  const recovered = new MergeCoordinator(h.service, h.client);
+  try { expect(await recovered.pollQueue()).toMatchObject({ state: 'queued', phase: 'QUEUED', retryable: false }); }
+  finally { await recovered.close(); h.store.close(); }
+});
+
+it('records only a confirmed enqueue refusal as retryable failure', async () => {
+  const h = queueHarness([]);
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Required review is missing.', 'refused'); });
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow('Required review is missing.');
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed', reason: 'Required review is missing.' });
+    expect(await h.coordinator.status()).toMatchObject({ ready: true, action: 'retry', queue: { state: 'failed', retryable: true } });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps an unknown enqueue failure submitting until external reconciliation', async () => {
+  const h = queueHarness([]);
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('GitHub merge submission timed out.', 'unknown'); });
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/timed out/i);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'submitting', reason: null });
+    expect(await h.coordinator.status()).toMatchObject({ ready: false, action: null, queue: { state: 'submitting', retryable: false } });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('classifies only explicit GitHub merge refusals as confirmed', async () => {
+  const config = { repository: 'owner/repo', pullRequest: 7, issue: 24 };
+  const refusal = new GhMergeGateway(config, async () => { throw new Error('Required review is missing.'); });
+  const unknown = new GhMergeGateway(config, async () => { throw new Error('request timed out'); });
+  await expect(refusal.merge(sha('b'))).rejects.toMatchObject({ name: 'MergeSubmissionError', outcome: 'refused' });
+  await expect(unknown.merge(sha('b'))).rejects.toMatchObject({ name: 'MergeSubmissionError', outcome: 'unknown' });
 });
 
 it('parses required checks from both rule sources and pins the gh merge head', async () => {

@@ -22,6 +22,14 @@ export interface RemoteMergeState {
 }
 
 export interface MergeResult { url: string; }
+export class MergeSubmissionError extends Error {
+  readonly outcome: 'refused' | 'unknown';
+  constructor(message: string, outcome: 'refused' | 'unknown', options?: ErrorOptions) {
+    super(message, options);
+    this.name = 'MergeSubmissionError';
+    this.outcome = outcome;
+  }
+}
 export type MergeQueueEntryPhase = 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED';
 export type MergeQueueObservation =
   | { state: 'queued'; reviewedHead: string; entryId: string; phase: MergeQueueEntryPhase; position: number; enqueuedAt: string; queueHead: string }
@@ -44,6 +52,10 @@ export interface GhMergeConfig {
 }
 
 type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
+
+function confirmedMergeRefusal(message: string): boolean {
+  return /required (?:approving )?review|required status check|branch protection|merge conflict|not mergeable|head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|pull request.*(?:closed|draft)|merge method.*not allowed/i.test(message);
+}
 
 function fullSha(value: unknown, label: string): string {
   if (typeof value !== 'string' || !/^[a-f0-9]{40}$/.test(value)) throw new Error(`GitHub returned an invalid ${label}.`);
@@ -319,6 +331,11 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (options.signal?.aborted) throw options.signal.reason;
       await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead], { signal: options.signal });
       return { url: `https://github.com/${this.config.repository}/pull/${this.config.pullRequest}` };
+    } catch (error) {
+      if (error instanceof MergeSubmissionError) throw error;
+      const message = error instanceof Error ? error.message : 'GitHub merge submission failed with an unknown outcome.';
+      const outcome = !options.signal?.aborted && confirmedMergeRefusal(message) ? 'refused' : 'unknown';
+      throw new MergeSubmissionError(message, outcome, { cause: error });
     } finally { this.#generation++; this.#cache = null; }
   }
 }

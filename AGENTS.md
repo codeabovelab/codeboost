@@ -76,6 +76,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Keep irreversible integrations disabled in demo mode even when configuration or an injected dependency is present. After a stale or refused irreversible action, keep its control disabled until fresh state is loaded.
 - When a stale or replaced external identity requires fresh review, keep that gate active across the context replacement until approvals or evidence are recorded against the replacement generation. A mismatch with the old context is not itself fresh review.
 - If the external lifecycle mechanism or mode changes between validation passes, abort before the irreversible command. Create durable lifecycle ownership from the final stable mode, never from an earlier observation.
+- When an irreversible command has an ambiguous timeout, cancellation, transport, or unknown outcome, retain durable in-flight ownership and reconcile external state before enabling retry. Only a confirmed refusal may become retryable failure.
 
 ## Blinded experiments
 
