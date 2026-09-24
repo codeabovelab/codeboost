@@ -10,13 +10,38 @@ const rawIssue = (overrides: Record<string, unknown> = {}) => ({
   created_at: '2026-01-01T00:00:00Z',
   updated_at: '2026-01-02T00:00:00Z',
   comments: 3,
+  user: { login: 'member' },
   author_association: 'MEMBER',
   labels: [{ name: 'bug' }, { name: 'P1' }],
   reactions: { '+1': 2, heart: 1, hooray: 0, rocket: 1 },
   ...overrides,
 });
 
+const isCollaboratorRequest = (args: readonly string[]) =>
+  args.some(argument => argument.toLocaleLowerCase('en-US').endsWith('/collaborators'));
+const responses = (issues: readonly unknown[], collaborators: readonly string[] = ['MEMBER']) =>
+  async (args: readonly string[]) => JSON.stringify(isCollaboratorRequest(args)
+    ? collaborators.map(login => ({ login }))
+    : issues);
+
 describe('GitHub issue retrieval', () => {
+  it.each([
+    'OWNER',
+    'MEMBER',
+    'COLLABORATOR',
+    'CONTRIBUTOR',
+    'FIRST_TIMER',
+    'FIRST_TIME_CONTRIBUTOR',
+    'MANNEQUIN',
+    'NONE',
+  ] as const)('classifies the intermediate %s association using current repository membership', async (authorAssociation) => {
+    const issue = rawIssue({ author_association: authorAssociation });
+    const trusted = await new GhIssueGateway('owner/repo', responses([issue])).fetch();
+    const outside = await new GhIssueGateway('owner/repo', responses([issue], [])).fetch();
+    expect(trusted.issues[0]).toMatchObject({ authorAssociation, authorLogin: 'member', trust: 'trusted' });
+    expect(outside.issues[0]).toMatchObject({ authorAssociation, authorLogin: 'member', trust: 'requires-approval' });
+  });
+
   it.each(['./repo', '../repo', 'owner/..'])('rejects unsafe repository identity %s', repository => {
     expect(() => new GhIssueGateway(repository)).toThrow('GitHub repository');
   });
@@ -25,12 +50,15 @@ describe('GitHub issue retrieval', () => {
     const calls: readonly string[][] = [];
     const run = vi.fn(async (args: readonly string[]) => {
       (calls as string[][]).push([...args]);
-      return JSON.stringify([rawIssue()]);
+      return responses([rawIssue()])(args);
     });
     const snapshot = await new GhIssueGateway('owner/repo', run, () => new Date('2026-02-01T00:00:00Z')).fetch();
     expect(calls).toEqual([[
       'api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
       'repos/owner/repo/issues', '-f', 'state=open', '-f', 'per_page=100', '-f', 'page=1',
+    ], [
+      'api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
+      'repos/owner/repo/collaborators', '-f', 'affiliation=all', '-f', 'per_page=100', '-f', 'page=1',
     ]]);
     expect(snapshot).toEqual({
       repository: 'owner/repo',
@@ -39,23 +67,23 @@ describe('GitHub issue retrieval', () => {
         repository: 'owner/repo', number: 7, title: 'Fix retries', body: 'Keep issue text as data.',
         url: 'https://github.com/owner/repo/issues/7', createdAt: '2026-01-01T00:00:00Z',
         updatedAt: '2026-01-02T00:00:00Z', comments: 3, positiveReactions: 4,
-        labels: ['bug', 'P1'], authorAssociation: 'MEMBER', trust: 'trusted',
+        labels: ['bug', 'P1'], authorLogin: 'member', authorAssociation: 'MEMBER', trust: 'trusted',
       }],
     });
   });
 
   it('excludes pull requests and requires approval for outside authors', async () => {
-    const run = vi.fn(async () => JSON.stringify([
+    const run = vi.fn(responses([
       rawIssue({ pull_request: { url: 'https://api.github.com/repos/owner/repo/pulls/7' } }),
       rawIssue({ number: 8, html_url: 'https://github.com/owner/repo/issues/8', author_association: 'CONTRIBUTOR' }),
-    ]));
+    ], []));
     const snapshot = await new GhIssueGateway('owner/repo', run).fetch();
     expect(snapshot.issues).toHaveLength(1);
     expect(snapshot.issues[0]).toMatchObject({ number: 8, trust: 'requires-approval' });
   });
 
   it('accepts canonical URL casing without relaxing repository identity or URL shape', async () => {
-    const run = vi.fn(async () => JSON.stringify([
+    const run = vi.fn(responses([
       rawIssue(),
       rawIssue({
         number: 8,
@@ -68,11 +96,18 @@ describe('GitHub issue retrieval', () => {
   });
 
   it('accepts the maximum bounded issue body', async () => {
-    const gateway = new GhIssueGateway('owner/repo', async () => JSON.stringify([
+    const gateway = new GhIssueGateway('owner/repo', responses([
       rawIssue({ body: 'x'.repeat(65_536) }),
     ]));
     const snapshot = await gateway.fetch();
     expect(snapshot.issues[0]?.body).toHaveLength(65_536);
+  });
+
+  it('requires approval when GitHub explicitly reports a deleted author', async () => {
+    const snapshot = await new GhIssueGateway('owner/repo', responses([
+      rawIssue({ user: null, author_association: 'OWNER' }),
+    ])).fetch();
+    expect(snapshot.issues[0]).toMatchObject({ authorLogin: null, trust: 'requires-approval' });
   });
 
   it('budgets for a maximum page of JSON-escaped control-character bodies', () => {
@@ -92,6 +127,8 @@ describe('GitHub issue retrieval', () => {
     ['state', { state: 'closed' }],
     ['pull request marker', { pull_request: {} }],
     ['author association', { author_association: 'UNKNOWN' }],
+    ['author object', { user: 42 }],
+    ['author login', { user: { login: '' } }],
     ['title', { title: '   ' }],
     ['body length', { body: 'x'.repeat(65_537) }],
     ['comments', { comments: -1 }],
@@ -101,6 +138,36 @@ describe('GitHub issue retrieval', () => {
     ['calendar timestamp', { created_at: '2026-02-31T00:00:00Z' }],
   ])('fails the complete refresh on invalid %s', async (_label, overrides) => {
     const gateway = new GhIssueGateway('owner/repo', async () => JSON.stringify([rawIssue(overrides)]));
+    await expect(gateway.fetch()).rejects.toThrow(/GitHub returned/);
+  });
+
+  it('fails closed when collaborator pagination reaches its bounded limit', async () => {
+    const gateway = new GhIssueGateway('owner/repo', async args => {
+      if (!isCollaboratorRequest(args)) return JSON.stringify([rawIssue()]);
+      const page = Number(args.at(-1)?.split('=')[1]);
+      return JSON.stringify(Array.from({ length: 100 }, (_, index) => ({
+        login: `member-${(page - 1) * 100 + index + 1}`,
+      })));
+    });
+    await expect(gateway.fetch()).rejects.toThrow('Collaborator retrieval exceeded the 1000-record safety limit');
+  });
+
+  it('distinguishes an omitted author from an explicitly deleted author', async () => {
+    const issue: Record<string, unknown> = rawIssue();
+    delete issue.user;
+    await expect(new GhIssueGateway('owner/repo', responses([issue])).fetch())
+      .rejects.toThrow('omitted the issue author');
+  });
+
+  it.each([
+    ['page shape', {}],
+    ['record shape', [null]],
+    ['login', [{ login: '' }]],
+    ['duplicate', [{ login: 'member' }, { login: 'MEMBER' }]],
+  ])('fails closed on invalid collaborator %s', async (_label, collaboratorPage) => {
+    const gateway = new GhIssueGateway('owner/repo', async args => JSON.stringify(
+      isCollaboratorRequest(args) ? collaboratorPage : [rawIssue()],
+    ));
     await expect(gateway.fetch()).rejects.toThrow(/GitHub returned/);
   });
 
