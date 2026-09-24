@@ -49,7 +49,7 @@ it('persists bounded per-item notes without creating a plan revision',()=>{
 });
 it('migrates a v1 database without losing its plans or ledger',()=>{
  const {service,config}=fixture();service.close();services.splice(services.indexOf(service),1);
- const db=new DatabaseSync(config.database);db.exec('ALTER TABLE plans DROP COLUMN review_version; DROP TABLE review_notes; PRAGMA user_version=1;');db.close();
+ const db=new DatabaseSync(config.database);db.exec('ALTER TABLE plans DROP COLUMN review_version; DROP TABLE review_notes; DROP TABLE app_settings; ALTER TABLE requests DROP COLUMN reason; ALTER TABLE requests DROP COLUMN snapshot_id; PRAGMA user_version=1;');db.close();
  const migrated=new ReviewService(config);services.push(migrated);expect(migrated.load().plan.revision).toBe(1);expect(migrated.store.getLedger(config.identity)).toHaveLength(2);expect(migrated.load().notes).toEqual([]);
 });
 it('rejects a concurrent store review edit through the atomic review counter',()=>{

@@ -12,6 +12,8 @@ export function requireSupportedNode(version = process.versions.node): void {
 }
 export interface Snapshot { id: string; base: string; head: string }
 export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
+export type SuggestionState = 'pending' | 'ready' | 'failed' | 'cancelled' | 'invalidated' | 'consumed';
+export interface SuggestionRequest { state: SuggestionState; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null }
 export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
 export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
@@ -40,8 +42,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version;
-        if (version !== 0 && version !== 1 && version !== 2 && version !== 3) throw new Error('Unsupported store schema version.');
-        if (version === 3) return;
+        if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4) throw new Error('Unsupported store schema version.');
+        if (version === 4) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -55,10 +57,14 @@ export class Store {
           CREATE TABLE continuations (key TEXT NOT NULL REFERENCES plans(key), checkpoint_id TEXT NOT NULL, revision INTEGER NOT NULL, PRIMARY KEY(key,checkpoint_id,revision));
           PRAGMA user_version=1;
         `);
-        if (version !== 2) this.#db.exec(`ALTER TABLE plans ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0;
+        if (version < 2) this.#db.exec(`ALTER TABLE plans ADD COLUMN review_version INTEGER NOT NULL DEFAULT 0;
           CREATE TABLE review_notes (key TEXT NOT NULL REFERENCES plans(key), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,id));
           PRAGMA user_version=2;`);
-        this.#db.exec("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=3;");
+        if (version < 3) this.#db.exec("CREATE TABLE IF NOT EXISTS app_settings (key TEXT PRIMARY KEY, value TEXT NOT NULL); PRAGMA user_version=3;");
+        if (version < 4) this.#db.exec(`ALTER TABLE requests ADD COLUMN snapshot_id TEXT;
+            ALTER TABLE requests ADD COLUMN reason TEXT;
+            UPDATE requests SET state='invalidated', reason='Request predates snapshot binding.' WHERE state IN ('pending','ready');
+            PRAGMA user_version=4;`);
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -94,7 +100,7 @@ export class Store {
   #savePlan(key: string, plan: Plan, expected: number): void {
     if (this.#run('UPDATE plans SET revision=? WHERE key=? AND revision=?', plan.revision, key, expected).changes !== 1) throw new Error('Stale plan revision.');
     this.#run('INSERT INTO revisions VALUES (?,?,?)', key, plan.revision, encode(plan));
-    this.#run("UPDATE requests SET state='invalidated' WHERE key=? AND state IN ('pending','ready')", key);
+    this.#run("UPDATE requests SET state='invalidated',reason='Plan revision changed.' WHERE key=? AND state IN ('pending','ready')", key);
     const items = new Set(plan.items.map(item => item.id));
     for (const row of this.#db.prepare('SELECT item FROM approvals WHERE key=?').all(key)) {
       if (!items.has(row.item as string)) this.#run('DELETE FROM approvals WHERE key=? AND item=?', key, row.item!);
@@ -135,6 +141,7 @@ export class Store {
     const snapshot = { id: randomUUID(), base, head };
     this.#run('INSERT INTO snapshots VALUES (?,?,?)', key, snapshot.id, encode(snapshot));
     this.#run('UPDATE plans SET snapshot_id=? WHERE key=?', snapshot.id, key);
+    this.#run("UPDATE requests SET state='invalidated',reason='Repository snapshot changed.' WHERE key=? AND state IN ('pending','ready')", key);
     return snapshot;
   }
   getSnapshot(identity: PlanIdentity, id?: string): Snapshot {
@@ -143,12 +150,12 @@ export class Store {
     if (!row) throw new Error('Unknown snapshot.');
     return decode<Snapshot>(row.data);
   }
-  beginSuggestions(identity: PlanIdentity, expectedRevision: number): string {
+  beginSuggestions(identity: PlanIdentity, expected: ReviewState): string {
     const key = identityKey(identity);
     return this.#transaction(() => {
-      if (this.#current(key).revision !== expectedRevision) throw new Error('Stale plan revision.');
+      this.#expect(key, expected);
       const id = randomUUID();
-      this.#run("INSERT INTO requests VALUES (?,?,?,'pending',NULL)", id, key, expectedRevision); return id;
+      this.#run("INSERT INTO requests (id,key,revision,state,reply,snapshot_id,reason) VALUES (?,?,?,'pending',NULL,?,NULL)", id, key, expected.revision, expected.snapshotId); return id;
     });
   }
   completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void {
@@ -156,17 +163,26 @@ export class Store {
     const key = identityKey(identity);
     this.#transaction(() => {
       const current = this.#current(key);
-      if (reply.base_revision !== current.revision || this.#run("UPDATE requests SET state='ready',reply=? WHERE id=? AND key=? AND revision=? AND state='pending'", encode(reply), id, key, current.revision!).changes !== 1)
+      if (reply.base_revision !== current.revision || this.#run("UPDATE requests SET state='ready',reply=?,reason=NULL WHERE id=? AND key=? AND revision=? AND snapshot_id=? AND state='pending'", encode(reply), id, key, current.revision!, current.snapshot_id!).changes !== 1)
         throw new Error('Suggestion request is stale, cancelled, or complete.');
     });
   }
-  cancelSuggestions(identity: PlanIdentity, id: string): void {
-    this.#run("UPDATE requests SET state='cancelled' WHERE id=? AND key=? AND state IN ('pending','ready')", id, identityKey(identity));
+  settleSuggestion(identity: PlanIdentity, id: string, expected: ReviewState, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean {
+    if (!['failed', 'cancelled', 'invalidated'].includes(outcome.state) || typeof outcome.reason !== 'string' || !outcome.reason.trim() || outcome.reason.length > 4000) throw new Error('Invalid suggestion outcome.');
+    const key = identityKey(identity);
+    return this.#transaction(() => this.#run(`UPDATE requests SET state=?,reason=?
+      WHERE id=? AND key=? AND revision=? AND snapshot_id=? AND state='pending'
+      AND EXISTS (SELECT 1 FROM plans WHERE key=? AND revision=? AND snapshot_id=?)`,
+      outcome.state, outcome.reason.trim(), id, key, expected.revision, expected.snapshotId, key, expected.revision, expected.snapshotId).changes === 1);
   }
-  getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; reply: EditReply | null } {
+  cancelSuggestions(identity: PlanIdentity, id: string, reason = 'Suggestion cancelled.'): void {
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
+    this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
+  }
+  getSuggestions(identity: PlanIdentity, id: string): SuggestionRequest {
     const row = this.#get('SELECT * FROM requests WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown suggestion request.');
-    return { state: row.state as string, revision: row.revision as number, reply: row.reply === null ? null : decode<EditReply>(row.reply) };
+    return { state: row.state as SuggestionState, revision: row.revision as number, snapshotId: row.snapshot_id as string | null, reply: row.reply === null ? null : decode<EditReply>(row.reply), reason: row.reason as string | null };
   }
   applySuggestion(identity: PlanIdentity, id: string, index: number, context: PlanContext): Plan {
     const key = identityKey(identity);
@@ -174,12 +190,14 @@ export class Store {
       this.#context(key, context);
       const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready'", id, key);
       if (!request) throw new Error('Suggestion is unavailable.');
+      const current = this.#current(key);
+      if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Suggestion is unavailable.');
       const plan = this.getPlan(identity);
       const next = applySuggestion(plan, decode<EditReply>(request.reply), index, context, {
         identity, schemaVersion: plan.schema_version, baseRevision: request.revision as number, issue: plan.issue,
       });
       this.#savePlan(key, next, request.revision as number);
-      this.#run("UPDATE requests SET state='consumed' WHERE id=?", id); return next;
+      this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return next;
     });
   }
   #entry(key: string, entry: LedgerEntry): void {
