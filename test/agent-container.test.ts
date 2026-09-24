@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
-import { AGENT_IMAGE, buildAgentImage } from '../agents/container/image.ts';
+import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
 import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
   hasExactOptions, validateContainer } from '../agents/container/run.ts';
@@ -194,7 +194,7 @@ describe('real Docker agent isolation', () => {
     chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
   });
 
-  it('rejects extra security policies and a PATH that can shadow the startup probe', () => {
+  it('rejects extra security policies and environment paths that can escape bounded storage', () => {
     const data = fixture(), valid = profile(data, 'planning', ['true']);
     const imageIndex = valid.args.indexOf(imageId);
     const securityArgs = [...valid.args.slice(0, imageIndex), '--security-opt', 'seccomp=unconfined',
@@ -207,6 +207,13 @@ describe('real Docker agent isolation', () => {
     docker(...pathArgs); containers.add(valid.name);
     expect(() => validateContainer(valid.name, valid)).toThrow(/environment|PATH/);
     docker('rm', '--force', valid.name); containers.delete(valid.name);
+
+    for (const changedCache of ['npm_config_cache=/work/npm-cache', 'XDG_CACHE_HOME=/work/xdg-cache']) {
+      const cacheArgs = [...valid.args.slice(0, imageIndex), '--env', changedCache, ...valid.args.slice(imageIndex)];
+      docker(...cacheArgs); containers.add(valid.name);
+      expect(() => validateContainer(valid.name, valid)).toThrow('isolation environment');
+      docker('rm', '--force', valid.name); containers.delete(valid.name);
+    }
   }, 60_000);
 
   it('rejects added capabilities and conflicting or duplicate filesystem options', () => {
@@ -241,6 +248,11 @@ describe('real Docker agent isolation', () => {
     expect(valid.expectedImage).toBe(imageId);
     expect(valid.args).toContain(imageId);
     expect(valid.args).not.toContain(AGENT_IMAGE);
+    const untrustedDigest = `sha256:${'0'.repeat(64)}`;
+    expect(() => assertBuiltAgentImage(untrustedDigest)).toThrow('trusted validated builder');
+    expect(() => prepareTaskFilesystems(data.clone.directory, {
+      workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
+    }, untrustedDigest)).toThrow('trusted validated builder');
     expect(() => prepareTaskFilesystems(data.clone.directory, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
     }, AGENT_IMAGE)).toThrow('immutable built image ID');

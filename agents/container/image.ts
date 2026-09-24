@@ -8,6 +8,11 @@ export const CODEX_VERSION = '0.153.4';
 export const CLAUDE_VERSION = '2.1.281';
 
 const context = dirname(fileURLToPath(import.meta.url));
+const trustedImages = new Set<string>();
+
+export function assertBuiltAgentImage(imageId: string): void {
+  if (!trustedImages.has(imageId)) throw new Error('Agent image was not produced by the trusted validated builder.');
+}
 
 export function buildAgentImage(timeoutMs = 10 * 60_000): string {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Image build requires a finite positive deadline.');
@@ -30,5 +35,6 @@ export function buildAgentImage(timeoutMs = 10 * 60_000): string {
     || labels['io.codeboost.codex.version'] !== CODEX_VERSION
     || labels['io.codeboost.claude.version'] !== CLAUDE_VERSION
     || labels['io.codeboost.profile.version'] !== '1') throw new Error('Built agent image does not match the pinned profile.');
+  trustedImages.add(inspect.Id);
   return inspect.Id;
 }

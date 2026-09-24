@@ -2,7 +2,7 @@ import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
 import { assertContainerProfile, disposeContainerProfile, type ContainerProfile, type TaskFilesystems } from './profile.ts';
-import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
+import { assertBuiltAgentImage, BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 
 const dockerEnvironment = (secrets: Readonly<Record<string, string>> = {}) => ({
   PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST, ...secrets,
@@ -41,6 +41,19 @@ const canonicalDockerBindSource = (source: string) => {
   const desktopHostPath = source.startsWith('/host_mnt/') ? source.slice('/host_mnt'.length) : source;
   try { return realpathSync(desktopHostPath); } catch { return source; }
 };
+const removeContainerOrThrow = (profile: ContainerProfile) => {
+  const result = spawnSync('docker', ['rm', '--force', profile.name], {
+    encoding: 'utf8', timeout: 30_000, env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+  });
+  if (result.status !== 0) {
+    const inspect = spawnSync('docker', ['container', 'inspect', profile.name], {
+      encoding: 'utf8', timeout: 30_000, env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    const absent = inspect.status !== 0 && !inspect.error && /No such (?:object|container)/i.test(inspect.stderr ?? '');
+    if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
+  }
+  disposeContainerProfile(profile);
+};
 
 export interface TaskStorageLimits {
   readonly workBytes: number;
@@ -54,6 +67,7 @@ export function prepareTaskFilesystems(stagingDirectory: string, limits: TaskSto
   imageId: string, timeoutMs = 60_000): TaskFilesystems {
   for (const [name, value] of Object.entries(limits)) validLimit(value, name);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('Task filesystems require the immutable built image ID.');
+  assertBuiltAgentImage(imageId);
   const remaining = createDeadline(timeoutMs);
   const staging = realpathSync(stagingDirectory);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
@@ -217,7 +231,9 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || environment.get('CODEBOOST_WORK_BYTES') !== String(profile.filesystems.workBytes)
     || environment.get('CODEBOOST_WORK_INODES') !== String(profile.filesystems.workInodes)
     || environment.get('CODEBOOST_METADATA_BYTES') !== String(profile.filesystems.metadataBytes)
-    || environment.get('CODEBOOST_METADATA_INODES') !== String(profile.filesystems.metadataInodes))
+    || environment.get('CODEBOOST_METADATA_INODES') !== String(profile.filesystems.metadataInodes)
+    || environment.get('npm_config_cache') !== '/tmp/npm-cache'
+    || environment.get('XDG_CACHE_HOME') !== '/tmp/xdg-cache')
     throw new Error('Container isolation environment changed.');
   if (profile.vendor === 'codex' && names.includes('CLAUDE_CODE_OAUTH_TOKEN')) throw new Error('Credential profiles must not be combined.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
@@ -238,8 +254,8 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     remaining();
     return profile.name;
   } catch (error) {
-    spawnSync('docker', ['rm', '--force', profile.name], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
-    disposeContainerProfile(profile);
+    try { removeContainerOrThrow(profile); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Container creation failed and cleanup did not settle.'); }
     throw error;
   }
 }
@@ -248,15 +264,20 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(timeoutMs);
   const container = createValidatedContainer(profile, remaining(), secrets);
+  let failure: unknown;
   try {
     assertContainerProfile(profile);
     const output = docker(['start', '--attach', container], { timeoutMs: remaining(), secrets });
     remaining();
     return output;
   }
+  catch (error) { failure = error; throw error; }
   finally {
-    spawnSync('docker', ['rm', '--force', container], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
-    disposeContainerProfile(profile);
+    try { removeContainerOrThrow(profile); }
+    catch (cleanupError) {
+      if (failure) throw new AggregateError([failure, cleanupError], 'Agent invocation failed and cleanup did not settle.');
+      throw cleanupError;
+    }
   }
 }
 

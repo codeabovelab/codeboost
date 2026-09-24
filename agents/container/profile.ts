@@ -4,6 +4,7 @@ import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, ope
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { InvocationInput, Phase } from '../contract.ts';
+import { assertBuiltAgentImage } from './image.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -122,6 +123,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     throw new Error('Container command must be a complete literal argv array.');
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId))
     throw new Error('Container profile requires the immutable built image ID.');
+  assertBuiltAgentImage(options.imageId);
   const inputIdentity = captureInput(options.inputDirectory);
   const inputDirectory = inputIdentity.inputDirectory;
   if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
