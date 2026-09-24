@@ -7,13 +7,13 @@ Owner and subsequent assignments: issue #29. This is evidence for E1, not comple
 
 | Requirement | Existing implementation and runnable evidence | Disposition |
 | --- | --- | --- |
-| Registry-selected immutable schema and semantic dispatch; identical CLI copies | `core/plan.ts`, `schema/versions.json`; `test/registry.test.ts` | Reuse; no schema edit needed |
+| Immutable v1 schema and registry-keyed semantic dispatch; identical CLI copies | `core/plan.ts` statically imports v1 and guards the registry paths/key; `test/registry.test.ts` checks snapshots and CLI copies | Reuse for the sole released v1. Generalized schema loading for another retained version is not implemented; track under #6 before a new version is introduced |
 | Deterministic bounded JSON/YAML, decoded duplicate keys, prohibited YAML features, safe integers, UTF-8 and depth limits | `core/parse-v1.ts`; `test/plan-v1.test.ts` frozen fixtures | Reuse |
 | Selected issue, canonical leaf paths, checkout case/Unicode identity, projected dependencies, base entry types and retained link lineage | `validatePlan`; `test/plan.test.ts`, `test/plan-v1.test.ts` | Reuse; runtime link-write auditing still belongs to D/F |
 | Exact complete command argv; appended flags cannot inherit approval | `commandArgv`/`commandAllowed`; frozen v1 tests | Reuse; execution enforcement belongs to D/F |
 | `update_file` requires the same existing path; payload and resulting-plan validation | `applySuggestion`; `test/plan.test.ts` | Reuse |
 | Stable repository/task/plan binding, revision CAS, replay/sibling invalidation | `runner/store.ts` request records and transactional Apply; `test/store.test.ts` | Reuse the store as the only writer |
-| Writer boundary and runtime availability (B0 subset consumed by E) | Core plan transforms are pure; ReviewStore owns SQLite transactions; store tests cover reopen, crash recovery, independent-process competing Apply and Node compatibility | Existing interface is sufficient for injected E orchestration |
+| Writer boundary and runtime availability (B0 subset consumed by E) | Core plan transforms are pure; `Store` owns SQLite transactions; store tests cover reopen, crash recovery, independent-process competing Apply and Node compatibility | Existing interface is sufficient for injected E orchestration |
 
 Baseline command:
 
@@ -34,7 +34,7 @@ The PR body records the final validated head separately from this baseline.
    select immutable schemas internally, and validate replies before publication.
 2. **E3:** Coordinate suggestion requests through the existing store methods. Capture
    identity, revision and request ID before invocation; reject stale completion and
-   retain invocation ownership until settlement. Apply stays in ReviewStore. Failure,
+   retain invocation ownership until settlement. Apply stays in `Store`. Failure,
    cancellation and shutdown need explicit lifecycle rules and controlled race tests.
 3. **E4:** Exercise imports, malformed provider output, hostile prompt data, delayed
    responses and replay end to end through the E interface and real SQLite authority.
@@ -45,7 +45,9 @@ The PR body records the final validated head separately from this baseline.
 
 PR #23 owns shared review/UI integration and does not edit E's dedicated modules,
 prompt template or planning tests. E must not change schema snapshots or the store.
-Issue #6's library/storage gaps above have existing coverage; do not rebuild them.
+Issue #6's current-v1 library/storage behavior above has existing coverage; do not rebuild it.
+Its generalized registry schema-loading requirement remains a shared integration-owner
+gap before supporting a second retained version; current E requests remain explicitly v1.
 Keep #6 open for its remaining runtime/integration obligations rather than equating
 this audit with full acceptance. New shared gaps must be assigned to the integration
 owner before dependent work proceeds.
