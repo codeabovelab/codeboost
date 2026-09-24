@@ -1,6 +1,6 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, mkdtempSync, readdirSync, realpathSync, rmSync } from 'node:fs';
+import { lstatSync, mkdtempSync, opendirSync, realpathSync, rmSync } from 'node:fs';
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { TaskClone } from '../agents/contract.ts';
 
@@ -32,12 +32,16 @@ export function createTaskClone(options: {
   // Deliberately do not inherit Git variables or credential/config environment.
   const env = { PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
     GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_GRAFT_FILE: '/dev/null' };
-  const run = (cwd: string, ...args: string[]) => execFileSync('git', [
-    '--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'init.templateDir=',
-    '-c', 'protocol.allow=never', '-c', 'submodule.recurse=false', ...args,
-  ], { cwd, env, timeout: remaining(), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
-    stdio: ['ignore', 'pipe', 'pipe'] }).toString().trim();
-  const common = resolve(source, run(source, 'rev-parse', '--git-common-dir'));
+  const run = (cwd: string, ...args: string[]) => {
+    const result = execFileSync('git', [
+      '--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'init.templateDir=',
+      '-c', 'protocol.allow=never', '-c', 'submodule.recurse=false', ...args,
+    ], { cwd, env, timeout: remaining(), killSignal: 'SIGKILL', maxBuffer: 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'] });
+    remaining();
+    return result.toString().trim();
+  };
+  const common = realpathSync(resolve(source, run(source, 'rev-parse', '--git-common-dir')));
   if (within(common, parent)) throw new Error('Task storage must be outside source metadata.');
   function audit(metadata: string, independent: boolean) {
     for (const name of ['shallow', 'info/grafts', 'objects/info/alternates', 'objects/info/http-alternates']) {
@@ -52,9 +56,14 @@ export function createTaskClone(options: {
       if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error('Unsupported object entry.');
       if (independent && stat.isFile() && stat.nlink !== 1) throw new Error('Task objects must not be hard-linked.');
       if (stat.isDirectory()) {
-        const children = readdirSync(path);
-        if (count + pending.length + children.length > 100_000) throw new Error('Object storage exceeds inspection limit.');
-        pending.push(...children.map(child => join(path, child)));
+        const directory = opendirSync(path, { bufferSize: 1 });
+        try {
+          for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+            remaining();
+            if (count + pending.length >= 100_000) throw new Error('Object storage exceeds inspection limit.');
+            pending.push(join(path, entry.name));
+          }
+        } finally { directory.closeSync(); }
       }
     }
   }

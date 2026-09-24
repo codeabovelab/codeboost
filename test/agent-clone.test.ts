@@ -1,9 +1,18 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, lstatSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, lstatSync, symlinkSync, writeFileSync, renameSync, opendirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createTaskClone } from '../git/clone.ts';
+
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, readdirSync: vi.fn(actual.readdirSync), opendirSync: vi.fn(actual.opendirSync) };
+});
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, execFileSync: vi.fn(actual.execFileSync) };
+});
 
 const roots: string[] = [];
 const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
@@ -16,7 +25,7 @@ function fixture() {
   writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '.'); git(source, 'commit', '-m', 'baseline');
   return { source, parent, head: git(source, 'rev-parse', 'HEAD'), taskId: 'task-1' };
 }
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); vi.resetAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 describe('isolated staging clone', () => {
   it('copies objects, ignores dirty source changes, and has no origin or shared metadata', () => {
     const input = fixture();
@@ -68,6 +77,43 @@ describe('isolated staging clone', () => {
     expect(() => createTaskClone({ ...input, head: 'f'.repeat(40) })).toThrow();
     expect(() => createTaskClone({ ...input, timeoutMs: Infinity })).toThrow('deadline');
     expect(readdirSync(input.parent)).toEqual([]);
+  });
+  it('canonicalizes symlinked common metadata before checking storage containment', () => {
+    const input = fixture(), metadata = join(input.parent, 'metadata');
+    renameSync(join(input.source, '.git'), metadata);
+    symlinkSync(metadata, join(input.source, '.git'));
+    const parent = join(metadata, 'tasks'); mkdirSync(parent);
+    // Disputed intermediate state: Git reports a lexical path through the link.
+    expect(git(input.source, 'rev-parse', '--git-common-dir')).toBe('.git');
+    expect(lstatSync(join(input.source, '.git')).isSymbolicLink()).toBe(true);
+    expect(() => createTaskClone({ ...input, parent })).toThrow('outside source metadata');
+    expect(readdirSync(parent)).toEqual([]);
+  });
+  it('never materializes an entire object directory before checking its entry budget', () => {
+    const input = fixture();
+    // A bulk enumeration is forbidden even for a small fixture; this asserts
+    // the disputed intermediate representation, not only a later limit error.
+    vi.mocked(readdirSync).mockClear();
+    createTaskClone(input);
+    expect(readdirSync).not.toHaveBeenCalled();
+    expect(opendirSync).toHaveBeenCalled();
+  });
+  it('rejects a successful final Git call that returns after the overall deadline', async () => {
+    const input = fixture();
+    const actual = await vi.importActual<typeof import('node:child_process')>('node:child_process');
+    let elapsed = 0, lateResult = false;
+    vi.spyOn(performance, 'now').mockImplementation(() => elapsed);
+    vi.mocked(execFileSync).mockImplementation(((file: string, args: string[], options: object) => {
+      const result = actual.execFileSync(file, args, options);
+      if (args.at(-2) === 'rev-parse' && args.at(-1) === 'HEAD') {
+        elapsed = 1001; lateResult = true;
+      }
+      return result;
+    }) as typeof execFileSync);
+    expect(() => createTaskClone({ ...input, timeoutMs: 1000 })).toThrow('deadline');
+    expect(lateResult).toBe(true);
+    expect(readdirSync(input.parent)).toEqual([]);
+    vi.mocked(execFileSync).mockImplementation(actual.execFileSync);
   });
   it('does not inherit Git directory, index, configuration or object overrides', () => {
     const input = fixture();

@@ -66,8 +66,8 @@ export function captureInvocation(input: InvocationInput, now = Date.now()): Inv
   const context = input.context;
   if (![context.snapshotId, context.planId, context.assignmentId, context.referencedCodeHash].every(nonempty)
     || !integer(context.planRevision) || !integer(context.stateVersion)) throw new Error('Invalid captured context.');
-  if (!Array.isArray(input.approvedArgv) || input.approvedArgv.some(argv => !Array.isArray(argv)
-    || argv.length === 0 || !nonempty(argv[0]) || argv.some(arg => typeof arg !== 'string' || arg.includes('\0'))))
+  if (!Array.isArray(input.approvedArgv) || Array.from(input.approvedArgv).some(argv => !Array.isArray(argv)
+    || argv.length === 0 || !nonempty(argv[0]) || Array.from(argv).some(arg => typeof arg !== 'string' || arg.includes('\0'))))
     throw new Error('Commands must be complete literal argv arrays.');
   if (['planning', 'questions'].includes(input.phase) && input.approvedArgv.length)
     throw new Error('Read-only authoring and questions cannot execute commands.');

@@ -39,4 +39,10 @@ describe('invocation boundary', () => {
     expect(() => captureInvocation({ ...request(), phase: 'shell' } as unknown as InvocationInput, 1000)).toThrow('profile');
     expect(() => captureInvocation({ ...request(), attemptId: '' }, 1000)).toThrow('identity');
   });
+  it('rejects sparse allowlists with missing arguments or commands', () => {
+    const argv = ['npm', 'test']; delete argv[1];
+    expect(1 in argv).toBe(false);
+    expect(() => captureInvocation({ ...request(), approvedArgv: [argv] }, 1000)).toThrow('argv');
+    expect(() => captureInvocation({ ...request(), approvedArgv: new Array(1) }, 1000)).toThrow('argv');
+  });
 });
