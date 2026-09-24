@@ -194,7 +194,21 @@ it('requires a fresh review after the queued head is replaced', async () => {
     expect(await h.coordinator.pollQueue()).toMatchObject({ state: 'failed', retryable: false, reason: 'The pull request head changed after review.' });
     expect((await h.coordinator.status(h.view())).action).toBeNull();
     h.replaceHead(sha('c'));
+    expect((await h.coordinator.status(h.view())).action).toBeNull();
+    h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'fresh-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('refuses a merge-queue mode change between validation passes', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn()
+    .mockResolvedValueOnce(remote(h.view(), { mergeQueue: false }))
+    .mockResolvedValueOnce(remote(h.view(), { mergeQueue: true }));
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/queue|requirements changed/i);
+    expect(h.merges).toEqual([]);
+    expect(h.store.getMergeAttempt(h.identity)).toBeNull();
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 

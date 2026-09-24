@@ -7,6 +7,7 @@ import { DatabaseSync } from 'node:sqlite';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { startServer } from '../web/server.ts';
+import { approveItem } from '../core/approvals.ts';
 // Each integration case performs several bounded real-Git reads.
 vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
@@ -57,6 +58,16 @@ it('rejects a concurrent store review edit through the atomic review counter',()
  other.store.addReviewNote(config.identity,view.expected,'P1','change','Please explain');
  expect(()=>service.store.saveReview(config.identity,view.expected,[],[])).toThrow(/Stale/);
 });
+it('requires every item to be reviewed again after a queued head is replaced',()=>{
+ const {service,config}=fixture();let view=service.load();
+ service.store.saveReview(config.identity,view.expected,view.items.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
+ const attempt=service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.example/pr/24');service.store.finishMergeAttempt(config.identity,attempt.id,{state:'failed',reason:'The pull request head changed after review.',requiresFreshReview:true});
+ execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','Replace reviewed head'],{cwd:config.repository,stdio:'pipe'});
+ view=service.load();expect(view.items.every(item=>item.state==='stale'&&item.reasons.includes('Pull request head was replaced after queueing'))).toBe(true);
+ const [first,...remaining]=view.items;service.store.saveReview(config.identity,view.expected,[approveItem(view.plan,view.segments,first!.id,config.identity,first!.count===0)],[]);view=service.load();expect(view.items.find(item=>item.id===first!.id)?.state).toBe('approved');expect(view.items.filter(item=>item.id!==first!.id).every(item=>item.state==='stale')).toBe(true);
+ service.store.saveReview(config.identity,view.expected,remaining.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
+ expect(view.items.every(item=>item.state==='approved')).toBe(true);
+},30000);
 it('refuses no-change confirmation while the item still owns ambiguous changes',async()=>{
  const {service,config}=fixture();const {writeFileSync}=await import('node:fs');const {execFileSync}=await import('node:child_process');
  writeFileSync(join(config.repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');

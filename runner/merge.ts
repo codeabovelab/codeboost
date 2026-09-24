@@ -52,6 +52,15 @@ export class MergeCoordinator {
     };
   }
 
+  #freshReviewComplete(attempt: MergeAttempt): boolean {
+    if (!attempt.requiresFreshReview) return true;
+    const { store, config } = this.service;
+    const plan = store.getPlan(config.identity), snapshot = store.getSnapshot(config.identity);
+    if (snapshot.head === attempt.reviewedHead) return false;
+    const approvals = store.getReview(config.identity).approvals;
+    return plan.items.every(item => approvals.some(approval => approval.item === item.id && approval.revision === plan.revision && approval.snapshotId === snapshot.id));
+  }
+
   async status(view = this.service.load(), fresh = false): Promise<MergeStatus> {
     const blockers: MergeBlocker[] = [];
     for (const item of view.items) {
@@ -82,7 +91,7 @@ export class MergeCoordinator {
       blockers.unshift({ code: 'queue-active', message: attempt.state === 'submitting' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' });
     } else if (attempt?.state === 'merged') {
       blockers.unshift({ code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' });
-    } else if (attempt && this.#current(attempt) && attempt.requiresFreshReview) {
+    } else if (attempt?.requiresFreshReview && !this.#freshReviewComplete(attempt)) {
       blockers.unshift({ code: 'queue-head', message: attempt.reason ?? 'The pull request head changed. Refresh and review the replacement head.' });
     }
     const active = attempt?.state === 'submitting' || attempt?.state === 'queued' || attempt?.state === 'merged';
@@ -121,6 +130,7 @@ export class MergeCoordinator {
       if (view.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       const finalStatus = await this.status(view, true);
       if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head) throw new Error('The pull request changed during merge validation. Refresh before merging.');
+      if (finalStatus.remote.mergeQueue !== status.remote.mergeQueue) throw new Error('Merge-queue requirements changed during validation. Refresh before merging.');
       if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;

@@ -14,7 +14,7 @@ submitting -> queued -> merged
 
 An observation may settle `submitting` after a process restart, because the enqueue command may have completed before the local queued update. Enqueue command success is never recorded as merged. Once the external command succeeds, a later local refresh failure does not turn that committed action into a command failure; the persisted `submitting` record remains disabled and recoverable through queue inspection.
 
-Every update compares the current attempt ID and legal source state. A delayed poll for an older attempt therefore cannot overwrite a retry. Removed and failed attempts retain GitHub's terminal reason. Retry creates a new attempt only when the same revision, snapshot, review version, and reviewed head are still current. A replaced head marks the old attempt as requiring fresh review; after the new snapshot is reviewed, the old attempt is historical rather than retryable.
+Every update compares the current attempt ID and legal source state. A delayed poll for an older attempt therefore cannot overwrite a retry. Removed and failed attempts retain GitHub's terminal reason. Retry creates a new attempt only when the same revision, snapshot, review version, and reviewed head are still current. A replaced head marks the old attempt as requiring fresh review. That gate remains through snapshot replacement until every plan item has a new approval bound to the replacement snapshot; context mismatch alone does not clear it. After those approvals are recorded, the old attempt is historical rather than retryable.
 
 ## Runtime ownership
 
@@ -23,6 +23,8 @@ The coordinator owns at most one enqueue and one shared queue inspection. Cancel
 `GET /api/merge` is the narrow polling path. It reads only the persisted attempt and the K1 queue observation; it does not reload Git history or reconstruct the review. The browser patches only the merge control and status banner, so current selection, scroll, code attachment, and composer drafts remain unchanged. The action stays disabled while submitting or queued and after confirmed merge. Removal or failure exposes the reason; retry is offered only for an unchanged reviewed context, and the full gate is revalidated twice before another enqueue.
 
 Transient or incomplete GitHub observations leave the attempt active and surface an observation error. Only a validated queued, merged, removed, or failed observation changes durable state. Queue rules count as the server-side current-base guard; adapters without queue inspection continue to fail closed.
+
+Both pre-action validation reads must agree on whether merge queues apply. A mode change aborts before `gh pr merge`; the coordinator never decides whether to create durable queue ownership from an earlier observation.
 
 ## Acceptance evidence
 

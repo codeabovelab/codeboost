@@ -49,6 +49,12 @@ export class ReviewService {
       return { ...segment, file, key: createHash('sha256').update(keys[index]!).digest('hex'), originalRow: raw[index]!.row };
     });
     const states = approvalStates(plan, segments, saved.approvals, identity);
+    const mergeAttempt = this.store.getMergeAttempt(identity);
+    const replacementReview = !!mergeAttempt?.requiresFreshReview && mergeAttempt.reviewedHead !== snapshot.head;
+    if (replacementReview) for (const item of plan.items) {
+      const approval = saved.approvals.find(value => value.item === item.id);
+      if (approval && (approval.revision !== plan.revision || approval.snapshotId !== snapshot.id)) states[item.id] = 'stale';
+    }
     for (const item of plan.items) {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
     }
@@ -64,6 +70,8 @@ export class ReviewService {
       const before = prior ? JSON.parse(prior.fingerprint) : null;
       const reasons: string[] = [];
       if (states[item.id] === 'stale') {
+        const approval = saved.approvals.find(value => value.item === item.id);
+        if (replacementReview && approval?.snapshotId !== snapshot.id) reasons.push('Pull request head was replaced after queueing');
         if (before && !isDeepStrictEqual(before.item.acceptance, item.acceptance)) reasons.push('Acceptance checks changed');
         if (before && owned.some(segment => before.segments.some((old: { path: string; content: string; context: string }) => old.path === segment.path && old.content === segment.content && old.context !== segment.context))) reasons.push('Moved to another function');
         for (const dep of item.depends_on) if (states[dep] === 'stale') reasons.push(`Depends on ${dep}, which changed`);
