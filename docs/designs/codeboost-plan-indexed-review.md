@@ -623,15 +623,13 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## What to do next
 
-1. Done: the repo exists at codeabovelab/codeboost with an MIT license. Still to do: write a README that explains reviewing by plan item and lists the known safety limits.
-2. Do the assignment below.
-3. Build step 1, with all its test cases.
-4. Build step 2: the read-only review screen from mockup B.
-5. Optionally run the non-blocking human validation tracked in #19.
-6. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before build step 5 if anything in those areas changes.
-7. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
+1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen.
+2. Continue the remaining roadmap from the current open issues; the cancelled experiment is not a prerequisite.
+3. Optionally run the non-blocking human validation tracked in #19.
+4. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before implementing code-writing agents if anything in those areas changes.
+5. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
 
-**The assignment.** Do this before you write any codeboost code:
+**Historical assignment.** This was completed before the initial implementation and is retained as design history:
 1. Pick one real, small issue in a repo you own.
 2. Write a plan for it by hand, in the format above.
 3. Run Claude on one plan item at a time. Tell it not to commit.
@@ -1915,7 +1913,7 @@ Built from this review's findings. Each task comes from a specific decision abov
   - Verify: a head or base push between validation and merge is refused or revalidated by the server-side guarded merge; a backend without atomic base protection blocks automatic merge, including with zero required checks
 - [x] **T8 (P1, historical estimate: human ~2 days / CC ~30 min)** — process — Cancelled before timed results; optional future validation moved to #19
   - Surfaced by: R3 (D4: A), O5, O9 (D19: A)
-  - Files: scripts/plant.ts, docs/go-no-go.md
+  - Files: scripts/plant.ts, docs/experiments/review-protocol.md
   - Outcome: no experimental result or product claim; future work must start with a fresh protocol and fresh blinded packages
 - [ ] **T9 (P1, human: ~2 weeks / CC: ~3 hours)** — tests — Set up Vitest, real git, recorded gh and CLI outputs, the real-Docker CI suite, Playwright, and the hostile-issue eval
   - Surfaced by: T1 (D10: A)
