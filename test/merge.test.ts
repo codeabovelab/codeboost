@@ -14,7 +14,7 @@ function readyView(): ReviewView {
 function serviceFor(view: ReviewView): ReviewService { return { load: vi.fn(() => view) } as unknown as ReviewService; }
 
 function remote(view: ReviewView, change: Partial<RemoteMergeState> = {}): RemoteMergeState {
-  return { base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, requiredChecks: [], alreadyFixed: 'clear', ...change };
+  return { base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', ...change };
 }
 
 function gateway(states: RemoteMergeState[]): MergeGateway & { heads: string[] } {
@@ -43,6 +43,7 @@ it.each([
   ['mergeable', (_view: ReviewView) => ({ mergeable: 'CONFLICTING' as const })],
   ['rules', (_view: ReviewView) => ({ rulesKnown: false })],
   ['base-guard', (_view: ReviewView) => ({ atomicBaseGuard: false })],
+  ['merge-queue', (_view: ReviewView) => ({ mergeQueue: true })],
   ['check', (_view: ReviewView) => ({ requiredChecks: [{ context: 'pending-test', appId: null, state: 'pending' as const }] })],
   ['check', (_view: ReviewView) => ({ requiredChecks: [{ context: 'failed-test', appId: null, state: 'failure' as const }] })],
   ['check', (_view: ReviewView) => ({ requiredChecks: [{ context: 'missing-test', appId: null, state: 'missing' as const }] })],
@@ -107,7 +108,7 @@ it('parses required checks from both rule sources and pins the gh merge head', a
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } },
       { context: 'lint', state: 'SUCCESS' },
     ] }); }
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
+    if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'merge_queue' }, { type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: 10 }] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.includes('/protection')) return JSON.stringify({ required_status_checks: { strict: false, checks: [{ context: 'lint', app_id: null }] } });
     if (joined.includes('/timeline')) return JSON.stringify([[]]);
@@ -117,6 +118,7 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run);
   const state = await client.inspect();
   expect(state.atomicBaseGuard).toBe(true);
+  expect(state.mergeQueue).toBe(true);
   expect(state.requiredChecks).toEqual([
     { context: 'test', appId: 10, state: 'success' },
     { context: 'lint', appId: null, state: 'success' },
@@ -125,6 +127,10 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   expect(calls.at(-1)).toEqual(['pr','merge','7','--repo','owner/repo','--merge','--match-head-commit',sha('b')]);
   await client.inspect();
   expect(pullReads).toBe(2);
+});
+
+it('rejects an unsupported runtime merge method', () => {
+  expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21, method: 'typo' as 'merge' })).toThrow(/merge method/i);
 });
 
 it.each([

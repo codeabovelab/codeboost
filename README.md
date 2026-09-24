@@ -31,7 +31,7 @@ An existing-store configuration may add a trusted GitHub binding:
 }
 ```
 
-The issue must match the stored plan. The authenticated `gh` account must be able to read the pull request, issue timeline, applicable rulesets, and classic branch protection, and to merge the PR. Codeboost unions required checks from both rule sources, requires a server-enforced current-base policy, rechecks the base and head immediately before merging, and passes the reviewed head to `gh pr merge --match-head-commit`. Missing permissions or ambiguous rule responses block the merge. A moved base and any unexecuted `cmd:` acceptance check remain blocked until [#22](https://github.com/codeabovelab/codeboost/issues/22) adds the runner path.
+The issue must match the stored plan. The authenticated `gh` account must be able to read the pull request, issue timeline, applicable rulesets, and classic branch protection, and to merge the PR. Codeboost unions required checks from both rule sources, requires strict server-enforced current-base checks, rechecks the base and head immediately before merging, and passes the reviewed head to `gh pr merge --match-head-commit`. Missing permissions, ambiguous rule responses, and merge queues block the merge. A moved base and any unexecuted `cmd:` acceptance check remain blocked until [#22](https://github.com/codeabovelab/codeboost/issues/22) adds the runner path.
 
 ## Library
 

@@ -16,6 +16,7 @@ export interface RemoteMergeState {
   mergeable: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
   rulesKnown: boolean;
   atomicBaseGuard: boolean;
+  mergeQueue: boolean;
   requiredChecks: RequiredCheck[];
   alreadyFixed: 'clear' | 'found' | 'unknown';
 }
@@ -55,6 +56,7 @@ export class GhMergeGateway implements MergeGateway {
   constructor(config: GhMergeConfig, run?: RunGh) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
+    if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
     this.config = config;
     this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
   }
@@ -126,11 +128,12 @@ export class GhMergeGateway implements MergeGateway {
     } catch { rulesKnown = false; }
     const requirements = new Map<string, { context: string; appId: number | null }>();
     let atomicBaseGuard = false;
+    let mergeQueue = false;
     if (rulesKnown) {
       for (const rule of rules) {
         if (!rule || typeof rule !== 'object') { rulesKnown = false; break; }
         const value = rule as { type?: unknown; parameters?: Record<string, unknown> };
-        if (value.type === 'merge_queue') atomicBaseGuard = true;
+        if (value.type === 'merge_queue') mergeQueue = true;
         if (value.type !== 'required_status_checks') continue;
         const parameters = value.parameters;
         if (!parameters || !Array.isArray(parameters.required_status_checks)) { rulesKnown = false; break; }
@@ -177,7 +180,7 @@ export class GhMergeGateway implements MergeGateway {
     return {
       base: fullSha(pr.baseRefOid, 'base SHA'), head: fullSha(pr.headRefOid, 'head SHA'),
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
-      rulesKnown, atomicBaseGuard, requiredChecks, alreadyFixed: await this.#alreadyFixed(signal),
+      rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks, alreadyFixed: await this.#alreadyFixed(signal),
     };
   }
 
