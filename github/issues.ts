@@ -5,6 +5,9 @@ const runFile = promisify(execFile);
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
+const MAX_BODY_LENGTH = 65_536;
+// Covers one bounded 100-record page, including multi-byte bodies, labels and JSON overhead.
+const MAX_PAGE_BYTES = 32 * 1024 * 1024;
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
@@ -112,7 +115,7 @@ function normalizeIssue(repository: string, value: unknown): RepositoryIssue | n
     repository,
     number,
     title,
-    body: boundedString(issue.body, 'body', 1_000_000, true),
+    body: boundedString(issue.body, 'body', MAX_BODY_LENGTH, true),
     url,
     createdAt,
     updatedAt,
@@ -134,7 +137,7 @@ export class GhIssueGateway implements IssueGateway {
     if (!repositoryName(repository)) throw new Error('A GitHub repository is required for issue retrieval.');
     this.repository = repository;
     this.run = run ?? (async (args, options) => (await runFile('gh', [...args], {
-      maxBuffer: 8 * 1024 * 1024,
+      maxBuffer: MAX_PAGE_BYTES,
       signal: options?.signal,
     })).stdout);
     this.now = now;
@@ -175,6 +178,7 @@ export class GhIssueGateway implements IssueGateway {
     const timer = setTimeout(() => controller.abort(new Error('Issue retrieval timed out.')), timeoutMs);
     try {
       const issues = await this.#load(controller.signal);
+      controller.signal.throwIfAborted();
       const retrievedAt = this.now();
       if (!Number.isFinite(retrievedAt.getTime())) throw new Error('Issue retrieval clock is invalid.');
       return { repository: this.repository, retrievedAt: retrievedAt.toISOString(), issues };

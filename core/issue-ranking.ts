@@ -72,8 +72,10 @@ export class IssuePrioritizer {
   }
 
   async refresh(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssuePriorityState> {
+    options.signal?.throwIfAborted();
     try {
       const snapshot: IssueSnapshot = await this.gateway.fetch(options);
+      options.signal?.throwIfAborted();
       if (snapshot.repository !== this.gateway.repository) throw new Error('Issue snapshot repository mismatch.');
       if (snapshot.issues.some(issue => issue.repository !== snapshot.repository))
         throw new Error('Issue snapshot contains an issue from another repository.');

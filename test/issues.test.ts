@@ -54,12 +54,21 @@ describe('GitHub issue retrieval', () => {
     expect(snapshot.issues[0]).toMatchObject({ number: 8, trust: 'requires-approval' });
   });
 
+  it('accepts the maximum bounded issue body', async () => {
+    const gateway = new GhIssueGateway('owner/repo', async () => JSON.stringify([
+      rawIssue({ body: 'x'.repeat(65_536) }),
+    ]));
+    const snapshot = await gateway.fetch();
+    expect(snapshot.issues[0]?.body).toHaveLength(65_536);
+  });
+
   it.each([
     ['repository URL', { html_url: 'https://github.com/other/repo/issues/7' }],
     ['state', { state: 'closed' }],
     ['pull request marker', { pull_request: {} }],
     ['author association', { author_association: 'UNKNOWN' }],
     ['title', { title: '   ' }],
+    ['body length', { body: 'x'.repeat(65_537) }],
     ['comments', { comments: -1 }],
     ['reactions', { reactions: { '+1': 0, heart: 0, hooray: 0 } }],
     ['labels', { labels: [{ name: 'bug' }, { name: 'BUG' }] }],
@@ -102,5 +111,15 @@ describe('GitHub issue retrieval', () => {
     controller.abort(cancelled);
     await expect(first).rejects.toBe(cancelled);
     await expect(new GhIssueGateway('owner/repo', run).fetch({ timeoutMs: 1 })).rejects.toThrow('timed out');
+  });
+
+  it('rechecks caller cancellation after a runner returns successfully', async () => {
+    const controller = new AbortController();
+    const cancelled = new Error('Stopped while the response settled.');
+    const gateway = new GhIssueGateway('owner/repo', async () => {
+      controller.abort(cancelled);
+      return JSON.stringify([rawIssue()]);
+    });
+    await expect(gateway.fetch({ signal: controller.signal })).rejects.toBe(cancelled);
   });
 });

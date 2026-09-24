@@ -140,4 +140,24 @@ describe('priority refresh state', () => {
     controller.abort(cancelled);
     await expect(pending).rejects.toBe(cancelled);
   });
+
+  it('rechecks cancellation after fetch settles and does not cache the cancelled snapshot', async () => {
+    const controller = new AbortController();
+    const cancelled = new Error('Stopped while fetch settled.');
+    let attempt = 0;
+    const gateway: IssueGateway = {
+      repository: 'owner/repo',
+      fetch: async () => {
+        attempt++;
+        if (attempt === 1) {
+          controller.abort(cancelled);
+          return { repository: 'owner/repo', retrievedAt: '2026-02-01T00:00:00Z', issues: [issue(1)] };
+        }
+        throw new Error('offline');
+      },
+    };
+    const prioritizer = new IssuePrioritizer(gateway, () => new Date('2026-02-02T00:00:00Z'));
+    await expect(prioritizer.refresh({ signal: controller.signal })).rejects.toBe(cancelled);
+    await expect(prioritizer.refresh()).resolves.toMatchObject({ state: 'unavailable', issues: [] });
+  });
 });
