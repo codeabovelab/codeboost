@@ -264,6 +264,12 @@ describe('real Docker agent isolation', () => {
     const state = JSON.parse(docker('container', 'inspect', valid.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
+
+    const imageIndex = valid.args.indexOf(imageId);
+    const namespaceArgs = [...valid.args.slice(0, imageIndex), '--uts=host', ...valid.args.slice(imageIndex)];
+    docker(...namespaceArgs); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
   it('creates containers from the captured immutable image rather than its mutable tag', () => {

@@ -78,7 +78,8 @@ type Inspect = {
     WorkingDir: string; Labels: Record<string, string> | null };
   HostConfig: { ReadonlyRootfs: boolean; Privileged: boolean; CapDrop: string[] | null; SecurityOpt: string[] | null;
     CapAdd: string[] | null;
-    NetworkMode: string; PidMode: string; IpcMode: string; PidsLimit: number; Memory: number; NanoCpus: number;
+    NetworkMode: string; PidMode: string; IpcMode: string; UTSMode: string; UsernsMode: string; CgroupnsMode: string;
+    PidsLimit: number; Memory: number; NanoCpus: number;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
@@ -111,6 +112,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactNoNewPrivileges(host.SecurityOpt)
     || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
+    || host.UTSMode !== '' || host.UsernsMode !== '' || host.CgroupnsMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
     || host.Memory !== 512 * 1024 * 1024 || host.NanoCpus !== 1_000_000_000)
     throw new Error('Container daemon configuration is missing required lockdown.');
@@ -137,6 +139,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   const requestedMounts = new Map((host.Mounts ?? []).map(item => [item.Target, item]));
   const requestedInput = requestedMounts.get('/run/codeboost-input');
   if (requestedInput?.Type !== 'bind' || canonicalDockerBindSource(requestedInput.Source) !== profile.inputDirectory
+    || canonicalDockerBindSource(input.Source) !== profile.inputDirectory
     || !requestedInput.ReadOnly) throw new Error('Schema input mount identity changed.');
   if (work.Name !== profile.filesystems.workVolume || metadata.Name !== profile.filesystems.metadataVolume)
     throw new Error('Container task volumes do not match their captured identity.');
@@ -177,7 +180,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   if (profile.vendor === 'codex' && (auth?.Type !== 'bind' || auth.RW)) throw new Error('Codex auth must be a read-only file mount.');
   const requestedAuth = requestedMounts.get('/run/codeboost-auth/codex/auth.json');
   if (profile.vendor === 'codex' && (requestedAuth?.Type !== 'bind'
-    || canonicalDockerBindSource(requestedAuth.Source) !== profile.codexAuthFile || !requestedAuth.ReadOnly))
+    || canonicalDockerBindSource(requestedAuth.Source) !== profile.codexAuthFile
+    || canonicalDockerBindSource(auth!.Source) !== profile.codexAuthFile || !requestedAuth.ReadOnly))
     throw new Error('Codex auth mount identity changed.');
   if (profile.vendor === 'claude' && auth) throw new Error('Claude profile must not mount Codex auth.');
   if (inspect.Config.Env.some(value => value.indexOf('=') < 1)) throw new Error('Container environment is malformed.');

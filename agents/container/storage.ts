@@ -64,10 +64,13 @@ const remove = (args: readonly string[], inspectArgs: readonly string[], remaini
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (!absent(inspect)) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
-const cleanup = (keeper: string, volumes: readonly string[], allocationId: string, timeoutMs = 30_000) => {
+const cleanup = (containers: readonly string[], volumes: readonly string[], allocationId: string, timeoutMs = 30_000) => {
   const remaining = createDeadline(timeoutMs), failures: unknown[] = [];
-  try { remove(['rm', '--force', keeper], ['container', 'inspect', keeper], remaining, 'task keeper', allocationId); }
-  catch (error) { failures.push(error); }
+  for (const container of containers) {
+    try { remove(['rm', '--force', container], ['container', 'inspect', container], remaining,
+      'task container', allocationId); }
+    catch (error) { failures.push(error); }
+  }
   for (const volume of volumes) {
     try { remove(['volume', 'rm', '--force', volume], ['volume', 'inspect', volume], remaining, 'task volume', allocationId); }
     catch (error) { failures.push(error); }
@@ -103,14 +106,15 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
   const allocationId = randomUUID();
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
-  const keeper = `codeboost-keeper-${randomUUID()}`, createdVolumes: string[] = [];
+  const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
+  const createdVolumes: string[] = [];
   try {
     for (const [kind, name, bytes, inodes] of [['work', workVolume, limits.workBytes, limits.workInodes],
       ['metadata', metadataVolume, limits.metadataBytes, limits.metadataInodes]] as const) {
+      createdVolumes.push(name);
       docker(['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
         '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
         '--label', `io.codeboost.task-storage=${kind}`, '--label', `io.codeboost.allocation=${allocationId}`, name], remaining());
-      createdVolumes.push(name);
     }
     const seed = ['set -eu', 'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/. /work/',
       'cp -a --no-preserve=ownership,timestamps /work/.git/. /metadata/', 'rm -rf /work/.git', 'mkdir /work/.git',
@@ -120,7 +124,8 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--label', 'io.codeboost.task-storage=keeper', '--label', `io.codeboost.allocation=${allocationId}`,
       '--entrypoint', 'sleep', imageId, 'infinity'], remaining());
-    docker(['run', '--rm', '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
+    docker(['run', '--rm', '--name', seeder, '--label', `io.codeboost.allocation=${allocationId}`,
+      '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
@@ -131,7 +136,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
     return filesystems;
   } catch (error) {
-    try { cleanup(keeper, createdVolumes.reverse(), allocationId); }
+    try { cleanup([seeder, keeper], createdVolumes.reverse(), allocationId); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
     throw error;
   }
@@ -140,6 +145,6 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
 export function removeTaskFilesystems(filesystems: TaskFilesystems): void {
   assertTaskFilesystems(filesystems);
   const allocationId = taskFilesystemAllocationId(filesystems);
-  cleanup(filesystems.keeper, [filesystems.metadataVolume, filesystems.workVolume], allocationId);
+  cleanup([filesystems.keeper], [filesystems.metadataVolume, filesystems.workVolume], allocationId);
   allocations.delete(filesystems);
 }

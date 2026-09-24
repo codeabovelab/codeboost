@@ -96,8 +96,8 @@ export function assertContainerProfile(profile: ContainerProfile): void {
 export function disposeContainerProfile(profile: ContainerProfile): void {
   const identity = identities.get(profile);
   if (!identity) return;
-  identities.delete(profile);
   if (identity.cleanupDirectory) rmSync(identity.cleanupDirectory, { recursive: true, force: true });
+  identities.delete(profile);
 }
 
 const safeName = (value: string) => {
