@@ -7,7 +7,7 @@ type ReviewView = ReturnType<ReviewService['load']>;
 const sha = (digit: string) => digit.repeat(40);
 function readyView(): ReviewView {
   return {
-    items: [{ id: 'P1', state: 'approved', acceptance: [{ type: 'check', text: 'Works' }], checks: { tests: '– No tests defined' } }],
+    items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [{ type: 'check', text: 'Works' }], checks: { tests: '– No tests defined' } }],
     plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: 'snapshot', base: sha('a'), head: sha('b') }, token: 'review-token',
   } as unknown as ReviewView;
 }
@@ -23,10 +23,10 @@ function gateway(states: RemoteMergeState[]): MergeGateway & { heads: string[] }
 }
 
 it('lists every local review blocker before merge', async () => {
-  const view = { ...readyView(), items: [{ ...readyView().items[0]!, state: 'stale' }], segments: [{ row: 'Unplanned' }], notes: [{ kind: 'change', revision: 1, snapshotId: 'snapshot' }] } as unknown as ReviewView;
+  const view = { ...readyView(), items: [{ ...readyView().items[0]!, state: 'stale', outside: ['undeclared.ts'] }], segments: [{ row: 'Unplanned' }], notes: [{ kind: 'change', revision: 1, snapshotId: 'snapshot' }] } as unknown as ReviewView;
   const service = serviceFor(view);
   const status = await new MergeCoordinator(service, gateway([remote(view)])).status(view);
-  expect(new Set(status.blockers.map(blocker => blocker.code))).toEqual(new Set(['approval', 'unplanned', 'changes']));
+  expect(new Set(status.blockers.map(blocker => blocker.code))).toEqual(new Set(['approval', 'scope', 'unplanned', 'changes']));
 });
 
 it('keeps review available when GitHub merge state cannot be read', async () => {

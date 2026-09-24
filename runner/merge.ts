@@ -18,6 +18,7 @@ export class MergeCoordinator {
     const blockers: MergeBlocker[] = [];
     for (const item of view.items) {
       if (item.state !== 'approved') blockers.push({ code: 'approval', message: `${item.id} is ${item.state}.` });
+      if (item.outside.length) blockers.push({ code: 'scope', message: `${item.id} has ${item.outside.length} out-of-scope file${item.outside.length === 1 ? '' : 's'} and requires a plan amendment.` });
       if (item.acceptance.some(check => check.type === 'cmd') && item.checks.tests !== '✓ Passed') blockers.push({ code: 'acceptance', message: `${item.id} command checks have not passed on this head.` });
     }
     const ambiguous = view.segments.filter(segment => segment.row === 'Ambiguous').length;

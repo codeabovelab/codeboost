@@ -64,6 +64,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Once an irreversible external command succeeds, do not convert later refresh or rendering failures into action failure. Return the committed result, keep repeat controls disabled, and require fresh confirmation of terminal state.
 - Track an in-flight irreversible subprocess as part of server shutdown. Abort it, await its settlement, and only then close the state it depends on.
 - Set the shutdown admission flag before snapshotting active work, and enforce it again at the irreversible action boundary for requests admitted before shutdown began.
+- An approval must not override server-computed plan-scope violations. Irreversible gates must block attributed out-of-scope files until the plan is amended.
 - When startup acquires a store, process, listener, or other resource before later dependency construction, close that resource on every construction failure. Prefer validating dependencies before acquisition when possible.
 - When deriving a review configuration for a clone, experiment, fork, or new identity, clear external action bindings unless they are re-established and validated for the derived target.
 - A deadline must abort and await the underlying operation before releasing its in-flight ownership; rejecting only the caller can leave untracked work running.

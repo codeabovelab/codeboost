@@ -1,5 +1,5 @@
 import { test, expect } from '@playwright/test';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -10,6 +10,7 @@ import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
 import type { MergeGateway } from '../../github/merge.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
+function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
 test.afterEach(async () => { await app.close();rmSync(root,{recursive:true,force:true}); });
 test('reviews real changes, persists approval and conversation, and assigns foreign code',async({page})=>{
@@ -45,7 +46,7 @@ test('requires private credentials and rejects foreign origins',async({request})
   expect((await request.get(base+'api/review',{headers:{'x-codeboost-token':app.token}})).status()).toBe(200);
 });
 test('shows merge blockers and submits one exact-head merge',async({page})=>{
- const config={...app.service.config,demo:false};await app.close();let mergeCalls:string[]=[];let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let mergeCalls:string[]=[];let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  const gateway:MergeGateway={
   inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},
   merge:async head=>{mergeCalls.push(head);await held;app.service.load=()=>{throw new Error('post-command reload failed');};return {url:'https://github.com/example/repo/pull/21'};},
@@ -57,7 +58,7 @@ test('shows merge blockers and submits one exact-head merge',async({page})=>{
  await page.locator('#merge').evaluate((button:HTMLButtonElement)=>{button.click();button.click();});await expect.poll(()=>mergeCalls.length).toBe(1);await expect(page.locator('#merge')).toBeDisabled();release();await expect(page.locator('#banner')).toContainText('Merge submitted.');await expect(page.locator('#merge')).toBeDisabled();await page.locator('#merge').evaluate((button:HTMLButtonElement)=>button.click());expect(mergeCalls).toEqual([expectedHead]);
 });
 test('keeps stale merge failures disabled until refresh',async({page})=>{
- const config={...app.service.config,demo:false};await app.close();let appRef:typeof app;const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('head changed');}};app=appRef=await startServer(config,0,undefined,gateway);
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('head changed');}};app=appRef=await startServer(config,0,undefined,gateway);
  let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('Merge blocked. head changed');await expect(page.locator('#merge')).toBeDisabled();
 });
