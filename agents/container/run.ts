@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, realpathSync } from 'node:fs';
-import { assertContainerProfile, type ContainerProfile, type TaskFilesystems } from './profile.ts';
+import { assertContainerProfile, disposeContainerProfile, type ContainerProfile, type TaskFilesystems } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 
 const dockerEnvironment = (secrets: Readonly<Record<string, string>> = {}) => ({
@@ -32,6 +32,11 @@ const createDeadline = (timeoutMs: number) => {
 const resourceName = (kind: string) => `codeboost-${kind}-${randomUUID()}`;
 const exactNoNewPrivileges = (options: string[] | null | undefined) => options?.length === 1
   && (options[0] === 'no-new-privileges' || options[0] === 'no-new-privileges:true');
+export const hasExactOptions = (value: string | undefined, expected: readonly string[]) => {
+  const parts = value?.split(',') ?? [];
+  return parts.length === expected.length && new Set(parts).size === parts.length
+    && expected.every(option => parts.includes(option));
+};
 const canonicalDockerBindSource = (source: string) => {
   const desktopHostPath = source.startsWith('/host_mnt/') ? source.slice('/host_mnt'.length) : source;
   try { return realpathSync(desktopHostPath); } catch { return source; }
@@ -98,6 +103,7 @@ type Inspect = {
   Image: string;
   Config: { Image: string; User: string; Env: string[]; Entrypoint: string[] | null; Cmd: string[] | null; WorkingDir: string };
   HostConfig: { ReadonlyRootfs: boolean; Privileged: boolean; CapDrop: string[] | null; SecurityOpt: string[] | null;
+    CapAdd: string[] | null;
     NetworkMode: string; PidMode: string; IpcMode: string; PidsLimit: number; Memory: number; NanoCpus: number;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
@@ -127,7 +133,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || JSON.stringify(inspect.Config.Entrypoint) !== JSON.stringify(['/usr/local/bin/codeboost-container-probe'])
     || JSON.stringify(inspect.Config.Cmd) !== JSON.stringify(profile.command)
     || !host.ReadonlyRootfs || host.Privileged
-    || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
+    || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactNoNewPrivileges(host.SecurityOpt)
     || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
@@ -142,8 +148,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   ]);
   if (Object.keys(tmpfs).length !== expectedTmpfs.size) throw new Error('Container tmpfs mount set changed.');
   for (const [path, expected] of expectedTmpfs) {
-    const actual = new Set((tmpfs[path] ?? '').split(','));
-    if (expected.some(option => !actual.has(option))) throw new Error(`Container tmpfs ${path} is missing required options.`);
+    if (!hasExactOptions(tmpfs[path], expected)) throw new Error(`Container tmpfs ${path} options changed.`);
   }
   const mounts = new Map(inspect.Mounts.map(item => [item.Destination, item]));
   const allowedMounts = new Set(['/work', '/work/.git', '/run/codeboost-input',
@@ -171,22 +176,21 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     const expected = expectedVolumes.get(volume.Name), options = volume.Options ?? {}, optionString = options.o ?? '';
     if (!expected || volume.Driver !== 'local' || options.type !== 'tmpfs' || options.device !== 'tmpfs'
       || volume.Labels?.['io.codeboost.task-storage'] !== expected[0]
-      || !optionString.split(',').includes(`size=${expected[1]}`)
-      || !optionString.split(',').includes(`nr_inodes=${expected[2]}`)
-      || !optionString.split(',').includes('uid=10001') || !optionString.split(',').includes('gid=10001')
-      || !optionString.split(',').includes('mode=0755') || !optionString.split(',').includes('nosuid')
-      || !optionString.split(',').includes('nodev'))
+      || !hasExactOptions(optionString, [`size=${expected[1]}`, `nr_inodes=${expected[2]}`,
+        'uid=10001', 'gid=10001', 'mode=0755', 'nosuid', 'nodev']))
       throw new Error('Task volume does not match its bounded tmpfs allocation.');
   }
   const keeper = JSON.parse(docker(['container', 'inspect', profile.filesystems.keeper], { timeoutMs: remaining() }))[0] as
     { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string> };
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; NetworkMode?: string; CapDrop?: string[] | null;
-        SecurityOpt?: string[] | null }; Mounts?: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }> } | undefined;
+        CapAdd?: string[] | null; SecurityOpt?: string[] | null };
+      Mounts?: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }> } | undefined;
   const keeperVolumes = new Map((keeper?.Mounts ?? []).filter(item => item.Type === 'volume').map(item => [item.Destination, item]));
   if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
     || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper' || !keeper.HostConfig?.ReadonlyRootfs
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
+    || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
     || !exactNoNewPrivileges(keeper.HostConfig.SecurityOpt)
     || keeperVolumes.get('/work')?.Name !== profile.filesystems.workVolume
     || keeperVolumes.get('/metadata')?.Name !== profile.filesystems.metadataVolume)
@@ -225,9 +229,9 @@ export function validateContainer(container: string, profile: ContainerProfile, 
 export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(timeoutMs);
-  validateSecrets(profile, secrets);
-  assertContainerProfile(profile);
   try {
+    validateSecrets(profile, secrets);
+    assertContainerProfile(profile);
     docker(profile.args, { timeoutMs: remaining(), secrets });
     validateContainer(profile.name, profile, remaining());
     assertContainerProfile(profile);
@@ -235,6 +239,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     return profile.name;
   } catch (error) {
     spawnSync('docker', ['rm', '--force', profile.name], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
+    disposeContainerProfile(profile);
     throw error;
   }
 }
@@ -249,7 +254,10 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
     remaining();
     return output;
   }
-  finally { spawnSync('docker', ['rm', '--force', container], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' }); }
+  finally {
+    spawnSync('docker', ['rm', '--force', container], { timeout: 30_000, env: dockerEnvironment(), stdio: 'ignore' });
+    disposeContainerProfile(profile);
+  }
 }
 
 export function removeTaskFilesystems(filesystems: TaskFilesystems): void {

@@ -1,5 +1,8 @@
 import { createHash } from 'node:crypto';
-import { closeSync, constants, fstatSync, lstatSync, openSync, readFileSync, readdirSync, realpathSync } from 'node:fs';
+import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readFileSync,
+  readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { InvocationInput, Phase } from '../contract.ts';
 
 export interface TaskFilesystems {
@@ -42,10 +45,11 @@ interface FileIdentity {
   readonly mtimeMs: number;
   readonly digest: string;
 }
-interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity }
+interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity;
+  readonly cleanupDirectory?: string }
 const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
 
-const captureFile = (path: string, kind: string): FileIdentity => {
+const readCapturedFile = (path: string, kind: string): { identity: FileIdentity; content: Buffer } => {
   let fd: number | undefined;
   try {
     fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
@@ -57,10 +61,12 @@ const captureFile = (path: string, kind: string): FileIdentity => {
     if (before.dev !== after.dev || before.ino !== after.ino || before.size !== after.size
       || before.mtimeMs !== after.mtimeMs || before.ctimeMs !== after.ctimeMs)
       throw new Error(`${kind} changed while its identity was captured.`);
-    return Object.freeze({ path, dev: after.dev, ino: after.ino, mode: after.mode, nlink: after.nlink,
+    const identity = Object.freeze({ path, dev: after.dev, ino: after.ino, mode: after.mode, nlink: after.nlink,
       size: after.size, mtimeMs: after.mtimeMs, digest: createHash('sha256').update(content).digest('hex') });
+    return { identity, content };
   } finally { if (fd !== undefined) closeSync(fd); }
 };
+const captureFile = (path: string, kind: string) => readCapturedFile(path, kind).identity;
 const sameFile = (actual: FileIdentity, expected: FileIdentity) => actual.path === expected.path
   && actual.dev === expected.dev && actual.ino === expected.ino && actual.mode === expected.mode
   && actual.nlink === expected.nlink && actual.size === expected.size && actual.mtimeMs === expected.mtimeMs
@@ -89,6 +95,14 @@ export function assertContainerProfile(profile: ContainerProfile): void {
     const auth = captureFile(expected.auth.path, 'Codex auth');
     if (!sameFile(auth, expected.auth)) throw new Error('Codex auth changed after the profile was captured.');
   }
+}
+
+/** Remove runner-owned credential staging after this one-shot profile settles. */
+export function disposeContainerProfile(profile: ContainerProfile): void {
+  const identity = identities.get(profile);
+  if (!identity) return;
+  identities.delete(profile);
+  if (identity.cleanupDirectory) rmSync(identity.cleanupDirectory, { recursive: true, force: true });
 }
 
 const safeName = (value: string) => {
@@ -120,8 +134,21 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     || !/^codeboost-keeper-[0-9a-f-]+$/.test(filesystems.keeper)) throw new Error('Task filesystem identity is invalid.');
   if (options.codexAuthFile && !lstatSync(options.codexAuthFile).isFile())
     throw new Error('Codex auth must be a direct regular file, not a link.');
-  const codexAuthFile = options.codexAuthFile ? mountSource(realpathSync(options.codexAuthFile), 'Codex auth') : undefined;
-  const authIdentity = codexAuthFile ? captureFile(codexAuthFile, 'Codex auth') : undefined;
+  const sourceAuth = options.codexAuthFile ? readCapturedFile(realpathSync(options.codexAuthFile), 'Codex auth') : undefined;
+  let cleanupDirectory: string | undefined, codexAuthFile: string | undefined, authIdentity: FileIdentity | undefined;
+  if (sourceAuth) {
+    cleanupDirectory = mkdtempSync(join(tmpdir(), 'codeboost-auth-'));
+    try {
+      const stagedAuth = join(cleanupDirectory, 'auth.json');
+      writeFileSync(stagedAuth, sourceAuth.content, { mode: 0o400, flag: 'wx' });
+      chmodSync(stagedAuth, 0o444);
+      codexAuthFile = mountSource(realpathSync(stagedAuth), 'Codex auth');
+      authIdentity = captureFile(codexAuthFile, 'Staged Codex auth');
+    } catch (error) {
+      rmSync(cleanupDirectory, { recursive: true, force: true });
+      throw error;
+    }
+  }
   const name = `codeboost-agent-${safeName(invocation.attemptId)}`;
   const readOnlyWork = ['planning', 'questions', 'review'].includes(invocation.phase);
   const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
@@ -147,6 +174,6 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     phase: invocation.phase, vendor: invocation.vendor,
     filesystems: capturedFilesystems, inputDirectory, codexAuthFile,
     command: Object.freeze([...options.command]) });
-  identities.set(profile, Object.freeze({ ...inputIdentity, auth: authIdentity }));
+  identities.set(profile, Object.freeze({ ...inputIdentity, auth: authIdentity, cleanupDirectory }));
   return profile;
 }

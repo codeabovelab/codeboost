@@ -1,19 +1,20 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, buildAgentImage } from '../agents/container/image.ts';
-import { createContainerProfile } from '../agents/container/profile.ts';
+import { createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
 import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
-  validateContainer } from '../agents/container/run.ts';
+  hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
+const profiles: ReturnType<typeof createContainerProfile>[] = [];
 let imageId = '';
 const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
   { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
@@ -54,6 +55,7 @@ function profile(data: ReturnType<typeof fixture>, phase: Phase, command: string
     imageId,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
+  profiles.push(base);
   return base;
 }
 
@@ -61,6 +63,7 @@ beforeAll(() => { imageId = buildAgentImage(); }, 10 * 60_000);
 afterAll(() => {
   for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
   for (const filesystems of taskFilesystems.reverse()) removeTaskFilesystems(filesystems);
+  for (const profile of profiles) disposeContainerProfile(profile);
   for (const root of roots.reverse()) {
     chmodSync(join(root, 'input'), 0o700);
     rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -180,13 +183,15 @@ describe('real Docker agent isolation', () => {
         ? value.replace(`source=${data.input},`, 'source=/,') : value)) });
     expect(() => createValidatedContainer(forged)).toThrow('trusted profile builder');
 
+    writeFileSync(data.fakeAuth, '{"changed":true}');
+    expect(valid.codexAuthFile).not.toBe(data.fakeAuth);
+    expect(readFileSync(valid.codexAuthFile!, 'utf8')).toBe('{}');
+    expect(statSync(valid.codexAuthFile!).mode & 0o777).toBe(0o444);
+    writeFileSync(data.fakeAuth, '{}');
+
     chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
     expect(() => createValidatedContainer(valid)).toThrow('only one bounded');
     chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
-
-    writeFileSync(data.fakeAuth, '{"changed":true}');
-    expect(() => createValidatedContainer(valid)).toThrow('Codex auth changed');
-    writeFileSync(data.fakeAuth, '{}');
   });
 
   it('rejects extra security policies and a PATH that can shadow the startup probe', () => {
@@ -202,6 +207,23 @@ describe('real Docker agent isolation', () => {
     docker(...pathArgs); containers.add(valid.name);
     expect(() => validateContainer(valid.name, valid)).toThrow(/environment|PATH/);
     docker('rm', '--force', valid.name); containers.delete(valid.name);
+  }, 60_000);
+
+  it('rejects added capabilities and conflicting or duplicate filesystem options', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const imageIndex = valid.args.indexOf(imageId);
+    const args = [...valid.args.slice(0, imageIndex), '--cap-add=SYS_ADMIN', ...valid.args.slice(imageIndex)];
+    docker(...args); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    const state = JSON.parse(docker('container', 'inspect', valid.name))[0] as { State: { Status: string } };
+    expect(state.State.Status).toBe('created');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+
+    const expected = ['size=1024', 'nr_inodes=16', 'uid=10001', 'gid=10001', 'mode=0755', 'nosuid', 'nodev'];
+    expect(hasExactOptions(expected.join(','), expected)).toBe(true);
+    expect(hasExactOptions([...expected, 'size=2048'].join(','), expected)).toBe(false);
+    expect(hasExactOptions([...expected, 'dev'].join(','), expected)).toBe(false);
+    expect(hasExactOptions([...expected, 'nosuid'].join(','), expected)).toBe(false);
   }, 60_000);
 
   it('rejects a caller-mutated network before the container can start', () => {
