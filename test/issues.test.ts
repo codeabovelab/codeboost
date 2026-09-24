@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GhIssueGateway } from '../github/issues.ts';
+import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES } from '../github/issues.ts';
 
 const rawIssue = (overrides: Record<string, unknown> = {}) => ({
   number: 7,
@@ -60,6 +60,18 @@ describe('GitHub issue retrieval', () => {
     ]));
     const snapshot = await gateway.fetch();
     expect(snapshot.issues[0]?.body).toHaveLength(65_536);
+  });
+
+  it('budgets for a maximum page of JSON-escaped control-character bodies', () => {
+    const body = '\0'.repeat(65_536);
+    const page = Array.from({ length: 100 }, (_, index) => rawIssue({
+      number: index + 1,
+      html_url: `https://github.com/owner/repo/issues/${index + 1}`,
+      body,
+    }));
+    const serializedBytes = Buffer.byteLength(JSON.stringify(page));
+    expect(serializedBytes).toBeGreaterThan(32 * 1024 * 1024);
+    expect(serializedBytes).toBeLessThan(ISSUE_PAGE_MAX_BYTES);
   });
 
   it.each([

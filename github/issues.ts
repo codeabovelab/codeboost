@@ -6,8 +6,8 @@ const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
-// Covers one bounded 100-record page, including multi-byte bodies, labels and JSON overhead.
-const MAX_PAGE_BYTES = 32 * 1024 * 1024;
+// Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
+export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
@@ -137,7 +137,7 @@ export class GhIssueGateway implements IssueGateway {
     if (!repositoryName(repository)) throw new Error('A GitHub repository is required for issue retrieval.');
     this.repository = repository;
     this.run = run ?? (async (args, options) => (await runFile('gh', [...args], {
-      maxBuffer: MAX_PAGE_BYTES,
+      maxBuffer: ISSUE_PAGE_MAX_BYTES,
       signal: options?.signal,
     })).stdout);
     this.now = now;
