@@ -264,13 +264,16 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       if (reviewedHead !== expectedHead) throw new Error('The pull request head changed after review.');
       if (!['OPEN','CLOSED','MERGED'].includes(String(pull.state))) throw new Error('GitHub returned an invalid queue pull request state.');
       if (!Object.hasOwn(pull, 'mergedAt') || (pull.mergedAt !== null && typeof pull.mergedAt !== 'string')) throw new Error('GitHub returned invalid merge completion data.');
+      if (!Object.hasOwn(pull, 'mergeQueueEntry') || !Object.hasOwn(pull, 'timelineItems')) throw new Error('GitHub returned incomplete merge-queue data.');
+      const entry = pull.mergeQueueEntry;
+      const timeline = pull.timelineItems;
+      if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline) || !Array.isArray((timeline as { nodes?: unknown }).nodes)) throw new Error('GitHub returned incomplete merge-queue history.');
       if (pull.state === 'MERGED') {
+        if (entry !== null) throw new Error('GitHub returned an active queue entry for a merged pull request.');
         return { state: 'merged', reviewedHead, mergedAt: timestamp(pull.mergedAt, 'merge completion time') };
       }
       if (pull.mergedAt !== null) throw new Error('GitHub returned inconsistent merge completion data.');
 
-      const timeline = pull.timelineItems;
-      if (!timeline || typeof timeline !== 'object' || Array.isArray(timeline) || !Array.isArray((timeline as { nodes?: unknown }).nodes)) throw new Error('GitHub returned incomplete merge-queue history.');
       const events = (timeline as { nodes: unknown[] }).nodes.map(event => {
         if (!event || typeof event !== 'object' || Array.isArray(event)) throw new Error('GitHub returned a malformed merge-queue event.');
         const value = event as { __typename?: unknown; createdAt?: unknown; reason?: unknown };
@@ -280,7 +283,6 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         return { type: value.__typename, createdAt, reason: value.reason as string | undefined };
       });
 
-      const entry = pull.mergeQueueEntry;
       if (entry !== null) {
         if (pull.state !== 'OPEN' || !entry || typeof entry !== 'object' || Array.isArray(entry)) throw new Error('GitHub returned an invalid merge-queue entry.');
         const value = entry as { id?: unknown; state?: unknown; position?: unknown; enqueuedAt?: unknown; headCommit?: { oid?: unknown } | null };

@@ -213,6 +213,8 @@ it.each([
   ['a replaced reviewed head', queueFixture({ state: 'OPEN', mergedAt: null, headRefOid: sha('d'), mergeQueueEntry: { id: 'MQE_1', state: 'QUEUED', position: 1, enqueuedAt: '2026-09-24T08:00:00Z', headCommit: { oid: sha('c') } }, timelineItems: { nodes: [] } })],
   ['an absent queue entry without a removal event', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [] } })],
   ['a removal without a reason', queueFixture({ state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [{ __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: null }] } })],
+  ['an omitted mergeQueueEntry field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', timelineItems: { nodes: [] } })],
+  ['an omitted timelineItems field', queueFixture({ state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null })],
   ['GraphQL errors alongside data', JSON.stringify({ data: { repository: { pullRequest: { number: 7, headRefOid: sha('b'), state: 'MERGED', mergedAt: '2026-09-24T08:10:00Z', mergeQueueEntry: null, timelineItems: { nodes: [] } } } }, errors: [{ message: 'partial' }] })],
 ] as const)('fails closed for %s', async (_case, fixture) => {
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => fixture);
