@@ -88,6 +88,9 @@ describe('vendor-only egress', () => {
   it.each([
     ['host namespace', ['--pid=host']],
     ['extra Node environment', ['--env', 'NODE_OPTIONS=--trace-warnings']],
+    ['DNS override', ['--dns=8.8.8.8']],
+    ['host override', ['--add-host=api.anthropic.com:127.0.0.1']],
+    ['published proxy port', ['--publish=127.0.0.1::3128']],
   ] as const)('rejects a proxy replaced with %s before launch', (_label, extra) => {
     const replacementInvocation = captureInvocation({ ...invocation, attemptId: 'mutated-proxy-probe',
       deadline: Date.now() + 60_000 });

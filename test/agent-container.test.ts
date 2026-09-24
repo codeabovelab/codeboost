@@ -7,7 +7,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
-import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
+import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer, startValidatedContainer,
   hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { createVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../agents/network/network.ts';
@@ -102,6 +102,13 @@ describe('real Docker agent isolation', () => {
       const data = fixture();
       expect(runContainer(profile(data, phase, 'phase-worktree'))).toBe('');
     }, 60_000);
+
+  it('removes the invocation proxy and network after the container settles', () => {
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
+    expect(runContainer(valid)).toBe('');
+    expect(spawnSync('docker', ['container', 'inspect', valid.network.proxyContainer]).status).not.toBe(0);
+    expect(spawnSync('docker', ['network', 'inspect', valid.network.name]).status).not.toBe(0);
+  }, 60_000);
 
   it('runs read-only with no root capabilities, host paths, inherited secrets, or writable tools', () => {
     const data = fixture();
@@ -258,10 +265,10 @@ describe('real Docker agent isolation', () => {
 
   it('does not remove an active container when a duplicate attempt name collides', () => {
     const data = fixture(), captured = invocation(data.clone, 'planning');
-    const common = governed(captured);
-    const first = createContainerProfile({ ...common, filesystems: data.filesystems,
+    const duplicateInvocation = captureInvocation({ ...captured });
+    const first = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
-    const duplicate = createContainerProfile({ ...common, filesystems: data.filesystems,
+    const duplicate = createContainerProfile({ ...governed(duplicateInvocation), filesystems: data.filesystems,
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
@@ -420,6 +427,14 @@ describe('real Docker agent isolation', () => {
     expect(() => validateContainer(valid.name, valid)).toThrow('DNS configuration');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
+    for (const extra of [['--add-host=api.openai.com:127.0.0.1'], ['--publish=127.0.0.1::3128']]) {
+      const changedArgs = [...valid.args.slice(0, valid.args.indexOf(imageId)), ...extra,
+        ...valid.args.slice(valid.args.indexOf(imageId))];
+      docker(...changedArgs); containers.add(valid.name);
+      expect(() => validateContainer(valid.name, valid)).toThrow('host or port configuration');
+      docker('rm', '--force', valid.name); containers.delete(valid.name);
+    }
+
     const imageIndex = valid.args.indexOf(imageId);
     const namespaceArgs = [...valid.args.slice(0, imageIndex), '--uts=host', ...valid.args.slice(imageIndex)];
     docker(...namespaceArgs); containers.add(valid.name);
@@ -438,10 +453,23 @@ describe('real Docker agent isolation', () => {
     try {
       docker('run', '--detach', '--name', rogue, `--network=${valid.network.name}`, '--entrypoint', 'node', imageId,
         '-e', 'setInterval(()=>{},1000)');
-      expect(() => createValidatedContainer(valid)).toThrow('network or proxy changed');
+      expect(() => createValidatedContainer(valid)).toThrow('cleanup did not settle');
       const absent = spawnSync('docker', ['container', 'inspect', valid.name], { encoding: 'utf8' });
       expect(absent.status).not.toBe(0);
-    } finally { spawnSync('docker', ['rm', '--force', rogue], { stdio: 'ignore' }); }
+    } finally {
+      spawnSync('docker', ['rm', '--force', rogue], { stdio: 'ignore' });
+      disposeContainerProfile(valid);
+    }
+  }, 60_000);
+
+  it('revalidates the agent attachment immediately before start', () => {
+    const data = fixture(), valid = profile(data, 'planning', 'must-not-run');
+    createValidatedContainer(valid); containers.add(valid.name);
+    docker('network', 'disconnect', valid.network.name, valid.name);
+    docker('network', 'connect', 'bridge', valid.name);
+    expect(() => startValidatedContainer(valid)).toThrow(/network attachment|lockdown/);
+    containers.delete(valid.name);
+    expect(spawnSync('docker', ['container', 'inspect', valid.name]).status).not.toBe(0);
   }, 60_000);
 
   it('creates containers from the captured immutable image rather than its mutable tag', () => {

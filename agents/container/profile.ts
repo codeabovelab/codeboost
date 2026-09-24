@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { assertCapturedInvocation, type InvocationInput, type Phase } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
-import { assertVendorNetwork, type VendorNetwork } from '../network/network.ts';
+import { assertVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
 import { assertAgentCommand, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
 export interface ContainerProfile {
   readonly name: string;
@@ -51,6 +51,7 @@ interface ProfileIdentity { readonly inputDirectory: string; readonly schema: Fi
 type InputIdentity = Pick<ProfileIdentity, 'inputDirectory' | 'schema'>;
 interface InputCapture extends InputIdentity { readonly content: Buffer }
 const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
+const claimedNetworks = new WeakSet<VendorNetwork>();
 const removeOwnedDirectory = (directory: string) => {
   if (!lstatSync(directory, { throwIfNoEntry: false })) return;
   chmodSync(directory, 0o700);
@@ -140,7 +141,10 @@ export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now
 export function disposeContainerProfile(profile: ContainerProfile): void {
   const identity = identities.get(profile);
   if (!identity) return;
-  removeOwnedDirectories(identity.cleanupDirectories);
+  const failures: unknown[] = [];
+  try { removeOwnedDirectories(identity.cleanupDirectories); } catch (error) { failures.push(error); }
+  try { removeVendorNetwork(identity.network); } catch (error) { failures.push(error); }
+  if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
   identities.delete(profile);
 }
 
@@ -164,6 +168,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   assertBuiltAgentImage(options.imageId);
   assertTaskFilesystems(filesystems, invocation.clone);
   assertVendorNetwork(options.network, invocation);
+  if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
   assertPhasePolicy(options.policy, invocation);
   const command = assertAgentCommand(options.command, options.policy, invocation.vendor);
   const sourceInput = captureInput(options.inputDirectory);
@@ -230,6 +235,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
+    claimedNetworks.add(options.network);
     return profile;
   } catch (error) {
     try { removeOwnedDirectories(cleanupDirectories); }

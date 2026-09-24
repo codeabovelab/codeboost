@@ -17,6 +17,7 @@ export interface VendorNetwork {
 interface NetworkIdentity { readonly allocationId: string; readonly imageId: string; readonly invocation: InvocationInput;
   readonly subnet: string; readonly proxyIp: string }
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
+const removedNetworks = new WeakSet<VendorNetwork>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const deadline = (timeoutMs: number) => {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Network deadline must be a positive integer.');
@@ -65,8 +66,11 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; CapDrop?: string[]; CapAdd?: string[] | null;
         SecurityOpt?: string[]; Memory?: number; MemorySwap?: number; NanoCpus?: number; PidsLimit?: number;
         NetworkMode?: string; PidMode?: string; IpcMode?: string; UTSMode?: string; UsernsMode?: string;
-        CgroupnsMode?: string; Devices?: unknown[] | null; DeviceRequests?: unknown[] | null };
-      NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }> }; Mounts?: unknown[] } | undefined;
+        CgroupnsMode?: string; Devices?: unknown[] | null; DeviceRequests?: unknown[] | null;
+        Dns?: string[]; DnsOptions?: string[]; DnsSearch?: string[]; ExtraHosts?: string[] | null;
+        PortBindings?: Record<string, unknown> | null; PublishAllPorts?: boolean };
+      NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }>; Ports?: Record<string, unknown> };
+      Mounts?: unknown[] } | undefined;
   const image = JSON.parse(docker(['image', 'inspect', identity.imageId], remaining()))[0] as
     { Config?: { Env?: string[] } } | undefined;
   const inspectedNetwork = JSON.parse(docker(['network', 'inspect', network.name], remaining()))[0] as
@@ -88,6 +92,10 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
     || inspect.HostConfig.IpcMode !== 'private' || inspect.HostConfig.UTSMode !== ''
     || inspect.HostConfig.UsernsMode !== '' || inspect.HostConfig.CgroupnsMode !== 'private'
     || (inspect.HostConfig.Devices?.length ?? 0) !== 0 || (inspect.HostConfig.DeviceRequests?.length ?? 0) !== 0
+    || (inspect.HostConfig.Dns?.length ?? 0) !== 0 || (inspect.HostConfig.DnsOptions?.length ?? 0) !== 0
+    || (inspect.HostConfig.DnsSearch?.length ?? 0) !== 0 || (inspect.HostConfig.ExtraHosts?.length ?? 0) !== 0
+    || Object.keys(inspect.HostConfig.PortBindings ?? {}).length !== 0 || inspect.HostConfig.PublishAllPorts
+    || Object.keys(inspect.NetworkSettings?.Ports ?? {}).length !== 0
     || JSON.stringify(networks) !== JSON.stringify(['bridge', network.name].sort()) || inspect.Mounts?.length
     || JSON.stringify(inspect.Config?.Entrypoint) !== JSON.stringify(['node'])
     || JSON.stringify(inspect.Config?.Cmd) !== JSON.stringify(['/usr/local/lib/codeboost-egress-proxy.mjs'])
@@ -156,7 +164,10 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
 
 export function removeVendorNetwork(network: VendorNetwork): void {
   const identity = identities.get(network);
-  if (!identity) throw new Error('Vendor network was not created by the trusted network builder.');
+  if (!identity) {
+    if (removedNetworks.has(network)) return;
+    throw new Error('Vendor network was not created by the trusted network builder.');
+  }
   assertBuiltAgentImage(identity.imageId);
   const allocationId = identity.allocationId;
   const remaining = deadline(30_000), failures: unknown[] = [];
@@ -166,4 +177,5 @@ export function removeVendorNetwork(network: VendorNetwork): void {
     remaining, 'vendor network', allocationId); } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   identities.delete(network);
+  removedNetworks.add(network);
 }

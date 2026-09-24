@@ -101,9 +101,11 @@ type Inspect = {
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
-    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null; Dns: string[] };
+    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null; Dns: string[];
+    DnsOptions: string[]; DnsSearch: string[]; ExtraHosts: string[] | null;
+    PortBindings: Record<string, unknown> | null; PublishAllPorts: boolean };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
-  NetworkSettings: { Networks: Record<string, unknown> };
+  NetworkSettings: { Networks: Record<string, unknown>; Ports: Record<string, unknown> };
 };
 
 /** Validate daemon-resolved configuration before starting an agent. */
@@ -149,6 +151,10 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     throw new Error('Container daemon configuration is missing required lockdown.');
   if (JSON.stringify(host.Dns) !== JSON.stringify(['127.0.0.1']))
     throw new Error('Container DNS configuration changed.');
+  if (host.DnsOptions.length || host.DnsSearch.length || (host.ExtraHosts?.length ?? 0)
+    || Object.keys(host.PortBindings ?? {}).length || host.PublishAllPorts
+    || Object.keys(inspect.NetworkSettings.Ports ?? {}).length)
+    throw new Error('Container host or port configuration changed.');
   if (JSON.stringify(Object.keys(inspect.NetworkSettings.Networks)) !== JSON.stringify([profile.network.name]))
     throw new Error('Container network attachment changed.');
   const tmpfs = host.Tmpfs ?? {};
@@ -281,14 +287,14 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
   }
 }
 
-export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
+export function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
-  const container = createValidatedContainer(profile, remaining(), secrets);
   let failure: unknown;
   try {
-    assertContainerProfile(profile, remaining());
-    const output = docker(['start', '--attach', container], { timeoutMs: remaining(), secrets });
+    validateSecrets(profile, secrets);
+    validateContainer(profile.name, profile, remaining());
+    const output = docker(['start', '--attach', profile.name], { timeoutMs: remaining(), secrets });
     remaining();
     return output;
   }
@@ -300,4 +306,18 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
       throw cleanupError;
     }
   }
+}
+
+export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
+  secrets: Readonly<Record<string, string>> = {}): string {
+  const remaining = createDeadline(timeoutMs);
+  createValidatedContainer(profile, remaining(), secrets);
+  let startBudget: number;
+  try { startBudget = remaining(); }
+  catch (error) {
+    try { removeContainerOrThrow(profile); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Agent deadline and cleanup both failed.'); }
+    throw error;
+  }
+  return startValidatedContainer(profile, startBudget, secrets);
 }
