@@ -1,6 +1,6 @@
 # Plan-indexed review: go/no-go protocol
 
-Status: **pair selection frozen; pair 1 prepared; reviews not started**. Max Hwang (`mchwang`) is the blinded reviewer and Codex is the experiment operator. This document does not claim a passed gate. Complete each row's PR and SHA fields and commit that exact revision before the first timed review. No issue, assignment, order, or threshold may change once the first review begins.
+Status: **pair selection frozen; all four pairs prepared; reviews not started**. Max Hwang (`mchwang`) is the blinded reviewer and Codex is the experiment operator. This document does not claim a passed gate. Every row's PR and exact base/head SHAs are committed below. No issue, assignment, order, or threshold may change once the first review begins.
 
 ## Pair selection and order
 
@@ -43,4 +43,4 @@ Report declared-file catch rate for both methods without a pass threshold. Stop 
 
 ## Current evidence
 
-Engineering tests prove browser interactions, persistence, attribution, and planting mechanics. The separate manual assignment proves that one real merged issue can be completely classified through stored review choices. Neither establishes human review speed or catch rates. Pair 1 is prepared at the exact PR revisions above and passed the repository preflight; the other three pairs remain in preparation. No timed decision or catch-rate result exists yet.
+Engineering tests prove browser interactions, persistence, attribution, and planting mechanics. The separate manual assignment proves that one real merged issue can be completely classified through stored review choices. Neither establishes human review speed or catch rates. All four pairs are prepared at the eight exact PR revisions above, and every revision passed the repository preflight. No timed decision or catch-rate result exists yet.
