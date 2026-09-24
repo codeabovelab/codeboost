@@ -77,6 +77,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - When a stale or replaced external identity requires fresh review, keep that gate active across the context replacement until approvals or evidence are recorded against the replacement generation. A mismatch with the old context is not itself fresh review.
 - If the external lifecycle mechanism or mode changes between validation passes, abort before the irreversible command. Create durable lifecycle ownership from the final stable mode, never from an earlier observation.
 - When an irreversible command has an ambiguous timeout, cancellation, transport, or unknown outcome, retain durable in-flight ownership and reconcile external state before enabling retry. Only a confirmed refusal may become retryable failure.
+- Correlate retry observations to the current attempt with an immutable external identity or event boundary. Matching only the resource or commit identity can replay a prior attempt's terminal event.
 
 ## Blinded experiments
 

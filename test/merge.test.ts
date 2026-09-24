@@ -156,6 +156,7 @@ it('persists enqueue success as queued and waits for a separate confirmed merge'
     await h.coordinator.merge(h.view().token);
     expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'queued', reviewedHead: sha('b') });
     expect((await h.coordinator.pollQueue())).toMatchObject({ state: 'queued', phase: 'AWAITING_CHECKS', position: 2 });
+    expect(h.client.inspectQueue).toHaveBeenCalledWith(sha('b'), expect.objectContaining({ notBefore: h.store.getMergeAttempt(h.identity)!.createdAt }));
     expect((await h.coordinator.pollQueue())).toMatchObject({ state: 'merged', occurredAt: '2026-09-24T08:10:00Z', retryable: false });
   } finally { await h.coordinator.close(); h.store.close(); }
 });
@@ -196,6 +197,18 @@ it('requires a fresh review after the queued head is replaced', async () => {
     h.replaceHead(sha('c'));
     expect((await h.coordinator.status(h.view())).action).toBeNull();
     h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'fresh-review' }], []);
+    expect((await h.coordinator.status(h.view())).action).toBe('merge');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('accepts a fully re-reviewed replacement snapshot restored to the original head', async () => {
+  const h = queueHarness([new Error('The pull request head changed after review.')]);
+  try {
+    await h.coordinator.merge(h.view().token);
+    await h.coordinator.pollQueue();
+    h.replaceHead(sha('c'));
+    h.replaceHead(sha('b'));
+    h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'restored-head-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
   } finally { await h.coordinator.close(); h.store.close(); }
 });
@@ -355,6 +368,17 @@ it('preserves the recorded reason when GitHub removes a pull request from the me
   await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run).inspectQueue(sha('b'))).resolves.toEqual({
     state: 'removed', reviewedHead: sha('b'), removedAt: '2026-09-24T08:05:00Z', reason: 'Checks failed',
   });
+});
+
+it('rejects a removal event that predates the current enqueue attempt', async () => {
+  const run = async () => queueFixture({
+    state: 'OPEN', mergedAt: null, mergeQueueEntry: null, timelineItems: { nodes: [
+      { __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T08:00:00Z' },
+      { __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T08:05:00Z', reason: 'Previous attempt failed', beforeCommit: { oid: sha('b') } },
+    ] },
+  });
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
+  await expect(client.inspectQueue(sha('b'), { notBefore: '2026-09-24T08:06:00Z' })).rejects.toThrow(/current enqueue attempt/i);
 });
 
 it('reports merged only when GitHub confirms the reviewed head was merged', async () => {

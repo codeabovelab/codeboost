@@ -37,7 +37,7 @@ export type MergeQueueObservation =
   | { state: 'failed'; reviewedHead: string; entryId: string; reason: string }
   | { state: 'merged'; reviewedHead: string; mergedAt: string };
 export interface MergeQueueGateway {
-  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<MergeQueueObservation>;
+  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; notBefore?: string }): Promise<MergeQueueObservation>;
 }
 export interface MergeGateway {
   inspect(options?: { fresh?: boolean; timeoutMs?: number }): Promise<RemoteMergeState>;
@@ -254,10 +254,13 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     return attempt;
   }
 
-  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<MergeQueueObservation> {
+  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; notBefore?: string } = {}): Promise<MergeQueueObservation> {
     fullSha(expectedHead, 'expected head SHA');
     const timeoutMs = options.timeoutMs ?? 12_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue inspection timeout.');
+    const notBefore = options.notBefore === undefined ? null : timestamp(options.notBefore, 'merge-queue attempt time');
+    // GitHub event timestamps may omit milliseconds, so compare at their common precision.
+    const notBeforeSecond = notBefore === null ? null : Math.floor(Date.parse(notBefore) / 1_000) * 1_000;
     const [owner, name] = this.config.repository.split('/') as [string, string];
     const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid state mergedAt mergeQueueEntry{id state position enqueuedAt headCommit{oid} pullRequest{number headRefOid}} timelineItems(last:20,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){nodes{__typename ... on AddedToMergeQueueEvent{createdAt} ... on RemovedFromMergeQueueEvent{createdAt reason beforeCommit{oid}}}}}}`;
     const timeout = new AbortController();
@@ -301,19 +304,21 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         const value = entry as { id?: unknown; state?: unknown; position?: unknown; enqueuedAt?: unknown; headCommit?: { oid?: unknown } | null; pullRequest?: { number?: unknown; headRefOid?: unknown } | null };
         if (typeof value.id !== 'string' || !value.id || !['AWAITING_CHECKS','LOCKED','MERGEABLE','QUEUED','UNMERGEABLE'].includes(String(value.state)) || !Number.isSafeInteger(value.position) || (value.position as number) < 0)
           throw new Error('GitHub returned an invalid merge-queue entry.');
-        timestamp(value.enqueuedAt, 'merge-queue entry time');
+        const enqueuedAt = timestamp(value.enqueuedAt, 'merge-queue entry time');
+        if (notBeforeSecond !== null && Date.parse(enqueuedAt) < notBeforeSecond) throw new Error('GitHub did not return a queue entry for the current enqueue attempt.');
         const queueHead = fullSha(value.headCommit?.oid, 'merge-queue head SHA');
         const entryHead = fullSha(value.pullRequest?.headRefOid, 'merge-queue entry pull request head SHA');
         if (value.pullRequest?.number !== this.config.pullRequest || queueHead !== expectedHead || entryHead !== expectedHead) throw new Error('The merge-queue entry does not match the reviewed pull request head.');
         if (value.state === 'UNMERGEABLE') return { state: 'failed', reviewedHead, entryId: value.id, reason: 'GitHub reported the merge queue entry as unmergeable.' };
         return {
           state: 'queued', reviewedHead, entryId: value.id, phase: value.state as MergeQueueEntryPhase,
-          position: value.position as number, enqueuedAt: value.enqueuedAt as string, queueHead,
+          position: value.position as number, enqueuedAt, queueHead,
         };
       }
       const last = events.at(-1);
       if (!last || last.type !== 'RemovedFromMergeQueueEvent') throw new Error('GitHub did not confirm a queued, removed, failed, or merged state.');
       if (last.beforeHead !== expectedHead) throw new Error('The merge-queue removal does not match the reviewed pull request head.');
+      if (notBeforeSecond !== null && Date.parse(last.createdAt) < notBeforeSecond) throw new Error('GitHub did not return a terminal event for the current enqueue attempt.');
       return { state: 'removed', reviewedHead, removedAt: last.createdAt, reason: last.reason! };
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;

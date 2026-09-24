@@ -56,7 +56,7 @@ export class MergeCoordinator {
     if (!attempt.requiresFreshReview) return true;
     const { store, config } = this.service;
     const plan = store.getPlan(config.identity), snapshot = store.getSnapshot(config.identity);
-    if (snapshot.head === attempt.reviewedHead) return false;
+    if (snapshot.id === attempt.snapshotId) return false;
     const approvals = store.getReview(config.identity).approvals;
     return plan.items.every(item => approvals.some(approval => approval.item === item.id && approval.revision === plan.revision && approval.snapshotId === snapshot.id));
   }
@@ -178,7 +178,7 @@ export class MergeCoordinator {
 
   async #pollQueue(attempt: MergeAttempt, signal: AbortSignal): Promise<MergeQueueStatus | null> {
     try {
-      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000 });
+      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, notBefore: attempt.createdAt });
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {
