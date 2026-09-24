@@ -20,6 +20,7 @@ it('expires a browser token after another view assigns a segment and recomputes 
 it('keeps both sides of a declared rename in scope after manual reassignment',()=>{
  const {service,config}=fixture(),identity=config.identity,plan=service.store.getPlan(identity);
  plan.items=[{...plan.items[0]!,files:[{path:'renamed.ts',kind:'rename',renamed_from:'retry.ts',change:'Rename the implementation.'}],depends_on:[]}];
+ expect(plan.items.map(item=>item.id)).toEqual(['P1']);
  service.store.importRevision(JSON.stringify(plan),'json',{identity,issue:plan.issue,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},plan.revision);
  renameSync(join(config.repository,'retry.ts'),join(config.repository,'renamed.ts'));
  writeFileSync(join(config.repository,'renamed.ts'),'export function delay(attempt: number) {\n  return Math.min(5000, 200 * 2 ** attempt);\n}\n');

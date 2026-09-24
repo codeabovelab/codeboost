@@ -4,7 +4,7 @@ Validated on 2026-09-23 from `5a2685c`, before selecting real issues for the pla
 
 ## Renamed-file reassignment
 
-A real-Git fixture declares `retry.ts` → `renamed.ts`, then creates an unplanned rename with a content edit. The review exposes removed and added text segments with `-` and `+` operations. The fixture resolves the removed side through `oldPath` and the added side through `path`, verifies both declared names, then manually assigns both segments. Each remains in scope.
+A real-Git fixture reduces the demo plan to P1, declares `retry.ts` → `renamed.ts`, then creates an unplanned rename with a content edit. The review exposes removed and added text segments with `-` and `+` operations. The fixture resolves the removed side through `oldPath` and the added side through `path`, verifies both declared names, then manually assigns both segments. Each remains in scope.
 
 Result: no defect reproduced. `ReviewService` evaluates a manual assignment against both `path` and `renamed_from`. The integration fixture remains as coverage.
 
