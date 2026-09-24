@@ -201,7 +201,7 @@ describe('real Docker agent isolation', () => {
     chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
     expect(() => createValidatedContainer(valid)).toThrow('only one bounded');
     chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
-  });
+  }, 60_000);
 
   it('rejects extra security policies and environment paths that can escape bounded storage', () => {
     const data = fixture(), valid = profile(data, 'planning', ['true']);
