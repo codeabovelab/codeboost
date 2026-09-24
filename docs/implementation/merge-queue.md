@@ -24,7 +24,7 @@ The coordinator owns at most one enqueue and one shared queue inspection. Cancel
 
 Transient or incomplete GitHub observations leave the attempt active and surface an observation error. Only a validated queued, merged, removed, or failed observation changes durable state. Queue rules count as the server-side current-base guard; adapters without queue inspection continue to fail closed.
 
-Both pre-action validation reads must agree on whether merge queues apply. A mode change aborts before `gh pr merge`; the coordinator never decides whether to create durable queue ownership from an earlier observation.
+Both pre-action validation reads must agree on whether merge queues apply. Queue mode performs one final fresh validation after capturing its timeline cursor, immediately before durable ownership and `gh pr merge`. Any mode change aborts before the command; the coordinator never decides whether to create durable queue ownership from an earlier observation.
 
 ## Acceptance evidence
 

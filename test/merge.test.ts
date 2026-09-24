@@ -41,7 +41,7 @@ function queueHarness(observations: Array<MergeQueueObservation | Error>) {
     const expected = view.expected;
     const snapshot = store.recordHistory(identity, expected, sha('a'), head, []);
     view = { ...view, snapshot, expected: { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, token: `review-${head}` } as ReviewView;
-  } };
+  }, changeToken(token: string) { view = { ...view, token } as ReviewView; } };
 }
 
 it('lists every local review blocker before merge', async () => {
@@ -228,9 +228,22 @@ it('refuses a merge-queue mode change between validation passes', async () => {
 
 it('revalidates the review generation after reading the queue watermark', async () => {
   const h = queueHarness([]);
-  h.client.queueWatermark = vi.fn(async () => { h.replaceHead(sha('c')); return 'MQEV_before'; });
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('new-review-token'); return 'MQEV_before'; });
   try {
     await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/review changed during merge validation/i);
+    expect(h.merges).toEqual([]);
+    expect(h.store.getMergeAttempt(h.identity)).toBeNull();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('refuses a queue-mode change observed after reading the queue watermark', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn()
+    .mockResolvedValueOnce(remote(h.view(), { mergeQueue: true }))
+    .mockResolvedValueOnce(remote(h.view(), { mergeQueue: true }))
+    .mockResolvedValueOnce(remote(h.view(), { mergeQueue: false }));
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/queue|requirements changed/i);
     expect(h.merges).toEqual([]);
     expect(h.store.getMergeAttempt(h.identity)).toBeNull();
   } finally { await h.coordinator.close(); h.store.close(); }
