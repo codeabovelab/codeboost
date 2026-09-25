@@ -50,6 +50,32 @@ const captureLimits = (override: Partial<CaptureLimits> | undefined): CaptureLim
 };
 const diagnosticFor = (reason: StopReason, detail?: string) => Buffer.from(
   `[codeboost: ${reason}${detail ? `: ${detail.replace(/[\r\n]+/g, ' ').slice(0, 512)}` : ''}]\n`);
+const retainCleanupOwnership = (profile: ContainerProfile, detail: string): InvocationHandle => {
+  const invocation = assertPhasePolicy(profile.policy);
+  let resolveSettled!: (result: InvocationResult) => void, cleaning = false;
+  const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
+  const retry = () => {
+    if (cleaning) return;
+    cleaning = true;
+    try {
+      disposeValidatedContainer(profile);
+      active.delete(invocation.attemptId);
+      resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
+        exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
+        stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
+    } catch {
+      const timer = setTimeout(() => { cleaning = false; retry(); }, 1_000);
+      timer.unref();
+      return;
+    }
+    cleaning = false;
+  };
+  const handle: InvocationHandle = Object.freeze({ attemptId: invocation.attemptId, settled,
+    cancel: retry });
+  active.set(invocation.attemptId, handle);
+  const timer = setTimeout(retry, 1_000); timer.unref();
+  return handle;
+};
 const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason, limits: CaptureLimits,
   detail?: string) => {
   const diagnostic = diagnosticFor(reason, detail).subarray(0, DIAGNOSTIC_BYTES);
@@ -62,21 +88,27 @@ export function readBoundedContainerFile(container: string, source: string, maxi
   timeoutMs = 30_000): Promise<Buffer> {
   positiveInteger(maximumBytes, 'maximumBytes');
   positiveInteger(timeoutMs, 'timeoutMs');
+  if (maximumBytes > OUTPUT_LIMITS.stdoutBytes)
+    throw new Error('Adapter output read cannot exceed the production stdout limit.');
   if (!/^\/run\/codeboost-output\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(source))
     throw new Error('Adapter output must come from the bounded output directory.');
   const reader = [
-    "const fs=require('node:fs'),path=process.argv[1],maximum=Number(process.argv[2]);",
-    'let fd;try{fd=fs.openSync(path,fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);',
-    "const before=fs.fstatSync(fd);if(before.size>maximum)throw new Error('OUTPUT_LIMIT');",
+    "const fs=require('node:fs'),path=process.argv[1],maximum=Number(process.argv[2]),directory='/run/codeboost-output';",
+    'let dirfd,fd;try{dirfd=fs.openSync(directory,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);',
+    "fd=fs.openSync('/proc/self/fd/'+dirfd+'/'+path.slice(directory.length+1),",
+    'fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);',
+    "const before=fs.fstatSync(fd,{bigint:true});if(before.size>BigInt(maximum))throw new Error('OUTPUT_LIMIT');",
     "if(!before.isFile()||before.nlink!==1)throw new Error('UNSAFE_FILE');",
     'const output=Buffer.allocUnsafe(maximum+1);let length=0,count=0;',
     'do{count=fs.readSync(fd,output,length,output.length-length,null);length+=count}',
     "while(count>0&&length<output.length);if(length>maximum)throw new Error('OUTPUT_LIMIT');",
-    'const after=fs.fstatSync(fd);if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size',
+    'const after=fs.fstatSync(fd,{bigint:true});if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size',
     '||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs||after.nlink!==1',
     "||!after.isFile())throw new Error('CHANGED_FILE');",
+    "const named=fs.statSync('/proc/self/fd/'+dirfd+'/'+path.slice(directory.length+1),{bigint:true,throwIfNoEntry:false});",
+    "if(!named||named.dev!==after.dev||named.ino!==after.ino||named.nlink!==1n)throw new Error('REPLACED_FILE');",
     "process.stdout.write(output.subarray(0,length))}catch(error){process.exitCode=error.message==='OUTPUT_LIMIT'?42:43}",
-    'finally{if(fd!==undefined)fs.closeSync(fd)}',
+    'finally{if(fd!==undefined)fs.closeSync(fd);if(dirfd!==undefined)fs.closeSync(dirfd)}',
   ].join('');
   return new Promise((resolve, reject) => {
     execFile('docker', ['exec', container, 'node', '-e', reader, source, String(maximumBytes)], {
@@ -128,13 +160,18 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     createValidatedContainer(profile, remaining(), options.secrets ?? {});
     validateContainer(profile.name, profile, remaining());
   } catch (error) {
-    try { disposeValidatedContainer(profile); } catch { /* createValidatedContainer already reports unsettled cleanup */ }
+    try { disposeValidatedContainer(profile); }
+    catch (cleanupError) {
+      const detail = `Container validation failed and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`;
+      return retainCleanupOwnership(profile, detail);
+    }
     throw error;
   }
 
   const stdoutChunks: Buffer[] = [], stderrChunks: Buffer[] = [];
   let stdoutBytes = 0, stderrBytes = 0, combinedBytes = 0;
-  let stopReason: StopReason | undefined, failureDetail: string | undefined, closed = false, terminating = false;
+  let stopReason: StopReason | undefined, failureDetail: string | undefined;
+  let closed = false, terminating = false, settlementComplete = false;
   let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
   let protocolToken: string | undefined;
   let protocolBuffer = Buffer.alloc(0);
@@ -178,9 +215,9 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     }, 4_000);
   };
   const stop = (reason: StopReason) => {
-    if (closed || stopReason) return;
+    if (settlementComplete || stopReason) return;
     stopReason = reason;
-    terminate();
+    if (!closed) terminate();
   };
   const capture = (stream: 'stdout' | 'stderr', value: Buffer | string) => {
     if (stopReason || closed) return;
@@ -207,6 +244,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         const raw = Buffer.concat(stdoutChunks, stdoutBytes);
         const decoded = await options.decode!(profile, raw,
           Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)), budget);
+        if (stopReason) return;
         const additional = decoded.additionalBytes ?? 0;
         const textBytes = Buffer.byteLength(decoded.text);
         if (!Number.isSafeInteger(additional) || additional < 0)
@@ -293,7 +331,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     closed = true;
     let finalStdout = Buffer.concat(stdoutChunks, stdoutBytes), finalStderr = Buffer.concat(stderrChunks, stderrBytes);
     let exitCode = code, finalSignal = signal;
-    if (!stopReason && code === 0 && options.decode && !profile.deferredOutput) await decodeOutput();
+    if (!stopReason && options.decode && !profile.deferredOutput) await decodeOutput();
     if (decodePromise) await decodePromise;
     if (!stopReason && code === 0 && profile.deferredOutput && !decodedOutput) {
       stopReason = 'capture-failure'; failureDetail ??= 'Deferred output protocol did not complete.';
@@ -313,6 +351,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     const result = Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
       exitCode, signal: finalSignal, ...(stopReason ? { stopReason } : {}),
       stdout: finalStdout.toString('utf8'), stderr: finalStderr.toString('utf8') });
+    settlementComplete = true;
     active.delete(invocation.attemptId);
     resolveSettled(result);
   });

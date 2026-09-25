@@ -130,6 +130,29 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('capture-failure')).toBe(false);
   }, 60_000);
 
+  it('preserves cancellation while post-close decoding is still unsettled', async () => {
+    let begin!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'cancel-during-decode'), {
+      decode: async () => { begin(); await gate; return { text: 'must-not-publish' }; },
+    });
+    await started;
+    handle.cancel('cancelled');
+    release();
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.stdout).not.toContain('must-not-publish');
+  }, 60_000);
+
+  it('validates and decodes provider output even when the process exits nonzero', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
+      decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),
+    }).settled;
+    expect(result).toMatchObject({ exitCode: 7, stdout: 'decoded:encoded-output' });
+    expect(result.stopReason).toBeUndefined();
+  }, 60_000);
+
   it('bounds decoded text independently of adapter byte accounting', async () => {
     const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'decoded-limit'), {
       limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },
@@ -141,6 +164,8 @@ describe('container invocation supervisor', () => {
   it('rejects traversal before starting an output read', () => {
     expect(() => readBoundedContainerFile('unused',
       '/run/codeboost-output/../../run/codeboost-auth/codex/auth.json', 1024)).toThrow('bounded output directory');
+    expect(() => readBoundedContainerFile('unused', '/run/codeboost-output/final.txt',
+      16 * 1024 * 1024 + 1)).toThrow('production stdout limit');
   });
 
   it.each([
