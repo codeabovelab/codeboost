@@ -593,11 +593,12 @@ describe('real Docker agent isolation', () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
       const authProfile = profile(data, 'planning', policy => createCodexCommand(policy,
-        'Reply only with this exact marker: codeboost-schema-marker'),
+        'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
       { authProbe: true, codexAuthFile: authFile, deadlineMs: 5 * 60_000 });
-      // The production launch path: create, validate, start and remove.
+      // The production launch path: create, validate, start and remove. Raw stdout can carry more than the final
+      // message, so the value must appear as a complete line; the adapter probe checks the exact file channel.
       const output = runContainer(authProfile, 5 * 60_000);
-      expect(output).toContain('codeboost-schema-marker');
+      expect(output.split('\n').map(line => line.trim())).toContain('codeboost-schema-marker');
     }, 6 * 60_000);
 
     it('runs the authenticated Claude startup path with only its OAuth token', () => {
@@ -610,9 +611,7 @@ describe('real Docker agent isolation', () => {
       const output = runContainer(authProfile, 5 * 60_000, { CLAUDE_CODE_OAUTH_TOKEN: token });
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
-      // Tolerate one wrapping pair of backticks or quotes, but nothing else around the value.
-      const value = envelope.result?.trim().replace(/^(`+|"|')([^]*)\1$/, '$2').trim();
-      expect(value).toBe('codeboost-schema-marker');
+      expect(envelope.result?.trim()).toBe('codeboost-schema-marker');
     }, 6 * 60_000);
   }
 });

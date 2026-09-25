@@ -375,8 +375,8 @@ describe('container invocation supervisor', () => {
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
     const schemaPrompt = 'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, '
       + 'without quotes or Markdown formatting.';
-    // Tolerate one wrapping pair of backticks or quotes, but nothing else around the value.
-    const schemaValue = (output: string) => output.trim().replace(/^(`+|"|')([^]*)\1$/, '$2').trim();
+    // Exact value only: the prompt forbids quotes and formatting, so anything around the value fails the probe.
+    const schemaValue = (output: string) => output.trim();
 
     it('runs the production Codex adapter and collects its bounded output file', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;

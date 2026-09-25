@@ -26,7 +26,8 @@ const seedRepository = 'git init -q /work && git -C /work -c user.name=gate -c u
   + 'commit -q --allow-empty -m seed';
 const runBroken = (mounts: readonly string[], script: string, env: readonly string[] = []) => spawnSync('docker', ['run',
   '--rm', '--network=none', '--user', '10001:10001', '--env', 'HOME=/home/codeboost', ...env, '--workdir', '/work', ...mounts,
-  '--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700',
+  ...(mounts.some(mount => mount.startsWith('/home/codeboost:')) ? []
+    : ['--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700']),
   '--entrypoint', 'sh', imageId, '-c', `${seedRepository} && ${script}`],
 { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
 const tmpfs = (target: string, options: string) => ['--tmpfs', `${target}:rw,uid=10001,gid=10001,${options}`];
@@ -49,6 +50,9 @@ describe('isolation gate detects breaches', () => {
     ['an unbounded task filesystem', 'execute', 'capacity',
       [...tmpfs('/work', 'size=256m'), ...writableMetadata, ...boundedScratch],
       'isolation breach: dd if=/dev/zero of=/work/overflow'],
+    ['an unbounded HOME', 'execute', 'scratch-capacity',
+      [...bounded, ...writableMetadata, ...boundedScratch, ...tmpfs('/home/codeboost', 'size=256m,mode=0700')],
+      'isolation breach: dd if=/dev/zero of=/home/codeboost/overflow'],
     ['unbounded scratch', 'execute', 'scratch-capacity',
       [...bounded, ...writableMetadata, ...tmpfs('/tmp', 'size=256m')], 'isolation breach: dd if=/dev/zero of=/tmp/overflow'],
   ] as const)('fails the probe for %s', (_label, phase, probe, mounts, breach) => {
@@ -63,6 +67,16 @@ describe('isolation gate detects breaches', () => {
       probeScript('execute', 'scratch-capacity'), ['--env', 'CODEBOOST_VENDOR=codex']);
     expect(result.status, result.stderr).not.toBe(0);
     expect(result.stdout).not.toContain('scratch-bounded');
+  }, 120_000);
+
+  it('fails the hostile-repository probe when a repository link resolves inside the container', () => {
+    // A link that resolves is readable through the checkout, whatever it contains.
+    const linked = 'ln -s /etc/hostname /work/escape && ln -s /nonexistent /work/escape-dir && git -C /work add -A '
+      + '&& git -C /work -c user.name=gate -c user.email=gate@example.com commit -q -m links && ';
+    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch],
+      linked + probeScript('execute', 'hostile-repo'));
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain('isolation breach: cat /work/escape');
   }, 120_000);
 
   it('fails the hostile-repository probe when secret content reaches the task filesystem', () => {
