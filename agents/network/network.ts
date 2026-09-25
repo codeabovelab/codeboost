@@ -18,6 +18,16 @@ interface NetworkIdentity { readonly allocationId: string; readonly imageId: str
   readonly subnet: string; readonly proxyIp: string;
   /** Daemon object IDs captured at creation; a same-named replacement has a different ID. */
   readonly networkId: string; readonly proxyId: string }
+export class VendorNetworkCreationCleanupError extends AggregateError {
+  readonly startupError: unknown;
+  readonly retryCleanup: () => void;
+
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void) {
+    super([startupError, cleanupError], 'Vendor network creation and cleanup failed.');
+    this.startupError = startupError;
+    this.retryCleanup = retryCleanup;
+  }
+}
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 const removedNetworks = new WeakSet<VendorNetwork>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
@@ -168,6 +178,24 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       throw error;
     }
   };
+  // The first cleanup shares the caller's overall deadline; a later retry gets its own budget. Killed
+  // creates get a settle window, bounded by whatever that budget has left.
+  const cleanupPlannedResources = (budget: () => number = deadline(30_000)) => {
+    let budgetLeft = 0;
+    try { budgetLeft = budget(); } catch { /* the budget is spent */ }
+    const settleBy = (object: string) => unsettled.has(object)
+      ? performance.now() + Math.min(CREATE_SETTLE_MS, budgetLeft) : 0;
+    const failures: unknown[] = [];
+    // Target the created IDs; names only for a create whose ID never came back, which alone gets a settle window.
+    const proxyTarget = proxyId ?? proxyContainer, networkTarget = networkId ?? name;
+    if (proxyPlanned) try { remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
+      budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer)); }
+    catch (cleanupError) { failures.push(cleanupError); }
+    if (networkPlanned) try { remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
+      budget, 'vendor network', allocationId, networkId ? 0 : settleBy(name)); }
+    catch (cleanupError) { failures.push(cleanupError); }
+    if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
+  };
   try {
     networkPlanned = true;
     networkId = createdId(create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
@@ -196,21 +224,10 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     remaining();
     return network;
   } catch (error) {
-    const failures: unknown[] = [];
-    // Killed creates get a settle window, but only inside the cleanup reserve of the caller's budget.
-    let reserveLeft = 0;
-    try { reserveLeft = overall(); } catch { /* the overall budget is spent */ }
-    const settleBy = (object: string) => unsettled.has(object)
-      ? performance.now() + Math.min(CREATE_SETTLE_MS, reserveLeft) : 0;
-    const cleanupBudget = overall;
-    const proxyTarget = proxyId ?? proxyContainer, networkTarget = networkId ?? name;
-    if (proxyPlanned) try { remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
-      cleanupBudget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer)); }
-    catch (cleanupError) { failures.push(cleanupError); }
-    if (networkPlanned) try { remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
-      cleanupBudget, 'vendor network', allocationId, networkId ? 0 : settleBy(name)); }
-    catch (cleanupError) { failures.push(cleanupError); }
-    if (failures.length) throw new AggregateError([error, ...failures], 'Vendor network creation and cleanup failed.');
+    try { cleanupPlannedResources(overall); }
+    catch (cleanupError) {
+      throw new VendorNetworkCreationCleanupError(error, cleanupError, () => cleanupPlannedResources());
+    }
     throw error;
   }
 }

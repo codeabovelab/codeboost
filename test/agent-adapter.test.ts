@@ -1,11 +1,19 @@
 import { describe, expect, it } from 'vitest';
-import { parseClaudeOutput } from '../agents/adapters/claude.ts';
-import { CODEX_OUTPUT_FILE } from '../agents/adapters/codex.ts';
-import { OUTPUT_LIMITS } from '../agents/adapters/supervisor.ts';
+import { parseClaudeOutput, startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { CODEX_OUTPUT_FILE, startCodexInvocation } from '../agents/adapters/codex.ts';
+import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { createCodexCommand, createPhasePolicy } from '../agents/policy.ts';
 
 describe('production agent adapters', () => {
+  const capturedInvocation = (attemptId: string, deadline: number, vendor: 'codex' | 'claude' = 'codex') =>
+    captureInvocation({
+      clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
+      phase: 'planning', vendor, approvedArgv: [], deadline, attemptId,
+      context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a',
+        referencedCodeHash: 'c', stateVersion: 1 },
+    }, deadline - 1);
+
   it('parses recorded Claude success and failure envelopes', () => {
     expect(parseClaudeOutput(Buffer.from('{"result":"planned","is_error":false}')))
       .toEqual({ text: 'planned', providerFailed: false });
@@ -31,5 +39,33 @@ describe('production agent adapters', () => {
     expect(OUTPUT_LIMITS).toEqual({ stdoutBytes: 16 * 1024 * 1024, stderrBytes: 4 * 1024 * 1024,
       combinedBytes: 20 * 1024 * 1024 });
     expect(Object.isFrozen(OUTPUT_LIMITS)).toBe(true);
+  });
+
+  it.each(['codex', 'claude'] as const)('rejects expired %s setup before allocating a network', vendor => {
+    const invocation = capturedInvocation(`expired-${vendor}`, Date.now() - 1, vendor);
+    const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused' };
+    const start = () => vendor === 'codex'
+      ? startCodexInvocation(request, '/unused/auth.json')
+      : startClaudeInvocation(request, 'token');
+    expect(start).toThrow('deadline expired during adapter setup');
+    expect(isInvocationActive(invocation.attemptId)).toBe(false);
+  });
+
+  it('retains setup cleanup ownership until a retry succeeds', async () => {
+    const invocation = capturedInvocation('setup-recovery', Date.now() + 60_000);
+    let attempts = 0;
+    const handle = retainSetupCleanup(invocation, () => {
+      attempts += 1;
+      if (attempts === 1) throw new Error('still busy');
+    }, new Error('startup failed'), new Error('cleanup failed'));
+    expect(isInvocationActive(invocation.attemptId)).toBe(true);
+    handle.cancel('cancelled');
+    expect(isInvocationActive(invocation.attemptId)).toBe(true);
+    handle.cancel('cancelled');
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stderr).toContain('setup cleanup remains unsettled');
+    expect(isInvocationActive(invocation.attemptId)).toBe(false);
   });
 });

@@ -95,17 +95,24 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
 /** Retain attempt ownership while retrying a network allocated before profile construction failed. */
 export function retainNetworkCleanup(invocation: InvocationInput, network: VendorNetwork,
   startupError: unknown, cleanupError: unknown): InvocationHandle {
+  return retainSetupCleanup(invocation, () => removeVendorNetwork(network), startupError, cleanupError,
+    'network cleanup');
+}
+
+/** Retain attempt ownership while retrying resources allocated during synchronous adapter setup. */
+export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: () => void,
+  startupError: unknown, cleanupError: unknown, kind = 'setup cleanup'): InvocationHandle {
   const register = !active.has(invocation.attemptId);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
   let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
-  const detail = `Adapter startup failed and network cleanup remains unsettled: ${String(startupError)}; ${String(cleanupError)}`;
+  const detail = `Adapter startup failed and ${kind} remains unsettled: ${String(startupError)}; ${String(cleanupError)}`;
   const retry = () => {
     if (cleaning || complete) return;
     cleaning = true;
     try {
-      removeVendorNetwork(network);
+      retryCleanup();
       if (timer) clearTimeout(timer);
       timer = undefined;
       complete = true;

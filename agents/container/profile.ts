@@ -34,6 +34,19 @@ export interface ProfileOptions {
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
   readonly deferredOutput?: boolean;
+  /** Remaining invocation budget for Docker-backed profile validation. */
+  readonly timeoutMs?: number;
+}
+
+export class ProfileCreationCleanupError extends AggregateError {
+  readonly startupError: unknown;
+  readonly retryCleanup: () => void;
+
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void) {
+    super([startupError, cleanupError], 'Profile creation and cleanup both failed.');
+    this.startupError = startupError;
+    this.retryCleanup = retryCleanup;
+  }
 }
 
 interface FileIdentity {
@@ -176,7 +189,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   assertTaskFilesystems(filesystems, invocation.clone);
   const invocationLeft = Math.floor(invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
-  assertVendorNetwork(options.network, invocation, undefined, Math.min(30_000, invocationLeft));
+  assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft));
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
   // Own the network from here on, so any later failure removes it rather than leaking it.
   claimedNetworks.add(options.network);
@@ -255,10 +268,14 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
-    const failures: unknown[] = [];
-    try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
-    try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
-    if (failures.length) throw new AggregateError([error, ...failures], 'Profile creation and cleanup both failed.');
+    const cleanupProfileResources = () => {
+      const failures: unknown[] = [];
+      try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
+      try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
+      if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
+    };
+    try { cleanupProfileResources(); }
+    catch (cleanupError) { throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources); }
     throw error;
   }
 }
