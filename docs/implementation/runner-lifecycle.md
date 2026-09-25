@@ -71,7 +71,8 @@ AGENTS.md requires these five holders to be treated separately. Each one has exa
 |---|---|---|---|
 | Durable records | Task rows, attempt rows, feedback events (SQLite through `runner/store.ts`) | `Store`. It is the only writer. | Never deleted by the lifecycle. Terminal rows stay as history. |
 | In-memory jobs | One `Job` per active attempt: attempt ID, handle, first reason, settlement promise | The runner coordinator (one instance per process) | After D's `settled` resolves **and** the terminal durable write has succeeded. If that write fails, the job becomes an unresolved marker (see "Slots and concurrency", rule 5) and is not removed. |
-| Agent containers and their processes | The agent container, capture processes, networks, task storage and their cleanup | D (the adapter behind `InvocationHandle`) | When `settled` resolves. F never signals or kills these directly. |
+| Agent containers and their processes | The agent container, capture processes, egress proxy and network, and their cleanup | D (the adapter behind `InvocationHandle`) | When `settled` resolves. F never signals or kills these directly. |
+| Task storage | The task-storage volumes and keeper container for one attempt | **F holds the capability** (`TaskFilesystems` from `prepareTaskFilesystems`, or a recovery handle); D implements the operations | It outlives `settled`. F releases it only by calling `removeTaskFilesystems`, after the partial-output export (or after recording that the export failed), and before the terminal write. D never removes it at settlement. |
 | Preparation subprocesses and files | Host-side work F runs before launch, such as `git clone`, and the attempt directory it fills | F (the job, then startup recovery) | When the process group has exited and the attempt directory has been captured and removed (see "Launch"). |
 | Admitted HTTP requests | Requests that have passed the token and admission checks | `web/server.ts` (`activeRequests`) | After the response ends, or after it is aborted during shutdown |
 | Rendered UI | What the browser shows, drafts, selections, the latest state version seen | `web/public/app.js` | It never owns durable truth. It shows server state and keeps unsent input. |
@@ -472,6 +473,7 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Recovered volume bound to its attempt (review round 20) | Crash with task storage for attempt A → restart → the handle's attempt and allocation IDs match A's row → export saved as A's `diagnostic_ref` → volumes removed; a volume whose labels match no row is reported and kept |
 | Unsafe parent before the lock (review round 20) | Parent writable by others and a lock file pre-created by another user → startup exits at step 0 without opening, removing or trusting that lock |
 | Expired and non-current after a crash (review round 20) | Budget passed and plan revision advanced, no reason recorded → restart → row `stale`, not `time-limit` |
+| Task storage outlives settlement (review round 21) | Writable attempt cancelled → `settled` → the volumes still exist → export runs → `removeTaskFilesystems` → terminal write; the order is asserted |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
