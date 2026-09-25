@@ -102,8 +102,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   for (const [name, value] of Object.entries(limits)) validLimit(value, name);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('Task filesystems require the immutable built image ID.');
   assertBuiltAgentImage(imageId);
-  assertTaskClone(clone);
-  const remaining = createDeadline(timeoutMs), staging = realpathSync(clone.directory);
+  const staging = assertTaskClone(clone), remaining = createDeadline(timeoutMs);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
   const allocationId = randomUUID();
@@ -125,16 +124,18 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
       'chown -R 10001:10001 /work /metadata'].join('; ');
     docker(['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
-      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=32', '--memory=128m', '--cpus=.25',
+      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=32', '--memory=128m', '--cpus=.25',
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--label', 'io.codeboost.task-storage=keeper', '--label', `io.codeboost.allocation=${allocationId}`,
       '--entrypoint', 'sleep', imageId, 'infinity'], remaining());
     docker(['run', '--rm', '--name', seeder, '--label', `io.codeboost.allocation=${allocationId}`,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
-      '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--pids-limit=32',
+      '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--entrypoint', 'sh', imageId, '-c', seed], remaining());
+    // Reject a staging directory swapped while the seeder was reading it.
+    assertTaskClone(clone);
     remaining();
     const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
     allocations.set(filesystems, Object.freeze({ allocationId,

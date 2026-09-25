@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -283,6 +283,32 @@ describe('real Docker agent isolation', () => {
     try { expect(() => createValidatedContainer(unsettled, 1_000)).toThrow('cleanup did not settle'); }
     finally { process.env.PATH = path; }
     expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
+  }, 60_000);
+
+  it('refuses to seed a clone whose staging directory was replaced after creation', () => {
+    const data = fixture();
+    const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-2',
+      head: git(data.source, 'rev-parse', 'HEAD') });
+    renameSync(clone.directory, `${clone.directory}-original`);
+    mkdirSync(clone.directory); git(clone.directory, 'init');
+    expect(() => prepareTaskFilesystems(clone, {
+      workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
+    }, imageId)).toThrow('replaced after it was created');
+  }, 60_000);
+
+  it('rejects a container that relies on the daemon default seccomp profile', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    docker(...valid.args.filter(arg => arg !== '--security-opt=seccomp=builtin')); containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+  }, 60_000);
+
+  it('startup probe refuses to exec when seccomp filtering is disabled', () => {
+    const result = spawnSync('docker', ['run', '--rm', '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
+      '--security-opt=no-new-privileges', '--security-opt=seccomp=unconfined', '--network=none', imageId, 'true'],
+      { encoding: 'utf8', timeout: 60_000 });
+    expect(result.status).toBe(78);
+    expect(result.stderr).toContain('seccomp syscall filter must be enforced');
   }, 60_000);
 
   it('refuses a Codex auth path that is a link without resolving it', () => {

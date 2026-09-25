@@ -4,10 +4,25 @@ import { lstatSync, mkdtempSync, opendirSync, realpathSync, rmSync } from 'node:
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { TaskClone } from '../agents/contract.ts';
 
-const trustedClones = new WeakSet<TaskClone>();
+interface DirectoryIdentity { readonly dev: number; readonly ino: number }
+interface CloneIdentity { readonly directory: string; readonly root: DirectoryIdentity; readonly metadata: DirectoryIdentity }
+const trustedClones = new WeakMap<TaskClone, CloneIdentity>();
+const directoryIdentity = (path: string): DirectoryIdentity | undefined => {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  return stat?.isDirectory() && !stat.isSymbolicLink() ? { dev: stat.dev, ino: stat.ino } : undefined;
+};
+const sameDirectory = (actual: DirectoryIdentity | undefined, expected: DirectoryIdentity) =>
+  actual?.dev === expected.dev && actual.ino === expected.ino;
 
-export function assertTaskClone(clone: TaskClone): void {
-  if (!trustedClones.has(clone)) throw new Error('Task clone was not created by the trusted clone builder.');
+/** Authenticate a clone and prove its staging directory is still the one the builder created. */
+export function assertTaskClone(clone: TaskClone): string {
+  const identity = trustedClones.get(clone);
+  if (!identity) throw new Error('Task clone was not created by the trusted clone builder.');
+  if (!sameDirectory(directoryIdentity(identity.directory), identity.root)
+    || !sameDirectory(directoryIdentity(join(identity.directory, '.git')), identity.metadata)
+    || realpathSync(identity.directory) !== identity.directory)
+    throw new Error('Task clone directory was replaced after it was created.');
+  return identity.directory;
 }
 
 /**
@@ -86,7 +101,9 @@ export function createTaskClone(options: {
     run(directory, 'checkout', '--detach', options.head);
     if (run(directory, 'rev-parse', 'HEAD') !== options.head) throw new Error('Task head changed during clone.');
     const clone = Object.freeze({ id: randomUUID(), taskId: options.taskId, directory, head: options.head });
-    trustedClones.add(clone);
+    const root = directoryIdentity(directory), cloneMetadata = directoryIdentity(metadata);
+    if (!root || !cloneMetadata) throw new Error('Task clone directory is not a real directory.');
+    trustedClones.set(clone, Object.freeze({ directory: realpathSync(directory), root, metadata: cloneMetadata }));
     return clone;
   } catch (error) {
     rmSync(directory, { recursive: true, force: true });

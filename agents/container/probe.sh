@@ -22,6 +22,7 @@ for field in CapInh CapPrm CapEff CapBnd CapAmb; do
     || fail 'all capability sets must be empty'
 done
 [ "$(awk '/^NoNewPrivs:/ { print $2 }' /proc/self/status)" = '1' ] || fail 'no-new-privileges must be enabled'
+[ "$(awk '/^Seccomp:/ { print $2 }' /proc/self/status)" = '2' ] || fail 'a seccomp syscall filter must be enforced'
 require_option / ro
 
 [ "${HOME:-}" = '/home/codeboost' ] || fail 'HOME must be the isolated home directory'

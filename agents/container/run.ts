@@ -31,8 +31,10 @@ const createDeadline = (timeoutMs: number) => {
     return value;
   };
 };
-const exactNoNewPrivileges = (options: string[] | null | undefined) => options?.length === 1
-  && (options[0] === 'no-new-privileges' || options[0] === 'no-new-privileges:true');
+// Only no-new-privileges plus Docker's builtin seccomp profile; the daemon default may be unconfined.
+const exactSecurityOptions = (options: string[] | null | undefined) => options?.length === 2
+  && options.some(option => option === 'no-new-privileges' || option === 'no-new-privileges:true')
+  && options.includes('seccomp=builtin');
 export const hasExactOptions = (value: string | undefined, expected: readonly string[]) => {
   const parts = value?.split(',') ?? [];
   return parts.length === expected.length && new Set(parts).size === parts.length
@@ -128,7 +130,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || inspect.Config.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
-    || !exactNoNewPrivileges(host.SecurityOpt)
+    || !exactSecurityOptions(host.SecurityOpt)
     || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
     || host.UTSMode !== '' || host.UsernsMode !== '' || host.CgroupnsMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
@@ -199,7 +201,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
-    || !exactNoNewPrivileges(keeper.HostConfig.SecurityOpt)
+    || !exactSecurityOptions(keeper.HostConfig.SecurityOpt)
     || keeperVolumes.get('/work')?.Name !== profile.filesystems.workVolume
     || keeperVolumes.get('/metadata')?.Name !== profile.filesystems.metadataVolume)
     throw new Error('Task filesystems must remain owned by their trusted keeper.');
