@@ -242,7 +242,6 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   };
   try {
     createValidatedContainer(profile, remaining(), options.secrets ?? {});
-    validateContainer(profile.name, profile, remaining());
   } catch (error) {
     try { disposeValidatedContainer(profile); }
     catch (cleanupError) {
@@ -260,6 +259,15 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   let decodeAbort: AbortController | undefined;
   let protocolToken: string | undefined, protocolStarted = false, protocolReady = false;
   let protocolBuffer = Buffer.alloc(0);
+  try { validateContainer(profile.name, profile, remaining()); }
+  catch (error) {
+    try { disposeValidatedContainer(profile); }
+    catch (cleanupError) {
+      const detail = `Final container validation failed and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`;
+      return retainCleanupOwnership(profile, detail);
+    }
+    throw error;
+  }
   const child = spawn('docker', ['start', '--attach', profile.name], {
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
   });
