@@ -1,5 +1,5 @@
 import type { InvocationInput, Phase } from './contract.ts';
-import { permitsCommand } from './contract.ts';
+import { assertCapturedInvocation, permitsCommand } from './contract.ts';
 
 export type AgentTool = 'read' | 'list' | 'search' | 'write' | 'edit' | 'runner-command';
 export interface PhasePolicy {
@@ -30,6 +30,8 @@ export function assertAgentCommand(value: AgentCommand, policy: PhasePolicy,
 }
 
 export function createPhasePolicy(invocation: InvocationInput): PhasePolicy {
+  // Tools and the command allowlist come from the phase, so only a captured request may define them.
+  assertCapturedInvocation(invocation);
   const writable = invocation.phase === 'execute' || invocation.phase === 'fix';
   const tools: AgentTool[] = ['read', 'list', 'search'];
   if (invocation.phase === 'review' || writable) tools.push('runner-command');

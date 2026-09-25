@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import type { InvocationInput } from '../contract.ts';
+import { assertCapturedInvocation, type InvocationInput } from '../contract.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 
 export const VENDOR_HOSTS = Object.freeze({
@@ -118,6 +118,7 @@ export function assertVendorNetwork(network: VendorNetwork, invocation?: Invocat
 
 export function createVendorNetwork(invocation: InvocationInput, imageId: string,
   timeoutMs = 60_000): VendorNetwork {
+  assertCapturedInvocation(invocation);
   assertBuiltAgentImage(imageId);
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.

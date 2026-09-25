@@ -12,6 +12,10 @@ const request = (phase: Phase, vendor: 'claude' | 'codex' = 'claude'): Invocatio
 }, 1000);
 
 describe('agent phase policy', () => {
+  it('refuses to build a policy from a request that was not captured', () => {
+    const forged = { ...request('review'), phase: 'execute' as Phase, approvedArgv: [['sh', '-c', 'anything']] };
+    expect(() => createPhasePolicy(forged)).toThrow('captured');
+  });
   it.each(['planning', 'questions'] as const)('%s exposes only non-mutating built-in tools', phase => {
     const policy = createPhasePolicy(request(phase));
     expect(policy).toMatchObject({ phase, worktree: 'read-only', tools: ['read', 'list', 'search'], web: false, mcp: false });
