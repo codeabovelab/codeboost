@@ -100,6 +100,8 @@ describe('isolation gate detects breaches', () => {
       linked + probeScript('execute', 'hostile-repo'));
     expect(result.status, result.stderr).not.toBe(0);
     expect(result.stderr).toContain('isolation breach: cat /work/escape');
+    // The probe reports only its fixed diagnostic; the readable target's contents never reach the output.
+    expect(result.stdout).toBe('');
   }, 120_000);
 
   it('fails the hostile-repository probe when secret content reaches the task filesystem', () => {

@@ -97,8 +97,9 @@ export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' |
   | 'hostile-repo';
 
 // `set -e` ignores a failing `! command`, so a negated check could never fail a probe. `deny` exits instead when a
-// forbidden action succeeds, and names the breach.
-const deny = 'deny() { if "$@" 2>/dev/null; then echo "isolation breach: $*" >&2; exit 1; fi; }; ';
+// forbidden action succeeds, and names the breach. Both streams of the attempted command are discarded, so a breach
+// that succeeds (such as reading a host file) cannot copy its data into the invocation output.
+const deny = 'deny() { if "$@" >/dev/null 2>&1; then echo "isolation breach: $*" >&2; exit 1; fi; }; ';
 // Fill a scratch directory past its byte and inode limits. Each fill must stop early, and must have written first, so
 // an unwritable or missing directory fails the probe instead of passing it vacuously.
 const scratchBounded = (directory: string, megabytes: number, files: number) =>
