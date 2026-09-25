@@ -32,7 +32,7 @@
 
 | Term | Meaning in this document |
 |---|---|
-| Task | One run of one GitHub issue through its plan, from start to merge or cancel. |
+| Task | One run of one GitHub issue through its plan, from start to merge or cancel. A task is identified by its full `PlanIdentity` (`repositoryId`, `taskId`, `planId`, from `core/identity.ts`), stored as its `identityKey` (the plan key). A bare `taskId` is never used alone, because it is unique only inside its repository and plan. |
 | Attempt | One agent invocation or one runner command for a task. Has a unique `attemptId`. |
 | Phase | D's invocation profile, from the closed `Phase` union in `agents/contract.ts`: `planning`, `questions`, `review`, `execute`, `fix`. `captureInvocation` rejects any other value. |
 | Attempt kind | F's own label for an attempt, stored on the attempt row. Each kind runs under exactly one D phase (see the table below). |
@@ -189,12 +189,14 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 | 1 | Set `stopping` on the server and `closing` on every coordinator (runner, questions, suggestions, merge), in the same synchronous turn, before any active-work list is copied. New API requests get HTTP 503. Every coordinator's start method checks `closing` synchronously and throws, so a request admitted before shutdown cannot start new work after it. | server flag: yes. Coordinator barrier: **new**. Today `close()` sets only `stopping`, and `questions.close()` runs later, so a request that was still reading its body can call `questions.start()` after shutdown began. F1 fixes this and adds a regression for it. |
 | 2 | Stop accepting connections, and wait for admitted requests up to the drain limit (at most 14.5 s, below the 15 s request timeout). | yes |
 | 3 | After the drain limit, abort the signals of the remaining requests, destroy requests that are still reading a body, then await request-owned work (the merge coordinator). | yes |
-| 4 | Record the first reason `shutdown` on every running attempt, call `cancel('shutdown')`, then await every `settled`. D guarantees that settlement ends by escalating to a forced kill. F does not abandon a job after a timer. | new |
+| 4 | Record the first reason `shutdown` on every running attempt, call `cancel('shutdown')`, then await every `settled`. F does not abandon a job after a timer (decision 4). **This is not yet guaranteed to end:** D4's supervisor escalates to a forced kill, but it retries unfinished container, network or setup cleanup every second with no limit (`agents/adapters/supervisor.ts`). If Docker is unreachable, `settled` never resolves and shutdown waits with the `Store` open. See the prerequisite below. | new |
 | 5 | Write the terminal states for the attempts from step 4. | new |
 | 6 | Await server closure; await the question and suggestion coordinators' `close()`. | yes (questions); suggestions: new wiring |
 | 7 | Close the `Store`. | yes |
 
 **Process shutdown is a hard stop.** When the process stops, the running task does not finish. Its attempt ends `cancelled` with the reason "Stopped by shutdown". Restart recovery (lane I3) puts the task back in the queue. This is different from "Stop the queue" (lane I), which lets the running task finish.
+
+**Prerequisite before F1 merges.** Settlement must be proven to end. D5, or a D follow-up, must either bound cleanup retries and settle with a terminal cleanup-failure result, or show in the real-Docker suite that every cleanup path ends, including when the Docker daemon is unreachable. Until one of these lands, decision 4 stays conditional, and the F1 implementation PR must not merge. F1 does not add its own timer to work around this.
 
 **A second Ctrl+C** does not skip steps 4 to 7. The CLI prints "Still stopping agents…" and keeps waiting.
 
@@ -214,7 +216,7 @@ This runs before the coordinator opens.
 
 **Status reads.** `GET /api/runner` returns only the task and attempt rows plus `stateVersion` and `retryable`. It does not rebuild Git history or the full review.
 
-**User actions.** Cancel, retry and "run again" requests send `taskId`, `attemptId` and `expectedStateVersion`. A mismatch returns HTTP 409 with the current state. The UI then shows that state and keeps any draft.
+**User actions.** Cancel, retry and "run again" requests send `attemptId` and `expectedStateVersion`. The server takes the plan identity from its trusted configuration, never from the request, and every `Store` call is scoped by that identity. A mismatch returns HTTP 409 with the current state. The UI then shows that state and keeps any draft.
 
 **UI rules** (from AGENTS.md "Async review UI"):
 
@@ -252,17 +254,17 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 | `segment-assign` | Assigning a segment to a plan item | choice key |
 | `finding-accept` | Marking an open problem "accepted" | finding ID |
 | `needs-human-guidance` | Guidance added when sending a needs-human task back | note ID |
-| `task-closed` | Task merged, cancelled or rejected | task ID |
+| `task-closed` | Task merged, cancelled or rejected | plan key |
 
-**Fields:** `id`, `taskId`, `repository`, `planKey`, `planRevision`, `snapshotId`, `item` (or null), `kind`, `text` (user text only, 4000 characters or fewer, or null), `sourceRef`, `supersedes` (or null), `createdAt`.
+**Fields:** `id`, `planKey` (the task's full identity), `planRevision`, `snapshotId`, `item` (or null), `kind`, `text` (user text only, 4000 characters or fewer, or null), `sourceRef`, `supersedes` (or null), `createdAt`.
 
 **Rules:**
 
 1. **Local actions.** Write the event in the same `Store` transaction as the user action. There is never an event without its action, or an action without its event.
 2. **External actions.** A GitHub merge cannot share a SQLite transaction. For a merge, write `task-closed` in the same transaction as the durable record of the **confirmed** outcome (`finishMergeAttempt` with state `merged`). Never write it when the merge is submitted, queued or ambiguous. Startup recovery also runs a reconciliation step: for every task whose confirmed terminal record exists without a `task-closed` event, insert that event. The uniqueness rule below makes this safe to repeat.
 3. Events are append-only. If a choice changes later, write a new event with `supersedes` set to the earlier event. J uses the newest event for each `sourceRef`.
-4. Replaying the same action or reconciliation does not duplicate an event. `(planKey, taskId, kind, sourceRef, planRevision)` is unique. Note, choice and task IDs are only unique inside their plan and task, so the key must include both.
-5. J reads events only through `Store.feedbackEvents(taskId)`, and only after that task's `task-closed` event exists.
+4. Replaying the same action or reconciliation does not duplicate an event. `(planKey, kind, sourceRef, planRevision)` is unique. Note and choice IDs are only unique inside their plan identity, so the key must include the full plan key.
+5. J reads events only through `Store.feedbackEvents(identity: PlanIdentity)`, which scopes every row by `identityKey(identity)`, and only after that task's `task-closed` event exists.
 
 ## Proposed storage additions
 
@@ -270,9 +272,9 @@ This is the smallest schema that holds the contract. The F1 implementation PR se
 
 | Table | Key columns |
 |---|---|
-| `tasks` | `id`, `plan_key`, `status`, `state_version`, `context_generation`, `current_attempt_id`, `created_at`, `updated_at` |
-| `attempts` | `id`, `task_id`, `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `diagnostic` (bounded), `created_at`, `started_at`, `settled_at` |
-| `feedback_events` | the fields listed above, with a unique index on `(plan_key, task_id, kind, source_ref, plan_revision)` |
+| `tasks` | `plan_key` (primary key), `status`, `state_version`, `context_generation`, `current_attempt_id`, `created_at`, `updated_at` |
+| `attempts` | `id`, `plan_key`, `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `diagnostic` (bounded), `created_at`, `started_at`, `settled_at` |
+| `feedback_events` | the fields listed above, with a unique index on `(plan_key, kind, source_ref, plan_revision)` |
 
 `tasks.status` holds the product states from the design (queued, running, needs human, needs amendment, needs approval, possibly already fixed, in review, approved but merge blocked, merged, cancelled). F1 defines the list and its invariants. F2 adds the per-item transitions. I1 adds queue admission and scheduling.
 
@@ -304,7 +306,7 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Attempt's own transitions, then publish (review round 2) | Admit → `pending` → `running` (the state version rises each time) → with no context change, a valid result publishes `completed`; the context generation is unchanged |
 | Two admissions race for one slot (review round 2) | Two admissions in the same tick for different tasks with one free slot → exactly one reserves and saves `pending`; a refused `Store` transaction releases its reservation |
 | Second process starts (review round 2) | Runner A holds the lock → process B exits before opening the `Store`; no migration or history write occurs |
-| Two plans emit the same source ID (review round 2) | Two tasks in different plans both record `task-closed` with source `task-1` at revision 1 → both events are saved |
+| Two plans emit the same source ID (review round 2) | Two plan identities with the same `taskId` in different repositories both record `task-closed` at revision 1 → both events are saved, and `feedbackEvents` for each identity returns only its own |
 | Stop before launch, and launch error (review round 3) | (a) Stop while the clone is being prepared → preparation settles and is removed → row `cancelled` → slot freed → next task admitted. (b) D start throws → row `failed` with the launch error → slot freed. (c) The `pending → running` write fails → slot and marker remain until restart |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
@@ -317,7 +319,7 @@ The user approved the proposal for each of these four questions.
 | 1 | How is one runner per database enforced across processes? | An exclusive lock file next to the database, holding the process ID and the process start time. | Take the lock at startup and release it at the end of shutdown. Accept a leftover lock file only if no live process has that ID and start time. Do not use a SQLite lease row, because lease expiry could release a live runner. |
 | 2 | Does E3 keep writing `cancelled` before the provider settles? | Yes. This exception applies only to read-only phases. | Leave E3 unchanged. New F records use "terminal only after settlement" for every phase. Revisit this when G4 wires the planning endpoints. |
 | 3 | Is process shutdown a hard stop? | Yes. | Stopping the process cancels the running task with the reason "Stopped by shutdown". It does not wait for the task to finish. Restart recovery requeues the task. |
-| 4 | Does F set its own time limit on settlement at shutdown? | No. F waits for D's forced-kill escalation. | Do not abandon a job after a timer. The D5 real-Docker suite must prove that settlement always ends, including for a child process that ignores SIGTERM. If D5 cannot prove this, reopen this decision before F1 merges. |
+| 4 | Does F set its own time limit on settlement at shutdown? | No. F waits for D's forced-kill escalation. | Do not abandon a job after a timer. The D5 real-Docker suite must prove that settlement always ends, including for a child process that ignores SIGTERM. D4 does not yet prove it: its cleanup retries have no limit (see the prerequisite under "Shutdown"). If D5 cannot prove it, reopen this decision before F1 merges. |
 
 ## Out of scope for F1
 
