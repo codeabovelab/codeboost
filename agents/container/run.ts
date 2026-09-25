@@ -65,16 +65,15 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
     if (before.status === 0) break;
     const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
     if (!missing) throw new Error('Failed to establish ownership of the agent container; staged credentials were retained.');
-    // A killed create may still land in the daemon; absence only counts once its settle window has passed. Only the
-    // create path waits here; later cleanup (such as a supervisor recovery) reports "not settled" and retries later.
-    const settled = performance.now() >= settleUntil;
-    if (settled && !(waitForSettle && settleUntil)) {
+    // A killed create may still land in the daemon; absence only counts once its settle window has passed, on every
+    // path. Only the create path waits here; later cleanup (such as a supervisor recovery) reports "not settled"
+    // inside the window and retries later.
+    if (performance.now() >= settleUntil) {
       unsettledCreates.delete(profile);
       disposeContainerProfile(profile);
       return;
     }
-    if (settled || !waitForSettle)
-      throw new Error('Agent container creation did not settle; staged credentials were retained.');
+    if (!waitForSettle) throw new Error('Agent container creation did not settle; staged credentials were retained.');
     sleep(250);
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as { Config?: { Labels?: Record<string, string> } } | undefined;

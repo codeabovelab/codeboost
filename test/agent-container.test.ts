@@ -279,7 +279,7 @@ describe('real Docker agent isolation', () => {
     docker('rm', '--force', first.name); containers.delete(first.name);
   }, 60_000);
 
-  it('retains credentials when a killed create cannot be proven absent', () => {
+  it('releases a killed create once its settle window passes with no container', () => {
     const data = fixture(), unsettled = profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -288,9 +288,13 @@ describe('real Docker agent isolation', () => {
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    try { expect(() => createValidatedContainer(unsettled, 1_000)).toThrow('cleanup did not settle'); }
+    const started = performance.now();
+    // The create path waits out the settle window, then treats absence as settled and releases the profile.
+    try { expect(() => createValidatedContainer(unsettled, 3_000)).toThrow('ETIMEDOUT'); }
     finally { process.env.PATH = path; }
-    expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
+    expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
+    expect(isContainerProfileAuthentic(unsettled)).toBe(false);
+    expect(existsSync(unsettled.codexAuthFile!)).toBe(false);
   }, 60_000);
 
   it('keeps a killed create unsettled for later cleanup until its settle window passes', () => {
