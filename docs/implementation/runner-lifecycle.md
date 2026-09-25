@@ -16,7 +16,7 @@
 - the order of steps when the program shuts down;
 - the feedback events that the learning lane (J) will read.
 
-**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The contract uses only the D interface that is already on `main` (`agents/contract.ts`). D4 (#47) merged without changing that interface. D5 changes this contract only if it changes that interface.
+**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The attempt lifecycle itself uses only the D interface already on `main` (`agents/contract.ts`), which D4 (#47) did not change. Startup recovery and shutdown need three D changes that do **not** exist yet: bounded settlement, a `runnerOwner` field on `InvocationInput`, and a scoped `recoverLeftovers` API. They are listed as prerequisites under "Shutdown". The F1 implementation may start against fakes, but it must not merge until D delivers them.
 
 ## Summary
 
@@ -25,7 +25,7 @@
 3. For attempts that can write to the task folder, the durable record becomes terminal only after the container has stopped. "Cancel" first records the reason and shows "Stopping". It does not free anything.
 4. A result is saved only if a compare-and-swap succeeds: the attempt ID must still be the task's current attempt, and the captured context (including the context generation) must still be current. Late results are thrown away, but their container must still stop before its slot is freed.
 5. Retry is allowed only when the last attempt is terminal on disk, nothing for that task is still running in this process, and its captured context still matches the current code, plan and assignment. Otherwise the user must start a new request.
-6. Shutdown order: reject new work → drain HTTP requests (with a time limit) → abort and await request-owned work → cancel and await runner jobs → write terminal states → close storage.
+6. Shutdown order: reject new work → drain HTTP requests (with a time limit) → abort and await request-owned work → cancel and await runner jobs → write terminal states → close storage → release the runner lock.
 7. Each piece of user feedback becomes one append-only **feedback event**, written in the same transaction as the user action, or, for a merge, in the same transaction as the confirmed outcome. Lane J reads these events after a task closes.
 
 ## Terms used
@@ -39,10 +39,10 @@
 | Writable attempt | An attempt whose D phase is `execute` or `fix`. It can change the task folder. |
 | Captured context | The `InvocationContext` saved when an attempt is admitted: snapshot ID, plan ID, plan revision, assignment ID, referenced-code hash, and the task's context generation (sent in D's `stateVersion` field). |
 | State version | A number stored on each task. It goes up by one on every durable change to the task or its attempts, including an attempt's own lifecycle changes. The UI and user actions use it for ordering and compare-and-swap. It is **not** part of the captured context. |
-| Context generation | A second number stored on each task. It goes up only when something an attempt depends on changes: the plan revision, the snapshot, the assignment or the referenced code. Attempt lifecycle changes never increase it. F puts it in `InvocationContext.stateVersion`. |
+| Context generation | A second number stored on each task. It goes up only when something an attempt depends on changes: the plan revision, the snapshot, the assignment or the referenced code. Every such change also increases the state version in the same transaction, so UI ordering and user-action checks see it too. Attempt lifecycle changes increase only the state version, never the context generation. F puts it in `InvocationContext.stateVersion`. |
 | Current | A captured context is current when its snapshot ID, plan ID, plan revision, assignment ID, referenced-code hash and context generation all match the task's present durable values. An attempt's own transitions therefore never make it non-current. |
 | Settled | D's `InvocationHandle.settled` promise has resolved. The container and its output capture have stopped. |
-| First reason | The first stop reason recorded for an attempt. Later reasons never replace it. |
+| First reason | The first stop reason recorded for an attempt: `cancelled`, `shutdown`, `stale` or `time-limit`. Later reasons never replace it. |
 | Slot | The in-memory right to run an attempt. A limited number of slots exist. |
 | Admission | The point where the runner accepts new work and writes the pending attempt. |
 | Feedback event | An append-only record of one piece of feedback that the user wrote or chose. |
@@ -97,11 +97,13 @@ Any change not in this table is illegal. The `Store` refuses it.
 | From | To | Trigger | Guard |
 |---|---|---|---|
 | — | `pending` | Admission | In memory, first: coordinator is `open`, no job or unresolved marker for the task, and a slot is free; then reserve the slot. In one `Store` transaction: task state version equals the caller's expected version; no non-terminal attempt exists for the task; captured context is current. |
-| `pending` | `running` | D returns a handle | Attempt ID is the task's current attempt; state is `pending` |
-| `pending` | `cancelled` / `stale` / `failed` | Stop before launch, context change, or launch error (see "Launch" below) | Same attempt ID; state is `pending` |
+| `pending` | `running` | D returns a handle | Attempt ID is the task's current attempt; state is `pending`. The launch check (see "Launch") ran immediately before the D start call. |
+| `pending` | `cancelled` | Stop before or during launch | Same attempt ID; state is `pending`; first reason is `cancelled`, `shutdown` or `time-limit` |
+| `pending` | `stale` | Context changed before launch | Same attempt ID; state is `pending`; first reason is `stale`, or no first reason and the context is no longer current |
+| `pending` | `failed` | Preparation or launch error | Same attempt ID; state is `pending`; **no first reason recorded** |
 | `running` | `completed` | Validated result | Attempt ID is current; state is `running`; no first reason recorded; captured context still current |
 | `running` | `failed` | Settled with an error or invalid output | Attempt ID is current; state is `running`; **no first reason recorded** |
-| `running` | `cancelled` | Settled after a user, hard-stop or shutdown reason | Attempt ID is current; state is `running`; first reason is `cancelled` or `shutdown` |
+| `running` | `cancelled` | Settled after a user, hard-stop, shutdown or time-limit reason | Attempt ID is current; state is `running`; first reason is `cancelled`, `shutdown` or `time-limit` |
 | `running` | `stale` | Settled after the context changed | Attempt ID is current; state is `running`; first reason is `stale`, **or** no first reason is recorded and the context is no longer current (a change made by another transaction that the runner had not yet seen) |
 | `pending` or `running` | terminal state from the first reason, or `failed` if there is none | Startup recovery (the previous process died). Uses the same first-reason mapping as settlement. | Runs before admission opens, after D's recovery has removed leftover containers |
 
@@ -124,9 +126,11 @@ A `pending` attempt has no `settled` promise, so the slot rules need a separate 
 |---|---|---|
 | Preparation fails before the D start call (for example the clone fails) | Preparation has already stopped its own subprocesses before rejecting (rule above). Remove anything it created. Write the terminal state from the first reason if one is recorded; otherwise write `failed` with the bounded preparation error. | After that terminal write succeeds |
 | Stop or context change before the D start call | Record the first reason. Await the preparation promise and remove anything it created. Then write the terminal state (`cancelled` or `stale`). | After that terminal write succeeds |
-| The D start call throws | Write `failed` with the launch error. D4's adapters throw only after their setup cleanup has succeeded. If cleanup is still unfinished, they return a handle instead, which settles when cleanup ends. So nothing is left running. | After that terminal write succeeds |
+| The D start call throws | Write the terminal state from the first reason if one is recorded (a stop can be recorded while preparation is finishing); otherwise write `failed` with the launch error. D4's adapters throw only after their setup cleanup has succeeded. If cleanup is still unfinished, they return a handle instead, which settles when cleanup ends. So nothing is left running. | After that terminal write succeeds |
 | The D start call returns a handle | Write `pending → running`. From here the running-state rules apply, even if the handle comes from failed setup that is still cleaning up. | After `settled` resolves and the terminal write succeeds |
 | The handle arrives but the `pending → running` write fails | Keep the job with its handle, call `handle.cancel('capture-failure')`, and await `settled`. Then keep an unresolved marker for the task, because the row is still `pending`. | Only at startup recovery |
+
+**Launch check.** Immediately before the D start call, in one synchronous turn with no await between them, F reads the task and plan rows (the `Store` is synchronous) and confirms that the attempt is still `pending`, has no first reason, and has a current captured context. Only then does it call D's start, which is also synchronous. If the context is no longer current, F takes `pending → stale` without launching. A writable invocation therefore never starts against an old plan, snapshot, assignment or referenced code. The later publish check cannot undo filesystem changes.
 
 In every case, a failed terminal write leaves an unresolved marker (see "Slots and concurrency", rule 5).
 
@@ -134,7 +138,9 @@ In every case, a failed terminal write leaves an unresolved marker (see "Slots a
 
 ### Rules for the running state
 
-1. **Stop requests do not end the attempt.** A cancel, hard stop, shutdown or detected staleness writes the first reason onto the `running` row and calls `handle.cancel(...)`. The row stays `running`, and the UI shows "Stopping".
+1. **Stop requests do not end the attempt.** A cancel, hard stop, shutdown, time limit or detected staleness sets the first reason on the in-memory job, writes it onto the row, and calls `handle.cancel(...)`. The row stays `running`, and the UI shows "Stopping".
+
+   **The in-memory job is the source of the first reason until the terminal write.** The terminal write stores the job's first reason and the terminal state together in one transaction. So if the earlier reason write fails, nothing is lost while the process lives, and the UI shows "Stopping (not saved yet)". If that terminal write also fails, the unresolved marker keeps the reason in memory. The one case that loses it is a crash after a failed reason write and before a successful terminal write. Startup recovery then records `failed` "Interrupted" and adds "a stop may have been requested" to the diagnostic. It cannot recover a reason that was never saved.
 2. **The terminal state comes from the first reason.** When `settled` resolves, the terminal state is chosen in this order:
 
    | First reason recorded by F | D result | Terminal state |
@@ -142,13 +148,14 @@ In every case, a failed terminal write leaves an unresolved marker (see "Slots a
    | `cancelled` (user or hard stop) | any | `cancelled` |
    | `shutdown` | any | `cancelled`, with the reason "Stopped by shutdown" |
    | `stale` (context change) | any | `stale`, with the cause (for example "plan revision 4 replaced 3") |
+   | `time-limit` | any | `cancelled`, reason "Task time limit reached"; the same transaction sets the task's status to `needs human` |
    | none | `stopReason` `timeout` | `failed`, reason "Timed out after *n* minutes" |
    | none | `stopReason` `output-limit` or `capture-failure` | `failed`, with D's bounded diagnostic |
    | none | exit 0 and output passes validation | `completed` (if the compare-and-swap succeeds) |
    | none | anything else | `failed`, with the bounded exit and stderr summary |
 
 3. **F keeps its own reason.** D's `StopReason` has no `stale` value. F passes `cancelled` to D for staleness, and keeps the real cause in its own first-reason field. No layer may replace an actionable reason with generic cancellation text.
-4. **Timeouts are D's job.** F sets `deadline` in `InvocationInput` and does not run a second timer that settles early. F also enforces a whole-task time budget (default 2 hours). When the budget runs out, F follows rule 1: it records the first reason `cancelled` ("Task time limit reached") on the `running` row and calls `handle.cancel('timeout')`. The row stays `running` and the slot stays held. Only after `settled` resolves does F write terminal `cancelled` and move the task to needs human.
+4. **Timeouts are D's job.** F sets `deadline` in `InvocationInput` and does not run a second timer that settles early. F also enforces a whole-task time budget (default 2 hours). When the budget runs out, F follows rule 1: it records the first reason `time-limit` and calls `handle.cancel('timeout')`. The row stays `running` and the slot stays held. After `settled` resolves, one transaction writes terminal `cancelled` and sets the task to `needs human`. Startup recovery applies the same mapping, so a crash before settlement still ends in `needs human`, and the retry guard refuses it.
 5. **Late results lose.** If the compare-and-swap for `completed` fails, the result is discarded and the row is settled by the table above. Discarded output still waits for `settled` before its slot is freed.
 
 ### Exception for existing read-only lifecycles
@@ -196,14 +203,22 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 | Step | Action | Existing? |
 |---|---|---|
-| 1 | Set `stopping` on the server and `closing` on every coordinator (runner, questions, suggestions, merge), in the same synchronous turn, before any active-work list is copied. New API requests get HTTP 503. Every coordinator's start method checks `closing` synchronously and throws, so a request admitted before shutdown cannot start new work after it. | server flag: yes. Coordinator barrier: **new**. Today `close()` sets only `stopping`, and `questions.close()` runs later, so a request that was still reading its body can call `questions.start()` after shutdown began. F1 fixes this and adds a regression for it. |
+| 1 | Set `stopping` on the server and `closing` on every coordinator (runner, questions, suggestions, merge), in the same synchronous turn, before any active-work list is copied. New API requests get HTTP 503. Every coordinator's start method checks `closing` synchronously and throws, so a request admitted before shutdown cannot start new work after it. | server flag: yes. Coordinator barrier: **new**. Today `close()` sets only `stopping`, and `questions.close()` runs later, so a request that was still reading its body can call `questions.start()` after shutdown began. The server also rechecks `stopping` after reading a body only for `merge`, so `service.act`, `setQuestionProvider` and future planning writers can still change the `Store`. F1 adds a `stopping` check after the body is read and before **every** mutating dispatch, returning HTTP 503, and adds regressions for each writer. |
 | 2 | Stop accepting connections, and wait for admitted requests up to the drain limit (at most 14.5 s, below the 15 s request timeout). | yes |
 | 3 | After the drain limit, abort the signals of the remaining requests, destroy requests that are still reading a body, then await request-owned work (the merge coordinator). | yes |
-| 4 | Record the first reason `shutdown` on every `pending` and `running` attempt that has an in-memory job. For `running`, call `cancel('shutdown')` and await `settled`. For `pending`, await its preparation promise (and the D start call if it is in progress), remove what preparation created, and cancel any handle that start returned, then await its `settled` (the "Launch" table). F does not abandon a job after a timer (decision 4). **This is not yet guaranteed to end:** D4's supervisor escalates to a forced kill, but it retries unfinished container, network or setup cleanup every second with no limit (`agents/adapters/supervisor.ts`). If Docker is unreachable, `settled` never resolves and shutdown waits with the `Store` open. See the prerequisite below. | new |
-| 5 | Write the terminal state `cancelled` ("Stopped by shutdown") for every attempt from step 4, `pending` or `running`, and free its slot. A failed write leaves the row non-terminal for startup recovery to handle. | new |
+| 4 | For every `pending` and `running` attempt that has an in-memory job, record the first reason `shutdown` **only if no first reason is set yet**. A job already marked `cancelled`, `stale` or `time-limit` keeps its reason. For `running`, call `cancel('shutdown')` and await `settled`. For `pending`, await its preparation promise (and the D start call if it is in progress), remove what preparation created, and cancel any handle that start returned, then await its `settled` (the "Launch" table). F does not abandon a job after a timer (decision 4). **This is not yet guaranteed to end:** D4's supervisor escalates to a forced kill, but it retries unfinished container, network or setup cleanup every second with no limit (`agents/adapters/supervisor.ts`). If Docker is unreachable, `settled` never resolves and shutdown waits with the `Store` open. See the prerequisite below. | new |
+| 5 | Write each attempt's terminal state from its first reason (a `shutdown` reason gives `cancelled` "Stopped by shutdown"), and free its slot. A failed write leaves the row non-terminal for startup recovery to handle. | new |
 | 6 | Await server closure; await the question and suggestion coordinators' `close()`. | yes (questions); suggestions: new wiring |
 | 7 | Close the `Store`. | yes |
 | 8 | Release the single-runner lock (decision 1). Release it on every exit path after it was taken, including a startup failure. | new |
+
+**Partial output and interrupted rebases.** The design requires a hard stop to keep partial output for diagnosis, and to cancel an interrupted rebase before the workspace is rebuilt.
+
+| Holder | Owner | Rule |
+|---|---|---|
+| Partial output of a stopped writable attempt | F | After `settled` and before the terminal write, F saves a bounded diagnostic (the diff against the last codeboost commit, capped at 1 MiB) to a runner-owned diagnostics directory, with a total byte cap and oldest-first deletion. The attempt row references it as `diagnostic_ref`. If the capture fails, the row records that it failed. The task filesystem is never reused. |
+| Interrupted rebase | F3 | F3 records `rebase in progress` durably before starting a rebase and clears it after. Startup recovery aborts every recorded rebase through the runner before it hands the task to I3. |
+| Workspace rebuild | I3 | I3 never rebuilds before both rows above are resolved for the task. |
 
 **Process shutdown is a hard stop.** When the process stops, the running task does not finish. Its attempt ends `cancelled` with the reason "Stopped by shutdown". Restart recovery (lane I3) puts the task back in the queue. This is different from "Stop the queue" (lane I), which lets the running task finish.
 
@@ -213,7 +228,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 | Part | Owner | Rule |
 |---|---|---|
-| Runner owner token | F | A random ID created once per database and stored in it (`app_settings`). It stays the same across restarts of that database, and it differs between databases. |
+| Runner owner token | F | A random ID stored in the database (`app_settings`), together with the database file's device and inode numbers. It is read, or created, in startup recovery step 2, after the lock is taken and the `Store` is opened. If the stored device and inode don't match the open file (the database was copied), F creates a new token. So a copy never shares a token with its original. |
 | Token in every request | D contract | `InvocationInput` gains a `runnerOwner` field. Every resource D creates carries the label `io.codeboost.runner=<token>`: containers, networks, egress proxies, task-storage volumes and allocations. |
 | Scoped recovery | D | `recoverLeftovers(runnerOwner): Promise<RecoveryReport>` removes only resources whose `io.codeboost.runner` label equals the token. It resolves only when all of them are gone, and rejects with a bounded diagnostic if one cannot be removed. F then refuses to open admission. |
 | Unowned resources | D | Resources with codeboost labels but no `io.codeboost.runner` label (from builds before this change) are listed in the report and never removed automatically. |
@@ -228,11 +243,12 @@ This belongs to D (D5 or a D follow-up), not F. It changes `agents/contract.ts`,
 This runs before the coordinator opens.
 
 1. Take the single-runner lock for this database (decision 1), **before opening the `Store`**, because opening runs migrations. If another live process holds it, exit with a message that names that process ID. Do not serve the review screen: it is not read-only, because `ReviewService.load()` records history when HEAD moves (`runner/review.ts`) and `act()` writes review actions. A true read-only mode would need `Store`-level write refusal and is out of scope for F1.
-2. Call D's startup recovery with this database's runner owner token, and await it. **D does not provide this yet.** `agents/contract.ts` exposes only per-invocation handles, and the supervisor's cleanup ownership lives in memory, so it is lost when the process crashes. See the second prerequisite under "Shutdown".
+2. Open the `Store` (migrations run here, under the lock). Read the runner owner token, or create it (see the table under "Shutdown"). Then call D's startup recovery with that token, and await it. **D does not provide this yet.** `agents/contract.ts` exposes only per-invocation handles, and the supervisor's cleanup ownership lives in memory, so it is lost when the process crashes. See the second prerequisite under "Shutdown".
 3. **Unclean leftovers.** These are `pending` or `running` rows left by a crash, or by a shutdown whose terminal write failed. Finalize each one using the first-reason table in "Rules for the running state", rule 2:
    - first reason `cancelled` → `cancelled`; `shutdown` → `cancelled` "Stopped by shutdown"; `stale` → `stale` with its cause;
    - no first reason → `failed` "Interrupted: codeboost stopped while this was running".
-4. Clear every unresolved marker (these exist only in memory, so a restart has already cleared them; step 3 reconciles their rows).
+   - first reason `time-limit` → `cancelled` and the task set to `needs human`, in the same transaction.
+4. Clear every unresolved marker (these exist only in memory, so a restart has already cleared them; step 3 reconciles their rows). Abort every recorded interrupted rebase (F3).
 5. Insert any missing `task-closed` events. This applies **only** to tasks with a confirmed `merged` merge attempt (feedback-event rule 2). An attempt's terminal state never closes a task: a `cancelled` or `failed` attempt means only that the attempt ended. User cancel and reject close a task in the same local transaction as their event, so they never need reconciliation.
 6. **Requeue input.** Hand lane I3 every task whose status is not closed (`merged`, `cancelled` or `rejected`) and not human-gated, and whose latest attempt is either (a) `cancelled` with first reason `shutdown`, whether written by clean shutdown or by step 3, or (b) `failed` "Interrupted" by step 3. Attempts that end `cancelled` by the user or `stale` are not requeued; they wait for a user action. I3 rebuilds the workspace and requeues. F1 only makes the attempt rows terminal and produces this list.
 7. Open the coordinator.
@@ -288,7 +304,7 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 **Rules:**
 
 1. **Local actions.** Write the event in the same `Store` transaction as the user action. There is never an event without its action, or an action without its event.
-2. **External actions.** A GitHub merge cannot share a SQLite transaction. For a merge, write `task-closed` in the same transaction as the durable record of the **confirmed** outcome (`finishMergeAttempt` with state `merged`). Never write it when the merge is submitted, queued or ambiguous. Startup recovery also runs a reconciliation step: for every task whose confirmed terminal record exists without a `task-closed` event, insert that event. The uniqueness rule below makes this safe to repeat.
+2. **External actions.** A GitHub merge cannot share a SQLite transaction. For a merge, one transaction records the **confirmed** outcome (`finishMergeAttempt` with state `merged`), sets `tasks.status` to `merged`, and inserts `task-closed`. Never write any of them when the merge is submitted, queued or ambiguous. Startup recovery also runs a reconciliation step: for every task with a confirmed `merged` merge attempt whose status or event is missing, one transaction sets the status and inserts the event. The uniqueness rule below makes this safe to repeat.
 3. Events are append-only. If a choice changes later, write a new event with `supersedes` set to the earlier event. J uses the newest event for each `sourceRef`.
 4. Replaying the same action or reconciliation does not duplicate an event: `(planKey, kind, actionId)` is unique. A superseding event for the same `sourceRef` has a new `actionId`, so it is never rejected. Note and choice IDs are only unique inside their plan identity, so the key must include the full plan key.
 5. J reads events only through `Store.feedbackEvents(identity: PlanIdentity)`, which scopes every row by `identityKey(identity)`, and only after that task's `task-closed` event exists.
@@ -299,8 +315,8 @@ This is the smallest schema that holds the contract. The F1 implementation PR se
 
 | Table | Key columns |
 |---|---|
-| `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `state_version`, `context_generation`, `assignment_id`, `referenced_code_hash`, `current_attempt_id` (references `attempts(id)`, nullable), `created_at`, `updated_at` |
-| `attempts` | `id` (**primary key**; never reused), `plan_key` (references `tasks(plan_key)`), `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `result` (JSON, only for `completed`, 1 MiB or less), `diagnostic` (bounded), `created_at`, `started_at`, `settled_at` |
+| `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `state_version`, `context_generation`, `assignment_id`, `referenced_code_hash`, `current_attempt_id` (nullable; the composite foreign key `(plan_key, current_attempt_id)` references `attempts(plan_key, id)`, so a task can only point at its own attempt), `created_at`, `updated_at` |
+| `attempts` | `id` (**primary key**; never reused), `plan_key` (references `tasks(plan_key)`; `(plan_key, id)` is also unique, for the composite key), `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `result` (JSON, only for `completed`, 1 MiB or less), `diagnostic` (bounded), `diagnostic_ref` (partial-output file, or null), `created_at`, `started_at`, `settled_at` |
 | `feedback_events` | the fields listed above, with `id` as primary key, with a unique index on `(plan_key, kind, action_id)` |
 
 `tasks.status` holds the product states from the design (queued, running, needs human, needs amendment, needs approval, possibly already fixed, in review, approved but merge blocked, merged, cancelled, rejected). **Closed** means `merged`, `cancelled` or `rejected`; a closed status never changes again. **Human-gated** means `needs human`, `needs amendment`, `needs approval` or `possibly already fixed`. F1 defines the list and its invariants. F2 adds the per-item transitions. I1 adds queue admission and scheduling.
@@ -349,6 +365,13 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Retry a closed or gated task (review round 7) | Task `rejected` (or `needs human` after the time limit) with a `cancelled` last attempt → retry refused; restart does not requeue it |
 | Assignment changes alone (review round 7) | Work reassigned without a plan-revision or snapshot change → generation increases in the same transaction → the old attempt's result is refused and the row becomes `stale` |
 | Two databases, one crashes (review round 8) | Runners for databases A and B are live → A crashes and restarts → recovery removes only resources labelled with A's token; B's container, network, egress proxy and volume keep running |
+| Context changes during preparation (review round 9) | Admit a writable attempt → assignment changes while the clone is prepared → launch check fails → row `stale`; D start is never called |
+| Stop during launch, then the start throws (review round 9) | User cancels while preparation finishes → D start throws → row `cancelled`, not `failed` |
+| Reason write fails (review round 9) | The first-reason write throws → settlement → the terminal write stores `cancelled` with the reason from memory |
+| Time limit, then crash (review round 9) | `time-limit` saved → process killed → restart → row `cancelled`, task `needs human`, retry refused |
+| Admitted write after shutdown (review round 9) | For each of `act`, `setQuestionProvider` and the planning writers: body half-sent → shutdown → body completes → HTTP 503 and no `Store` change |
+| Stale, then shutdown (review round 9) | Attempt marked `stale` → shutdown → row `stale`, not requeued |
+| Copied database (review round 9) | Copy the database file → start the copy → new token; recovery for the copy leaves the original's resources alone |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
