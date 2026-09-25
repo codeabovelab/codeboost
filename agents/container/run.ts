@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { assertContainerProfile, disposeContainerProfile, isContainerProfileAuthentic, profileTimeout,
+import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
+  isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemAllocationId } from './storage.ts';
@@ -48,12 +49,14 @@ const canonicalDockerBindSource = (source: string) => {
 /** How long a killed `docker create` may still materialize its container in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = false) => {
+// When a killed `docker create` for a profile stops counting as possibly in flight (performance.now() timestamp).
+const unsettledCreates = new WeakMap<ContainerProfile, number>();
+const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false) => {
   // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
   if (!isContainerProfileAuthentic(profile))
     throw new Error('Container profile was not created by the trusted profile builder.');
-  const remaining = createDeadline(30_000 + (createUnsettled ? CREATE_SETTLE_MS : 0));
-  const settleBy = performance.now() + (createUnsettled ? CREATE_SETTLE_MS : 0);
+  const settleUntil = unsettledCreates.get(profile) ?? 0;
+  const remaining = createDeadline(30_000 + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
     before = spawnSync('docker', ['container', 'inspect', profile.name], {
@@ -62,13 +65,15 @@ const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = fal
     if (before.status === 0) break;
     const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
     if (!missing) throw new Error('Failed to establish ownership of the agent container; staged credentials were retained.');
-    if (!createUnsettled) {
+    // A killed create may still land in the daemon; absence only counts once its settle window has passed, on every
+    // path. Only the create path waits here; later cleanup (such as a supervisor recovery) reports "not settled"
+    // inside the window and retries later.
+    if (performance.now() >= settleUntil) {
+      unsettledCreates.delete(profile);
       disposeContainerProfile(profile);
       return;
     }
-    // A killed create may still land in the daemon; absence is not proof until the settle window passes.
-    if (performance.now() >= settleBy)
-      throw new Error('Agent container creation did not settle; staged credentials were retained.');
+    if (!waitForSettle) throw new Error('Agent container creation did not settle; staged credentials were retained.');
     sleep(250);
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
@@ -85,8 +90,15 @@ const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = fal
       && /No such (?:object|container)/i.test(`${inspect.stdout ?? ''}\n${inspect.stderr ?? ''}`);
     if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
   }
+  unsettledCreates.delete(profile);
   disposeContainerProfile(profile);
 };
+
+/** Remove a validated invocation container, then its profile-owned staging and network resources. */
+export function disposeValidatedContainer(profile: ContainerProfile): void {
+  assertContainerProfileAuthenticity(profile);
+  removeContainerOrThrow(profile);
+}
 
 type Inspect = {
   Image: string;
@@ -166,7 +178,11 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     ['/tmp', ['rw', 'nosuid', 'nodev', 'size=33554432', 'nr_inodes=4096', 'mode=1777']],
     ['/home/codeboost', ['rw', 'nosuid', 'nodev', 'size=1048576', 'nr_inodes=128', 'uid=10001', 'gid=10001', 'mode=0700']],
     ...(profile.vendor === 'codex' ? [['/run/codeboost-auth/codex',
-      ['rw', 'nosuid', 'nodev', 'size=4194304', 'nr_inodes=256', 'uid=10001', 'gid=10001', 'mode=0700']] as const] : []),
+      ['rw', 'nosuid', 'nodev', 'size=4194304', 'nr_inodes=256', 'uid=10001', 'gid=10001', 'mode=0700']] as const,
+    ['/run/codeboost-output',
+      ['rw', 'nosuid', 'nodev', 'noexec', 'size=20971520', 'nr_inodes=64', 'uid=10001', 'gid=10001', 'mode=0700']] as const] : []),
+    ...(profile.deferredOutput ? [['/run/codeboost-control',
+      ['rw', 'nosuid', 'nodev', 'noexec', 'size=65536', 'nr_inodes=16', 'uid=0', 'gid=0', 'mode=0711']] as const] : []),
   ]);
   if (Object.keys(tmpfs).length !== expectedTmpfs.size) throw new Error('Container tmpfs mount set changed.');
   for (const [path, expected] of expectedTmpfs) {
@@ -239,6 +255,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   const allowedEnvironment = new Set(['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'CODEBOOST_PHASE', 'CODEBOOST_VENDOR',
     'CODEBOOST_WORK_BYTES', 'CODEBOOST_WORK_INODES', 'CODEBOOST_METADATA_BYTES', 'CODEBOOST_METADATA_INODES',
     'npm_config_cache', 'XDG_CACHE_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
+    ...(profile.deferredOutput ? ['CODEBOOST_DEFERRED_OUTPUT'] : []),
     ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
   if (new Set(names).size !== names.length || names.some(name => !allowedEnvironment.has(name)))
     throw new Error('Container includes an unexpected environment variable.');
@@ -255,6 +272,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || environment.get('HTTP_PROXY') !== profile.network.proxyUrl
     || environment.get('NO_PROXY') !== 'localhost,127.0.0.1')
     throw new Error('Container isolation environment changed.');
+  if (profile.deferredOutput && environment.get('CODEBOOST_DEFERRED_OUTPUT') !== '1')
+    throw new Error('Container deferred-output protocol changed.');
   if (profile.vendor === 'codex' && (names.includes('CLAUDE_CODE_OAUTH_TOKEN')
     || environment.get('CODEX_HOME') !== '/run/codeboost-auth/codex'))
     throw new Error('Credential profiles must not be combined or redirected.');
@@ -285,6 +304,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     remaining();
     return profile.name;
   } catch (error) {
+    if (createUnsettled) unsettledCreates.set(profile, performance.now() + CREATE_SETTLE_MS);
     try { removeContainerOrThrow(profile, createUnsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Container creation failed and cleanup did not settle.'); }
     throw error;
