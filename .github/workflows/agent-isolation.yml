@@ -18,7 +18,8 @@ permissions:
 jobs:
   real-docker:
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # Covers the 10 min image build, 2 min teardown and the per-test Docker budgets.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4

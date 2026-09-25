@@ -3,7 +3,7 @@ import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, ope
   readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import type { InvocationInput, Phase } from '../contract.ts';
+import { assertCapturedInvocation, type InvocationInput, type Phase } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
 export interface ContainerProfile {
@@ -148,6 +148,8 @@ const mountSource = (path: string, kind: string) => {
 
 export function createContainerProfile(options: ProfileOptions): ContainerProfile {
   const { invocation, filesystems } = options;
+  // Phase, vendor and deadline drive mount modes and credentials, so they must come from a captured request.
+  assertCapturedInvocation(invocation);
   if (!options.command.length || options.command.some(value => typeof value !== 'string' || value.includes('\0')))
     throw new Error('Container command must be a complete literal argv array.');
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId))

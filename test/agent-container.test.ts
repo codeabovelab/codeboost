@@ -359,6 +359,13 @@ describe('real Docker agent isolation', () => {
     expect(performance.now() - started).toBeLessThan(15_000);
   }, 60_000);
 
+  it('refuses an invocation copied from a captured request with a different phase', () => {
+    const data = fixture(), captured = invocation(data.clone, 'review');
+    const forged = { ...captured, phase: 'execute' as Phase };
+    expect(() => createContainerProfile({ invocation: forged, filesystems: data.filesystems,
+      inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId })).toThrow('captured');
+  }, 60_000);
+
   it('refuses a Codex auth path that is a link without resolving it', () => {
     const data = fixture(), link = join(data.root, 'auth-link.json');
     symlinkSync(data.fakeAuth, link);
