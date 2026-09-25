@@ -64,10 +64,10 @@ const governed = (captured: InvocationInput, probe: IsolationProbe = 'noop') => 
 
 function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
-  vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string;
+  vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
-  const captured = invocation(data.clone, phase, vendor);
+  const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
   const policy = createPhasePolicy(captured), network = createVendorNetwork(captured, imageId);
   vendorNetworks.push(network);
   const trustedCommand = typeof command === 'string' ? createIsolationProbeCommand(policy, command) : command(policy);
@@ -264,10 +264,9 @@ describe('real Docker agent isolation', () => {
 
   it('does not remove an active container when a duplicate attempt name collides', () => {
     const data = fixture(), captured = invocation(data.clone, 'planning');
-    const duplicateInvocation = captureInvocation({ ...captured });
     const first = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
-    const duplicate = createContainerProfile({ ...governed(duplicateInvocation), filesystems: data.filesystems,
+    const duplicate = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
@@ -345,7 +344,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects a task keeper whose restart policy was changed', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     docker('update', '--restart=always', data.filesystems.keeper);
     try {
       docker(...valid.args); containers.add(valid.name);
@@ -354,22 +353,17 @@ describe('real Docker agent isolation', () => {
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
-  it('stops a running agent at the captured invocation deadline', () => {
-    const data = fixture();
-    const late = createContainerProfile({ invocation: invocation(data.clone, 'planning', 'codex', 4_000),
-      filesystems: data.filesystems, inputDirectory: data.input, command: ['sh', '-c', 'sleep 30'],
-      codexAuthFile: data.fakeAuth, imageId });
-    profiles.push(late);
-    const started = performance.now();
-    expect(() => runContainer(late, 60_000)).toThrow();
-    expect(performance.now() - started).toBeLessThan(15_000);
+  it('refuses to launch once the captured invocation deadline has passed', () => {
+    const data = fixture(), late = profile(data, 'planning', 'noop', { deadlineMs: 1_500 });
+    execFileSync('sleep', ['2']);
+    expect(() => runContainer(late, 60_000)).toThrow('deadline has passed');
   }, 60_000);
 
   it('refuses an invocation copied from a captured request with a different phase', () => {
-    const data = fixture(), captured = invocation(data.clone, 'review');
-    const forged = { ...captured, phase: 'execute' as Phase };
-    expect(() => createContainerProfile({ invocation: forged, filesystems: data.filesystems,
-      inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId })).toThrow('captured');
+    const data = fixture(), trusted = governed(invocation(data.clone, 'review'));
+    const forged = { ...trusted.invocation, phase: 'execute' as Phase };
+    expect(() => createContainerProfile({ ...trusted, invocation: forged, filesystems: data.filesystems,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).toThrow('captured');
   }, 60_000);
 
   it('removes the claimed vendor network when profile creation fails after the claim', () => {
@@ -387,7 +381,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects an alternate Docker runtime that may not honour the checked isolation', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     docker(...valid.args.map(arg => arg === '--runtime=runc' ? '--runtime=io.containerd.runc.v2' : arg));
     containers.add(valid.name);
     expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');

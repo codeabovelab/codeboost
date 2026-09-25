@@ -68,7 +68,7 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
         NetworkMode?: string; PidMode?: string; IpcMode?: string; UTSMode?: string; UsernsMode?: string;
         CgroupnsMode?: string; Devices?: unknown[] | null; DeviceRequests?: unknown[] | null;
         Dns?: string[]; DnsOptions?: string[]; DnsSearch?: string[]; ExtraHosts?: string[] | null;
-        PortBindings?: Record<string, unknown> | null; PublishAllPorts?: boolean };
+        PortBindings?: Record<string, unknown> | null; PublishAllPorts?: boolean; Runtime?: string };
       NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }>; Ports?: Record<string, unknown> };
       Mounts?: unknown[] } | undefined;
   const image = JSON.parse(docker(['image', 'inspect', identity.imageId], remaining()))[0] as
@@ -87,6 +87,7 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
     || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 2
     || !inspect.HostConfig.SecurityOpt.some(option => ['no-new-privileges', 'no-new-privileges:true'].includes(option))
     || !inspect.HostConfig.SecurityOpt.includes('seccomp=builtin')
+    || inspect.HostConfig.Runtime !== 'runc'
     || inspect.HostConfig.PidsLimit !== 64 || inspect.HostConfig.Memory !== 64 * 1024 * 1024
     || inspect.HostConfig.MemorySwap !== 64 * 1024 * 1024 || inspect.HostConfig.NanoCpus !== 250_000_000
     || inspect.HostConfig.NetworkMode !== network.name || inspect.HostConfig.PidMode !== ''
@@ -133,7 +134,7 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       '--label', `io.codeboost.egress=${allocationId}`, name], remaining());
     proxyPlanned = true;
     docker(['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
-      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
+      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
       '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs'], remaining());

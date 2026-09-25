@@ -108,7 +108,7 @@ describe('vendor-only egress', () => {
     ['host override', ['--add-host=api.anthropic.com:127.0.0.1']],
     ['published proxy port', ['--publish=127.0.0.1::3128']],
   ] as const)('rejects a proxy replaced with %s before launch', (_label, extra) => {
-    const replacementInvocation = captureInvocation({ ...invocation, attemptId: 'mutated-proxy-probe',
+    const replacementInvocation = captureInvocation({ ...invocation, attemptId: `mutated-proxy-probe-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const replacement = createVendorNetwork(replacementInvocation, imageId);
     const inspected = JSON.parse(docker('container', 'inspect', replacement.proxyContainer))[0] as

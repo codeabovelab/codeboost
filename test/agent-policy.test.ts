@@ -3,10 +3,11 @@ import { captureInvocation, type InvocationInput, type Phase } from '../agents/c
 import { assertAgentCommand, assertAgentTool, codexBaseArguments, createClaudeCommand, createCodexCommand,
   createPhasePolicy, dispatchApprovedCommand } from '../agents/policy.ts';
 
+let attempt = 0;
 const request = (phase: Phase, vendor: 'claude' | 'codex' = 'claude'): InvocationInput => captureInvocation({
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tmp/task', head: 'a'.repeat(40) },
   vendor, phase, approvedArgv: ['planning', 'questions'].includes(phase) ? [] : [['npm', 'test']],
-  deadline: 2000, attemptId: `attempt-${phase}`,
+  deadline: 2000, attemptId: `attempt-${phase}-${++attempt}`,
   context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
 }, 1000);
 

@@ -310,7 +310,7 @@ export function startValidatedContainer(profile: ContainerProfile, timeoutMs = 6
 
 export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
-  const remaining = createDeadline(timeoutMs);
+  const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   createValidatedContainer(profile, remaining(), secrets);
   let startBudget: number;
   try { startBudget = remaining(); }
