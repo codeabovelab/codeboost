@@ -372,6 +372,14 @@ describe('real Docker agent isolation', () => {
     expect(() => profile(data, 'planning', ['true'], { codexAuthFile: link })).toThrow('not a link');
   }, 60_000);
 
+  it('rejects an alternate Docker runtime that may not honour the checked isolation', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    docker(...valid.args.map(arg => arg === '--runtime=runc' ? '--runtime=io.containerd.runc.v2' : arg));
+    containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+  }, 60_000);
+
   it('rejects a restart policy that could relaunch the agent after it exits', () => {
     const data = fixture(), valid = profile(data, 'planning', ['true']);
     const imageIndex = valid.args.indexOf(imageId);

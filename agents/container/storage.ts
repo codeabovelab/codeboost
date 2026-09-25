@@ -146,13 +146,13 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
       'chown -R 10001:10001 /work /metadata'].join('; ');
     allocate(keeper, ['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
-      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=32', '--memory=128m', '--cpus=.25',
+      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m', '--cpus=.25',
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--label', 'io.codeboost.task-storage=keeper', '--label', `io.codeboost.allocation=${allocationId}`,
       '--entrypoint', 'sleep', imageId, 'infinity']);
     allocate(seeder, ['run', '--rm', '--name', seeder, '--label', `io.codeboost.allocation=${allocationId}`,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
-      '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=32',
+      '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--entrypoint', 'sh', imageId, '-c', seed]);

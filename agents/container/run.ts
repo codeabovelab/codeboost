@@ -99,7 +99,7 @@ type Inspect = {
     Ulimits: unknown[] | null; CpuCount: number;
     CpuPercent: number; IOMaximumBandwidth: number; IOMaximumIOps: number; DeviceCgroupRules: unknown[] | null;
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
-    RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null;
+    RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
@@ -143,7 +143,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || host.BlkioDeviceReadIOps?.length || host.BlkioDeviceWriteIOps?.length || host.Ulimits?.length
     || host.CpuCount !== 0 || host.CpuPercent !== 0 || host.IOMaximumBandwidth !== 0 || host.IOMaximumIOps !== 0
     || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== ''
-    || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0)
+    || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
+    || host.Runtime !== 'runc')
     throw new Error('Container daemon configuration is missing required lockdown.');
   const tmpfs = host.Tmpfs ?? {};
   const expectedTmpfs = new Map([
@@ -193,7 +194,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string> };
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; NetworkMode?: string; CapDrop?: string[] | null;
         CapAdd?: string[] | null; SecurityOpt?: string[] | null;
-        RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null };
+        RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime?: string };
       Mounts?: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }> } | undefined;
   const keeperVolumes = new Map((keeper?.Mounts ?? []).filter(item => item.Type === 'volume').map(item => [item.Destination, item]));
   if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
@@ -204,7 +205,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
     || !exactSecurityOptions(keeper.HostConfig.SecurityOpt)
     || !['', 'no'].includes(keeper.HostConfig.RestartPolicy?.Name ?? '')
-    || (keeper.HostConfig.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
+    || (keeper.HostConfig.RestartPolicy?.MaximumRetryCount ?? 0) !== 0 || keeper.HostConfig.Runtime !== 'runc'
     || keeperVolumes.get('/work')?.Name !== profile.filesystems.workVolume
     || keeperVolumes.get('/metadata')?.Name !== profile.filesystems.metadataVolume)
     throw new Error('Task filesystems must remain owned by their trusted keeper.');
