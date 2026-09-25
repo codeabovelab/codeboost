@@ -1,8 +1,9 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import type { InvocationHandle, InvocationResult, StopReason } from '../contract.ts';
+import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
 import type { ContainerProfile } from '../container/profile.ts';
+import { removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
 
 export const OUTPUT_LIMITS = Object.freeze({
   stdoutBytes: 16 * 1024 * 1024,
@@ -10,6 +11,7 @@ export const OUTPUT_LIMITS = Object.freeze({
   combinedBytes: 20 * 1024 * 1024,
 });
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+const CAPTURE_ABORT_GRACE_MS = 1_000;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
 
@@ -84,6 +86,42 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string): Invo
   schedule();
   return handle;
 };
+
+/** Retain attempt ownership while retrying a network allocated before profile construction failed. */
+export function retainNetworkCleanup(invocation: InvocationInput, network: VendorNetwork,
+  startupError: unknown, cleanupError: unknown): InvocationHandle {
+  if (active.has(invocation.attemptId)) throw cleanupError;
+  let resolveSettled!: (result: InvocationResult) => void, cleaning = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
+  const detail = `Adapter startup failed and network cleanup remains unsettled: ${String(startupError)}; ${String(cleanupError)}`;
+  const retry = () => {
+    if (cleaning) return;
+    cleaning = true;
+    try {
+      removeVendorNetwork(network);
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      active.delete(invocation.attemptId);
+      resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
+        exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
+        stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
+    } catch {
+      cleaning = false;
+      if (!timer) {
+        timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
+        timer.unref();
+      }
+      return;
+    }
+    cleaning = false;
+  };
+  const handle: InvocationHandle = Object.freeze({ attemptId: invocation.attemptId, settled,
+    cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
+  active.set(invocation.attemptId, handle);
+  timer = setTimeout(() => { timer = undefined; retry(); }, 1_000); timer.unref();
+  return handle;
+}
 const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason, limits: CaptureLimits,
   detail?: string) => {
   const diagnostic = diagnosticFor(reason, detail).subarray(0, DIAGNOSTIC_BYTES);
@@ -279,7 +317,14 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         try { decoded = await Promise.race([operation, timeout]); }
         catch (error) {
           controller.abort();
-          try { await operation; } catch { /* termination is confirmed by operation settlement */ }
+          let graceTimer: ReturnType<typeof setTimeout> | undefined;
+          const grace = new Promise<void>(resolve => {
+            graceTimer = setTimeout(resolve, CAPTURE_ABORT_GRACE_MS);
+            graceTimer.unref();
+          });
+          await Promise.race([operation.then(() => undefined, () => undefined), grace]);
+          if (graceTimer) clearTimeout(graceTimer);
+          void operation.catch(() => { /* prevent a detached noncooperative decoder from becoming unhandled */ });
           throw error;
         } finally {
           if (decodeTimer) clearTimeout(decodeTimer);

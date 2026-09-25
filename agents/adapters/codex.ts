@@ -2,7 +2,7 @@ import type { InvocationHandle } from '../contract.ts';
 import { createContainerProfile } from '../container/profile.ts';
 import { createVendorNetwork, removeVendorNetwork } from '../network/network.ts';
 import { createCodexCommand, createPhasePolicy } from '../policy.ts';
-import { readBoundedContainerFile, startProfileInvocation } from './supervisor.ts';
+import { readBoundedContainerFile, retainNetworkCleanup, startProfileInvocation } from './supervisor.ts';
 import type { AgentAdapterOptions, AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
@@ -26,7 +26,8 @@ export function startCodexInvocation(request: AgentAdapterRequest,
       decode: (current, _raw, maximum, timeoutMs, signal) =>
         readCodexOutput(current.name, maximum, timeoutMs, signal) });
   } catch (error) {
-    removeVendorNetwork(network);
+    try { removeVendorNetwork(network); }
+    catch (cleanupError) { return retainNetworkCleanup(request.invocation, network, error, cleanupError); }
     throw error;
   }
 }

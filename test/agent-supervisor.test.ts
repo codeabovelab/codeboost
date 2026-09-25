@@ -157,6 +157,17 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('decode-timeout')).toBe(false);
   }, 30_000);
 
+  it('does not wedge when an injected decoder ignores abort', async () => {
+    const started = Date.now();
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-ignores-abort', 30_000), {
+      timeoutMs: 3_000,
+      decode: () => new Promise(() => {}),
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(isInvocationActive('decode-ignores-abort')).toBe(false);
+  }, 30_000);
+
   it('validates and decodes provider output even when the process exits nonzero', async () => {
     const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
       decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),

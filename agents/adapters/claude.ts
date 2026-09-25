@@ -2,7 +2,7 @@ import type { InvocationHandle } from '../contract.ts';
 import { createContainerProfile } from '../container/profile.ts';
 import { createVendorNetwork, removeVendorNetwork } from '../network/network.ts';
 import { createClaudeCommand, createPhasePolicy } from '../policy.ts';
-import { startProfileInvocation } from './supervisor.ts';
+import { retainNetworkCleanup, startProfileInvocation } from './supervisor.ts';
 import type { AgentAdapterOptions, AgentAdapterRequest } from './types.ts';
 
 export function parseClaudeOutput(raw: Buffer): { text: string; providerFailed: boolean } {
@@ -24,7 +24,8 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
     return startProfileInvocation(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
       decode: (_profile, raw) => parseClaudeOutput(raw) });
   } catch (error) {
-    removeVendorNetwork(network);
+    try { removeVendorNetwork(network); }
+    catch (cleanupError) { return retainNetworkCleanup(request.invocation, network, error, cleanupError); }
     throw error;
   }
 }
