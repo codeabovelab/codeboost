@@ -49,12 +49,14 @@ const canonicalDockerBindSource = (source: string) => {
 /** How long a killed `docker create` may still materialize its container in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = false) => {
+// When a killed `docker create` for a profile stops counting as possibly in flight (performance.now() timestamp).
+const unsettledCreates = new WeakMap<ContainerProfile, number>();
+const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false) => {
   // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
   if (!isContainerProfileAuthentic(profile))
     throw new Error('Container profile was not created by the trusted profile builder.');
-  const remaining = createDeadline(30_000 + (createUnsettled ? CREATE_SETTLE_MS : 0));
-  const settleBy = performance.now() + (createUnsettled ? CREATE_SETTLE_MS : 0);
+  const settleUntil = unsettledCreates.get(profile) ?? 0;
+  const remaining = createDeadline(30_000 + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
     before = spawnSync('docker', ['container', 'inspect', profile.name], {
@@ -63,12 +65,15 @@ const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = fal
     if (before.status === 0) break;
     const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
     if (!missing) throw new Error('Failed to establish ownership of the agent container; staged credentials were retained.');
-    if (!createUnsettled) {
+    // A killed create may still land in the daemon; absence only counts once its settle window has passed. Only the
+    // create path waits here; later cleanup (such as a supervisor recovery) reports "not settled" and retries later.
+    const settled = performance.now() >= settleUntil;
+    if (settled && !(waitForSettle && settleUntil)) {
+      unsettledCreates.delete(profile);
       disposeContainerProfile(profile);
       return;
     }
-    // A killed create may still land in the daemon; absence is not proof until the settle window passes.
-    if (performance.now() >= settleBy)
+    if (settled || !waitForSettle)
       throw new Error('Agent container creation did not settle; staged credentials were retained.');
     sleep(250);
   }
@@ -86,6 +91,7 @@ const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = fal
       && /No such (?:object|container)/i.test(`${inspect.stdout ?? ''}\n${inspect.stderr ?? ''}`);
     if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
   }
+  unsettledCreates.delete(profile);
   disposeContainerProfile(profile);
 };
 
@@ -299,6 +305,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     remaining();
     return profile.name;
   } catch (error) {
+    if (createUnsettled) unsettledCreates.set(profile, performance.now() + CREATE_SETTLE_MS);
     try { removeContainerOrThrow(profile, createUnsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Container creation failed and cleanup did not settle.'); }
     throw error;

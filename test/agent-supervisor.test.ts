@@ -154,6 +154,13 @@ describe('container invocation supervisor', () => {
     expect(result.stopReason).toBe('timeout');
   }, 15_000);
 
+  it('fails capture instead of publishing replacement characters for invalid UTF-8 stderr', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'invalid-utf8-stderr'), { timeoutMs: 30_000 }).settled;
+    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stderr).not.toContain('\uFFFD');
+    expect(result.stderr).not.toContain('bad-');
+  }, 60_000);
+
   it('blocks a duplicate attempt while the original container remains active', async () => {
     const data = fixture(), duplicate = invocation(data, 'duplicate');
     const first = startProfileInvocation(profile(data, 'ignore-term', duplicate), { timeoutMs: 30_000 });

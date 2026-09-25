@@ -583,6 +583,18 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         });
       }
     }
+    // Publish only strictly valid UTF-8: replacement characters would grow the result past the byte ceilings.
+    // A multi-byte character cut at a capture limit is an incomplete tail, which the streaming decode drops.
+    const strictText = (value: Buffer) => {
+      try { return new TextDecoder('utf-8', { fatal: true }).decode(value, { stream: true }); }
+      catch { return undefined; }
+    };
+    const stdoutText = strictText(finalStdout), stderrText = strictText(finalStderr);
+    if (stdoutText === undefined || stderrText === undefined) {
+      stopReason ??= 'capture-failure';
+      failureDetail ??= 'Captured output is not valid UTF-8.';
+    }
+    finalStdout = Buffer.from(stdoutText ?? ''); finalStderr = Buffer.from(stderrText ?? '');
     if (stopReason) finalStderr = withDiagnostic(finalStderr, finalStdout.length, stopReason, limits, failureDetail);
     const result = Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
       exitCode, signal: finalSignal, ...(stopReason ? { stopReason } : {}),

@@ -8,8 +8,8 @@ import { captureInvocation, type InvocationInput, type Phase } from '../agents/c
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
   isContainerProfileAuthentic } from '../agents/container/profile.ts';
-import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer, startValidatedContainer,
-  hasExactOptions, validateContainer } from '../agents/container/run.ts';
+import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
+  startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { createVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../agents/network/network.ts';
 import { createClaudeCommand, createCodexCommand, createIsolationProbeCommand, createPhasePolicy,
@@ -290,6 +290,29 @@ describe('real Docker agent isolation', () => {
     process.env.PATH = `${shim}:${path}`;
     try { expect(() => createValidatedContainer(unsettled, 1_000)).toThrow('cleanup did not settle'); }
     finally { process.env.PATH = path; }
+    expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
+  }, 60_000);
+
+  it('keeps a killed create unsettled for later cleanup until its settle window passes', () => {
+    const data = fixture(), unsettled = profile(data, 'planning', 'noop');
+    const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
+    const created = join(shim, 'created'), failed = join(shim, 'failed');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The create client hangs until killed, and the first inspect after it fails for an unrelated reason, so the
+    // create path gives up early, inside the settle window.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = create ]; then touch '${created}'; exec sleep 30; fi`,
+      `if [ "$1" = container ] && [ "$2" = inspect ] && [ -e '${created}' ] && [ ! -e '${failed}' ]; then`,
+      `  touch '${failed}'; echo 'daemon unavailable' >&2; exit 1`, 'fi',
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    try {
+      expect(() => createValidatedContainer(unsettled, 3_000)).toThrow('cleanup did not settle');
+      // A follow-up cleanup inside the window must not treat absence as proof and release the profile.
+      expect(() => disposeValidatedContainer(unsettled)).toThrow('did not settle');
+    } finally { process.env.PATH = path; }
+    expect(isContainerProfileAuthentic(unsettled)).toBe(true);
     expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
   }, 60_000);
 
