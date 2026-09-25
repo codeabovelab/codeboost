@@ -120,7 +120,7 @@ Every legal change increases the task's state version by one. Recording a first 
 A `pending` attempt has no `settled` promise, so the slot rules need a separate release path for it. Between admission and launch, F may prepare resources such as the task clone and the prompt. The in-memory job tracks that preparation as its own promise, with the same ownership rules as an invocation:
 
 - Preparation receives an `AbortSignal` from the job. Stopping a pending attempt aborts that signal with the first reason.
-- Each preparation step must stop and await any subprocess it started (for example `git clone`) when the signal aborts, and only then reject. It never leaves work running after it settles.
+- An `AbortSignal` does not stop a child process by itself. Every preparation subprocess (for example `git clone`) is started in its own process group, owned by the job. On abort, F sends `SIGTERM` to the group, waits a fixed grace period (5 seconds), then sends `SIGKILL`, and awaits the `close` event. Preparation settles only after that. A child that ignores `SIGTERM` is therefore still bounded by the kill. Preparation never leaves work running after it settles.
 - Preparation counts against two limits, so it cannot hold a slot forever. If the **task time budget** runs out first, the job records the first reason `time-limit`, then aborts the signal; the pending row ends `cancelled` and the task goes to `needs human`, as for a running attempt. If the **attempt deadline** passes first, the job aborts the signal with `timeout` and records no first reason; the row ends `failed` "Timed out while preparing".
 - Shutdown aborts every preparation signal in step 4.
 
@@ -251,7 +251,7 @@ This runs before the coordinator opens.
    - no first reason → `failed` "Interrupted: codeboost stopped while this was running".
    - first reason `time-limit` → `cancelled` and the task set to `needs human`, in the same transaction.
 4. Clear every unresolved marker (these exist only in memory, so a restart has already cleared them; step 3 reconciles their rows). Abort every recorded interrupted rebase (F3).
-5. Insert any missing `task-closed` events. This applies **only** to tasks with a confirmed `merged` merge attempt (feedback-event rule 2). An attempt's terminal state never closes a task: a `cancelled` or `failed` attempt means only that the attempt ended. **Cancel attempt** (stop the current run; the task stays open) and **cancel task** (close the task and discard its workspace) are different user actions. Only cancel task closes a task, and it writes `task-closed` in its own local transaction, so it never needs reconciliation. "Reject with feedback" never closes a task (see the status list).
+5. Insert any missing `task-closed` events. This applies **only** to tasks with a confirmed `merged` merge attempt (feedback-event rule 2). An attempt's terminal state never closes a task: a `cancelled` or `failed` attempt means only that the attempt ended. **Cancel attempt** (stop the current run; the task stays open) and **cancel task** (close the task and discard its workspace) are different user actions. Only cancel task closes a task, and it writes `task-closed` in its own local transaction, so it never needs reconciliation. **Cancel task is refused while a merge attempt is `submitting` or `queued`**, including when its outcome is unclear. GitHub may still merge, and a closed task can never change to `merged`. The user can cancel the task after the merge coordinator records `merged`, `removed` or `failed`. If the result is `merged`, the task closes as merged instead. "Reject with feedback" never closes a task (see the status list).
 6. **Requeue input.** Hand lane I3 every task whose status is not closed (`merged` or `cancelled`) and not human-gated, and whose latest attempt is either (a) `cancelled` with first reason `shutdown`, whether written by clean shutdown or by step 3, or (b) `failed` "Interrupted" by step 3. Attempts that end `cancelled` by the user or `stale` are not requeued; they wait for a user action. I3 rebuilds the workspace and requeues. F1 only makes the attempt rows terminal and produces this list.
 7. Open the coordinator.
 
@@ -353,7 +353,7 @@ A merged v5 task also gets its `task-closed` event, keyed by the merge attempt I
 |---|---|---|---|
 | Questions (`runner/questions.ts`, `QuestionAnswer`) | `pending`, `complete`, `failed`; 125 s persisted lease | `running`, `completed`, `failed` | No durable `cancelled` or `stale`; stale is only worked out when the screen renders. The lease allows a second process to start after 125 s. Fixed when F moves Ask onto D's contract after D5. |
 | Suggestions (E3, `requests`) | `pending`, `ready`, `consumed`, `failed`, `cancelled`, `invalidated` | `running`, `completed`, `completed` (applied), `failed`, `cancelled`, `stale` | Durable `cancelled` before settlement (allowed for read-only phases; see the exception above). No change. |
-| Merge attempts (C and K, `merge_attempts`) | `submitting`, `queued`, `merged`, `removed`, `failed` | `running`, `running` (external), `completed`, `failed`, `failed` | None. When the outcome is unclear, ownership is kept, as AGENTS.md requires. F6 integrates. |
+| Merge attempts (C and K, `merge_attempts`) | `submitting`, `queued`, `merged`, `removed`, `failed` | `running`, `running` (external), `completed`, and `removed`/`failed` as terminal failures for display only | **Excluded from F's generic retry and state machine.** Merge attempts keep their own states and guards in `MergeCoordinator`, including `requiresFreshReview` after `removed`. F's retry rule never applies to them, and the mapping is only for the shared UI vocabulary. When the outcome is unclear, ownership is kept, as AGENTS.md requires. F6 integrates. |
 
 ## Required race regressions for the F1 implementation
 
@@ -412,6 +412,9 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Question settling after the gate closes (review round 13) | Question running → shutdown → the abort path's `finishAnswer` writes through the capability → row `failed` with the shutdown reason; `questions.close()` resolves |
 | Hard-link alias (review round 13) | Hard-link the database to a second name → start through either name → refused |
 | First start with no database (review round 13) | Start with a missing database path → lock created → database created → identity written into the lock → a concurrent second start exits at step 1 |
+| Preparation child ignores SIGTERM (review round 14) | Clone subprocess ignores `SIGTERM` → cancel → `SIGKILL` after the grace period → `close` awaited → row `cancelled` → slot freed; shutdown completes |
+| Cancel task during a merge (review round 14) | Merge attempt `queued` → cancel task → refused; after the merge is recorded as `merged`, the task is `merged` with one `task-closed` |
+| Retry after queue removal (review round 14) | Merge attempt `removed` with `requiresFreshReview` → F's retry endpoint does not offer or accept a merge retry |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
@@ -424,7 +427,7 @@ The user approved the proposal for each of these four questions.
 
 1. Create the lock file exclusively (`O_EXCL`) at the canonical path, holding the process ID and start time. No database file is needed for this.
 2. Open (and, for a new database, create) the `Store` under the lock. Migrations run here.
-3. Read the open file's device and inode numbers and link count. Refuse a link count above 1. Write the identity into the lock file, which this process owns, by writing a temporary file and renaming it over the lock.
+3. Read the open file's device and inode numbers and link count. Refuse a link count above 1. Write the identity into the lock file **through the file descriptor opened in step 1**, and keep that descriptor open until shutdown step 8. The lock path is never replaced, so the file this process created stays the one at the path.
 4. Stat the database path again and check that it still has that identity. Exit on a mismatch.
 
 Symlink aliases therefore meet the same lock, hard-link aliases are refused, and a new database is created only while the lock is held. Take the lock at startup and release it at the end of shutdown. Accept a leftover lock file only if no live process has that ID and start time. Do not use a SQLite lease row, because lease expiry could release a live runner. |
