@@ -89,7 +89,10 @@ export class ByteCollector {
   get blockCount(): number { return this.blocks.length; }
 }
 
-const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true): InvocationHandle => {
+// `cleanup` is what recovery retries: container-level disposal by default, or profile-only disposal for a
+// rejection that happened before this profile created any container.
+const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true,
+  cleanup: (profile: ContainerProfile) => void = disposeValidatedContainer): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
   let cancelReason: StopReason | undefined;
@@ -104,7 +107,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
     if (cleaning || complete) return;
     cleaning = true;
     try {
-      disposeValidatedContainer(profile);
+      cleanup(profile);
       if (timer) clearTimeout(timer);
       timer = undefined;
       complete = true;
@@ -246,11 +249,14 @@ export function isInvocationActive(attemptId: string): boolean {
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
   assertContainerProfileAuthenticity(profile);
   const invocation = assertPhasePolicy(profile.policy);
+  // Rejections before container creation own no container, so they release (and retry) only the profile's own
+  // staging and network; a name held by another invocation or a failing inspect cannot block that.
   const rejectWithCleanup = (error: unknown, register = true): InvocationHandle => {
-    try { disposeValidatedContainer(profile); }
+    try { disposeContainerProfile(profile); }
     catch (cleanupError) {
       return retainCleanupOwnership(profile,
-        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`, register);
+        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`, register,
+        disposeContainerProfile);
     }
     throw error;
   };
@@ -259,13 +265,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       throw new Error('This container profile already owns the active invocation.');
     // This profile never created a container; the name belongs to the active invocation, so only
     // release this profile's own staging and network.
-    const error = new Error('An invocation with this attempt ID is still active.');
-    try { disposeContainerProfile(profile); }
-    catch (cleanupError) {
-      return retainCleanupOwnership(profile,
-        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`, false);
-    }
-    throw error;
+    return rejectWithCleanup(new Error('An invocation with this attempt ID is still active.'), false);
   }
   let limits: CaptureLimits, configuredTimeout: number, carriedBudget: number;
   try {

@@ -9,7 +9,8 @@ import { isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
   startProfileInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { createContainerProfile, disposeContainerProfile, type ContainerProfile } from '../agents/container/profile.ts';
+import { createContainerProfile, disposeContainerProfile, isContainerProfileAuthentic,
+  type ContainerProfile } from '../agents/container/profile.ts';
 import { disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createVendorNetwork } from '../agents/network/network.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
@@ -165,6 +166,18 @@ describe('container invocation supervisor', () => {
     const result = await startProfileInvocation(profile(fixture(), 'truncated-utf8-stderr'), { timeoutMs: 30_000 }).settled;
     expect(result.stopReason).toBe('capture-failure');
     expect(result.stderr).not.toContain('cut-');
+  }, 60_000);
+
+  it('releases only the profile when rejecting before creation, even if its name is held elsewhere', () => {
+    const current = profile(fixture(), 'noop');
+    // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
+    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
+      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+    try {
+      expect(() => startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 })).toThrow('ceiling');
+      expect(isContainerProfileAuthentic(current)).toBe(false);
+      expect(spawnSync('docker', ['container', 'inspect', current.name], { stdio: 'ignore' }).status).toBe(0);
+    } finally { spawnSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' }); }
   }, 60_000);
 
   it('blocks a duplicate attempt while the original container remains active', async () => {
