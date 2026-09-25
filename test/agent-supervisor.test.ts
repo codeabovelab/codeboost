@@ -149,7 +149,8 @@ describe('container invocation supervisor', () => {
     const started = Date.now();
     const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-timeout', 30_000), {
       timeoutMs: 3_000,
-      decode: () => new Promise(() => {}),
+      decode: (_current, _raw, _maximum, _timeout, signal) => new Promise((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(new Error('decoder aborted')), { once: true })),
     }).settled;
     expect(result.stopReason).toBe('timeout');
     expect(Date.now() - started).toBeLessThan(10_000);
@@ -200,6 +201,21 @@ describe('container invocation supervisor', () => {
     expect(() => startProfileInvocation(current, { limits: { stdoutBytes: 16 * 1024 * 1024 + 1 } }))
       .toThrow('production hard limits');
     expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it('rejects timeouts above the production ceiling and cleans the unused profile', () => {
+    const current = profile(fixture(), 'finite-output', 'invalid-timeout');
+    expect(() => startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 }))
+      .toThrow('ten-minute ceiling');
+    expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it('fails closed when deferred output is never produced', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'nonzero-output', 'missing-deferred', 2 * 60_000, true), {
+      decode: (current, _raw, maximum, timeoutMs, signal) =>
+        readCodexOutput(current.name, maximum, timeoutMs, signal),
+    });
+    expect((await handle.settled).stopReason).toBe('capture-failure');
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {

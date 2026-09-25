@@ -29,7 +29,7 @@ export interface SupervisorOptions {
   readonly timeoutMs?: number;
   readonly limits?: Partial<CaptureLimits>;
   readonly decode?: (profile: ContainerProfile, rawStdout: Buffer, maximumBytes: number,
-    timeoutMs: number) => DecodedOutput | Promise<DecodedOutput>;
+    timeoutMs: number, signal: AbortSignal) => DecodedOutput | Promise<DecodedOutput>;
 }
 export class OutputLimitError extends Error {}
 export class CaptureDeadlineError extends Error {}
@@ -93,7 +93,7 @@ const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason,
 };
 /** Read a running container's tmpfs file with a pinned no-follow bounded reader. */
 export function readBoundedContainerFile(container: string, source: string, maximumBytes: number,
-  timeoutMs = 30_000): Promise<Buffer> {
+  timeoutMs = 30_000, signal?: AbortSignal): Promise<Buffer> {
   positiveInteger(maximumBytes, 'maximumBytes');
   positiveInteger(timeoutMs, 'timeoutMs');
   if (maximumBytes > OUTPUT_LIMITS.stdoutBytes)
@@ -113,15 +113,15 @@ export function readBoundedContainerFile(container: string, source: string, maxi
     'const after=fs.fstatSync(fd,{bigint:true});if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size',
     '||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs||after.nlink!==1n',
     "||!after.isFile())throw new Error('CHANGED_FILE');",
-    "const named=fs.statSync('/proc/self/fd/'+dirfd+'/'+path.slice(directory.length+1),{bigint:true,throwIfNoEntry:false});",
-    "if(!named||named.dev!==after.dev||named.ino!==after.ino||named.nlink!==1n)throw new Error('REPLACED_FILE');",
+    "const named=fs.lstatSync('/proc/self/fd/'+dirfd+'/'+path.slice(directory.length+1),{bigint:true,throwIfNoEntry:false});",
+    "if(!named||!named.isFile()||named.dev!==after.dev||named.ino!==after.ino||named.nlink!==1n)throw new Error('REPLACED_FILE');",
     "process.stdout.write(output.subarray(0,length))}catch(error){const codes={OUTPUT_LIMIT:42,UNSAFE_FILE:43,CHANGED_FILE:44,REPLACED_FILE:45};process.exitCode=codes[error.message]||46}",
     'finally{if(fd!==undefined)fs.closeSync(fd);if(dirfd!==undefined)fs.closeSync(dirfd)}',
   ].join('');
   return new Promise((resolve, reject) => {
     execFile('docker', ['exec', container, 'node', '-e', reader, source, String(maximumBytes)], {
       env: dockerEnvironment(), timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: maximumBytes + 1,
-      encoding: 'buffer',
+      encoding: 'buffer', signal,
     }, (error, stdout, stderr) => {
       if (!error) { resolve(stdout); return; }
       if (error.code === 42) {
@@ -143,6 +143,14 @@ export function isInvocationActive(attemptId: string): boolean {
 
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
   const invocation = assertPhasePolicy(profile.policy);
+  const rejectWithCleanup = (error: unknown): InvocationHandle => {
+    try { disposeValidatedContainer(profile); }
+    catch (cleanupError) {
+      return retainCleanupOwnership(profile,
+        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`);
+    }
+    throw error;
+  };
   if (active.has(invocation.attemptId)) {
     disposeValidatedContainer(profile);
     throw new Error('An invocation with this attempt ID is still active.');
@@ -152,14 +160,14 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     limits = captureLimits(options.limits);
     configuredTimeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     positiveInteger(configuredTimeout, 'timeoutMs');
+    if (configuredTimeout > DEFAULT_TIMEOUT_MS)
+      throw new Error('timeoutMs cannot exceed the production ten-minute ceiling.');
   } catch (error) {
-    disposeValidatedContainer(profile);
-    throw error;
+    return rejectWithCleanup(error);
   }
   const now = Date.now(), deadline = Math.min(invocation.deadline, now + configuredTimeout);
   if (!Number.isSafeInteger(deadline) || deadline <= now) {
-    disposeValidatedContainer(profile);
-    throw new Error('Invocation deadline has already expired.');
+    return rejectWithCleanup(new Error('Invocation deadline has already expired.'));
   }
   const remaining = () => {
     const value = deadline - Date.now();
@@ -183,6 +191,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   let stopReason: StopReason | undefined, failureDetail: string | undefined;
   let closed = false, terminating = false, settlementComplete = false;
   let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
+  let decodeAbort: AbortController | undefined;
   let protocolToken: string | undefined;
   let protocolBuffer = Buffer.alloc(0);
   const child = spawn('docker', ['start', '--attach', profile.name], {
@@ -227,6 +236,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   const stop = (reason: StopReason) => {
     if (settlementComplete || stopReason) return;
     stopReason = reason;
+    decodeAbort?.abort();
     if (!closed) terminate();
   };
   const capture = (stream: 'stdout' | 'stderr', value: Buffer | string) => {
@@ -251,18 +261,30 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       try {
         const budget = deadline - Date.now();
         if (budget < 1) throw new CaptureDeadlineError('Invocation deadline expired before output capture.');
+        const controller = new AbortController();
+        decodeAbort = controller;
         const raw = Buffer.concat(stdoutChunks, stdoutBytes);
         const operation = Promise.resolve(options.decode!(profile, raw,
-          Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)), budget));
+          Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)),
+          budget, controller.signal));
         let decodeTimer: ReturnType<typeof setTimeout> | undefined;
         const timeout = new Promise<never>((_resolve, reject) => {
-          decodeTimer = setTimeout(() => reject(
-            new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.')), budget);
+          decodeTimer = setTimeout(() => {
+            stop('timeout');
+            reject(new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.'));
+          }, budget);
           decodeTimer.unref();
         });
         let decoded: DecodedOutput;
         try { decoded = await Promise.race([operation, timeout]); }
-        finally { if (decodeTimer) clearTimeout(decodeTimer); }
+        catch (error) {
+          controller.abort();
+          try { await operation; } catch { /* termination is confirmed by operation settlement */ }
+          throw error;
+        } finally {
+          if (decodeTimer) clearTimeout(decodeTimer);
+          if (decodeAbort === controller) decodeAbort = undefined;
+        }
         if (stopReason) return;
         const additional = decoded.additionalBytes ?? 0;
         const textBytes = Buffer.byteLength(decoded.text);
@@ -353,7 +375,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     let exitCode = code, finalSignal = signal;
     if (!stopReason && options.decode && !profile.deferredOutput) await decodeOutput();
     if (decodePromise) await decodePromise;
-    if (!stopReason && code === 0 && profile.deferredOutput && !decodedOutput) {
+    if (!stopReason && profile.deferredOutput && !decodedOutput) {
       stopReason = 'capture-failure'; failureDetail ??= 'Deferred output protocol did not complete.';
     }
     if (decodedOutput) {
