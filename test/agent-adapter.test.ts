@@ -2,7 +2,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { parseClaudeOutput, startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { CODEX_OUTPUT_FILE, startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
-import { createInvocationBudget } from '../agents/adapters/types.ts';
+import { createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { createCodexCommand, createPhasePolicy } from '../agents/policy.ts';
 
@@ -84,5 +84,13 @@ describe('production agent adapters', () => {
       expect(remaining()).toBeGreaterThan(0);
       expect(remaining()).toBeLessThanOrEqual(1_000);
     } finally { clock.mockRestore(); }
+  });
+
+  it('applies the configured timeout to the original adapter setup budget', () => {
+    const invocation = capturedInvocation('configured-budget', Date.now() + 60_000);
+    const remaining = createAdapterInvocationBudget(invocation, 250);
+    expect(remaining()).toBeGreaterThan(0);
+    expect(remaining()).toBeLessThanOrEqual(250);
+    expect(() => createAdapterInvocationBudget(invocation, 10 * 60_000 + 1)).toThrow('ten-minute ceiling');
   });
 });

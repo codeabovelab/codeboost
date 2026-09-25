@@ -4,7 +4,7 @@ import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupE
   type VendorNetwork } from '../network/network.ts';
 import { createClaudeCommand, createPhasePolicy } from '../policy.ts';
 import { retainNetworkCleanup, retainSetupCleanup, startProfileInvocation } from './supervisor.ts';
-import { createInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
+import { createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export function parseClaudeOutput(raw: Buffer): { text: string; providerFailed: boolean } {
   const envelope = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)) as
@@ -18,7 +18,7 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   oauthToken: string, options: AgentAdapterOptions = {}): InvocationHandle {
   if (!oauthToken || oauthToken.includes('\0')) throw new Error('Claude OAuth token is malformed.');
   const policy = createPhasePolicy(request.invocation);
-  const remaining = createInvocationBudget(request.invocation, 10 * 60_000);
+  const remaining = createAdapterInvocationBudget(request.invocation, options.timeoutMs);
   let network: VendorNetwork;
   try { network = createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining())); }
   catch (error) {
