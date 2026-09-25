@@ -53,6 +53,15 @@ export interface InvocationHandle {
 const nonempty = (value: unknown): value is string => typeof value === 'string' && value.length > 0 && !value.includes('\0');
 const integer = (value: unknown): value is number => Number.isSafeInteger(value) && (value as number) >= 0;
 
+const capturedInvocations = new WeakSet<InvocationInput>();
+// One capture per attempt: an existing request cannot be re-captured with an upgraded phase, deadline or allowlist.
+const capturedAttempts = new Set<string>();
+
+/** Authenticate a request produced by captureInvocation, so a copied or edited request cannot pass. */
+export function assertCapturedInvocation(input: InvocationInput): void {
+  if (!capturedInvocations.has(input)) throw new Error('Invocation was not captured by the trusted capture boundary.');
+}
+
 /** Capture a deep immutable request so caller edits cannot change an active run. */
 export function captureInvocation(input: InvocationInput, now = Date.now()): InvocationInput {
   if (!input || !input.clone || !input.context) throw new Error('Missing invocation context.');
@@ -71,8 +80,13 @@ export function captureInvocation(input: InvocationInput, now = Date.now()): Inv
     throw new Error('Commands must be complete literal argv arrays.');
   if (['planning', 'questions'].includes(input.phase) && input.approvedArgv.length)
     throw new Error('Read-only authoring and questions cannot execute commands.');
-  return Object.freeze({ ...input, clone: Object.freeze({ ...input.clone }), context: Object.freeze({ ...context }),
+  if (capturedAttempts.has(input.attemptId))
+    throw new Error('Attempt was already captured; a new invocation requires a new attempt identity.');
+  const captured = Object.freeze({ ...input, clone: Object.freeze({ ...input.clone }), context: Object.freeze({ ...context }),
     approvedArgv: Object.freeze(input.approvedArgv.map(argv => Object.freeze([...argv]))) });
+  capturedInvocations.add(captured);
+  capturedAttempts.add(captured.attemptId);
+  return captured;
 }
 
 /** Dispatcher predicate, not a sandbox. An adapter must enforce this externally. */

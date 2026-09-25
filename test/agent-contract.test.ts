@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'vitest';
 import { captureInvocation, permitsCommand, type InvocationInput } from '../agents/contract.ts';
 
+let attempt = 0;
 const request = (): InvocationInput => ({
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tasks/one', head: 'a'.repeat(40) },
-  vendor: 'codex', phase: 'review', approvedArgv: [['npm', 'test']], deadline: 2000, attemptId: 'attempt-1',
+  vendor: 'codex', phase: 'review', approvedArgv: [['npm', 'test']], deadline: 2000, attemptId: `attempt-${++attempt}`,
   context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
     referencedCodeHash: 'hash-1', stateVersion: 3 },
 });
@@ -38,6 +39,12 @@ describe('invocation boundary', () => {
     expect(() => captureInvocation({ ...request(), context: { ...request().context, stateVersion: -1 } }, 1000)).toThrow('context');
     expect(() => captureInvocation({ ...request(), phase: 'shell' } as unknown as InvocationInput, 1000)).toThrow('profile');
     expect(() => captureInvocation({ ...request(), attemptId: '' }, 1000)).toThrow('identity');
+  });
+  it('refuses to re-capture an attempt with an upgraded phase, deadline or allowlist', () => {
+    const review = captureInvocation(request(), 1000);
+    expect(() => captureInvocation({ ...review, phase: 'execute', deadline: 5000,
+      approvedArgv: [['sh', '-c', 'anything']] }, 1000)).toThrow('already captured');
+    expect(() => captureInvocation({ ...review }, 1000)).toThrow('already captured');
   });
   it('rejects sparse allowlists with missing arguments or commands', () => {
     const argv = ['npm', 'test']; delete argv[1];
