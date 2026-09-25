@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -7,7 +7,8 @@ import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 const publicRoot = new URL('./public/', import.meta.url);
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway) {
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500) {
+  if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > 14_500) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null;
   try {
@@ -15,12 +16,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     questions=new Questions(service,questionAgent);
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
   } catch (error) { service.close(); throw error; }
-  const load=async()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)})),merge:merges?await merges.displayStatus(view):{available:false}};};
+  const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
+  const load=async(signal?:AbortSignal)=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   let stopping = false;
+  const activeRequests=new Set<{abort:AbortController;request:IncomingMessage;readingBody:boolean}>();
   const server = createServer(async (req, res) => {
+    const requestAbort=new AbortController(),activeRequest={abort:requestAbort,request:req,readingBody:false};activeRequests.add(activeRequest);
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -32,26 +36,29 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (path.startsWith('/api/')) {
         const supplied = req.headers['x-codeboost-token'];
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
-        if (stopping && req.method === 'POST') { json(503, { error: 'The review server is shutting down.' }); return; }
+        if (stopping) { json(503, { error: 'The review server is shutting down.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
-        if (req.method === 'GET' && path === '/api/review') { json(200, await load()); return; }
+        if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
+        if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
-        for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
+        activeRequest.readingBody=true;
+        try { for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
+        finally { activeRequest.readingBody=false; }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
-          questions.start(input.id,view);json(200,await load());return;
+          questions.start(input.id,view);json(200,await load(requestAbort.signal));return;
         }
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
           const merged=await merges.merge(input.token);
-          try { json(200,{...(await load()),mergeResult:merged.result,mergeRefreshRequired:false}); }
-          catch { json(200,{mergeResult:merged.result,mergeRefreshRequired:true}); }
+          try { const mergeQueue=merges.queueSnapshot();json(200,{...loadReview(),merge:{...merged.status,queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
+          catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
         }
         const view=service.act(input);
@@ -60,7 +67,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             // The saved question remains visible and retryable when capacity is reached.
           }
         }
-        json(200,await load());return;
+        json(200,await load(requestAbort.signal));return;
       }
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
@@ -73,6 +80,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }
       json(404, { error: 'Not found.' });
     } catch (error) { json(409, { error: error instanceof Error ? error.message : 'Review failed.' }); }
+    finally {activeRequests.delete(activeRequest);}
   });
   server.requestTimeout = 15000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
@@ -80,6 +88,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   return { server, service, token, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     stopping = true;
     const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([closing, new Promise<void>(resolve => { timer=setTimeout(resolve,shutdownDrainMs); })]);
+    if(timer)clearTimeout(timer);
+    for(const active of activeRequests) {
+      const reason=new Error('Request cancelled during shutdown.');
+      active.abort.abort(reason);
+      if(active.readingBody)active.request.destroy(reason);
+    }
     await merges?.close();
     await closing;
     await questions.close();

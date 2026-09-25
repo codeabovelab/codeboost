@@ -14,7 +14,9 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Validate retry context against the current snapshot, plan revision, assignment, and referenced code. If any context is stale, disable retry and require a new request.
 - Preserve the original timeout, cancellation, and shutdown reason through every layer. Do not replace actionable errors with generic cancellation text.
 - Begin shutdown by rejecting new work at the outer admission boundary. Drain already-admitted HTTP requests, then cancel and await jobs, then close storage.
+- Bound the HTTP drain during shutdown. After its grace period, abort and await owned work before awaiting server closure so an admitted poll cannot deadlock teardown.
 - Polling endpoints should read only the state they need. Do not rebuild Git history or the full review merely to retrieve background-job status.
+- Back off recurring external-status polling to a bounded cap. Reset the interval only after a meaningful lifecycle change or explicit user action.
 
 ## Async review UI
 
@@ -74,6 +76,10 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - A deadline must abort and await the underlying operation before releasing its in-flight ownership; rejecting only the caller can leave untracked work running.
 - Invalidate pre-action status caches after both successful and refused external mutations before rendering or fetching status again. Use a generation guard so reads started before or during the mutation cannot repopulate the cache afterward.
 - Keep irreversible integrations disabled in demo mode even when configuration or an injected dependency is present. After a stale or refused irreversible action, keep its control disabled until fresh state is loaded.
+- When a durable external-action attempt is bound to an older snapshot, require approvals or evidence recorded against the replacement generation before another action, whether or not the prior outcome explicitly requested fresh review. A mismatch with the old context is not itself fresh review.
+- If the external lifecycle mechanism or mode changes between validation passes, abort before the irreversible command. Create durable lifecycle ownership from the final stable mode, never from an earlier observation.
+- When an irreversible command has an ambiguous timeout, cancellation, transport, or unknown outcome, retain durable in-flight ownership and reconcile external state before enabling retry. Only a confirmed refusal may become retryable failure.
+- Correlate retry observations to the current attempt with an immutable external identity or event boundary, and fail closed when multiple post-boundary action sequences appear. Matching only the resource or commit identity can replay another attempt's terminal event.
 
 ## Blinded experiments
 

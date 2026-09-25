@@ -8,7 +8,7 @@ import { createDemo } from '../../scripts/demo.ts';
 import { choiceKeys } from '../../core/approvals.ts';
 import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
-import type { MergeGateway } from '../../github/merge.ts';
+import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
 function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
@@ -49,13 +49,78 @@ test('shows merge blockers and submits one exact-head merge',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let mergeCalls:string[]=[];let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  const gateway:MergeGateway={
   inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},
-  merge:async head=>{mergeCalls.push(head);await held;app.service.load=()=>{throw new Error('post-command reload failed');};return {url:'https://github.com/example/repo/pull/21'};},
+  merge:async head=>{mergeCalls.push(head);await held;app.service.load=()=>{throw new Error('post-command reload failed');};app.service.store.getMergeAttempt=()=>{throw new Error('post-command queue read failed');};return {url:'https://github.com/example/repo/pull/21'};},
  };
  app=await startServer(config,0,undefined,gateway);await page.goto(app.url);
  await expect(page.locator('#merge')).toBeDisabled();await page.getByRole('button',{name:'Review blockers'}).click();await expect(page.getByRole('heading',{name:'Merge blockers'})).toBeVisible();await expect(page.getByText(/is unreviewed/).first()).toBeVisible();await page.screenshot({path:'test-results/merge-blockers.png',fullPage:true});await page.getByRole('button',{name:'Close',exact:true}).click();
  let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();const expectedHead=view.snapshot.head;await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();page.on('dialog',dialog=>dialog.accept());
  await page.locator('#merge').evaluate((button:HTMLButtonElement)=>{button.click();button.click();});await expect.poll(()=>mergeCalls.length).toBe(1);await expect(page.locator('#merge')).toBeDisabled();release();await expect(page.locator('#banner')).toContainText('Merge submitted.');await expect(page.locator('#merge')).toBeDisabled();await page.locator('#merge').evaluate((button:HTMLButtonElement)=>button.click());expect(mergeCalls).toEqual([expectedHead]);
+});
+test('keeps the reviewed head queued until confirmed merged and preserves current input',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,phase:'queued'|'merged'='queued',queueReads=0;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  queueWatermark:async()=>null,
+  merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
+  inspectQueue:async head=>{queueReads++;return phase==='queued'?{state:'queued',reviewedHead:head,entryId:'MQE_1',phase:'AWAITING_CHECKS',position:2,enqueuedAt:'2026-09-24T08:00:00Z',queueHead:head}:{state:'merged',reviewedHead:head,mergedAt:'2026-09-24T08:10:00Z'};},
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByLabel('Question about this item').fill('Keep this draft while polling.');page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();
+ await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();await expect(page.getByLabel('Question about this item')).toHaveValue('Keep this draft while polling.');await expect.poll(()=>queueReads).toBeGreaterThan(0);
+ phase='merged';await expect(page.getByRole('button',{name:'Merged',exact:true})).toBeDisabled({timeout:10000});await expect(page.locator('#banner')).toContainText('GitHub confirmed the reviewed head was merged.');await expect(page.getByRole('heading',{name:'Document retry behavior'})).toBeVisible();await expect(page.getByLabel('Question about this item')).toHaveValue('Keep this draft while polling.');
+});
+test('backs off repeated merge-queue polling',async({page})=>{
+ await page.addInitScript(()=>{const delays:number[]=[];(window as typeof window&{__mergePollDelays:number[]}).__mergePollDelays=delays;const native=window.setTimeout.bind(window);window.setTimeout=((handler:TimerHandler,timeout?:number,...args:unknown[])=>{if(typeof timeout==='number')delays.push(timeout);return native(handler,timeout,...args);}) as typeof window.setTimeout;});
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,queueReads=0;
+ const gateway:MergeGateway&MergeQueueGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},queueWatermark:async()=>null,merge:async()=>({url:'https://github.com/example/repo/pull/24'}),inspectQueue:async head=>{queueReads++;return{state:'queued',reviewedHead:head,entryId:'MQE_1',phase:'QUEUED',position:1,enqueuedAt:'2026-09-24T08:00:00Z',queueHead:head};}};
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>queueReads,{timeout:10000}).toBeGreaterThanOrEqual(2);
+ const delays=await page.evaluate(()=>(window as typeof window&{__mergePollDelays:number[]}).__mergePollDelays.filter(value=>value>=500));expect(delays.slice(0,2)).toEqual([2000,4000]);
+});
+test('does not queue-poll an ambiguous direct merge attempt',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,polls=0;
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>({url:''})};
+ app=appRef=await startServer(config,0,undefined,gateway);const view=app.service.load();app.service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head,null,'direct');
+ await page.route('**/api/merge',async route=>{polls++;await route.continue();});await page.goto(app.url);await expect(page.getByRole('button',{name:'Submitting…',exact:true})).toBeDisabled();await page.waitForTimeout(2500);expect(polls).toBe(0);
+});
+test('surfaces queue removal and retries only the same reviewed head',async({page})=>{
+ test.slow();
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,mergeCalls=0;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  queueWatermark:async()=>null,
+  merge:async()=>{mergeCalls++;return {url:'https://github.com/example/repo/pull/24'};},
+  inspectQueue:async head=>mergeCalls===1?{state:'removed',reviewedHead:head,removedAt:'2026-09-24T08:05:00Z',reason:'Required check failed.'}:{state:'queued',reviewedHead:head,entryId:'MQE_2',phase:'QUEUED',position:1,enqueuedAt:'2026-09-24T08:06:00Z',queueHead:head},
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('Refresh to verify retry readiness.',{timeout:10000});await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toHaveCount(0);await expect(page.locator('#merge')).toBeDisabled();await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();await expect.poll(()=>mergeCalls).toBe(2);await expect(page.getByRole('button',{name:'Merge queued',exact:true})).toBeDisabled();expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({state:'queued',reviewedHead:view.snapshot.head});
+});
+test('ignores a merge poll started before a newer review action',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  queueWatermark:async()=>null,
+  merge:async()=>({url:'https://github.com/example/repo/pull/24'}),
+  inspectQueue:async head=>({state:'removed',reviewedHead:head,removedAt:'2026-09-24T08:05:00Z',reason:'Old poll result.'}),
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ let release!:()=>void,releaseNew!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>release=resolve),heldNew=new Promise<void>(resolve=>releaseNew=resolve),started=new Promise<void>(resolve=>arrived=resolve);let polls=0;
+ await page.route('**/api/merge',async route=>{polls++;if(polls===1){arrived();await held;await route.fulfill({status:200,contentType:'application/json',body:JSON.stringify({queue:{state:'removed',reviewedHead:view.snapshot.head,url:null,reason:'Old poll result.',phase:null,position:null,occurredAt:'2026-09-24T08:05:00Z',retryable:true}})});return;}await heldNew;await route.continue();});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await started;
+ await page.getByRole('button',{name:'Request change',exact:true}).click();await page.getByLabel('Change to request').fill('New review decision.');await page.getByRole('button',{name:'Save change request'}).click();await expect(page.getByText('New review decision.',{exact:true})).toBeVisible();
+ const staleResponse=page.waitForResponse(response=>response.url().endsWith('/api/merge'));release();try{await staleResponse;await page.waitForTimeout(100);await expect(page.locator('#banner')).not.toContainText('Old poll result.');await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toHaveCount(0);await expect(page.locator('#merge')).toBeDisabled();}finally{releaseNew();}
+});
+test('requires fresh review instead of retry when GitHub replaces the queued head',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;
+ const gateway:MergeGateway&MergeQueueGateway={
+  inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
+  queueWatermark:async()=>null,
+  merge:async()=>({url:'https://github.com/example/repo/pull/24'}),inspectQueue:async()=>{throw new Error('The pull request head changed after review.');},
+ };
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect(page.locator('#banner')).toContainText('The pull request head changed after review.',{timeout:10000});await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toHaveCount(0);await expect(page.locator('#merge')).toBeDisabled();
 });
 test('keeps stale merge failures disabled until refresh',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app;const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('head changed');}};app=appRef=await startServer(config,0,undefined,gateway);
@@ -382,6 +447,37 @@ test('drains an in-flight question request before closing its agent manager',asy
   expect(calls).toBe(1);expect(note?.answer?.status).toBe('failed');expect(note?.answer?.error).toMatch(/Server stopped/);
   expect(JSON.parse(response).notes.some((candidate:{text:string})=>candidate.text==='Question during shutdown')).toBe(true);
  } finally {reopened.close();app=await startServer(config,0);}
+});
+test('drains an admitted merge request before closing its coordinator',async()=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,started!:(value?:void)=>void,release!:(value?:void)=>void,commandSignal:AbortSignal|undefined;
+ const commandStarted=new Promise<void>(resolve=>{started=resolve;}),held=new Promise<void>(resolve=>{release=resolve;});
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async(_head,options)=>{commandSignal=options?.signal;started();await held;return {url:'https://github.com/example/repo/pull/24'};}};
+ app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'merge',token:view.token});let status=0;
+ const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.resume();res.on('end',resolve);});req.on('error',reject);req.end(body);});
+ await commandStarted;const closing=app.close();await new Promise(resolve=>setTimeout(resolve,25));expect(commandSignal?.aborted).toBe(false);release();await Promise.all([closing,completed]);expect(status).toBe(200);app=await startServer(config,0);
+});
+test('bounds shutdown draining before aborting active queue polling',async()=>{
+ const config={...app.service.config,demo:false};await app.close();let appRef:typeof app,started!:(value?:void)=>void,settled=false;
+ const pollingStarted=new Promise<void>(resolve=>{started=resolve;});
+ const gateway:MergeGateway&MergeQueueGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},queueWatermark:async()=>null,merge:async()=>({url:'https://github.com/example/repo/pull/24'}),inspectQueue:async(_head,options)=>new Promise<never>((_resolve,reject)=>{started();options?.signal?.addEventListener('abort',()=>{settled=true;reject(options.signal?.reason);},{once:true});})};
+ app=appRef=await startServer(config,0,undefined,gateway,50);const view=app.service.load(),attempt=app.service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);app.service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.com/example/repo/pull/24');
+ const response=fetch(new URL('/api/merge',app.url),{headers:{'x-codeboost-token':app.token}});await pollingStarted;await app.close();expect(settled).toBe(true);expect((await response).status).toBe(409);app=await startServer(config,0);
+});
+test('aborts an admitted review status inspection after the shutdown drain',async()=>{
+ const config={...app.service.config,demo:false};await app.close();let started!:(value?:void)=>void,settled=false;const inspectionStarted=new Promise<void>(resolve=>{started=resolve;});
+ const gateway:MergeGateway={inspect:async options=>new Promise<never>((_resolve,reject)=>{started();options?.signal?.addEventListener('abort',()=>{settled=true;reject(options.signal?.reason);},{once:true});}),merge:async()=>({url:''})};
+ app=await startServer(config,0,undefined,gateway,50);const response=fetch(new URL('/api/review',app.url),{headers:{'x-codeboost-token':app.token}});await inspectionStarted;await app.close();expect(settled).toBe(true);expect((await response).status).toBe(409);app=await startServer(config,0);
+});
+test('destroys a partial request body after the shutdown drain',async()=>{
+ const config=app.service.config;await app.close();app=await startServer(config,0,undefined,undefined,50);
+ const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'note'});
+ let admitted!:(value?:void)=>void;const requestAdmitted=new Promise<void>(resolve=>{admitted=resolve;});
+ const completed=new Promise<'response'|'error'>(resolve=>{
+  const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{res.resume();res.on('end',()=>resolve('response'));});
+  req.on('error',()=>resolve('error'));req.write(body.slice(0,1),()=>admitted());
+ });
+ await requestAdmitted;const started=Date.now();await app.close();expect(Date.now()-started).toBeLessThan(1000);expect(await completed).toBe('error');app=await startServer(config,0);
 });
 test('blocks a partially received merge request when shutdown starts',async()=>{
  const config={...app.service.config,demo:false};await app.close();let mergeCalls=0;let appRef:typeof app;
