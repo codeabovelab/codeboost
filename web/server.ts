@@ -1,4 +1,4 @@
-import { createServer } from 'node:http';
+import { createServer, type IncomingMessage } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
@@ -22,9 +22,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   let stopping = false;
-  const activeRequests=new Set<AbortController>();
+  const activeRequests=new Set<{abort:AbortController;request:IncomingMessage}>();
   const server = createServer(async (req, res) => {
-    const requestAbort=new AbortController();activeRequests.add(requestAbort);
+    const requestAbort=new AbortController(),activeRequest={abort:requestAbort,request:req};activeRequests.add(activeRequest);
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -78,7 +78,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }
       json(404, { error: 'Not found.' });
     } catch (error) { json(409, { error: error instanceof Error ? error.message : 'Review failed.' }); }
-    finally {activeRequests.delete(requestAbort);}
+    finally {activeRequests.delete(activeRequest);}
   });
   server.requestTimeout = 15000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
@@ -89,7 +89,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([closing, new Promise<void>(resolve => { timer=setTimeout(resolve,shutdownDrainMs); })]);
     if(timer)clearTimeout(timer);
-    for(const controller of activeRequests)controller.abort(new Error('Request cancelled during shutdown.'));
+    for(const active of activeRequests) {
+      const reason=new Error('Request cancelled during shutdown.');
+      active.abort.abort(reason);
+      active.request.destroy(reason);
+    }
     await merges?.close();
     await closing;
     await questions.close();

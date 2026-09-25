@@ -165,7 +165,7 @@ async function pollMergeQueue(generation) {
       data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` }] };
       $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
     } else if (queue?.observationError) {
-      $("banner").textContent = `Merge remains queued. ${queue.observationError}`;
+      $("banner").textContent = `${queue.state === "submitting" ? "Merge submission status is unknown" : "Merge remains queued"}. ${queue.observationError}`;
     } else if (queue?.state === "queued") {
       $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
     }

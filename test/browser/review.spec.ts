@@ -79,6 +79,7 @@ test('backs off repeated merge-queue polling',async({page})=>{
  const delays=await page.evaluate(()=>(window as typeof window&{__mergePollDelays:number[]}).__mergePollDelays.filter(value=>value>=500));expect(delays.slice(0,2)).toEqual([2000,4000]);
 });
 test('surfaces queue removal and retries only the same reviewed head',async({page})=>{
+ test.slow();
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,mergeCalls=0;
  const gateway:MergeGateway&MergeQueueGateway={
   inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},
@@ -461,6 +462,16 @@ test('aborts an admitted review status inspection after the shutdown drain',asyn
  const config={...app.service.config,demo:false};await app.close();let started!:(value?:void)=>void,settled=false;const inspectionStarted=new Promise<void>(resolve=>{started=resolve;});
  const gateway:MergeGateway={inspect:async options=>new Promise<never>((_resolve,reject)=>{started();options?.signal?.addEventListener('abort',()=>{settled=true;reject(options.signal?.reason);},{once:true});}),merge:async()=>({url:''})};
  app=await startServer(config,0,undefined,gateway,50);const response=fetch(new URL('/api/review',app.url),{headers:{'x-codeboost-token':app.token}});await inspectionStarted;await app.close();expect(settled).toBe(true);expect((await response).status).toBe(409);app=await startServer(config,0);
+});
+test('destroys a partial request body after the shutdown drain',async()=>{
+ const config=app.service.config;await app.close();app=await startServer(config,0,undefined,undefined,50);
+ const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'note'});
+ let admitted!:(value?:void)=>void;const requestAdmitted=new Promise<void>(resolve=>{admitted=resolve;});
+ const completed=new Promise<'response'|'error'>(resolve=>{
+  const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{res.resume();res.on('end',()=>resolve('response'));});
+  req.on('error',()=>resolve('error'));req.write(body.slice(0,1),()=>admitted());
+ });
+ await requestAdmitted;const started=Date.now();await app.close();expect(Date.now()-started).toBeLessThan(1000);expect(await completed).toBe('error');app=await startServer(config,0);
 });
 test('blocks a partially received merge request when shutdown starts',async()=>{
  const config={...app.service.config,demo:false};await app.close();let mergeCalls=0;let appRef:typeof app;

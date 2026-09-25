@@ -227,7 +227,7 @@ export class MergeCoordinator {
         this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'failed', reason: message, requiresFreshReview: true });
         return this.#queueStatus();
       }
-      return this.#queueStatus(undefined, message);
+      return this.#queueStatus(attempt, message);
     }
   }
 

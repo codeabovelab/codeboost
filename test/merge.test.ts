@@ -322,6 +322,19 @@ it('keeps retry disabled while a prior queue attempt is active', async () => {
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('keeps an active queue attempt visible when inspection fails', async () => {
+  const h = queueHarness([new Error('GitHub queue status unavailable.')]);
+  try {
+    await h.coordinator.merge(h.view().token);
+    await expect(h.coordinator.pollQueue()).resolves.toMatchObject({
+      state: 'queued',
+      reviewedHead: sha('b'),
+      observationError: 'GitHub queue status unavailable.',
+    });
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'queued', reviewedHead: sha('b') });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('aborts and awaits an active queue inspection during shutdown', async () => {
   const h = queueHarness([]);
   let settled = false;
