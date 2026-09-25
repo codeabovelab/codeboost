@@ -45,8 +45,8 @@ describe('isolation gate detects breaches', () => {
       [...bounded, ...writableMetadata, ...boundedScratch], 'isolation breach: sh -c printf x >> /tmp/config-alias'],
     ['a writable worktree in a read-only phase', 'planning', 'read-only-isolation',
       [...bounded, ...writableMetadata, ...boundedScratch], 'isolation breach: touch /work/forbidden'],
-    ['a writable worktree for the phase probe', 'review', 'phase-worktree',
-      [...bounded, ...writableMetadata, ...boundedScratch], 'isolation breach: touch /work/review.txt'],
+    ['writable Git metadata under alias attacks in a read-only phase', 'planning', 'metadata-alias',
+      [...bounded, ...writableMetadata, ...boundedScratch], 'isolation breach: sh -c printf x >> /tmp/config-alias'],
     ['an unbounded task filesystem', 'execute', 'capacity',
       [...tmpfs('/work', 'size=256m'), ...writableMetadata, ...boundedScratch],
       'isolation breach: dd if=/dev/zero of=/work/overflow'],
@@ -57,6 +57,29 @@ describe('isolation gate detects breaches', () => {
       [...bounded, ...writableMetadata, ...tmpfs('/tmp', 'size=256m')], 'isolation breach: dd if=/dev/zero of=/tmp/overflow'],
   ] as const)('fails the probe for %s', (_label, phase, probe, mounts, breach) => {
     const result = runBroken(mounts, probeScript(phase, probe));
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain(breach);
+  }, 180_000);
+
+  it.each(['planning', 'questions', 'review'] as const)('fails the phase probe for a writable worktree in %s', phase => {
+    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch], probeScript(phase, 'phase-worktree'));
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain(`isolation breach: touch /work/${phase}.txt`);
+  }, 120_000);
+
+  // Codex-only scratch areas are checked only in a Codex container, so these cases supply that environment and make
+  // exactly one Codex area unbounded.
+  const codexEnvironment = ['--env', 'CODEBOOST_VENDOR=codex', '--env', 'CODEX_HOME=/run/codeboost-auth/codex'];
+  const codexHome = (options: string) => tmpfs('/run/codeboost-auth/codex', `${options},mode=0700`);
+  const codexOutput = (options: string) => tmpfs('/run/codeboost-output', `${options},mode=0700`);
+  it.each([
+    ['CODEX_HOME', [...codexHome('size=256m'), ...codexOutput('size=20m,nr_inodes=64')],
+      'isolation breach: dd if=/dev/zero of=/run/codeboost-auth/codex/overflow'],
+    ['Codex output directory', [...codexHome('size=4m,nr_inodes=256'), ...codexOutput('size=256m')],
+      'isolation breach: dd if=/dev/zero of=/run/codeboost-output/overflow'],
+  ] as const)('fails the scratch probe for an unbounded %s', (_label, codexMounts, breach) => {
+    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch, ...codexMounts],
+      probeScript('execute', 'scratch-capacity'), codexEnvironment);
     expect(result.status, result.stderr).not.toBe(0);
     expect(result.stderr).toContain(breach);
   }, 180_000);
