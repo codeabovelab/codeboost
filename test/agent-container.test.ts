@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
-import { assertContainerProfile, createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
+import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
+  isContainerProfileAuthentic } from '../agents/container/profile.ts';
 import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer, startValidatedContainer,
   hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
@@ -272,6 +273,7 @@ describe('real Docker agent isolation', () => {
     docker(...first.args); containers.add(first.name);
     expect(() => createValidatedContainer(duplicate)).toThrow('Container creation failed and cleanup did not settle.');
     expect(existsSync(duplicate.codexAuthFile!)).toBe(true);
+    expect(isContainerProfileAuthentic(duplicate)).toBe(true);
     const state = JSON.parse(docker('container', 'inspect', first.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', first.name); containers.delete(first.name);

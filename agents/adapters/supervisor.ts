@@ -2,7 +2,8 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
-import { assertContainerProfileAuthenticity, type ContainerProfile } from '../container/profile.ts';
+import { assertContainerProfileAuthenticity, isContainerProfileAuthentic,
+  type ContainerProfile } from '../container/profile.ts';
 import { removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
 
 export const OUTPUT_LIMITS = Object.freeze({
@@ -256,6 +257,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   try {
     createValidatedContainer(profile, remaining(), options.secrets ?? {});
   } catch (error) {
+    if (!isContainerProfileAuthentic(profile)) throw error;
     try { disposeValidatedContainer(profile); }
     catch (cleanupError) {
       const detail = `Container validation failed and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`;
@@ -510,8 +512,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   child.once('close', async (code, signal) => {
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
-    if (!stopReason && performance.now() >= deadline) stopReason = 'timeout';
     closed = true;
+    if (!stopReason && performance.now() >= deadline) stop('timeout');
     if (protocolBuffer.length) {
       if (!protocolLine(protocolBuffer)) capture('stderr', protocolBuffer, true);
       protocolBuffer = Buffer.alloc(0);

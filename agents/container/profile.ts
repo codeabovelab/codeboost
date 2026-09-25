@@ -132,6 +132,10 @@ export function assertContainerProfileAuthenticity(profile: ContainerProfile): v
   if (!identities.has(profile)) throw new Error('Container profile was not created by the trusted profile builder.');
 }
 
+export function isContainerProfileAuthentic(profile: ContainerProfile): boolean {
+  return identities.has(profile);
+}
+
 /** Internal authenticity and host-file revalidation used at every launch boundary. */
 export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000): void {
   const expected = identities.get(profile);
@@ -147,10 +151,6 @@ export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30
     const auth = captureFile(expected.auth.path, 'Codex auth');
     if (!sameFile(auth, expected.auth)) throw new Error('Codex auth changed after the profile was captured.');
   }
-}
-
-export function isContainerProfileAuthentic(profile: ContainerProfile): boolean {
-  return identities.has(profile);
 }
 
 /** Clamp a Docker budget to the captured invocation deadline, which no launch may outlive. */
