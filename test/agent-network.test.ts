@@ -1,5 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS,
@@ -27,6 +30,19 @@ beforeAll(() => {
 afterAll(() => removeVendorNetwork(network), 60_000);
 
 describe('vendor-only egress', () => {
+  it('keeps failed allocation and its cleanup inside the caller deadline', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-'));
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // Every network operation hangs, so both setup and cleanup can only end by deadline.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = network ]; then exec sleep 30; fi',
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH, started = performance.now();
+    process.env.PATH = `${shim}:${path}`;
+    try { expect(() => createVendorNetwork(invocation, imageId, 3_000)).toThrow(); }
+    finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    expect(performance.now() - started).toBeLessThan(6_000);
+  }, 60_000);
+
   it('pins the host list with each vendor profile', () => {
     expect(VENDOR_HOSTS).toEqual({ claude: ['api.anthropic.com'], codex: ['api.openai.com', 'chatgpt.com'] });
     expect(Object.isFrozen(VENDOR_HOSTS.claude)).toBe(true);

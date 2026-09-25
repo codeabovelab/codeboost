@@ -119,7 +119,9 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   timeoutMs = 60_000): VendorNetwork {
   assertBuiltAgentImage(imageId);
   const vendor = invocation.vendor;
-  const remaining = deadline(timeoutMs), allocationId = randomUUID();
+  // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
+  const overall = deadline(timeoutMs), cleanupReserve = Math.min(10_000, Math.floor(timeoutMs / 3));
+  const remaining = deadline(Math.max(1, timeoutMs - cleanupReserve)), allocationId = randomUUID();
   const name = `codeboost-egress-${vendor}-${randomUUID()}`;
   const proxyContainer = `codeboost-proxy-${vendor}-${randomUUID()}`;
   const subnetSeed = randomUUID().replaceAll('-', '');
@@ -155,9 +157,9 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   } catch (error) {
     const failures: unknown[] = [];
     if (proxyPlanned) try { remove(['rm', '--force', proxyContainer], ['container', 'inspect', proxyContainer],
-      deadline(30_000), 'vendor proxy', allocationId); } catch (cleanupError) { failures.push(cleanupError); }
+      overall, 'vendor proxy', allocationId); } catch (cleanupError) { failures.push(cleanupError); }
     if (networkPlanned) try { remove(['network', 'rm', name], ['network', 'inspect', name],
-      deadline(30_000), 'vendor network', allocationId); } catch (cleanupError) { failures.push(cleanupError); }
+      overall, 'vendor network', allocationId); } catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError([error, ...failures], 'Vendor network creation and cleanup failed.');
     throw error;
   }

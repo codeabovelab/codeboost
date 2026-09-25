@@ -372,6 +372,14 @@ describe('real Docker agent isolation', () => {
       inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId })).toThrow('captured');
   }, 60_000);
 
+  it('removes the claimed vendor network when profile creation fails after the claim', () => {
+    const data = fixture();
+    expect(() => profile(data, 'planning', 'noop', { codexAuthFile: join(data.root, 'missing-auth.json') })).toThrow();
+    const orphan = vendorNetworks.at(-1)!;
+    expect(spawnSync('docker', ['network', 'inspect', orphan.name], { stdio: 'ignore' }).status).not.toBe(0);
+    expect(spawnSync('docker', ['container', 'inspect', orphan.proxyContainer], { stdio: 'ignore' }).status).not.toBe(0);
+  }, 60_000);
+
   it('refuses a Codex auth path that is a link without resolving it', () => {
     const data = fixture(), link = join(data.root, 'auth-link.json');
     symlinkSync(data.fakeAuth, link);
@@ -515,7 +523,9 @@ describe('real Docker agent isolation', () => {
       docker('rm', '--force', authProfile.name); containers.delete(authProfile.name);
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
-      expect(envelope.result).toContain('codeboost-schema-marker');
+      // Tolerate one wrapping pair of backticks or quotes, but nothing else around the value.
+      const value = envelope.result?.trim().replace(/^(`+|"|')([^]*)\1$/, '$2').trim();
+      expect(value).toBe('codeboost-schema-marker');
     }, 6 * 60_000);
   }
 });

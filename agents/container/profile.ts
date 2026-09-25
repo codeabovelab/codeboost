@@ -169,22 +169,24 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   assertTaskFilesystems(filesystems, invocation.clone);
   assertVendorNetwork(options.network, invocation);
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
-  assertPhasePolicy(options.policy, invocation);
-  const command = assertAgentCommand(options.command, options.policy, invocation.vendor);
-  const sourceInput = captureInput(options.inputDirectory);
-  if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
-    throw new Error('Codex requires only its auth file.');
-  if (invocation.vendor === 'claude' && (!options.claudeToken || options.codexAuthFile))
-    throw new Error('Claude requires only its OAuth token.');
-  if (options.claudeToken?.includes('\0')) throw new Error('Claude OAuth token is malformed.');
-  if (!/^codeboost-work-[0-9a-f-]+$/.test(filesystems.workVolume)
-    || !/^codeboost-metadata-[0-9a-f-]+$/.test(filesystems.metadataVolume)
-    || !/^codeboost-keeper-[0-9a-f-]+$/.test(filesystems.keeper)) throw new Error('Task filesystem identity is invalid.');
-  // Read through one no-follow descriptor so the path cannot be swapped between check and open.
-  const sourceAuth = options.codexAuthFile ? readCapturedFile(options.codexAuthFile, 'Codex auth') : undefined;
+  // Own the network from here on, so any later failure removes it rather than leaking it.
+  claimedNetworks.add(options.network);
   const cleanupDirectories: string[] = [];
   let codexAuthFile: string | undefined, authIdentity: FileIdentity | undefined;
   try {
+    assertPhasePolicy(options.policy, invocation);
+    const command = assertAgentCommand(options.command, options.policy, invocation.vendor);
+    const sourceInput = captureInput(options.inputDirectory);
+    if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
+      throw new Error('Codex requires only its auth file.');
+    if (invocation.vendor === 'claude' && (!options.claudeToken || options.codexAuthFile))
+      throw new Error('Claude requires only its OAuth token.');
+    if (options.claudeToken?.includes('\0')) throw new Error('Claude OAuth token is malformed.');
+    if (!/^codeboost-work-[0-9a-f-]+$/.test(filesystems.workVolume)
+      || !/^codeboost-metadata-[0-9a-f-]+$/.test(filesystems.metadataVolume)
+      || !/^codeboost-keeper-[0-9a-f-]+$/.test(filesystems.keeper)) throw new Error('Task filesystem identity is invalid.');
+    // Read through one no-follow descriptor so the path cannot be swapped between check and open.
+    const sourceAuth = options.codexAuthFile ? readCapturedFile(options.codexAuthFile, 'Codex auth') : undefined;
     const inputDirectory = mkdtempSync(join(tmpdir(), 'codeboost-input-'));
     cleanupDirectories.push(inputDirectory);
     writeFileSync(join(inputDirectory, 'schema.json'), sourceInput.content,
@@ -235,11 +237,12 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
-    claimedNetworks.add(options.network);
     return profile;
   } catch (error) {
-    try { removeOwnedDirectories(cleanupDirectories); }
-    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Profile creation and cleanup both failed.'); }
+    const failures: unknown[] = [];
+    try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
+    try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
+    if (failures.length) throw new AggregateError([error, ...failures], 'Profile creation and cleanup both failed.');
     throw error;
   }
 }
