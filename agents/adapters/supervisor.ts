@@ -62,6 +62,7 @@ const diagnosticFor = (reason: StopReason, detail?: string) => Buffer.from(
 const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
+  let cancelReason: StopReason | undefined;
   let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
@@ -81,8 +82,8 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
       activeProfiles.delete(profile);
       cleanupRecoveries.delete(handle);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
-        exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
-        stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
+        exitCode: null, signal: null, stopReason: cancelReason ?? 'capture-failure', stdout: '',
+        stderr: diagnosticFor(cancelReason ?? 'capture-failure', detail).toString('utf8') }));
     } catch {
       cleaning = false;
       schedule();
@@ -91,7 +92,12 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
     cleaning = false;
   };
   handle = Object.freeze({ attemptId: invocation.attemptId, settled,
-    cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
+    cancel: (reason: StopReason) => {
+      cancelReason ??= reason;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      retry();
+    } });
   activeProfiles.add(profile);
   if (register) active.set(invocation.attemptId, handle);
   else cleanupRecoveries.add(handle);
@@ -111,6 +117,7 @@ export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: ()
   startupError: unknown, cleanupError: unknown, kind = 'setup cleanup'): InvocationHandle {
   const register = !ownsAttempt(invocation.attemptId);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
+  let cancelReason: StopReason | undefined;
   let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
@@ -126,8 +133,8 @@ export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: ()
       if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
       cleanupRecoveries.delete(handle);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
-        exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
-        stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
+        exitCode: null, signal: null, stopReason: cancelReason ?? 'capture-failure', stdout: '',
+        stderr: diagnosticFor(cancelReason ?? 'capture-failure', detail).toString('utf8') }));
     } catch {
       cleaning = false;
       if (!timer) {
@@ -138,7 +145,12 @@ export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: ()
     cleaning = false;
   };
   handle = Object.freeze({ attemptId: invocation.attemptId, settled,
-    cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
+    cancel: (reason: StopReason) => {
+      cancelReason ??= reason;
+      if (timer) clearTimeout(timer);
+      timer = undefined;
+      retry();
+    } });
   if (register) active.set(invocation.attemptId, handle);
   else cleanupRecoveries.add(handle);
   timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);

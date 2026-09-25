@@ -5,7 +5,8 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
-import { isInvocationActive, readBoundedContainerFile, startProfileInvocation } from '../agents/adapters/supervisor.ts';
+import { isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
+  startProfileInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile, type ContainerProfile } from '../agents/container/profile.ts';
@@ -62,6 +63,23 @@ afterAll(() => {
 }, 3 * 60_000);
 
 describe('container invocation supervisor', () => {
+  it('preserves the first cancellation reason while retained setup cleanup settles', async () => {
+    const data = fixture(), captured = invocation(data, 'cancel-setup-cleanup');
+    let attempts = 0;
+    const handle = retainSetupCleanup(captured, () => {
+      attempts += 1;
+      if (attempts === 1) return;
+      throw new Error('unexpected repeated cleanup');
+    }, new Error('startup failed'), new Error('cleanup failed'));
+    handle.cancel('shutdown');
+    handle.cancel('cancelled');
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('shutdown');
+    expect(result.stderr).toContain('[codeboost: shutdown:');
+    expect(attempts).toBe(1);
+    expect(isInvocationActive('cancel-setup-cleanup')).toBe(false);
+  });
+
   it('captures finite output and releases ownership only after cleanup', async () => {
     const current = profile(fixture(), 'finite-output', 'finite');
     const handle = startProfileInvocation(current);
