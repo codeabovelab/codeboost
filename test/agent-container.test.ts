@@ -279,7 +279,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('retains credentials when a killed create cannot be proven absent', () => {
-    const data = fixture(), unsettled = profile(data, 'planning', ['true']);
+    const data = fixture(), unsettled = profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // The create client hangs until its deadline kills it, so the daemon outcome stays unknown.
@@ -304,7 +304,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects a container that relies on the daemon default seccomp profile', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     docker(...valid.args.filter(arg => arg !== '--security-opt=seccomp=builtin')); containers.add(valid.name);
     expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
@@ -375,7 +375,7 @@ describe('real Docker agent isolation', () => {
   it('refuses a Codex auth path that is a link without resolving it', () => {
     const data = fixture(), link = join(data.root, 'auth-link.json');
     symlinkSync(data.fakeAuth, link);
-    expect(() => profile(data, 'planning', ['true'], { codexAuthFile: link })).toThrow('not a link');
+    expect(() => profile(data, 'planning', 'noop', { codexAuthFile: link })).toThrow('not a link');
   }, 60_000);
 
   it('rejects an alternate Docker runtime that may not honour the checked isolation', () => {
@@ -387,7 +387,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects a restart policy that could relaunch the agent after it exits', () => {
-    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const data = fixture(), valid = profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     docker(...valid.args.slice(0, imageIndex), '--restart=always', ...valid.args.slice(imageIndex));
     containers.add(valid.name);

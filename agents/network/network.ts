@@ -84,8 +84,9 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
   if (!inspect?.State?.Running || inspect.Config?.Image !== identity.imageId || inspect.Config?.User !== '10001:10001'
     || inspect.Config?.Labels?.['io.codeboost.egress'] !== identity.allocationId || !inspect.HostConfig?.ReadonlyRootfs
     || inspect.HostConfig.Privileged || !inspect.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
-    || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 1
-    || !['no-new-privileges', 'no-new-privileges:true'].includes(inspect.HostConfig.SecurityOpt[0] ?? '')
+    || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 2
+    || !inspect.HostConfig.SecurityOpt.some(option => ['no-new-privileges', 'no-new-privileges:true'].includes(option))
+    || !inspect.HostConfig.SecurityOpt.includes('seccomp=builtin')
     || inspect.HostConfig.PidsLimit !== 64 || inspect.HostConfig.Memory !== 64 * 1024 * 1024
     || inspect.HostConfig.MemorySwap !== 64 * 1024 * 1024 || inspect.HostConfig.NanoCpus !== 250_000_000
     || inspect.HostConfig.NetworkMode !== network.name || inspect.HostConfig.PidMode !== ''
@@ -130,7 +131,7 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       '--label', `io.codeboost.egress=${allocationId}`, name], remaining());
     proxyPlanned = true;
     docker(['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
-      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
+      '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
       '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs'], remaining());
