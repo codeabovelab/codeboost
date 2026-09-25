@@ -23,7 +23,7 @@
 1. Every agent run or runner command is an **attempt**. An attempt has one ID, which is never reused. A retry is a new attempt.
 2. An attempt moves through `pending → running → completed | failed | cancelled | stale`. The runner as a whole is `open` or `closing`.
 3. For attempts that can write to the task folder, the durable record becomes terminal only after the container has stopped. "Cancel" first records the reason and shows "Stopping". It does not free anything.
-4. A result is saved only if a compare-and-swap succeeds: the attempt ID, the task's state version and the captured context must all still be current. Late results are thrown away, but their container must still stop before its slot is freed.
+4. A result is saved only if a compare-and-swap succeeds: the attempt ID must still be the task's current attempt, and the captured context (including the context generation) must still be current. Late results are thrown away, but their container must still stop before its slot is freed.
 5. Retry is allowed only when the last attempt is terminal on disk, nothing for that task is still running in this process, and its captured context still matches the current code, plan and assignment. Otherwise the user must start a new request.
 6. Shutdown order: reject new work → drain HTTP requests (with a time limit) → abort and await request-owned work → cancel and await runner jobs → write terminal states → close storage.
 7. Each piece of user feedback becomes one append-only **feedback event**, written in the same transaction as the user action, or, for a merge, in the same transaction as the confirmed outcome. Lane J reads these events after a task closes.
@@ -37,9 +37,10 @@
 | Phase | D's invocation profile, from the closed `Phase` union in `agents/contract.ts`: `planning`, `questions`, `review`, `execute`, `fix`. `captureInvocation` rejects any other value. |
 | Attempt kind | F's own label for an attempt, stored on the attempt row. Each kind runs under exactly one D phase (see the table below). |
 | Writable attempt | An attempt whose D phase is `execute` or `fix`. It can change the task folder. |
-| Captured context | The `InvocationContext` saved when an attempt is admitted: snapshot ID, plan ID, plan revision, assignment ID, referenced-code hash and state version. |
-| State version | A number stored on each task. It goes up by one on every durable change to the task or its attempts. |
-| Current | A captured context is current when every field matches the task's present durable state. |
+| Captured context | The `InvocationContext` saved when an attempt is admitted: snapshot ID, plan ID, plan revision, assignment ID, referenced-code hash, and the task's context generation (sent in D's `stateVersion` field). |
+| State version | A number stored on each task. It goes up by one on every durable change to the task or its attempts, including an attempt's own lifecycle changes. The UI and user actions use it for ordering and compare-and-swap. It is **not** part of the captured context. |
+| Context generation | A second number stored on each task. It goes up only when something an attempt depends on changes: the plan revision, the snapshot, the assignment or the referenced code. Attempt lifecycle changes never increase it. F puts it in `InvocationContext.stateVersion`. |
+| Current | A captured context is current when its snapshot ID, plan ID, plan revision, assignment ID, referenced-code hash and context generation all match the task's present durable values. An attempt's own transitions therefore never make it non-current. |
 | Settled | D's `InvocationHandle.settled` promise has resolved. The container and its output capture have stopped. |
 | First reason | The first stop reason recorded for an attempt. Later reasons never replace it. |
 | Slot | The in-memory right to run an attempt. A limited number of slots exist. |
@@ -93,16 +94,18 @@ AGENTS.md requires these five holders to be treated separately. Each one has exa
 
 Any change not in this table is illegal. The `Store` refuses it.
 
-| From | To | Trigger | Guard (checked in one transaction) |
+| From | To | Trigger | Guard |
 |---|---|---|---|
-| — | `pending` | Admission | Coordinator is `open`; task state version equals the caller's expected version; no non-terminal attempt exists for the task; captured context is current; a slot is free |
+| — | `pending` | Admission | In memory, first: coordinator is `open`, no job or unresolved marker for the task, and a slot is free; then reserve the slot. In one `Store` transaction: task state version equals the caller's expected version; no non-terminal attempt exists for the task; captured context is current. |
 | `pending` | `running` | D returns a handle | Attempt ID is the task's current attempt; state is `pending` |
 | `pending` | `cancelled` / `stale` / `failed` | Stop before launch, context change, or launch error | Same attempt ID; state is `pending` |
-| `running` | `completed` | Validated result | Attempt ID is current; state is `running`; no first reason recorded; task state version and captured context still current |
+| `running` | `completed` | Validated result | Attempt ID is current; state is `running`; no first reason recorded; captured context still current |
 | `running` | `failed` | Settled with an error or invalid output | Attempt ID is current; state is `running` |
 | `running` | `cancelled` | Settled after a user, hard-stop or shutdown reason | Attempt ID is current; state is `running`; first reason is `cancelled` or `shutdown` |
 | `running` | `stale` | Settled after the context changed | Attempt ID is current; state is `running`; context no longer current |
 | `pending` or `running` | `failed` | Startup recovery (the previous process died) | Runs before admission opens, after D's recovery has removed leftover containers |
+
+**Admission is two steps.** SQLite cannot check in-memory facts, so the coordinator first checks `open`, the task's job or marker, and slot capacity, and reserves a slot, all in one synchronous turn with no await. It then runs the `Store` transaction. If the transaction refuses or throws, the coordinator releases the reservation in the same turn. Two admissions therefore cannot both see the same free slot.
 
 Every legal change increases the task's state version by one. Recording a first reason on a `running` row is also a durable change and increases it, so a poll can show "Stopping".
 
@@ -157,7 +160,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 1. Wait for `settled`.
 2. Validate the output (schema, size, file-scope audit for writable attempts). Do not await anything between the last check and the transaction.
-3. In one `Store` transaction: confirm that the attempt ID is the task's current attempt, the state is `running`, there is no first reason, and the task's state version and captured context match. Then write `completed` and the result, and increase the state version.
+3. In one `Store` transaction: confirm that the attempt ID is the task's current attempt, the state is `running`, there is no first reason, and the captured context is still current. Do not compare the task's state version here; the attempt's own transitions have increased it. Then write `completed` and the result, and increase the state version.
 4. If step 3 refuses, reread durable state and settle the row by the rules above. Keep the original diagnostic.
 
 **Irreversible actions.** Before each commit, push, PR open or merge, re-read the task's state version and the coordinator's `closing` flag **after the final await**. Stop if either changed. A check made before an await does not count. (This follows the AGENTS.md rules on guarded external actions.)
@@ -184,7 +187,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 This runs before the coordinator opens.
 
-1. Take the single-runner lock for this database (decision 1). If another live runner holds it, start the review screen read-only and do not start the runner.
+1. Take the single-runner lock for this database (decision 1), **before opening the `Store`**, because opening runs migrations. If another live process holds it, exit with a message that names that process ID. Do not serve the review screen: it is not read-only, because `ReviewService.load()` records history when HEAD moves (`runner/review.ts`) and `act()` writes review actions. A true read-only mode would need `Store`-level write refusal and is out of scope for F1.
 2. Run D's leftover-container and network cleanup. Await it.
 3. For every `pending` or `running` attempt row, write `failed` with the reason "Interrupted: codeboost stopped while this was running". A first reason that was already recorded is kept in the diagnostic.
 4. Clear every unresolved marker (these exist only in memory, so a restart has already cleared them; step 3 reconciles their rows).
@@ -217,7 +220,7 @@ F1 owns the production planning endpoints that G4 needs. They wrap E3's coordina
 | `POST /api/plan/import` | `Store.importRevision` | expected revision |
 | `POST /api/plan/suggestions` | E3 coordinator start (`beginSuggestions`) | expected revision and snapshot |
 | `GET /api/plan/suggestions/:id` | `Store.getSuggestions` | reads only the request row |
-| `POST /api/plan/suggestions/:id/cancel` | E3 coordinator cancel | pending only |
+| `POST /api/plan/suggestions/:id/cancel` | `pending`: E3 coordinator cancel, which stops the invocation. `ready`: `Store.cancelSuggestions` (dismiss), because no invocation is running. | request is `pending` or `ready`, as `Store.cancelSuggestions` already allows |
 | `POST /api/plan/suggestions/:id/apply` | `Store.applySuggestion` | request `ready` and bound to the current revision and snapshot |
 
 Live planning invocation waits for D5. Until then, the server returns "Planning agent not available yet" instead of using a fake provider.
@@ -243,7 +246,7 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 1. **Local actions.** Write the event in the same `Store` transaction as the user action. There is never an event without its action, or an action without its event.
 2. **External actions.** A GitHub merge cannot share a SQLite transaction. For a merge, write `task-closed` in the same transaction as the durable record of the **confirmed** outcome (`finishMergeAttempt` with state `merged`). Never write it when the merge is submitted, queued or ambiguous. Startup recovery also runs a reconciliation step: for every task whose confirmed terminal record exists without a `task-closed` event, insert that event. The uniqueness rule below makes this safe to repeat.
 3. Events are append-only. If a choice changes later, write a new event with `supersedes` set to the earlier event. J uses the newest event for each `sourceRef`.
-4. Replaying the same action or reconciliation does not duplicate an event. `(kind, sourceRef, planRevision)` is unique.
+4. Replaying the same action or reconciliation does not duplicate an event. `(planKey, taskId, kind, sourceRef, planRevision)` is unique. Note, choice and task IDs are only unique inside their plan and task, so the key must include both.
 5. J reads events only through `Store.feedbackEvents(taskId)`, and only after that task's `task-closed` event exists.
 
 ## Proposed storage additions
@@ -252,9 +255,9 @@ This is the smallest schema that holds the contract. The F1 implementation PR se
 
 | Table | Key columns |
 |---|---|
-| `tasks` | `id`, `plan_key`, `status`, `state_version`, `current_attempt_id`, `created_at`, `updated_at` |
+| `tasks` | `id`, `plan_key`, `status`, `state_version`, `context_generation`, `current_attempt_id`, `created_at`, `updated_at` |
 | `attempts` | `id`, `task_id`, `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `diagnostic` (bounded), `created_at`, `started_at`, `settled_at` |
-| `feedback_events` | the fields listed above, with a unique index on `(kind, source_ref, plan_revision)` |
+| `feedback_events` | the fields listed above, with a unique index on `(plan_key, task_id, kind, source_ref, plan_revision)` |
 
 `tasks.status` holds the product states from the design (queued, running, needs human, needs amendment, needs approval, possibly already fixed, in review, approved but merge blocked, merged, cancelled). F1 defines the list and its invariants. F2 adds the per-item transitions. I1 adds queue admission and scheduling.
 
@@ -283,6 +286,10 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Terminal write fails after settlement (review finding) | `settled` resolves → the terminal write throws → slot and unresolved marker remain → retry and admission refused → restart recovery makes the row terminal |
 | Request admitted, then shutdown, then the request tries to start work (review finding) | Question body half-sent → shutdown sets `closing` → body completes → `questions.start()` throws → no answer attempt is saved |
 | Merge confirmed, then the event write is lost (review finding) | `merged` recorded without `task-closed` → restart → reconciliation inserts exactly one event → a second restart inserts none |
+| Attempt's own transitions, then publish (review round 2) | Admit → `pending` → `running` (the state version rises each time) → with no context change, a valid result publishes `completed`; the context generation is unchanged |
+| Two admissions race for one slot (review round 2) | Two admissions in the same tick for different tasks with one free slot → exactly one reserves and saves `pending`; a refused `Store` transaction releases its reservation |
+| Second process starts (review round 2) | Runner A holds the lock → process B exits before opening the `Store`; no migration or history write occurs |
+| Two plans emit the same source ID (review round 2) | Two tasks in different plans both record `task-closed` with source `task-1` at revision 1 → both events are saved |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
