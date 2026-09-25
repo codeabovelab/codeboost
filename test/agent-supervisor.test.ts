@@ -152,6 +152,17 @@ describe('container invocation supervisor', () => {
     expect((await first.settled).stopReason).toBe('shutdown');
   }, 60_000);
 
+  it('rejects a cloned profile without disposing the authentic active container', async () => {
+    const current = profile(fixture(), 'ignore-term', 'cloned-profile');
+    const first = startProfileInvocation(current, { timeoutMs: 30_000 });
+    const clone = Object.freeze({ ...current });
+    expect(() => startProfileInvocation(clone)).toThrow('not created by the trusted profile builder');
+    expect(isInvocationActive('cloned-profile')).toBe(true);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
+    first.cancel('shutdown');
+    expect((await first.settled).stopReason).toBe('shutdown');
+  }, 60_000);
+
   it('records decoder failure without publishing a successful result', async () => {
     const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'capture-failure'), {
       decode: () => { throw new Error('simulated capture failure'); },

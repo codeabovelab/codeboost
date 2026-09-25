@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
-import type { ContainerProfile } from '../container/profile.ts';
+import { assertContainerProfileAuthenticity, type ContainerProfile } from '../container/profile.ts';
 import { removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
 
 export const OUTPUT_LIMITS = Object.freeze({
@@ -202,6 +202,7 @@ export function isInvocationActive(attemptId: string): boolean {
 }
 
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
+  assertContainerProfileAuthenticity(profile);
   const invocation = assertPhasePolicy(profile.policy);
   const rejectWithCleanup = (error: unknown, register = true): InvocationHandle => {
     try { disposeValidatedContainer(profile); }

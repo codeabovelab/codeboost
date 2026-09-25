@@ -127,6 +127,11 @@ const captureInput = (directory: string): InputCapture => {
   return Object.freeze({ inputDirectory: canonical, schema, content: captured.content });
 };
 
+/** Prove that a profile object is the exact capability issued by this module. */
+export function assertContainerProfileAuthenticity(profile: ContainerProfile): void {
+  if (!identities.has(profile)) throw new Error('Container profile was not created by the trusted profile builder.');
+}
+
 /** Internal authenticity and host-file revalidation used at every launch boundary. */
 export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000): void {
   const expected = identities.get(profile);
