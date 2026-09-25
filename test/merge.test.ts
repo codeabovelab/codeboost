@@ -92,11 +92,22 @@ it('rechecks the exact base and head, then invokes the guarded head merge', asyn
   expect(merged.result.url).toContain('/pr/1');
 });
 
-it('budgets both fresh validation passes below the serving deadline', async () => {
-  const view = readyView(), service = serviceFor(view), options: Array<{ fresh?: boolean; timeoutMs?: number } | undefined> = [];
-  const client: MergeGateway = { inspect: vi.fn(async value => { options.push(value); return remote(view); }), merge: vi.fn(async () => ({ url: 'https://github.example/pr/1' })) };
-  await new MergeCoordinator(service, client).merge(view.token);
-  expect(options).toEqual([{ fresh: true, timeoutMs: 6_000 }, { fresh: true, timeoutMs: 6_000 }]);
+it('enforces one deadline across every merge validation stage', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async value => {
+    await new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(resolve, 100);
+      const signal = (value as { signal?: AbortSignal } | undefined)?.signal;
+      signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+    });
+    return remote(h.view(), { mergeQueue: true });
+  });
+  try {
+    const started = Date.now();
+    await expect(new MergeCoordinator(h.service, h.client, 250).merge(h.view().token)).rejects.toThrow(/deadline/i);
+    expect(Date.now() - started).toBeLessThan(500);
+    expect(h.client.merge).not.toHaveBeenCalled();
+  } finally { h.store.close(); }
 });
 
 it('refuses a base or head race after the initial validation', async () => {
@@ -317,8 +328,8 @@ it('keeps an unknown enqueue failure submitting until external reconciliation', 
   h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('GitHub merge submission timed out.', 'unknown'); });
   try {
     await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/timed out/i);
-    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'submitting', reason: null });
-    expect(await h.coordinator.status()).toMatchObject({ ready: false, action: null, queue: { state: 'submitting', retryable: false } });
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'submitting', reason: 'GitHub merge submission timed out.' });
+    expect(await h.coordinator.status()).toMatchObject({ ready: false, action: null, queue: { state: 'submitting', retryable: false, reason: 'GitHub merge submission timed out.' } });
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
@@ -578,6 +589,16 @@ it('aborts one shared status inspection at its overall deadline', async () => {
     expect(results.every(result => result.status === 'rejected' && /timed out/i.test(String(result.reason)))).toBe(true);
     expect(aborts).toBe(1);
   } finally { vi.useRealTimers(); }
+});
+
+it('preserves caller cancellation while reading merge status', async () => {
+  const controller = new AbortController();
+  const run = async (_args: readonly string[], options?: { signal?: AbortSignal }) => new Promise<string>((_resolve, reject) => {
+    options?.signal?.addEventListener('abort', () => reject(new Error('generic runner abort')), { once: true });
+  });
+  const pending = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect({ fresh: true, signal: controller.signal });
+  controller.abort(new Error('merge request deadline exceeded'));
+  await expect(pending).rejects.toThrow('merge request deadline exceeded');
 });
 
 it.each([[false, true], [true, false]])('treats a protection 404 with protected=%s as rulesKnown=%s', async (protectedBranch, expectedKnown) => {

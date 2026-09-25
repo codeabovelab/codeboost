@@ -78,7 +78,10 @@ it('persists the merge-queue lifecycle and terminal reason across restart', () =
   const { store, path } = fixture();
   const expected = { ...state(store), reviewVersion: store.reviewVersion(identity) };
   const attempt = store.beginMergeAttempt(identity, expected, oid(2), 'MQEV_before');
+  expect(store.recordMergeAttemptDiagnostic(identity, attempt.id, 'Submission timed out after GitHub may have accepted it.')).toBe(true);
+  expect(store.getMergeAttempt(identity)).toMatchObject({ state: 'submitting', reason: 'Submission timed out after GitHub may have accepted it.' });
   expect(store.queueMergeAttempt(identity, attempt.id, 'https://github.example/pr/1')).toBe(true);
+  expect(store.getMergeAttempt(identity)).toMatchObject({ state: 'queued', reason: null });
   expect(store.observeQueuedMerge(identity, attempt.id, { entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2 })).toBe(true);
   expect(store.finishMergeAttempt(identity, attempt.id, { state: 'removed', reason: 'Checks failed.', occurredAt: '2026-09-24T08:05:00Z' })).toBe(true);
   close(store);

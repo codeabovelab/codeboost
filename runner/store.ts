@@ -228,12 +228,16 @@ export class Store {
     if (typeof url !== 'string' || url.length > 2048 || !/^https:\/\//.test(url)) throw new Error('Invalid merge result URL.');
     return this.#changeMergeAttempt(identity, id, ['submitting'], attempt => ({ ...attempt, state: 'queued', url, reason: null }));
   }
+  recordMergeAttemptDiagnostic(identity: PlanIdentity, id: string, reason: string): boolean {
+    if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('A bounded merge diagnostic is required.');
+    return this.#changeMergeAttempt(identity, id, ['submitting'], attempt => ({ ...attempt, reason: reason.trim() }));
+  }
   observeQueuedMerge(identity: PlanIdentity, id: string, observation: { entryId: string; phase: MergeAttempt['phase']; position: number }): boolean {
     if (typeof observation.entryId !== 'string' || !observation.entryId || observation.entryId.length > 512 ||
         !['AWAITING_CHECKS','LOCKED','MERGEABLE','QUEUED'].includes(String(observation.phase)) ||
         !Number.isSafeInteger(observation.position) || observation.position < 0) throw new Error('Invalid merge-queue observation.');
     return this.#changeMergeAttempt(identity, id, ['submitting','queued'], attempt => ({
-      ...attempt, state: 'queued', entryId: observation.entryId, phase: observation.phase, position: observation.position,
+      ...attempt, state: 'queued', reason: null, entryId: observation.entryId, phase: observation.phase, position: observation.position,
     }));
   }
   finishMergeAttempt(identity: PlanIdentity, id: string, outcome: {

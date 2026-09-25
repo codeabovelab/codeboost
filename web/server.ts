@@ -15,7 +15,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     questions=new Questions(service,questionAgent);
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
   } catch (error) { service.close(); throw error; }
-  const load=async()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)})),merge:merges?await merges.displayStatus(view):{available:false}};};
+  const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
+  const load=async()=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
@@ -52,8 +53,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
           const merged=await merges.merge(input.token);
-          try { json(200,{...(await load()),mergeResult:merged.result,mergeQueue:merges.queueSnapshot(),mergeRefreshRequired:false}); }
-          catch { json(200,{mergeResult:merged.result,mergeQueue:merges.queueSnapshot(),mergeRefreshRequired:true}); }
+          json(200,{...loadReview(),merge:merged.status,mergeResult:merged.result,mergeQueue:merges.queueSnapshot(),mergeRefreshRequired:false});
           return;
         }
         const view=service.act(input);
@@ -82,8 +82,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   return { server, service, token, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     stopping = true;
     const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await merges?.close();
     await closing;
+    await merges?.close();
     await questions.close();
     service.close();
   } };

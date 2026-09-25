@@ -41,7 +41,7 @@ export interface MergeQueueGateway {
   inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null }): Promise<MergeQueueObservation>;
 }
 export interface MergeGateway {
-  inspect(options?: { fresh?: boolean; timeoutMs?: number }): Promise<RemoteMergeState>;
+  inspect(options?: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal }): Promise<RemoteMergeState>;
   merge(expectedHead: string, options?: { signal?: AbortSignal }): Promise<MergeResult>;
 }
 
@@ -236,16 +236,18 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     };
   }
 
-  async inspect(options: { fresh?: boolean; timeoutMs?: number } = {}): Promise<RemoteMergeState> {
+  async inspect(options: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RemoteMergeState> {
     const timeoutMs = options.timeoutMs ?? 12_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub inspection timeout.');
     if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
     const generation = this.#generation;
     if (!options.fresh && this.#inflight?.generation === generation) return this.#inflight.promise;
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(new Error('GitHub merge-state inspection timed out.')), timeoutMs);
-    const attempt = this.#inspectNow(controller.signal).catch(error => {
-      if (controller.signal.aborted) throw new Error('GitHub merge-state inspection timed out.');
+    const timeout = new AbortController();
+    const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-state inspection timed out.')), timeoutMs);
+    const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
+    const attempt = this.#inspectNow(signal).catch(error => {
+      if (timeout.signal.aborted) throw timeout.signal.reason;
+      if (options.signal?.aborted) throw options.signal.reason;
       throw error;
     }).then(state => {
       if (this.#generation === generation) this.#cache = { expiresAt: Date.now() + 5_000, state };
