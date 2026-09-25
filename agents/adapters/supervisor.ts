@@ -78,6 +78,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
       timer = undefined;
       complete = true;
       if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
+      activeProfiles.delete(profile);
       cleanupRecoveries.delete(handle);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
         exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
@@ -91,6 +92,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
   };
   handle = Object.freeze({ attemptId: invocation.attemptId, settled,
     cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
+  activeProfiles.add(profile);
   if (register) active.set(invocation.attemptId, handle);
   else cleanupRecoveries.add(handle);
   schedule();
@@ -399,8 +401,9 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         decodedOutput = decoded;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
-        const reason = error instanceof OutputLimitError || /exceeds its capture limit/i.test(message)
-          ? 'output-limit' : error instanceof CaptureDeadlineError ? 'timeout' : 'capture-failure';
+        const reason: StopReason = stopReason ?? (performance.now() >= deadline ? 'timeout'
+          : error instanceof OutputLimitError || /exceeds its capture limit/i.test(message)
+            ? 'output-limit' : error instanceof CaptureDeadlineError ? 'timeout' : 'capture-failure');
         failureDetail ??= message;
         if (closed) stopReason ??= reason;
         else stop(reason);

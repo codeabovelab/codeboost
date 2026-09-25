@@ -229,6 +229,18 @@ describe('container invocation supervisor', () => {
     expect(result.stdout).not.toContain('must-not-publish');
   }, 15_000);
 
+  it('classifies a decoder failure after the monotonic deadline as timeout', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-fails-late', 30_000), {
+      timeoutMs: 3_000,
+      decode: (_current, _raw, _maximum, timeoutMs) => {
+        const end = performance.now() + timeoutMs + 50;
+        while (performance.now() < end) { /* deliberately block the timer queue */ }
+        throw new Error('late decoder failure');
+      },
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+  }, 15_000);
+
   it('validates and decodes provider output even when the process exits nonzero', async () => {
     const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
       decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),
