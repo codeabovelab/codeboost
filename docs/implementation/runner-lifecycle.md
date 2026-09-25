@@ -287,7 +287,12 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 
 **What becomes an event.** Only feedback the user wrote or chose. Issue text, issue comments and agent output never become events.
 
-`actionId` identifies the one user action (or confirmed external outcome) that caused the event. **For user actions it is an idempotency key the UI generates** (a UUID) when the user acts, and resends unchanged if it retries after a lost response. The `Store` saves it with the action itself (the note, choice change, finding acceptance, rejection or cancel) under a unique `(planKey, actionId)` index. A replay with a known `actionId` applies nothing and returns the saved result, so neither the action nor its event is duplicated. For a merge `task-closed` it is the merge attempt ID. A later change to the same source is a new user action with a new `actionId`.
+`actionId` identifies the one user action (or confirmed external outcome) that caused the event. **For user actions it is an idempotency key the UI generates** (a UUID) when the user acts, and resends unchanged if it retries after a lost response. Every writing user action goes through one `user_actions` table, keyed by `(planKey, actionId)`. That covers notes, choice changes, finding acceptance, rejection, cancel, retry and "run again". The same transaction that applies the action inserts its row, with the action kind, a hash of the request body, and the bounded response. A replay is handled before any other guard:
+
+- the same `actionId` with the same request hash returns the saved response and applies nothing, even though the state version has since moved on;
+- the same `actionId` with a different request hash (including a different action kind) is refused with HTTP 409 "Action ID already used" and applies nothing.
+
+So neither an action nor its events can be duplicated, including a retry that would otherwise admit a second attempt. For a merge `task-closed` it is the merge attempt ID. A later change to the same source is a new user action with a new `actionId`.
 
 | Event kind | Source action | `sourceRef` |
 |---|---|---|
@@ -306,7 +311,7 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 1. **Local actions.** Write the event in the same `Store` transaction as the user action. There is never an event without its action, or an action without its event.
 2. **External actions.** A GitHub merge cannot share a SQLite transaction. For a merge, one transaction records the **confirmed** outcome (`finishMergeAttempt` with state `merged`), sets `tasks.status` to `merged`, and inserts `task-closed`. Never write any of them when the merge is submitted, queued or ambiguous. Startup recovery also runs a reconciliation step: for every task with a confirmed `merged` merge attempt whose status or event is missing, one transaction sets the status and inserts the event. The uniqueness rule below makes this safe to repeat.
 3. Events are append-only. If a choice changes later, write a new event with `supersedes` set to the earlier event. J uses the newest event for each `sourceRef`.
-4. Replaying the same action or reconciliation does not duplicate an event: `(planKey, kind, actionId)` is unique. A superseding event for the same `sourceRef` has a new `actionId`, so it is never rejected. Note and choice IDs are only unique inside their plan identity, so the key must include the full plan key.
+4. Replaying the same action or reconciliation does not duplicate an event: `(planKey, kind, actionId)` is unique. One action may produce more than one event kind (a user cancel produces its own event and `task-closed`), but it is applied only once, because `user_actions` holds one row per `(planKey, actionId)`. A superseding event for the same `sourceRef` has a new `actionId`, so it is never rejected. Note and choice IDs are only unique inside their plan identity, so the key must include the full plan key.
 5. J reads events only through `Store.feedbackEvents(identity: PlanIdentity)`, which scopes every row by `identityKey(identity)`, and only after that task's `task-closed` event exists.
 
 ## Proposed storage additions
@@ -329,6 +334,7 @@ A merged v5 task also gets its `task-closed` event, keyed by the merge attempt I
 |---|---|
 | `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `state_version`, `context_generation`, `assignment_id`, `referenced_code_hash`, `current_attempt_id` (nullable; the composite foreign key `(plan_key, current_attempt_id)` references `attempts(plan_key, id)`, so a task can only point at its own attempt), `created_at`, `updated_at` |
 | `attempts` | `id` (**primary key**; never reused), `plan_key` (references `tasks(plan_key)`; `(plan_key, id)` is also unique, for the composite key), `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `result` (JSON, only for `completed`, 1 MiB or less), `diagnostic` (bounded), `diagnostic_ref` (partial-output file, or null), `created_at`, `started_at`, `settled_at` |
+| `user_actions` | `plan_key`, `action_id` (together the primary key), `kind`, `request_hash`, `response` (JSON, bounded), `created_at` |
 | `feedback_events` | the fields listed above, with `id` as primary key, with a unique index on `(plan_key, kind, action_id)` |
 
 `tasks.status` holds the product states from the design (queued, running, needs human, needs amendment, needs approval, possibly already fixed, in review, approved but merge blocked, merged, cancelled, rejected). **Closed** means `merged`, `cancelled` or `rejected`; a closed status never changes again. **Human-gated** means `needs human`, `needs amendment`, `needs approval` or `possibly already fixed`. F1 defines the list and its invariants. F2 adds the per-item transitions. I1 adds queue admission and scheduling.
@@ -391,6 +397,8 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | v5 upgrade (review round 10) | Migrate a v5 database with an open and a merged plan → two task rows with the backfill values; the merged one has one `task-closed` |
 | Path alias (review round 10) | Start through a symlinked parent directory while a runner holds the lock through the real path → the second start exits |
 | Unresolved marker is visible (review round 10) | Terminal write fails → `GET /api/runner` returns `unresolved` → the UI shows the restart message |
+| Lost retry response, then replay (review round 11) | Retry commits a new attempt → the response is lost → resend with the same `actionId` → the saved response comes back, and there is no second attempt and no 409 |
+| Action ID reused for another action (review round 11) | Send a note with `actionId` X → send a reject with X → HTTP 409, nothing applied |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
