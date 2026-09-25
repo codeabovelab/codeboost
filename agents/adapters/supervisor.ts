@@ -15,6 +15,9 @@ const CAPTURE_ABORT_GRACE_MS = 1_000;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
 const cleanupRecoveries = new Set<InvocationHandle>();
+const hasCleanupRecovery = (attemptId: string) =>
+  Array.from(cleanupRecoveries).some(handle => handle.attemptId === attemptId);
+const ownsAttempt = (attemptId: string) => active.has(attemptId) || hasCleanupRecovery(attemptId);
 
 export interface CaptureLimits {
   readonly stdoutBytes: number;
@@ -31,6 +34,8 @@ export interface SupervisorOptions {
   readonly secrets?: Readonly<Record<string, string>>;
   readonly timeoutMs?: number;
   readonly limits?: Partial<CaptureLimits>;
+  /** Trusted monotonic budget carried from synchronous adapter setup. */
+  readonly invocationBudget?: () => number;
   readonly decode?: (profile: ContainerProfile, rawStdout: Buffer, maximumBytes: number,
     timeoutMs: number, signal: AbortSignal) => DecodedOutput | Promise<DecodedOutput>;
 }
@@ -62,7 +67,6 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
   const schedule = () => {
     if (timer) return;
     timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
-    timer.unref();
   };
   const retry = () => {
     if (cleaning || complete) return;
@@ -102,7 +106,7 @@ export function retainNetworkCleanup(invocation: InvocationInput, network: Vendo
 /** Retain attempt ownership while retrying resources allocated during synchronous adapter setup. */
 export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: () => void,
   startupError: unknown, cleanupError: unknown, kind = 'setup cleanup'): InvocationHandle {
-  const register = !active.has(invocation.attemptId);
+  const register = !ownsAttempt(invocation.attemptId);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
   let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -125,7 +129,6 @@ export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: ()
       cleaning = false;
       if (!timer) {
         timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
-        timer.unref();
       }
       return;
     }
@@ -135,7 +138,7 @@ export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: ()
     cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
   if (register) active.set(invocation.attemptId, handle);
   else cleanupRecoveries.add(handle);
-  timer = setTimeout(() => { timer = undefined; retry(); }, 1_000); timer.unref();
+  timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
   return handle;
 }
 const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason, limits: CaptureLimits,
@@ -192,7 +195,7 @@ export function readBoundedContainerFile(container: string, source: string, maxi
 }
 
 export function isInvocationActive(attemptId: string): boolean {
-  return active.has(attemptId);
+  return ownsAttempt(attemptId);
 }
 
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
@@ -205,16 +208,20 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     }
     throw error;
   };
-  if (active.has(invocation.attemptId)) {
+  if (ownsAttempt(invocation.attemptId)) {
     return rejectWithCleanup(new Error('An invocation with this attempt ID is still active.'), false);
   }
-  let limits: CaptureLimits, configuredTimeout: number;
+  let limits: CaptureLimits, configuredTimeout: number, carriedBudget: number;
   try {
     limits = captureLimits(options.limits);
     configuredTimeout = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     positiveInteger(configuredTimeout, 'timeoutMs');
     if (configuredTimeout > DEFAULT_TIMEOUT_MS)
       throw new Error('timeoutMs cannot exceed the production ten-minute ceiling.');
+    carriedBudget = options.invocationBudget?.() ?? DEFAULT_TIMEOUT_MS;
+    positiveInteger(carriedBudget, 'invocationBudget');
+    if (carriedBudget > DEFAULT_TIMEOUT_MS)
+      throw new Error('invocationBudget cannot exceed the production ten-minute ceiling.');
   } catch (error) {
     return rejectWithCleanup(error);
   }
@@ -222,7 +229,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   if (!Number.isSafeInteger(wallRemaining) || wallRemaining < 1) {
     return rejectWithCleanup(new Error('Invocation deadline has already expired.'));
   }
-  const duration = Math.min(wallRemaining, configuredTimeout), deadline = performance.now() + duration;
+  const duration = Math.min(wallRemaining, configuredTimeout, carriedBudget), deadline = performance.now() + duration;
   const remaining = () => {
     const value = Math.ceil(deadline - performance.now());
     if (value < 1) throw new Error('Invocation deadline has already expired.');
@@ -372,6 +379,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
           if (decodeAbort === controller) decodeAbort = undefined;
         }
         if (stopReason) return;
+        if (performance.now() >= deadline)
+          throw new CaptureDeadlineError('Invocation deadline expired while decoding output.');
         const additional = decoded.additionalBytes ?? 0;
         const textBytes = Buffer.byteLength(decoded.text);
         if (!Number.isSafeInteger(additional) || additional < 0)
@@ -381,6 +390,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
           throw new OutputLimitError('Decoded adapter output exceeds its capture limit.');
         if (stdoutBytes + additional > limits.stdoutBytes || combinedBytes + additional > limits.combinedBytes)
           throw new OutputLimitError('Adapter output exceeds its capture limit.');
+        if (performance.now() >= deadline)
+          throw new CaptureDeadlineError('Invocation deadline expired while validating decoded output.');
         decodedOutput = decoded;
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error);
@@ -498,7 +509,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         await new Promise<void>(resolve => {
           let finished = false;
           const wake = () => { if (finished) return; finished = true; clearTimeout(timer); resolve(); };
-          const timer = setTimeout(wake, 1_000); timer.unref();
+          const timer = setTimeout(wake, 1_000);
           wakeCleanup = wake;
         });
       }

@@ -53,18 +53,23 @@ describe('production agent adapters', () => {
     expect(isInvocationActive(invocation.attemptId)).toBe(false);
   });
 
-  it('retains setup cleanup ownership until a retry succeeds', async () => {
+  it('retains every colliding setup cleanup owner until all retries succeed', async () => {
     const invocation = capturedInvocation('setup-recovery', Date.now() + 60_000);
-    let attempts = 0;
-    const handle = retainSetupCleanup(invocation, () => {
-      attempts += 1;
-      if (attempts === 1) throw new Error('still busy');
+    let releaseFirst = false, releaseSecond = false;
+    const first = retainSetupCleanup(invocation, () => {
+      if (!releaseFirst) throw new Error('first still busy');
     }, new Error('startup failed'), new Error('cleanup failed'));
+    const second = retainSetupCleanup(invocation, () => {
+      if (!releaseSecond) throw new Error('second still busy');
+    }, new Error('duplicate startup failed'), new Error('duplicate cleanup failed'));
     expect(isInvocationActive(invocation.attemptId)).toBe(true);
-    handle.cancel('cancelled');
+    releaseFirst = true;
+    first.cancel('cancelled');
+    await first.settled;
     expect(isInvocationActive(invocation.attemptId)).toBe(true);
-    handle.cancel('cancelled');
-    const result = await handle.settled;
+    releaseSecond = true;
+    second.cancel('cancelled');
+    const result = await second.settled;
     expect(result.stopReason).toBe('capture-failure');
     expect(result.stderr).toContain('setup cleanup remains unsettled');
     expect(isInvocationActive(invocation.attemptId)).toBe(false);

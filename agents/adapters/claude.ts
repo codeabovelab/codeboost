@@ -18,9 +18,9 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   oauthToken: string, options: AgentAdapterOptions = {}): InvocationHandle {
   if (!oauthToken || oauthToken.includes('\0')) throw new Error('Claude OAuth token is malformed.');
   const policy = createPhasePolicy(request.invocation);
-  const remaining = createInvocationBudget(request.invocation, 60_000);
+  const remaining = createInvocationBudget(request.invocation, 10 * 60_000);
   let network: VendorNetwork;
-  try { network = createVendorNetwork(request.invocation, request.imageId, remaining()); }
+  try { network = createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining())); }
   catch (error) {
     if (error instanceof VendorNetworkCreationCleanupError)
       return retainSetupCleanup(request.invocation, error.retryCleanup, error.startupError, error,
@@ -29,8 +29,10 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   }
   try {
     const profile = createContainerProfile({ ...request, policy, network,
-      command: createClaudeCommand(policy, request.prompt), claudeToken: oauthToken, timeoutMs: remaining() });
+      command: createClaudeCommand(policy, request.prompt), claudeToken: oauthToken,
+      timeoutMs: Math.min(60_000, remaining()) });
     return startProfileInvocation(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
+      invocationBudget: remaining,
       decode: (_profile, raw) => parseClaudeOutput(raw) });
   } catch (error) {
     if (error instanceof ProfileCreationCleanupError) {

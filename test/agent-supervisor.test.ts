@@ -197,6 +197,19 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('cancel-ignored-decode')).toBe(false);
   }, 15_000);
 
+  it('does not publish a synchronous decode that finishes after the monotonic deadline', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-over-deadline', 30_000), {
+      timeoutMs: 3_000,
+      decode: (_current, _raw, _maximum, timeoutMs) => {
+        const end = performance.now() + timeoutMs + 50;
+        while (performance.now() < end) { /* deliberately block the timer queue */ }
+        return { text: 'must-not-publish' };
+      },
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(result.stdout).not.toContain('must-not-publish');
+  }, 15_000);
+
   it('validates and decodes provider output even when the process exits nonzero', async () => {
     const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
       decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),

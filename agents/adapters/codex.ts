@@ -20,9 +20,9 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   authFile: string, options: AgentAdapterOptions = {}): InvocationHandle {
   if (!authFile || authFile.includes('\0')) throw new Error('Codex auth path is malformed.');
   const policy = createPhasePolicy(request.invocation);
-  const remaining = createInvocationBudget(request.invocation, 60_000);
+  const remaining = createInvocationBudget(request.invocation, 10 * 60_000);
   let network: VendorNetwork;
-  try { network = createVendorNetwork(request.invocation, request.imageId, remaining()); }
+  try { network = createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining())); }
   catch (error) {
     if (error instanceof VendorNetworkCreationCleanupError)
       return retainSetupCleanup(request.invocation, error.retryCleanup, error.startupError, error,
@@ -32,8 +32,9 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   try {
     const profile = createContainerProfile({ ...request, policy, network,
       command: createCodexCommand(policy, request.prompt), codexAuthFile: authFile, deferredOutput: true,
-      timeoutMs: remaining() });
+      timeoutMs: Math.min(60_000, remaining()) });
     return startProfileInvocation(profile, { ...options,
+      invocationBudget: remaining,
       decode: (current, _raw, maximum, timeoutMs, signal) =>
         readCodexOutput(current.name, maximum, timeoutMs, signal) });
   } catch (error) {
