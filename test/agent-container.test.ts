@@ -271,6 +271,20 @@ describe('real Docker agent isolation', () => {
     docker('rm', '--force', first.name); containers.delete(first.name);
   }, 60_000);
 
+  it('retains credentials when a killed create cannot be proven absent', () => {
+    const data = fixture(), unsettled = profile(data, 'planning', ['true']);
+    const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The create client hangs until its deadline kills it, so the daemon outcome stays unknown.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = create ]; then exec sleep 30; fi',
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    try { expect(() => createValidatedContainer(unsettled, 1_000)).toThrow('cleanup did not settle'); }
+    finally { process.env.PATH = path; }
+    expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
+  }, 60_000);
+
   it('refuses a Codex auth path that is a link without resolving it', () => {
     const data = fixture(), link = join(data.root, 'auth-link.json');
     symlinkSync(data.fakeAuth, link);
@@ -340,7 +354,7 @@ describe('real Docker agent isolation', () => {
     expect(() => prepareTaskFilesystems({ ...data.clone }, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
     }, imageId)).toThrow('trusted clone builder');
-  });
+  }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
     it('runs the authenticated Codex startup path with isolated writable state', () => {

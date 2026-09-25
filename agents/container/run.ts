@@ -42,18 +42,30 @@ const canonicalDockerBindSource = (source: string) => {
   const desktopHostPath = source.startsWith('/host_mnt/') ? source.slice('/host_mnt'.length) : source;
   try { return realpathSync(desktopHostPath); } catch { return source; }
 };
-const removeContainerOrThrow = (profile: ContainerProfile) => {
-  const remaining = createDeadline(30_000);
-  const before = spawnSync('docker', ['container', 'inspect', profile.name], {
-    encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  if (before.status !== 0) {
+/** How long a killed `docker create` may still materialize its container in the daemon. */
+const CREATE_SETTLE_MS = 10_000;
+const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = false) => {
+  const remaining = createDeadline(30_000 + (createUnsettled ? CREATE_SETTLE_MS : 0));
+  const settleBy = performance.now() + (createUnsettled ? CREATE_SETTLE_MS : 0);
+  let before: ReturnType<typeof spawnSync>;
+  for (;;) {
+    before = spawnSync('docker', ['container', 'inspect', profile.name], {
+      encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (before.status === 0) break;
     const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
     if (!missing) throw new Error('Failed to establish ownership of the agent container; staged credentials were retained.');
-    disposeContainerProfile(profile);
-    return;
+    if (!createUnsettled) {
+      disposeContainerProfile(profile);
+      return;
+    }
+    // A killed create may still land in the daemon; absence is not proof until the settle window passes.
+    if (performance.now() >= settleBy)
+      throw new Error('Agent container creation did not settle; staged credentials were retained.');
+    sleep(250);
   }
-  const inspected = JSON.parse(before.stdout || '[]')[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
+  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
   if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
   const result = spawnSync('docker', ['rm', '--force', profile.name], {
@@ -230,16 +242,25 @@ export function validateContainer(container: string, profile: ContainerProfile, 
 export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(timeoutMs);
+  let createUnsettled = false;
   try {
     validateSecrets(profile, secrets);
     assertContainerProfile(profile);
-    docker(profile.args, { timeoutMs: remaining(), secrets });
+    const createTimeout = remaining();
+    createUnsettled = true;
+    try { docker(profile.args, { timeoutMs: createTimeout, secrets }); }
+    catch (error) {
+      // A nonzero exit means the daemon answered; a killed client leaves the request in flight.
+      createUnsettled = typeof (error as { status?: unknown }).status !== 'number';
+      throw error;
+    }
+    createUnsettled = false;
     validateContainer(profile.name, profile, remaining());
     assertContainerProfile(profile);
     remaining();
     return profile.name;
   } catch (error) {
-    try { removeContainerOrThrow(profile); }
+    try { removeContainerOrThrow(profile, createUnsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Container creation failed and cleanup did not settle.'); }
     throw error;
   }
