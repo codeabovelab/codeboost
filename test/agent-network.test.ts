@@ -7,14 +7,9 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS,
   type VendorNetwork } from '../agents/network/network.ts';
-import { captureInvocation } from '../agents/contract.ts';
+import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 
-let imageId = '', network: VendorNetwork;
-const invocation = captureInvocation({
-  clone: { id: 'clone-network', taskId: 'task-network', directory: '/tmp/network', head: 'a'.repeat(40) },
-  vendor: 'claude', phase: 'planning', approvedArgv: [], deadline: Date.now() + 60_000, attemptId: 'network-probe',
-  context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
-});
+let imageId = '', network: VendorNetwork, invocation: InvocationInput;
 const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
@@ -25,6 +20,12 @@ const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm'
 
 beforeAll(() => {
   imageId = buildAgentImage();
+  // Capture after the image build, so a cold build cannot spend the invocation's deadline before allocation.
+  invocation = captureInvocation({
+    clone: { id: 'clone-network', taskId: 'task-network', directory: '/tmp/network', head: 'a'.repeat(40) },
+    vendor: 'claude', phase: 'planning', approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId: 'network-probe',
+    context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
+  });
   network = createVendorNetwork(invocation, imageId);
 }, 10 * 60_000);
 afterAll(() => removeVendorNetwork(network), 60_000);
