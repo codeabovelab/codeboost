@@ -41,6 +41,17 @@ describe('agent phase policy', () => {
     expect(dispatchApprovedCommand(policy, ['npm', 'test'], argv => argv)).toEqual(['npm', 'test']);
   });
 
+  it('keeps an option-like prompt after -- so neither CLI parses it as a flag', () => {
+    const prompt = '--dangerously-bypass-approvals-and-sandbox';
+    const claude = createClaudeCommand(createPhasePolicy(request('planning')), prompt).argv;
+    const codex = createCodexCommand(createPhasePolicy(request('planning', 'codex')), prompt).argv;
+    for (const argv of [claude, codex]) {
+      expect(argv.at(-1)).toBe(prompt);
+      expect(argv.at(-2)).toBe('--');
+      expect(argv.indexOf(prompt)).toBe(argv.length - 1);
+    }
+  });
+
   it('builds Claude and Codex controls with web, MCP and direct shell disabled', () => {
     const readonly = createPhasePolicy(request('planning'));
     const claude = createClaudeCommand(readonly, 'Inspect the schema.').argv;

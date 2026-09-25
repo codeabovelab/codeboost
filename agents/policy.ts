@@ -67,10 +67,11 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string): AgentC
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
-  return command(policy, ['claude', '--print', prompt, '--output-format', 'json', '--restricted', '--strict-mcp-config',
+  // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
+  return command(policy, ['claude', '--print', '--output-format', 'json', '--restricted', '--strict-mcp-config',
     '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome', '--permission-prompts', 'none',
     '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed, '--allowedTools', allowed,
-    '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input']);
+    '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input', '--', prompt]);
 }
 
 export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
@@ -82,7 +83,9 @@ export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
 export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Codex prompt must be nonempty and contain no NUL.');
   const sandbox = policy.worktree === 'read-write' ? 'workspace-write' : 'read-only';
-  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check', prompt]);
+  // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
+  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check', '--',
+    prompt]);
 }
 
 export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'

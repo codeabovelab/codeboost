@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -44,25 +44,28 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('removes a network that lands in the daemon after its create client was killed', () => {
-    const networks = () => new Set(docker('network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress')
-      .split('\n').filter(Boolean));
-    const before = networks();
-    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-'));
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), requested = join(shim, 'network-name');
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // The create client hangs until killed, and the real create lands after that, inside the cleanup reserve.
+    // The shim records this test's network name, since other suites may create egress networks concurrently.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
-      `if [ "$1" = network ] && [ "$2" = create ]; then ( sleep 7; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
+      `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; printf %s "$last" > '${requested}'; `
+        + `( sleep 7; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const lateInvocation = captureInvocation({ ...invocation, attemptId: `late-network-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    try { expect(() => createVendorNetwork(lateInvocation, imageId, 9_000)).toThrow(); }
-    finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    let name = '';
+    try {
+      expect(() => createVendorNetwork(lateInvocation, imageId, 9_000)).toThrow();
+      name = readFileSync(requested, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     execFileSync('sleep', ['3']);
-    const orphans = [...networks()].filter(id => !before.has(id));
-    for (const id of orphans) docker('network', 'rm', id);
-    expect(orphans).toEqual([]);
+    const orphaned = spawnSync('docker', ['network', 'inspect', name], { stdio: 'ignore' }).status === 0;
+    if (orphaned) docker('network', 'rm', name);
+    expect(name).toMatch(/^codeboost-egress-/);
+    expect(orphaned).toBe(false);
   }, 60_000);
 
   it('pins the host list with each vendor profile', () => {
