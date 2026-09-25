@@ -1,6 +1,6 @@
 # F1 runner lifecycle and state-holder contract
 
-**Status:** proposed for review. Nothing in this document is implemented yet.
+**Status:** contract proposed; the four open decisions are approved (2026-09-25). Nothing in this document is implemented yet.
 **Lane and step:** lane F (runner and pre-merge automation), step F1. Related issue: #22.
 **Baseline:** `main` at `f8c8d9f` (D1–D3 merged; D4 open as #47; D5 not started).
 
@@ -167,7 +167,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 This runs before the coordinator opens.
 
-1. Take the single-runner lock for this database (see open decision 1). If another live runner holds it, start the review screen read-only and do not start the runner.
+1. Take the single-runner lock for this database (decision 1). If another live runner holds it, start the review screen read-only and do not start the runner.
 2. Run D's leftover-container and network cleanup. Await it.
 3. For every `pending` or `running` attempt row, write `failed` with the reason "Interrupted: codeboost stopped while this was running". A first reason that was already recorded is kept in the diagnostic.
 4. Hand the tasks to lane I3 for workspace rebuild and requeue. F1 only makes the attempt rows terminal.
@@ -262,12 +262,16 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Code reassigned or snapshot changed, then retry or render | Snapshot advances during a run → result discarded → row `stale` with the cause → retry disabled; "run again" allowed |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
-## Open decisions for reviewers
+## Decisions (approved 2026-09-25)
 
-1. **Single-runner lock.** How does one runner per database get enforced across processes? Proposal: an exclusive lock file next to the database, holding the process ID and start time. It is taken at startup and released at the end of shutdown. A stale file is accepted only if that process ID is not alive with the same start time. The alternative is a SQLite lease row, but that brings back the lease-expiry problem.
-2. **E3 durable cancellation.** Keep the read-only exception, or move E3 to "terminal only after settlement" for consistency? Proposal: keep it. Revisit it when G4 wires the endpoints.
-3. **Process shutdown as a hard stop.** Confirm that stopping the process cancels the running task instead of waiting for it to finish.
-4. **Unbounded wait for settlement at shutdown.** F waits for D's kill escalation and does not set its own limit. Confirm that D5's real-Docker suite proves settlement always ends.
+The user approved the proposal for each of these four questions.
+
+| # | Question | Decision | What F1 must do |
+|---|---|---|---|
+| 1 | How is one runner per database enforced across processes? | An exclusive lock file next to the database, holding the process ID and the process start time. | Take the lock at startup and release it at the end of shutdown. Accept a leftover lock file only if no live process has that ID and start time. Do not use a SQLite lease row, because lease expiry could release a live runner. |
+| 2 | Does E3 keep writing `cancelled` before the provider settles? | Yes. This exception applies only to read-only phases. | Leave E3 unchanged. New F records use "terminal only after settlement" for every phase. Revisit this when G4 wires the planning endpoints. |
+| 3 | Is process shutdown a hard stop? | Yes. | Stopping the process cancels the running task with the reason "Stopped by shutdown". It does not wait for the task to finish. Restart recovery requeues the task. |
+| 4 | Does F set its own time limit on settlement at shutdown? | No. F waits for D's forced-kill escalation. | Do not abandon a job after a timer. The D5 real-Docker suite must prove that settlement always ends, including for a child process that ignores SIGTERM. If D5 cannot prove this, reopen this decision before F1 merges. |
 
 ## Out of scope for F1
 
