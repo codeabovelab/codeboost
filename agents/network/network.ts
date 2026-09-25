@@ -232,7 +232,7 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   }
 }
 
-export function removeVendorNetwork(network: VendorNetwork): void {
+export function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30_000): void {
   const identity = identities.get(network);
   if (!identity) {
     if (removedNetworks.has(network)) return;
@@ -240,7 +240,7 @@ export function removeVendorNetwork(network: VendorNetwork): void {
   }
   assertBuiltAgentImage(identity.imageId);
   const allocationId = identity.allocationId;
-  const remaining = deadline(30_000), failures: unknown[] = [];
+  const remaining = deadline(timeoutMs), failures: unknown[] = [];
   // Remove by the captured IDs; a same-named replacement is not ours to delete and keeps the network busy.
   try { remove(['rm', '--force', identity.proxyId], ['container', 'inspect', identity.proxyId],
     remaining, 'vendor proxy', allocationId); } catch (error) { failures.push(error); }

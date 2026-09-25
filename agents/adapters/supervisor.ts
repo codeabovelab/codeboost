@@ -315,8 +315,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     decodeAbort?.abort();
     if (!closed) terminate();
   };
-  const capture = (stream: 'stdout' | 'stderr', value: Buffer | string) => {
-    if (stopReason || closed) return;
+  const capture = (stream: 'stdout' | 'stderr', value: Buffer | string, final = false) => {
+    if (!final && (stopReason || closed)) return;
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     const streamBytes = stream === 'stdout' ? stdoutBytes : stderrBytes;
     const streamLimit = stream === 'stdout' ? limits.stdoutBytes : limits.stderrBytes;
@@ -328,7 +328,10 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       else stderrBytes += retained.length;
       combinedBytes += retained.length;
     }
-    if (chunk.length > available) stop('output-limit');
+    if (chunk.length > available) {
+      if (final) stopReason ??= 'output-limit';
+      else stop('output-limit');
+    }
   };
   const consumeProtocol = (length: number) => {
     const available = Math.max(0, Math.min(limits.stderrBytes - stderrBytes,
@@ -486,11 +489,11 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
     if (!stopReason && performance.now() >= deadline) stopReason = 'timeout';
+    closed = true;
     if (protocolBuffer.length) {
-      if (!protocolLine(protocolBuffer)) capture('stderr', protocolBuffer);
+      if (!protocolLine(protocolBuffer)) capture('stderr', protocolBuffer, true);
       protocolBuffer = Buffer.alloc(0);
     }
-    closed = true;
     let finalStdout = Buffer.concat(stdoutChunks, stdoutBytes), finalStderr = Buffer.concat(stderrChunks);
     let exitCode = code, finalSignal = signal;
     if (!stopReason && options.decode && !profile.deferredOutput) await decodeOutput();

@@ -39,18 +39,18 @@ export function startCodexInvocation(request: AgentAdapterRequest,
         readCodexOutput(current.name, maximum, timeoutMs, signal) });
   } catch (error) {
     if (error instanceof ProfileCreationCleanupError) {
-      const retryCleanup = () => {
+      const retryCleanup = (networkTimeoutMs = 30_000) => {
         const failures: unknown[] = [];
         try { error.retryCleanup(); } catch (cleanupError) { failures.push(cleanupError); }
-        try { removeVendorNetwork(network); } catch (cleanupError) { failures.push(cleanupError); }
+        try { removeVendorNetwork(network, networkTimeoutMs); } catch (cleanupError) { failures.push(cleanupError); }
         if (failures.length) throw new AggregateError(failures, 'Adapter setup cleanup did not settle.');
       };
-      try { retryCleanup(); }
-      catch (cleanupError) { return retainSetupCleanup(request.invocation, retryCleanup,
+      try { retryCleanup(Math.min(30_000, remaining())); }
+      catch (cleanupError) { return retainSetupCleanup(request.invocation, () => retryCleanup(),
         error.startupError, cleanupError, 'profile and network cleanup'); }
       throw error.startupError;
     }
-    try { removeVendorNetwork(network); }
+    try { removeVendorNetwork(network, Math.min(30_000, remaining())); }
     catch (cleanupError) { return retainNetworkCleanup(request.invocation, network, error, cleanupError); }
     throw error;
   }
