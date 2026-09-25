@@ -10,7 +10,9 @@ require_option() { has_option "$(mount_options "$1")" "$2" || fail "$1 must be m
 filesystem_bytes() { df -B1 --output=size "$1" | tail -n 1 | tr -d ' '; }
 filesystem_inodes() { df --output=itotal "$1" | tail -n 1 | tr -d ' '; }
 require_ceiling() {
-  [ "$(filesystem_bytes "$1")" -le "$2" ] || fail "$1 exceeds its byte limit"
+  # tmpfs rounds size= up to a whole page, so compare against the page-rounded limit.
+  page=$(getconf PAGESIZE)
+  [ "$(filesystem_bytes "$1")" -le "$(( ($2 + page - 1) / page * page ))" ] || fail "$1 exceeds its byte limit"
   [ "$(filesystem_inodes "$1")" -le "$3" ] || fail "$1 exceeds its inode limit"
 }
 

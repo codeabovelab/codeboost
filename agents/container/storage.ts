@@ -118,8 +118,11 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
         '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
         '--label', `io.codeboost.task-storage=${kind}`, '--label', `io.codeboost.allocation=${allocationId}`, name], remaining());
     }
-    const seed = ['set -eu', 'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/. /work/',
-      'cp -a --no-preserve=ownership,timestamps /work/.git/. /metadata/', 'rm -rf /work/.git', 'mkdir /work/.git',
+    // Copy metadata straight to its own volume so the work allocation never holds both at once.
+    const seed = ['set -eu',
+      'find /run/codeboost-staging -mindepth 1 -maxdepth 1 ! -name .git'
+        + ' -exec cp -a --no-preserve=ownership,timestamps -t /work/ {} +',
+      'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
       'chown -R 10001:10001 /work /metadata'].join('; ');
     docker(['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=32', '--memory=128m', '--cpus=.25',

@@ -176,7 +176,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     const readOnlyWork = ['planning', 'questions', 'review'].includes(invocation.phase);
     const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--pids-limit=128', '--memory=512m', '--memory-swap=512m',
-      '--cpus=1', '--shm-size=16m',
+      '--cpus=1', '--shm-size=16m', '--ipc=private', '--cgroupns=private',
       '--network=none', '--env', 'HOME=/home/codeboost', '--env', `CODEBOOST_PHASE=${invocation.phase}`,
       '--label', `io.codeboost.invocation=${ownershipId}`,
       '--env', `CODEBOOST_VENDOR=${invocation.vendor}`, '--env', 'npm_config_cache=/tmp/npm-cache',

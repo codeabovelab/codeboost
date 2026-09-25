@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -22,16 +22,22 @@ const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
 
-function fixture() {
+function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'agent-container-')); roots.push(root);
   const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
   git(source, 'init'); git(source, 'config', 'user.name', 'Test'); git(source, 'config', 'user.email', 'test@example.com');
-  writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '.'); git(source, 'commit', '-m', 'baseline');
+  if (options.historyBytes) {
+    // Incompressible history that no longer exists in the checked-out worktree.
+    writeFileSync(join(source, 'history.bin'), randomBytes(options.historyBytes));
+    git(source, 'add', '.'); git(source, 'commit', '-m', 'history');
+    rmSync(join(source, 'history.bin'));
+  }
+  writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '-A'); git(source, 'commit', '-m', 'baseline');
   writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-schema-marker"}\n');
   chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
   const clone = createTaskClone({ source, parent: staging, taskId: 'task-1', head: git(source, 'rev-parse', 'HEAD') });
-  const filesystems = prepareTaskFilesystems(clone, {
+  const filesystems = prepareTaskFilesystems(clone, options.limits ?? {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
   }, imageId);
   taskFilesystems.push(filesystems);
@@ -87,6 +93,27 @@ describe('real Docker agent isolation', () => {
       ].join('; '), 'probe', data.source]));
       expect(output).toBe('isolated');
     } finally { delete process.env.HOST_SECRET_SENTINEL; }
+  }, 60_000);
+
+  it('seeds Git history larger than the work allocation into the metadata volume only', () => {
+    const data = fixture({ historyBytes: 4 * 1024 * 1024, limits: {
+      workBytes: 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
+    } });
+    expect(runContainer(profile(data, 'review', ['sh', '-c',
+      'set -eu; test ! -e /work/history.bin; git cat-file -e HEAD~1:history.bin; cat /work/file.txt']))).toBe('trusted');
+  }, 60_000);
+
+  it('accepts byte limits that tmpfs rounds up to a whole page', () => {
+    const data = fixture({ limits: {
+      workBytes: 16 * 1024 * 1024 + 1, workInodes: 512, metadataBytes: 16 * 1024 * 1024 + 1, metadataInodes: 512,
+    } });
+    expect(runContainer(profile(data, 'execute', ['sh', '-c', 'printf rounded']))).toBe('rounded');
+  }, 60_000);
+
+  it('requests private IPC and cgroup namespaces instead of relying on daemon defaults', () => {
+    const args = profile(fixture(), 'planning', ['true']).args;
+    expect(args).toContain('--ipc=private');
+    expect(args).toContain('--cgroupns=private');
   }, 60_000);
 
   it('persists execution changes while replacing HOME and scratch for each invocation', () => {

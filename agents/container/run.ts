@@ -82,8 +82,9 @@ type Inspect = {
     PidsLimit: number; Memory: number; MemorySwap: number; MemoryReservation: number; MemorySwappiness: number | null;
     OomKillDisable: boolean; OomScoreAdj: number; NanoCpus: number; CpuShares: number; CpuPeriod: number; CpuQuota: number;
     CpuRealtimePeriod: number; CpuRealtimeRuntime: number; CpusetCpus: string; CpusetMems: string; ShmSize: number;
-    BlkioWeight: number; BlkioWeightDevice: unknown[]; BlkioDeviceReadBps: unknown[]; BlkioDeviceWriteBps: unknown[];
-    BlkioDeviceReadIOps: unknown[]; BlkioDeviceWriteIOps: unknown[]; Ulimits: unknown[]; CpuCount: number;
+    BlkioWeight: number; BlkioWeightDevice: unknown[] | null; BlkioDeviceReadBps: unknown[] | null;
+    BlkioDeviceWriteBps: unknown[] | null; BlkioDeviceReadIOps: unknown[] | null; BlkioDeviceWriteIOps: unknown[] | null;
+    Ulimits: unknown[] | null; CpuCount: number;
     CpuPercent: number; IOMaximumBandwidth: number; IOMaximumIOps: number; DeviceCgroupRules: unknown[] | null;
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
@@ -125,8 +126,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || host.NanoCpus !== 1_000_000_000 || host.CpuShares !== 0 || host.CpuPeriod !== 0 || host.CpuQuota !== 0
     || host.CpuRealtimePeriod !== 0 || host.CpuRealtimeRuntime !== 0 || host.CpusetCpus !== '' || host.CpusetMems !== ''
     || host.ShmSize !== 16 * 1024 * 1024 || host.BlkioWeight !== 0
-    || host.BlkioWeightDevice.length || host.BlkioDeviceReadBps.length || host.BlkioDeviceWriteBps.length
-    || host.BlkioDeviceReadIOps.length || host.BlkioDeviceWriteIOps.length || host.Ulimits.length
+    || host.BlkioWeightDevice?.length || host.BlkioDeviceReadBps?.length || host.BlkioDeviceWriteBps?.length
+    || host.BlkioDeviceReadIOps?.length || host.BlkioDeviceWriteIOps?.length || host.Ulimits?.length
     || host.CpuCount !== 0 || host.CpuPercent !== 0 || host.IOMaximumBandwidth !== 0 || host.IOMaximumIOps !== 0
     || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== '')
     throw new Error('Container daemon configuration is missing required lockdown.');

@@ -1,7 +1,12 @@
 name: Agent isolation
 on:
   push:
-    branches: ['codex/agent-isolation-d2']
+    branches: [main]
+    paths:
+      - 'agents/**'
+      - 'git/clone.ts'
+      - 'test/agent-*.test.ts'
+      - '.github/workflows/agent-isolation.yml'
   pull_request:
     paths:
       - 'agents/**'
