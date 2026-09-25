@@ -60,6 +60,35 @@ const captureLimits = (override: Partial<CaptureLimits> | undefined): CaptureLim
 };
 const diagnosticFor = (reason: StopReason, detail?: string) => Buffer.from(
   `[codeboost: ${reason}${detail ? `: ${detail.replace(/[\r\n]+/g, ' ').slice(0, 512)}` : ''}]\n`);
+/**
+ * Retains captured output in fixed-size blocks, so memory scales with retained bytes rather than with the number
+ * of write events a container emits.
+ */
+export class ByteCollector {
+  static readonly BLOCK_BYTES = 64 * 1024;
+  private readonly blocks: Buffer[] = [];
+  private used = 0;
+  push(data: Buffer): void {
+    for (let offset = 0; offset < data.length;) {
+      let block = this.blocks.at(-1);
+      if (!block || this.used === block.length) {
+        block = Buffer.allocUnsafe(ByteCollector.BLOCK_BYTES);
+        this.blocks.push(block);
+        this.used = 0;
+      }
+      const count = Math.min(data.length - offset, block.length - this.used);
+      data.copy(block, this.used, offset, offset + count);
+      this.used += count;
+      offset += count;
+    }
+  }
+  toBuffer(): Buffer {
+    if (!this.blocks.length) return Buffer.alloc(0);
+    return Buffer.concat([...this.blocks.slice(0, -1), this.blocks.at(-1)!.subarray(0, this.used)]);
+  }
+  get blockCount(): number { return this.blocks.length; }
+}
+
 const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
@@ -274,7 +303,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     throw error;
   }
 
-  const stdoutChunks: Buffer[] = [], stderrChunks: Buffer[] = [];
+  const stdoutChunks = new ByteCollector(), stderrChunks = new ByteCollector();
   let stdoutBytes = 0, stderrBytes = 0, combinedBytes = 0;
   let stopReason: StopReason | undefined, failureDetail: string | undefined;
   let closed = false, terminating = false, settlementComplete = false;
@@ -388,7 +417,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
             ? new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.')
             : new Error('Adapter output capture was cancelled.')), { once: true });
         });
-        const raw = Buffer.concat(stdoutChunks, stdoutBytes);
+        const raw = stdoutChunks.toBuffer();
         const operation = Promise.resolve(options.decode!(profile, raw,
           Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)),
           budget, controller.signal));
@@ -526,7 +555,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       if (!protocolLine(protocolBuffer)) capture('stderr', protocolBuffer, true);
       protocolBuffer = Buffer.alloc(0);
     }
-    let finalStdout = Buffer.concat(stdoutChunks, stdoutBytes), finalStderr = Buffer.concat(stderrChunks);
+    let finalStdout = stdoutChunks.toBuffer(), finalStderr = stderrChunks.toBuffer();
     let exitCode = code, finalSignal = signal;
     if (!stopReason && options.decode && !profile.deferredOutput) await decodeOutput();
     if (decodePromise) await decodePromise;
