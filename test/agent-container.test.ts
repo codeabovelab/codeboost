@@ -123,19 +123,18 @@ describe('real Docker agent isolation', () => {
     const data = fixture({ historyBytes: 4 * 1024 * 1024, limits: {
       workBytes: 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
     } });
-    expect(runContainer(profile(data, 'review', ['sh', '-c',
-      'set -eu; test ! -e /work/history.bin; git cat-file -e HEAD~1:history.bin; cat /work/file.txt']))).toBe('trusted');
+    expect(runContainer(profile(data, 'execute', 'metadata'))).toBe('metadata-safe');
   }, 60_000);
 
   it('accepts byte limits that tmpfs rounds up to a whole page', () => {
     const data = fixture({ limits: {
       workBytes: 16 * 1024 * 1024 + 1, workInodes: 512, metadataBytes: 16 * 1024 * 1024 + 1, metadataInodes: 512,
     } });
-    expect(runContainer(profile(data, 'execute', ['sh', '-c', 'printf rounded']))).toBe('rounded');
+    expect(runContainer(profile(data, 'execute', 'noop'))).toBe('');
   }, 60_000);
 
   it('requests private IPC and cgroup namespaces instead of relying on daemon defaults', () => {
-    const args = profile(fixture(), 'planning', ['true']).args;
+    const args = profile(fixture(), 'planning', 'noop').args;
     expect(args).toContain('--ipc=private');
     expect(args).toContain('--cgroupns=private');
   }, 60_000);
