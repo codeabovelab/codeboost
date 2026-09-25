@@ -122,6 +122,7 @@ A `pending` attempt has no `settled` promise, so the slot rules need a separate 
 
 | Case | What F does | When the slot is freed |
 |---|---|---|
+| Preparation fails before the D start call (for example the clone fails) | Preparation has already stopped its own subprocesses before rejecting (rule above). Remove anything it created. Write the terminal state from the first reason if one is recorded; otherwise write `failed` with the bounded preparation error. | After that terminal write succeeds |
 | Stop or context change before the D start call | Record the first reason. Await the preparation promise and remove anything it created. Then write the terminal state (`cancelled` or `stale`). | After that terminal write succeeds |
 | The D start call throws | Write `failed` with the launch error. D4's adapters throw only after their setup cleanup has succeeded. If cleanup is still unfinished, they return a handle instead, which settles when cleanup ends. So nothing is left running. | After that terminal write succeeds |
 | The D start call returns a handle | Write `pending → running`. From here the running-state rules apply, even if the handle comes from failed setup that is still cleaning up. | After `settled` resolves and the terminal write succeeds |
@@ -168,11 +169,13 @@ A retry is a new attempt with a new attempt ID. The runner allows it only when a
 
 | Check | Where it is checked |
 |---|---|
-| The last attempt for the task is `failed` or `cancelled` on disk | `Store` transaction |
+| The last attempt for the task is `failed` or `cancelled` on disk, **and** the task's status is `running` or `queued` | `Store` transaction |
 | No in-memory job **and no unresolved marker** exists for the task | Coordinator, synchronously before the transaction |
 | The caller's expected state version and attempt ID match the task's current values | `Store` transaction (prevents a double retry from two tabs) |
 | The last attempt's captured context is still current: snapshot ID, plan ID, plan revision, assignment ID, referenced-code hash and context generation (every field in "Current") | `Store` transaction |
 | The coordinator is `open` | Coordinator |
+
+**Closed and human-gated tasks are never retryable.** If the task is closed (`merged`, `cancelled` or `rejected`) or waits for a person (`needs human`, `needs amendment`, `needs approval`, `possibly already fixed`), retry is refused. Leaving a human-gated status needs its own explicit user action, such as sending the task back with guidance or approving a continuation. That action belongs to F2 or lane I, not to retry. A closed task never reopens. The task time limit moves the task to `needs human`, so a timed-out task cannot be retried this way either.
 
 A `stale` attempt can never be retried. The UI instead offers "Run again on the current code". That creates a new request, which captures a fresh context.
 
@@ -221,7 +224,7 @@ This runs before the coordinator opens.
    - no first reason → `failed` "Interrupted: codeboost stopped while this was running".
 4. Clear every unresolved marker (these exist only in memory, so a restart has already cleared them; step 3 reconciles their rows).
 5. Insert any missing `task-closed` events. This applies **only** to tasks with a confirmed `merged` merge attempt (feedback-event rule 2). An attempt's terminal state never closes a task: a `cancelled` or `failed` attempt means only that the attempt ended. User cancel and reject close a task in the same local transaction as their event, so they never need reconciliation.
-6. **Requeue input.** Hand lane I3 every task whose status is not closed (merged or cancelled by the user) and whose latest attempt is either (a) `cancelled` with first reason `shutdown`, whether written by clean shutdown or by step 3, or (b) `failed` "Interrupted" by step 3. Attempts that end `cancelled` by the user or `stale` are not requeued; they wait for a user action. I3 rebuilds the workspace and requeues. F1 only makes the attempt rows terminal and produces this list.
+6. **Requeue input.** Hand lane I3 every task whose status is not closed (`merged`, `cancelled` or `rejected`) and not human-gated, and whose latest attempt is either (a) `cancelled` with first reason `shutdown`, whether written by clean shutdown or by step 3, or (b) `failed` "Interrupted" by step 3. Attempts that end `cancelled` by the user or `stale` are not requeued; they wait for a user action. I3 rebuilds the workspace and requeues. F1 only makes the attempt rows terminal and produces this list.
 7. Open the coordinator.
 
 ## HTTP and UI contract
@@ -286,11 +289,13 @@ This is the smallest schema that holds the contract. The F1 implementation PR se
 
 | Table | Key columns |
 |---|---|
-| `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `state_version`, `context_generation`, `current_attempt_id` (references `attempts(id)`, nullable), `created_at`, `updated_at` |
+| `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `state_version`, `context_generation`, `assignment_id`, `referenced_code_hash`, `current_attempt_id` (references `attempts(id)`, nullable), `created_at`, `updated_at` |
 | `attempts` | `id` (**primary key**; never reused), `plan_key` (references `tasks(plan_key)`), `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `result` (JSON, only for `completed`, 1 MiB or less), `diagnostic` (bounded), `created_at`, `started_at`, `settled_at` |
 | `feedback_events` | the fields listed above, with `id` as primary key, with a unique index on `(plan_key, kind, action_id)` |
 
-`tasks.status` holds the product states from the design (queued, running, needs human, needs amendment, needs approval, possibly already fixed, in review, approved but merge blocked, merged, cancelled). F1 defines the list and its invariants. F2 adds the per-item transitions. I1 adds queue admission and scheduling.
+`tasks.status` holds the product states from the design (queued, running, needs human, needs amendment, needs approval, possibly already fixed, in review, approved but merge blocked, merged, cancelled, rejected). **Closed** means `merged`, `cancelled` or `rejected`; a closed status never changes again. **Human-gated** means `needs human`, `needs amendment`, `needs approval` or `possibly already fixed`. F1 defines the list and its invariants. F2 adds the per-item transitions. I1 adds queue admission and scheduling.
+
+**Where the current context lives.** The `Current` check reads two rows in one transaction: `plans` (plan revision, snapshot ID) and `tasks` (assignment ID, referenced-code hash, context generation). The plan ID comes from the plan key. Every `Store` method that changes any of these fields increases `tasks.context_generation` **in the same transaction**. That covers `importRevision`, `applySuggestion`, `recordHistory`, `recordRebase`, and any new method that reassigns work or changes the referenced code. A regression test lists these methods and fails if one of them changes a context field without increasing the generation. An assignment change that keeps the same plan revision and snapshot therefore still makes old attempts non-current.
 
 **Where results live.** `attempts.result` holds the validated structured result of a `completed` attempt: for example review findings, a question answer or check outcomes. It is limited to 1 MiB, the same as the plan-document limit after extraction. Larger or already-owned artifacts stay with their existing owners, and `result` references them by ID. Commits go in the ledger and snapshots (`recordHistory`), and continuation evidence goes in checkpoints. Raw stdout and stderr are never kept beyond the bounded `diagnostic`.
 
@@ -330,6 +335,9 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Preparation hangs, then cancel (review round 6) | Clone preparation blocks → user cancels → the signal aborts and the clone subprocess is awaited → row `cancelled` → slot freed |
 | Crash with a recorded first reason (review round 6) | User cancels (first reason saved) → process killed before settlement → restart → row `cancelled`, not `failed`, and not requeued |
 | Clean stop, then restart (review round 6) | Shutdown completes → lock file removed → a new process takes the lock and starts |
+| Preparation fails (review round 7) | Clone fails before the D start call → partial clone removed → row `failed` with the clone error → slot freed |
+| Retry a closed or gated task (review round 7) | Task `rejected` (or `needs human` after the time limit) with a `cancelled` last attempt → retry refused; restart does not requeue it |
+| Assignment changes alone (review round 7) | Work reassigned without a plan-revision or snapshot change → generation increases in the same transaction → the old attempt's result is refused and the row becomes `stale` |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
