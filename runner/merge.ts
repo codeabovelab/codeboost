@@ -92,10 +92,16 @@ export class MergeCoordinator {
     if (remote.alreadyFixed === 'found') blockers.push({ code: 'already-fixed', message: 'Another open or merged pull request references this issue.' });
     if (remote.alreadyFixed === 'unknown') blockers.push({ code: 'already-fixed', message: 'The already-fixed check could not be completed.' });
 
-    const attempt = this.#attempt(), queue = this.#queueStatus(attempt);
+    let attempt = this.#attempt();
+    if (attempt?.kind === 'direct' && attempt.state === 'submitting') {
+      if (remote.pullRequestState === 'MERGED' && remote.head === attempt.reviewedHead)
+        this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'merged' });
+      attempt = this.#attempt();
+    }
+    const queue = this.#queueStatus(attempt);
     if (attempt?.state === 'submitting' || attempt?.state === 'queued') {
       blockers.unshift({ code: 'queue-active', message: attempt.state === 'submitting'
-        ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : 'The reviewed head is being submitted to the merge queue.'
+        ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
         : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' });
     } else if (attempt?.state === 'merged') {
       blockers.unshift({ code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' });
@@ -108,9 +114,12 @@ export class MergeCoordinator {
     return { available: true, ready, action: ready ? (retry ? 'retry' : 'merge') : null, blockers, remote, queue };
   }
 
-  async displayStatus(view = this.service.load()): Promise<MergeStatus | MergeUnavailableStatus> {
-    try { return await this.status(view); }
-    catch (error) { return { available: true, ready: false, action: null, blockers: [{ code: 'github', message: `Could not read GitHub merge state. ${error instanceof Error ? error.message : 'Unknown error.'}` }], remote: null, queue: this.#queueStatus() }; }
+  async displayStatus(view = this.service.load(), signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
+    try { return await this.status(view, false, signal); }
+    catch (error) {
+      if (signal?.aborted) throw signal.reason;
+      return { available: true, ready: false, action: null, blockers: [{ code: 'github', message: `Could not read GitHub merge state. ${error instanceof Error ? error.message : 'Unknown error.'}` }], remote: null, queue: this.#queueStatus() };
+    }
   }
 
   async merge(token: unknown): Promise<{ status: MergeStatus; result: MergeResult }> {
@@ -155,12 +164,16 @@ export class MergeCoordinator {
       }
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
-      if (commandStatus.remote.mergeQueue) queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion! }, commandStatus.remote.head, queueWatermark);
+      if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined)
+        queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion }, commandStatus.remote.head, queueWatermark, commandStatus.remote.mergeQueue ? 'queue' : 'direct');
       const result = await this.gateway.merge(commandStatus.remote.head, { signal });
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not
         // report that action as failed; the durable submitting record is recoverable by polling.
-        try { this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url); } catch {}
+        try {
+          if (queueAttempt.kind === 'queue') this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url);
+          else this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged' });
+        } catch {}
       }
       return { status: commandStatus, result };
     } catch (error) {
@@ -188,6 +201,7 @@ export class MergeCoordinator {
     if (this.#queuePoll) return this.#queuePoll;
     const attempt = this.#attempt();
     if (!attempt || (attempt.state !== 'submitting' && attempt.state !== 'queued')) return this.#queueStatus(attempt);
+    if (attempt.kind === 'direct') return this.#queueStatus(attempt);
     if (!queueGateway(this.gateway)) return this.#queueStatus(attempt, 'This GitHub adapter cannot verify the merge-queue lifecycle.');
     const abort = new AbortController();
     this.#queueAbort = abort;

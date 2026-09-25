@@ -17,12 +17,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
   } catch (error) { service.close(); throw error; }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
-  const load=async()=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view):{available:false}};};
+  const load=async(signal?:AbortSignal)=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   let stopping = false;
+  const activeRequests=new Set<AbortController>();
   const server = createServer(async (req, res) => {
+    const requestAbort=new AbortController();activeRequests.add(requestAbort);
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -38,7 +40,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
         if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
-        if (req.method === 'GET' && path === '/api/review') { json(200, await load()); return; }
+        if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
         for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
@@ -48,7 +50,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
-          questions.start(input.id,view);json(200,await load());return;
+          questions.start(input.id,view);json(200,await load(requestAbort.signal));return;
         }
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
@@ -63,7 +65,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             // The saved question remains visible and retryable when capacity is reached.
           }
         }
-        json(200,await load());return;
+        json(200,await load(requestAbort.signal));return;
       }
       if (req.method !== 'GET') { json(405, { error: 'Method not allowed.' }); return; }
       const files: Record<string, [string, string]> = { '/': ['index.html', 'text/html'], '/app.js': ['app.js', 'text/javascript'], '/style.css': ['style.css', 'text/css'] };
@@ -76,6 +78,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }
       json(404, { error: 'Not found.' });
     } catch (error) { json(409, { error: error instanceof Error ? error.message : 'Review failed.' }); }
+    finally {activeRequests.delete(requestAbort);}
   });
   server.requestTimeout = 15000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
@@ -86,6 +89,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([closing, new Promise<void>(resolve => { timer=setTimeout(resolve,shutdownDrainMs); })]);
     if(timer)clearTimeout(timer);
+    for(const controller of activeRequests)controller.abort(new Error('Request cancelled during shutdown.'));
     await merges?.close();
     await closing;
     await questions.close();

@@ -19,7 +19,7 @@ export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
 export interface MergeAttempt {
-  id: string; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
+  id: string; kind: 'queue' | 'direct'; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
   queueWatermark?: string | null;
   url: string | null; reason: string | null; requiresFreshReview: boolean; entryId: string | null;
   phase: 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED' | null; position: number | null;
@@ -193,8 +193,9 @@ export class Store {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
-  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null): MergeAttempt {
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue'): MergeAttempt {
     sha(reviewedHead);
+    if (!['queue','direct'].includes(kind)) throw new Error('Invalid merge attempt kind.');
     if (queueWatermark !== null && (typeof queueWatermark !== 'string' || !queueWatermark || queueWatermark.length > 512)) throw new Error('Invalid merge-queue event cursor.');
     if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for merging.');
     const key = identityKey(identity);
@@ -205,7 +206,7 @@ export class Store {
       if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');
       const now = new Date().toISOString();
       const attempt: MergeAttempt = {
-        id: randomUUID(), state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
+        id: randomUUID(), kind, state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
         reviewVersion: expected.reviewVersion, reviewedHead, queueWatermark, url: null, reason: null, requiresFreshReview: false,
         entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now,
       };
@@ -254,7 +255,9 @@ export class Store {
   getMergeAttempt(identity: PlanIdentity): MergeAttempt | null {
     this.#current(identityKey(identity));
     const row = this.#get('SELECT data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
-    return row ? decode<MergeAttempt>(row.data) : null;
+    if (!row) return null;
+    const attempt = decode<MergeAttempt>(row.data);
+    return { ...attempt, kind: attempt.kind ?? 'queue' };
   }
   getSuggestions(identity: PlanIdentity, id: string): SuggestionRequest {
     const row = this.#get('SELECT * FROM requests WHERE key=? AND id=?', identityKey(identity), id);

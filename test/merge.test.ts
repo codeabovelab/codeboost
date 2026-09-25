@@ -143,6 +143,20 @@ it('preserves the GitHub merge refusal', async () => {
   await expect(new MergeCoordinator(service, client).merge(view.token)).rejects.toThrow('Required review is missing.');
 });
 
+it('persists and reconciles an ambiguous direct merge outcome', async () => {
+  const h = queueHarness([]);let state=remote(h.view(),{mergeQueue:false});
+  h.client.inspect=vi.fn(async()=>state);
+  h.client.merge=vi.fn(async()=>{throw new MergeSubmissionError('Direct merge response was lost.','unknown');});
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/response was lost/i);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({kind:'direct',state:'submitting',reason:'Direct merge response was lost.'});
+    expect(await h.coordinator.status(h.view())).toMatchObject({ready:false,action:null,queue:{state:'submitting'}});
+    state={...state,pullRequestState:'MERGED'};
+    expect(await h.coordinator.status(h.view())).toMatchObject({ready:false,action:null,queue:{state:'merged'}});
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({kind:'direct',state:'merged'});
+  } finally {await h.coordinator.close();h.store.close();}
+});
+
 it('aborts and awaits an active merge command during shutdown', async () => {
   const view = readyView(), service = serviceFor(view);
   let commandStarted!: () => void, commandSettled = false;

@@ -457,6 +457,11 @@ test('bounds shutdown draining before aborting active queue polling',async()=>{
  app=appRef=await startServer(config,0,undefined,gateway,50);const view=app.service.load(),attempt=app.service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);app.service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.com/example/repo/pull/24');
  const response=fetch(new URL('/api/merge',app.url),{headers:{'x-codeboost-token':app.token}});await pollingStarted;await app.close();expect(settled).toBe(true);expect((await response).status).toBe(409);app=await startServer(config,0);
 });
+test('aborts an admitted review status inspection after the shutdown drain',async()=>{
+ const config={...app.service.config,demo:false};await app.close();let started!:(value?:void)=>void,settled=false;const inspectionStarted=new Promise<void>(resolve=>{started=resolve;});
+ const gateway:MergeGateway={inspect:async options=>new Promise<never>((_resolve,reject)=>{started();options?.signal?.addEventListener('abort',()=>{settled=true;reject(options.signal?.reason);},{once:true});}),merge:async()=>({url:''})};
+ app=await startServer(config,0,undefined,gateway,50);const response=fetch(new URL('/api/review',app.url),{headers:{'x-codeboost-token':app.token}});await inspectionStarted;await app.close();expect(settled).toBe(true);expect((await response).status).toBe(409);app=await startServer(config,0);
+});
 test('blocks a partially received merge request when shutdown starts',async()=>{
  const config={...app.service.config,demo:false};await app.close();let mergeCalls=0;let appRef:typeof app;
  const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{mergeCalls++;return {url:''};}};
