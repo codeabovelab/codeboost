@@ -22,9 +22,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   let stopping = false;
-  const activeRequests=new Set<{abort:AbortController;request:IncomingMessage}>();
+  const activeRequests=new Set<{abort:AbortController;request:IncomingMessage;readingBody:boolean}>();
   const server = createServer(async (req, res) => {
-    const requestAbort=new AbortController(),activeRequest={abort:requestAbort,request:req};activeRequests.add(activeRequest);
+    const requestAbort=new AbortController(),activeRequest={abort:requestAbort,request:req,readingBody:false};activeRequests.add(activeRequest);
     const address = server.address(); const actualPort = address && typeof address !== 'string' ? address.port : port;
     const origin = `http://127.0.0.1:${actualPort}`;
     res.setHeader('Cache-Control', 'no-store'); res.setHeader('X-Content-Type-Options', 'nosniff');
@@ -43,7 +43,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
         if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
-        for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
+        activeRequest.readingBody=true;
+        try { for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
+        finally { activeRequest.readingBody=false; }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
@@ -92,7 +94,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     for(const active of activeRequests) {
       const reason=new Error('Request cancelled during shutdown.');
       active.abort.abort(reason);
-      active.request.destroy(reason);
+      if(active.readingBody)active.request.destroy(reason);
     }
     await merges?.close();
     await closing;
