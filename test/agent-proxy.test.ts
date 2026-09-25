@@ -89,6 +89,26 @@ describe('vendor egress proxy', () => {
     expect(response).toMatch(/^HTTP\/1\.1 431 /);
   });
 
+  it('refuses a streamed unterminated header without buffering it, and keeps serving', async () => {
+    const { proxyPort, upstreamPort, received } = await startProxy();
+    const flood = connect(proxyPort, '127.0.0.1');
+    let response = '';
+    flood.on('data', chunk => { response += chunk.toString('utf8'); });
+    flood.on('error', () => undefined);
+    const closed = new Promise(resolve => flood.once('close', resolve));
+    flood.write(`CONNECT localhost:${upstreamPort} HTTP/1.1\r\nX-Pad: ${'p'.repeat(1024 * 1024)}`);
+    await closed;
+    expect(response).toMatch(/^HTTP\/1\.1 431 /);
+    const client = connect(proxyPort, '127.0.0.1');
+    await new Promise(resolve => client.once('connect', resolve));
+    client.write(`CONNECT localhost:${upstreamPort} HTTP/1.1\r\n\r\nstill-serving`);
+    const deadline = Date.now() + 3_000;
+    while (!received().includes('still-serving') && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 20));
+    client.destroy();
+    expect(received()).toContain('still-serving');
+  });
+
   it('refuses hosts outside the vendor allowlist', async () => {
     const { proxyPort, upstreamPort } = await startProxy();
     const client = connect(proxyPort, '127.0.0.1');

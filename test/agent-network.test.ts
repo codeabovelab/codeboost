@@ -69,6 +69,31 @@ describe('vendor-only egress', () => {
     expect(orphaned).toBe(false);
   }, 60_000);
 
+  it('does not delete a same-named stand-in when setup fails after the proxy exists', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The readiness exec swaps the proxy for a same-named, same-labelled stand-in, then fails setup.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh', 'if [ "$1" = exec ]; then',
+      `  name=$('${realDocker}' inspect -f '{{.Name}}' "$2" | sed 's#^/##')`,
+      `  label=$('${realDocker}' inspect -f '{{index .Config.Labels "io.codeboost.egress"}}' "$2")`,
+      `  '${realDocker}' rm --force "$2" >/dev/null`,
+      `  '${realDocker}' run --detach --name "$name" --label "io.codeboost.egress=$label" --entrypoint sleep ${imageId} 300 >/dev/null`,
+      `  printf %s "$name" > '${recorded}'; exit 1`, 'fi', `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const failing = captureInvocation({ ...invocation, attemptId: `failed-setup-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let impostor = '';
+    try {
+      expect(() => createVendorNetwork(failing, imageId)).toThrow();
+      impostor = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
+    spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
+    expect(impostor).toMatch(/^codeboost-proxy-/);
+    expect(survived).toBe(true);
+  }, 60_000);
+
   it('pins the host list with each vendor profile', () => {
     expect(VENDOR_HOSTS).toEqual({ claude: ['api.anthropic.com'], codex: ['api.openai.com', 'chatgpt.com'] });
     expect(Object.isFrozen(VENDOR_HOSTS.claude)).toBe(true);

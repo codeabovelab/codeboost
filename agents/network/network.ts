@@ -152,7 +152,13 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   const subnetSeed = randomUUID().replaceAll('-', '');
   const subnet = `10.254.${parseInt(subnetSeed.slice(0, 2), 16)}.${parseInt(subnetSeed.slice(2, 4), 16) & 0xf8}/29`;
   let networkPlanned = false, proxyPlanned = false;
+  // IDs of the objects this call created; cleanup targets these, and names only for a create whose ID never returned.
+  let networkId: string | undefined, proxyId: string | undefined;
   const unsettled = new Set<string>();
+  const createdId = (value: string, kind: string) => {
+    if (!/^[0-9a-f]{64}$/.test(value)) throw new Error(`Docker did not return the created ${kind} ID.`);
+    return value;
+  };
   // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.
   const create = (object: string, args: readonly string[]) => {
     const timeout = remaining();
@@ -164,29 +170,27 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   };
   try {
     networkPlanned = true;
-    const networkId = create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
-      '--label', `io.codeboost.egress=${allocationId}`, name]);
+    networkId = createdId(create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
+      '--label', `io.codeboost.egress=${allocationId}`, name]), 'network');
     proxyPlanned = true;
-    const proxyId = create(proxyContainer, ['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
+    proxyId = createdId(create(proxyContainer, ['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
-      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']);
-    docker(['network', 'connect', 'bridge', proxyContainer], remaining());
-    docker(['exec', proxyContainer, 'node', '-e', [
+      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']), 'proxy');
+    docker(['network', 'connect', 'bridge', proxyId], remaining());
+    docker(['exec', proxyId, 'node', '-e', [
       "const net=require('node:net');let attempts=0;",
       "const check=()=>{const socket=net.connect(3128,'127.0.0.1');",
       "socket.once('connect',()=>{socket.destroy();process.exit(0)});",
       "socket.once('error',()=>{socket.destroy();if(++attempts===50)process.exit(1);setTimeout(check,20)})};check();",
     ].join('')], remaining());
-    const proxyInspect = JSON.parse(docker(['container', 'inspect', proxyContainer], remaining()))[0] as
+    const proxyInspect = JSON.parse(docker(['container', 'inspect', proxyId], remaining()))[0] as
       { NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }> } } | undefined;
     const proxyIp = proxyInspect?.NetworkSettings?.Networks?.[name]?.IPAddress;
     if (!proxyIp || !/^10\.254\.\d{1,3}\.\d{1,3}$/.test(proxyIp))
       throw new Error('Vendor proxy did not receive its expected internal address.');
     const network = Object.freeze({ name, proxyContainer, proxyUrl: `http://${proxyIp}:3128`, vendor });
-    if (!/^[0-9a-f]{64}$/.test(networkId) || !/^[0-9a-f]{64}$/.test(proxyId))
-      throw new Error('Docker did not return the created network and proxy IDs.');
     identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet, proxyIp, networkId, proxyId }));
     validateVendorNetwork(network, invocation, undefined, remaining);
     remaining();
@@ -199,11 +203,12 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     const settleBy = (object: string) => unsettled.has(object)
       ? performance.now() + Math.min(CREATE_SETTLE_MS, reserveLeft) : 0;
     const cleanupBudget = overall;
-    if (proxyPlanned) try { remove(['rm', '--force', proxyContainer], ['container', 'inspect', proxyContainer],
-      cleanupBudget, 'vendor proxy', allocationId, settleBy(proxyContainer)); }
+    const proxyTarget = proxyId ?? proxyContainer, networkTarget = networkId ?? name;
+    if (proxyPlanned) try { remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
+      cleanupBudget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer)); }
     catch (cleanupError) { failures.push(cleanupError); }
-    if (networkPlanned) try { remove(['network', 'rm', name], ['network', 'inspect', name],
-      cleanupBudget, 'vendor network', allocationId, settleBy(name)); }
+    if (networkPlanned) try { remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
+      cleanupBudget, 'vendor network', allocationId, networkId ? 0 : settleBy(name)); }
     catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError([error, ...failures], 'Vendor network creation and cleanup failed.');
     throw error;

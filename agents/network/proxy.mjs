@@ -7,6 +7,8 @@ const listenPort = Number(process.env.CODEBOOST_PROXY_PORT ?? 3128);
 const upstreamPort = Number(process.env.CODEBOOST_UPSTREAM_PORT ?? 443);
 const connectLine = new RegExp(`^CONNECT ([a-z0-9.-]+):${upstreamPort} HTTP\\/1\\.[01]$`);
 
+const MAX_HEADER_BYTES = 8192;
+
 const refuse = (socket, status = '403 Forbidden') => {
   socket.end(`HTTP/1.1 ${status}\r\nConnection: close\r\n\r\n`);
 };
@@ -15,10 +17,11 @@ createServer(client => {
   client.setTimeout(300_000, () => client.destroy());
   let request = Buffer.alloc(0);
   const receive = chunk => {
+    // Between reads `request` holds at most an unfinished 8 KiB header, so memory stays within the header limit plus
+    // one socket read however much a client streams. Tunnel bytes in the same read as the header may follow it.
     request = Buffer.concat([request, chunk], request.length + chunk.length);
-    // The limit applies to the header only; tunnel bytes sent in the same read may follow it.
-    const boundary = request.indexOf('\r\n\r\n');
-    if (boundary < 0 ? request.length > 8192 : boundary + 4 > 8192) {
+    const boundary = request.subarray(0, MAX_HEADER_BYTES).indexOf('\r\n\r\n');
+    if (boundary < 0 && request.length >= MAX_HEADER_BYTES) {
       client.off('data', receive);
       refuse(client, '431 Request Header Fields Too Large');
       return;
