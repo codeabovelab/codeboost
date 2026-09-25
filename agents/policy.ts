@@ -84,12 +84,16 @@ export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCo
   if (!prompt || prompt.includes('\0')) throw new Error('Codex prompt must be nonempty and contain no NUL.');
   const sandbox = policy.worktree === 'read-write' ? 'workspace-write' : 'read-only';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
-  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check', '--',
-    prompt]);
+  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check',
+    '--output-last-message', '/run/codeboost-output/final.txt', '--', prompt]);
 }
 
 export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'
-  | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker';
+  | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker' | 'finite-output'
+  | 'infinite-stdout' | 'infinite-stderr' | 'infinite-mixed' | 'ignore-term' | 'symlink-output'
+  | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'truncated-utf8-stderr'
+  | 'replace-output-directory'
+  | 'nonzero-output' | 'duplicate-protocol' | 'newline-free-deferred-output';
 
 /** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
 export function createIsolationProbeCommand(policy: PhasePolicy, probe: IsolationProbe): AgentCommand {
@@ -112,6 +116,21 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
     'must-not-run': 'touch /tmp/command-ran',
     'input-marker': 'set -eu; grep -q codeboost-schema-marker /run/codeboost-input/schema.json; '
       + 'test ! -e /run/codeboost-input/extra.json',
+    'finite-output': 'printf stdout-marker; printf stderr-marker >&2',
+    'invalid-utf8-stderr': "printf 'bad-\\377\\377-stderr' >&2",
+    'truncated-utf8-stderr': "printf 'cut-\\342' >&2",
+    'infinite-stdout': "while :; do head -c 4096 /dev/zero | tr '\\0' x; done",
+    'infinite-stderr': "while :; do head -c 4096 /dev/zero | tr '\\0' x >&2; done",
+    'infinite-mixed': "while :; do head -c 4096 /dev/zero | tr '\\0' x; head -c 4096 /dev/zero | tr '\\0' y >&2; done",
+    'ignore-term': "trap '' TERM; while :; do sleep 1; done",
+    'symlink-output': 'ln -s /etc/passwd /run/codeboost-output/final.txt',
+    'oversized-output': 'head -c 131072 /dev/zero > /run/codeboost-output/final.txt',
+    'fifo-output': 'mkfifo /run/codeboost-output/final.txt',
+    'invalid-utf8-output': "printf '\\377' > /run/codeboost-output/final.txt",
+    'replace-output-directory': 'rm -rf /run/codeboost-output; ln -s /etc /run/codeboost-output',
+    'nonzero-output': 'printf encoded-output; exit 7',
+    'duplicate-protocol': "printf '\\036CODEBOOST_START:00000000-0000-0000-0000-000000000000\\036\\n' >&2",
+    'newline-free-deferred-output': "printf captured > /run/codeboost-output/final.txt; printf trailing-diagnostic >&2",
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }

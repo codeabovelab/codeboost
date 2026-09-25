@@ -1,0 +1,398 @@
+import { execFileSync, spawnSync } from 'node:child_process';
+import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
+import { isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
+  startProfileInvocation } from '../agents/adapters/supervisor.ts';
+import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
+import { buildAgentImage } from '../agents/container/image.ts';
+import { createContainerProfile, disposeContainerProfile, isContainerProfileAuthentic,
+  type ContainerProfile } from '../agents/container/profile.ts';
+import { disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
+import { createVendorNetwork } from '../agents/network/network.ts';
+import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
+import { createTaskClone } from '../git/clone.ts';
+
+const roots: string[] = [], profiles: ContainerProfile[] = [];
+const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
+let imageId = '';
+const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
+  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+
+function fixture() {
+  const root = mkdtempSync(join(tmpdir(), 'agent-supervisor-')); roots.push(root);
+  const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
+  mkdirSync(source); mkdirSync(staging); mkdirSync(input);
+  git(source, 'init'); git(source, 'config', 'user.name', 'Test'); git(source, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '.'); git(source, 'commit', '-m', 'baseline');
+  writeFileSync(join(input, 'schema.json'), '{}\n'); chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
+  const clone = createTaskClone({ source, parent: staging, taskId: 'supervisor', head: git(source, 'rev-parse', 'HEAD') });
+  const filesystems = prepareTaskFilesystems(clone, {
+    workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
+  }, imageId); allocations.push(filesystems);
+  const auth = join(root, 'auth.json'); writeFileSync(auth, '{}', { mode: 0o600 });
+  return { root, input, clone, filesystems, auth };
+}
+function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlineMs = 2 * 60_000,
+  vendor: 'codex' | 'claude' = 'codex'): InvocationInput {
+  return captureInvocation({ clone: data.clone, phase: 'planning', vendor, approvedArgv: [],
+    deadline: Date.now() + deadlineMs, attemptId,
+    context: { snapshotId: 'snapshot', planId: 'plan', planRevision: 1, assignmentId: 'assignment',
+      referencedCodeHash: 'code', stateVersion: 1 } });
+}
+function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
+  attempt: string | InvocationInput = `attempt-${Math.random()}`, deadlineMs = 2 * 60_000, deferredOutput = false) {
+  // An attempt can be captured once, so a duplicate-attempt profile reuses the captured invocation.
+  const captured = typeof attempt === 'string' ? invocation(data, attempt, deadlineMs) : attempt;
+  const policy = createPhasePolicy(captured);
+  const network = createVendorNetwork(captured, imageId);
+  const value = createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
+    inputDirectory: data.input, command: createIsolationProbeCommand(policy, probe), imageId, codexAuthFile: data.auth,
+    deferredOutput });
+  profiles.push(value); return value;
+}
+
+beforeAll(() => { imageId = buildAgentImage(); }, 10 * 60_000);
+afterAll(() => {
+  for (const profile of profiles) disposeContainerProfile(profile);
+  for (const allocation of allocations.reverse()) removeTaskFilesystems(allocation);
+  for (const root of roots.reverse()) {
+    chmodSync(join(root, 'input'), 0o700);
+    rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  }
+}, 3 * 60_000);
+
+describe('container invocation supervisor', () => {
+  it('preserves the first cancellation reason while retained setup cleanup settles', async () => {
+    const data = fixture(), captured = invocation(data, 'cancel-setup-cleanup');
+    let attempts = 0;
+    const handle = retainSetupCleanup(captured, () => {
+      attempts += 1;
+      if (attempts === 1) return;
+      throw new Error('unexpected repeated cleanup');
+    }, new Error('startup failed'), new Error('cleanup failed'));
+    handle.cancel('shutdown');
+    handle.cancel('cancelled');
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('shutdown');
+    expect(result.stderr).toContain('[codeboost: shutdown:');
+    expect(attempts).toBe(1);
+    expect(isInvocationActive('cancel-setup-cleanup')).toBe(false);
+  });
+
+  it('captures finite output and releases ownership only after cleanup', async () => {
+    const current = profile(fixture(), 'finite-output', 'finite');
+    const handle = startProfileInvocation(current);
+    expect(isInvocationActive('finite')).toBe(true);
+    const result = await handle.settled;
+    expect(result).toMatchObject({ attemptId: 'finite', exitCode: 0, signal: null,
+      stdout: 'stdout-marker', stderr: 'stderr-marker' });
+    expect(result.stopReason).toBeUndefined();
+    expect(isInvocationActive('finite')).toBe(false);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
+    expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it.each([
+    ['infinite-stdout', { stdoutBytes: 64 * 1024, stderrBytes: 32 * 1024, combinedBytes: 96 * 1024 }],
+    ['infinite-stderr', { stdoutBytes: 64 * 1024, stderrBytes: 32 * 1024, combinedBytes: 96 * 1024 }],
+    ['infinite-mixed', { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 48 * 1024 }],
+  ] as const)('terminates %s at bounded output limits', async (probe, limits) => {
+    const attemptId = `limit-${probe}`, handle = startProfileInvocation(profile(fixture(), probe, attemptId), { limits });
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('output-limit');
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(limits.stdoutBytes);
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.stderrBytes);
+    expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.combinedBytes);
+    expect(isInvocationActive(attemptId)).toBe(false);
+  }, 60_000);
+
+  it('stops buffering deferred newline-free stderr after the limit is reached', async () => {
+    const attemptId = 'deferred-stderr-limit';
+    const handle = startProfileInvocation(profile(fixture(), 'infinite-stderr', attemptId, 2 * 60_000, true), {
+      limits: { stdoutBytes: 64 * 1024, stderrBytes: 32 * 1024, combinedBytes: 64 * 1024 },
+      decode: (current, _raw, maximum, timeoutMs, signal) =>
+        readCodexOutput(current.name, maximum, timeoutMs, signal),
+    });
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('output-limit');
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(32 * 1024);
+    expect(isInvocationActive(attemptId)).toBe(false);
+  }, 60_000);
+
+  it('preserves the first cancellation reason until an ignored SIGTERM fully settles', async () => {
+    const current = profile(fixture(), 'ignore-term', 'cancelled');
+    const handle = startProfileInvocation(current, { timeoutMs: 30_000 });
+    let settled = false; void handle.settled.then(() => { settled = true; });
+    handle.cancel('cancelled'); handle.cancel('shutdown');
+    await Promise.resolve();
+    expect(settled).toBe(false);
+    expect(isInvocationActive('cancelled')).toBe(true);
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.stderr).toContain('[codeboost: cancelled]');
+    expect(isInvocationActive('cancelled')).toBe(false);
+  }, 60_000);
+
+  it('enforces a finite wall deadline and force-settles the container', async () => {
+    const started = Date.now();
+    const handle = startProfileInvocation(profile(fixture(), 'ignore-term', 'timeout', 8_000), { timeoutMs: 30_000 });
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(20_000);
+    expect(isInvocationActive('timeout')).toBe(false);
+  }, 60_000);
+
+  it('records timeout when close delivery resumes after the monotonic deadline', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'late-close-delivery', 30_000),
+      { timeoutMs: 3_000 });
+    const end = performance.now() + 3_500;
+    while (performance.now() < end) { /* delay both close and timer delivery */ }
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('timeout');
+  }, 15_000);
+
+  it('fails capture instead of publishing replacement characters for invalid UTF-8 stderr', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'invalid-utf8-stderr'), { timeoutMs: 30_000 }).settled;
+    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stderr).not.toContain('\uFFFD');
+    expect(result.stderr).not.toContain('bad-');
+  }, 60_000);
+
+  it('fails capture when output ends in an incomplete character without reaching a limit', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'truncated-utf8-stderr'), { timeoutMs: 30_000 }).settled;
+    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stderr).not.toContain('cut-');
+  }, 60_000);
+
+  it('releases only the profile when rejecting before creation, even if its name is held elsewhere', () => {
+    const current = profile(fixture(), 'noop');
+    // A foreign container occupies the deterministic name, so container-level cleanup could never settle.
+    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=someone-else',
+      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+    try {
+      expect(() => startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 })).toThrow('ceiling');
+      expect(isContainerProfileAuthentic(current)).toBe(false);
+      expect(spawnSync('docker', ['container', 'inspect', current.name], { stdio: 'ignore' }).status).toBe(0);
+    } finally { spawnSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('blocks a duplicate attempt while the original container remains active', async () => {
+    const data = fixture(), duplicate = invocation(data, 'duplicate');
+    const first = startProfileInvocation(profile(data, 'ignore-term', duplicate), { timeoutMs: 30_000 });
+    expect(() => startProfileInvocation(profile(data, 'finite-output', duplicate))).toThrow('still active');
+    expect(isInvocationActive('duplicate')).toBe(true);
+    first.cancel('shutdown');
+    expect((await first.settled).stopReason).toBe('shutdown');
+  }, 60_000);
+
+  it('rejects reuse of the same active profile without disposing its container', async () => {
+    const current = profile(fixture(), 'ignore-term', 'same-profile-duplicate');
+    const first = startProfileInvocation(current, { timeoutMs: 30_000 });
+    expect(() => startProfileInvocation(current)).toThrow('already owns the active invocation');
+    expect(isInvocationActive('same-profile-duplicate')).toBe(true);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
+    first.cancel('shutdown');
+    expect((await first.settled).stopReason).toBe('shutdown');
+  }, 60_000);
+
+  it('rejects a cloned profile without disposing the authentic active container', async () => {
+    const current = profile(fixture(), 'ignore-term', 'cloned-profile');
+    const first = startProfileInvocation(current, { timeoutMs: 30_000 });
+    const clone = Object.freeze({ ...current });
+    expect(() => disposeValidatedContainer(clone)).toThrow('not created by the trusted profile builder');
+    expect(() => startProfileInvocation(clone)).toThrow('not created by the trusted profile builder');
+    expect(isInvocationActive('cloned-profile')).toBe(true);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
+    first.cancel('shutdown');
+    expect((await first.settled).stopReason).toBe('shutdown');
+  }, 60_000);
+
+  it('records decoder failure without publishing a successful result', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'capture-failure'), {
+      decode: () => { throw new Error('simulated capture failure'); },
+    });
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stderr).toContain('[codeboost: capture-failure');
+    expect(isInvocationActive('capture-failure')).toBe(false);
+  }, 60_000);
+
+  it('preserves cancellation while post-close decoding is still unsettled', async () => {
+    let begin!: () => void, release!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'cancel-during-decode'), {
+      decode: async () => { begin(); await gate; return { text: 'must-not-publish' }; },
+    });
+    await started;
+    handle.cancel('cancelled');
+    release();
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.stdout).not.toContain('must-not-publish');
+  }, 60_000);
+
+  it('keeps post-close decoding inside the invocation deadline', async () => {
+    const started = Date.now();
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-timeout', 30_000), {
+      timeoutMs: 3_000,
+      decode: (_current, _raw, _maximum, _timeout, signal) => new Promise((_resolve, reject) =>
+        signal.addEventListener('abort', () => reject(new Error('decoder aborted')), { once: true })),
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(isInvocationActive('decode-timeout')).toBe(false);
+  }, 30_000);
+
+  it('does not wedge when an injected decoder ignores abort', async () => {
+    const started = Date.now();
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-ignores-abort', 30_000), {
+      timeoutMs: 3_000,
+      decode: () => new Promise(() => {}),
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(15_000);
+    expect(isInvocationActive('decode-ignores-abort')).toBe(false);
+  }, 30_000);
+
+  it('settles cancellation promptly when an injected decoder ignores abort', async () => {
+    let begin!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'cancel-ignored-decode', 30_000), {
+      timeoutMs: 30_000,
+      decode: () => { begin(); return new Promise(() => {}); },
+    });
+    await started;
+    const cancelledAt = performance.now();
+    handle.cancel('cancelled');
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('cancelled');
+    expect(performance.now() - cancelledAt).toBeLessThan(5_000);
+    expect(isInvocationActive('cancel-ignored-decode')).toBe(false);
+  }, 15_000);
+
+  it('does not publish a synchronous decode that finishes after the monotonic deadline', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-over-deadline', 30_000), {
+      timeoutMs: 3_000,
+      decode: (_current, _raw, _maximum, timeoutMs) => {
+        const end = performance.now() + timeoutMs + 50;
+        while (performance.now() < end) { /* deliberately block the timer queue */ }
+        return { text: 'must-not-publish' };
+      },
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(result.stdout).not.toContain('must-not-publish');
+  }, 15_000);
+
+  it('classifies a decoder failure after the monotonic deadline as timeout', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-fails-late', 30_000), {
+      timeoutMs: 3_000,
+      decode: (_current, _raw, _maximum, timeoutMs) => {
+        const end = performance.now() + timeoutMs + 50;
+        while (performance.now() < end) { /* deliberately block the timer queue */ }
+        throw new Error('late decoder failure');
+      },
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+  }, 15_000);
+
+  it('validates and decodes provider output even when the process exits nonzero', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
+      decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),
+    }).settled;
+    expect(result).toMatchObject({ exitCode: 7, stdout: 'decoded:encoded-output' });
+    expect(result.stopReason).toBeUndefined();
+  }, 60_000);
+
+  it('bounds decoded text independently of adapter byte accounting', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'decoded-limit'), {
+      limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },
+      decode: () => ({ text: 'x'.repeat(64 * 1024 + 1), additionalBytes: 0 }),
+    });
+    expect((await handle.settled).stopReason).toBe('output-limit');
+  }, 60_000);
+
+  it('rejects traversal before starting an output read', () => {
+    expect(() => readBoundedContainerFile('unused',
+      '/run/codeboost-output/../../run/codeboost-auth/codex/auth.json', 1024)).toThrow('bounded output directory');
+    expect(() => readBoundedContainerFile('unused', '/run/codeboost-output/final.txt',
+      16 * 1024 * 1024 + 1)).toThrow('production stdout limit');
+  });
+
+  it.each([
+    ['symlink-output', 'capture-failure'],
+    ['oversized-output', 'output-limit'],
+    ['fifo-output', 'capture-failure'],
+    ['invalid-utf8-output', 'capture-failure'],
+    ['replace-output-directory', 'capture-failure'],
+    ['duplicate-protocol', 'capture-failure'],
+  ] as const)('rejects unsafe Codex output from %s', async (probe, reason) => {
+    const handle = startProfileInvocation(profile(fixture(), probe, `file-${probe}`, 2 * 60_000, true), {
+      limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },
+      decode: (current, _raw, maximum, timeoutMs) => readCodexOutput(current.name, maximum, timeoutMs),
+    });
+    const result = await handle.settled;
+    expect(result.stopReason, result.stderr).toBe(reason);
+  }, 60_000);
+
+  it('rejects limits above the production ceilings and cleans the unused profile', () => {
+    const current = profile(fixture(), 'finite-output', 'invalid-limit');
+    expect(() => startProfileInvocation(current, { limits: { stdoutBytes: 16 * 1024 * 1024 + 1 } }))
+      .toThrow('production hard limits');
+    expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it('rejects timeouts above the production ceiling and cleans the unused profile', () => {
+    const current = profile(fixture(), 'finite-output', 'invalid-timeout');
+    expect(() => startProfileInvocation(current, { timeoutMs: 10 * 60_000 + 1 }))
+      .toThrow('ten-minute ceiling');
+    expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it('fails closed when deferred output is never produced', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'nonzero-output', 'missing-deferred', 2 * 60_000, true), {
+      decode: (current, _raw, maximum, timeoutMs, signal) =>
+        readCodexOutput(current.name, maximum, timeoutMs, signal),
+    });
+    expect((await handle.settled).stopReason).toBe('capture-failure');
+  }, 60_000);
+
+  it('delimits READY after finite newline-free stderr', async () => {
+    const result = await startProfileInvocation(
+      profile(fixture(), 'newline-free-deferred-output', 'newline-free-ready', 2 * 60_000, true), {
+        decode: (current, _raw, maximum, timeoutMs, signal) =>
+          readCodexOutput(current.name, maximum, timeoutMs, signal),
+      }).settled;
+    expect(result.stopReason, result.stderr).toBeUndefined();
+    expect(result.stdout).toBe('captured');
+    expect(result.stderr).toContain('trailing-diagnostic');
+  }, 60_000);
+
+  if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
+    it('runs the production Codex adapter and collects its bounded output file', async () => {
+      const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
+      if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
+      const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000),
+        filesystems: data.filesystems, inputDirectory: data.input, imageId,
+        prompt: 'Reply only with this exact marker: codeboost-adapter-marker' }, authFile).settled;
+      expect(result.stopReason, result.stderr).toBeUndefined();
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('codeboost-adapter-marker');
+    }, 8 * 60_000);
+
+    it('runs the production Claude adapter and parses its bounded envelope', async () => {
+      const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
+      const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude', 6 * 60_000, 'claude'),
+        filesystems: data.filesystems, inputDirectory: data.input, imageId,
+        prompt: 'Reply only with this exact marker: codeboost-adapter-marker' }, token).settled;
+      expect(result.stopReason).toBeUndefined();
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('codeboost-adapter-marker');
+    }, 8 * 60_000);
+  }
+});

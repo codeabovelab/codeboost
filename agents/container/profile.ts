@@ -21,6 +21,7 @@ export interface ContainerProfile {
   readonly ownershipId: string;
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
+  readonly deferredOutput: boolean;
 }
 export interface ProfileOptions {
   readonly invocation: InvocationInput;
@@ -32,6 +33,20 @@ export interface ProfileOptions {
   readonly claudeToken?: string;
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
+  readonly deferredOutput?: boolean;
+  /** Remaining invocation budget for Docker-backed profile validation. */
+  readonly timeoutMs?: number;
+}
+
+export class ProfileCreationCleanupError extends AggregateError {
+  readonly startupError: unknown;
+  readonly retryCleanup: () => void;
+
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void) {
+    super([startupError, cleanupError], 'Profile creation and cleanup both failed.');
+    this.startupError = startupError;
+    this.retryCleanup = retryCleanup;
+  }
 }
 
 interface FileIdentity {
@@ -112,6 +127,15 @@ const captureInput = (directory: string): InputCapture => {
   return Object.freeze({ inputDirectory: canonical, schema, content: captured.content });
 };
 
+/** Prove that a profile object is the exact capability issued by this module. */
+export function assertContainerProfileAuthenticity(profile: ContainerProfile): void {
+  if (!identities.has(profile)) throw new Error('Container profile was not created by the trusted profile builder.');
+}
+
+export function isContainerProfileAuthentic(profile: ContainerProfile): boolean {
+  return identities.has(profile);
+}
+
 /** Internal authenticity and host-file revalidation used at every launch boundary. */
 export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000): void {
   const expected = identities.get(profile);
@@ -127,10 +151,6 @@ export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30
     const auth = captureFile(expected.auth.path, 'Codex auth');
     if (!sameFile(auth, expected.auth)) throw new Error('Codex auth changed after the profile was captured.');
   }
-}
-
-export function isContainerProfileAuthentic(profile: ContainerProfile): boolean {
-  return identities.has(profile);
 }
 
 /** Clamp a Docker budget to the captured invocation deadline, which no launch may outlive. */
@@ -174,7 +194,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   assertTaskFilesystems(filesystems, invocation.clone);
   const invocationLeft = Math.floor(invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
-  assertVendorNetwork(options.network, invocation, undefined, Math.min(30_000, invocationLeft));
+  assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft));
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
   // Own the network from here on, so any later failure removes it rather than leaking it.
   claimedNetworks.add(options.network);
@@ -229,8 +249,14 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       '--mount', mount({ type: 'volume', source: filesystems.workVolume, target: '/work', readonly: readOnlyWork }),
       '--mount', mount({ type: 'volume', source: filesystems.metadataVolume, target: '/work/.git', readonly: true }),
       '--mount', mount({ type: 'bind', source: inputIdentity.inputDirectory, target: '/run/codeboost-input', readonly: true })];
+    if (options.deferredOutput) {
+      if (invocation.vendor !== 'codex') throw new Error('Deferred output is available only for Codex.');
+      args.push('--env', 'CODEBOOST_DEFERRED_OUTPUT=1',
+        '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711');
+    }
     if (invocation.vendor === 'codex') {
       args.push('--env', 'CODEX_HOME=/run/codeboost-auth/codex',
+        '--tmpfs', '/run/codeboost-output:rw,nosuid,nodev,noexec,size=20971520,nr_inodes=64,uid=10001,gid=10001,mode=0700',
         '--tmpfs', '/run/codeboost-auth/codex:rw,nosuid,nodev,size=4194304,nr_inodes=256,uid=10001,gid=10001,mode=0700',
         '--mount', mount({ type: 'bind', source: codexAuthFile!, target: '/run/codeboost-auth/codex/auth.json', readonly: true }));
     } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
@@ -239,17 +265,22 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,
       phase: invocation.phase, vendor: invocation.vendor,
       filesystems: capturedFilesystems, inputDirectory: inputIdentity.inputDirectory, codexAuthFile,
-      command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy });
+      command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy,
+      deferredOutput: options.deferredOutput === true });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
-    const failures: unknown[] = [];
-    try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
-    try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
-    if (failures.length) throw new AggregateError([error, ...failures], 'Profile creation and cleanup both failed.');
+    const cleanupProfileResources = () => {
+      const failures: unknown[] = [];
+      try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
+      try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
+      if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
+    };
+    try { cleanupProfileResources(); }
+    catch (cleanupError) { throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources); }
     throw error;
   }
 }
