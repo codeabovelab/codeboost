@@ -198,7 +198,7 @@ describe('container invocation supervisor', () => {
       const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000),
         filesystems: data.filesystems, inputDirectory: data.input, imageId,
         prompt: 'Reply only with this exact marker: codeboost-adapter-marker' }, authFile).settled;
-      expect(result.stopReason).toBeUndefined();
+      expect(result.stopReason, result.stderr).toBeUndefined();
       expect(result.exitCode).toBe(0);
       expect(result.stdout).toContain('codeboost-adapter-marker');
     }, 8 * 60_000);

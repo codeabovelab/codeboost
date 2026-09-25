@@ -98,16 +98,16 @@ export function readBoundedContainerFile(container: string, source: string, maxi
     "fd=fs.openSync('/proc/self/fd/'+dirfd+'/'+path.slice(directory.length+1),",
     'fs.constants.O_RDONLY|fs.constants.O_NOFOLLOW|fs.constants.O_NONBLOCK);',
     "const before=fs.fstatSync(fd,{bigint:true});if(before.size>BigInt(maximum))throw new Error('OUTPUT_LIMIT');",
-    "if(!before.isFile()||before.nlink!==1)throw new Error('UNSAFE_FILE');",
+    "if(!before.isFile()||before.nlink!==1n)throw new Error('UNSAFE_FILE');",
     'const output=Buffer.allocUnsafe(maximum+1);let length=0,count=0;',
     'do{count=fs.readSync(fd,output,length,output.length-length,null);length+=count}',
     "while(count>0&&length<output.length);if(length>maximum)throw new Error('OUTPUT_LIMIT');",
     'const after=fs.fstatSync(fd,{bigint:true});if(before.dev!==after.dev||before.ino!==after.ino||before.size!==after.size',
-    '||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs||after.nlink!==1',
+    '||before.mtimeMs!==after.mtimeMs||before.ctimeMs!==after.ctimeMs||after.nlink!==1n',
     "||!after.isFile())throw new Error('CHANGED_FILE');",
     "const named=fs.statSync('/proc/self/fd/'+dirfd+'/'+path.slice(directory.length+1),{bigint:true,throwIfNoEntry:false});",
     "if(!named||named.dev!==after.dev||named.ino!==after.ino||named.nlink!==1n)throw new Error('REPLACED_FILE');",
-    "process.stdout.write(output.subarray(0,length))}catch(error){process.exitCode=error.message==='OUTPUT_LIMIT'?42:43}",
+    "process.stdout.write(output.subarray(0,length))}catch(error){const codes={OUTPUT_LIMIT:42,UNSAFE_FILE:43,CHANGED_FILE:44,REPLACED_FILE:45};process.exitCode=codes[error.message]||46}",
     'finally{if(fd!==undefined)fs.closeSync(fd);if(dirfd!==undefined)fs.closeSync(dirfd)}',
   ].join('');
   return new Promise((resolve, reject) => {
@@ -122,7 +122,9 @@ export function readBoundedContainerFile(container: string, source: string, maxi
       if ('killed' in error && error.killed) {
         reject(new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.')); return;
       }
-      reject(new Error('Adapter output is not a stable bounded unlinked regular file.'));
+      const reason = error.code === 43 ? 'unsafe type or link count' : error.code === 44 ? 'changed while reading'
+        : error.code === 45 ? 'pathname identity changed' : 'reader failure';
+      reject(new Error(`Adapter output is not a stable bounded unlinked regular file (${reason}).`));
     });
   });
 }
