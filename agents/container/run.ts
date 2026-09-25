@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { assertContainerProfile, disposeContainerProfile, isContainerProfileAuthentic, profileTimeout,
+import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
+  isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemAllocationId } from './storage.ts';
@@ -90,6 +91,7 @@ const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = fal
 
 /** Remove a validated invocation container, then its profile-owned staging and network resources. */
 export function disposeValidatedContainer(profile: ContainerProfile): void {
+  assertContainerProfileAuthenticity(profile);
   removeContainerOrThrow(profile);
 }
 

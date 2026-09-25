@@ -10,7 +10,7 @@ import { isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile, type ContainerProfile } from '../agents/container/profile.ts';
-import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
+import { disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createVendorNetwork } from '../agents/network/network.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
 import { createTaskClone } from '../git/clone.ts';
@@ -174,6 +174,7 @@ describe('container invocation supervisor', () => {
     const current = profile(fixture(), 'ignore-term', 'cloned-profile');
     const first = startProfileInvocation(current, { timeoutMs: 30_000 });
     const clone = Object.freeze({ ...current });
+    expect(() => disposeValidatedContainer(clone)).toThrow('not created by the trusted profile builder');
     expect(() => startProfileInvocation(clone)).toThrow('not created by the trusted profile builder');
     expect(isInvocationActive('cloned-profile')).toBe(true);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
