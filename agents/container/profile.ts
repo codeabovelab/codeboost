@@ -129,6 +129,10 @@ export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30
   }
 }
 
+export function isContainerProfileAuthentic(profile: ContainerProfile): boolean {
+  return identities.has(profile);
+}
+
 /** Clamp a Docker budget to the captured invocation deadline, which no launch may outlive. */
 export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now = Date.now()): number {
   const expected = identities.get(profile);

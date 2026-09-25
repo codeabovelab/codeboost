@@ -391,6 +391,16 @@ describe('real Docker agent isolation', () => {
     expect(spawnSync('docker', ['container', 'inspect', orphan.proxyContainer], { stdio: 'ignore' }).status).not.toBe(0);
   }, 60_000);
 
+  it('does not let a copied profile start or remove the original container', () => {
+    const data = fixture(), live = profile(data, 'planning', 'noop');
+    expect(createValidatedContainer(live)).toBe(live.name); containers.add(live.name);
+    const copy = Object.freeze({ ...live });
+    expect(() => startValidatedContainer(copy)).toThrow('trusted profile builder');
+    expect(() => runContainer(copy)).toThrow('trusted profile builder');
+    expect(spawnSync('docker', ['container', 'inspect', live.name], { stdio: 'ignore' }).status).toBe(0);
+    docker('rm', '--force', live.name); containers.delete(live.name);
+  }, 60_000);
+
   it('refuses a Codex auth path that is a link without resolving it', () => {
     const data = fixture(), link = join(data.root, 'auth-link.json');
     symlinkSync(data.fakeAuth, link);

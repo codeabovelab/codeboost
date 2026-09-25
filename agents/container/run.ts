@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { assertContainerProfile, disposeContainerProfile, profileTimeout, type ContainerProfile } from './profile.ts';
+import { assertContainerProfile, disposeContainerProfile, isContainerProfileAuthentic, profileTimeout,
+  type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemAllocationId } from './storage.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
@@ -48,6 +49,9 @@ const canonicalDockerBindSource = (source: string) => {
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = false) => {
+  // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
+  if (!isContainerProfileAuthentic(profile))
+    throw new Error('Container profile was not created by the trusted profile builder.');
   const remaining = createDeadline(30_000 + (createUnsettled ? CREATE_SETTLE_MS : 0));
   const settleBy = performance.now() + (createUnsettled ? CREATE_SETTLE_MS : 0);
   let before: ReturnType<typeof spawnSync>;
