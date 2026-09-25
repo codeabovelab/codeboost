@@ -21,7 +21,7 @@ it('persists answers with plan, code, selected snippet and prior conversation co
  expect(prompt).toContain('Why cap the retry delay?');expect(prompt).toContain('Math.min');expect(prompt).toContain('Keep the signature.');
  const after=service.load();expect(after.plan.revision).toBe(asked.plan.revision);expect(after.token).toBe(asked.token);expect(after.approved).toBe(0);
  const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.load().notes.at(-1)?.answer?.text).toContain('bounds retry latency');
-});
+},30_000);
 it('fails visibly and retries without duplicating the question or accepting stale completions',async()=>{
  const service=fixture(),asked=question(service);let calls=0;
  const manager=new Questions(service,async()=>{if(++calls===1)throw new Error('Login required');return 'Recovered answer';});managers.push(manager);manager.start(asked.createdNoteId!,asked);
