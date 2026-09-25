@@ -42,9 +42,11 @@ function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlin
     context: { snapshotId: 'snapshot', planId: 'plan', planRevision: 1, assignmentId: 'assignment',
       referencedCodeHash: 'code', stateVersion: 1 } });
 }
-function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe, attemptId = `attempt-${Math.random()}`,
-  deadlineMs = 2 * 60_000, deferredOutput = false) {
-  const captured = invocation(data, attemptId, deadlineMs), policy = createPhasePolicy(captured);
+function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
+  attempt: string | InvocationInput = `attempt-${Math.random()}`, deadlineMs = 2 * 60_000, deferredOutput = false) {
+  // An attempt can be captured once, so a duplicate-attempt profile reuses the captured invocation.
+  const captured = typeof attempt === 'string' ? invocation(data, attempt, deadlineMs) : attempt;
+  const policy = createPhasePolicy(captured);
   const network = createVendorNetwork(captured, imageId);
   const value = createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
     inputDirectory: data.input, command: createIsolationProbeCommand(policy, probe), imageId, codexAuthFile: data.auth,
@@ -153,8 +155,9 @@ describe('container invocation supervisor', () => {
   }, 15_000);
 
   it('blocks a duplicate attempt while the original container remains active', async () => {
-    const data = fixture(), first = startProfileInvocation(profile(data, 'ignore-term', 'duplicate'), { timeoutMs: 30_000 });
-    expect(() => startProfileInvocation(profile(data, 'finite-output', 'duplicate'))).toThrow('still active');
+    const data = fixture(), duplicate = invocation(data, 'duplicate');
+    const first = startProfileInvocation(profile(data, 'ignore-term', duplicate), { timeoutMs: 30_000 });
+    expect(() => startProfileInvocation(profile(data, 'finite-output', duplicate))).toThrow('still active');
     expect(isInvocationActive('duplicate')).toBe(true);
     first.cancel('shutdown');
     expect((await first.settled).stopReason).toBe('shutdown');

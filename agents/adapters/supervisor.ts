@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
-import { assertContainerProfileAuthenticity, isContainerProfileAuthentic,
+import { assertContainerProfileAuthenticity, disposeContainerProfile, isContainerProfileAuthentic,
   type ContainerProfile } from '../container/profile.ts';
 import { removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
 
@@ -228,7 +228,15 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   if (ownsAttempt(invocation.attemptId)) {
     if (activeProfiles.has(profile))
       throw new Error('This container profile already owns the active invocation.');
-    return rejectWithCleanup(new Error('An invocation with this attempt ID is still active.'), false);
+    // This profile never created a container; the name belongs to the active invocation, so only
+    // release this profile's own staging and network.
+    const error = new Error('An invocation with this attempt ID is still active.');
+    try { disposeContainerProfile(profile); }
+    catch (cleanupError) {
+      return retainCleanupOwnership(profile,
+        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`, false);
+    }
+    throw error;
   }
   let limits: CaptureLimits, configuredTimeout: number, carriedBudget: number;
   try {
