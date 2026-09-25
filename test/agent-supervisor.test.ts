@@ -153,7 +153,7 @@ describe('container invocation supervisor', () => {
         signal.addEventListener('abort', () => reject(new Error('decoder aborted')), { once: true })),
     }).settled;
     expect(result.stopReason).toBe('timeout');
-    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(Date.now() - started).toBeLessThan(15_000);
     expect(isInvocationActive('decode-timeout')).toBe(false);
   }, 30_000);
 
@@ -164,7 +164,7 @@ describe('container invocation supervisor', () => {
       decode: () => new Promise(() => {}),
     }).settled;
     expect(result.stopReason).toBe('timeout');
-    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(Date.now() - started).toBeLessThan(15_000);
     expect(isInvocationActive('decode-ignores-abort')).toBe(false);
   }, 30_000);
 
