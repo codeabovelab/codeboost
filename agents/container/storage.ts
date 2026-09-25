@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync } from 'node:fs';
+import { lstatSync, opendirSync, readlinkSync, realpathSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
@@ -109,6 +110,46 @@ export function taskFilesystemAllocationId(filesystems: TaskFilesystems): string
   return allocations.get(filesystems)!.allocationId;
 }
 
+const within = (base: string, path: string) => {
+  const rel = relative(base, path);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
+};
+/**
+ * Refuse a checkout whose symbolic links leave it. The seeder copies links as links, so an absolute or escaping link
+ * would let a path-restricted agent tool read container files outside the checkout (for example process environments
+ * that hold vendor credentials). Links that stay inside, including loops and not-yet-existing targets, are allowed.
+ */
+const assertContainedLinks = (staging: string, remaining: () => number) => {
+  const pending = [staging];
+  let count = 0;
+  while (pending.length) {
+    remaining();
+    if (++count > 200_000) throw new Error('Repository checkout exceeds the link inspection limit.');
+    const path = pending.pop()!, stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      const target = readlinkSync(path), name = JSON.stringify(relative(staging, path));
+      if (isAbsolute(target) || !within(staging, resolve(dirname(path), target)))
+        throw new Error(`Repository link ${name} leaves the checkout.`);
+      // realpathSync.native follows POSIX (each link is resolved before a later `..`), as the container kernel does;
+      // the JavaScript realpathSync cancels `..` textually first and would miss an escape through a chain of links.
+      let real: string | undefined;
+      try { real = realpathSync.native(path); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      if (real !== undefined && !within(staging, real)) throw new Error(`Repository link ${name} leaves the checkout.`);
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const directory = opendirSync(path);
+    try {
+      for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+        // Git metadata is copied to its own read-only volume and is not part of the checkout.
+        if (path === staging && entry.name === '.git') continue;
+        pending.push(join(path, entry.name));
+      }
+    } finally { directory.closeSync(); }
+  }
+};
+
 /** Allocate bounded, engine-owned task filesystems and keep them mounted. */
 export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimits,
   imageId: string, timeoutMs = 60_000): TaskFilesystems {
@@ -118,6 +159,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   const staging = assertTaskClone(clone), remaining = createDeadline(timeoutMs);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
+  assertContainedLinks(staging, remaining);
   const allocationId = randomUUID();
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;

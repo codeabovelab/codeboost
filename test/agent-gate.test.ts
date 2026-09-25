@@ -61,6 +61,25 @@ describe('isolation gate detects breaches', () => {
     expect(result.stderr).toContain(breach);
   }, 180_000);
 
+  it('fails the scratch probe when the deferred-output control directory is writable', () => {
+    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch,
+      ...tmpfs('/run/codeboost-control', 'size=64k,nr_inodes=16')], probeScript('execute', 'scratch-capacity'));
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain('isolation breach: touch /run/codeboost-control/forged');
+  }, 120_000);
+
+  // Byte limits alone are not enough: with bytes bounded but inodes unlimited, the file-count loops must fail.
+  it.each([
+    ['scratch', 'scratch-capacity', [...bounded, ...writableMetadata, ...tmpfs('/tmp', 'size=32m,nr_inodes=1000000')],
+      'scratch-bounded'],
+    ['task', 'capacity', [...tmpfs('/work', 'size=16m,nr_inodes=1000000'), ...writableMetadata, ...boundedScratch],
+      'bounded'],
+  ] as const)('fails the %s probe when only its inode limit is missing', (_label, probe, mounts, marker) => {
+    const result = runBroken(mounts, probeScript('execute', probe));
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stdout).not.toContain(marker);
+  }, 180_000);
+
   it.each(['planning', 'questions', 'review'] as const)('fails the phase probe for a writable worktree in %s', phase => {
     const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch], probeScript(phase, 'phase-worktree'));
     expect(result.status, result.stderr).not.toBe(0);
@@ -92,25 +111,20 @@ describe('isolation gate detects breaches', () => {
     expect(result.stdout).not.toContain('scratch-bounded');
   }, 120_000);
 
-  it('fails the hostile-repository probe when a repository link resolves inside the container', () => {
-    // A link that resolves is readable through the checkout, whatever it contains.
-    const linked = 'ln -s /etc/hostname /work/escape && ln -s /nonexistent /work/escape-dir && git -C /work add -A '
-      + '&& git -C /work -c user.name=gate -c user.email=gate@example.com commit -q -m links && ';
+  const commit = (setup: string) => `${setup} && git -C /work add -A `
+    + '&& git -C /work -c user.name=gate -c user.email=gate@example.com commit -q -m hostile && ';
+  it.each([
+    ['an absolute repository link', 'ln -s /etc/hostname /work/escape', 'isolation breach: absolute link /work/escape'],
+    ['a relative repository link that leaves the checkout', 'mkdir /work/nested && ln -s ../../etc /work/nested/up',
+      'isolation breach: link leaves the checkout /work/nested/up'],
+    ['secret content in the checkout', 'printf codeboost-host-secret > /work/leak',
+      'isolation breach: grep -rqs codeboost-host-secret'],
+  ] as const)('fails the hostile-repository probe for %s', (_label, setup, breach) => {
     const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch],
-      linked + probeScript('execute', 'hostile-repo'));
+      commit(setup) + probeScript('execute', 'hostile-repo'));
     expect(result.status, result.stderr).not.toBe(0);
-    expect(result.stderr).toContain('isolation breach: cat /work/escape');
-    // The probe reports only its fixed diagnostic; the readable target's contents never reach the output.
+    expect(result.stderr).toContain(breach);
+    // The probe reports only its fixed diagnostic; no linked or leaked content reaches the output.
     expect(result.stdout).toBe('');
-  }, 120_000);
-
-  it('fails the hostile-repository probe when secret content reaches the task filesystem', () => {
-    // Stand-in for a seeder that followed a symlink: the secret text is committed into /work behind the link names.
-    const leaked = 'printf codeboost-host-secret > /work/leak && ln -s /work/leak /work/escape && ln -s /tmp /work/escape-dir '
-      + '&& git -C /work add -A && git -C /work -c user.name=gate -c user.email=gate@example.com commit -q -m leak && ';
-    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch],
-      leaked + probeScript('execute', 'hostile-repo'));
-    expect(result.status, result.stderr).not.toBe(0);
-    expect(result.stderr).toContain('isolation breach: grep -rqs codeboost-host-secret');
   }, 120_000);
 });

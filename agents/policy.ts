@@ -160,12 +160,14 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + "deny sh -c ': > /work/.git/config'; deny truncate -s 0 /work/.git/config; "
       + 'deny rm -rf /work/.git; deny mv /work/.git /work/replaced; deny mv /work/.git /tmp/replaced; '
       + 'test "$(digest)" = "$before"; git status --porcelain > /dev/null; printf metadata-unchanged',
-    // Repository symlinks that point outside the checkout arrive as links, never as their host targets. The search does
-    // not follow links, so a hostile link to `/` or a loop cannot make it walk the whole container; the link targets
-    // are checked separately.
-    'hostile-repo': `${deny}set -eu; test -L /work/escape; test -L /work/escape-dir; `
-      + 'test "$(git status --porcelain)" = ""; deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; '
-      + 'deny cat /work/escape; deny ls -A /work/escape-dir/; printf hostile-repo-contained',
+    // Every repository link in the checkout is relative and resolves inside it, and no host secret is reachable. The
+    // search does not follow links, so a link loop cannot make it walk the whole container.
+    'hostile-repo': `${deny}set -eu; test "$(git status --porcelain)" = ""; `
+      + 'find /work -path /work/.git -prune -o -type l -exec sh -c \'for link; do target=$(readlink "$link"); '
+      + 'case "$target" in /*) echo "isolation breach: absolute link $link" >&2; exit 1;; esac; '
+      + 'case "$(realpath -m "$link")" in /work|/work/*) ;; '
+      + '*) echo "isolation breach: link leaves the checkout $link" >&2; exit 1;; esac; done\' sh {} +; '
+      + 'deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; printf hostile-repo-contained',
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }

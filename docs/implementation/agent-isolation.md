@@ -34,15 +34,19 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
 | Mountpoint replacement fails | `agent-container`: metadata and metadata alias probes (`mv` and `rm -rf` of `.git`) |
 | Both vendor startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes: Codex through its output file, Claude through its stdout envelope (credentials required) |
-| Hostile input stays inside the boundary | `agent-container`: repository symlinks to host files, oversized repositories fail closed; `agent-policy`: option-like prompts; `agent-proxy`: hostile CONNECT traffic; `agent-supervisor`: hostile output |
+| Hostile input stays inside the boundary | `agent-container`: repositories with links that leave the checkout are refused, links inside the checkout still work, oversized repositories fail closed; `agent-policy`: option-like prompts; `agent-proxy`: hostile CONNECT traffic; `agent-supervisor`: hostile output |
 
 ## Why the gate can fail
 
 A test that cannot fail proves nothing. `agent-gate` runs each negative probe from
 production in a container that is missing one protection. It then checks that the
-probe reports that exact breach. The cases are writable Git metadata, a writable
-worktree in a read-only phase, an unbounded task filesystem, unbounded scratch, and
-secret content in the worktree.
+probe reports that exact breach. The cases include writable Git metadata, a writable
+worktree in each read-only phase, task and scratch areas without a byte or an inode
+limit, the Codex-only scratch areas, a writable control directory, and repository
+links or secret content in the worktree.
+
+A probe also discards the output of any forbidden command it tries. So a breach that
+succeeds, such as reading a file through a link, cannot copy data into the output.
 
 Probe scripts must use the `deny` helper for actions that must fail. Do not write
 `! command` in a probe: `set -e` ignores a negated command, so the probe would
@@ -55,7 +59,10 @@ Use only these entry points to run an agent:
 
 1. `createTaskClone` creates a committed, standalone staging clone.
 2. `prepareTaskFilesystems` copies that clone into bounded task storage. Call
-   `removeTaskFilesystems` when the task ends.
+   `removeTaskFilesystems` when the task ends. It refuses a repository that has a
+   symbolic link with an absolute target or a target outside the checkout, before it
+   creates any storage. Report this to the user as a repository the agent cannot run
+   on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
 4. `startCodexInvocation` or `startClaudeInvocation` runs the agent and returns a

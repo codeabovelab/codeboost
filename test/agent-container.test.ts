@@ -157,17 +157,39 @@ describe('real Docker agent isolation', () => {
     expect(runContainer(claude, 60_000, { CLAUDE_CODE_OAUTH_TOKEN: placeholder })).toBe('scratch-bounded');
   }, 120_000);
 
-  it('seeds repository symlinks that point at host files as links, without their targets', () => {
-    const data = fixture({ hostile: (source, root) => {
+  it.each([
+    ['an absolute link to a host file', (source: string, root: string) => {
       writeFileSync(join(root, 'host-only.txt'), 'codeboost-host-secret\n');
       symlinkSync(join(root, 'host-only.txt'), join(source, 'escape'));
-      symlinkSync(root, join(source, 'escape-dir'));
-      // Links a traversal must not follow: the container root and a self-reference.
-      symlinkSync('/', join(source, 'root-link'));
+    }],
+    ['an absolute link to the filesystem root', (source: string) => symlinkSync('/', join(source, 'root-link'))],
+    ['a relative link that climbs out of the checkout', (source: string) => {
+      mkdirSync(join(source, 'nested')); symlinkSync('../../..', join(source, 'nested', 'up'));
+    }],
+    ['a chain of in-checkout links that ends outside it', (source: string) => {
+      mkdirSync(join(source, 'deep')); mkdirSync(join(source, 'deep', 'er'));
+      symlinkSync('../..', join(source, 'deep', 'er', 'top'));
+      symlinkSync('deep/er/top/..', join(source, 'chained'));
+    }],
+  ] as const)('refuses to seed a repository with %s, before any storage exists', (_label, hostile) => {
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
+      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const before = new Set(owned());
+    expect(() => fixture({ hostile })).toThrow('leaves the checkout');
+    expect(owned().filter(id => !before.has(id))).toEqual([]);
+  }, 60_000);
+
+  it('seeds links that stay inside the checkout, including loops and not-yet-existing targets', () => {
+    const data = fixture({ hostile: source => {
+      mkdirSync(join(source, 'docs'));
+      writeFileSync(join(source, 'docs', 'guide.md'), 'guide\n');
+      symlinkSync('docs/guide.md', join(source, 'readme-link'));
+      symlinkSync('../docs', join(source, 'docs', 'self'));
       symlinkSync('.', join(source, 'loop'));
+      symlinkSync('later.txt', join(source, 'future'));
     } });
     const started = performance.now();
-    expect(runContainer(profile(data, 'execute', 'hostile-repo'))).toBe('hostile-repo-contained');
+    expect(runContainer(profile(data, 'planning', 'hostile-repo'))).toBe('hostile-repo-contained');
     expect(performance.now() - started).toBeLessThan(30_000);
   }, 60_000);
 
