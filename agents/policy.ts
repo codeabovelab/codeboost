@@ -85,13 +85,13 @@ export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCo
   const sandbox = policy.worktree === 'read-write' ? 'workspace-write' : 'read-only';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
   return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check',
-    '--output-last-message', '/tmp/codeboost-output/final.txt', '--', prompt]);
+    '--output-last-message', '/run/codeboost-output/final.txt', '--', prompt]);
 }
 
 export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'
   | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker' | 'finite-output'
   | 'infinite-stdout' | 'infinite-stderr' | 'infinite-mixed' | 'ignore-term' | 'symlink-output'
-  | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output';
+  | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'replace-output-directory' | 'ack-failure';
 
 /** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
 export function createIsolationProbeCommand(policy: PhasePolicy, probe: IsolationProbe): AgentCommand {
@@ -119,10 +119,12 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
     'infinite-stderr': "while :; do head -c 4096 /dev/zero | tr '\\0' x >&2; done",
     'infinite-mixed': "while :; do head -c 4096 /dev/zero | tr '\\0' x; head -c 4096 /dev/zero | tr '\\0' y >&2; done",
     'ignore-term': "trap '' TERM; while :; do sleep 1; done",
-    'symlink-output': 'ln -s /etc/passwd /tmp/codeboost-output/final.txt',
-    'oversized-output': 'head -c 131072 /dev/zero > /tmp/codeboost-output/final.txt',
-    'fifo-output': 'mkfifo /tmp/codeboost-output/final.txt',
-    'invalid-utf8-output': "printf '\\377' > /tmp/codeboost-output/final.txt",
+    'symlink-output': 'ln -s /etc/passwd /run/codeboost-output/final.txt',
+    'oversized-output': 'head -c 131072 /dev/zero > /run/codeboost-output/final.txt',
+    'fifo-output': 'mkfifo /run/codeboost-output/final.txt',
+    'invalid-utf8-output': "printf '\\377' > /run/codeboost-output/final.txt",
+    'replace-output-directory': 'rm -rf /run/codeboost-output; ln -s /etc /run/codeboost-output',
+    'ack-failure': "printf captured > /run/codeboost-output/final.txt; chmod 0500 /run/codeboost-output",
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }

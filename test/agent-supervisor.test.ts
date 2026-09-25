@@ -140,7 +140,7 @@ describe('container invocation supervisor', () => {
 
   it('rejects traversal before starting an output read', () => {
     expect(() => readBoundedContainerFile('unused',
-      '/tmp/codeboost-output/../../run/codeboost-auth/codex/auth.json', 1024)).toThrow('bounded output directory');
+      '/run/codeboost-output/../../run/codeboost-auth/codex/auth.json', 1024)).toThrow('bounded output directory');
   });
 
   it.each([
@@ -148,6 +148,8 @@ describe('container invocation supervisor', () => {
     ['oversized-output', 'output-limit'],
     ['fifo-output', 'capture-failure'],
     ['invalid-utf8-output', 'capture-failure'],
+    ['replace-output-directory', 'capture-failure'],
+    ['ack-failure', 'capture-failure'],
   ] as const)('rejects unsafe Codex output from %s', async (probe, reason) => {
     const handle = startProfileInvocation(profile(fixture(), probe, `file-${probe}`, 2 * 60_000, true), {
       limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },

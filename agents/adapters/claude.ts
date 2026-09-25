@@ -6,7 +6,8 @@ import { startProfileInvocation } from './supervisor.ts';
 import type { AgentAdapterOptions, AgentAdapterRequest } from './types.ts';
 
 export function parseClaudeOutput(raw: Buffer): { text: string; providerFailed: boolean } {
-  const envelope = JSON.parse(raw.toString('utf8')) as { result?: unknown; is_error?: unknown };
+  const envelope = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)) as
+    { result?: unknown; is_error?: unknown };
   if (typeof envelope.result !== 'string' || typeof envelope.is_error !== 'boolean')
     throw new Error('Claude returned a malformed output envelope.');
   return Object.freeze({ text: envelope.result, providerFailed: envelope.is_error });

@@ -81,7 +81,6 @@ esac
 [ "$(codex --version)" = 'codex-cli 0.153.4' ] || fail 'unexpected Codex version'
 [ "$(claude --version | awk '{print $1}')" = '2.1.281' ] || fail 'unexpected Claude version'
 
-install --directory --owner=10001 --group=10001 --mode=0700 /tmp/codeboost-output
 if [ "${CODEBOOST_DEFERRED_OUTPUT:-}" = '1' ]; then
   token="$(cat /proc/sys/kernel/random/uuid)"
   printf '\036CODEBOOST_START:%s\036\n' "$token" >&2
@@ -90,7 +89,7 @@ if [ "${CODEBOOST_DEFERRED_OUTPUT:-}" = '1' ]; then
   status="$?"
   set -e
   printf '\036CODEBOOST_READY:%s:%s\036\n' "$token" "$status" >&2
-  acknowledgement="/tmp/codeboost-output/collected-$token"
+  acknowledgement="/run/codeboost-output/collected-$token"
   while [ ! -e "$acknowledgement" ]; do sleep 0.05; done
   exit "$status"
 fi

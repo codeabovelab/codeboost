@@ -62,7 +62,7 @@ export function readBoundedContainerFile(container: string, source: string, maxi
   timeoutMs = 30_000): Promise<Buffer> {
   positiveInteger(maximumBytes, 'maximumBytes');
   positiveInteger(timeoutMs, 'timeoutMs');
-  if (!/^\/tmp\/codeboost-output\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(source))
+  if (!/^\/run\/codeboost-output\/[A-Za-z0-9][A-Za-z0-9._-]*$/.test(source))
     throw new Error('Adapter output must come from the bounded output directory.');
   const reader = [
     "const fs=require('node:fs'),path=process.argv[1],maximum=Number(process.argv[2]);",
@@ -142,15 +142,19 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
   });
   const timers = new Set<ReturnType<typeof setTimeout>>();
-  const controls = new Set<Promise<void>>();
+  const controls = new Set<Promise<boolean>>();
   const runControl = (args: readonly string[], timeoutMs = 5_000) => {
-    const operation = new Promise<void>(resolve => {
+    const operation = new Promise<boolean>(resolve => {
       const control = spawn('docker', [...args], { env: dockerEnvironment(), stdio: 'ignore' });
       const timer = setTimeout(() => control.kill('SIGKILL'), timeoutMs);
       timer.unref();
-      const done = () => { clearTimeout(timer); resolve(); };
-      control.once('close', done);
-      control.once('error', done);
+      let completed = false;
+      const done = (success: boolean) => {
+        if (completed) return;
+        completed = true; clearTimeout(timer); resolve(success);
+      };
+      control.once('close', code => done(code === 0));
+      control.once('error', () => done(false));
     });
     controls.add(operation);
     void operation.finally(() => controls.delete(operation));
@@ -235,8 +239,15 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     const ready = /^\x1eCODEBOOST_READY:([0-9a-f-]{36}):([0-9]+)\x1e$/.exec(text);
     if (!ready || ready[1] !== protocolToken) return false;
     void decodeOutput().then(() => {
-      if (decodedOutput && !stopReason)
-        void runControl(['exec', profile.name, 'touch', `/tmp/codeboost-output/collected-${ready[1]}`]);
+      if (decodedOutput && !stopReason) {
+        void runControl(['exec', profile.name, 'touch', `/run/codeboost-output/collected-${ready[1]}`])
+          .then(success => {
+            if (!success) {
+              failureDetail ??= 'Deferred output acknowledgement failed.';
+              stop('capture-failure');
+            }
+          });
+      }
     });
     return true;
   };

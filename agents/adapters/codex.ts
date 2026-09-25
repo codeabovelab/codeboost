@@ -5,7 +5,7 @@ import { createCodexCommand, createPhasePolicy } from '../policy.ts';
 import { readBoundedContainerFile, startProfileInvocation } from './supervisor.ts';
 import type { AgentAdapterOptions, AgentAdapterRequest } from './types.ts';
 
-export const CODEX_OUTPUT_FILE = '/tmp/codeboost-output/final.txt';
+export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
 
 export async function readCodexOutput(container: string, maximumBytes: number, timeoutMs = 30_000) {
   const output = await readBoundedContainerFile(container, CODEX_OUTPUT_FILE, maximumBytes, timeoutMs);

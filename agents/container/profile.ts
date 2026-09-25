@@ -237,6 +237,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     }
     if (invocation.vendor === 'codex') {
       args.push('--env', 'CODEX_HOME=/run/codeboost-auth/codex',
+        '--tmpfs', '/run/codeboost-output:rw,nosuid,nodev,noexec,size=20971520,nr_inodes=64,uid=10001,gid=10001,mode=0700',
         '--tmpfs', '/run/codeboost-auth/codex:rw,nosuid,nodev,size=4194304,nr_inodes=256,uid=10001,gid=10001,mode=0700',
         '--mount', mount({ type: 'bind', source: codexAuthFile!, target: '/run/codeboost-auth/codex/auth.json', readonly: true }));
     } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');

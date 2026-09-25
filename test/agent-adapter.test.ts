@@ -13,6 +13,7 @@ describe('production agent adapters', () => {
       .toEqual({ text: 'login required', providerFailed: true });
     expect(() => parseClaudeOutput(Buffer.from('{"result":3,"is_error":false}'))).toThrow('malformed');
     expect(() => parseClaudeOutput(Buffer.from('not json'))).toThrow();
+    expect(() => parseClaudeOutput(Buffer.from([0xff]))).toThrow();
   });
 
   it('routes Codex final output to the bounded scratch directory', () => {
