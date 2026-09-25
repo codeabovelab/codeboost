@@ -40,7 +40,7 @@ interface FileIdentity {
 }
 interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity;
   readonly cleanupDirectories: readonly string[]; readonly filesystems: TaskFilesystems;
-  readonly clone: InvocationInput['clone'] }
+  readonly clone: InvocationInput['clone']; readonly deadline: number }
 type InputIdentity = Pick<ProfileIdentity, 'inputDirectory' | 'schema'>;
 interface InputCapture extends InputIdentity { readonly content: Buffer }
 const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
@@ -116,6 +116,15 @@ export function assertContainerProfile(profile: ContainerProfile): void {
     const auth = captureFile(expected.auth.path, 'Codex auth');
     if (!sameFile(auth, expected.auth)) throw new Error('Codex auth changed after the profile was captured.');
   }
+}
+
+/** Clamp a Docker budget to the captured invocation deadline, which no launch may outlive. */
+export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now = Date.now()): number {
+  const expected = identities.get(profile);
+  if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
+  const left = Math.floor(expected.deadline - now);
+  if (left < 1) throw new Error('Invocation deadline has passed.');
+  return Math.min(timeoutMs, left);
 }
 
 /** Remove runner-owned credential staging after this one-shot profile settles. */
@@ -204,7 +213,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       command: Object.freeze([...options.command]), ownershipId });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
-      cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone }));
+      cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,
+      deadline: invocation.deadline }));
     return profile;
   } catch (error) {
     try { removeOwnedDirectories(cleanupDirectories); }

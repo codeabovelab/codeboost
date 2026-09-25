@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, realpathSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
@@ -24,6 +24,8 @@ export interface TaskStorageLimits {
 interface AllocationIdentity {
   readonly allocationId: string;
   readonly clone: Readonly<TaskClone>;
+  /** The builder-registered clone object, whose staging directory identity is re-verified. */
+  readonly trustedClone: TaskClone;
   readonly limits: Readonly<TaskStorageLimits>;
 }
 const allocations = new WeakMap<TaskFilesystems, AllocationIdentity>();
@@ -46,15 +48,22 @@ const docker = (args: readonly string[], timeoutMs: number) => execFileSync('doc
 }).trim();
 const absent = (result: ReturnType<typeof spawnSync>) => result.status !== 0 && !result.error
   && /No such (?:object|container|volume)/i.test(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
+/** How long an object whose create client was killed may still materialize in the daemon. */
+const CREATE_SETTLE_MS = 10_000;
+const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const remove = (args: readonly string[], inspectArgs: readonly string[], remaining: () => number, kind: string,
-  allocationId: string) => {
-  const before = spawnSync('docker', [...inspectArgs], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-    env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
-  if (before.status !== 0) {
-    if (absent(before)) return;
-    throw new Error(`Failed to establish ownership of ${kind}.`);
+  allocationId: string, settleBy = 0) => {
+  let before: ReturnType<typeof spawnSync>;
+  for (;;) {
+    before = spawnSync('docker', [...inspectArgs], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
+      env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    if (before.status === 0) break;
+    if (!absent(before)) throw new Error(`Failed to establish ownership of ${kind}.`);
+    // A killed create may still land; only absence after the settle window counts.
+    if (performance.now() >= settleBy) return;
+    sleep(250);
   }
-  const inspected = JSON.parse(before.stdout || '[]')[0] as
+  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
   if (labels?.['io.codeboost.allocation'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
@@ -65,15 +74,18 @@ const remove = (args: readonly string[], inspectArgs: readonly string[], remaini
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (!absent(inspect)) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
-const cleanup = (containers: readonly string[], volumes: readonly string[], allocationId: string, timeoutMs = 30_000) => {
-  const remaining = createDeadline(timeoutMs), failures: unknown[] = [];
+const cleanup = (containers: readonly string[], volumes: readonly string[], allocationId: string,
+  unsettled: ReadonlySet<string> = new Set(), timeoutMs = 30_000) => {
+  const remaining = createDeadline(timeoutMs + (unsettled.size ? CREATE_SETTLE_MS : 0)), failures: unknown[] = [];
+  const settleBy = (name: string) => unsettled.has(name) ? performance.now() + CREATE_SETTLE_MS : 0;
   for (const container of containers) {
     try { remove(['rm', '--force', container], ['container', 'inspect', container], remaining,
-      'task container', allocationId); }
+      'task container', allocationId, settleBy(container)); }
     catch (error) { failures.push(error); }
   }
   for (const volume of volumes) {
-    try { remove(['volume', 'rm', '--force', volume], ['volume', 'inspect', volume], remaining, 'task volume', allocationId); }
+    try { remove(['volume', 'rm', '--force', volume], ['volume', 'inspect', volume], remaining, 'task volume', allocationId,
+      settleBy(volume)); }
     catch (error) { failures.push(error); }
   }
   if (failures.length) throw new AggregateError(failures, 'Task filesystem cleanup did not settle.');
@@ -87,7 +99,8 @@ export function assertTaskFilesystems(filesystems: TaskFilesystems, clone?: Task
     || filesystems.metadataBytes !== limits.metadataBytes || filesystems.metadataInodes !== limits.metadataInodes)
     throw new Error('Task filesystem limits changed after allocation.');
   if (clone && (clone.id !== identity.clone.id || clone.taskId !== identity.clone.taskId
-    || realpathSync(clone.directory) !== identity.clone.directory || clone.head !== identity.clone.head))
+    || clone.directory !== identity.trustedClone.directory
+    || assertTaskClone(identity.trustedClone) !== identity.clone.directory || clone.head !== identity.clone.head))
     throw new Error('Task filesystems do not belong to the invocation clone.');
 }
 
@@ -108,14 +121,23 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   const allocationId = randomUUID();
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
-  const createdVolumes: string[] = [];
+  const createdVolumes: string[] = [], unsettled = new Set<string>();
+  // Run one allocation step; a client killed by its deadline leaves the daemon outcome for `name` unknown.
+  const allocate = (name: string, args: readonly string[]) => {
+    const timeout = remaining();
+    try { docker(args, timeout); }
+    catch (error) {
+      if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(name);
+      throw error;
+    }
+  };
   try {
     for (const [kind, name, bytes, inodes] of [['work', workVolume, limits.workBytes, limits.workInodes],
       ['metadata', metadataVolume, limits.metadataBytes, limits.metadataInodes]] as const) {
       createdVolumes.push(name);
-      docker(['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
+      allocate(name, ['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
         '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
-        '--label', `io.codeboost.task-storage=${kind}`, '--label', `io.codeboost.allocation=${allocationId}`, name], remaining());
+        '--label', `io.codeboost.task-storage=${kind}`, '--label', `io.codeboost.allocation=${allocationId}`, name]);
     }
     // Copy metadata straight to its own volume so the work allocation never holds both at once.
     const seed = ['set -eu',
@@ -123,26 +145,26 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
         + ' -exec cp -a --no-preserve=ownership,timestamps -t /work/ {} +',
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
       'chown -R 10001:10001 /work /metadata'].join('; ');
-    docker(['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
+    allocate(keeper, ['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=32', '--memory=128m', '--cpus=.25',
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--label', 'io.codeboost.task-storage=keeper', '--label', `io.codeboost.allocation=${allocationId}`,
-      '--entrypoint', 'sleep', imageId, 'infinity'], remaining());
-    docker(['run', '--rm', '--name', seeder, '--label', `io.codeboost.allocation=${allocationId}`,
+      '--entrypoint', 'sleep', imageId, 'infinity']);
+    allocate(seeder, ['run', '--rm', '--name', seeder, '--label', `io.codeboost.allocation=${allocationId}`,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
-      '--entrypoint', 'sh', imageId, '-c', seed], remaining());
+      '--entrypoint', 'sh', imageId, '-c', seed]);
     // Reject a staging directory swapped while the seeder was reading it.
     assertTaskClone(clone);
     remaining();
     const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
-    allocations.set(filesystems, Object.freeze({ allocationId,
+    allocations.set(filesystems, Object.freeze({ allocationId, trustedClone: clone,
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
     return filesystems;
   } catch (error) {
-    try { cleanup([seeder, keeper], createdVolumes.reverse(), allocationId); }
+    try { cleanup([seeder, keeper], createdVolumes.reverse(), allocationId, unsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
     throw error;
   }

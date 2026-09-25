@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { assertContainerProfile, disposeContainerProfile, type ContainerProfile } from './profile.ts';
+import { assertContainerProfile, disposeContainerProfile, profileTimeout, type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemAllocationId } from './storage.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
@@ -192,7 +192,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   const keeper = JSON.parse(docker(['container', 'inspect', profile.filesystems.keeper], { timeoutMs: remaining() }))[0] as
     { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string> };
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; NetworkMode?: string; CapDrop?: string[] | null;
-        CapAdd?: string[] | null; SecurityOpt?: string[] | null };
+        CapAdd?: string[] | null; SecurityOpt?: string[] | null;
+        RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null };
       Mounts?: Array<{ Type: string; Name?: string; Destination: string; RW: boolean }> } | undefined;
   const keeperVolumes = new Map((keeper?.Mounts ?? []).filter(item => item.Type === 'volume').map(item => [item.Destination, item]));
   if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
@@ -202,6 +203,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
     || !exactSecurityOptions(keeper.HostConfig.SecurityOpt)
+    || !['', 'no'].includes(keeper.HostConfig.RestartPolicy?.Name ?? '')
+    || (keeper.HostConfig.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
     || keeperVolumes.get('/work')?.Name !== profile.filesystems.workVolume
     || keeperVolumes.get('/metadata')?.Name !== profile.filesystems.metadataVolume)
     throw new Error('Task filesystems must remain owned by their trusted keeper.');
@@ -243,7 +246,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
 
 export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
   secrets: Readonly<Record<string, string>> = {}): string {
-  const remaining = createDeadline(timeoutMs);
+  const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let createUnsettled = false;
   try {
     validateSecrets(profile, secrets);
@@ -270,7 +273,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
 
 export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
-  const remaining = createDeadline(timeoutMs);
+  const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   const container = createValidatedContainer(profile, remaining(), secrets);
   let failure: unknown;
   try {

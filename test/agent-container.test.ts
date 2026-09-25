@@ -45,9 +45,10 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
   return { root, source, input, clone, filesystems, fakeAuth };
 }
 
-function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, vendor: 'codex' | 'claude' = 'codex'): InvocationInput {
+function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, vendor: 'codex' | 'claude' = 'codex',
+  deadlineMs = 60_000): InvocationInput {
   return captureInvocation({ clone, phase, vendor, approvedArgv: phase === 'planning' || phase === 'questions' ? [] : [['git', 'status']],
-    deadline: Date.now() + 60_000, attemptId: `${vendor}-${phase}-${Math.random().toString(16).slice(2)}`,
+    deadline: Date.now() + deadlineMs, attemptId: `${vendor}-${phase}-${Math.random().toString(16).slice(2)}`,
     context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
       referencedCodeHash: 'code-1', stateVersion: 1 } });
 }
@@ -309,6 +310,53 @@ describe('real Docker agent isolation', () => {
       { encoding: 'utf8', timeout: 60_000 });
     expect(result.status).toBe(78);
     expect(result.stderr).toContain('seccomp syscall filter must be enforced');
+  }, 60_000);
+
+  it('removes a keeper that lands in the daemon after its run client was killed', () => {
+    const data = fixture();
+    const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-late',
+      head: git(data.source, 'rev-parse', 'HEAD') });
+    const keepers = () => new Set(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=keeper')
+      .split('\n').filter(Boolean));
+    const before = keepers();
+    const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The keeper's run client hangs until killed, and the real run lands in the daemon afterwards.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = run ] && [ "$2" = --detach ]; then ( sleep 4; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    try {
+      expect(() => prepareTaskFilesystems(clone, {
+        workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
+      }, imageId, 2_000)).toThrow();
+    } finally { process.env.PATH = path; }
+    execFileSync('sleep', ['6']);
+    const orphans = [...keepers()].filter(id => !before.has(id));
+    for (const id of orphans) docker('rm', '--force', id);
+    expect(orphans).toEqual([]);
+  }, 60_000);
+
+  it('rejects a task keeper whose restart policy was changed', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    docker('update', '--restart=always', data.filesystems.keeper);
+    try {
+      docker(...valid.args); containers.add(valid.name);
+      expect(() => validateContainer(valid.name, valid)).toThrow('trusted keeper');
+    } finally { docker('update', '--restart=no', data.filesystems.keeper); }
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
+  }, 60_000);
+
+  it('stops a running agent at the captured invocation deadline', () => {
+    const data = fixture();
+    const late = createContainerProfile({ invocation: invocation(data.clone, 'planning', 'codex', 4_000),
+      filesystems: data.filesystems, inputDirectory: data.input, command: ['sh', '-c', 'sleep 30'],
+      codexAuthFile: data.fakeAuth, imageId });
+    profiles.push(late);
+    const started = performance.now();
+    expect(() => runContainer(late, 60_000)).toThrow();
+    expect(performance.now() - started).toBeLessThan(15_000);
   }, 60_000);
 
   it('refuses a Codex auth path that is a link without resolving it', () => {
