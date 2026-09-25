@@ -6,7 +6,7 @@ type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
 export interface MergeQueueStatus {
-  state: MergeAttempt['state']; reviewedHead: string; url: string | null; reason: string | null;
+  kind: MergeAttempt['kind']; state: MergeAttempt['state']; reviewedHead: string; url: string | null; reason: string | null;
   phase: MergeAttempt['phase']; position: number | null; occurredAt: string | null; retryable: boolean;
   observationError?: string;
 }
@@ -50,7 +50,7 @@ export class MergeCoordinator {
   #queueStatus(attempt = this.#attempt(), observationError?: string): MergeQueueStatus | null {
     if (!attempt) return null;
     return {
-      state: attempt.state, reviewedHead: attempt.reviewedHead, url: attempt.url, reason: attempt.reason,
+      kind: attempt.kind, state: attempt.state, reviewedHead: attempt.reviewedHead, url: attempt.url, reason: attempt.reason,
       phase: attempt.phase, position: attempt.position, occurredAt: attempt.occurredAt,
       retryable: (attempt.state === 'removed' || attempt.state === 'failed') && !attempt.requiresFreshReview && this.#current(attempt),
       ...(observationError ? { observationError } : {}),

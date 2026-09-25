@@ -78,6 +78,12 @@ test('backs off repeated merge-queue polling',async({page})=>{
  await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>queueReads,{timeout:10000}).toBeGreaterThanOrEqual(2);
  const delays=await page.evaluate(()=>(window as typeof window&{__mergePollDelays:number[]}).__mergePollDelays.filter(value=>value>=500));expect(delays.slice(0,2)).toEqual([2000,4000]);
 });
+test('does not queue-poll an ambiguous direct merge attempt',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,polls=0;
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>({url:''})};
+ app=appRef=await startServer(config,0,undefined,gateway);const view=app.service.load();app.service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head,null,'direct');
+ await page.route('**/api/merge',async route=>{polls++;await route.continue();});await page.goto(app.url);await expect(page.getByRole('button',{name:'Submitting…',exact:true})).toBeDisabled();await page.waitForTimeout(2500);expect(polls).toBe(0);
+});
 test('surfaces queue removal and retries only the same reviewed head',async({page})=>{
  test.slow();
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let appRef:typeof app,mergeCalls=0;

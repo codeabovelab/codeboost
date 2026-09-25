@@ -136,8 +136,9 @@ function renderMerge() {
 function scheduleMergePoll() {
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
-  const state = data?.merge?.queue?.state;
-  if (["submitting", "queued"].includes(state)) {
+  const queue = data?.merge?.queue;
+  const state = queue?.state;
+  if (queue?.kind === "queue" && ["submitting", "queued"].includes(state)) {
     if (state !== mergePollState) {
       mergePollState = state;
       mergePollDelay = 2000;

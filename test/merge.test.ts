@@ -150,7 +150,7 @@ it('persists and reconciles an ambiguous direct merge outcome', async () => {
   try {
     await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(/response was lost/i);
     expect(h.store.getMergeAttempt(h.identity)).toMatchObject({kind:'direct',state:'submitting',reason:'Direct merge response was lost.'});
-    expect(await h.coordinator.status(h.view())).toMatchObject({ready:false,action:null,queue:{state:'submitting'}});
+    expect(await h.coordinator.status(h.view())).toMatchObject({ready:false,action:null,queue:{kind:'direct',state:'submitting'}});
     state={...state,pullRequestState:'MERGED'};
     expect(await h.coordinator.status(h.view())).toMatchObject({ready:false,action:null,queue:{state:'merged'}});
     expect(h.store.getMergeAttempt(h.identity)).toMatchObject({kind:'direct',state:'merged'});
@@ -527,6 +527,25 @@ it('paginates forward from the stored cursor to the terminal event', async () =>
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, run);
   await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before' })).resolves.toMatchObject({ state: 'removed', reason: 'Checks failed' });
   expect(calls).toBe(2);
+});
+
+it('reads the tenth queue-history page and fails closed beyond it', async () => {
+  const response = (calls: number, hasNextPage: boolean) => JSON.stringify({ data: { repository: { pullRequest: {
+    number: 7, headRefOid: sha('b'), state: 'OPEN', mergedAt: null, mergeQueueEntry: null,
+    timelineItems: { edges: calls === 10 ? [
+      { cursor: 'CURSOR_added', node: { id: 'MQEV_added', __typename: 'AddedToMergeQueueEvent', createdAt: '2026-09-24T09:00:00Z' } },
+      { cursor: 'CURSOR_removed', node: { id: 'MQEV_removed', __typename: 'RemovedFromMergeQueueEvent', createdAt: '2026-09-24T09:05:00Z', reason: 'Checks failed', beforeCommit: { oid: sha('b') } } },
+    ] : [], pageInfo: { hasNextPage, endCursor: `CURSOR_${calls}` } },
+  } } } });
+  let calls = 0;
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => response(++calls, calls < 10));
+  await expect(client.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before' })).resolves.toMatchObject({ state: 'removed', reason: 'Checks failed' });
+  expect(calls).toBe(10);
+
+  calls = 0;
+  const overLimit = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 24 }, async () => response(++calls, true));
+  await expect(overLimit.inspectQueue(sha('b'), { afterCursor: 'CURSOR_before' })).rejects.toThrow(/exceeded the inspection limit/i);
+  expect(calls).toBe(10);
 });
 
 it('fails closed when multiple enqueue sequences follow the stored cursor', async () => {
