@@ -127,7 +127,14 @@ describe('vendor-only egress', () => {
     }
   }, 60_000);
 
+  it('rejects a proxy whose restart policy was changed', () => {
+    docker('update', '--restart=always', network.proxyContainer);
+    try { expect(() => assertVendorNetwork(network, invocation)).toThrow('network or proxy changed'); }
+    finally { docker('update', '--restart=no', network.proxyContainer); }
+  }, 60_000);
+
   it.each([
+    ['nothing but a new object ID', []],
     ['host namespace', ['--pid=host']],
     ['extra Node environment', ['--env', 'NODE_OPTIONS=--trace-warnings']],
     ['DNS override', ['--dns=8.8.8.8']],
@@ -138,17 +145,24 @@ describe('vendor-only egress', () => {
       deadline: Date.now() + 60_000 });
     const replacement = createVendorNetwork(replacementInvocation, imageId);
     const inspected = JSON.parse(docker('container', 'inspect', replacement.proxyContainer))[0] as
-      { Config: { Labels: Record<string, string> } };
+      { Config: { Labels: Record<string, string> }; NetworkSettings: { Networks: Record<string, { IPAddress: string }> } };
     const allocation = inspected.Config.Labels['io.codeboost.egress'];
+    const proxyIp = inspected.NetworkSettings.Networks[replacement.name]!.IPAddress;
     try {
       docker('rm', '--force', replacement.proxyContainer);
+      // Same name, label, image, lockdown and IP as the original, so only the extra option and the object ID differ.
       docker('run', '--detach', '--name', replacement.proxyContainer, '--read-only', '--user', '10001:10001',
-        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
-        '--cpus=.25', ...extra, '--network', replacement.name, '--network-alias', 'codeboost-proxy',
+        '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc',
+        '--pids-limit=64', '--memory=64m', '--memory-swap=64m', '--cpus=.25', ...extra,
+        '--network', replacement.name, '--ip', proxyIp, '--network-alias', 'codeboost-proxy',
         '--label', `io.codeboost.egress=${allocation}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS.claude.join(',')}`,
         '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs');
       docker('network', 'connect', 'bridge', replacement.proxyContainer);
       expect(() => assertVendorNetwork(replacement, replacementInvocation)).toThrow('network or proxy changed');
-    } finally { removeVendorNetwork(replacement); }
+    } finally {
+      // Cleanup removes only the objects it created, so the stand-in proxy must go first.
+      spawnSync('docker', ['rm', '--force', replacement.proxyContainer], { stdio: 'ignore' });
+      removeVendorNetwork(replacement);
+    }
   }, 60_000);
 });

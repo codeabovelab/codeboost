@@ -15,7 +15,9 @@ export interface VendorNetwork {
   readonly vendor: InvocationInput['vendor'];
 }
 interface NetworkIdentity { readonly allocationId: string; readonly imageId: string; readonly invocation: InvocationInput;
-  readonly subnet: string; readonly proxyIp: string }
+  readonly subnet: string; readonly proxyIp: string;
+  /** Daemon object IDs captured at creation; a same-named replacement has a different ID. */
+  readonly networkId: string; readonly proxyId: string }
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 const removedNetworks = new WeakSet<VendorNetwork>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
@@ -67,34 +69,44 @@ const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInp
   if (invocation && (identity.invocation !== invocation || network.vendor !== invocation.vendor))
     throw new Error('Vendor network does not belong to this invocation.');
   assertBuiltAgentImage(identity.imageId);
-  const inspect = JSON.parse(docker(['container', 'inspect', network.proxyContainer], remaining()))[0] as
-    { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string>; Env?: string[];
+  // Inspect by the captured IDs, so a removed-and-recreated network or proxy cannot stand in for the original.
+  const inspectAllocated = (args: readonly string[]) => {
+    try { return docker(args, remaining()); }
+    catch (cause) { throw new Error('Vendor network or proxy changed after allocation.', { cause }); }
+  };
+  const inspect = JSON.parse(inspectAllocated(['container', 'inspect', identity.proxyId]))[0] as
+    { Id?: string; State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string>; Env?: string[];
       Entrypoint?: string[] | null; Cmd?: string[] | null };
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; CapDrop?: string[]; CapAdd?: string[] | null;
         SecurityOpt?: string[]; Memory?: number; MemorySwap?: number; NanoCpus?: number; PidsLimit?: number;
         NetworkMode?: string; PidMode?: string; IpcMode?: string; UTSMode?: string; UsernsMode?: string;
         CgroupnsMode?: string; Devices?: unknown[] | null; DeviceRequests?: unknown[] | null;
         Dns?: string[]; DnsOptions?: string[]; DnsSearch?: string[]; ExtraHosts?: string[] | null;
-        PortBindings?: Record<string, unknown> | null; PublishAllPorts?: boolean; Runtime?: string };
+        PortBindings?: Record<string, unknown> | null; PublishAllPorts?: boolean; Runtime?: string;
+        RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null };
       NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }>; Ports?: Record<string, unknown> };
       Mounts?: unknown[] } | undefined;
   const image = JSON.parse(docker(['image', 'inspect', identity.imageId], remaining()))[0] as
     { Config?: { Env?: string[] } } | undefined;
-  const inspectedNetwork = JSON.parse(docker(['network', 'inspect', network.name], remaining()))[0] as
-    { Internal?: boolean; Driver?: string; Labels?: Record<string, string>; IPAM?: { Config?: Array<{ Subnet?: string }> };
+  const inspectedNetwork = JSON.parse(inspectAllocated(['network', 'inspect', identity.networkId]))[0] as
+    { Id?: string; Name?: string; Internal?: boolean; Driver?: string; Labels?: Record<string, string>; IPAM?: { Config?: Array<{ Subnet?: string }> };
       Containers?: Record<string, { Name?: string }> } | undefined;
   const networks = Object.keys(inspect?.NetworkSettings?.Networks ?? {}).sort();
   const endpoints = Object.values(inspectedNetwork?.Containers ?? {}).map(value => value.Name).sort();
   const allowedEndpoints = [network.proxyContainer, ...(agentName ? [agentName] : [])];
   const expectedEnvironment = [...(image?.Config?.Env ?? []),
     `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[network.vendor].join(',')}`].sort();
-  if (!inspect?.State?.Running || inspect.Config?.Image !== identity.imageId || inspect.Config?.User !== '10001:10001'
+  if (inspect?.Id !== identity.proxyId || inspectedNetwork?.Id !== identity.networkId
+    || inspectedNetwork.Name !== network.name || !Object.keys(inspectedNetwork.Containers ?? {}).includes(identity.proxyId)
+    || !inspect?.State?.Running || inspect.Config?.Image !== identity.imageId || inspect.Config?.User !== '10001:10001'
     || inspect.Config?.Labels?.['io.codeboost.egress'] !== identity.allocationId || !inspect.HostConfig?.ReadonlyRootfs
     || inspect.HostConfig.Privileged || !inspect.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 2
     || !inspect.HostConfig.SecurityOpt.some(option => ['no-new-privileges', 'no-new-privileges:true'].includes(option))
     || !inspect.HostConfig.SecurityOpt.includes('seccomp=builtin')
     || inspect.HostConfig.Runtime !== 'runc'
+    || !['', 'no'].includes(inspect.HostConfig.RestartPolicy?.Name ?? '')
+    || (inspect.HostConfig.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
     || inspect.HostConfig.PidsLimit !== 64 || inspect.HostConfig.Memory !== 64 * 1024 * 1024
     || inspect.HostConfig.MemorySwap !== 64 * 1024 * 1024 || inspect.HostConfig.NanoCpus !== 250_000_000
     || inspect.HostConfig.NetworkMode !== network.name || inspect.HostConfig.PidMode !== ''
@@ -152,10 +164,10 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   };
   try {
     networkPlanned = true;
-    create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
+    const networkId = create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
       '--label', `io.codeboost.egress=${allocationId}`, name]);
     proxyPlanned = true;
-    create(proxyContainer, ['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
+    const proxyId = create(proxyContainer, ['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
@@ -173,7 +185,9 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     if (!proxyIp || !/^10\.254\.\d{1,3}\.\d{1,3}$/.test(proxyIp))
       throw new Error('Vendor proxy did not receive its expected internal address.');
     const network = Object.freeze({ name, proxyContainer, proxyUrl: `http://${proxyIp}:3128`, vendor });
-    identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet, proxyIp }));
+    if (!/^[0-9a-f]{64}$/.test(networkId) || !/^[0-9a-f]{64}$/.test(proxyId))
+      throw new Error('Docker did not return the created network and proxy IDs.');
+    identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet, proxyIp, networkId, proxyId }));
     validateVendorNetwork(network, invocation, undefined, remaining);
     remaining();
     return network;
@@ -205,9 +219,10 @@ export function removeVendorNetwork(network: VendorNetwork): void {
   assertBuiltAgentImage(identity.imageId);
   const allocationId = identity.allocationId;
   const remaining = deadline(30_000), failures: unknown[] = [];
-  try { remove(['rm', '--force', network.proxyContainer], ['container', 'inspect', network.proxyContainer],
+  // Remove by the captured IDs; a same-named replacement is not ours to delete and keeps the network busy.
+  try { remove(['rm', '--force', identity.proxyId], ['container', 'inspect', identity.proxyId],
     remaining, 'vendor proxy', allocationId); } catch (error) { failures.push(error); }
-  try { remove(['network', 'rm', network.name], ['network', 'inspect', network.name],
+  try { remove(['network', 'rm', identity.networkId], ['network', 'inspect', identity.networkId],
     remaining, 'vendor network', allocationId); } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   identities.delete(network);
