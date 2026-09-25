@@ -18,6 +18,6 @@ jobs:
       - run: npm run typecheck
       # The Docker agent suites run one file at a time in the Agent isolation workflow; running them here
       # would put them in parallel against the same image tag and daemon.
-      - run: npm test -- --exclude test/agent-container.test.ts --exclude test/agent-network.test.ts --exclude test/agent-adapter.test.ts --exclude test/agent-supervisor.test.ts
+      - run: npm test -- --exclude test/agent-container.test.ts --exclude test/agent-network.test.ts --exclude test/agent-adapter.test.ts --exclude test/agent-supervisor.test.ts --exclude test/agent-gate.test.ts
       - run: npx playwright install --with-deps chromium
       - run: npm run test:browser

@@ -27,7 +27,8 @@ const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
 
-function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number } = {}) {
+function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number;
+  hostile?: (source: string, root: string) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'agent-container-')); roots.push(root);
   const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
@@ -38,6 +39,7 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
     git(source, 'add', '.'); git(source, 'commit', '-m', 'history');
     rmSync(join(source, 'history.bin'));
   }
+  options.hostile?.(source, root);
   writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '-A'); git(source, 'commit', '-m', 'baseline');
   writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-schema-marker"}\n');
   chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
@@ -138,6 +140,40 @@ describe('real Docker agent isolation', () => {
     const args = profile(fixture(), 'planning', 'noop').args;
     expect(args).toContain('--ipc=private');
     expect(args).toContain('--cgroupns=private');
+  }, 60_000);
+
+  it.each(['planning', 'review', 'execute'] as const)(
+    'keeps Git metadata unchanged under link, alias, truncation and replacement attempts during %s', phase => {
+      expect(runContainer(profile(fixture(), phase, 'metadata-alias'))).toBe('metadata-unchanged');
+    }, 60_000);
+
+  it('enforces byte and inode ceilings on every Codex scratch area', () => {
+    expect(runContainer(profile(fixture(), 'execute', 'scratch-capacity'))).toBe('scratch-bounded');
+  }, 120_000);
+
+  it('enforces byte and inode ceilings on every Claude scratch area', () => {
+    const placeholder = 'offline-placeholder-token';
+    const claude = profile(fixture(), 'execute', 'scratch-capacity', { vendor: 'claude', claudeToken: placeholder });
+    expect(runContainer(claude, 60_000, { CLAUDE_CODE_OAUTH_TOKEN: placeholder })).toBe('scratch-bounded');
+  }, 120_000);
+
+  it('seeds repository symlinks that point at host files as links, without their targets', () => {
+    const data = fixture({ hostile: (source, root) => {
+      writeFileSync(join(root, 'host-only.txt'), 'codeboost-host-secret\n');
+      symlinkSync(join(root, 'host-only.txt'), join(source, 'escape'));
+      symlinkSync(root, join(source, 'escape-dir'));
+    } });
+    expect(runContainer(profile(data, 'execute', 'hostile-repo'))).toBe('hostile-repo-contained');
+  }, 60_000);
+
+  it('fails closed without leaving storage when a repository exceeds its allocation', () => {
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
+      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const before = new Set(owned());
+    expect(() => fixture({ historyBytes: 4 * 1024 * 1024, limits: {
+      workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 1024 * 1024, metadataInodes: 512,
+    } })).toThrow();
+    expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
   it('persists execution changes while replacing HOME and scratch for each invocation', () => {

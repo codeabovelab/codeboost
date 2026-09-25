@@ -28,7 +28,7 @@ function fixture() {
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
   git(source, 'init'); git(source, 'config', 'user.name', 'Test'); git(source, 'config', 'user.email', 'test@example.com');
   writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '.'); git(source, 'commit', '-m', 'baseline');
-  writeFileSync(join(input, 'schema.json'), '{}\n'); chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
+  writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-adapter-schema-marker"}\n'); chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
   const clone = createTaskClone({ source, parent: staging, taskId: 'supervisor', head: git(source, 'rev-parse', 'HEAD') });
   const filesystems = prepareTaskFilesystems(clone, {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
@@ -373,15 +373,21 @@ describe('container invocation supervisor', () => {
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
+    const schemaPrompt = 'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, '
+      + 'without quotes or Markdown formatting.';
+    // Tolerate one wrapping pair of backticks or quotes, but nothing else around the value.
+    const schemaValue = (output: string) => output.trim().replace(/^(`+|"|')([^]*)\1$/, '$2').trim();
+
     it('runs the production Codex adapter and collects its bounded output file', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
       const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000),
         filesystems: data.filesystems, inputDirectory: data.input, imageId,
-        prompt: 'Reply only with this exact marker: codeboost-adapter-marker' }, authFile).settled;
+        prompt: schemaPrompt }, authFile).settled;
       expect(result.stopReason, result.stderr).toBeUndefined();
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('codeboost-adapter-marker');
+      // Codex returns through its bounded output file; the value can only come from the mounted schema.
+      expect(schemaValue(result.stdout)).toBe('codeboost-adapter-schema-marker');
     }, 8 * 60_000);
 
     it('runs the production Claude adapter and parses its bounded envelope', async () => {
@@ -389,10 +395,11 @@ describe('container invocation supervisor', () => {
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
       const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude', 6 * 60_000, 'claude'),
         filesystems: data.filesystems, inputDirectory: data.input, imageId,
-        prompt: 'Reply only with this exact marker: codeboost-adapter-marker' }, token).settled;
-      expect(result.stopReason).toBeUndefined();
+        prompt: schemaPrompt }, token).settled;
+      expect(result.stopReason, result.stderr).toBeUndefined();
       expect(result.exitCode).toBe(0);
-      expect(result.stdout).toContain('codeboost-adapter-marker');
+      // Claude returns through its bounded stdout envelope; the value can only come from the mounted schema.
+      expect(schemaValue(result.stdout)).toBe('codeboost-adapter-schema-marker');
     }, 8 * 60_000);
   }
 });
