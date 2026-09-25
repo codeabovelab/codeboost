@@ -2,7 +2,7 @@
 
 **Status:** contract proposed; the four open decisions are approved (2026-09-25). Nothing in this document is implemented yet.
 **Lane and step:** lane F (runner and pre-merge automation), step F1. Related issue: #22.
-**Baseline:** `main` at `f8c8d9f` (D1–D3 merged; D4 open as #47; D5 not started).
+**Baseline:** `main` at `5881a43` (D1–D4 merged; D5 not started).
 
 ## About this document
 
@@ -16,7 +16,7 @@
 - the order of steps when the program shuts down;
 - the feedback events that the learning lane (J) will read.
 
-**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The contract uses only the D interface that is already on `main` (`agents/contract.ts`), so D4 and D5 do not change it unless they change that interface.
+**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The contract uses only the D interface that is already on `main` (`agents/contract.ts`), D4 (#47) merged without changing that interface. D5 changes this contract only if it changes that interface.
 
 ## Summary
 
