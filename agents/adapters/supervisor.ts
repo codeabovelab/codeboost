@@ -584,9 +584,11 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       }
     }
     // Publish only strictly valid UTF-8: replacement characters would grow the result past the byte ceilings.
-    // A multi-byte character cut at a capture limit is an incomplete tail, which the streaming decode drops.
+    // Only output cut at a capture limit may end in an incomplete character, which the streaming decode then drops;
+    // otherwise the decode flushes, so a trailing lone lead byte fails closed.
+    const truncated = stopReason === 'output-limit';
     const strictText = (value: Buffer) => {
-      try { return new TextDecoder('utf-8', { fatal: true }).decode(value, { stream: true }); }
+      try { return new TextDecoder('utf-8', { fatal: true }).decode(value, truncated ? { stream: true } : undefined); }
       catch { return undefined; }
     };
     const stdoutText = strictText(finalStdout), stderrText = strictText(finalStderr);

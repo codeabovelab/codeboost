@@ -161,6 +161,12 @@ describe('container invocation supervisor', () => {
     expect(result.stderr).not.toContain('bad-');
   }, 60_000);
 
+  it('fails capture when output ends in an incomplete character without reaching a limit', async () => {
+    const result = await startProfileInvocation(profile(fixture(), 'truncated-utf8-stderr'), { timeoutMs: 30_000 }).settled;
+    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stderr).not.toContain('cut-');
+  }, 60_000);
+
   it('blocks a duplicate attempt while the original container remains active', async () => {
     const data = fixture(), duplicate = invocation(data, 'duplicate');
     const first = startProfileInvocation(profile(data, 'ignore-term', duplicate), { timeoutMs: 30_000 });

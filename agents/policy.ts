@@ -91,7 +91,8 @@ export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCo
 export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'
   | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker' | 'finite-output'
   | 'infinite-stdout' | 'infinite-stderr' | 'infinite-mixed' | 'ignore-term' | 'symlink-output'
-  | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'replace-output-directory'
+  | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'truncated-utf8-stderr'
+  | 'replace-output-directory'
   | 'nonzero-output' | 'duplicate-protocol' | 'newline-free-deferred-output';
 
 /** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
@@ -117,6 +118,7 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + 'test ! -e /run/codeboost-input/extra.json',
     'finite-output': 'printf stdout-marker; printf stderr-marker >&2',
     'invalid-utf8-stderr': "printf 'bad-\\377\\377-stderr' >&2",
+    'truncated-utf8-stderr': "printf 'cut-\\342' >&2",
     'infinite-stdout': "while :; do head -c 4096 /dev/zero | tr '\\0' x; done",
     'infinite-stderr': "while :; do head -c 4096 /dev/zero | tr '\\0' x >&2; done",
     'infinite-mixed': "while :; do head -c 4096 /dev/zero | tr '\\0' x; head -c 4096 /dev/zero | tr '\\0' y >&2; done",
