@@ -233,7 +233,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       '--mount', mount({ type: 'bind', source: inputIdentity.inputDirectory, target: '/run/codeboost-input', readonly: true })];
     if (options.deferredOutput) {
       if (invocation.vendor !== 'codex') throw new Error('Deferred output is available only for Codex.');
-      args.push('--env', 'CODEBOOST_DEFERRED_OUTPUT=1');
+      args.push('--env', 'CODEBOOST_DEFERRED_OUTPUT=1',
+        '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711');
     }
     if (invocation.vendor === 'codex') {
       args.push('--env', 'CODEX_HOME=/run/codeboost-auth/codex',

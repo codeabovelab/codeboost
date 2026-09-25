@@ -174,6 +174,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
       ['rw', 'nosuid', 'nodev', 'size=4194304', 'nr_inodes=256', 'uid=10001', 'gid=10001', 'mode=0700']] as const,
     ['/run/codeboost-output',
       ['rw', 'nosuid', 'nodev', 'noexec', 'size=20971520', 'nr_inodes=64', 'uid=10001', 'gid=10001', 'mode=0700']] as const] : []),
+    ...(profile.deferredOutput ? [['/run/codeboost-control',
+      ['rw', 'nosuid', 'nodev', 'noexec', 'size=65536', 'nr_inodes=16', 'uid=0', 'gid=0', 'mode=0711']] as const] : []),
   ]);
   if (Object.keys(tmpfs).length !== expectedTmpfs.size) throw new Error('Container tmpfs mount set changed.');
   for (const [path, expected] of expectedTmpfs) {

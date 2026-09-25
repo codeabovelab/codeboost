@@ -89,6 +89,19 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive(attemptId)).toBe(false);
   }, 60_000);
 
+  it('stops buffering deferred newline-free stderr after the limit is reached', async () => {
+    const attemptId = 'deferred-stderr-limit';
+    const handle = startProfileInvocation(profile(fixture(), 'infinite-stderr', attemptId, 2 * 60_000, true), {
+      limits: { stdoutBytes: 64 * 1024, stderrBytes: 32 * 1024, combinedBytes: 64 * 1024 },
+      decode: (current, _raw, maximum, timeoutMs, signal) =>
+        readCodexOutput(current.name, maximum, timeoutMs, signal),
+    });
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('output-limit');
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(32 * 1024);
+    expect(isInvocationActive(attemptId)).toBe(false);
+  }, 60_000);
+
   it('preserves the first cancellation reason until an ignored SIGTERM fully settles', async () => {
     const current = profile(fixture(), 'ignore-term', 'cancelled');
     const handle = startProfileInvocation(current, { timeoutMs: 30_000 });
@@ -197,7 +210,7 @@ describe('container invocation supervisor', () => {
     ['fifo-output', 'capture-failure'],
     ['invalid-utf8-output', 'capture-failure'],
     ['replace-output-directory', 'capture-failure'],
-    ['ack-failure', 'capture-failure'],
+    ['duplicate-protocol', 'capture-failure'],
   ] as const)('rejects unsafe Codex output from %s', async (probe, reason) => {
     const handle = startProfileInvocation(profile(fixture(), probe, `file-${probe}`, 2 * 60_000, true), {
       limits: { stdoutBytes: 64 * 1024, stderrBytes: 64 * 1024, combinedBytes: 128 * 1024 },

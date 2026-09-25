@@ -52,9 +52,10 @@ const captureLimits = (override: Partial<CaptureLimits> | undefined): CaptureLim
 };
 const diagnosticFor = (reason: StopReason, detail?: string) => Buffer.from(
   `[codeboost: ${reason}${detail ? `: ${detail.replace(/[\r\n]+/g, ' ').slice(0, 512)}` : ''}]\n`);
-const retainCleanupOwnership = (profile: ContainerProfile, detail: string): InvocationHandle => {
+const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
-  let resolveSettled!: (result: InvocationResult) => void, cleaning = false;
+  let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
+  let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
   const schedule = () => {
@@ -63,13 +64,14 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string): Invo
     timer.unref();
   };
   const retry = () => {
-    if (cleaning) return;
+    if (cleaning || complete) return;
     cleaning = true;
     try {
       disposeValidatedContainer(profile);
       if (timer) clearTimeout(timer);
       timer = undefined;
-      active.delete(invocation.attemptId);
+      complete = true;
+      if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
         exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
         stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
@@ -80,9 +82,9 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string): Invo
     }
     cleaning = false;
   };
-  const handle: InvocationHandle = Object.freeze({ attemptId: invocation.attemptId, settled,
+  handle = Object.freeze({ attemptId: invocation.attemptId, settled,
     cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
-  active.set(invocation.attemptId, handle);
+  if (register) active.set(invocation.attemptId, handle);
   schedule();
   return handle;
 };
@@ -91,18 +93,20 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string): Invo
 export function retainNetworkCleanup(invocation: InvocationInput, network: VendorNetwork,
   startupError: unknown, cleanupError: unknown): InvocationHandle {
   if (active.has(invocation.attemptId)) throw cleanupError;
-  let resolveSettled!: (result: InvocationResult) => void, cleaning = false;
+  let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
+  let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
   const detail = `Adapter startup failed and network cleanup remains unsettled: ${String(startupError)}; ${String(cleanupError)}`;
   const retry = () => {
-    if (cleaning) return;
+    if (cleaning || complete) return;
     cleaning = true;
     try {
       removeVendorNetwork(network);
       if (timer) clearTimeout(timer);
       timer = undefined;
-      active.delete(invocation.attemptId);
+      complete = true;
+      if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
         exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
         stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
@@ -116,7 +120,7 @@ export function retainNetworkCleanup(invocation: InvocationInput, network: Vendo
     }
     cleaning = false;
   };
-  const handle: InvocationHandle = Object.freeze({ attemptId: invocation.attemptId, settled,
+  handle = Object.freeze({ attemptId: invocation.attemptId, settled,
     cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
   active.set(invocation.attemptId, handle);
   timer = setTimeout(() => { timer = undefined; retry(); }, 1_000); timer.unref();
@@ -181,17 +185,16 @@ export function isInvocationActive(attemptId: string): boolean {
 
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
   const invocation = assertPhasePolicy(profile.policy);
-  const rejectWithCleanup = (error: unknown): InvocationHandle => {
+  const rejectWithCleanup = (error: unknown, register = true): InvocationHandle => {
     try { disposeValidatedContainer(profile); }
     catch (cleanupError) {
       return retainCleanupOwnership(profile,
-        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`);
+        `Invocation was rejected and cleanup remains unsettled: ${String(error)}; ${String(cleanupError)}`, register);
     }
     throw error;
   };
   if (active.has(invocation.attemptId)) {
-    disposeValidatedContainer(profile);
-    throw new Error('An invocation with this attempt ID is still active.');
+    return rejectWithCleanup(new Error('An invocation with this attempt ID is still active.'), false);
   }
   let limits: CaptureLimits, configuredTimeout: number;
   try {
@@ -230,7 +233,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   let closed = false, terminating = false, settlementComplete = false;
   let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
   let decodeAbort: AbortController | undefined;
-  let protocolToken: string | undefined;
+  let protocolToken: string | undefined, protocolStarted = false, protocolReady = false;
   let protocolBuffer = Buffer.alloc(0);
   const child = spawn('docker', ['start', '--attach', profile.name], {
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
@@ -253,6 +256,18 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     controls.add(operation);
     void operation.finally(() => controls.delete(operation));
     return operation;
+  };
+  const acknowledgeDeferredOutput = (token: string) => {
+    const script = [
+      "const fs=require('node:fs'),token=process.argv[1],directory='/run/codeboost-control';",
+      'let dirfd,fd;try{dirfd=fs.openSync(directory,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);',
+      "fd=fs.openSync('/proc/self/fd/'+dirfd+'/collected-'+token,",
+      'fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o444);',
+      "fs.writeFileSync(fd,token);fs.fsyncSync(fd);const stat=fs.fstatSync(fd,{bigint:true});",
+      "if(!stat.isFile()||stat.nlink!==1n)throw new Error('UNSAFE_ACK')}finally{if(fd!==undefined)fs.closeSync(fd);",
+      'if(dirfd!==undefined)fs.closeSync(dirfd)}',
+    ].join('');
+    return runControl(['exec', '--user', '0', profile.name, 'node', '-e', script, token]);
   };
   const later = (callback: () => void, delay: number) => {
     const timer = setTimeout(() => { timers.delete(timer); callback(); }, delay);
@@ -291,6 +306,14 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       combinedBytes += retained.length;
     }
     if (chunk.length > available) stop('output-limit');
+  };
+  const consumeProtocol = (length: number) => {
+    const available = Math.max(0, Math.min(limits.stderrBytes - stderrBytes,
+      limits.combinedBytes - combinedBytes));
+    const consumed = Math.min(length, available);
+    stderrBytes += consumed;
+    combinedBytes += consumed;
+    if (length > available) stop('output-limit');
   };
   const decodeOutput = () => {
     if (decodePromise) return decodePromise;
@@ -356,15 +379,32 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     const text = line.toString('utf8').trim();
     const started = /^\x1eCODEBOOST_START:([0-9a-f-]{36})\x1e$/.exec(text);
     if (started) {
+      consumeProtocol(line.length);
+      if (stopReason) return true;
+      if (protocolStarted) {
+        failureDetail ??= 'Deferred output emitted a duplicate START frame.';
+        stop('capture-failure');
+        return true;
+      }
       if (protocolToken && protocolToken !== started[1]) return false;
+      protocolStarted = true;
       protocolToken = started[1];
       return true;
     }
     const ready = /^\x1eCODEBOOST_READY:([0-9a-f-]{36}):([0-9]+)\x1e$/.exec(text);
     if (!ready || ready[1] !== protocolToken) return false;
+    consumeProtocol(line.length);
+    if (stopReason) return true;
+    if (protocolReady) {
+      failureDetail ??= 'Deferred output emitted a duplicate READY frame.';
+      stop('capture-failure');
+      return true;
+    }
+    protocolReady = true;
+    const readyToken = ready[1]!;
     void decodeOutput().then(() => {
       if (decodedOutput && !stopReason) {
-        void runControl(['exec', profile.name, 'touch', `/run/codeboost-output/collected-${ready[1]}`])
+        void acknowledgeDeferredOutput(readyToken)
           .then(success => {
             if (!success) {
               failureDetail ??= 'Deferred output acknowledgement failed.';
@@ -376,6 +416,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     return true;
   };
   const captureStderr = (value: Buffer | string) => {
+    if (stopReason || closed) return;
     if (!profile.deferredOutput) { capture('stderr', value); return; }
     const chunk = Buffer.isBuffer(value) ? value : Buffer.from(value);
     protocolBuffer = Buffer.concat([protocolBuffer, chunk]);
@@ -416,7 +457,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       protocolBuffer = Buffer.alloc(0);
     }
     closed = true;
-    let finalStdout = Buffer.concat(stdoutChunks, stdoutBytes), finalStderr = Buffer.concat(stderrChunks, stderrBytes);
+    let finalStdout = Buffer.concat(stdoutChunks, stdoutBytes), finalStderr = Buffer.concat(stderrChunks);
     let exitCode = code, finalSignal = signal;
     if (!stopReason && options.decode && !profile.deferredOutput) await decodeOutput();
     if (decodePromise) await decodePromise;

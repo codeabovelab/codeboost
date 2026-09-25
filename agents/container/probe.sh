@@ -70,6 +70,13 @@ case "$CODEBOOST_VENDOR" in
     require_option "$CODEX_HOME" nodev
     require_option "$CODEX_HOME/auth.json" ro
     require_ceiling "$CODEX_HOME" 4194304 256
+    [ "$(findmnt --noheadings --output FSTYPE --target /run/codeboost-output)" = 'tmpfs' ] \
+      || fail 'Codex output must use tmpfs'
+    require_option /run/codeboost-output rw
+    require_option /run/codeboost-output nosuid
+    require_option /run/codeboost-output nodev
+    require_option /run/codeboost-output noexec
+    require_ceiling /run/codeboost-output 20971520 64
     ;;
   claude)
     [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || fail 'Claude credential is missing'
@@ -82,6 +89,14 @@ esac
 [ "$(claude --version | awk '{print $1}')" = '2.1.281' ] || fail 'unexpected Claude version'
 
 if [ "${CODEBOOST_DEFERRED_OUTPUT:-}" = '1' ]; then
+  [ "$(findmnt --noheadings --output FSTYPE --target /run/codeboost-control)" = 'tmpfs' ] \
+    || fail 'deferred control must use tmpfs'
+  require_option /run/codeboost-control rw
+  require_option /run/codeboost-control nosuid
+  require_option /run/codeboost-control nodev
+  require_option /run/codeboost-control noexec
+  require_ceiling /run/codeboost-control 65536 16
+  [ ! -w /run/codeboost-control ] || fail 'agent must not write deferred control markers'
   token="$(cat /proc/sys/kernel/random/uuid)"
   printf '\036CODEBOOST_START:%s\036\n' "$token" >&2
   set +e
@@ -89,8 +104,9 @@ if [ "${CODEBOOST_DEFERRED_OUTPUT:-}" = '1' ]; then
   status="$?"
   set -e
   printf '\036CODEBOOST_READY:%s:%s\036\n' "$token" "$status" >&2
-  acknowledgement="/run/codeboost-output/collected-$token"
-  while [ ! -e "$acknowledgement" ]; do sleep 0.05; done
+  acknowledgement="/run/codeboost-control/collected-$token"
+  while [ ! -f "$acknowledgement" ] || [ -L "$acknowledgement" ] \
+    || [ "$(cat "$acknowledgement" 2>/dev/null || true)" != "$token" ]; do sleep 0.05; done
   exit "$status"
 fi
 exec "$@"
