@@ -16,12 +16,13 @@ createServer(client => {
   let request = Buffer.alloc(0);
   const receive = chunk => {
     request = Buffer.concat([request, chunk], request.length + chunk.length);
-    if (request.length > 8192) {
+    // The limit applies to the header only; tunnel bytes sent in the same read may follow it.
+    const boundary = request.indexOf('\r\n\r\n');
+    if (boundary < 0 ? request.length > 8192 : boundary + 4 > 8192) {
       client.off('data', receive);
       refuse(client, '431 Request Header Fields Too Large');
       return;
     }
-    const boundary = request.indexOf('\r\n\r\n');
     if (boundary < 0) return;
     // Stop reading until the tunnel is piped, so bytes sent after CONNECT stay buffered instead of being dropped.
     client.off('data', receive);

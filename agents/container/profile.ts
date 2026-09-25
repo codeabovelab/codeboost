@@ -117,7 +117,8 @@ export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
   assertTaskFilesystems(expected.filesystems, expected.clone);
-  assertVendorNetwork(expected.network, expected.invocation, profile.name, timeoutMs);
+  // Every caller, including those using the default budget, is bounded by the invocation deadline.
+  assertVendorNetwork(expected.network, expected.invocation, profile.name, profileTimeout(profile, timeoutMs));
   assertPhasePolicy(expected.policy, expected.invocation);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))

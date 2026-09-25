@@ -65,6 +65,30 @@ describe('vendor egress proxy', () => {
     expect(received()).toContain('early-client-hello');
   });
 
+  it('forwards a large payload that arrives in the same read as the CONNECT header', async () => {
+    const { proxyPort, upstreamPort, received } = await startProxy();
+    const client = connect(proxyPort, '127.0.0.1');
+    await new Promise(resolve => client.once('connect', resolve));
+    const payload = `large-hello-${'x'.repeat(16 * 1024)}`;
+    client.write(`CONNECT localhost:${upstreamPort} HTTP/1.1\r\nHost: localhost\r\n\r\n${payload}`);
+    const deadline = Date.now() + 3_000;
+    while (received().length < payload.length && Date.now() < deadline)
+      await new Promise(resolve => setTimeout(resolve, 20));
+    client.destroy();
+    expect(received()).toBe(payload);
+  });
+
+  it('refuses a CONNECT header larger than 8 KiB', async () => {
+    const { proxyPort, upstreamPort } = await startProxy();
+    const client = connect(proxyPort, '127.0.0.1');
+    let response = '';
+    client.on('data', chunk => { response += chunk.toString('utf8'); });
+    const closed = new Promise(resolve => client.once('close', resolve));
+    client.write(`CONNECT localhost:${upstreamPort} HTTP/1.1\r\nX-Pad: ${'p'.repeat(9 * 1024)}\r\n\r\n`);
+    await closed;
+    expect(response).toMatch(/^HTTP\/1\.1 431 /);
+  });
+
   it('refuses hosts outside the vendor allowlist', async () => {
     const { proxyPort, upstreamPort } = await startProxy();
     const client = connect(proxyPort, '127.0.0.1');

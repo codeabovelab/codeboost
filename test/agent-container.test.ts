@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
-import { createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
+import { assertContainerProfile, createContainerProfile, disposeContainerProfile } from '../agents/container/profile.ts';
 import { createValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer, startValidatedContainer,
   hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
@@ -328,16 +328,17 @@ describe('real Docker agent isolation', () => {
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // The keeper's run client hangs until killed, and the real run lands in the daemon afterwards.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
-      `if [ "$1" = run ] && [ "$2" = --detach ]; then ( sleep 4; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
+      `if [ "$1" = run ] && [ "$2" = --detach ]; then ( sleep 10; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
     try {
       expect(() => prepareTaskFilesystems(clone, {
         workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
-      }, imageId, 2_000)).toThrow();
+      // A budget that tolerates a loaded daemon; the keeper still lands after its client is killed at ~8 s.
+      }, imageId, 8_000)).toThrow();
     } finally { process.env.PATH = path; }
-    execFileSync('sleep', ['6']);
+    execFileSync('sleep', ['3']);
     const orphans = [...keepers()].filter(id => !before.has(id));
     for (const id of orphans) docker('rm', '--force', id);
     expect(orphans).toEqual([]);
@@ -351,6 +352,12 @@ describe('real Docker agent isolation', () => {
       expect(() => validateContainer(valid.name, valid)).toThrow('trusted keeper');
     } finally { docker('update', '--restart=no', data.filesystems.keeper); }
     docker('rm', '--force', valid.name); containers.delete(valid.name);
+  }, 60_000);
+
+  it('bounds profile revalidation by the invocation deadline, even with the default budget', () => {
+    const data = fixture(), captured = Date.now(), late = profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
+    execFileSync('sleep', [String(Math.max(0, captured + 6_500 - Date.now()) / 1000)]);
+    expect(() => assertContainerProfile(late)).toThrow('deadline has passed');
   }, 60_000);
 
   it('refuses to launch once the captured invocation deadline has passed', () => {
