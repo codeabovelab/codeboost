@@ -70,7 +70,8 @@ describe('production agent adapters', () => {
     releaseSecond = true;
     second.cancel('cancelled');
     const result = await second.settled;
-    expect(result.stopReason).toBe('capture-failure');
+    expect(result.stopReason).toBe('cancelled');
+    expect(result.stderr).toContain('[codeboost: cancelled:');
     expect(result.stderr).toContain('setup cleanup remains unsettled');
     expect(isInvocationActive(invocation.attemptId)).toBe(false);
   });
