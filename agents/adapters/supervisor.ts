@@ -365,7 +365,6 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
             stop('timeout');
             reject(new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.'));
           }, budget);
-          decodeTimer.unref();
         });
         let decoded: DecodedOutput;
         try { decoded = await Promise.race([operation, timeout, aborted]); }
@@ -374,7 +373,6 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
           let graceTimer: ReturnType<typeof setTimeout> | undefined;
           const grace = new Promise<void>(resolve => {
             graceTimer = setTimeout(resolve, CAPTURE_ABORT_GRACE_MS);
-            graceTimer.unref();
           });
           await Promise.race([operation.then(() => undefined, () => undefined), grace]);
           if (graceTimer) clearTimeout(graceTimer);
