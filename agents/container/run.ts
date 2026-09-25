@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
-import { assertContainerProfile, disposeContainerProfile, profileTimeout, type ContainerProfile } from './profile.ts';
+import { assertContainerProfile, disposeContainerProfile, isContainerProfileAuthentic, profileTimeout,
+  type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemAllocationId } from './storage.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
@@ -48,6 +49,9 @@ const canonicalDockerBindSource = (source: string) => {
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const removeContainerOrThrow = (profile: ContainerProfile, createUnsettled = false) => {
+  // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
+  if (!isContainerProfileAuthentic(profile))
+    throw new Error('Container profile was not created by the trusted profile builder.');
   const remaining = createDeadline(30_000 + (createUnsettled ? CREATE_SETTLE_MS : 0));
   const settleBy = performance.now() + (createUnsettled ? CREATE_SETTLE_MS : 0);
   let before: ReturnType<typeof spawnSync>;
@@ -101,14 +105,17 @@ type Inspect = {
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
-    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
+    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null; Dns: string[];
+    DnsOptions: string[]; DnsSearch: string[]; ExtraHosts: string[] | null;
+    PortBindings: Record<string, unknown> | null; PublishAllPorts: boolean };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
+  NetworkSettings: { Networks: Record<string, unknown>; Ports: Record<string, unknown> };
 };
 
 /** Validate daemon-resolved configuration before starting an agent. */
 export function validateContainer(container: string, profile: ContainerProfile, timeoutMs = 30_000): void {
   const remaining = createDeadline(timeoutMs);
-  assertContainerProfile(profile);
+  assertContainerProfile(profile, remaining());
   const inspect = JSON.parse(docker(['container', 'inspect', container], { timeoutMs: remaining() }))[0] as Inspect | undefined;
   if (!inspect) throw new Error('Docker did not return the created container.');
   const image = JSON.parse(docker(['image', 'inspect', profile.expectedImage], { timeoutMs: remaining() }))[0] as
@@ -131,7 +138,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactSecurityOptions(host.SecurityOpt)
-    || host.NetworkMode !== 'none' || host.PidMode !== '' || host.IpcMode !== 'private'
+    || host.NetworkMode !== profile.network.name || host.PidMode !== '' || host.IpcMode !== 'private'
     || host.UTSMode !== '' || host.UsernsMode !== '' || host.CgroupnsMode !== 'private'
     || (host.Devices?.length ?? 0) !== 0 || (host.DeviceRequests?.length ?? 0) !== 0 || host.PidsLimit !== 128
     || host.Memory !== 512 * 1024 * 1024 || host.MemorySwap !== 512 * 1024 * 1024
@@ -146,6 +153,14 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0
     || host.Runtime !== 'runc')
     throw new Error('Container daemon configuration is missing required lockdown.');
+  if (JSON.stringify(host.Dns) !== JSON.stringify(['127.0.0.1']))
+    throw new Error('Container DNS configuration changed.');
+  if (host.DnsOptions.length || host.DnsSearch.length || (host.ExtraHosts?.length ?? 0)
+    || Object.keys(host.PortBindings ?? {}).length || host.PublishAllPorts
+    || Object.keys(inspect.NetworkSettings.Ports ?? {}).length)
+    throw new Error('Container host or port configuration changed.');
+  if (JSON.stringify(Object.keys(inspect.NetworkSettings.Networks)) !== JSON.stringify([profile.network.name]))
+    throw new Error('Container network attachment changed.');
   const tmpfs = host.Tmpfs ?? {};
   const expectedTmpfs = new Map([
     ['/tmp', ['rw', 'nosuid', 'nodev', 'size=33554432', 'nr_inodes=4096', 'mode=1777']],
@@ -223,7 +238,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   const imageEnvironment = new Map((image?.Config?.Env ?? []).map(value => [value.slice(0, value.indexOf('=')), value.slice(value.indexOf('=') + 1)]));
   const allowedEnvironment = new Set(['PATH', 'NODE_VERSION', 'YARN_VERSION', 'HOME', 'CODEBOOST_PHASE', 'CODEBOOST_VENDOR',
     'CODEBOOST_WORK_BYTES', 'CODEBOOST_WORK_INODES', 'CODEBOOST_METADATA_BYTES', 'CODEBOOST_METADATA_INODES',
-    'npm_config_cache', 'XDG_CACHE_HOME', ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
+    'npm_config_cache', 'XDG_CACHE_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
+    ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
   if (new Set(names).size !== names.length || names.some(name => !allowedEnvironment.has(name)))
     throw new Error('Container includes an unexpected environment variable.');
   if (environment.get('PATH') !== imageEnvironment.get('PATH')
@@ -234,14 +250,17 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || environment.get('CODEBOOST_METADATA_BYTES') !== String(profile.filesystems.metadataBytes)
     || environment.get('CODEBOOST_METADATA_INODES') !== String(profile.filesystems.metadataInodes)
     || environment.get('npm_config_cache') !== '/tmp/npm-cache'
-    || environment.get('XDG_CACHE_HOME') !== '/tmp/xdg-cache')
+    || environment.get('XDG_CACHE_HOME') !== '/tmp/xdg-cache'
+    || environment.get('HTTPS_PROXY') !== profile.network.proxyUrl
+    || environment.get('HTTP_PROXY') !== profile.network.proxyUrl
+    || environment.get('NO_PROXY') !== 'localhost,127.0.0.1')
     throw new Error('Container isolation environment changed.');
   if (profile.vendor === 'codex' && (names.includes('CLAUDE_CODE_OAUTH_TOKEN')
     || environment.get('CODEX_HOME') !== '/run/codeboost-auth/codex'))
     throw new Error('Credential profiles must not be combined or redirected.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
     throw new Error('Credential profiles must not be combined.');
-  assertContainerProfile(profile);
+  assertContainerProfile(profile, remaining());
   remaining();
 }
 
@@ -251,7 +270,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
   let createUnsettled = false;
   try {
     validateSecrets(profile, secrets);
-    assertContainerProfile(profile);
+    assertContainerProfile(profile, remaining());
     const createTimeout = remaining();
     createUnsettled = true;
     try { docker(profile.args, { timeoutMs: createTimeout, secrets }); }
@@ -262,7 +281,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     }
     createUnsettled = false;
     validateContainer(profile.name, profile, remaining());
-    assertContainerProfile(profile);
+    assertContainerProfile(profile, remaining());
     remaining();
     return profile.name;
   } catch (error) {
@@ -272,14 +291,14 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
   }
 }
 
-export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
+export function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
-  const container = createValidatedContainer(profile, remaining(), secrets);
   let failure: unknown;
   try {
-    assertContainerProfile(profile);
-    const output = docker(['start', '--attach', container], { timeoutMs: remaining(), secrets });
+    validateSecrets(profile, secrets);
+    validateContainer(profile.name, profile, remaining());
+    const output = docker(['start', '--attach', profile.name], { timeoutMs: remaining(), secrets });
     remaining();
     return output;
   }
@@ -291,4 +310,18 @@ export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
       throw cleanupError;
     }
   }
+}
+
+export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
+  secrets: Readonly<Record<string, string>> = {}): string {
+  const remaining = createDeadline(profileTimeout(profile, timeoutMs));
+  createValidatedContainer(profile, remaining(), secrets);
+  let startBudget: number;
+  try { startBudget = remaining(); }
+  catch (error) {
+    try { removeContainerOrThrow(profile); }
+    catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Agent deadline and cleanup both failed.'); }
+    throw error;
+  }
+  return startValidatedContainer(profile, startBudget, secrets);
 }

@@ -28,4 +28,5 @@ jobs:
           cache: npm
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
-      - run: npx vitest run test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts
+      # The Docker suites share one image tag and daemon, so run test files one at a time.
+      - run: npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts
