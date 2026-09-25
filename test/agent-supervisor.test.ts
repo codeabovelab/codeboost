@@ -242,6 +242,17 @@ describe('container invocation supervisor', () => {
     expect((await handle.settled).stopReason).toBe('capture-failure');
   }, 60_000);
 
+  it('delimits READY after finite newline-free stderr', async () => {
+    const result = await startProfileInvocation(
+      profile(fixture(), 'newline-free-deferred-output', 'newline-free-ready', 2 * 60_000, true), {
+        decode: (current, _raw, maximum, timeoutMs, signal) =>
+          readCodexOutput(current.name, maximum, timeoutMs, signal),
+      }).settled;
+    expect(result.stopReason, result.stderr).toBeUndefined();
+    expect(result.stdout).toBe('captured');
+    expect(result.stderr).toContain('trailing-diagnostic');
+  }, 60_000);
+
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
     it('runs the production Codex adapter and collects its bounded output file', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;

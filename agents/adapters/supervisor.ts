@@ -14,6 +14,7 @@ const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const CAPTURE_ABORT_GRACE_MS = 1_000;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
+const cleanupRecoveries = new Set<InvocationHandle>();
 
 export interface CaptureLimits {
   readonly stdoutBytes: number;
@@ -72,6 +73,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
       timer = undefined;
       complete = true;
       if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
+      cleanupRecoveries.delete(handle);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
         exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
         stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
@@ -85,6 +87,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
   handle = Object.freeze({ attemptId: invocation.attemptId, settled,
     cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
   if (register) active.set(invocation.attemptId, handle);
+  else cleanupRecoveries.add(handle);
   schedule();
   return handle;
 };
@@ -92,7 +95,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
 /** Retain attempt ownership while retrying a network allocated before profile construction failed. */
 export function retainNetworkCleanup(invocation: InvocationInput, network: VendorNetwork,
   startupError: unknown, cleanupError: unknown): InvocationHandle {
-  if (active.has(invocation.attemptId)) throw cleanupError;
+  const register = !active.has(invocation.attemptId);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
   let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -107,6 +110,7 @@ export function retainNetworkCleanup(invocation: InvocationInput, network: Vendo
       timer = undefined;
       complete = true;
       if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
+      cleanupRecoveries.delete(handle);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
         exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
         stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
@@ -122,7 +126,8 @@ export function retainNetworkCleanup(invocation: InvocationInput, network: Vendo
   };
   handle = Object.freeze({ attemptId: invocation.attemptId, settled,
     cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
-  active.set(invocation.attemptId, handle);
+  if (register) active.set(invocation.attemptId, handle);
+  else cleanupRecoveries.add(handle);
   timer = setTimeout(() => { timer = undefined; retry(); }, 1_000); timer.unref();
   return handle;
 }

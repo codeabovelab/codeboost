@@ -103,7 +103,7 @@ if [ "${CODEBOOST_DEFERRED_OUTPUT:-}" = '1' ]; then
   "$@"
   status="$?"
   set -e
-  printf '\036CODEBOOST_READY:%s:%s\036\n' "$token" "$status" >&2
+  printf '\n\036CODEBOOST_READY:%s:%s\036\n' "$token" "$status" >&2
   acknowledgement="/run/codeboost-control/collected-$token"
   while [ ! -f "$acknowledgement" ] || [ -L "$acknowledgement" ] \
     || [ "$(cat "$acknowledgement" 2>/dev/null || true)" != "$token" ]; do sleep 0.05; done
