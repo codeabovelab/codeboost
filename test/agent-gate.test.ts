@@ -80,6 +80,31 @@ describe('isolation gate detects breaches', () => {
     expect(result.stdout).not.toContain(marker);
   }, 180_000);
 
+  // The metadata-alias probe exits at its first breach, so each documented operation is also proven on its own: the
+  // production script must deny it, and that deny line must report it when the operation succeeds. Metadata here is a
+  // plain writable .git on the task filesystem, so links, aliases, truncation, removal and moves all succeed.
+  it.each([
+    ['ln /work/.git/config "$target/config-link"', 'isolation breach: ln /work/.git/config /work/config-link'],
+    ['ln "$object" "$target/object-link"', '/work/object-link'],
+    ["sh -c 'printf x >> /tmp/config-alias'", 'isolation breach: sh -c printf x >> /tmp/config-alias'],
+    ["sh -c 'printf x >> /tmp/object-alias'", 'isolation breach: sh -c printf x >> /tmp/object-alias'],
+    ["sh -c ': > /work/.git/config'", 'isolation breach: sh -c : > /work/.git/config'],
+    ['truncate -s 0 /work/.git/config', 'isolation breach: truncate -s 0 /work/.git/config'],
+    ['rm -rf /work/.git', 'isolation breach: rm -rf /work/.git'],
+    ['mv /work/.git /work/replaced', 'isolation breach: mv /work/.git /work/replaced'],
+    ['mv /work/.git /tmp/replaced', 'isolation breach: mv /work/.git /tmp/replaced'],
+  ] as const)('reports the metadata operation %s on its own when it succeeds', (operation, breach) => {
+    const script = probeScript('execute', 'metadata-alias');
+    expect(script).toContain(`deny ${operation}`);
+    const denyHelper = script.slice(0, script.indexOf('set -eu; '));
+    const prelude = 'object=$(find /work/.git/objects -type f | head -n 1); chmod -R u+w /work/.git/objects; target=/work; '
+      + 'ln -s /work/.git/config /tmp/config-alias; ln -s "$object" /tmp/object-alias; ';
+    const result = runBroken([...bounded, ...boundedScratch], `${denyHelper}set -eu; ${prelude}deny ${operation}`);
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stderr).toContain(breach);
+    expect(result.stderr).toContain('isolation breach:');
+  }, 120_000);
+
   it.each(['planning', 'questions', 'review'] as const)('fails the phase probe for a writable worktree in %s', phase => {
     const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch], probeScript(phase, 'phase-worktree'));
     expect(result.status, result.stderr).not.toBe(0);
