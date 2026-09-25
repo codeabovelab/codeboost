@@ -60,7 +60,11 @@ const removeOwnedDirectories = (directories: readonly string[]) => {
 const readCapturedFile = (path: string, kind: string): { identity: FileIdentity; content: Buffer } => {
   let fd: number | undefined;
   try {
-    fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+    catch (error) {
+      if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error(`${kind} must be a direct regular file, not a link.`);
+      throw error;
+    }
     const before = fstatSync(fd);
     const maximum = 1024 * 1024;
     if (!before.isFile() || before.nlink !== 1 || before.size > maximum)
@@ -150,9 +154,8 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   if (!/^codeboost-work-[0-9a-f-]+$/.test(filesystems.workVolume)
     || !/^codeboost-metadata-[0-9a-f-]+$/.test(filesystems.metadataVolume)
     || !/^codeboost-keeper-[0-9a-f-]+$/.test(filesystems.keeper)) throw new Error('Task filesystem identity is invalid.');
-  if (options.codexAuthFile && !lstatSync(options.codexAuthFile).isFile())
-    throw new Error('Codex auth must be a direct regular file, not a link.');
-  const sourceAuth = options.codexAuthFile ? readCapturedFile(realpathSync(options.codexAuthFile), 'Codex auth') : undefined;
+  // Read through one no-follow descriptor so the path cannot be swapped between check and open.
+  const sourceAuth = options.codexAuthFile ? readCapturedFile(options.codexAuthFile, 'Codex auth') : undefined;
   const cleanupDirectories: string[] = [];
   let codexAuthFile: string | undefined, authIdentity: FileIdentity | undefined;
   try {

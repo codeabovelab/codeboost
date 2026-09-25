@@ -54,10 +54,8 @@ const removeContainerOrThrow = (profile: ContainerProfile) => {
     return;
   }
   const inspected = JSON.parse(before.stdout || '[]')[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
-  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId) {
-    disposeContainerProfile(profile);
-    return;
-  }
+  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
+    throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
   const result = spawnSync('docker', ['rm', '--force', profile.name], {
     encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -87,6 +85,7 @@ type Inspect = {
     Ulimits: unknown[] | null; CpuCount: number;
     CpuPercent: number; IOMaximumBandwidth: number; IOMaximumIOps: number; DeviceCgroupRules: unknown[] | null;
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
+    RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
     Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
@@ -129,7 +128,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     || host.BlkioWeightDevice?.length || host.BlkioDeviceReadBps?.length || host.BlkioDeviceWriteBps?.length
     || host.BlkioDeviceReadIOps?.length || host.BlkioDeviceWriteIOps?.length || host.Ulimits?.length
     || host.CpuCount !== 0 || host.CpuPercent !== 0 || host.IOMaximumBandwidth !== 0 || host.IOMaximumIOps !== 0
-    || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== '')
+    || host.DeviceCgroupRules !== null || host.StorageOpt != null || host.CgroupParent !== ''
+    || !['', 'no'].includes(host.RestartPolicy?.Name ?? '') || (host.RestartPolicy?.MaximumRetryCount ?? 0) !== 0)
     throw new Error('Container daemon configuration is missing required lockdown.');
   const tmpfs = host.Tmpfs ?? {};
   const expectedTmpfs = new Map([

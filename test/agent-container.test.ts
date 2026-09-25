@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -264,10 +264,26 @@ describe('real Docker agent isolation', () => {
       inputDirectory: data.input, command: ['true'], codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
-    expect(() => createValidatedContainer(duplicate)).toThrow();
+    expect(() => createValidatedContainer(duplicate)).toThrow('Container creation failed and cleanup did not settle.');
+    expect(existsSync(duplicate.codexAuthFile!)).toBe(true);
     const state = JSON.parse(docker('container', 'inspect', first.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', first.name); containers.delete(first.name);
+  }, 60_000);
+
+  it('refuses a Codex auth path that is a link without resolving it', () => {
+    const data = fixture(), link = join(data.root, 'auth-link.json');
+    symlinkSync(data.fakeAuth, link);
+    expect(() => profile(data, 'planning', ['true'], { codexAuthFile: link })).toThrow('not a link');
+  }, 60_000);
+
+  it('rejects a restart policy that could relaunch the agent after it exits', () => {
+    const data = fixture(), valid = profile(data, 'planning', ['true']);
+    const imageIndex = valid.args.indexOf(imageId);
+    docker(...valid.args.slice(0, imageIndex), '--restart=always', ...valid.args.slice(imageIndex));
+    containers.add(valid.name);
+    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
   it('rejects added capabilities and conflicting or duplicate filesystem options', () => {
