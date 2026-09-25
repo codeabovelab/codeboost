@@ -44,7 +44,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
-        if (stopping) { json(503, { error: 'The review server is shutting down.' }); return; }
+        if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
