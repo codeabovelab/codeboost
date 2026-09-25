@@ -125,10 +125,29 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('timeout')).toBe(false);
   }, 60_000);
 
+  it('records timeout when close delivery resumes after the monotonic deadline', async () => {
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'late-close-delivery', 30_000),
+      { timeoutMs: 3_000 });
+    const end = performance.now() + 3_500;
+    while (performance.now() < end) { /* delay both close and timer delivery */ }
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('timeout');
+  }, 15_000);
+
   it('blocks a duplicate attempt while the original container remains active', async () => {
     const data = fixture(), first = startProfileInvocation(profile(data, 'ignore-term', 'duplicate'), { timeoutMs: 30_000 });
     expect(() => startProfileInvocation(profile(data, 'finite-output', 'duplicate'))).toThrow('still active');
     expect(isInvocationActive('duplicate')).toBe(true);
+    first.cancel('shutdown');
+    expect((await first.settled).stopReason).toBe('shutdown');
+  }, 60_000);
+
+  it('rejects reuse of the same active profile without disposing its container', async () => {
+    const current = profile(fixture(), 'ignore-term', 'same-profile-duplicate');
+    const first = startProfileInvocation(current, { timeoutMs: 30_000 });
+    expect(() => startProfileInvocation(current)).toThrow('already owns the active invocation');
+    expect(isInvocationActive('same-profile-duplicate')).toBe(true);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
     first.cancel('shutdown');
     expect((await first.settled).stopReason).toBe('shutdown');
   }, 60_000);

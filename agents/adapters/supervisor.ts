@@ -14,6 +14,7 @@ const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const CAPTURE_ABORT_GRACE_MS = 1_000;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
+const activeProfiles = new WeakSet<ContainerProfile>();
 const cleanupRecoveries = new Set<InvocationHandle>();
 const hasCleanupRecovery = (attemptId: string) =>
   Array.from(cleanupRecoveries).some(handle => handle.attemptId === attemptId);
@@ -209,6 +210,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     throw error;
   };
   if (ownsAttempt(invocation.attemptId)) {
+    if (activeProfiles.has(profile))
+      throw new Error('This container profile already owns the active invocation.');
     return rejectWithCleanup(new Error('An invocation with this attempt ID is still active.'), false);
   }
   let limits: CaptureLimits, configuredTimeout: number, carriedBudget: number;
@@ -477,10 +480,12 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     cancel: (reason: StopReason) => { stop(reason); wakeCleanup?.(); },
   });
   active.set(invocation.attemptId, handle);
+  activeProfiles.add(profile);
 
   child.once('close', async (code, signal) => {
     for (const timer of timers) clearTimeout(timer);
     timers.clear();
+    if (!stopReason && performance.now() >= deadline) stopReason = 'timeout';
     if (protocolBuffer.length) {
       if (!protocolLine(protocolBuffer)) capture('stderr', protocolBuffer);
       protocolBuffer = Buffer.alloc(0);
@@ -493,7 +498,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     if (!stopReason && profile.deferredOutput && !decodedOutput) {
       stopReason = 'capture-failure'; failureDetail ??= 'Deferred output protocol did not complete.';
     }
-    if (decodedOutput) {
+    if (decodedOutput && !stopReason) {
       finalStdout = Buffer.from(decodedOutput.text);
       if (decodedOutput.providerFailed) exitCode = exitCode === 0 ? 1 : exitCode;
     }
@@ -519,6 +524,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       exitCode, signal: finalSignal, ...(stopReason ? { stopReason } : {}),
       stdout: finalStdout.toString('utf8'), stderr: finalStderr.toString('utf8') });
     settlementComplete = true;
+    activeProfiles.delete(profile);
     active.delete(invocation.attemptId);
     resolveSettled(result);
   });
