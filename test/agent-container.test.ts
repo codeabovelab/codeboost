@@ -514,10 +514,9 @@ describe('real Docker agent isolation', () => {
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
       const authProfile = profile(data, 'planning', policy => createCodexCommand(policy,
         'Reply only with this exact marker: codeboost-schema-marker'),
-      { authProbe: true, codexAuthFile: authFile });
-      docker(...authProfile.args); containers.add(authProfile.name);
-      const output = docker('start', '--attach', authProfile.name);
-      docker('rm', '--force', authProfile.name); containers.delete(authProfile.name);
+      { authProbe: true, codexAuthFile: authFile, deadlineMs: 5 * 60_000 });
+      // The production launch path: create, validate, start and remove.
+      const output = runContainer(authProfile, 5 * 60_000);
       expect(output).toContain('codeboost-schema-marker');
     }, 6 * 60_000);
 
@@ -526,12 +525,9 @@ describe('real Docker agent isolation', () => {
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
       const authProfile = profile(data, 'planning', policy => createClaudeCommand(policy,
         'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
-        { vendor: 'claude', authProbe: true, claudeToken: token });
-      const result = execFileSync('docker', authProfile.args, { encoding: 'utf8', timeout: 60_000,
-        env: { PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST, CLAUDE_CODE_OAUTH_TOKEN: token } });
-      void result; containers.add(authProfile.name);
-      const output = docker('start', '--attach', authProfile.name);
-      docker('rm', '--force', authProfile.name); containers.delete(authProfile.name);
+        { vendor: 'claude', authProbe: true, claudeToken: token, deadlineMs: 5 * 60_000 });
+      // The production launch path, with the token passed only as the Claude profile's secret.
+      const output = runContainer(authProfile, 5 * 60_000, { CLAUDE_CODE_OAUTH_TOKEN: token });
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
       // Tolerate one wrapping pair of backticks or quotes, but nothing else around the value.

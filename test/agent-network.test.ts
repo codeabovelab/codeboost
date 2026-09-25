@@ -28,7 +28,8 @@ beforeAll(() => {
   });
   network = createVendorNetwork(invocation, imageId);
 }, 10 * 60_000);
-afterAll(() => removeVendorNetwork(network), 60_000);
+// If setup failed there is no network, and a teardown error would hide the setup failure.
+afterAll(() => { if (network) removeVendorNetwork(network); }, 60_000);
 
 describe('vendor-only egress', () => {
   it('keeps failed allocation and its cleanup inside the caller deadline', () => {
