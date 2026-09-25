@@ -16,7 +16,7 @@
 - the order of steps when the program shuts down;
 - the feedback events that the learning lane (J) will read.
 
-**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The contract uses only the D interface that is already on `main` (`agents/contract.ts`), D4 (#47) merged without changing that interface. D5 changes this contract only if it changes that interface.
+**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The contract uses only the D interface that is already on `main` (`agents/contract.ts`). D4 (#47) merged without changing that interface. D5 changes this contract only if it changes that interface.
 
 ## Summary
 
