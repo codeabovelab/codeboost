@@ -162,8 +162,13 @@ describe('real Docker agent isolation', () => {
       writeFileSync(join(root, 'host-only.txt'), 'codeboost-host-secret\n');
       symlinkSync(join(root, 'host-only.txt'), join(source, 'escape'));
       symlinkSync(root, join(source, 'escape-dir'));
+      // Links a traversal must not follow: the container root and a self-reference.
+      symlinkSync('/', join(source, 'root-link'));
+      symlinkSync('.', join(source, 'loop'));
     } });
+    const started = performance.now();
     expect(runContainer(profile(data, 'execute', 'hostile-repo'))).toBe('hostile-repo-contained');
+    expect(performance.now() - started).toBeLessThan(30_000);
   }, 60_000);
 
   it('fails closed without leaving storage when a repository exceeds its allocation', () => {

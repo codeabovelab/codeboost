@@ -24,8 +24,8 @@ const probeScript = (phase: Phase, probe: IsolationProbe) => {
 // A committed repository whose metadata lives on its own filesystem, as in a real task container.
 const seedRepository = 'git init -q /work && git -C /work -c user.name=gate -c user.email=gate@example.com '
   + 'commit -q --allow-empty -m seed';
-const runBroken = (mounts: readonly string[], script: string) => spawnSync('docker', ['run', '--rm', '--network=none',
-  '--user', '10001:10001', '--env', 'HOME=/home/codeboost', '--workdir', '/work', ...mounts,
+const runBroken = (mounts: readonly string[], script: string, env: readonly string[] = []) => spawnSync('docker', ['run',
+  '--rm', '--network=none', '--user', '10001:10001', '--env', 'HOME=/home/codeboost', ...env, '--workdir', '/work', ...mounts,
   '--tmpfs', '/home/codeboost:rw,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700',
   '--entrypoint', 'sh', imageId, '-c', `${seedRepository} && ${script}`],
 { encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
@@ -57,6 +57,14 @@ describe('isolation gate detects breaches', () => {
     expect(result.stderr).toContain(breach);
   }, 180_000);
 
+  it('fails the scratch probe for a Codex container whose Codex scratch areas are missing', () => {
+    // Missing scratch areas must fail the probe, not skip their checks and report the container as bounded.
+    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch],
+      probeScript('execute', 'scratch-capacity'), ['--env', 'CODEBOOST_VENDOR=codex']);
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stdout).not.toContain('scratch-bounded');
+  }, 120_000);
+
   it('fails the hostile-repository probe when secret content reaches the task filesystem', () => {
     // Stand-in for a seeder that followed a symlink: the secret text is committed into /work behind the link names.
     const leaked = 'printf codeboost-host-secret > /work/leak && ln -s /work/leak /work/escape && ln -s /tmp /work/escape-dir '
@@ -64,6 +72,6 @@ describe('isolation gate detects breaches', () => {
     const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch],
       leaked + probeScript('execute', 'hostile-repo'));
     expect(result.status, result.stderr).not.toBe(0);
-    expect(result.stderr).toContain('isolation breach: grep -Rqs codeboost-host-secret');
+    expect(result.stderr).toContain('isolation breach: grep -rqs codeboost-host-secret');
   }, 120_000);
 });

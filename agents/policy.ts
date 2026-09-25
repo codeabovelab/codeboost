@@ -99,11 +99,13 @@ export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' |
 // `set -e` ignores a failing `! command`, so a negated check could never fail a probe. `deny` exits instead when a
 // forbidden action succeeds, and names the breach.
 const deny = 'deny() { if "$@" 2>/dev/null; then echo "isolation breach: $*" >&2; exit 1; fi; }; ';
-// Fill a scratch directory past its byte and inode limits; each must stop well before the fill completes.
+// Fill a scratch directory past its byte and inode limits. Each fill must stop early, and must have written first, so
+// an unwritable or missing directory fails the probe instead of passing it vacuously.
 const scratchBounded = (directory: string, megabytes: number, files: number) =>
-  `deny dd if=/dev/zero of="${directory}/overflow" bs=1M count=${megabytes}; rm -f "${directory}/overflow"; `
-  + `mkdir "${directory}/many"; i=0; while touch "${directory}/many/$i" 2>/dev/null; do i=$((i+1)); `
-  + `test "$i" -lt ${files}; done; test "$i" -lt ${files}; rm -rf "${directory}/many"; `;
+  `deny dd if=/dev/zero of="${directory}/overflow" bs=1M count=${megabytes}; test -s "${directory}/overflow"; `
+  + `rm -f "${directory}/overflow"; mkdir "${directory}/many"; i=0; `
+  + `while touch "${directory}/many/$i" 2>/dev/null; do i=$((i+1)); test "$i" -lt ${files}; done; `
+  + `test "$i" -gt 0; test "$i" -lt ${files}; rm -rf "${directory}/many"; `;
 
 /** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
 export function createIsolationProbeCommand(policy: PhasePolicy, probe: IsolationProbe): AgentCommand {
@@ -143,7 +145,7 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
     'newline-free-deferred-output': "printf captured > /run/codeboost-output/final.txt; printf trailing-diagnostic >&2",
     // Every agent-writable scratch area enforces both its byte and inode ceilings; the control area is not writable.
     'scratch-capacity': `${deny}set -eu; ${scratchBounded('/tmp', 64, 10000)}${scratchBounded('$HOME', 4, 1000)}`
-      + 'if [ -n "${CODEX_HOME:-}" ]; then '
+      + 'if [ "${CODEBOOST_VENDOR:-}" = codex ]; then test -n "${CODEX_HOME:-}"; '
       + `${scratchBounded('$CODEX_HOME', 16, 2000)}${scratchBounded('/run/codeboost-output', 64, 1000)}fi; `
       + 'if [ -d /run/codeboost-control ]; then deny touch /run/codeboost-control/forged; fi; printf scratch-bounded',
     // Hard links, symlink aliases, truncation and replacement all fail, and the metadata digest is unchanged.
@@ -157,10 +159,12 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + "deny sh -c ': > /work/.git/config'; deny truncate -s 0 /work/.git/config; "
       + 'deny rm -rf /work/.git; deny mv /work/.git /work/replaced; deny mv /work/.git /tmp/replaced; '
       + 'test "$(digest)" = "$before"; git status --porcelain > /dev/null; printf metadata-unchanged',
-    // Repository symlinks that point outside the checkout arrive as links, never as their host targets.
+    // Repository symlinks that point outside the checkout arrive as links, never as their host targets. The search does
+    // not follow links, so a hostile link to `/` or a loop cannot make it walk the whole container; the link targets
+    // are checked separately.
     'hostile-repo': `${deny}set -eu; test -L /work/escape; test -L /work/escape-dir; `
-      + 'test "$(git status --porcelain)" = ""; deny grep -Rqs codeboost-host-secret /work /tmp "$HOME"; '
-      + 'printf hostile-repo-contained',
+      + 'test "$(git status --porcelain)" = ""; deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; '
+      + 'deny cat /work/escape; deny ls -A /work/escape-dir/; printf hostile-repo-contained',
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }
