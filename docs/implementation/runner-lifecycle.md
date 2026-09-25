@@ -98,7 +98,7 @@ Any change not in this table is illegal. The `Store` refuses it.
 |---|---|---|---|
 | — | `pending` | Admission | In memory, first: coordinator is `open`, no job or unresolved marker for the task, and a slot is free; then reserve the slot. In one `Store` transaction: task state version equals the caller's expected version; no non-terminal attempt exists for the task; captured context is current. |
 | `pending` | `running` | D returns a handle | Attempt ID is the task's current attempt; state is `pending` |
-| `pending` | `cancelled` / `stale` / `failed` | Stop before launch, context change, or launch error | Same attempt ID; state is `pending` |
+| `pending` | `cancelled` / `stale` / `failed` | Stop before launch, context change, or launch error (see "Launch" below) | Same attempt ID; state is `pending` |
 | `running` | `completed` | Validated result | Attempt ID is current; state is `running`; no first reason recorded; captured context still current |
 | `running` | `failed` | Settled with an error or invalid output | Attempt ID is current; state is `running` |
 | `running` | `cancelled` | Settled after a user, hard-stop or shutdown reason | Attempt ID is current; state is `running`; first reason is `cancelled` or `shutdown` |
@@ -108,6 +108,21 @@ Any change not in this table is illegal. The `Store` refuses it.
 **Admission is two steps.** SQLite cannot check in-memory facts, so the coordinator first checks `open`, the task's job or marker, and slot capacity, and reserves a slot, all in one synchronous turn with no await. It then runs the `Store` transaction. If the transaction refuses or throws, the coordinator releases the reservation in the same turn. Two admissions therefore cannot both see the same free slot.
 
 Every legal change increases the task's state version by one. Recording a first reason on a `running` row is also a durable change and increases it, so a poll can show "Stopping".
+
+### Launch: ending an attempt that has no handle
+
+A `pending` attempt has no `settled` promise, so the slot rules need a separate release path for it. Between admission and launch, F may prepare resources such as the task clone and the prompt. The in-memory job tracks that preparation as its own promise.
+
+| Case | What F does | When the slot is freed |
+|---|---|---|
+| Stop or context change before the D start call | Record the first reason. Await the preparation promise and remove anything it created. Then write the terminal state (`cancelled` or `stale`). | After that terminal write succeeds |
+| The D start call throws | Write `failed` with the launch error. D4's adapters throw only after their setup cleanup has succeeded. If cleanup is still unfinished, they return a handle instead, which settles when cleanup ends. So nothing is left running. | After that terminal write succeeds |
+| The D start call returns a handle | Write `pending → running`. From here the running-state rules apply, even if the handle comes from failed setup that is still cleaning up. | After `settled` resolves and the terminal write succeeds |
+| The handle arrives but the `pending → running` write fails | Keep the job with its handle, call `handle.cancel('capture-failure')`, and await `settled`. Then keep an unresolved marker for the task, because the row is still `pending`. | Only at startup recovery |
+
+In every case, a failed terminal write leaves an unresolved marker (see "Slots and concurrency", rule 5).
+
+**Rule for D.** D's start call must keep this shape: it either throws with nothing left running, or it returns a handle that settles only after everything it started has stopped. An adapter that needs an asynchronous start must still follow this rule. Changing it is a change to D's contract.
 
 ### Rules for the running state
 
@@ -134,7 +149,7 @@ E3 suggestions (`requests` table) write `cancelled` to disk when the stop is req
 
 ## Slots and concurrency
 
-1. A slot is taken at admission and freed only in the `finally` step that runs after `settled` resolves. Cancel does not free a slot. Lease expiry and clock changes do not free a slot.
+1. A slot is taken at admission. For an attempt that got a handle, it is freed only in the `finally` step that runs after `settled` resolves. For an attempt that ended without a handle, it is freed by the "Launch" table above. In both cases the terminal write must have succeeded first. Cancel does not free a slot. Lease expiry and clock changes do not free a slot.
 2. At most one non-terminal attempt exists per task.
 3. codeboost 1.0 runs one task at a time. Writable attempts therefore share one global slot.
 4. Existing limits stay: two question slots (`runner/questions.ts`); one suggestion request per plan identity (E3).
@@ -290,6 +305,7 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Two admissions race for one slot (review round 2) | Two admissions in the same tick for different tasks with one free slot → exactly one reserves and saves `pending`; a refused `Store` transaction releases its reservation |
 | Second process starts (review round 2) | Runner A holds the lock → process B exits before opening the `Store`; no migration or history write occurs |
 | Two plans emit the same source ID (review round 2) | Two tasks in different plans both record `task-closed` with source `task-1` at revision 1 → both events are saved |
+| Stop before launch, and launch error (review round 3) | (a) Stop while the clone is being prepared → preparation settles and is removed → row `cancelled` → slot freed → next task admitted. (b) D start throws → row `failed` with the launch error → slot freed. (c) The `pending → running` write fails → slot and marker remain until restart |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
