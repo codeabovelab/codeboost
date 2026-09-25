@@ -49,7 +49,7 @@ test('shows merge blockers and submits one exact-head merge',async({page})=>{
  const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);let mergeCalls:string[]=[];let release!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;});
  const gateway:MergeGateway={
   inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},
-  merge:async head=>{mergeCalls.push(head);await held;app.service.load=()=>{throw new Error('post-command reload failed');};return {url:'https://github.com/example/repo/pull/21'};},
+  merge:async head=>{mergeCalls.push(head);await held;app.service.load=()=>{throw new Error('post-command reload failed');};app.service.store.getMergeAttempt=()=>{throw new Error('post-command queue read failed');};return {url:'https://github.com/example/repo/pull/21'};},
  };
  app=await startServer(config,0,undefined,gateway);await page.goto(app.url);
  await expect(page.locator('#merge')).toBeDisabled();await page.getByRole('button',{name:'Review blockers'}).click();await expect(page.getByRole('heading',{name:'Merge blockers'})).toBeVisible();await expect(page.getByText(/is unreviewed/).first()).toBeVisible();await page.screenshot({path:'test-results/merge-blockers.png',fullPage:true});await page.getByRole('button',{name:'Close',exact:true}).click();
@@ -449,6 +449,13 @@ test('drains an admitted merge request before closing its coordinator',async()=>
  const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'merge',token:view.token});let status=0;
  const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.resume();res.on('end',resolve);});req.on('error',reject);req.end(body);});
  await commandStarted;const closing=app.close();await new Promise(resolve=>setTimeout(resolve,25));expect(commandSignal?.aborted).toBe(false);release();await Promise.all([closing,completed]);expect(status).toBe(200);app=await startServer(config,0);
+});
+test('bounds shutdown draining before aborting active queue polling',async()=>{
+ const config={...app.service.config,demo:false};await app.close();let appRef:typeof app,started!:(value?:void)=>void,settled=false;
+ const pollingStarted=new Promise<void>(resolve=>{started=resolve;});
+ const gateway:MergeGateway&MergeQueueGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:true,requiredChecks:[],alreadyFixed:'clear'};},queueWatermark:async()=>null,merge:async()=>({url:'https://github.com/example/repo/pull/24'}),inspectQueue:async(_head,options)=>new Promise<never>((_resolve,reject)=>{started();options?.signal?.addEventListener('abort',()=>{settled=true;reject(options.signal?.reason);},{once:true});})};
+ app=appRef=await startServer(config,0,undefined,gateway,50);const view=app.service.load(),attempt=app.service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);app.service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.com/example/repo/pull/24');
+ const response=fetch(new URL('/api/merge',app.url),{headers:{'x-codeboost-token':app.token}});await pollingStarted;await app.close();expect(settled).toBe(true);expect((await response).status).toBe(409);app=await startServer(config,0);
 });
 test('blocks a partially received merge request when shutdown starts',async()=>{
  const config={...app.service.config,demo:false};await app.close();let mergeCalls=0;let appRef:typeof app;

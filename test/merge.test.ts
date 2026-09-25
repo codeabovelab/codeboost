@@ -26,8 +26,9 @@ function gateway(states: RemoteMergeState[]): MergeGateway & { heads: string[] }
 function queueHarness(observations: Array<MergeQueueObservation | Error>) {
   const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
   const store = new Store(':memory:');
-  store.createPlan(JSON.stringify({ schema_version: 1, revision: 1, issue: 24, summary: 'Queue', questions: [], items: [{ id: 'P1', title: 'Queue', intent: 'Queue safely', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] }), 'json',
-    { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: (path: string) => path, allowedCommands: [] }, sha('a'), sha('b'));
+  const plan = { schema_version: 1 as const, revision: 1, issue: 24, summary: 'Queue', questions: [], items: [{ id: 'P1', title: 'Queue', intent: 'Queue safely', files: [{ path: 'a', kind: 'edit' as const, renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check' as const, text: 'Works' }], depends_on: [] }] };
+  const context = { identity, issue: 24, baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (path: string) => path, allowedCommands: [] };
+  store.createPlan(JSON.stringify(plan), 'json', context, sha('a'), sha('b'));
   let view = { ...readyView(), expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } } as ReviewView;
   const service = { store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService;
   const merges: string[] = [];
@@ -37,7 +38,10 @@ function queueHarness(observations: Array<MergeQueueObservation | Error>) {
     merge: vi.fn(async head => { merges.push(head); return { url: 'https://github.example/pr/1' }; }),
     inspectQueue: vi.fn(async () => { const next = observations.shift(); if (next instanceof Error) throw next; if (!next) throw new Error('No queue observation.'); return next; }),
   };
-  return { store, identity, service, client, merges, coordinator: new MergeCoordinator(service, client), view: () => view, replaceHead(head: string) {
+  return { store, identity, service, client, merges, coordinator: new MergeCoordinator(service, client), view: () => view, amendPlan() {
+    const amended = store.importRevision(JSON.stringify({ ...plan, summary: 'Amended queue plan' }), 'json', context, 1);
+    view = { ...view, plan: amended, expected: { revision: amended.revision, snapshotId: view.expected.snapshotId, reviewVersion: store.reviewVersion(identity) }, token: 'review-amended-plan' } as ReviewView;
+  }, replaceHead(head: string) {
     const expected = view.expected;
     const snapshot = store.recordHistory(identity, expected, sha('a'), head, []);
     view = { ...view, snapshot, expected: { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, token: `review-${head}` } as ReviewView;
@@ -208,6 +212,18 @@ it('requires current-snapshot approvals after an ordinary queue removal and forc
     h.replaceHead(sha('c'));
     expect((await h.coordinator.status(h.view())).action).toBeNull();
     h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'replacement-review' }], []);
+    expect((await h.coordinator.status(h.view())).action).toBe('merge');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('requires current-revision approvals after a same-snapshot plan amendment', async () => {
+  const h = queueHarness([{ state: 'removed', reviewedHead: sha('b'), removedAt: '2026-09-24T08:05:00Z', reason: 'Checks failed.' }]);
+  try {
+    await h.coordinator.merge(h.view().token);
+    await h.coordinator.pollQueue();
+    h.amendPlan();
+    expect((await h.coordinator.status(h.view())).action).toBeNull();
+    h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'amended-plan-review' }], []);
     expect((await h.coordinator.status(h.view())).action).toBe('merge');
   } finally { await h.coordinator.close(); h.store.close(); }
 });

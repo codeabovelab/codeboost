@@ -7,7 +7,8 @@ import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 const publicRoot = new URL('./public/', import.meta.url);
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway) {
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500) {
+  if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > 14_500) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null;
   try {
@@ -53,9 +54,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
           const merged=await merges.merge(input.token);
-          const mergeQueue=merges.queueSnapshot();
-          try { json(200,{...loadReview(),merge:{...merged.status,queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
-          catch { json(200,{mergeResult:merged.result,mergeQueue,mergeRefreshRequired:true}); }
+          try { const mergeQueue=merges.queueSnapshot();json(200,{...loadReview(),merge:{...merged.status,queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
+          catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
         }
         const view=service.act(input);
@@ -84,8 +84,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   return { server, service, token, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     stopping = true;
     const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
-    await closing;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    await Promise.race([closing, new Promise<void>(resolve => { timer=setTimeout(resolve,shutdownDrainMs); })]);
+    if(timer)clearTimeout(timer);
     await merges?.close();
+    await closing;
     await questions.close();
     service.close();
   } };
