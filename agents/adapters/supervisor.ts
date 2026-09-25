@@ -53,27 +53,35 @@ const diagnosticFor = (reason: StopReason, detail?: string) => Buffer.from(
 const retainCleanupOwnership = (profile: ContainerProfile, detail: string): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false;
+  let timer: ReturnType<typeof setTimeout> | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
+  const schedule = () => {
+    if (timer) return;
+    timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
+    timer.unref();
+  };
   const retry = () => {
     if (cleaning) return;
     cleaning = true;
     try {
       disposeValidatedContainer(profile);
+      if (timer) clearTimeout(timer);
+      timer = undefined;
       active.delete(invocation.attemptId);
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
         exitCode: null, signal: null, stopReason: 'capture-failure', stdout: '',
         stderr: diagnosticFor('capture-failure', detail).toString('utf8') }));
     } catch {
-      const timer = setTimeout(() => { cleaning = false; retry(); }, 1_000);
-      timer.unref();
+      cleaning = false;
+      schedule();
       return;
     }
     cleaning = false;
   };
   const handle: InvocationHandle = Object.freeze({ attemptId: invocation.attemptId, settled,
-    cancel: retry });
+    cancel: () => { if (timer) clearTimeout(timer); timer = undefined; retry(); } });
   active.set(invocation.attemptId, handle);
-  const timer = setTimeout(retry, 1_000); timer.unref();
+  schedule();
   return handle;
 };
 const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason, limits: CaptureLimits,
@@ -244,8 +252,17 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         const budget = deadline - Date.now();
         if (budget < 1) throw new CaptureDeadlineError('Invocation deadline expired before output capture.');
         const raw = Buffer.concat(stdoutChunks, stdoutBytes);
-        const decoded = await options.decode!(profile, raw,
-          Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)), budget);
+        const operation = Promise.resolve(options.decode!(profile, raw,
+          Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)), budget));
+        let decodeTimer: ReturnType<typeof setTimeout> | undefined;
+        const timeout = new Promise<never>((_resolve, reject) => {
+          decodeTimer = setTimeout(() => reject(
+            new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.')), budget);
+          decodeTimer.unref();
+        });
+        let decoded: DecodedOutput;
+        try { decoded = await Promise.race([operation, timeout]); }
+        finally { if (decodeTimer) clearTimeout(decodeTimer); }
         if (stopReason) return;
         const additional = decoded.additionalBytes ?? 0;
         const textBytes = Buffer.byteLength(decoded.text);
@@ -315,11 +332,12 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   later(() => stop('timeout'), Math.max(1, deadline - Date.now()));
 
   let resolveSettled!: (result: InvocationResult) => void;
+  let wakeCleanup: (() => void) | undefined;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
   const handle: InvocationHandle = Object.freeze({
     attemptId: invocation.attemptId,
     settled,
-    cancel: (reason: StopReason) => stop(reason),
+    cancel: (reason: StopReason) => { stop(reason); wakeCleanup?.(); },
   });
   active.set(invocation.attemptId, handle);
 
@@ -343,11 +361,21 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       if (decodedOutput.providerFailed) exitCode = exitCode === 0 ? 1 : exitCode;
     }
     await Promise.all([...controls]);
-    try {
-      disposeValidatedContainer(profile);
-    } catch {
-      stopReason ??= 'capture-failure';
-      return; // Ownership remains active because termination/cleanup was not confirmed.
+    while (true) {
+      try {
+        disposeValidatedContainer(profile);
+        wakeCleanup = undefined;
+        break;
+      } catch (error) {
+        stopReason ??= 'capture-failure';
+        failureDetail ??= error instanceof Error ? error.message : String(error);
+        await new Promise<void>(resolve => {
+          let finished = false;
+          const wake = () => { if (finished) return; finished = true; clearTimeout(timer); resolve(); };
+          const timer = setTimeout(wake, 1_000); timer.unref();
+          wakeCleanup = wake;
+        });
+      }
     }
     if (stopReason) finalStderr = withDiagnostic(finalStderr, finalStdout.length, stopReason, limits, failureDetail);
     const result = Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,

@@ -145,6 +145,17 @@ describe('container invocation supervisor', () => {
     expect(result.stdout).not.toContain('must-not-publish');
   }, 60_000);
 
+  it('keeps post-close decoding inside the invocation deadline', async () => {
+    const started = Date.now();
+    const result = await startProfileInvocation(profile(fixture(), 'finite-output', 'decode-timeout', 30_000), {
+      timeoutMs: 3_000,
+      decode: () => new Promise(() => {}),
+    }).settled;
+    expect(result.stopReason).toBe('timeout');
+    expect(Date.now() - started).toBeLessThan(10_000);
+    expect(isInvocationActive('decode-timeout')).toBe(false);
+  }, 30_000);
+
   it('validates and decodes provider output even when the process exits nonzero', async () => {
     const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
       decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),
