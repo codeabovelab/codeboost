@@ -1,7 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { parseClaudeOutput, startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { CODEX_OUTPUT_FILE, startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
+import { createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { createCodexCommand, createPhasePolicy } from '../agents/policy.ts';
 
@@ -67,5 +68,16 @@ describe('production agent adapters', () => {
     expect(result.stopReason).toBe('capture-failure');
     expect(result.stderr).toContain('setup cleanup remains unsettled');
     expect(isInvocationActive(invocation.attemptId)).toBe(false);
+  });
+
+  it('does not extend an invocation budget when the wall clock moves backward', () => {
+    const wall = Date.now();
+    const invocation = capturedInvocation('monotonic-budget', wall + 5_000);
+    const clock = vi.spyOn(Date, 'now').mockReturnValueOnce(wall).mockReturnValue(wall - 60_000);
+    try {
+      const remaining = createInvocationBudget(invocation, 1_000);
+      expect(remaining()).toBeGreaterThan(0);
+      expect(remaining()).toBeLessThanOrEqual(1_000);
+    } finally { clock.mockRestore(); }
   });
 });

@@ -5,7 +5,7 @@ import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupE
 import { createCodexCommand, createPhasePolicy } from '../policy.ts';
 import { readBoundedContainerFile, retainNetworkCleanup, retainSetupCleanup,
   startProfileInvocation } from './supervisor.ts';
-import type { AgentAdapterOptions, AgentAdapterRequest } from './types.ts';
+import { createInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
 
@@ -20,12 +20,7 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   authFile: string, options: AgentAdapterOptions = {}): InvocationHandle {
   if (!authFile || authFile.includes('\0')) throw new Error('Codex auth path is malformed.');
   const policy = createPhasePolicy(request.invocation);
-  const remaining = () => {
-    const value = request.invocation.deadline - Date.now();
-    if (!Number.isSafeInteger(value) || value < 1)
-      throw new Error('Invocation deadline expired during adapter setup.');
-    return Math.min(60_000, value);
-  };
+  const remaining = createInvocationBudget(request.invocation, 60_000);
   let network: VendorNetwork;
   try { network = createVendorNetwork(request.invocation, request.imageId, remaining()); }
   catch (error) {

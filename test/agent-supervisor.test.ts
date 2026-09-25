@@ -181,6 +181,22 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('decode-ignores-abort')).toBe(false);
   }, 30_000);
 
+  it('settles cancellation promptly when an injected decoder ignores abort', async () => {
+    let begin!: () => void;
+    const started = new Promise<void>(resolve => { begin = resolve; });
+    const handle = startProfileInvocation(profile(fixture(), 'finite-output', 'cancel-ignored-decode', 30_000), {
+      timeoutMs: 30_000,
+      decode: () => { begin(); return new Promise(() => {}); },
+    });
+    await started;
+    const cancelledAt = performance.now();
+    handle.cancel('cancelled');
+    const result = await handle.settled;
+    expect(result.stopReason).toBe('cancelled');
+    expect(performance.now() - cancelledAt).toBeLessThan(5_000);
+    expect(isInvocationActive('cancel-ignored-decode')).toBe(false);
+  }, 15_000);
+
   it('validates and decodes provider output even when the process exits nonzero', async () => {
     const result = await startProfileInvocation(profile(fixture(), 'nonzero-output', 'nonzero-decode'), {
       decode: (_current, raw) => ({ text: `decoded:${raw.toString('utf8')}` }),

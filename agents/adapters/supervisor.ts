@@ -218,12 +218,13 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   } catch (error) {
     return rejectWithCleanup(error);
   }
-  const now = Date.now(), deadline = Math.min(invocation.deadline, now + configuredTimeout);
-  if (!Number.isSafeInteger(deadline) || deadline <= now) {
+  const wallRemaining = invocation.deadline - Date.now();
+  if (!Number.isSafeInteger(wallRemaining) || wallRemaining < 1) {
     return rejectWithCleanup(new Error('Invocation deadline has already expired.'));
   }
+  const duration = Math.min(wallRemaining, configuredTimeout), deadline = performance.now() + duration;
   const remaining = () => {
-    const value = deadline - Date.now();
+    const value = Math.ceil(deadline - performance.now());
     if (value < 1) throw new Error('Invocation deadline has already expired.');
     return value;
   };
@@ -332,10 +333,15 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     if (!options.decode || decodedOutput || stopReason) return Promise.resolve();
     decodePromise = (async () => {
       try {
-        const budget = deadline - Date.now();
+        const budget = Math.ceil(deadline - performance.now());
         if (budget < 1) throw new CaptureDeadlineError('Invocation deadline expired before output capture.');
         const controller = new AbortController();
         decodeAbort = controller;
+        const aborted = new Promise<never>((_resolve, reject) => {
+          controller.signal.addEventListener('abort', () => reject(stopReason === 'timeout'
+            ? new CaptureDeadlineError('Adapter output capture exceeded the invocation deadline.')
+            : new Error('Adapter output capture was cancelled.')), { once: true });
+        });
         const raw = Buffer.concat(stdoutChunks, stdoutBytes);
         const operation = Promise.resolve(options.decode!(profile, raw,
           Math.max(1, Math.min(limits.stdoutBytes - stdoutBytes, limits.combinedBytes - combinedBytes)),
@@ -349,7 +355,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
           decodeTimer.unref();
         });
         let decoded: DecodedOutput;
-        try { decoded = await Promise.race([operation, timeout]); }
+        try { decoded = await Promise.race([operation, timeout, aborted]); }
         catch (error) {
           controller.abort();
           let graceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -449,7 +455,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   child.stdout?.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
   child.stderr?.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
   child.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
-  later(() => stop('timeout'), Math.max(1, deadline - Date.now()));
+  later(() => stop('timeout'), Math.max(1, Math.ceil(deadline - performance.now())));
 
   let resolveSettled!: (result: InvocationResult) => void;
   let wakeCleanup: (() => void) | undefined;
