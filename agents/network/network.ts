@@ -33,15 +33,22 @@ const docker = (args: readonly string[], timeout: number) => execFileSync('docke
 }).trim();
 const absent = (result: ReturnType<typeof spawnSync>) => result.status !== 0 && !result.error
   && /(?:No such (?:object|container|network)|network .* not found)/i.test(`${result.stdout ?? ''}\n${result.stderr ?? ''}`);
+/** How long a network or proxy whose create client was killed may still materialize in the daemon. */
+const CREATE_SETTLE_MS = 10_000;
+const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const remove = (args: readonly string[], inspect: readonly string[], remaining: () => number, kind: string,
-  allocationId: string) => {
-  const before = spawnSync('docker', [...inspect], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-    env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
-  if (before.status !== 0) {
-    if (absent(before)) return;
-    throw new Error(`Failed to establish ownership of ${kind}.`);
+  allocationId: string, settleBy = 0) => {
+  let before: ReturnType<typeof spawnSync>;
+  for (;;) {
+    before = spawnSync('docker', [...inspect], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
+      env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    if (before.status === 0) break;
+    if (!absent(before)) throw new Error(`Failed to establish ownership of ${kind}.`);
+    // A killed create may still land; only absence after the settle window counts.
+    if (performance.now() >= settleBy) return;
+    sleep(250);
   }
-  const inspected = JSON.parse(before.stdout || '[]')[0] as
+  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
   if (labels?.['io.codeboost.egress'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
@@ -122,6 +129,10 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   assertBuiltAgentImage(imageId);
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
+  // No allocation may outlive the invocation it serves.
+  const invocationLeft = Math.floor(invocation.deadline - Date.now());
+  if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
+  timeoutMs = Math.min(timeoutMs, invocationLeft);
   const overall = deadline(timeoutMs), cleanupReserve = Math.min(10_000, Math.floor(timeoutMs / 3));
   const remaining = deadline(Math.max(1, timeoutMs - cleanupReserve)), allocationId = randomUUID();
   const name = `codeboost-egress-${vendor}-${randomUUID()}`;
@@ -129,16 +140,26 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   const subnetSeed = randomUUID().replaceAll('-', '');
   const subnet = `10.254.${parseInt(subnetSeed.slice(0, 2), 16)}.${parseInt(subnetSeed.slice(2, 4), 16) & 0xf8}/29`;
   let networkPlanned = false, proxyPlanned = false;
+  const unsettled = new Set<string>();
+  // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.
+  const create = (object: string, args: readonly string[]) => {
+    const timeout = remaining();
+    try { return docker(args, timeout); }
+    catch (error) {
+      if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
+      throw error;
+    }
+  };
   try {
     networkPlanned = true;
-    docker(['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
-      '--label', `io.codeboost.egress=${allocationId}`, name], remaining());
+    create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
+      '--label', `io.codeboost.egress=${allocationId}`, name]);
     proxyPlanned = true;
-    docker(['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
+    create(proxyContainer, ['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
-      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs'], remaining());
+      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']);
     docker(['network', 'connect', 'bridge', proxyContainer], remaining());
     docker(['exec', proxyContainer, 'node', '-e', [
       "const net=require('node:net');let attempts=0;",
@@ -158,10 +179,18 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     return network;
   } catch (error) {
     const failures: unknown[] = [];
+    // Killed creates get a settle window, but only inside the cleanup reserve of the caller's budget.
+    let reserveLeft = 0;
+    try { reserveLeft = overall(); } catch { /* the overall budget is spent */ }
+    const settleBy = (object: string) => unsettled.has(object)
+      ? performance.now() + Math.min(CREATE_SETTLE_MS, reserveLeft) : 0;
+    const cleanupBudget = overall;
     if (proxyPlanned) try { remove(['rm', '--force', proxyContainer], ['container', 'inspect', proxyContainer],
-      overall, 'vendor proxy', allocationId); } catch (cleanupError) { failures.push(cleanupError); }
+      cleanupBudget, 'vendor proxy', allocationId, settleBy(proxyContainer)); }
+    catch (cleanupError) { failures.push(cleanupError); }
     if (networkPlanned) try { remove(['network', 'rm', name], ['network', 'inspect', name],
-      overall, 'vendor network', allocationId); } catch (cleanupError) { failures.push(cleanupError); }
+      cleanupBudget, 'vendor network', allocationId, settleBy(name)); }
+    catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError([error, ...failures], 'Vendor network creation and cleanup failed.');
     throw error;
   }

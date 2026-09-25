@@ -167,7 +167,9 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     throw new Error('Container profile requires the immutable built image ID.');
   assertBuiltAgentImage(options.imageId);
   assertTaskFilesystems(filesystems, invocation.clone);
-  assertVendorNetwork(options.network, invocation);
+  const invocationLeft = Math.floor(invocation.deadline - Date.now());
+  if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
+  assertVendorNetwork(options.network, invocation, undefined, Math.min(30_000, invocationLeft));
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
   // Own the network from here on, so any later failure removes it rather than leaking it.
   claimedNetworks.add(options.network);

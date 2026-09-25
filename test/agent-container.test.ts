@@ -354,9 +354,19 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('refuses to launch once the captured invocation deadline has passed', () => {
-    const data = fixture(), late = profile(data, 'planning', 'noop', { deadlineMs: 1_500 });
-    execFileSync('sleep', ['2']);
+    const data = fixture(), captured = Date.now(), late = profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
+    execFileSync('sleep', [String(Math.max(0, captured + 6_500 - Date.now()) / 1000)]);
     expect(() => runContainer(late, 60_000)).toThrow('deadline has passed');
+  }, 60_000);
+
+  it('refuses to build a profile once the invocation deadline has passed', () => {
+    const data = fixture(), trusted = governed(invocation(data.clone, 'planning', 'codex', 5_000));
+    const wait = Math.max(0, trusted.invocation.deadline - Date.now() + 500);
+    execFileSync('sleep', [String(wait / 1000)]);
+    const started = performance.now();
+    expect(() => createContainerProfile({ ...trusted, filesystems: data.filesystems, inputDirectory: data.input,
+      codexAuthFile: data.fakeAuth, imageId })).toThrow('deadline has passed');
+    expect(performance.now() - started).toBeLessThan(2_000);
   }, 60_000);
 
   it('refuses an invocation copied from a captured request with a different phase', () => {
