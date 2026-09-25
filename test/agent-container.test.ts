@@ -186,6 +186,8 @@ describe('real Docker agent isolation', () => {
       symlinkSync('docs/guide.md', join(source, 'readme-link'));
       symlinkSync('../docs', join(source, 'docs', 'self'));
       symlinkSync('.', join(source, 'loop'));
+      symlinkSync('cycle-b', join(source, 'cycle-a'));
+      symlinkSync('cycle-a', join(source, 'cycle-b'));
       symlinkSync('later.txt', join(source, 'future'));
     } });
     const started = performance.now();

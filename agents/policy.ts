@@ -165,7 +165,9 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
     'hostile-repo': `${deny}set -eu; test "$(git status --porcelain)" = ""; `
       + 'find /work -path /work/.git -prune -o -type l -exec sh -c \'for link; do target=$(readlink "$link"); '
       + 'case "$target" in /*) echo "isolation breach: absolute link $link" >&2; exit 1;; esac; '
-      + 'case "$(realpath -m "$link")" in /work|/work/*) ;; '
+      // Resolve the target from the link's directory; a cycle never resolves and cannot reach anything.
+      + 'resolved=$(realpath -m "$(dirname "$link")/$target" 2>/dev/null) || continue; '
+      + 'case "$resolved" in /work|/work/*) ;; '
       + '*) echo "isolation breach: link leaves the checkout $link" >&2; exit 1;; esac; done\' sh {} +; '
       + 'deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; printf hostile-repo-contained',
   };

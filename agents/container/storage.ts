@@ -134,7 +134,9 @@ const assertContainedLinks = (staging: string, remaining: () => number) => {
       // the JavaScript realpathSync cancels `..` textually first and would miss an escape through a chain of links.
       let real: string | undefined;
       try { real = realpathSync.native(path); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; }
+      // A missing target or a cycle of links never resolves, so it cannot reach anything; direct escapes were already
+      // refused by the lexical check above.
+      catch (error) { if (!['ENOENT', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error; }
       if (real !== undefined && !within(staging, real)) throw new Error(`Repository link ${name} leaves the checkout.`);
       continue;
     }
