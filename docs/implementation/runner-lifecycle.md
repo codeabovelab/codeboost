@@ -209,7 +209,17 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 **First prerequisite before F1 merges: settlement ends.** Settlement must be proven to end. D5, or a D follow-up, must either bound cleanup retries and settle with a terminal cleanup-failure result, or show in the real-Docker suite that every cleanup path ends, including when the Docker daemon is unreachable. Until one of these lands, decision 4 stays conditional, and the F1 implementation PR must not merge. F1 does not add its own timer to work around this.
 
-**Second prerequisite before F1 merges: a D recovery API.** D must add an operation to its contract, for example `recoverLeftovers(): Promise<RecoveryReport>`. It finds every container, network and task-storage volume that carries codeboost's ownership labels (D already sets `io.codeboost.invocation` and `io.codeboost.task-storage`), removes them, and resolves only when all are gone. If a resource cannot be removed, it rejects with a bounded diagnostic, and F then refuses to open admission. This belongs to D (D5 or a D follow-up), not F.
+**Second prerequisite before F1 merges: a D recovery API scoped to one database.** Decision 1 allows one runner per database, so several databases can have live runners on the same machine at once. Recovery must therefore never touch another database's resources. D's current labels (`io.codeboost.invocation`, `io.codeboost.task-storage`, `io.codeboost.allocation`, `io.codeboost.egress`) do not say which database owns a resource, so they are not enough.
+
+| Part | Owner | Rule |
+|---|---|---|
+| Runner owner token | F | A random ID created once per database and stored in it (`app_settings`). It stays the same across restarts of that database, and it differs between databases. |
+| Token in every request | D contract | `InvocationInput` gains a `runnerOwner` field. Every resource D creates carries the label `io.codeboost.runner=<token>`: containers, networks, egress proxies, task-storage volumes and allocations. |
+| Scoped recovery | D | `recoverLeftovers(runnerOwner): Promise<RecoveryReport>` removes only resources whose `io.codeboost.runner` label equals the token. It resolves only when all of them are gone, and rejects with a bounded diagnostic if one cannot be removed. F then refuses to open admission. |
+| Unowned resources | D | Resources with codeboost labels but no `io.codeboost.runner` label (from builds before this change) are listed in the report and never removed automatically. |
+| When it runs | F | Only while holding this database's single-runner lock (startup recovery step 1 comes first). |
+
+This belongs to D (D5 or a D follow-up), not F. It changes `agents/contract.ts`, so it goes through D's contract tests.
 
 **A second Ctrl+C** does not skip steps 4 to 8. The CLI prints "Still stopping agents…" and keeps waiting.
 
@@ -218,7 +228,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 This runs before the coordinator opens.
 
 1. Take the single-runner lock for this database (decision 1), **before opening the `Store`**, because opening runs migrations. If another live process holds it, exit with a message that names that process ID. Do not serve the review screen: it is not read-only, because `ReviewService.load()` records history when HEAD moves (`runner/review.ts`) and `act()` writes review actions. A true read-only mode would need `Store`-level write refusal and is out of scope for F1.
-2. Call D's startup recovery and await it. **D does not provide this yet.** `agents/contract.ts` exposes only per-invocation handles, and the supervisor's cleanup ownership lives in memory, so it is lost when the process crashes. See the second prerequisite under "Shutdown".
+2. Call D's startup recovery with this database's runner owner token, and await it. **D does not provide this yet.** `agents/contract.ts` exposes only per-invocation handles, and the supervisor's cleanup ownership lives in memory, so it is lost when the process crashes. See the second prerequisite under "Shutdown".
 3. **Unclean leftovers.** These are `pending` or `running` rows left by a crash, or by a shutdown whose terminal write failed. Finalize each one using the first-reason table in "Rules for the running state", rule 2:
    - first reason `cancelled` → `cancelled`; `shutdown` → `cancelled` "Stopped by shutdown"; `stale` → `stale` with its cause;
    - no first reason → `failed` "Interrupted: codeboost stopped while this was running".
@@ -338,6 +348,7 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Preparation fails (review round 7) | Clone fails before the D start call → partial clone removed → row `failed` with the clone error → slot freed |
 | Retry a closed or gated task (review round 7) | Task `rejected` (or `needs human` after the time limit) with a `cancelled` last attempt → retry refused; restart does not requeue it |
 | Assignment changes alone (review round 7) | Work reassigned without a plan-revision or snapshot change → generation increases in the same transaction → the old attempt's result is refused and the row becomes `stale` |
+| Two databases, one crashes (review round 8) | Runners for databases A and B are live → A crashes and restarts → recovery removes only resources labelled with A's token; B's container, network, egress proxy and volume keep running |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
