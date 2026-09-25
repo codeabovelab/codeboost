@@ -50,10 +50,11 @@ export class ReviewService {
     });
     const states = approvalStates(plan, segments, saved.approvals, identity);
     const mergeAttempt = this.store.getMergeAttempt(identity);
-    const replacementReview = !!mergeAttempt && mergeAttempt.snapshotId !== snapshot.id;
+    const replacementReview = !!mergeAttempt && (mergeAttempt.snapshotId !== snapshot.id || mergeAttempt.revision !== plan.revision || mergeAttempt.requiresFreshReview);
     if (replacementReview) for (const item of plan.items) {
       const approval = saved.approvals.find(value => value.item === item.id);
-      if (approval && (approval.revision !== plan.revision || approval.snapshotId !== snapshot.id)) states[item.id] = 'stale';
+      if (approval && (approval.revision !== plan.revision || approval.snapshotId !== snapshot.id ||
+          (mergeAttempt.requiresFreshReview && (approval.reviewVersion === undefined || approval.reviewVersion < mergeAttempt.reviewVersion)))) states[item.id] = 'stale';
     }
     for (const item of plan.items) {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
@@ -72,6 +73,8 @@ export class ReviewService {
       if (states[item.id] === 'stale') {
         const approval = saved.approvals.find(value => value.item === item.id);
         if (replacementReview && approval?.snapshotId !== snapshot.id) reasons.push('Pull request snapshot changed after the queue attempt');
+        if (replacementReview && approval?.revision !== plan.revision) reasons.push('Plan revision changed after the queue attempt');
+        if (mergeAttempt?.requiresFreshReview && approval && (approval.reviewVersion === undefined || approval.reviewVersion < mergeAttempt.reviewVersion)) reasons.push('GitHub requires a fresh review after the queue attempt');
         if (before && !isDeepStrictEqual(before.item.acceptance, item.acceptance)) reasons.push('Acceptance checks changed');
         if (before && owned.some(segment => before.segments.some((old: { path: string; content: string; context: string }) => old.path === segment.path && old.content === segment.content && old.context !== segment.context))) reasons.push('Moved to another function');
         for (const dep of item.depends_on) if (states[dep] === 'stale') reasons.push(`Depends on ${dep}, which changed`);

@@ -34,8 +34,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (path.startsWith('/api/')) {
         const supplied = req.headers['x-codeboost-token'];
         if (typeof supplied !== 'string' || !/^[a-f0-9]{64}$/.test(supplied) || !timingSafeEqual(Buffer.from(supplied), Buffer.from(token))) { json(403, { error: 'Open the private local URL printed by the CLI.' }); return; }
-        if (stopping && req.method === 'POST') { json(503, { error: 'The review server is shutting down.' }); return; }
-        if (stopping && path === '/api/merge') { json(503, { error: 'The review server is shutting down.' }); return; }
+        if (stopping) { json(503, { error: 'The review server is shutting down.' }); return; }
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
         if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
@@ -45,7 +44,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); }
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
-        if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
+        if (stopping) { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');

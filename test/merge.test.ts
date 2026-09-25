@@ -241,6 +241,17 @@ it('requires a fresh review after the queued head is replaced', async () => {
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('accepts post-attempt approvals when GitHub reports a transient head replacement', async () => {
+  const h = queueHarness([new Error('The pull request head changed after review.')]);
+  try {
+    await h.coordinator.merge(h.view().token);
+    await h.coordinator.pollQueue();
+    expect((await h.coordinator.status(h.view())).action).toBeNull();
+    h.store.saveReview(h.identity, h.view().expected, [{ item: 'P1', fingerprint: 'post-attempt-review' }], []);
+    expect((await h.coordinator.status(h.view())).action).toBe('merge');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('accepts a fully re-reviewed replacement snapshot restored to the original head', async () => {
   const h = queueHarness([new Error('The pull request head changed after review.')]);
   try {

@@ -68,6 +68,14 @@ it('requires every item to be reviewed again after a queued head is replaced',()
  service.store.saveReview(config.identity,view.expected,remaining.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
  expect(view.items.every(item=>item.state==='approved')).toBe(true);
 },30000);
+it('marks unchanged items stale after a same-snapshot plan amendment',()=>{
+ const {service,config}=fixture();let view=service.load();
+ service.store.saveReview(config.identity,view.expected,view.items.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
+ const attempt=service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.example/pr/24');service.store.finishMergeAttempt(config.identity,attempt.id,{state:'removed',reason:'Checks failed.'});
+ const amended={...view.plan,summary:'Amended review requirements'};service.store.importRevision(JSON.stringify(amended),'json',{identity:config.identity,issue:amended.issue,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},amended.revision);
+ view=service.load();expect(view.items.every(item=>item.state==='stale'&&item.reasons.includes('Plan revision changed after the queue attempt'))).toBe(true);
+ const first=view.items[0]!;view=service.act({action:'approve',item:first.id,confirmNoChange:first.count===0,token:view.token});expect(view.items.find(item=>item.id===first.id)?.state).toBe('approved');
+});
 it('refuses no-change confirmation while the item still owns ambiguous changes',async()=>{
  const {service,config}=fixture();const {writeFileSync}=await import('node:fs');const {execFileSync}=await import('node:child_process');
  writeFileSync(join(config.repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');

@@ -60,9 +60,10 @@ export class MergeCoordinator {
   #freshReviewComplete(attempt: MergeAttempt): boolean {
     const { store, config } = this.service;
     const plan = store.getPlan(config.identity), snapshot = store.getSnapshot(config.identity);
-    if (snapshot.id === attempt.snapshotId && plan.revision === attempt.revision) return !attempt.requiresFreshReview;
+    if (snapshot.id === attempt.snapshotId && plan.revision === attempt.revision && !attempt.requiresFreshReview) return true;
     const approvals = store.getReview(config.identity).approvals;
-    return plan.items.every(item => approvals.some(approval => approval.item === item.id && approval.revision === plan.revision && approval.snapshotId === snapshot.id));
+    return store.reviewVersion(config.identity) > attempt.reviewVersion && plan.items.every(item => approvals.some(approval => approval.item === item.id &&
+      approval.revision === plan.revision && approval.snapshotId === snapshot.id && approval.reviewVersion !== undefined && approval.reviewVersion >= attempt.reviewVersion));
   }
 
   async status(view = this.service.load(), fresh = false, signal?: AbortSignal): Promise<MergeStatus> {
