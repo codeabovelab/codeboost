@@ -195,7 +195,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 3. In one `Store` transaction: confirm that the attempt ID is the task's current attempt, the state is `running`, there is no first reason, and the captured context is still current. Do not compare the task's state version here; the attempt's own transitions have increased it. Then write `completed` and the result, and increase the state version.
 4. If step 3 refuses, reread durable state and settle the row by the rules above. Keep the original diagnostic.
 
-**Irreversible actions.** Before each commit, push, PR open or merge, re-read the task's state version and the coordinator's `closing` flag **after the final await**. Stop if either changed. A check made before an await does not count. (This follows the AGENTS.md rules on guarded external actions.)
+**Irreversible actions.** Before each commit, push, PR open or merge, re-read the task's state version, the plan's `review_version` (which `saveReview` and `addReviewNote` advance) and the coordinator's `closing` flag **after the final await**. Stop if any of them changed. For a merge this means an approval or choice edit made during the final GitHub check blocks the merge. A check made before an await does not count. (This follows the AGENTS.md rules on guarded external actions.)
 
 ## Shutdown
 
@@ -203,7 +203,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 | Step | Action | Existing? |
 |---|---|---|
-| 1 | Set `stopping` on the server and `closing` on every coordinator (runner, questions, suggestions, merge), in the same synchronous turn, before any active-work list is copied. New API requests get HTTP 503. Every coordinator's start method checks `closing` synchronously and throws, so a request admitted before shutdown cannot start new work after it. | server flag: yes. Coordinator barrier: **new**. Today `close()` sets only `stopping`, and `questions.close()` runs later, so a request that was still reading its body can call `questions.start()` after shutdown began. The server also rechecks `stopping` after reading a body only for `merge`, so `service.act`, `setQuestionProvider` and future planning writers can still change the `Store`. F1 adds a `stopping` check after the body is read and before **every** mutating dispatch, returning HTTP 503, and adds regressions for each writer. |
+| 1 | Set `stopping` on the server and `closing` on every coordinator (runner, questions, suggestions, merge), in the same synchronous turn, before any active-work list is copied. New API requests get HTTP 503. Every coordinator's start method checks `closing` synchronously and throws, so a request admitted before shutdown cannot start new work after it. | server flag: yes. Coordinator barrier: **new**. Today `close()` sets only `stopping`, and `questions.close()` runs later, so a request that was still reading its body can call `questions.start()` after shutdown began. The server also rechecks `stopping` after reading a body only for `merge`, so `service.act`, `setQuestionProvider` and future planning writers can still change the `Store`. F1 adds a `stopping` check after the body is read and before **every** mutating dispatch, returning HTTP 503, and adds regressions for each writer. Two GET handlers also write: `/api/review` (`ReviewService.load()` calls `recordHistory` when HEAD moved) and `/api/merge` (queue polling records merge observations and outcomes). Each checks `stopping` synchronously right before its `Store` write. After shutdown begins, `load()` returns the view without recording history, and queue polling skips the write. The next startup polls again, so a skipped merge observation is recovered, not lost. Regressions cover both GETs. |
 | 2 | Stop accepting connections, and wait for admitted requests up to the drain limit (at most 14.5 s, below the 15 s request timeout). | yes |
 | 3 | After the drain limit, abort the signals of the remaining requests, destroy requests that are still reading a body, then await request-owned work (the merge coordinator). | yes |
 | 4 | For every `pending` and `running` attempt that has an in-memory job, record the first reason `shutdown` **only if no first reason is set yet**. A job already marked `cancelled`, `stale` or `time-limit` keeps its reason. For `running`, call `cancel('shutdown')` and await `settled`. For `pending`, await its preparation promise (and the D start call if it is in progress), remove what preparation created, and cancel any handle that start returned, then await its `settled` (the "Launch" table). F does not abandon a job after a timer (decision 4). **This is not yet guaranteed to end:** D4's supervisor escalates to a forced kill, but it retries unfinished container, network or setup cleanup every second with no limit (`agents/adapters/supervisor.ts`). If Docker is unreachable, `settled` never resolves and shutdown waits with the `Store` open. See the prerequisite below. | new |
@@ -231,7 +231,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 | Runner owner token | F | A random ID stored in the database (`app_settings`), together with the database file's device and inode numbers. It is read, or created, in startup recovery step 2, after the lock is taken and the `Store` is opened. If the stored device and inode don't match the open file (the database was copied), F creates a new token. So a copy never shares a token with its original. |
 | Token in every request | D contract | `InvocationInput` gains a `runnerOwner` field. Every resource D creates carries the label `io.codeboost.runner=<token>`: containers, networks, egress proxies, task-storage volumes and allocations. |
 | Scoped recovery | D | `recoverLeftovers(runnerOwner): Promise<RecoveryReport>` removes only resources whose `io.codeboost.runner` label equals the token. It resolves only when all of them are gone, and rejects with a bounded diagnostic if one cannot be removed. F then refuses to open admission. |
-| Unowned resources | D | Resources with codeboost labels but no `io.codeboost.runner` label (from builds before this change) are listed in the report and never removed automatically. |
+| Unowned resources | D and F | Resources with codeboost labels but no `io.codeboost.runner` label (from builds before this change) fail closed. The report lists them, F refuses to open admission, and the CLI prints the list with the instruction to stop every codeboost process and then run `--remove-unowned-agent-resources`. That flag removes them only when no other codeboost runner lock is live on the machine. It never adopts or reuses them. |
 | When it runs | F | Only while holding this database's single-runner lock (startup recovery step 1 comes first). |
 
 This belongs to D (D5 or a D follow-up), not F. It changes `agents/contract.ts`, so it goes through D's contract tests.
@@ -255,9 +255,9 @@ This runs before the coordinator opens.
 
 ## HTTP and UI contract
 
-**Status reads.** `GET /api/runner` returns only the task and attempt rows plus `stateVersion` and `retryable`. It does not rebuild Git history or the full review.
+**Status reads.** `GET /api/runner` returns only the task and attempt rows plus `stateVersion`, `retryable` and `unresolved`. `unresolved` is computed by the server from the in-memory marker: null, or `{ attemptId, reason: "result-not-saved" | "start-not-saved" }`. The UI shows "Needs restart: result could not be saved" only from this field, because the durable row alone may still look active. It does not rebuild Git history or the full review.
 
-**User actions.** Cancel, retry and "run again" requests send `attemptId` and `expectedStateVersion`. The server takes the plan identity from its trusted configuration, never from the request, and every `Store` call is scoped by that identity. A mismatch returns HTTP 409 with the current state. The UI then shows that state and keeps any draft.
+**User actions.** Cancel, retry and "run again" requests send `attemptId`, `expectedStateVersion` and an `actionId` idempotency key (see "Feedback-event contract"). A replayed `actionId` returns the saved outcome. The server takes the plan identity from its trusted configuration, never from the request, and every `Store` call is scoped by that identity. A mismatch returns HTTP 409 with the current state. The UI then shows that state and keeps any draft.
 
 **UI rules** (from AGENTS.md "Async review UI"):
 
@@ -287,7 +287,7 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 
 **What becomes an event.** Only feedback the user wrote or chose. Issue text, issue comments and agent output never become events.
 
-`actionId` identifies the one user action (or confirmed external outcome) that caused the event. For a note it is the note ID. For a choice change, finding acceptance or task close it is an ID the `Store` generates in the same transaction as that change. For a merge `task-closed` it is the merge attempt ID. A replay of the same action has the same `actionId`; a later change to the same source has a new one.
+`actionId` identifies the one user action (or confirmed external outcome) that caused the event. **For user actions it is an idempotency key the UI generates** (a UUID) when the user acts, and resends unchanged if it retries after a lost response. The `Store` saves it with the action itself (the note, choice change, finding acceptance, rejection or cancel) under a unique `(planKey, actionId)` index. A replay with a known `actionId` applies nothing and returns the saved result, so neither the action nor its event is duplicated. For a merge `task-closed` it is the merge attempt ID. A later change to the same source is a new user action with a new `actionId`.
 
 | Event kind | Source action | `sourceRef` |
 |---|---|---|
@@ -312,6 +312,18 @@ Live planning invocation waits for D5. Until then, the server returns "Planning 
 ## Proposed storage additions
 
 This is the smallest schema that holds the contract. The F1 implementation PR sets the final column names. The migration increases `user_version` from 5 to 6.
+
+**Backfill in the same migration transaction.** Every existing `plans` row gets one `tasks` row:
+
+| Column | Initial value |
+|---|---|
+| `status` | `merged` if its latest merge attempt is `merged`; otherwise `in review` (v5 data only comes from the review screen) |
+| `state_version`, `context_generation` | `0` |
+| `assignment_id` | `unassigned`, the value F uses until F2 assigns work |
+| `referenced_code_hash` | the head SHA of the plan's current snapshot, or `none` if it has no snapshot |
+| `current_attempt_id` | null (v5 has no attempt rows) |
+
+A merged v5 task also gets its `task-closed` event, keyed by the merge attempt ID. A test migrates a v5 fixture with an open and a merged plan and checks both rows.
 
 | Table | Key columns |
 |---|---|
@@ -372,6 +384,13 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Admitted write after shutdown (review round 9) | For each of `act`, `setQuestionProvider` and the planning writers: body half-sent → shutdown → body completes → HTTP 503 and no `Store` change |
 | Stale, then shutdown (review round 9) | Attempt marked `stale` → shutdown → row `stale`, not requeued |
 | Copied database (review round 9) | Copy the database file → start the copy → new token; recovery for the copy leaves the original's resources alone |
+| Review edit during the final merge check (review round 10) | Merge passes its GitHub checks → approval changed before the final re-read → merge refused |
+| Writing GET after shutdown (review round 10) | `/api/review` with a moved HEAD, and `/api/merge` with a queue result, both admitted → shutdown → neither writes to the `Store` |
+| Legacy resource present (review round 10) | An agent container without a runner label exists → startup refuses admission and lists it |
+| Lost response, then replay (review round 10) | Add a note → the transaction commits → the response is lost → resend with the same `actionId` → one note, one event, same response |
+| v5 upgrade (review round 10) | Migrate a v5 database with an open and a merged plan → two task rows with the backfill values; the merged one has one `task-closed` |
+| Path alias (review round 10) | Start through a symlinked parent directory while a runner holds the lock through the real path → the second start exits |
+| Unresolved marker is visible (review round 10) | Terminal write fails → `GET /api/runner` returns `unresolved` → the UI shows the restart message |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
@@ -380,7 +399,7 @@ The user approved the proposal for each of these four questions.
 
 | # | Question | Decision | What F1 must do |
 |---|---|---|---|
-| 1 | How is one runner per database enforced across processes? | An exclusive lock file next to the database, holding the process ID and the process start time. | Take the lock at startup and release it at the end of shutdown. Accept a leftover lock file only if no live process has that ID and start time. Do not use a SQLite lease row, because lease expiry could release a live runner. |
+| 1 | How is one runner per database enforced across processes? | An exclusive lock file next to the database, holding the process ID and the process start time. | Derive the lock path from the **canonical** database path: resolve the parent directory with `realpath`, and refuse a database path that is itself a symlink. Store the database file's device and inode numbers in the lock, and after opening the `Store` check that the open file matches them; exit on a mismatch. Two aliases of one file therefore always meet the same lock. Take the lock at startup and release it at the end of shutdown. Accept a leftover lock file only if no live process has that ID and start time. Do not use a SQLite lease row, because lease expiry could release a live runner. |
 | 2 | Does E3 keep writing `cancelled` before the provider settles? | Yes. This exception applies only to read-only phases. | Leave E3 unchanged. New F records use "terminal only after settlement" for every phase. Revisit this when G4 wires the planning endpoints. |
 | 3 | Is process shutdown a hard stop? | Yes. | Stopping the process cancels the running task with the reason "Stopped by shutdown". It does not wait for the task to finish. Restart recovery requeues the task. |
 | 4 | Does F set its own time limit on settlement at shutdown? | No. F waits for D's forced-kill escalation. | Do not abandon a job after a timer. The D5 real-Docker suite must prove that settlement always ends, including for a child process that ignores SIGTERM. D4 does not yet prove it: its cleanup retries have no limit (see the prerequisite under "Shutdown"). If D5 cannot prove it, reopen this decision before F1 merges. |
