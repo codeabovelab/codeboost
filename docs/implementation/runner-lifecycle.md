@@ -227,7 +227,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 | Holder | Owner | Rule |
 |---|---|---|
 | Partial output of a stopped writable attempt | F, using a new D export | The task filesystems are Docker volumes behind a keeper container. F allocates them with `prepareTaskFilesystems` and removes them with `removeTaskFilesystems`; D's supervisor does not remove them at settlement. But F cannot read a volume from the host. So the order is: `settled` → a **D-provided bounded export** (a new D operation, for example `exportTaskDiff(filesystems, maxBytes)`, which runs `git diff` against the last codeboost commit in a read-only container and returns at most 1 MiB) → F saves it → the terminal write stores `diagnostic_ref` → `removeTaskFilesystems` → the slot is freed. F saves the export to a runner-owned diagnostics directory, with a total byte cap and oldest-first deletion. The attempt row references it as `diagnostic_ref`. If the capture fails, the row records that it failed. The task filesystem is never reused. |
-| Interrupted rebase | F3 | F3 records `rebase in progress` durably before starting a rebase and clears it after. Startup recovery aborts every recorded rebase through the runner before it hands the task to I3. |
+| Interrupted rebase | F3 | F3 records `rebase in progress` durably before starting a rebase and clears it after. It is stored as `tasks.rebase_in_progress`: null, or JSON `{ attemptId, oldHead, onto, startedAt }`. F3 sets it by compare-and-swap from null, and clears it by compare-and-swap on the same `attemptId`. Startup recovery aborts every recorded rebase through the runner before it hands the task to I3. |
 | Workspace rebuild | I3 | I3 never rebuilds before both rows above are resolved for the task. |
 
 **Process shutdown is a hard stop.** When the process stops, the running task does not finish. Its attempt ends `cancelled` with the reason "Stopped by shutdown". Restart recovery (lane I3) puts the task back in the queue. This is different from "Stop the queue" (lane I), which lets the running task finish.
@@ -363,12 +363,17 @@ This is the smallest schema that holds the contract. The F1 implementation PR se
 | `assignment_id` | `unassigned`, the value F uses until F2 assigns work |
 | `referenced_code_hash` | the head SHA of the plan's current snapshot, or `none` if it has no snapshot |
 | `current_attempt_id` | null (v5 has no attempt rows) |
+| `requeue_pending` | false |
+| `cancel_requested` | null |
+| `rebase_in_progress` | null |
+| `budget_deadline` | null. The budget has not started; it starts on the task's first move to `running`. Every deadline check treats null as "not started", never as expired. |
+| `created_at`, `updated_at` | the migration time |
 
-A merged v5 task also gets its `task-closed` event, keyed by the merge attempt ID. A test migrates a v5 fixture with an open and a merged plan and checks both rows.
+A merged v5 task also gets its `task-closed` event, keyed by the merge attempt ID. A test migrates a v5 fixture with an open and a merged plan, checks every column of both rows, and then checks that retry, recovery and the time-limit check treat the migrated open task as not expired and not requeue-pending.
 
 | Table | Key columns |
 |---|---|
-| `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `requeue_pending` (boolean), `budget_deadline` (absolute time the task budget ends), `cancel_requested` (action ID or null), `state_version`, `context_generation`, `assignment_id`, `referenced_code_hash`, `current_attempt_id` (nullable; the composite foreign key `(plan_key, current_attempt_id)` references `attempts(plan_key, id)`, so a task can only point at its own attempt), `created_at`, `updated_at` |
+| `tasks` | `plan_key` (primary key, references `plans(key)`), `status`, `requeue_pending` (boolean), `rebase_in_progress` (JSON or null; see "Partial output and interrupted rebases"), `budget_deadline` (absolute time the task budget ends; null until the budget starts, which is the task's first move to `running`, when it is set to that time plus the configured budget), `cancel_requested` (action ID or null), `state_version`, `context_generation`, `assignment_id`, `referenced_code_hash`, `current_attempt_id` (nullable; the composite foreign key `(plan_key, current_attempt_id)` references `attempts(plan_key, id)`, so a task can only point at its own attempt), `created_at`, `updated_at` |
 | `attempts` | `id` (**primary key**; never reused), `deadline` (the attempt's absolute deadline, saved at admission), `plan_key` (references `tasks(plan_key)`; `(plan_key, id)` is also unique, for the composite key), `kind`, `phase`, `item`, `state`, `context` (JSON), `first_reason`, `stop_reason`, `exit_code`, `signal`, `result` (JSON, only for `completed`, 1 MiB or less), `diagnostic` (bounded), `diagnostic_ref` (partial-output file, or null), `preparation_pgid` and `preparation_started_at` (or null), `allocation_id` (task storage, or null), `created_at`, `started_at`, `settled_at` |
 | `user_actions` | `plan_key`, `action_id` (together the primary key), `kind`, `request_hash`, `response` (JSON, bounded), `created_at` |
 | `feedback_events` | the fields listed above, with `id` as primary key, with a unique index on `(plan_key, kind, action_id)` |
@@ -482,6 +487,7 @@ Each case needs a test that fails before the fix and passes after it. Each test 
 | Invalid action ID (review round 23) | A 10 KB `actionId`, and one that is not a UUID → HTTP 400; no `user_actions` row |
 | Two starters after a crash (review round 23) | Runner killed (the OS releases its lock) → two processes start at once → exactly one gets the exclusive lock and the other exits; the lock file is never deleted |
 | Retry versus recovery requeue (review round 24) | Restart lists the task and sets `requeue_pending` → user retry → refused → "Resume" and I3 requeue race → exactly one admits an attempt |
+| Crash during a rebase (review round 25) | F3 sets `rebase_in_progress` → runner killed → restart → step 4 aborts that rebase and clears the field by compare-and-swap on its `attemptId` → only then is the task listed for I3 |
 | Old attempt settles after a retry (D/F contract) | Attempt A cancelled and settled → retry B admitted → a late publish from A is refused → B's row and the visible status are unchanged |
 
 ## Decisions (approved 2026-09-25)
