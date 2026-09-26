@@ -586,5 +586,7 @@ it('keeps the root recorded when the final release report cannot be saved', asyn
   // Nothing was lost: the root stays on disk and in the record for the next session to reclaim.
   expect(existsSync(root)).toBe(true);
   expect(read(path).roots).toEqual([root]);
+  // And the review is not left locked for the rest of the process.
+  expect(lockFree(path)).toBe(true);
   rmSync(root, { recursive: true, force: true });
 });

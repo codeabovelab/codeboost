@@ -214,6 +214,9 @@ export class QuestionWorker {
       // The root is the durable evidence of this worker: delete it only once the release report is saved. Otherwise
       // it stays recorded (from start()), and Docker leftovers are still caught by the startup label scan.
       if (recorded) this.#removeRoot();
+      // The thread has stopped, so nothing writes into the root any more: it stays on disk and in the record for the
+      // next check, and this process lets go of it so close() can release the lock.
+      else this.root = undefined;
     }
   }
 }
