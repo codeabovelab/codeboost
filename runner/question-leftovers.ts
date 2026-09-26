@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
-import { chmodSync, closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 
@@ -77,11 +78,6 @@ export const dockerTaskStorage: ListTaskStorage = async signal => {
 };
 const LABELLED = 'docker ps -a, docker volume ls and docker network ls, each with --filter label=io.codeboost.allocation, label=io.codeboost.invocation or label=io.codeboost.egress';
 
-function processExists(pid: number): boolean {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
-}
-
 function parse(text: string): LedgerRecord {
   const value = JSON.parse(text) as { leftovers?: unknown; untracked?: unknown };
   const list = value?.leftovers, untracked = value?.untracked, roots = (value as { roots?: unknown })?.roots;
@@ -103,39 +99,48 @@ function parse(text: string): LedgerRecord {
  */
 export class LeftoverLedger {
   readonly path: string;
-  #locked = false;
+  #lock?: import('node:sqlite').DatabaseSync;
+  #refusal?: string;
   readonly listTaskStorage: ListTaskStorage;
   constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; }
 
   /**
    * Exclusive Ask lock for this review database, held for the question worker's lifetime. Only the holder scans,
    * starts a worker or writes this record, so two processes on one review cannot both pass the startup scan or
-   * overwrite each other's record. A lock left by a process that no longer exists is taken over.
+   * overwrite each other's record. It is an exclusive SQLite transaction on `<record>.lock`: an OS file lock that the
+   * operating system releases when its process ends, so no PID check or takeover is needed.
    */
   acquire(): void {
-    if (this.#locked) return;
-    const lock = `${this.path}.lock`;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      try {
-        const fd = openSync(lock, 'wx', 0o600);
-        try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
-        this.#locked = true;
-        return;
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
-        const owner = Number.parseInt(readFileSync(lock, 'utf8'), 10);
-        if (!Number.isSafeInteger(owner) || owner <= 0 || processExists(owner)) {
-          throw new Error(`Ask is off: another codeboost process (${Number.isSafeInteger(owner) ? `PID ${owner}` : 'unknown'}) is running Ask for this review. Stop it, or delete ${lock} if that process is gone.`);
-        }
-        rmSync(lock, { force: true });
-      }
+    if (this.#lock) return;
+    if (this.#refusal) throw new Error(this.#refusal);
+    const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+    const lock = new DatabaseSync(`${this.path}.lock`, { timeout: 0 });
+    try { lock.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;'); }
+    catch (error) {
+      lock.close();
+      if (/locked|busy/i.test(String((error as Error).message)))
+        throw new Error('Ask is off: another codeboost process is running Ask for this review. Stop it, then retry.');
+      throw error;
     }
-    throw new Error(`Ask is off: could not take the Ask lock ${lock}.`);
+    this.#lock = lock;
   }
   release(): void {
-    if (!this.#locked) return;
-    this.#locked = false;
-    rmSync(`${this.path}.lock`, { force: true });
+    const lock = this.#lock;
+    if (!lock) return;
+    this.#lock = undefined;
+    try { lock.exec('ROLLBACK'); } finally { lock.close(); }
+  }
+
+  /**
+   * The ledger for a review database, keyed by its canonical path so relative, absolute and symlinked spellings share
+   * one lock and record. A hard-linked database has no single canonical path, so Ask refuses to run on it.
+   */
+  static forDatabase(database: string, listTaskStorage?: ListTaskStorage): LeftoverLedger {
+    const canonical = realpathSync(database);
+    const ledger = new LeftoverLedger(`${canonical}.ask-leftovers.json`, listTaskStorage);
+    if (statSync(canonical).nlink > 1)
+      ledger.#refusal = `Ask is off: the review database ${canonical} has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.`;
+    return ledger;
   }
 
   #read(): LedgerRecord {

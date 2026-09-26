@@ -28,8 +28,8 @@ export class Questions {
   private worker: QuestionWorker;
   constructor(service: ReviewService, agent?: QuestionAgent) {
     this.service=service; this.agent=agent;
-    // Beside the review database, so a restart of the same review finds storage an earlier session could not remove.
-    this.worker=new QuestionWorker(undefined,new LeftoverLedger(`${service.config.database}.ask-leftovers.json`));
+    // Beside the review database's canonical path, so a restart of the same review finds what an earlier session left.
+    this.worker=new QuestionWorker(undefined,LeftoverLedger.forDatabase(service.config.database));
   }
   isRunning(id: string) { return this.running.has(id); }
   start(id: string, view: ReturnType<ReviewService['load']>) {

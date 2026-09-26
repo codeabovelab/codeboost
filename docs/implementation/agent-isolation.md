@@ -127,11 +127,13 @@ Ask keeps the contract's identity and cleanup rules:
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
   allocation IDs (#51 item 3) would let Ask name these resources instead.
-- One process at a time runs Ask for a review: an exclusive lock file next to the record
-  (`<database>.ask-leftovers.json.lock`, holding the PID) is taken before the scan and kept until the worker has
-  stopped. Only the holder scans, starts a worker or writes the record. A lock whose process no longer exists is
-  taken over. Separating different reviews that share one Docker daemon needs runner identity labels (#51 item 3),
-  and the general single-runner lock is F1d (#59).
+- One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on
+  `<database>.ask-leftovers.json.lock`, an OS file lock that the operating system releases when its process ends.
+  It is taken before the scan and kept until the worker has stopped. Only the holder scans, starts a worker or
+  writes the record. The record and lock are keyed by the database's canonical path (`realpath`), so relative,
+  absolute and symlinked spellings share them. A database with other hard links is refused. Separating different
+  reviews that share one Docker daemon needs runner identity labels (#51 item 3), and the general single-runner
+  lock is F1d (#59).
 - The first question of each process runs that scan even without a record, because a process killed before it
   could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
   process running Ask at the same moment also keeps this one off.

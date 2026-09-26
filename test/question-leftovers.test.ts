@@ -1,4 +1,5 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -293,26 +294,49 @@ it('hands a thread that outlives the wait to the durable record, and deletes its
   await expect(worker.agent('claude')('answer', new AbortController().signal, scope(20), 60_000)).rejects.toThrow('Ask is off');
 });
 
-it('lets only one process run Ask for a review, and takes over a lock left by a dead process', async () => {
+/** Whether another holder could take the Ask lock right now. */
+const lockFree = (path: string) => {
+  const probe = new LeftoverLedger(path, docker(new Set()));
+  try { probe.acquire(); probe.release(); return true; } catch { return false; }
+};
+
+it('lets only one holder run Ask for a review, and the OS frees the lock when its process exits', async () => {
   const path = ledgerPath();
   const first = stubWorker(new LeftoverLedger(path, docker(new Set())));
   const second = stubWorker(new LeftoverLedger(path, docker(new Set())));
   try {
     expect(await first.agent('claude')('answer', new AbortController().signal, scope(21), 60_000)).toBe('claude:answer:n');
     const [liveRoot] = read(path).roots;
-    // Same PID stands in for another live process holding the lock.
-    await expect(second.agent('claude')('answer', new AbortController().signal, scope(22), 60_000)).rejects.toThrow(`PID ${process.pid}`);
-    // The refused process never reaches cleanup, so the live worker's root and its record survive.
+    await expect(second.agent('claude')('answer', new AbortController().signal, scope(22), 60_000)).rejects.toThrow('another codeboost process');
+    // The refused holder never reaches cleanup, so the live worker's root and its record survive.
     expect(existsSync(liveRoot)).toBe(true);
     expect(read(path).roots).toEqual([liveRoot]);
   } finally { await first.close(); await second.close(); }
-  expect(existsSync(`${path}.lock`)).toBe(false);
-  // A lock whose process no longer exists is taken over.
-  writeFileSync(`${path}.lock`, '2147483646\n');
-  const third = stubWorker(new LeftoverLedger(path, docker(new Set())));
-  try { expect(await third.agent('claude')('answer', new AbortController().signal, scope(23), 60_000)).toBe('claude:answer:n'); }
-  finally { await third.close(); }
-  expect(existsSync(`${path}.lock`)).toBe(false);
+  expect(lockFree(path)).toBe(true);
+  // A process that takes the lock and exits without releasing it leaves nothing to take over: the OS freed it.
+  const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
+    import { DatabaseSync } from 'node:sqlite';
+    const lock = new DatabaseSync(${JSON.stringify(`${path}.lock`)});
+    lock.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;');
+    process.stdout.write('held');
+    process.exit(0);`], { encoding: 'utf8' });
+  expect(child.stdout).toBe('held');
+  expect(lockFree(path)).toBe(true);
+});
+
+it('keys the lock and record by the canonical database path, and refuses a hard-linked database', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ask-db-')); roots.push(root);
+  const database = join(root, 'review.sqlite');
+  writeFileSync(database, '');
+  symlinkSync(database, join(root, 'alias.sqlite'));
+  const direct = LeftoverLedger.forDatabase(database);
+  expect(LeftoverLedger.forDatabase(join(root, 'alias.sqlite')).path).toBe(direct.path);
+  expect(LeftoverLedger.forDatabase(join(root, '.', 'review.sqlite')).path).toBe(direct.path);
+  direct.acquire();
+  try { expect(() => LeftoverLedger.forDatabase(join(root, 'alias.sqlite')).acquire()).toThrow('another codeboost process'); }
+  finally { direct.release(); }
+  linkSync(database, join(root, 'hard.sqlite'));
+  expect(() => LeftoverLedger.forDatabase(database).acquire()).toThrow('hard links');
 });
 
 it('bounds shutdown when the worker does not report, keeping its root recorded until the thread stops', async () => {
@@ -327,7 +351,7 @@ it('bounds shutdown when the worker does not report, keeping its root recorded u
   const [root] = record.roots;
   expect(existsSync(root)).toBe(true);
   // The lock stays while the thread may still write; both go once it stops.
-  expect(existsSync(`${path}.lock`)).toBe(true);
+  expect(lockFree(path)).toBe(false);
   await expect.poll(() => existsSync(root), { timeout: 5_000 }).toBe(false);
-  expect(existsSync(`${path}.lock`)).toBe(false);
+  expect(lockFree(path)).toBe(true);
 });
