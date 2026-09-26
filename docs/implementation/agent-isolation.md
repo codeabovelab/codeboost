@@ -10,7 +10,7 @@ The gate needs a running Docker daemon. Run the suites one file at a time, becau
 they share one image tag and one daemon:
 
 ```bash
-npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts
+npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts test/agent-question.test.ts
 ```
 
 The `Agent isolation` workflow runs the same command. The main `CI` workflow skips
@@ -85,6 +85,43 @@ The caller must do the following:
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
+
+## First consumer: Ask
+
+Ask (`runner/question-container.ts`) is the first production caller. It follows the four entry points above in the
+"questions" phase with no approved commands, clones the reviewed snapshot head, and writes a fixed answer schema as the
+only input file. Because every entry point above is synchronous, a worker thread (`runner/question-worker.ts`) owns the
+image, clones and allocations, so the review server keeps serving while Docker and Git run. The worker settles a
+question only after the invocation settles and its storage is removed.
+
+Ask keeps the contract's identity and cleanup rules:
+
+- The invocation's `attemptId` is the answer attempt that `Questions` saved, and `referencedCodeHash` is the note's
+  `contextId` (the hash of the code assigned to its plan item). An answer is accepted only when the result and the
+  worker reply carry that attempt and the captured context. The Store then compares the attempt before saving it.
+- Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
+- If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
+  question, and refuses Ask while any removal is unconfirmed.
+- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
+  anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
+  Ask stays off while any recorded container or volume still exists. The check is two read-only label queries
+  (`docker ps` and `docker volume ls`) with a 15-second limit, and the question can cancel it. The refusal shows
+  `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
+  they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
+  at shutdown keeps Ask off. Entries beyond the record's cap of 100 count as unidentified, never dropped. Removal goes through D only once D has
+  recovery handles (#51 item 4).
+- If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
+  resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
+  restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
+  allocation IDs (#51 item 3) would let Ask name these resources instead.
+- If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
+  replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
+  while any `io.codeboost.task-storage` container or volume exists. Reclaiming those leftovers after a crash or restart
+  needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.
+
+`test/agent-question.test.ts` runs this path
+against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Limits of this gate
 

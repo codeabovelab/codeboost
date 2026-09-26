@@ -1,39 +1,104 @@
-import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
-export type Provider = 'claude' | 'codex';
-export function agentArguments(provider: Provider): string[] {
-  if(provider==='claude') return ['--print','--output-format','json','--tools','','--safe-mode','--strict-mcp-config','--no-session-persistence','--disable-slash-commands'];
-  return ['exec','--ignore-user-config','--ignore-rules','--sandbox','read-only','--skip-git-repo-check','--ephemeral','--json',
-    '-c','approval_policy="never"','-c','web_search="disabled"','-c','project_doc_max_bytes=0',
-    ...['shell_tool','apps','plugins','hooks','memories','multi_agent','multi_agent_v2','skill_search','skill_mcp_dependency_install'].flatMap(key=>['-c',`features.${key}=false`]),'-'];
-}
-export function cliQuestionAgent(provider: Provider): QuestionAgent {
-  return async(prompt,signal)=>{
-    const cwd=await mkdtemp(join(tmpdir(),'codeboost-question-'));
-    try {
+import type { Provider } from './question-container.ts';
+import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
+import type { LeftoverLedger } from './question-leftovers.ts';
+export type { Provider } from './question-container.ts';
+
+// Leave the worker time to cancel the container and release storage before the review's own timeout fires.
+const SETTLE_MARGIN_MS = 5_000;
+// Bounds the final storage removal at shutdown; whatever remains is recorded instead of waited for.
+const RELEASE_TIMEOUT_MS = 30_000;
+
+/** One worker owns every Ask container, so lane D's trusted image and allocations stay in one registry. */
+export class QuestionWorker {
+  private worker?: Worker;
+  private pending = new Map<string, { attemptId: string; resolve: (text: string) => void; reject: (error: Error) => void }>();
+  // Set when the worker dies. Its containers and storage may still exist, and nothing in this process can reclaim
+  // them until lane D's scoped recovery exists (#51), so Ask stays off rather than starting a replacement worker.
+  private crashed?: Error;
+  private releases = new Map<string, (reply: Omit<ReleaseReply, 'id'> | null) => void>();
+  private url: URL;
+  private ledger?: LeftoverLedger;
+  /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
+  constructor(url = new URL('./question-worker.ts', import.meta.url), ledger?: LeftoverLedger) { this.url = url; this.ledger = ledger; }
+  private start(): Worker {
+    if (this.crashed) throw this.crashed;
+    if (this.worker) return this.worker;
+    const worker = new Worker(this.url);
+    worker.on('message', (reply: WorkerReply | ReleaseReply) => {
+      if ('remaining' in reply) { this.releases.get(reply.id)?.(reply); this.releases.delete(reply.id); return; }
+      const job = this.pending.get(reply.id);
+      if (!job) return;
+      this.pending.delete(reply.id);
+      if (reply.attemptId !== job.attemptId) job.reject(new Error('The agent returned a result for a different question attempt.'));
+      else if (reply.ok) job.resolve(reply.text); else job.reject(new Error(reply.error));
+    });
+    const fail = (error: Error) => {
+      if (this.worker !== worker) return;
+      this.worker = undefined;
+      this.crashed = new Error(`The agent container worker stopped (${error.message}). Its containers and storage may still exist, so Ask is off until codeboost restarts. Check \`docker ps -a\` and \`docker volume ls\` before restarting.`);
+      // The dead worker's allocations are unknown: record that durably now, not only at a clean shutdown.
+      this.#recordUnknown();
+      for (const job of this.pending.values()) job.reject(this.crashed);
+      this.pending.clear();
+      for (const release of this.releases.values()) release(null);
+      this.releases.clear();
+    };
+    worker.on('error', fail);
+    worker.on('exit', code => fail(new Error(`exit code ${code}`)));
+    this.worker = worker;
+    return worker;
+  }
+  #recordUnknown() {
+    try { this.ledger?.record([], 1); }
+    catch (error) { console.error(`codeboost: could not record possible leftover agent storage: ${error instanceof Error ? error.message : error}`); }
+  }
+  agent(provider: Provider): QuestionAgent {
+    return async (prompt, signal, scope, timeoutMs) => {
+      if (this.crashed) throw this.crashed;
+      await this.ledger?.assertClear(signal);
       signal.throwIfAborted();
-      const stdout=await new Promise<string>((resolve,reject)=>{
-        const env={...process.env};delete env.CLAUDECODE;delete env.NODE_OPTIONS;
-        const child=spawn(provider,agentArguments(provider),{cwd,env,stdio:['pipe','pipe','pipe'],signal,killSignal:'SIGKILL'});
-        const chunks:Buffer[]=[];let bytes=0,diagnostic='';let failure:Error|undefined;
-        child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>1024*1024){failure ??= new Error('Agent output exceeded its limit.');child.kill('SIGKILL');}else chunks.push(chunk);});
-        child.stderr.on('data',(chunk:Buffer)=>{diagnostic=(diagnostic+chunk.toString()).slice(-2000);});
-        child.on('error',error=>{failure = signal.aborted && signal.reason instanceof Error ? signal.reason : new Error(signal.aborted?'Agent cancelled.':`Could not start ${provider}. Check that its CLI is installed and signed in. (${error.name})`);});
-        child.on('close',code=>failure?reject(failure):code===0?resolve(Buffer.concat(chunks).toString('utf8')):reject(new Error(`${provider} exited with status ${code}. Check its login and usage limits.${/auth|login|sign.in/i.test(diagnostic)?' Authentication may be required.':''}`)));
-        child.stdin.on('error',()=>{});child.stdin.end(prompt);
-      });
-      if(provider==='claude') {
-        const result=JSON.parse(stdout);
-        if(result.is_error || typeof result.result!=='string') throw new Error('Claude could not answer. Check its login and usage limits.');
-        return result.result;
-      }
-      const events=stdout.split('\n').filter(Boolean).map(line=>JSON.parse(line));
-      const failure=events.find(event=>event.type==='turn.failed'||event.type==='error');
-      if(failure) throw new Error('Codex could not answer. Check its login and usage limits.');
-      return events.filter(event=>event.type==='item.completed'&&event.item?.type==='agent_message').map(event=>event.item.text).join('\n\n');
-    } finally {await rm(cwd,{recursive:true,force:true});}
-  };
+      return this.#ask(provider, prompt, signal, scope, timeoutMs);
+    };
+  }
+  #ask(provider: Provider, ...[prompt, signal, scope, timeoutMs]: Parameters<QuestionAgent>) {
+    return new Promise<string>((resolve, reject) => {
+      if (!scope) { reject(new Error('Ask needs the reviewed repository and head.')); return; }
+      let worker: Worker;
+      try { worker = this.start(); } catch (error) { reject(error as Error); return; }
+      const id = randomUUID();
+      this.pending.set(id, { attemptId: scope.attemptId, resolve, reject });
+      const question = { ...scope, provider, prompt,
+        deadline: Date.now() + Math.max(1_000, (timeoutMs ?? 120_000) - SETTLE_MARGIN_MS) };
+      worker.postMessage({ type: 'ask', id, question } satisfies WorkerRequest);
+      // The promise settles only when the worker reports that the container and its storage are gone.
+      const cancel = () => worker.postMessage({ type: 'cancel', id,
+        reason: signal.reason instanceof Error ? signal.reason.message : 'Agent cancelled.' } satisfies WorkerRequest);
+      if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
+    });
+  }
+  /**
+   * Call only after every agent promise has settled. Asks the worker for a final storage removal and records
+   * anything it could not remove before terminating it, because terminating drops the worker's allocation handles.
+   */
+  async close() {
+    const worker = this.worker;
+    if (!worker) return;
+    const id = randomUUID();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const released = await new Promise<Omit<ReleaseReply, 'id'> | null>(resolve => {
+      this.releases.set(id, resolve);
+      timer = setTimeout(() => { this.releases.delete(id); resolve(null); }, RELEASE_TIMEOUT_MS);
+      worker.postMessage({ type: 'release', id } satisfies WorkerRequest);
+    });
+    clearTimeout(timer);
+    this.worker = undefined;
+    try {
+      // No report (timeout or crash) means unknown leftovers, which stay recorded until no task storage remains.
+      if (released === null) this.#recordUnknown();
+      else this.ledger?.record(released.remaining, released.untracked);
+    } finally { await worker.terminate(); }
+  }
 }

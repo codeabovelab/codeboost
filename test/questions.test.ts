@@ -6,7 +6,6 @@ import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { Questions } from '../runner/questions.ts';
 import { choiceKeys } from '../core/approvals.ts';
-import { agentArguments } from '../runner/question-agent.ts';
 // Real-Git context reads can overlap the Docker-backed isolation suite in a full run.
 vi.setConfig({testTimeout:30000});
 const roots:string[]=[], services:ReviewService[]=[], managers:Questions[]=[];
@@ -22,6 +21,12 @@ it('persists answers with plan, code, selected snippet and prior conversation co
  const after=service.load();expect(after.plan.revision).toBe(asked.plan.revision);expect(after.token).toBe(asked.token);expect(after.approved).toBe(0);
  const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.load().notes.at(-1)?.answer?.text).toContain('bounds retry latency');
 },30_000);
+it('asks about the configured repository at the reviewed snapshot head',async()=>{
+ const service=fixture(),asked=question(service);let received:unknown;
+ const manager=new Questions(service,async(_prompt,_signal,scope)=>{received=scope;return 'Answer';});managers.push(manager);manager.start(asked.createdNoteId!,asked);
+ await vi.waitFor(()=>expect(received).toBeDefined());
+ expect(received).toEqual({repository:service.config.repository,head:asked.snapshot.head,snapshotId:asked.snapshot.id,planId:service.config.identity.planId,planRevision:asked.plan.revision,noteId:asked.createdNoteId,attemptId:service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt,contextId:asked.notes.find(note=>note.id===asked.createdNoteId)!.contextId});
+});
 it('fails visibly and retries without duplicating the question or accepting stale completions',async()=>{
  const service=fixture(),asked=question(service);let calls=0;
  const manager=new Questions(service,async()=>{if(++calls===1)throw new Error('Login required');return 'Recovered answer';});managers.push(manager);manager.start(asked.createdNoteId!,asked);
@@ -36,10 +41,8 @@ it('prevents duplicate invocations and records interruption when the server stop
  expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow(/already answering/);await manager.close();
  expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/Server stopped/);
 });
-it('persists provider selection and restricts commands to fixed provider launch arguments',()=>{
+it('persists provider selection and rejects anything but a known provider',()=>{
  const service=fixture();expect(service.store.questionProvider()).toBeNull();service.store.setQuestionProvider('codex');const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.store.questionProvider()).toBe('codex');expect(()=>service.store.setQuestionProvider('sh -c anything')).toThrow(/Choose/);
- const claude=agentArguments('claude');expect(claude[claude.indexOf('--tools')+1]).toBe('');expect(claude).toContain('--safe-mode');
- const codex=agentArguments('codex');expect(codex).toContain('read-only');expect(codex).toContain('features.shell_tool=false');expect(codex).toContain('features.plugins=false');
 });
 it('times out an unresponsive agent and allows expired pending attempts to be recovered',async()=>{
  const service=fixture(),asked=question(service);const manager=new Questions(service,waitForAbort);managers.push(manager);
