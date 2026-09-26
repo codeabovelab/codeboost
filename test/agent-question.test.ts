@@ -18,7 +18,8 @@ function repository(secret: string) {
   git(root, 'init'); git(root, 'config', 'user.name', 'Test'); git(root, 'config', 'user.email', 'test@example.com');
   writeFileSync(join(root, 'secret.txt'), `The review word is ${secret}.\n`);
   git(root, 'add', '.'); git(root, 'commit', '-m', 'baseline');
-  return { repository: root, head: git(root, 'rev-parse', 'HEAD'), snapshotId: 'snapshot', planId: 'plan', planRevision: 1, noteId: 'note' };
+  return { repository: root, head: git(root, 'rev-parse', 'HEAD'), snapshotId: 'snapshot', planId: 'plan', planRevision: 1, noteId: 'note',
+    attemptId: randomBytes(16).toString('hex'), contextId: 'c'.repeat(64) };
 }
 
 describe('Ask in the agent container', () => {

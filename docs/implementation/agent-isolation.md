@@ -92,7 +92,21 @@ Ask (`runner/question-container.ts`) is the first production caller. It follows 
 "questions" phase with no approved commands, clones the reviewed snapshot head, and writes a fixed answer schema as the
 only input file. Because every entry point above is synchronous, a worker thread (`runner/question-worker.ts`) owns the
 image, clones and allocations, so the review server keeps serving while Docker and Git run. The worker settles a
-question only after the invocation settles and its storage is removed. `test/agent-question.test.ts` runs this path
+question only after the invocation settles and its storage is removed.
+
+Ask keeps the contract's identity and cleanup rules:
+
+- The invocation's `attemptId` is the answer attempt that `Questions` saved, and `referencedCodeHash` is the note's
+  `contextId` (the hash of the code assigned to its plan item). An answer is accepted only when the result and the
+  worker reply carry that attempt and the captured context. The Store then compares the attempt before saving it.
+- Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
+- If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
+  question, and refuses Ask while any removal is unconfirmed.
+- If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
+  replacement worker; Ask stays off until codeboost restarts. Reclaiming those leftovers after a crash or restart
+  needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.
+
+`test/agent-question.test.ts` runs this path
 against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
 `CLAUDE_CODE_OAUTH_TOKEN`.
 

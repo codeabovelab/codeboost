@@ -25,7 +25,7 @@ it('asks about the configured repository at the reviewed snapshot head',async()=
  const service=fixture(),asked=question(service);let received:unknown;
  const manager=new Questions(service,async(_prompt,_signal,scope)=>{received=scope;return 'Answer';});managers.push(manager);manager.start(asked.createdNoteId!,asked);
  await vi.waitFor(()=>expect(received).toBeDefined());
- expect(received).toEqual({repository:service.config.repository,head:asked.snapshot.head,snapshotId:asked.snapshot.id,planId:service.config.identity.planId,planRevision:asked.plan.revision,noteId:asked.createdNoteId});
+ expect(received).toEqual({repository:service.config.repository,head:asked.snapshot.head,snapshotId:asked.snapshot.id,planId:service.config.identity.planId,planRevision:asked.plan.revision,noteId:asked.createdNoteId,attemptId:service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt,contextId:asked.notes.find(note=>note.id===asked.createdNoteId)!.contextId});
 });
 it('fails visibly and retries without duplicating the question or accepting stale completions',async()=>{
  const service=fixture(),asked=question(service);let calls=0;

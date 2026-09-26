@@ -5,7 +5,7 @@ import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
 const roots: string[] = [];
@@ -13,7 +13,8 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 
 const question = (overrides: Partial<ContainerQuestion> = {}): ContainerQuestion => ({
   repository: '/repo', head: 'a'.repeat(40), snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 3, noteId: 'note-1',
-  provider: 'claude', prompt: 'Why cap the retry delay?', attemptId: `attempt-${Math.random()}`, deadline: Date.now() + 60_000,
+  provider: 'claude', prompt: 'Why cap the retry delay?', attemptId: `attempt-${Math.random()}`, contextId: 'c'.repeat(64),
+  deadline: Date.now() + 60_000,
   ...overrides,
 });
 
@@ -41,7 +42,7 @@ function fakeDeps(result: Partial<InvocationResult> = {}, env: Record<string, st
     capture: input => { captured.push(input); return Object.freeze(input); },
     startClaude: start('claude'), startCodex: start('codex'), env,
   };
-  return { deps, events, captured, started, cancels, settle: (value: Partial<InvocationResult>) => settle({ attemptId: 'x',
+  return { deps, events, captured, started, cancels, settle: (value: Partial<InvocationResult>) => settle({ attemptId: captured[0]!.attemptId,
     context: captured[0]!.context, exitCode: null, signal: null, stdout: '', stderr: '', ...value }) };
 }
 
@@ -123,16 +124,18 @@ it('stops before starting the container once the deadline has passed', async () 
   expect(fake.events).not.toContain('start');
 });
 
-const scope = { repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n' };
+let attempts = 0;
+const scope = () => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
+  attemptId: `attempt-${++attempts}`, contextId: 'c'.repeat(64) });
 const stubWorker = () => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url));
 
 it('returns the worker answer and forwards cancellation, settling only when the worker replies', async () => {
   const worker = stubWorker();
   try {
-    expect(await worker.agent('claude')('answer', new AbortController().signal, scope, 60_000)).toBe('claude:answer:n');
+    expect(await worker.agent('claude')('answer', new AbortController().signal, scope(), 60_000)).toBe('claude:answer:n');
     const controller = new AbortController();
     let done = false;
-    const pending = worker.agent('codex')('wait', controller.signal, scope, 60_000).catch((error: Error) => error).finally(() => { done = true; });
+    const pending = worker.agent('codex')('wait', controller.signal, scope(), 60_000).catch((error: Error) => error).finally(() => { done = true; });
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(done).toBe(false);
     controller.abort(new Error('Agent timed out. Try again.'));
@@ -140,10 +143,65 @@ it('returns the worker answer and forwards cancellation, settling only when the 
   } finally { await worker.close(); }
 });
 
-it('rejects pending questions when the worker crashes', async () => {
+it('fails closed after the worker crashes instead of starting a replacement', async () => {
   const worker = stubWorker();
   try {
-    await expect(worker.agent('claude')('crash', new AbortController().signal, scope, 60_000)).rejects.toThrow('worker stopped');
-    expect(await worker.agent('claude')('answer', new AbortController().signal, scope, 60_000)).toBe('claude:answer:n');
+    await expect(worker.agent('claude')('crash', new AbortController().signal, scope(), 60_000)).rejects.toThrow('worker stopped');
+    // The crashed worker's containers and storage may still exist, so no new worker may take their place.
+    await expect(worker.agent('claude')('answer', new AbortController().signal, scope(), 60_000))
+      .rejects.toThrow('Ask is off until codeboost restarts');
   } finally { await worker.close(); }
+});
+
+it('rejects a worker reply that carries another attempt identity', async () => {
+  const worker = stubWorker();
+  try {
+    await expect(worker.agent('claude')('wrong-attempt', new AbortController().signal, scope(), 60_000))
+      .rejects.toThrow('different question attempt');
+  } finally { await worker.close(); }
+});
+
+it('binds the invocation to the persisted attempt and the assigned code hash', async () => {
+  const fake = fakeDeps();
+  await askInContainer(question({ attemptId: 'persisted-attempt', contextId: 'd'.repeat(64) }), fake.deps, new AbortController().signal);
+  expect(fake.captured[0]).toMatchObject({ attemptId: 'persisted-attempt', context: { referencedCodeHash: 'd'.repeat(64) } });
+});
+
+it.each([
+  ['another attempt', { attemptId: 'someone-else' }],
+  ['another context', { context: { snapshotId: 'other', planId: 'plan-1', planRevision: 3, assignmentId: 'note-1', referencedCodeHash: 'c'.repeat(64), stateVersion: 0 } }],
+] as const)('refuses an answer from %s', async (_label, override) => {
+  const fake = fakeDeps(override as Partial<InvocationResult>);
+  await expect(askInContainer(question(), fake.deps, new AbortController().signal)).rejects.toThrow('different question attempt');
+});
+
+it.each([
+  ['no exit code', { exitCode: null }, 'Claude stopped unexpectedly. Try again.'],
+  ['a signal', { exitCode: 0, signal: 'SIGKILL' }, 'Claude stopped unexpectedly (SIGKILL). Try again.'],
+] as const)('refuses partial output after %s', async (_label, override, message) => {
+  const fake = fakeDeps(override as Partial<InvocationResult>);
+  await expect(askInContainer(question(), fake.deps, new AbortController().signal)).rejects.toThrow(message);
+});
+
+it('keeps storage whose removal failed, refuses Ask until it is removed, then continues', async () => {
+  const retained = new RetainedStorage();
+  const first = fakeDeps();
+  first.deps.removeFilesystems = () => { throw new Error('Docker did not confirm removal.'); };
+  await expect(askInContainer(question(), first.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
+  expect(retained.size).toBe(1);
+
+  const blocked = fakeDeps();
+  blocked.deps.removeFilesystems = () => { throw new Error('Docker is still down.'); };
+  await expect(askInContainer(question(), blocked.deps, new AbortController().signal, {}, retained))
+    .rejects.toThrow('could not be removed (1 allocation)');
+  expect(blocked.events).toEqual([]);
+  expect(retained.size).toBe(1);
+
+  const recovered = fakeDeps();
+  const removed: unknown[] = [];
+  recovered.deps.removeFilesystems = value => { removed.push(value); };
+  expect(await askInContainer(question(), recovered.deps, new AbortController().signal, {}, retained)).toBe('The cap bounds latency.');
+  expect(retained.size).toBe(0);
+  // The retained allocation from the first question, then this question's own.
+  expect(removed).toHaveLength(2);
 });

@@ -43,7 +43,7 @@ export class Questions {
       try {
         if(!agent) throw new Error('Choose a question agent in Settings, then retry.');
         const aborted = new Promise<never>((_,reject)=>controller.signal.addEventListener('abort',()=>reject(controller.signal.reason),{once:true}));
-        const scope={repository:this.service.config.repository,head:view.snapshot.head,snapshotId:view.snapshot.id,planId:this.service.config.identity.planId,planRevision:view.plan.revision,noteId:id};
+        const scope={repository:this.service.config.repository,head:view.snapshot.head,snapshotId:view.snapshot.id,planId:this.service.config.identity.planId,planRevision:view.plan.revision,noteId:id,attemptId:attempt,contextId:note.contextId};
         invocation = agent(questionPrompt(view,note),controller.signal,scope,QUESTION_TIMEOUT_MS);
         const text=await Promise.race([invocation,aborted]);
         if(typeof text!=='string'||!text.trim()||text.length>24000) throw new Error('Agent returned an empty or oversized answer.');
