@@ -411,3 +411,37 @@ it('never drops a recorded Ask root; adding one past the cap is refused instead'
     expect(read(path).untracked).toBe(0);
   } finally { for (const root of made) rmSync(root, { recursive: true, force: true }); }
 });
+
+it('runs one startup scan for concurrent first questions, so neither sees the other as a leftover', async () => {
+  const path = ledgerPath();
+  let scans = 0, release!: () => void;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const worker = stubWorker(new LeftoverLedger(path, async () => {
+    scans++;
+    await gate;
+    return { containers: new Set(), volumes: new Set() };
+  }));
+  try {
+    const first = worker.agent('claude')('answer', new AbortController().signal, scope(28), 60_000);
+    const second = worker.agent('claude')('answer', new AbortController().signal, scope(29), 60_000);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    release();
+    expect(await Promise.all([first, second])).toEqual(['claude:answer:n', 'claude:answer:n']);
+    expect(scans).toBe(1);
+    expect(read(path)).toMatchObject({ leftovers: [], untracked: 0 });
+  } finally { await worker.close(); }
+});
+
+it('retries the startup scan after it fails', async () => {
+  const path = ledgerPath();
+  let scans = 0;
+  const worker = stubWorker(new LeftoverLedger(path, async () => {
+    if (++scans === 1) throw new Error('Docker is starting');
+    return { containers: new Set(), volumes: new Set() };
+  }));
+  try {
+    await expect(worker.agent('claude')('answer', new AbortController().signal, scope(30), 60_000)).rejects.toThrow('could not check Docker');
+    expect(await worker.agent('claude')('answer', new AbortController().signal, scope(31), 60_000)).toBe('claude:answer:n');
+    expect(scans).toBe(2);
+  } finally { await worker.close(); }
+});

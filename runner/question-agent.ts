@@ -137,12 +137,26 @@ export class QuestionWorker {
       questionCredential(provider, this.env);
       // Held until close, so no other process can scan, start a worker or write the record for this review.
       this.ledger?.acquire();
-      // The first question of a process also scans for labelled leftovers when there is no record.
-      await this.ledger?.assertClear(signal, { startup: !this.scanned, active: this.root });
-      this.scanned = true;
+      // The first question of a process also scans for labelled leftovers when there is no record. The scan is
+      // single-flight: concurrent first questions share it, so none can see another's new resources as leftovers.
+      if (!this.scanned) await this.#startupScan(signal);
+      else await this.ledger?.assertClear(signal, { active: this.root });
       signal.throwIfAborted();
       return this.#ask(provider, prompt, signal, scope, timeoutMs);
     };
+  }
+  #scanning?: Promise<void>;
+  /** One startup scan for all concurrent first questions. Each caller may stop waiting; a failed scan is retried. */
+  async #startupScan(signal: AbortSignal) {
+    this.#scanning ??= (async () => {
+      try { await this.ledger?.assertClear(undefined, { startup: true, active: this.root }); this.scanned = true; }
+      finally { this.#scanning = undefined; }
+    })();
+    const scan = this.#scanning;
+    let release!: () => void;
+    const aborted = new Promise<never>((_, reject) => { release = () => reject(signal.reason); signal.addEventListener('abort', release, { once: true }); });
+    try { await Promise.race([scan, aborted]); }
+    finally { signal.removeEventListener('abort', release); }
   }
   #ask(provider: Provider, ...[prompt, signal, scope, timeoutMs]: Parameters<QuestionAgent>) {
     return new Promise<string>((resolve, reject) => {
