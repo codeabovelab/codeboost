@@ -299,8 +299,12 @@ it('lets only one process run Ask for a review, and takes over a lock left by a 
   const second = stubWorker(new LeftoverLedger(path, docker(new Set())));
   try {
     expect(await first.agent('claude')('answer', new AbortController().signal, scope(21), 60_000)).toBe('claude:answer:n');
+    const [liveRoot] = read(path).roots;
     // Same PID stands in for another live process holding the lock.
     await expect(second.agent('claude')('answer', new AbortController().signal, scope(22), 60_000)).rejects.toThrow(`PID ${process.pid}`);
+    // The refused process never reaches cleanup, so the live worker's root and its record survive.
+    expect(existsSync(liveRoot)).toBe(true);
+    expect(read(path).roots).toEqual([liveRoot]);
   } finally { await first.close(); await second.close(); }
   expect(existsSync(`${path}.lock`)).toBe(false);
   // A lock whose process no longer exists is taken over.
