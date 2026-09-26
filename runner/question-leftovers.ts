@@ -164,8 +164,11 @@ export class LeftoverLedger {
     const merged = [...known.leftovers, ...leftovers.filter(entry => !keys.has(entry.keeper))];
     // Never drop evidence: entries beyond the cap become unnamed, which keeps Ask off until no task storage remains.
     const mergedRoots = [...new Set([...known.roots, ...roots.filter(isAskRoot)])];
-    this.#write({ leftovers: merged.slice(0, MAX_LEFTOVERS), roots: mergedRoots.slice(0, MAX_LEFTOVERS),
-      untracked: known.untracked + untracked + Math.max(0, merged.length - MAX_LEFTOVERS) + Math.max(0, mergedRoots.length - MAX_LEFTOVERS) });
+    // Roots hold host copies that only their path can find, so none is ever dropped: refuse to add one past the cap.
+    if (mergedRoots.length > MAX_LEFTOVERS)
+      throw new Error(`Ask is off: ${known.roots.length} Ask folders from earlier sessions could not be deleted. Delete the codeboost-ask-* folders in ${tmpdir()}, then retry.`);
+    this.#write({ leftovers: merged.slice(0, MAX_LEFTOVERS), roots: mergedRoots,
+      untracked: known.untracked + untracked + Math.max(0, merged.length - MAX_LEFTOVERS) });
   }
 
   /** Drop an Ask root from the record after it has been deleted. */
@@ -210,11 +213,15 @@ export class LeftoverLedger {
       if (keeper) commands.push(`docker rm -f ${entry.keeper}`);
       if (volumes.length) commands.push(`docker volume rm ${volumes.join(' ')}`);
     }
-    // Unnamed leftovers are gone only when no task storage exists at all.
-    const labelled = storage.containers.size + storage.volumes.size + (storage.networks?.size ?? 0);
-    const untracked = known.untracked && labelled ? known.untracked : 0;
+    // Any labelled resource that is not part of a still-listed allocation is unidentified (a seeder, agent container,
+    // proxy or network). It keeps the marker even when the named entries are gone; the marker clears only when none
+    // remain.
+    const named = new Set(remaining.flatMap(entry => [entry.keeper, entry.workVolume, entry.metadataVolume]));
+    const labelled = [...storage.containers, ...storage.volumes, ...(storage.networks ?? [])].filter(name => !named.has(name)).length;
+    const untracked = labelled ? Math.max(known.untracked, 1) : 0;
     this.#write({ leftovers: remaining, untracked, roots: known.roots });
-    if (untracked) throw new Error(`Ask is off: an earlier codeboost session may have left agent containers, volumes or networks that cannot be identified (${labelled} labelled resource${labelled === 1 ? '' : 's'} found). List them with ${LABELLED}. Remove them if no other codeboost is running, then retry.`);
+    // Named leftovers first: their exact removal commands are the most useful next step. The marker is saved either way.
     if (remaining.length) throw new Error(`Ask is off: agent storage from an earlier session was not removed. Remove it, then retry:\n${commands.join('\n')}`);
+    if (untracked) throw new Error(`Ask is off: an earlier codeboost session may have left agent containers, volumes or networks that cannot be identified (${labelled} labelled resource${labelled === 1 ? '' : 's'} found). List them with ${LABELLED}. Remove them if no other codeboost is running, then retry.`);
   }
 }

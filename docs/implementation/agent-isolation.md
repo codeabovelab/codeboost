@@ -119,7 +119,9 @@ Ask keeps the contract's identity and cleanup rules:
   and `io.codeboost.egress`) with one 15-second limit, and the question can cancel it. The refusal shows
   `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
   they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
-  at shutdown keeps Ask off. Entries beyond the record's cap of 100 count as unidentified, never dropped. Removal goes through D only once D has
+  at shutdown keeps Ask off. Allocations beyond the record's cap of 100 count as unidentified, never dropped; Ask
+  roots are never dropped, and recording one past the cap is refused. Any labelled resource that is not part of a
+  still-listed allocation keeps the unidentified marker until none remain. Removal goes through D only once D has
   recovery handles (#51 item 4).
 - Host copies are owned through one Ask root per worker, `<tmp>/codeboost-ask-XXXXXX`. The bridge creates it and
   records it before the worker starts, and runs the worker with it as `TMPDIR`. So the reviewed clone, lane D's

@@ -382,3 +382,32 @@ it('serializes abandonment, so a second trigger cannot release questions before 
   expect(second - started).toBeGreaterThanOrEqual(2_500);
   await worker.close();
 }, 20_000);
+
+it('keeps an unidentified marker for labelled resources left after the named leftovers are gone', async () => {
+  const path = ledgerPath();
+  const names = new Set(['codeboost-keeper-1', 'codeboost-seeder-1']);
+  const ledger = new LeftoverLedger(path, docker(names));
+  ledger.record([leftover(1)]);
+  await expect(ledger.assertClear()).rejects.toThrow('docker rm -f codeboost-keeper-1');
+  // The recorded keeper is removed, but a seeder the record never named is still there.
+  names.delete('codeboost-keeper-1');
+  await expect(ledger.assertClear()).rejects.toThrow('cannot be identified');
+  expect(read(path)).toEqual({ leftovers: [], untracked: 1, roots: [] });
+  names.clear();
+  await expect(ledger.assertClear()).resolves.toBeUndefined();
+  expect(existsSync(path)).toBe(false);
+});
+
+it('never drops a recorded Ask root; adding one past the cap is refused instead', () => {
+  const path = ledgerPath();
+  const ledger = new LeftoverLedger(path, docker(new Set()));
+  const made = Array.from({ length: 100 }, () => mkdtempSync(join(tmpdir(), 'codeboost-ask-')));
+  try {
+    ledger.record([], 0, made);
+    const extra = mkdtempSync(join(tmpdir(), 'codeboost-ask-'));
+    made.push(extra);
+    expect(() => ledger.record([], 0, [extra])).toThrow('could not be deleted');
+    expect(read(path).roots).toEqual(made.slice(0, 100));
+    expect(read(path).untracked).toBe(0);
+  } finally { for (const root of made) rmSync(root, { recursive: true, force: true }); }
+});
