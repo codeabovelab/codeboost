@@ -10,6 +10,8 @@ import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
 import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
+// Resolves once the server has parsed a request's headers and is reading its body, so a partial request is provably admitted before shutdown starts.
+function requestAdmitted(server: typeof app.server) { return new Promise<void>(resolve=>server.once('request',()=>resolve())); }
 function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
 test.afterEach(async () => { await app.close();rmSync(root,{recursive:true,force:true}); });
@@ -404,15 +406,17 @@ for(const scenario of ['navigation','snapshot','removed item','failure']) test(`
 });
 for(const switchItem of [false,true]) test(`preserves edits made while a question submission is in flight (switch item: ${switchItem})`,async({page})=>{
  await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
- let release!:()=>void;const held=new Promise<void>(resolve=>release=resolve);
- await page.route('**/api/action',async route=>{await held;await route.continue();});
+ let release!:()=>void,arrived!:(body:string)=>void;const held=new Promise<void>(resolve=>release=resolve),submitted=new Promise<string>(resolve=>arrived=resolve);
+ await page.route('**/api/action',async route=>{arrived(route.request().postData()??'');await held;await route.continue();});
  await page.getByLabel('Question about this item').fill('Submitted question');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
+ expect(JSON.parse(await submitted)).toMatchObject({action:'note',item:'P1',kind:'question',text:'Submitted question'});
  await page.getByLabel('Question about this item').fill('New unsent draft');
  if(switchItem){await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByLabel('Question about this item').fill('Other item draft');}
  release();
  if(switchItem){await expect(page.locator('#saved')).toContainText('Question submitted');await expect(page.getByLabel('Question about this item')).toHaveValue('Other item draft');await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();}
  await expect(page.getByText('Submitted question',{exact:true})).toBeVisible();
  await expect(page.getByLabel('Question about this item')).toHaveValue('New unsent draft');
+ expect(app.service.store.getReviewNotes(app.service.config.identity).map(note=>note.text)).toEqual(['Submitted question']);
 });
 test('warns on completed answers when a snippet assignment changes',async({page})=>{
  const service=app.service,identity=service.config.identity,initial=service.load();
@@ -431,16 +435,16 @@ test('drains an in-flight question request before closing its agent manager',asy
  app=await startServer(config,0,(_prompt,signal)=>{calls++;return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));});
  const view=app.service.load(),body=JSON.stringify({action:'note',item:'P1',kind:'question',text:'Question during shutdown',token:view.token});
  const endpoint=new URL('/api/action',app.url);
- let response='';
+ let response='',finish!:()=>void;const admitted=requestAdmitted(app.server);
  const completed=new Promise<void>((resolve,reject)=>{
   const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{
    res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);
   });
   req.on('error',reject);req.write(body.slice(0,1));
-  setTimeout(()=>req.end(body.slice(1)),50);
+  finish=()=>req.end(body.slice(1));
  });
- await new Promise(resolve=>setTimeout(resolve,10));
- await Promise.all([app.close(),completed]);
+ await Promise.race([admitted,completed]);const closing=app.close();finish();
+ await Promise.all([closing,completed]);
  const reopened=new ReviewService(config);
  try {
   const note=reopened.load().notes.find(note=>note.text==='Question during shutdown');
@@ -471,13 +475,12 @@ test('aborts an admitted review status inspection after the shutdown drain',asyn
 });
 test('destroys a partial request body after the shutdown drain',async()=>{
  const config=app.service.config;await app.close();app=await startServer(config,0,undefined,undefined,50);
- const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'note'});
- let admitted!:(value?:void)=>void;const requestAdmitted=new Promise<void>(resolve=>{admitted=resolve;});
+ const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'note'}),admitted=requestAdmitted(app.server);
  const completed=new Promise<'response'|'error'>(resolve=>{
   const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{res.resume();res.on('end',()=>resolve('response'));});
-  req.on('error',()=>resolve('error'));req.write(body.slice(0,1),()=>admitted());
+  req.on('error',()=>resolve('error'));req.write(body.slice(0,1));
  });
- await requestAdmitted;const started=Date.now();await app.close();expect(Date.now()-started).toBeLessThan(1000);expect(await completed).toBe('error');app=await startServer(config,0);
+ await admitted;const started=Date.now();await app.close();expect(Date.now()-started).toBeLessThan(1000);expect(await completed).toBe('error');app=await startServer(config,0);
 });
 test('blocks a partially received merge request when shutdown starts',async()=>{
  const config={...app.service.config,demo:false};await app.close();let mergeCalls=0;let appRef:typeof app;
@@ -485,9 +488,9 @@ test('blocks a partially received merge request when shutdown starts',async()=>{
  app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();
  for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});
  for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const body=JSON.stringify({action:'merge',token:view.token}),endpoint=new URL('/api/action',app.url);let status=0,response='';
- const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);});req.on('error',reject);req.write(body.slice(0,1));setTimeout(()=>req.end(body.slice(1)),50);});
- await new Promise(resolve=>setTimeout(resolve,10));await Promise.all([app.close(),completed]);
+ const body=JSON.stringify({action:'merge',token:view.token}),endpoint=new URL('/api/action',app.url);let status=0,response='',finish!:()=>void;const admitted=requestAdmitted(app.server);
+ const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);});req.on('error',reject);req.write(body.slice(0,1));finish=()=>req.end(body.slice(1));});
+ await Promise.race([admitted,completed]);const closing=app.close();finish();await Promise.all([closing,completed]);
  expect(status).toBe(503);expect(JSON.parse(response).error).toMatch(/shutting down/i);expect(mergeCalls).toBe(0);app=await startServer(config,0);
 });
 test('hides Retry until a timed-out invocation has actually settled',async({page})=>{
