@@ -560,3 +560,15 @@ it('still scans Docker at startup after deleting a recorded root', async () => {
     expect(read(path)).toMatchObject({ leftovers: [], untracked: 1 });
   } finally { await worker.close(); }
 });
+
+it('never follows a link planted at a temporary name when writing the record', () => {
+  const path = ledgerPath();
+  const victim = join(dirname(path), 'victim.txt');
+  writeFileSync(victim, 'original');
+  // The name the previous implementation used.
+  symlinkSync(victim, `${path}.${process.pid}.tmp`);
+  new LeftoverLedger(path, docker(new Set())).record([leftover(1)]);
+  expect(readFileSync(victim, 'utf8')).toBe('original');
+  expect(read(path).leftovers).toEqual([leftover(1)]);
+  expect(readdirSync(dirname(path)).filter(name => name.endsWith('.tmp') && !name.includes(String(process.pid)))).toEqual([]);
+});

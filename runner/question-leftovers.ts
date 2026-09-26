@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -211,9 +211,12 @@ export class LeftoverLedger {
 
   #write(record: LedgerRecord): void {
     if (!record.leftovers.length && !record.untracked && !record.roots.length) { rmSync(this.path, { force: true }); return; }
-    const temporary = `${this.path}.${process.pid}.tmp`;
-    writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
-    renameSync(temporary, this.path);
+    // A fresh random name, created exclusively: an existing file or planted link at the name is never followed.
+    const temporary = `${this.path}.${randomUUID()}.tmp`;
+    try {
+      writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600, flag: 'wx' });
+      renameSync(temporary, this.path);
+    } catch (error) { rmSync(temporary, { force: true }); throw error; }
   }
 
   /** Add allocations that could not be removed, unnamed failures, and Ask roots that may still hold host copies. */
