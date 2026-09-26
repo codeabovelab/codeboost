@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync } from 'node:fs';
+import { lstatSync, opendirSync, readlinkSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
@@ -109,6 +110,74 @@ export function taskFilesystemAllocationId(filesystems: TaskFilesystems): string
   return allocations.get(filesystems)!.allocationId;
 }
 
+const within = (base: string, path: string) => {
+  const rel = relative(base, path);
+  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
+};
+const LINK_INSPECTION_LIMIT = 200_000;
+// The Linux kernel gives up after 40 link hops (ELOOP); a cycle never resolves, so it cannot reach anything.
+const MAXIMUM_LINK_HOPS = 40;
+/**
+ * Resolve a link as the container kernel will, with the checkout standing for /work. Each existing link along the way
+ * is followed, `..` is applied to the resolved path, and the path must stay inside the checkout after every step.
+ * Components that do not exist here are applied textually: /work mirrors the checkout, so they are missing there too,
+ * and a target the host lacks (such as a container mount under /run) cannot hide an escape.
+ */
+const linkStaysInside = (staging: string, link: string) => {
+  let current = dirname(link), hops = 0, exists = true;
+  const components = readlinkSync(link).split('/');
+  if (components[0] === '') return false;
+  while (components.length) {
+    const component = components.shift()!;
+    if (component === '' || component === '.') continue;
+    current = component === '..' ? dirname(current) : join(current, component);
+    if (!within(staging, current)) return false;
+    if (!exists || component === '..') continue;
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (!stat) { exists = false; continue; }
+    if (!stat.isSymbolicLink()) continue;
+    if (++hops > MAXIMUM_LINK_HOPS) return true;
+    const target = readlinkSync(current);
+    if (target.startsWith('/')) return false;
+    components.unshift(...target.split('/'));
+    current = dirname(current);
+  }
+  return true;
+};
+/**
+ * Refuse a checkout whose symbolic links leave it, or whose Git metadata contains any link. The seeder copies links as
+ * links, so an absolute or escaping link would let a path-restricted agent tool read container files outside the
+ * checkout (for example process environments that hold vendor credentials). Worktree links that stay inside, including
+ * loops and not-yet-existing targets, are allowed.
+ */
+const assertContainedLinks = (staging: string, remaining: () => number) => {
+  const metadata = join(staging, '.git'), pending = [staging];
+  let count = 0;
+  while (pending.length) {
+    remaining();
+    count++;
+    const path = pending.pop()!, stat = lstatSync(path);
+    if (stat.isSymbolicLink()) {
+      const name = JSON.stringify(relative(staging, path));
+      // Git never needs links in its own metadata, which is mounted at /work/.git; refuse any, wherever it points.
+      if (within(metadata, path)) throw new Error(`Repository Git metadata contains a link ${name}.`);
+      if (!linkStaysInside(staging, path)) throw new Error(`Repository link ${name} leaves the checkout.`);
+      continue;
+    }
+    if (!stat.isDirectory()) continue;
+    const directory = opendirSync(path, { bufferSize: 1 });
+    try {
+      for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
+        // Bound time and memory per entry, so one huge directory cannot defer the deadline or the entry limit.
+        remaining();
+        if (count + pending.length >= LINK_INSPECTION_LIMIT)
+          throw new Error('Repository checkout exceeds the link inspection limit.');
+        pending.push(join(path, entry.name));
+      }
+    } finally { directory.closeSync(); }
+  }
+};
+
 /** Allocate bounded, engine-owned task filesystems and keep them mounted. */
 export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimits,
   imageId: string, timeoutMs = 60_000): TaskFilesystems {
@@ -118,6 +187,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   const staging = assertTaskClone(clone), remaining = createDeadline(timeoutMs);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
+  assertContainedLinks(staging, remaining);
   const allocationId = randomUUID();
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;

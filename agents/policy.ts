@@ -93,7 +93,20 @@ export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' |
   | 'infinite-stdout' | 'infinite-stderr' | 'infinite-mixed' | 'ignore-term' | 'symlink-output'
   | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'truncated-utf8-stderr'
   | 'replace-output-directory'
-  | 'nonzero-output' | 'duplicate-protocol' | 'newline-free-deferred-output';
+  | 'nonzero-output' | 'duplicate-protocol' | 'newline-free-deferred-output' | 'scratch-capacity' | 'metadata-alias'
+  | 'hostile-repo';
+
+// `set -e` ignores a failing `! command`, so a negated check could never fail a probe. `deny` exits instead when a
+// forbidden action succeeds, and names the breach. Both streams of the attempted command are discarded, so a breach
+// that succeeds (such as reading a host file) cannot copy its data into the invocation output.
+const deny = 'deny() { if "$@" >/dev/null 2>&1; then echo "isolation breach: $*" >&2; exit 1; fi; }; ';
+// Fill a scratch directory past its byte and inode limits. Each fill must stop early, and must have written first, so
+// an unwritable or missing directory fails the probe instead of passing it vacuously.
+const scratchBounded = (directory: string, megabytes: number, files: number) =>
+  `deny dd if=/dev/zero of="${directory}/overflow" bs=1M count=${megabytes}; test -s "${directory}/overflow"; `
+  + `rm -f "${directory}/overflow"; mkdir "${directory}/many"; i=0; `
+  + `while touch "${directory}/many/$i" 2>/dev/null; do i=$((i+1)); test "$i" -lt ${files}; done; `
+  + `test "$i" -gt 0; test "$i" -lt ${files}; rm -rf "${directory}/many"; `;
 
 /** Fixed startup probes validate the sandbox itself without granting an agent a process tool. */
 export function createIsolationProbeCommand(policy: PhasePolicy, probe: IsolationProbe): AgentCommand {
@@ -102,17 +115,17 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
   const scripts: Record<Exclude<IsolationProbe, 'noop'>, string> = {
     'phase-worktree': policy.worktree === 'read-write'
       ? `set -eu; printf ${phase} > /work/${phase}.txt; test -f /work/${phase}.txt`
-      : `set -eu; ! touch /work/${phase}.txt 2>/dev/null; test ! -e /work/${phase}.txt`,
-    'read-only-isolation': 'set -eu; test "$(id -u)" = 10001; test "$(git status --porcelain)" = ""; '
-      + 'test -z "${HOST_SECRET_SENTINEL:-}"; ! touch /work/forbidden; ! touch /usr/bin/forbidden; '
+      : `${deny}set -eu; deny touch /work/${phase}.txt; test ! -e /work/${phase}.txt`,
+    'read-only-isolation': `${deny}set -eu; test "$(id -u)" = 10001; test "$(git status --porcelain)" = ""; `
+      + 'test -z "${HOST_SECRET_SENTINEL:-}"; deny touch /work/forbidden; deny touch /usr/bin/forbidden; '
       + 'touch /tmp/allowed "$HOME/allowed"; printf isolated',
     'persist-write': 'set -eu; printf generated > /work/generated.txt; touch /tmp/old "$HOME/old"; printf first',
     'persist-read': 'set -eu; test -f /work/generated.txt; test ! -e /tmp/old; test ! -e "$HOME/old"; git status --porcelain',
-    capacity: 'set -eu; ! dd if=/dev/zero of=/work/overflow bs=1M count=32 2>/dev/null; rm -f /work/overflow; '
+    capacity: `${deny}set -eu; deny dd if=/dev/zero of=/work/overflow bs=1M count=32; rm -f /work/overflow; `
       + 'mkdir /work/many; i=0; while touch "/work/many/$i" 2>/dev/null; do i=$((i+1)); test "$i" -lt 2000; done; '
       + 'test "$i" -lt 2000; test "$(find /work/many -type f | wc -l)" -eq "$i"; rm -rf /work/many; printf bounded',
-    metadata: 'set -eu; ! touch /work/.git/forbidden 2>/dev/null; ! ln /work/.git/HEAD /work/metadata-link 2>/dev/null; '
-      + '! mv /work/.git /work/replaced 2>/dev/null; git status --porcelain; printf metadata-safe',
+    metadata: `${deny}set -eu; deny touch /work/.git/forbidden; deny ln /work/.git/HEAD /work/metadata-link; `
+      + 'deny mv /work/.git /work/replaced; git status --porcelain; printf metadata-safe',
     'must-not-run': 'touch /tmp/command-ran',
     'input-marker': 'set -eu; grep -q codeboost-schema-marker /run/codeboost-input/schema.json; '
       + 'test ! -e /run/codeboost-input/extra.json',
@@ -131,6 +144,32 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
     'nonzero-output': 'printf encoded-output; exit 7',
     'duplicate-protocol': "printf '\\036CODEBOOST_START:00000000-0000-0000-0000-000000000000\\036\\n' >&2",
     'newline-free-deferred-output': "printf captured > /run/codeboost-output/final.txt; printf trailing-diagnostic >&2",
+    // Every agent-writable scratch area enforces both its byte and inode ceilings; the control area is not writable.
+    'scratch-capacity': `${deny}set -eu; ${scratchBounded('/tmp', 64, 10000)}${scratchBounded('$HOME', 4, 1000)}`
+      + 'if [ "${CODEBOOST_VENDOR:-}" = codex ]; then test -n "${CODEX_HOME:-}"; '
+      + `${scratchBounded('$CODEX_HOME', 16, 2000)}${scratchBounded('/run/codeboost-output', 64, 1000)}fi; `
+      + 'if [ -d /run/codeboost-control ]; then deny touch /run/codeboost-control/forged; fi; printf scratch-bounded',
+    // Hard links, symlink aliases, truncation and replacement all fail, and the metadata digest is unchanged.
+    'metadata-alias': `${deny}set -eu; `
+      + 'digest() { (cd /work/.git && find . -type f -exec sha256sum {} + | sort | sha256sum); }; before=$(digest); '
+      + 'object=$(find /work/.git/objects -type f | head -n 1); test -n "$object"; '
+      + 'for target in /work /tmp "$HOME"; do deny ln /work/.git/config "$target/config-link"; '
+      + 'deny ln "$object" "$target/object-link"; done; '
+      + 'ln -s /work/.git/config /tmp/config-alias; ln -s "$object" /tmp/object-alias; '
+      + "deny sh -c 'printf x >> /tmp/config-alias'; deny sh -c 'printf x >> /tmp/object-alias'; "
+      + "deny sh -c ': > /work/.git/config'; deny truncate -s 0 /work/.git/config; "
+      + 'deny rm -rf /work/.git; deny mv /work/.git /work/replaced; deny mv /work/.git /tmp/replaced; '
+      + 'test "$(digest)" = "$before"; git status --porcelain > /dev/null; printf metadata-unchanged',
+    // Every repository link in the checkout is relative and resolves inside it, and no host secret is reachable. The
+    // search does not follow links, so a link loop cannot make it walk the whole container.
+    'hostile-repo': `${deny}set -eu; test "$(git status --porcelain)" = ""; `
+      + 'find /work -path /work/.git -prune -o -type l -exec sh -c \'for link; do target=$(readlink "$link"); '
+      + 'case "$target" in /*) echo "isolation breach: absolute link $link" >&2; exit 1;; esac; '
+      // Resolve the target from the link's directory; a cycle never resolves and cannot reach anything.
+      + 'resolved=$(realpath -m "$(dirname "$link")/$target" 2>/dev/null) || continue; '
+      + 'case "$resolved" in /work|/work/*) ;; '
+      + '*) echo "isolation breach: link leaves the checkout $link" >&2; exit 1;; esac; done\' sh {} +; '
+      + 'deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; printf hostile-repo-contained',
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }
