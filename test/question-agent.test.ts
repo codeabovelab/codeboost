@@ -5,7 +5,8 @@ import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, isolateCredentials, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
 const roots: string[] = [];
@@ -127,7 +128,8 @@ it('stops before starting the container once the deadline has passed', async () 
 let attempts = 0;
 const scope = () => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
   attemptId: `attempt-${++attempts}`, contextId: 'c'.repeat(64) });
-const stubWorker = () => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url));
+const stubWorker = () => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), undefined,
+  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' } });
 
 it('returns the worker answer and forwards cancellation, settling only when the worker replies', async () => {
   const worker = stubWorker();
@@ -245,4 +247,14 @@ it('keeps storage whose removal failed, refuses Ask until it is removed, then co
   expect(retained.size).toBe(0);
   // The retained allocation from the first question, then this question's own.
   expect(removed).toHaveLength(2);
+});
+
+it('keeps credentials for the adapters and removes them from the environment other subprocesses inherit', () => {
+  const env: NodeJS.ProcessEnv = { PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', CLAUDE_CODE_OAUTH_TOKEN: 'secret-1',
+    ANTHROPIC_API_KEY: 'secret-2', GITHUB_TOKEN: 'secret-3', SSH_AUTH_SOCK: '/tmp/agent', CODEX_HOME: '/home/codex' };
+  const snapshot = isolateCredentials(env);
+  expect(snapshot).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1', CODEX_HOME: '/home/codex' });
+  expect(env).toEqual({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', CODEX_HOME: '/home/codex' });
+  expect(JSON.stringify(env)).not.toContain('secret');
+  expect(Object.keys(dockerQueryEnvironment()).sort()).toEqual(['DOCKER_HOST', 'PATH']);
 });

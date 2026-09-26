@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { parentPort } from 'node:worker_threads';
 import type { WorkerRequest } from '../../runner/question-worker.ts';
 
@@ -33,6 +34,8 @@ parentPort!.on('message', (message: WorkerRequest) => {
   }
   // Never replies, like a question whose lane D cleanup does not settle.
   if (prompt === 'hang') return;
+  // Blocks the thread in a native subprocess call, like lane D's synchronous Docker and Git setup, then never replies.
+  if (prompt === 'block') { spawnSync('sleep', ['1']); return; }
   if (prompt.startsWith('stuck-path:')) {
     stuckPaths.push(prompt.slice('stuck-path:'.length));
     parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Question container cleanup did not settle.' });

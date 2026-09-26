@@ -37,9 +37,11 @@ export function removeStaging(root: string): void {
 const MAX_LEFTOVERS = 100;
 
 /** Read-only label queries (Docker ANDs label filters, so one query per label). Any failure keeps Ask off. */
+// The same minimal environment lane D gives Docker: no credentials reach these queries.
+export const dockerQueryEnvironment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 export const dockerTaskStorage: ListTaskStorage = async signal => {
   const list = (args: string[]) => new Promise<string[]>((resolve, reject) => execFile('docker', args,
-    { timeout: CHECK_TIMEOUT_MS, signal }, (error, stdout) => error ? reject(error)
+    { timeout: CHECK_TIMEOUT_MS, signal, env: dockerQueryEnvironment() }, (error, stdout) => error ? reject(error)
       : resolve(String(stdout).split('\n').map(line => line.trim()).filter(Boolean))));
   const labels = ['io.codeboost.allocation', 'io.codeboost.invocation', 'io.codeboost.egress'];
   const [containers, volumes, networks] = await Promise.all([

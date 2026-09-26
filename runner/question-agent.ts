@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
-import type { Provider } from './question-container.ts';
+import { questionCredential, type Provider } from './question-container.ts';
 import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
 import type { LeftoverLedger } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
@@ -13,6 +13,8 @@ const RELEASE_TIMEOUT_MS = 30_000;
 // Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled this long after its
 // deadline is abandoned: its resources are recorded as unknown and the worker is stopped.
 const ABANDON_AFTER_DEADLINE_MS = 30_000;
+// Bounds the wait for an abandoned worker thread to stop (a synchronous Docker or Git call finishes first).
+const TERMINATE_WAIT_MS = 15_000;
 
 /** One worker owns every Ask container, so lane D's trusted image and allocations stay in one registry. */
 export class QuestionWorker {
@@ -28,9 +30,11 @@ export class QuestionWorker {
   private ledger?: LeftoverLedger;
   /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
   private abandonAfterMs: number;
+  private env: Readonly<Record<string, string | undefined>>;
   constructor(url = new URL('./question-worker.ts', import.meta.url), ledger?: LeftoverLedger,
-    options: { abandonAfterDeadlineMs?: number } = {}) {
+    options: { abandonAfterDeadlineMs?: number; env?: Readonly<Record<string, string | undefined>> } = {}) {
     this.url = url; this.ledger = ledger; this.abandonAfterMs = options.abandonAfterDeadlineMs ?? ABANDON_AFTER_DEADLINE_MS;
+    this.env = options.env ?? process.env;
   }
   private start(): Worker {
     if (this.crashed) throw this.crashed;
@@ -45,7 +49,7 @@ export class QuestionWorker {
       if (reply.attemptId !== job.attemptId) job.reject(new Error('The agent returned a result for a different question attempt.'));
       else if (reply.ok) job.resolve(reply.text); else job.reject(new Error(reply.error));
     });
-    const fail = (error: Error) => { if (this.worker === worker) this.#abandon(`stopped (${error.message})`); };
+    const fail = (error: Error) => { if (this.worker === worker) void this.#abandon(`stopped (${error.message})`); };
     worker.on('error', fail);
     worker.on('exit', code => fail(new Error(`exit code ${code}`)));
     this.worker = worker;
@@ -56,17 +60,23 @@ export class QuestionWorker {
    * Used after a crash and when lane D does not settle in time. Ask stays off until codeboost restarts, and after
    * the restart until no labelled resources remain.
    */
-  #abandon(why: string) {
+  async #abandon(why: string) {
     const worker = this.worker;
     this.worker = undefined;
     this.crashed ??= new Error(`The agent container worker ${why}. Its containers and storage may still exist, so Ask is off until codeboost restarts. Check \`docker ps -a\` and \`docker volume ls\` before restarting.`);
     // Durable before anything else, so a later kill of this process cannot lose it.
     this.#recordUnknown();
-    for (const job of this.pending.values()) { clearTimeout(job.watchdog); job.reject(this.crashed); }
-    this.pending.clear();
     for (const release of this.releases.values()) release(null);
     this.releases.clear();
-    void worker?.terminate();
+    // Keep the questions (and their slots) pending until the thread has stopped: a synchronous Docker or Git call
+    // in progress finishes first. Asynchronous children it leaves are covered by the unknown-leftover record.
+    if (worker) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      await Promise.race([worker.terminate().catch(() => undefined), new Promise(resolve => { timer = setTimeout(resolve, TERMINATE_WAIT_MS); })]);
+      clearTimeout(timer);
+    }
+    for (const job of this.pending.values()) { clearTimeout(job.watchdog); job.reject(this.crashed); }
+    this.pending.clear();
   }
   #recordUnknown() {
     try { this.ledger?.record([], 1); }
@@ -75,6 +85,8 @@ export class QuestionWorker {
   agent(provider: Provider): QuestionAgent {
     return async (prompt, signal, scope, timeoutMs) => {
       if (this.crashed) throw this.crashed;
+      // Missing sign-in is reported before any Docker work, including the leftover scan.
+      questionCredential(provider, this.env);
       // The first question of a process also scans for labelled leftovers when there is no record.
       await this.ledger?.assertClear(signal, { startup: !this.scanned });
       this.scanned = true;
@@ -90,7 +102,7 @@ export class QuestionWorker {
       const id = randomUUID();
       const question = { ...scope, provider, prompt,
         deadline: Date.now() + Math.max(1_000, (timeoutMs ?? 120_000) - SETTLE_MARGIN_MS) };
-      const watchdog = setTimeout(() => { if (this.pending.has(id)) this.#abandon('did not settle a question after its deadline'); },
+      const watchdog = setTimeout(() => { if (this.pending.has(id)) void this.#abandon('did not settle a question after its deadline'); },
         question.deadline - Date.now() + this.abandonAfterMs);
       watchdog.unref?.();
       this.pending.set(id, { attemptId: scope.attemptId, resolve, reject, watchdog });
@@ -109,7 +121,7 @@ export class QuestionWorker {
     const worker = this.worker;
     if (!worker) return;
     // Questions still waiting mean lane D has not settled; do not wait on it at shutdown.
-    if (this.pending.size) { this.#abandon('was stopped at shutdown with questions still settling'); return; }
+    if (this.pending.size) { await this.#abandon('was stopped at shutdown with questions still settling'); return; }
     const id = randomUUID();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const released = await new Promise<Omit<ReleaseReply, 'id'> | null>(resolve => {

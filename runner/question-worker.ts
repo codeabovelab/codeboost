@@ -5,7 +5,7 @@ import { captureInvocation } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { askInContainer, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
+import { askInContainer, isolateCredentials, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
 import type { Leftover } from './question-leftovers.ts';
 
 // Lane D setup is synchronous (Docker and Git calls), so it runs here instead of blocking the review server.
@@ -16,6 +16,8 @@ export type WorkerReply = { id: string; attemptId: string; ok: true; text: strin
 /** Reply to `release`: allocations still not removed after a final attempt. */
 export type ReleaseReply = { id: string; remaining: Leftover[]; untracked: number; paths: string[] };
 
+// Worker threads get their own copy of process.env; after this, only the adapters receive credentials.
+const credentials = isolateCredentials(process.env);
 const deps: ContainerDependencies = {
   buildImage: buildAgentImage,
   createClone: createTaskClone,
@@ -24,7 +26,7 @@ const deps: ContainerDependencies = {
   capture: input => captureInvocation(input),
   startClaude: startClaudeInvocation,
   startCodex: startCodexInvocation,
-  env: process.env,
+  env: credentials,
 };
 const image: { id?: string } = {};
 const retained = new RetainedStorage();

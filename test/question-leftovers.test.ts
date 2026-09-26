@@ -83,8 +83,9 @@ it('keeps Ask off after an unidentifiable leftover until no labelled task storag
   expect(existsSync(path)).toBe(false);
 });
 
-const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number } = {}) =>
-  new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), ledger, options);
+const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number; env?: Record<string, string> } = {}) =>
+  new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), ledger,
+    { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' }, ...options });
 const scope = (n: number) => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
   attemptId: `leftover-attempt-${n}`, contextId: 'c'.repeat(64) });
 
@@ -219,4 +220,30 @@ it('refuses a record that names a path outside Ask staging', async () => {
   const path = ledgerPath();
   writeFileSync(path, JSON.stringify({ leftovers: [], untracked: 0, paths: ['/home/user'] }));
   await expect(new LeftoverLedger(path, docker(new Set())).assertClear()).rejects.toThrow('unreadable');
+});
+
+it('reports a missing sign-in before any Docker query', async () => {
+  let scans = 0;
+  const worker = stubWorker(new LeftoverLedger(ledgerPath(), async () => { scans++; throw new Error('Docker is down'); }), { env: {} });
+  try {
+    await expect(worker.agent('claude')('answer', new AbortController().signal, scope(16), 60_000)).rejects.toThrow('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(scans).toBe(0);
+  } finally { await worker.close(); }
+});
+
+it('keeps an abandoned question pending until its worker thread has stopped', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())));
+  let settledAt = 0;
+  const blocked = worker.agent('claude')('block', new AbortController().signal, scope(17), 60_000)
+    .catch((error: Error) => { settledAt = Date.now(); return error; });
+  await expect.poll(async () => (worker as unknown as { pending: Map<string, unknown> }).pending.size).toBe(1);
+  // Give the stub time to enter its one-second native call before shutdown abandons it.
+  await new Promise(resolve => setTimeout(resolve, 200));
+  const started = Date.now();
+  await worker.close();
+  expect(((await blocked) as Error).message).toContain('stopped at shutdown');
+  // The thread could not stop before the native call returned, and the question stayed pending until then.
+  expect(settledAt - started).toBeGreaterThanOrEqual(500);
+  expect(read(path)).toEqual({ leftovers: [], untracked: 1, paths: [] });
 });

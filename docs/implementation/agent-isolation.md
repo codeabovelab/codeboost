@@ -99,6 +99,10 @@ Ask keeps the contract's identity and cleanup rules:
 - The invocation's `attemptId` is the answer attempt that `Questions` saved, and `referencedCodeHash` is the note's
   `contextId` (the hash of the code assigned to its plan item). An answer is accepted only when the result and the
   worker reply carry that attempt and the captured context. The Store then compares the attempt before saving it.
+- The worker takes a credential snapshot for the adapters, then removes credential-like variables from its own
+  environment, so the image build, clone and other setup subprocesses never inherit them. The leftover Docker
+  queries use the same minimal environment as lane D (`PATH`, `DOCKER_HOST`). Missing sign-in is reported before
+  any Docker work.
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.
@@ -123,7 +127,8 @@ Ask keeps the contract's identity and cleanup rules:
   process running Ask at the same moment also keeps this one off.
 - Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
-  records unknown leftovers, rejects the waiting questions and stops the worker, so shutdown cannot hang on D.
+  records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
+  finishes first), then rejects the waiting questions, so shutdown cannot hang on D.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
   while any `io.codeboost.task-storage` container or volume exists. Reclaiming those leftovers after a crash or restart

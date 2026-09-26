@@ -77,6 +77,18 @@ export const QUESTION_STORAGE: TaskStorageLimits = Object.freeze({
 // The profile requires exactly one read-only schema.json in the input mount. Answers are plain text.
 const ANSWER_SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost question answer","type":"string"}\n';
 
+// Names that may hold credentials. Setup and cleanup subprocesses must never see them.
+const CREDENTIAL_NAME = /TOKEN|SECRET|PASSWORD|PASSWD|API_?KEY|CREDENTIAL|AUTH/i;
+/**
+ * Take the credential snapshot the adapters need, then remove credential variables from `env` (the worker's own
+ * `process.env`), so the image build, clone and other non-adapter subprocesses that inherit it cannot read them.
+ */
+export function isolateCredentials(env: NodeJS.ProcessEnv): Readonly<Record<string, string | undefined>> {
+  const snapshot = Object.freeze({ ...env });
+  for (const name of Object.keys(env)) if (CREDENTIAL_NAME.test(name)) delete env[name];
+  return snapshot;
+}
+
 export function questionCredential(provider: Provider, env: ContainerDependencies['env']): string {
   if (provider === 'claude') {
     const token = env.CLAUDE_CODE_OAUTH_TOKEN;
