@@ -98,7 +98,8 @@ export class QuestionWorker {
     // in progress finishes first. Asynchronous children it leaves are covered by the unknown-leftover record.
     if (worker) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const termination = worker.terminate().then(() => true, () => true);
+      // A rejected terminate() proves nothing about the thread: only a settled termination counts as stopped.
+      const termination = worker.terminate().then(() => true, () => false);
       const stopped = await Promise.race([termination,
         new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), this.terminateWaitMs); })]);
       clearTimeout(timer);
@@ -107,7 +108,7 @@ export class QuestionWorker {
       // admits no new question, so the waiters can be released; the root is deleted once the thread does stop.
       const root = this.root;
       if (stopped) this.#removeRoot();
-      else void termination.then(() => { if (this.root === root) this.#removeRoot(); });
+      else void termination.then(ended => { if (ended && this.root === root) this.#removeRoot(); });
     }
     for (const job of this.pending.values()) { clearTimeout(job.watchdog); job.reject(this.crashed); }
     this.pending.clear();

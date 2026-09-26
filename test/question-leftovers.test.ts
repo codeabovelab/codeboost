@@ -590,3 +590,21 @@ it('keeps the root recorded when the final release report cannot be saved', asyn
   expect(lockFree(path)).toBe(true);
   rmSync(root, { recursive: true, force: true });
 });
+
+it('keeps the root recorded and the lock held when terminating an abandoned worker fails', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())));
+  const hanging = worker.agent('claude')('hang', new AbortController().signal, scope(40), 60_000).catch((error: Error) => error);
+  const internals = worker as unknown as { pending: Map<string, unknown>; worker: import('node:worker_threads').Worker };
+  await expect.poll(() => internals.pending.size).toBe(1);
+  const thread = internals.worker;
+  const terminate = thread.terminate.bind(thread);
+  thread.terminate = () => Promise.reject(new Error('terminate failed'));
+  await worker.close();
+  expect(((await hanging) as Error).message).toContain('stopped at shutdown');
+  const [root] = read(path).roots;
+  expect(existsSync(root)).toBe(true);
+  expect(lockFree(path)).toBe(false);
+  await terminate();
+  rmSync(root, { recursive: true, force: true });
+});
