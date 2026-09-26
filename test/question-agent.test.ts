@@ -303,3 +303,24 @@ it('measures the checkout at the reviewed head and the object store with Git', (
   expect(size.objectBytes).toBeGreaterThan(0);
   expect(() => measureGitRepository(repo, 'not-a-sha', 10_000)).toThrow('Invalid reviewed head');
 });
+
+it('does not start an Ask for a question whose request finishes arriving after shutdown began', async () => {
+  const { createDemo } = await import('../scripts/demo.ts');
+  const { startServer } = await import('../web/server.ts');
+  const { request } = await import('node:http');
+  const root = mkdtempSync(join(tmpdir(), 'ask-shutdown-')); roots.push(root);
+  let asked = 0;
+  const app = await startServer(createDemo(join(root, 'demo')), 0, async () => { asked++; return 'Answer'; });
+  const view = app.service.load();
+  const body = JSON.stringify({ action: 'note', item: view.items[0]!.id, kind: 'question', text: 'Why?', token: view.token });
+  const completed = new Promise<number>((resolve, reject) => {
+    const req = request(new URL('/api/action', app.url), { method: 'POST', headers: { 'x-codeboost-token': app.token,
+      'content-type': 'application/json', 'content-length': Buffer.byteLength(body) } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode ?? 0)); });
+    req.on('error', reject);
+    req.write(body.slice(0, 1));
+    setTimeout(() => req.end(body.slice(1)), 50);
+  });
+  await new Promise(resolve => setTimeout(resolve, 10));
+  await Promise.all([app.close(), completed.catch(() => 0)]);
+  expect(asked).toBe(0);
+}, 30_000);

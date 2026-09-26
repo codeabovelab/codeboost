@@ -32,6 +32,18 @@ export class Questions {
     this.worker=new QuestionWorker(undefined,LeftoverLedger.forDatabase(service.config.database));
   }
   isRunning(id: string) { return this.running.has(id); }
+  get stopping() { return this.closing; }
+  /**
+   * A question saved by a request that was admitted before shutdown began: no agent (and no container worker) starts,
+   * but it gets a retryable failed answer, as it would had shutdown cancelled it.
+   */
+  markStopped(id: string, view: ReturnType<ReviewService['load']>) {
+    const note = view.notes.find(n=>n.id===id && n.kind==='question');
+    if (!note || note.answer || this.running.has(id)) return;
+    const attempt=randomUUID();
+    this.service.store.beginAnswer(this.service.config.identity,id,attempt,this.service.store.questionProvider()??undefined,note.contextId);
+    this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:'Server stopped. Retry the question.'});
+  }
   start(id: string, view: ReturnType<ReviewService['load']>) {
     if (this.closing) throw new Error('Server is stopping. Reconnect before asking again.');
     if (this.running.has(id)) throw new Error('Agent is already answering this question.');
@@ -64,6 +76,8 @@ export class Questions {
     });
     this.running.set(id,{controller,done:settled});
   }
+  /** Refuse new questions from now on. The server calls this in the same turn that shutdown begins. */
+  stopAdmission() { this.closing = true; }
   async close() {
     this.closing = true;
     for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));

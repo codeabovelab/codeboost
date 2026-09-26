@@ -207,7 +207,13 @@ export class QuestionWorker {
     // which records unknown leftovers and keeps the root recorded until the thread has stopped.
     if (released === null) { await this.#abandon('did not report its storage before shutdown'); return; }
     this.worker = undefined;
-    try { this.ledger?.record(released.remaining, released.untracked); }
-    finally { await worker.terminate(); this.#removeRoot(); }
+    let recorded = false;
+    try { this.ledger?.record(released.remaining, released.untracked); recorded = true; }
+    finally {
+      await worker.terminate();
+      // The root is the durable evidence of this worker: delete it only once the release report is saved. Otherwise
+      // it stays recorded (from start()), and Docker leftovers are still caught by the startup label scan.
+      if (recorded) this.#removeRoot();
+    }
   }
 }

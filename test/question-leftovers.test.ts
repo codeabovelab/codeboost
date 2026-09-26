@@ -572,3 +572,19 @@ it('never follows a link planted at a temporary name when writing the record', (
   expect(read(path).leftovers).toEqual([leftover(1)]);
   expect(readdirSync(dirname(path)).filter(name => name.endsWith('.tmp') && !name.includes(String(process.pid)))).toEqual([]);
 });
+
+it('keeps the root recorded when the final release report cannot be saved', async () => {
+  const path = ledgerPath();
+  const ledger = new LeftoverLedger(path, docker(new Set()));
+  const worker = stubWorker(ledger);
+  expect(await worker.agent('claude')('leak', new AbortController().signal, scope(39), 60_000).catch(() => 'failed')).toBe('failed');
+  const [root] = read(path).roots;
+  const original = ledger.record.bind(ledger);
+  ledger.record = () => { throw new Error('disk full'); };
+  await expect(worker.close()).rejects.toThrow('disk full');
+  ledger.record = original;
+  // Nothing was lost: the root stays on disk and in the record for the next session to reclaim.
+  expect(existsSync(root)).toBe(true);
+  expect(read(path).roots).toEqual([root]);
+  rmSync(root, { recursive: true, force: true });
+});

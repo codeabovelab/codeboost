@@ -109,3 +109,12 @@ it('marks an item-level attempt historical and rejects retry when assigned code 
  expect(changed.snapshot.id).toBe(asked.snapshot.id);expect(note.answerOutdated).toBe(true);
  expect(()=>manager.start(note.id,changed)).toThrow(/older review/);expect(agent).toHaveBeenCalledTimes(1);
 });
+it('refuses new questions once admission has stopped, before close() runs',()=>{
+ const service=fixture(),asked=question(service);const manager=new Questions(service,async()=>'Answer');managers.push(manager);
+ manager.stopAdmission();
+ expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow('Server is stopping');
+ expect(manager.isRunning(asked.createdNoteId!)).toBe(false);
+ expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toBeUndefined();
+ manager.markStopped(asked.createdNoteId!,service.load());
+ expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toMatchObject({status:'failed',error:'Server stopped. Retry the question.'});
+});

@@ -81,7 +81,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const view=service.act(input);
         if(view.createdNoteId && input.kind==='question') {
           try {questions.start(view.createdNoteId,view);} catch(error) {
-            // The saved question remains visible and retryable when capacity is reached.
+            // The saved question remains visible and retryable when capacity is reached. If shutdown began while this
+            // request was arriving, no agent starts; the question gets a retryable "Server stopped" answer instead.
+            if (questions.stopping) questions.markStopped(view.createdNoteId,service.load());
           }
         }
         json(200,await load(requestAbort.signal));return;
@@ -104,6 +106,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Cannot determine local address.');
   return { server, service, token, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     stopping = true;
+    // Same turn as the admission flag: a request already reading its body must not start a new Ask worker.
+    questions.stopAdmission();
     const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     let timer: ReturnType<typeof setTimeout> | undefined;
     await Promise.race([closing, new Promise<void>(resolve => { timer=setTimeout(resolve,shutdownDrainMs); })]);
