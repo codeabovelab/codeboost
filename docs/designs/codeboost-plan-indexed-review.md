@@ -27,7 +27,7 @@ Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel bui
 - **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
 - **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. One exception exists today: Ask still runs the agent CLI on your computer with its tools turned off, until lane F moves it into the container (see "Keeping unattended runs safe"). codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
-- **Where the build is.** Built: the plan and linking library, the SQLite store, the review screen with Ask and change requests, the guarded merge gate with merge-queue support, and the agent isolation boundary (containers, vendor-only network, Claude and Codex adapters). Not built yet: the runner that uses that boundary, rebasing, `cmd:` execution, and the Planning, Issues, Queue, Lessons and Learning screens. Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
+- **Where the build is.** Built: the plan and linking library, the SQLite store, the review screen with Ask and change requests, the guarded merge gate with merge-queue support, and the agent isolation boundary (containers, vendor-only network, Claude and Codex adapters). Not built yet: the runner that uses that boundary, rebasing, `cmd:` execution, and the Planning, Queue, Lessons and Learning screens (the ranked Issues screen is built). Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
 
 ## Terms used
 
@@ -570,7 +570,7 @@ The numbers below identify delivery milestones, not a requirement to implement t
 5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6). Isolation boundary merged (lane D, PRs #31, #40, #44, #47, #50); the runner (lane F) is next.
 6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3). Backend in progress (lane E); no screen yet.
 7. **Queue, schedule, and recovery** (steps 4 and 5).
-8. **Issue list, sorted by how critical each issue is** (step 1). Ranking backend merged (H1–H3); no screen yet.
+8. **Issue list, sorted by how critical each issue is** (step 1). Ranking backend (H1–H3) and the Issues screen (H4a, #55) merged; the "trust this issue" action (H4b) remains.
 9. **Learning from your feedback** (step 10): lessons, the Lessons inbox, and the Learning screen. It needs the reject loop from steps 4 to 7.
 
 ### Build step 4: scope and progress
@@ -652,7 +652,7 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## What to do next
 
-1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), and the agent isolation boundary (D1–D5).
+1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), the agent isolation boundary (D1–D5), the runner lifecycle contract (F1) and the Issues screen (H4a).
 2. Finish the open lane PRs listed in "Lane status", then continue the roadmap from the current open issues; the cancelled experiment is not a prerequisite.
 3. Optionally run the non-blocking human validation tracked in #19.
 4. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before implementing code-writing agents if anything in those areas changes.
@@ -1893,7 +1893,7 @@ Critical gaps (no test, no handling, and silent): 0.
 
 **Scheduling decision (2026-09-24).** Run up to three implementation tasks concurrently in separate feature branches and worktrees. The foundation and review screen are the baseline, not new assignments. Recheck current main, open PRs, and existing implementations before taking a lane; unchecked historical T-items are not proof that their code is missing. These lanes authorize a development schedule, not simultaneous task execution in the shipped runner.
 
-#### Lane status (checked 2026-09-26)
+#### Lane status (checked 2026-09-26, after #55)
 
 This table records merged and open PRs only. A lane is complete only when every step meets its acceptance criteria on `main`.
 
@@ -1903,9 +1903,9 @@ This table records merged and open PRs only. A lane is complete only when every 
 | C — guarded merge gate | C1–C4 (PR #23) | — | Done. Remaining build step 4 work belongs to F (#22) |
 | D — agent isolation | D1 (#31), D2 (#40), D3 (#44), D4 (#47), D5 (#50); gate in `docs/implementation/agent-isolation.md` | — | Done. F, G4 and live planning may now use the boundary; F also moves Ask into it |
 | E — planning logic | E1 (#30), E2 (#32), E3 (#35), suggestion lifecycle bindings (#43) | E4 #45 (draft; replaces #37) | Finish E4 with real recordings |
-| F — runner | — | F1 #49 (lifecycle and state-holder contract, for review) | Review and land F1, then F2 |
+| F — runner | F1 contract (#49, `docs/implementation/runner-lifecycle.md`) | F1a #53 (Store lifecycle), F1b #56 (coordinator), F1c #57 (shutdown wiring, `/api/runner`) | Land F1a–F1c, then F2 |
 | G — planning screen | — | — | G1 after E4 |
-| H — issue prioritization | H1–H3 (#39), trust fix #42 (issue #41) | — | H4 after G4 releases web files |
+| H — issue prioritization | H1–H3 (#39), trust fix #42 (issue #41), H4a Issues screen (#55) | — | H4b: the "trust this issue" action, which needs Store persistence through F after F1a |
 | I, J | — | — | After F6 |
 | K — merge-queue compatibility | K1 (#38), K2–K3 (#46, closes #24); see `docs/implementation/merge-queue.md` | — | Done |
 
@@ -1953,7 +1953,7 @@ Read each row left to right: finish and validate step 1 before step 2 within tha
 |---|---|---|---|
 | F — runner and pre-merge automation | C and D merged; invocation contract available | Build step 5 runner plus #22 / remaining build step 4; T3, T6, T11. Own `runner/`, rebase helpers and shared acceptance persistence during this wave. | Preserve ledger attribution through rebase; recompute approval staleness; execute and persist head-bound checks; cover timeout, cancellation, shutdown and collaborator-push races; complete #22 acceptance. |
 | G — planning screen | E merged; C releases shared UI files | Build step 6 UI and T18 integration. Own `web/` and dedicated browser tests during this wave. Route persistence changes through F. UI work can use controlled provider fixtures until D is available. | Import, generation and Apply preserve user drafts and attachments and reject stale/replayed suggestions. Final completion requires real D-backed invocation and integration with F/store, not fixtures alone. |
-| H — issue prioritization | Done: access contract inspected and ranking policy recorded in `docs/implementation/issue-prioritization.md` (H1); H2–H3 merged (#39, #42) | Build step 8: issue-fetch/normalization and ranking modules with dedicated tests. Shared shell/navigation integration waits for G. | Stable ranking with a visible reason per issue; unavailable/stale data has explicit states. Ranking policy decided in H1; H4 (the Issues screen) remains. |
+| H — issue prioritization | Done: access contract inspected and ranking policy recorded in `docs/implementation/issue-prioritization.md` (H1); H2–H3 merged (#39, #42); H4a Issues screen merged (#55) | Build step 8: issue-fetch/normalization and ranking modules with dedicated tests. Shared shell/navigation integration waits for G. | Stable ranking with a visible reason per issue; unavailable/stale data has explicit states. Ranking policy decided in H1; Issues screen merged in #55 (H4a); H4b trust action remains. |
 
 F, G and H can proceed together within these ownership boundaries. If F and G need an incompatible shared storage/API change, land that small prerequisite first; neither edits the other's files in parallel. Merge independent backend modules first, then their shared integration, and rerun checks on the combined head.
 
@@ -2163,7 +2163,7 @@ Built from this review's decisions. Tick each one as you ship it.
 
 **Status (checked against `main` on 2026-09-26).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
 - Built: two-tab composer and "n pending changes" tags (part of DT4); the notice below 1280px (part of DT13); the `?` shortcut help (part of DT12); a blocker list from the guarded merge gate (part of DT7).
-- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Issues, Plans, Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 6 to 9); Lessons inbox and Learning screen (DT14, DT15, build step 9).
+- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Plans, Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 6 to 9; Issues became a link in #55); Lessons inbox and Learning screen (DT14, DT15, build step 9).
 - Not yet audited against their Verify lines: DT2, DT3, DT5, DT6, DT9, DT10, DT11.
 - File paths in the DTs (`web/review`, `web/shell` and others) are proposed names. Today all UI code is in `web/public/`.
 
