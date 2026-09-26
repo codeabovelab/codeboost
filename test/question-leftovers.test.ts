@@ -75,22 +75,24 @@ it('keeps Ask off after an unidentifiable leftover until no labelled task storag
   const names = new Set(['codeboost-work-unrelated']);
   const ledger = new LeftoverLedger(path, docker(names));
   ledger.record([], 1);
-  await expect(ledger.assertClear()).rejects.toThrow('label=io.codeboost.task-storage');
+  await expect(ledger.assertClear()).rejects.toThrow('label=io.codeboost.allocation');
   expect(read(path)).toEqual({ leftovers: [], untracked: 1 });
   names.clear();
   await expect(ledger.assertClear()).resolves.toBeUndefined();
   expect(existsSync(path)).toBe(false);
 });
 
-const stubWorker = (ledger: LeftoverLedger) => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), ledger);
+const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number } = {}) =>
+  new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), ledger, options);
 const scope = (n: number) => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
   attemptId: `leftover-attempt-${n}`, contextId: 'c'.repeat(64) });
 
 it('records storage the worker still owns at shutdown, and the next session refuses Ask until it is removed', async () => {
   const path = ledgerPath();
-  const names = new Set(['codeboost-keeper-1', 'codeboost-work-1', 'codeboost-meta-1']);
+  const names = new Set<string>();
   const first = stubWorker(new LeftoverLedger(path, docker(names)));
   await expect(first.agent('claude')('leak', new AbortController().signal, scope(1), 60_000)).rejects.toThrow('cleanup did not settle');
+  for (const name of Object.values(leftover(1))) names.add(name);
   await first.close();
   expect(read(path)).toEqual({ leftovers: [leftover(1)], untracked: 0 });
 
@@ -105,7 +107,7 @@ it('records storage the worker still owns at shutdown, and the next session refu
 
 it('carries an untracked setup failure from the worker into the record at shutdown', async () => {
   const path = ledgerPath();
-  const first = stubWorker(new LeftoverLedger(path, docker(new Set(['codeboost-work-x']))));
+  const first = stubWorker(new LeftoverLedger(path, docker(new Set())));
   await expect(first.agent('claude')('lose-setup', new AbortController().signal, scope(5), 60_000)).rejects.toThrow('cleanup did not settle');
   await first.close();
   expect(read(path)).toEqual({ leftovers: [], untracked: 1 });
@@ -113,7 +115,7 @@ it('carries an untracked setup failure from the worker into the record at shutdo
 
 it('records unknown leftovers as soon as the worker crashes', async () => {
   const path = ledgerPath();
-  const worker = stubWorker(new LeftoverLedger(path, docker(new Set(['codeboost-work-x']))));
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())));
   try {
     await expect(worker.agent('claude')('crash', new AbortController().signal, scope(6), 60_000)).rejects.toThrow('worker stopped');
     expect(read(path)).toEqual({ leftovers: [], untracked: 1 });
@@ -128,4 +130,51 @@ it('writes no record when nothing was left behind', async () => {
   expect(await worker.agent('claude')('answer', new AbortController().signal, scope(4), 60_000)).toBe('claude:answer:n');
   await worker.close();
   expect(existsSync(path)).toBe(false);
+});
+
+it('scans for labelled leftovers on the first question even without a record, including networks', async () => {
+  const path = ledgerPath();
+  let storage = { containers: new Set<string>(), volumes: new Set<string>(), networks: new Set(['codeboost-egress-1']) };
+  const worker = stubWorker(new LeftoverLedger(path, async () => storage));
+  try {
+    await expect(worker.agent('claude')('answer', new AbortController().signal, scope(7), 60_000)).rejects.toThrow('1 labelled resource found');
+    expect(read(path)).toEqual({ leftovers: [], untracked: 1 });
+    storage = { containers: new Set(), volumes: new Set(), networks: new Set() };
+    expect(await worker.agent('claude')('answer', new AbortController().signal, scope(8), 60_000)).toBe('claude:answer:n');
+    expect(existsSync(path)).toBe(false);
+  } finally { await worker.close(); }
+});
+
+it('scans only once per process, so its own later storage does not block Ask', async () => {
+  const path = ledgerPath();
+  let scans = 0;
+  const worker = stubWorker(new LeftoverLedger(path, async () => { scans++; return { containers: new Set(), volumes: new Set() }; }));
+  try {
+    await worker.agent('claude')('answer', new AbortController().signal, scope(9), 60_000);
+    await worker.agent('claude')('answer', new AbortController().signal, scope(10), 60_000);
+    expect(scans).toBe(1);
+  } finally { await worker.close(); }
+});
+
+it('abandons a question that does not settle after its deadline, recording unknown leftovers', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())), { abandonAfterDeadlineMs: 50 });
+  try {
+    // Deadline is at least one second; the stub never replies.
+    await expect(worker.agent('claude')('hang', new AbortController().signal, scope(11), 1_000)).rejects.toThrow('did not settle');
+    expect(read(path)).toEqual({ leftovers: [], untracked: 1 });
+    await expect(worker.agent('claude')('answer', new AbortController().signal, scope(12), 60_000)).rejects.toThrow('Ask is off until codeboost restarts');
+  } finally { await worker.close(); }
+});
+
+it('does not wait on unsettled questions at shutdown', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())));
+  const hanging = worker.agent('claude')('hang', new AbortController().signal, scope(13), 60_000).catch((error: Error) => error);
+  await expect.poll(async () => (worker as unknown as { pending: Map<string, unknown> }).pending.size).toBe(1);
+  const started = Date.now();
+  await worker.close();
+  expect(Date.now() - started).toBeLessThan(5_000);
+  expect(((await hanging) as Error).message).toContain('stopped at shutdown');
+  expect(read(path)).toEqual({ leftovers: [], untracked: 1 });
 });

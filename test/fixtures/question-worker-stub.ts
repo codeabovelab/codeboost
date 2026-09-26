@@ -30,6 +30,8 @@ parentPort!.on('message', (message: WorkerRequest) => {
     parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Task allocation failed and cleanup did not settle.' });
     return;
   }
+  // Never replies, like a question whose lane D cleanup does not settle.
+  if (prompt === 'hang') return;
   if (prompt === 'wait') { waiting.set(message.id, attemptId); return; }
   // Simulates a reply that carries another attempt's identity.
   const replied = prompt === 'wrong-attempt' ? `${attemptId}-other` : attemptId;

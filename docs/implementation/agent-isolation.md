@@ -104,8 +104,9 @@ Ask keeps the contract's identity and cleanup rules:
   question, and refuses Ask while any removal is unconfirmed.
 - At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
   anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
-  Ask stays off while any recorded container or volume still exists. The check is two read-only label queries
-  (`docker ps` and `docker volume ls`) with a 15-second limit, and the question can cancel it. The refusal shows
+  Ask stays off while any recorded container or volume still exists. The check is read-only label queries
+  (`docker ps`, `docker volume ls` and `docker network ls` for `io.codeboost.allocation`, `io.codeboost.invocation`
+  and `io.codeboost.egress`) with one 15-second limit, and the question can cancel it. The refusal shows
   `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
   they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
   at shutdown keeps Ask off. Entries beyond the record's cap of 100 count as unidentified, never dropped. Removal goes through D only once D has
@@ -114,6 +115,12 @@ Ask keeps the contract's identity and cleanup rules:
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
   allocation IDs (#51 item 3) would let Ask name these resources instead.
+- The first question of each process runs that scan even without a record, because a process killed before it
+  could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
+  process running Ask at the same moment also keeps this one off.
+- Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled 30 seconds after its
+  deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
+  records unknown leftovers, rejects the waiting questions and stops the worker, so shutdown cannot hang on D.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
   while any `io.codeboost.task-storage` container or volume exists. Reclaiming those leftovers after a crash or restart

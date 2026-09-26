@@ -6,6 +6,7 @@ import type { QuestionScope } from './question-container.ts';
 import type { ReviewNote } from './store.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal, scope?: QuestionScope, timeoutMs?: number) => Promise<string>;
 const QUESTION_TIMEOUT_MS = 120_000;
+const SHUTDOWN_SETTLE_MS = 20_000;
 export function questionPrompt(view: ReturnType<ReviewService['load']>, note: ReviewNote): string {
   let remaining = 100_000;
   const changes = view.segments.filter(s => s.row === note.item).map(s => {
@@ -63,5 +64,16 @@ export class Questions {
     });
     this.running.set(id,{controller,done:settled});
   }
-  async close() {this.closing = true;for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));await Promise.all([...this.running.values()].map(job=>job.done));await this.worker.close();}
+  async close() {
+    this.closing = true;
+    for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));
+    const settled=Promise.all([...this.running.values()].map(job=>job.done));
+    // Lane D may never settle (#51 item 1). After the grace period the worker is abandoned, which records its
+    // allocations as unknown and rejects the waiting questions, so shutdown cannot hang here.
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const graceful=await Promise.race([settled.then(()=>true),new Promise<false>(resolve=>{timer=setTimeout(()=>resolve(false),SHUTDOWN_SETTLE_MS);})]);
+    clearTimeout(timer);
+    await this.worker.close();
+    if(!graceful) await Promise.race([settled,new Promise(resolve=>setTimeout(resolve,1_000))]);
+  }
 }

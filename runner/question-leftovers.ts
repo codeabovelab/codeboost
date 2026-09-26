@@ -7,8 +7,15 @@ export interface Leftover {
   readonly workVolume: string;
   readonly metadataVolume: string;
 }
-/** Names of the containers and volumes that carry lane D's task-storage label. */
-export interface TaskStorage { readonly containers: ReadonlySet<string>; readonly volumes: ReadonlySet<string> }
+/**
+ * Names of Docker resources that lane D labels as its own: task storage and the seeder (`io.codeboost.allocation`),
+ * agent containers (`io.codeboost.invocation`), and egress proxies and networks (`io.codeboost.egress`).
+ */
+export interface TaskStorage {
+  readonly containers: ReadonlySet<string>;
+  readonly volumes: ReadonlySet<string>;
+  readonly networks?: ReadonlySet<string>;
+}
 export type ListTaskStorage = (signal: AbortSignal) => Promise<TaskStorage>;
 interface LedgerRecord { leftovers: Leftover[]; untracked: number }
 
@@ -17,16 +24,19 @@ const CHECK_TIMEOUT_MS = 15_000;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
 const MAX_LEFTOVERS = 100;
 
-/** Two read-only label queries. Any failure rejects, so an unreachable daemon keeps Ask off. */
+/** Read-only label queries (Docker ANDs label filters, so one query per label). Any failure keeps Ask off. */
 export const dockerTaskStorage: ListTaskStorage = async signal => {
-  const list = (args: string[]) => new Promise<Set<string>>((resolve, reject) => execFile('docker', args,
+  const list = (args: string[]) => new Promise<string[]>((resolve, reject) => execFile('docker', args,
     { timeout: CHECK_TIMEOUT_MS, signal }, (error, stdout) => error ? reject(error)
-      : resolve(new Set(String(stdout).split('\n').map(line => line.trim()).filter(Boolean)))));
-  const [containers, volumes] = await Promise.all([
-    list(['ps', '-a', '--format', '{{.Names}}', '--filter', 'label=io.codeboost.task-storage']),
-    list(['volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.task-storage'])]);
-  return { containers, volumes };
+      : resolve(String(stdout).split('\n').map(line => line.trim()).filter(Boolean))));
+  const labels = ['io.codeboost.allocation', 'io.codeboost.invocation', 'io.codeboost.egress'];
+  const [containers, volumes, networks] = await Promise.all([
+    Promise.all(labels.map(label => list(['ps', '-a', '--format', '{{.Names}}', '--filter', `label=${label}`]))),
+    list(['volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation']),
+    list(['network', 'ls', '--format', '{{.Name}}', '--filter', 'label=io.codeboost.egress'])]);
+  return { containers: new Set(containers.flat()), volumes: new Set(volumes), networks: new Set(networks) };
 };
+const LABELLED = 'docker ps -a, docker volume ls and docker network ls, each with --filter label=io.codeboost.allocation, label=io.codeboost.invocation or label=io.codeboost.egress';
 
 function parse(text: string): LedgerRecord {
   const value = JSON.parse(text) as { leftovers?: unknown; untracked?: unknown };
@@ -79,8 +89,10 @@ export class LeftoverLedger {
    * Drop entries whose resources are all gone. Throws, with removal commands, while any remain, and also when
    * Docker cannot be checked within the time limit or `signal` aborts.
    */
-  async assertClear(signal?: AbortSignal): Promise<void> {
+  async assertClear(signal?: AbortSignal, options: { startup?: boolean } = {}): Promise<void> {
     const known = this.#read();
+    // At startup a missing record proves nothing: the last process may have been killed before writing it.
+    if (options.startup && !known.untracked) known.untracked = 1;
     if (!known.leftovers.length && !known.untracked) return;
     const limit = AbortSignal.timeout(CHECK_TIMEOUT_MS);
     let storage: TaskStorage;
@@ -100,9 +112,10 @@ export class LeftoverLedger {
       if (volumes.length) commands.push(`docker volume rm ${volumes.join(' ')}`);
     }
     // Unnamed leftovers are gone only when no task storage exists at all.
-    const untracked = known.untracked && (storage.containers.size || storage.volumes.size) ? known.untracked : 0;
+    const labelled = storage.containers.size + storage.volumes.size + (storage.networks?.size ?? 0);
+    const untracked = known.untracked && labelled ? known.untracked : 0;
     this.#write({ leftovers: remaining, untracked });
-    if (untracked) throw new Error('Ask is off: agent storage setup failed in an earlier session and its leftovers could not be identified. Remove the containers and volumes listed by `docker ps -a --filter label=io.codeboost.task-storage` and `docker volume ls --filter label=io.codeboost.task-storage`, then retry.');
+    if (untracked) throw new Error(`Ask is off: an earlier codeboost session may have left agent containers, volumes or networks that cannot be identified (${labelled} labelled resource${labelled === 1 ? '' : 's'} found). List them with ${LABELLED}. Remove them if no other codeboost is running, then retry.`);
     if (remaining.length) throw new Error(`Ask is off: agent storage from an earlier session was not removed. Remove it, then retry:\n${commands.join('\n')}`);
   }
 }
