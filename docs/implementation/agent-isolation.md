@@ -135,7 +135,8 @@ Ask keeps the contract's identity and cleanup rules:
   owner is still running.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
-  restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
+  restart, Ask stays off while any container, volume or network labelled `io.codeboost.allocation`,
+  `io.codeboost.invocation` or `io.codeboost.egress` exists. Caller-provided
   allocation IDs (#51 item 3) would let Ask name these resources instead.
 - One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on a lock file keyed by
   the database file's identity (device and inode) in the temp directory. It is an OS file lock that the operating
@@ -159,7 +160,8 @@ absolute and symlinked spellings share them. A database with other hard links is
   admitted; the root is deleted as soon as the thread stops.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
-  while any `io.codeboost.task-storage` container or volume exists. Reclaiming those leftovers after a crash or restart
+  while any container, volume or network labelled `io.codeboost.allocation`,
+  `io.codeboost.invocation` or `io.codeboost.egress` exists. Reclaiming those leftovers after a crash or restart
   needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.
 
 `test/agent-question.test.ts` runs this path

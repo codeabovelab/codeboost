@@ -55,7 +55,7 @@ export class RetainedStorage {
       try { remove(filesystems); this.#retained.delete(filesystems); } catch { /* still owned; retried next time */ }
     }
     if (this.#paths.size) throw new Error(`A copy of reviewed code from an earlier question could not be deleted (${[...this.#paths].join(', ')}). Ask stays off until it is deleted.`);
-    if (this.#untracked) throw new Error(`Agent storage setup failed and its cleanup was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no \`io.codeboost.task-storage\` containers or volumes remain.`);
+    if (this.#untracked) throw new Error(`Agent storage setup failed and its cleanup was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no containers, volumes or networks labelled \`io.codeboost.allocation\`, \`io.codeboost.invocation\` or \`io.codeboost.egress\` remain.`);
     if (this.#retained.size) throw new Error(`Agent storage from an earlier question could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
   }
 }
