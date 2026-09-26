@@ -1902,9 +1902,9 @@ This table records merged and open PRs only. A lane is complete only when every 
 | C — guarded merge gate | C1–C4 (PR #23) | — | Done. Remaining build step 4 work belongs to F (#22) |
 | D — agent isolation | D1 (#31), D2 (#40), D3 (#44), D4 (#47), D5 (#50); gate in `docs/implementation/agent-isolation.md` | — | Done. F, G4 and live planning may now use the boundary; Ask already does |
 | E — planning logic | E1 (#30), E2 (#32), E3 (#35), suggestion lifecycle bindings (#43) | E4 #45 (draft; replaces #37) | Finish E4 with real recordings |
-| F — runner | F1 contract (#49, `docs/implementation/runner-lifecycle.md`) | F1a #53 (Store lifecycle), F1b #56 (coordinator), F1c #57 (shutdown wiring, `/api/runner`) | Land F1a–F1c, then F2 |
+| F — runner | F1 contract (#49, `docs/implementation/runner-lifecycle.md`); Ask in the agent container (#54), which ends the interim R1 exception | F1a #53 (Store lifecycle), F1b #56 (coordinator), F1c #57 (shutdown wiring, `/api/runner`), F1d #59 (startup recovery, single-runner lock) | Land F1a–F1d in stack order, then F2 |
 | G — planning screen | — | — | G1 after E4 |
-| H — issue prioritization | H1–H3 (#39), trust fix #42 (issue #41), H4a Issues screen (#55) | — | H4b: the "trust this issue" action, which needs Store persistence through F after F1a |
+| H — issue prioritization | H1–H3 (#39), trust fix #42 (issue #41), H4a Issues screen (#55) | — | H4b: the "trust this issue" action, which needs Store persistence through F after F1a. H4a holds the web files until G1 starts. Follow-up #58 (disconnect concern) |
 | I, J | — | — | After F6 |
 | K — merge-queue compatibility | K1 (#38), K2–K3 (#46, closes #24); see `docs/implementation/merge-queue.md` | — | Done |
 
@@ -1961,7 +1961,7 @@ F, G and H can proceed together within these ownership boundaries. If F and G ne
 - **Queue, scheduling and recovery (build step 7):** starts after F establishes persisted task lifecycle and shutdown ownership. One owner controls the runner/store changes and recovery regressions.
 - **Lessons pipeline (build step 9; T15):** can proceed alongside queue work after F's reject-loop and feedback-event contract lands. Own dedicated lesson modules and tests; inject storage/provider interfaces and queue shared schema or runner wiring behind the queue owner.
 - **Lessons inbox and Learning screen (T16, T17):** follow the lesson persistence/metrics contracts and G's release of shared UI ownership. Require a working reject-to-lesson-to-approved-prompt path before marking the learning milestone complete.
-- **Merge queue support (#24):** *Done 2026-09-25 (#38, #46); queue merging is enabled only for an adapter that implements the K1 observation contract.* Original plan: a separate compatibility follow-up. Its GitHub adapter/fixture work can use a free lane after C; runner/UI lifecycle integration waits for those files' owners. Keep queue-based merging blocked until queued, removed, failed and confirmed-merged states are implemented and tested. Enqueue success is not merge completion.
+- **Merge queue support (#24):** *Done 2026-09-25 (#38, #46); queue merging is enabled only for an adapter that implements the K1 observation contract.* Original plan: a separate compatibility follow-up. Its GitHub adapter/fixture work can use a free lane after C; runner/UI lifecycle integration waits for those files' owners. Queue-based merging stayed blocked until the queued, removed, failed and confirmed-merged states were implemented and tested, which #46 completed. Enqueue success is still not merge completion.
 - **Optional human validation (#19):** may run separately with fresh blinded packages; it is never a dependency for these lanes. Schema extensions #5 and #7 remain separate follow-ups unless a lane explicitly needs them; do not silently expand T18 or duplicate #6 alignment work.
 
 #### Ownership and integration rules
