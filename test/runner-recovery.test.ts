@@ -39,6 +39,14 @@ describe('runner lock', () => {
     expect(again.file).toEqual(first.file);
     expect(existsSync(join(locksDir, `${first.file.dev}-${first.file.ino}.runner-lock`))).toBe(true);
   });
+  it('keeps holding the lock when the caller drops the returned object and garbage collection runs', async () => {
+    const d = dir(), locksDir = join(d, 'locks'), path = join(d, 'db.sqlite');
+    const recovery = fileURLToPath(new URL('../runner/recovery.ts', import.meta.url));
+    const child = spawn(process.execPath, ['--expose-gc', '-e', `import(${JSON.stringify(recovery)}).then(m => { m.acquireRunnerLock(${JSON.stringify(path)}, { lockRoot: ${JSON.stringify(locksDir)} }); for (let i = 0; i < 5; i++) globalThis.gc(); setTimeout(() => { globalThis.gc(); console.log('held'); }, 50); setInterval(() => {}, 1000); })`], { stdio: ['ignore', 'pipe', 'inherit'] });
+    children.push(child);
+    await new Promise<void>(resolve => child.stdout!.on('data', chunk => { if (String(chunk).includes('held')) resolve(); }));
+    expect(() => acquireRunnerLock(path, { lockRoot: locksDir })).toThrow(LockHeld);
+  });
   it('is released by the OS when the holding process is killed', async () => {
     const d = dir(), locksDir = join(d, 'locks'), path = join(d, 'db.sqlite');
     const recovery = fileURLToPath(new URL('../runner/recovery.ts', import.meta.url));

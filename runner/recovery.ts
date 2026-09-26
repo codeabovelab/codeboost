@@ -29,6 +29,11 @@ function assertLocal(path: string): void {
   if (NETWORK_FILESYSTEMS.has(Number(statfsSync(path).type))) throw new Error(`${path} is on a network filesystem; the runner lock needs a local filesystem.`);
 }
 
+/**
+ * Strong references to every held lock connection. Without this, a caller that drops the returned RunnerLock lets the
+ * connection be garbage-collected, and closing it silently releases the OS lock while the runner is still alive.
+ */
+const heldLocks = new Set<DatabaseSync>();
 export interface RunnerLock {
   readonly file: { dev: bigint; ino: bigint };
   /** Step 4: the database path still names the locked file. Call after the Store opens. */
@@ -67,6 +72,7 @@ export function acquireRunnerLock(databasePath: string, options: { lockRoot?: st
       throw error;
     }
     const file = { dev: st.dev, ino: st.ino }, heldDb = db;
+    heldLocks.add(heldDb);
     let released = false;
     return {
       file,
@@ -75,7 +81,7 @@ export function acquireRunnerLock(databasePath: string, options: { lockRoot?: st
         if (now.isSymbolicLink() || !now.isFile() || now.dev !== file.dev || now.ino !== file.ino || now.nlink !== 1n)
           throw new Error('The database path changed while opening. Refusing to start.');
       },
-      release() { if (released) return; released = true; heldDb.close(); closeSync(fd); },
+      release() { if (released) return; released = true; heldLocks.delete(heldDb); heldDb.close(); closeSync(fd); },
     };
   } catch (error) { db?.close(); closeSync(fd); throw error; }
 }
