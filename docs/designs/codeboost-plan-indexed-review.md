@@ -540,7 +540,7 @@ If codeboost is stopped or crashes during a rebase, it always cancels the rebase
 Added by the engineering review (L1 to L4). The agent tools cannot be retrained, so codeboost learns by adding approved lessons to its prompts.
 
 **How a lesson is made (L1).**
-1. A task closes: it is merged, cancelled, or rejected.
+1. A task closes: it is merged, or you cancel it. "Reject with feedback" does not close a task: it creates the next plan revision and puts the task back in the queue (step 8). Each reject round's feedback stays with the task and is included when the task finally closes.
 2. An agent reads your feedback on that task: rejection notes, change requests, and your accept, assign, and "accepted finding" choices. It never reads issue text or comments from other people.
 3. It writes short lessons, such as "In this repo, every retry change needs a test for the 5xx path." Each lesson links to the feedback it came from.
 
