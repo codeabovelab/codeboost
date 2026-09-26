@@ -644,8 +644,8 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## How people will install it
 
-- **One command.** Run `npx codeboost` inside a repo. It starts the local server and opens the app in your browser.
-- **Requirements.** Node 26.7.0 or later: CI proves this version runs `node:sqlite` with no warning, and codeboost refuses older versions with an upgrade message. codeboost checks for `git`, a signed-in `gh`, a running Docker or Podman, and at least one of `claude` or `codex` with its sign-in (a `claude setup-token` token, or Codex's `auth.json`). It tells you what is missing.
+- **One command (planned).** Run `npx codeboost` inside a repo. It starts the local server and opens the app in your browser. The package is not published yet; today you run `npm start -- --config …` or `npm run demo` from a checkout.
+- **Requirements.** Node 26.7.0 or later: CI proves this version runs `node:sqlite` with no warning, and codeboost refuses older versions with an upgrade message. **Planned, not yet implemented:** codeboost will check for `git`, a signed-in `gh`, a running Docker or Podman, and at least one of `claude` or `codex` with its sign-in (a `claude setup-token` token, or Codex's `auth.json`), and tell you what is missing. **Today** the CLI (`web/cli.ts`) checks only the Node version before it starts; a missing tool shows up later as an error from the feature that needs it.
 - **No compiler needed.** It has no native modules. It uses Node's built-in `node:sqlite`.
 - **Releases.** GitHub Actions runs all tests on every PR. When we tag a version, it publishes to npm and creates a GitHub release.
 - **Later, maybe:** a Homebrew formula.
