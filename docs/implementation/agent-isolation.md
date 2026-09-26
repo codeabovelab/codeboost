@@ -111,6 +111,9 @@ Ask keeps the contract's identity and cleanup rules:
   they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
   at shutdown keeps Ask off. Entries beyond the record's cap of 100 count as unidentified, never dropped. Removal goes through D only once D has
   recovery handles (#51 item 4).
+- The host staging directory (a copy of the reviewed code) is owned the same way. If it cannot be deleted, the
+  worker keeps its path and retries before the next question, shutdown records it, and the next check deletes it.
+  Ask stays off while any copy remains. The record accepts only `codeboost-question-*` staging paths.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided

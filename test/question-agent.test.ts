@@ -1,6 +1,6 @@
-import { existsSync, lstatSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
@@ -181,6 +181,30 @@ it.each([
 ] as const)('refuses partial output after %s', async (_label, override, message) => {
   const fake = fakeDeps(override as Partial<InvocationResult>);
   await expect(askInContainer(question(), fake.deps, new AbortController().signal)).rejects.toThrow(message);
+});
+
+it.skipIf(process.getuid?.() === 0)('keeps a host copy of the code it could not delete and refuses Ask until it is gone', async () => {
+  const retained = new RetainedStorage();
+  const fake = fakeDeps();
+  let locked = '';
+  const clone = fake.deps.createClone;
+  fake.deps.createClone = options => {
+    // A directory without permissions cannot be emptied by a non-root user, so deleting the staging root fails.
+    locked = join(options.parent, 'locked'); mkdirSync(locked); writeFileSync(join(locked, 'file'), 'x'); chmodSync(locked, 0o000);
+    return clone(options);
+  };
+  try {
+    await expect(askInContainer(question(), fake.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
+    const root = dirname(dirname(locked));
+    expect(retained.paths()).toEqual([root]);
+    expect(existsSync(root)).toBe(true);
+    const next = fakeDeps();
+    await expect(askInContainer(question(), next.deps, new AbortController().signal, {}, retained)).rejects.toThrow('could not be deleted');
+    expect(next.events).toEqual([]);
+    chmodSync(locked, 0o700);
+    expect(await askInContainer(question(), fakeDeps().deps, new AbortController().signal, {}, retained)).toBe('The cap bounds latency.');
+    expect(existsSync(root)).toBe(false);
+  } finally { if (locked && existsSync(locked)) { chmodSync(locked, 0o700); rmSync(dirname(dirname(locked)), { recursive: true, force: true }); } }
 });
 
 it('turns Ask off when a failed setup leaves storage D cannot hand back', async () => {

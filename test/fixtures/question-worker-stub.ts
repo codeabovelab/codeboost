@@ -6,9 +6,10 @@ const waiting = new Map<string, string>();
 // Allocations a question could not remove, as the real worker's RetainedStorage would report them.
 const leaked: { keeper: string; workVolume: string; metadataVolume: string }[] = [];
 let untracked = 0;
+const stuckPaths: string[] = [];
 parentPort!.on('message', (message: WorkerRequest) => {
   if (message.type === 'release') {
-    parentPort!.postMessage({ id: message.id, remaining: leaked, untracked });
+    parentPort!.postMessage({ id: message.id, remaining: leaked, untracked, paths: stuckPaths });
     return;
   }
   if (message.type === 'cancel') {
@@ -32,6 +33,11 @@ parentPort!.on('message', (message: WorkerRequest) => {
   }
   // Never replies, like a question whose lane D cleanup does not settle.
   if (prompt === 'hang') return;
+  if (prompt.startsWith('stuck-path:')) {
+    stuckPaths.push(prompt.slice('stuck-path:'.length));
+    parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Question container cleanup did not settle.' });
+    return;
+  }
   if (prompt === 'wait') { waiting.set(message.id, attemptId); return; }
   // Simulates a reply that carries another attempt's identity.
   const replied = prompt === 'wrong-attempt' ? `${attemptId}-other` : attemptId;

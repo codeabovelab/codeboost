@@ -1,10 +1,10 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { InvocationContext, InvocationHandle, InvocationInput, InvocationResult, StopReason, TaskClone } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
-import type { Leftover } from './question-leftovers.ts';
+import { removeStaging, type Leftover } from './question-leftovers.ts';
 
 export type Provider = 'claude' | 'codex';
 /** What the review knows about a question when it asks the agent. */
@@ -31,21 +31,29 @@ export interface ContainerQuestion extends QuestionScope {
  */
 export class RetainedStorage {
   readonly #retained = new Set<TaskFilesystems>();
+  readonly #paths = new Set<string>();
   #untracked = 0;
   get size() { return this.#retained.size; }
   /** Allocations whose setup failed and whose cleanup D could not confirm. D returns no handle for them. */
   get untracked() { return this.#untracked; }
   retain(filesystems: TaskFilesystems) { this.#retained.add(filesystems); }
   markUntracked() { this.#untracked++; }
+  /** A host staging directory (a copy of the reviewed code) that could not be deleted. */
+  retainPath(path: string) { this.#paths.add(path); }
+  paths(): string[] { return [...this.#paths]; }
   /** Docker names of the retained allocations, for a durable record before this registry is dropped. */
   list(): Leftover[] {
     return [...this.#retained].map(({ keeper, workVolume, metadataVolume }) => ({ keeper, workVolume, metadataVolume }));
   }
   /** Retry removal of every retained allocation. Throws while any removal is still unconfirmed. */
   release(remove: (filesystems: TaskFilesystems) => void): void {
+    for (const path of [...this.#paths]) {
+      try { removeStaging(path); this.#paths.delete(path); } catch { /* still owned; retried next time */ }
+    }
     for (const filesystems of [...this.#retained]) {
       try { remove(filesystems); this.#retained.delete(filesystems); } catch { /* still owned; retried next time */ }
     }
+    if (this.#paths.size) throw new Error(`A copy of reviewed code from an earlier question could not be deleted (${[...this.#paths].join(', ')}). Ask stays off until it is deleted.`);
     if (this.#untracked) throw new Error(`Agent storage setup failed and its cleanup was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no \`io.codeboost.task-storage\` containers or volumes remain.`);
     if (this.#retained.size) throw new Error(`Agent storage from an earlier question could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
   }
@@ -149,8 +157,7 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
   } finally {
     const failures: unknown[] = [];
     if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.retain(filesystems); failures.push(error); }
-    try { chmodSync(input, 0o700); } catch { /* not created */ }
-    try { rmSync(root, { recursive: true, force: true }); } catch (error) { failures.push(error); }
+    try { removeStaging(root); } catch (error) { retained.retainPath(root); failures.push(error); }
     if (failures.length) throw new AggregateError(failures, 'Question container cleanup did not settle.');
   }
 }

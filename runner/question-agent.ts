@@ -122,7 +122,7 @@ export class QuestionWorker {
     try {
       // No report (timeout or crash) means unknown leftovers, which stay recorded until no task storage remains.
       if (released === null) this.#recordUnknown();
-      else this.ledger?.record(released.remaining, released.untracked);
+      else this.ledger?.record(released.remaining, released.untracked, released.paths);
     } finally { await worker.terminate(); }
   }
 }
