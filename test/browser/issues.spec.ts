@@ -84,7 +84,7 @@ test('shows unavailable, then current, then stale issue data with the retrieval 
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
   await page.goto(app.url);
   await page.getByRole('link', { name: 'Issues', exact: true }).click();
-  await expect(page.getByRole('button', { name: 'Refreshing…' })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Refreshing…' })).toHaveAttribute('aria-disabled', 'true');
   await expect.poll(() => pending.length).toBe(1);
   pending[0]!.reject(new Error('gh: could not resolve host'));
   await expect(page.locator('#issues-status')).toHaveText('✕ Unavailable · gh: could not resolve host');
@@ -103,6 +103,29 @@ test('shows unavailable, then current, then stale issue data with the retrieval 
   await expect(page.locator('#issues-status')).toContainText('gh: HTTP 502');
   await expect(issueRows(page).locator('.issue-title a')).toHaveText(['Typo', 'Crash on start']);
   await page.screenshot({ path: 'test-results/issues-stale.png', fullPage: true });
+});
+
+test('keyboard focus stays on Refresh issues through a refresh', async ({ page }) => {
+  const { gateway, pending } = scriptedGateway();
+  app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await expect.poll(() => pending.length).toBe(1);
+  pending[0]!.resolve(snapshot(['First']));
+  const refresh = page.locator('#issues-refresh');
+  await expect(refresh).toHaveText('Refresh issues');
+  await refresh.focus();
+  await page.keyboard.press('Enter');
+  await expect(refresh).toHaveAttribute('aria-disabled', 'true');
+  await expect(refresh).toBeFocused();
+  // A second activation while busy must not start another retrieval.
+  await page.keyboard.press('Enter');
+  await expect.poll(() => pending.length).toBe(2);
+  pending[1]!.resolve(snapshot(['Second']));
+  await expect(issueRows(page).locator('.issue-title a')).toHaveText(['Second']);
+  await expect(refresh).not.toHaveAttribute('aria-disabled', 'true');
+  await expect(refresh).toBeFocused();
+  expect(pending).toHaveLength(2);
 });
 
 test('a refresh that returns after the user leaves Issues does not pull them back', async ({ page }) => {

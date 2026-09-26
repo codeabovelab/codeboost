@@ -791,7 +791,8 @@ new ResizeObserver(() => {
 
 let issuesGeneration = 0,
   issuesView = null,
-  issuesRequested = false;
+  issuesRequested = false,
+  issuesLoading = false;
 function showView(next) {
   view = next;
   $("review-view").hidden = next !== "review";
@@ -846,9 +847,12 @@ function renderIssues() {
     .join("")}</tbody></table>`;
 }
 async function loadIssues() {
+  if (issuesLoading) return;
   const generation = ++issuesGeneration;
   issuesRequested = true;
-  $("issues-refresh").disabled = true;
+  issuesLoading = true;
+  // aria-disabled, not disabled: disabling the focused button would drop keyboard focus to the page.
+  $("issues-refresh").setAttribute("aria-disabled", "true");
   $("issues-refresh").textContent = "Refreshing…";
   if (issuesView?.configured) issuesView = { ...issuesView, refreshing: true };
   renderIssues();
@@ -865,7 +869,8 @@ async function loadIssues() {
     $("issues-status").textContent = `✕ Could not refresh issues. ${error.message}`;
   } finally {
     if (generation === issuesGeneration) {
-      $("issues-refresh").disabled = false;
+      issuesLoading = false;
+      $("issues-refresh").removeAttribute("aria-disabled");
       $("issues-refresh").textContent = "Refresh issues";
     }
   }

@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:http';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IssueBoard } from '../web/issues.ts';
 import { startServer } from '../web/server.ts';
 import { createDemo } from '../scripts/demo.ts';
@@ -138,6 +138,37 @@ describe('issue endpoints', { timeout: 30_000 }, () => {
       expect(response.status).toBe(200);
       expect(response.body.state).toMatchObject({ state: 'fresh', issues: [{ number: 1, reasons: ['20 points: bug label'] }] });
     } finally { await app.close(); }
+  });
+
+  it('a disconnected browser stops waiting while the shared refresh continues for another caller', async () => {
+    root = mkdtempSync(join(tmpdir(), 'codeboost-issues-'));
+    const { gateway, calls } = heldGateway();
+    const waits: Promise<unknown>[] = [];
+    const original = IssueBoard.prototype.refresh;
+    const spy = vi.spyOn(IssueBoard.prototype, 'refresh').mockImplementation(function (this: IssueBoard, signal) {
+      const wait = original.call(this, signal);
+      waits.push(wait.then(() => 'settled', error => String(error)));
+      return wait;
+    });
+    const app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
+    try {
+      const target = new URL(app.url);
+      const payload = JSON.stringify({ action: 'refresh' });
+      const leaving = request({ host: target.hostname, port: target.port, path: '/api/issues', method: 'POST', headers: {
+        'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(payload),
+      } });
+      leaving.on('error', () => undefined);
+      leaving.end(payload);
+      await expect.poll(() => calls.length).toBe(1);
+      const staying = call(app.url, app.token, 'POST', { action: 'refresh' });
+      await expect.poll(() => waits.length).toBe(2);
+      leaving.destroy();
+      await expect(waits[0]).resolves.toContain('Client disconnected');
+      expect(calls[0]!.signal!.aborted).toBe(false);
+      calls[0]!.result.resolve(snapshot());
+      await expect(staying).resolves.toMatchObject({ status: 200, body: { state: { state: 'fresh' } } });
+      expect(calls).toHaveLength(1);
+    } finally { spy.mockRestore(); await app.close(); }
   });
 
   it('shutdown aborts an admitted refresh and waits for the retrieval to settle', async () => {

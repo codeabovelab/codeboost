@@ -58,7 +58,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/issues') {
           if(input?.action!=='refresh')throw new Error('Unsupported issue action.');
-          json(200,await issues.refresh(requestAbort.signal));return;
+          // A departing browser stops waiting; the board keeps the shared refresh for other callers.
+          const departed=new AbortController();
+          const depart=()=>{if(!res.writableEnded)departed.abort(new Error('Client disconnected.'));};
+          res.once('close',depart);
+          try { json(200,await issues.refresh(AbortSignal.any([requestAbort.signal,departed.signal]))); }
+          finally { res.removeListener('close',depart); }
+          return;
         }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {

@@ -74,7 +74,8 @@ button:hover,
 select:hover {
   background: var(--selected);
 }
-button:disabled {
+button:disabled,
+button[aria-disabled="true"] {
   color: var(--muted);
   cursor: default;
   background: var(--surface);
