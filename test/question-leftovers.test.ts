@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { createAskRoot, LeftoverLedger, type ListTaskStorage } from '../runner/question-leftovers.ts';
 import { RetainedStorage } from '../runner/question-container.ts';
@@ -316,7 +316,7 @@ it('lets only one holder run Ask for a review, and the OS frees the lock when it
   // A process that takes the lock and exits without releasing it leaves nothing to take over: the OS freed it.
   const child = spawnSync(process.execPath, ['--input-type=module', '-e', `
     import { DatabaseSync } from 'node:sqlite';
-    const lock = new DatabaseSync(${JSON.stringify(`${path}.lock`)});
+    const lock = new DatabaseSync(${JSON.stringify(new LeftoverLedger(path).lockPath)});
     lock.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;');
     process.stdout.write('held');
     process.exit(0);`], { encoding: 'utf8' });
@@ -528,4 +528,35 @@ it('leaves an unrecorded root alone while its owner holds its lock, and reclaims
   try { expect(await second.agent('claude')('answer', new AbortController().signal, scope(36), 60_000)).toBe('claude:answer:n'); }
   finally { await second.close(); }
   expect(existsSync(root)).toBe(false);
+});
+
+it('never probes an owner stamp that is not a codeboost lock in the temp directory', async () => {
+  const outside = join(mkdtempSync(join(tmpdir(), 'ask-outside-')), 'victim.sqlite'); roots.push(dirname(outside));
+  writeFileSync(outside, 'not a lock');
+  const lookalike = mkdtempSync(join(tmpdir(), 'codeboost-askprep-'));
+  const root = join(tmpdir(), `codeboost-ask-${basename(lookalike).slice(-6)}`);
+  renameSync(lookalike, root);
+  writeFileSync(join(root, '.owner'), `${outside}\n`);
+  const worker = stubWorker(new LeftoverLedger(ledgerPath(), docker(new Set())));
+  try { expect(await worker.agent('claude')('answer', new AbortController().signal, scope(37), 60_000)).toBe('claude:answer:n'); }
+  finally { await worker.close(); }
+  const cleanup = () => rmSync(root, { recursive: true, force: true });
+  try {
+  // The stamp was not trusted: the named file was never opened, and the root was treated as ownerless.
+  expect(readFileSync(outside, 'utf8')).toBe('not a lock');
+  expect(existsSync(root)).toBe(false);
+  } finally { cleanup(); }
+});
+
+it('still scans Docker at startup after deleting a recorded root', async () => {
+  const path = ledgerPath();
+  const stale = mkdtempSync(join(tmpdir(), 'codeboost-ask-'));
+  new LeftoverLedger(path, docker(new Set())).record([], 0, [stale]);
+  // An unrecorded labelled container remains from the earlier session.
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set(['codeboost-keeper-orphan']))));
+  try {
+    await expect(worker.agent('claude')('answer', new AbortController().signal, scope(38), 60_000)).rejects.toThrow('cannot be identified');
+    expect(existsSync(stale)).toBe(false);
+    expect(read(path)).toMatchObject({ leftovers: [], untracked: 1 });
+  } finally { await worker.close(); }
 });

@@ -60,14 +60,17 @@ export class RetainedStorage {
   }
 }
 export interface RepositorySize { readonly checkoutBytes: number; readonly entries: number; readonly objectBytes: number }
-const GIT_ENV = () => ({ PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' });
+// The same hardening as lane D's clone: no user or system config, no prompts, no lazy fetch from a promisor remote.
+const GIT_ENV = () => ({ PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+  GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_GRAFT_FILE: '/dev/null' });
 // A tree listing larger than this is itself too large to review; refuse rather than read it.
 const TREE_LISTING_LIMIT = 64 * 1024 * 1024;
 /** Read-only size measurement with Git's own plumbing: tree entries and blob sizes at `head`, plus object storage. */
 export function measureGitRepository(source: string, head: string, timeoutMs: number): RepositorySize {
   if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Invalid reviewed head.');
   const git = (args: string[]) => {
-    const result = spawnSync('git', ['--no-pager', '-C', source, ...args], { env: GIT_ENV(), timeout: timeoutMs,
+    const result = spawnSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null',
+      '-c', 'protocol.allow=never', '-c', 'submodule.recurse=false', '-C', source, ...args], { env: GIT_ENV(), timeout: timeoutMs,
       killSignal: 'SIGKILL', maxBuffer: TREE_LISTING_LIMIT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
     if (result.error || result.status !== 0) throw new Error('The repository is too large to review, or Git could not measure it.');
     return result.stdout;

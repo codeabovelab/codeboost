@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto';
 import { execFile } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
@@ -77,6 +78,9 @@ export const dockerTaskStorage: ListTaskStorage = async signal => {
   return { containers: new Set(containers.flat()), volumes: new Set(volumes), networks: new Set(networks) };
 };
 const OWNER_FILE = '.owner';
+/** A codeboost Ask lock: a direct child of the temp directory with the lock name, so a stamp cannot aim elsewhere. */
+export const isAskLock = (path: unknown): path is string => typeof path === 'string' && path.length <= 4096
+  && isAbsolute(path) && dirname(path) === tmpdir() && /^codeboost-asklock-[0-9a-f]+(?:-[0-9]+)?\.sqlite$/.test(basename(path));
 /**
  * Create an Ask root stamped with the lock of the process that owns it. The stamp is written under a preparation name
  * and the folder is then renamed, so any folder visible under the Ask root name already carries its owner stamp.
@@ -130,7 +134,10 @@ export class LeftoverLedger {
   readonly listTaskStorage: ListTaskStorage;
   /** Where the exclusive lock lives; for a review database it is keyed by the file's identity (see forDatabase). */
   lockPath: string;
-  constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; this.lockPath = `${path}.lock`; }
+  constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) {
+    this.path = path; this.listTaskStorage = listTaskStorage;
+    this.lockPath = join(tmpdir(), `codeboost-asklock-${createHash('sha256').update(path).digest('hex').slice(0, 32)}.sqlite`);
+  }
 
   /**
    * Exclusive Ask lock for this review database, held for the question worker's lifetime. Only the holder scans,
@@ -171,7 +178,8 @@ export class LeftoverLedger {
       if (!isAskRoot(root) || skip.has(root)) continue;
       let owner = '';
       try { owner = readFileSync(join(root, OWNER_FILE), 'utf8').trim(); } catch { /* no stamp: its creator stopped first */ }
-      if (owner && !isAbsolute(owner)) owner = '';
+      // Only a codeboost lock file in the temp directory is ever probed; anything else counts as no owner.
+      if (!isAskLock(owner)) owner = '';
       if (owner && owner !== this.lockPath && existsSync(owner) && lockIsHeld(owner)) continue;
       // Our own lock is held by us, so our earlier-session roots (not the live one, which is skipped) are reclaimed.
       try { removeAskRoot(root); } catch { stuck.push(root); }
