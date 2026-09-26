@@ -131,7 +131,9 @@ Ask keeps the contract's identity and cleanup rules:
 - Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
   records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
-  finishes first), then rejects the waiting questions, so shutdown cannot hang on D.
+  finishes first), then rejects the waiting questions, so shutdown cannot hang on D. If the thread is still busy
+  after that wait, its ownership is already durable (unknown leftovers and the recorded root) and no new question is
+  admitted; the root is deleted as soon as the thread stops.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
   while any `io.codeboost.task-storage` container or volume exists. Reclaiming those leftovers after a crash or restart

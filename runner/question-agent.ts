@@ -17,7 +17,7 @@ const RELEASE_TIMEOUT_MS = 30_000;
 // deadline is abandoned: its resources are recorded as unknown and the worker is stopped.
 const ABANDON_AFTER_DEADLINE_MS = 30_000;
 // Bounds the wait for an abandoned worker thread to stop (a synchronous Docker or Git call finishes first).
-const TERMINATE_WAIT_MS = 15_000;
+const DEFAULT_TERMINATE_WAIT_MS = 15_000;
 
 /** One worker owns every Ask container, so lane D's trusted image and allocations stay in one registry. */
 export class QuestionWorker {
@@ -35,10 +35,12 @@ export class QuestionWorker {
   private ledger?: LeftoverLedger;
   /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
   private abandonAfterMs: number;
+  private terminateWaitMs: number;
   private env: Readonly<Record<string, string | undefined>>;
   constructor(url = new URL('./question-worker.ts', import.meta.url), ledger?: LeftoverLedger,
-    options: { abandonAfterDeadlineMs?: number; env?: Readonly<Record<string, string | undefined>> } = {}) {
+    options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; env?: Readonly<Record<string, string | undefined>> } = {}) {
     this.url = url; this.ledger = ledger; this.abandonAfterMs = options.abandonAfterDeadlineMs ?? ABANDON_AFTER_DEADLINE_MS;
+    this.terminateWaitMs = options.terminateWaitMs ?? DEFAULT_TERMINATE_WAIT_MS;
     this.env = options.env ?? process.env;
   }
   private start(): Worker {
@@ -81,11 +83,16 @@ export class QuestionWorker {
     // in progress finishes first. Asynchronous children it leaves are covered by the unknown-leftover record.
     if (worker) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      const stopped = await Promise.race([worker.terminate().then(() => true, () => true),
-        new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), TERMINATE_WAIT_MS); })]);
+      const termination = worker.terminate().then(() => true, () => true);
+      const stopped = await Promise.race([termination,
+        new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), this.terminateWaitMs); })]);
       clearTimeout(timer);
-      // Only a stopped thread can no longer write into its root; otherwise the root stays recorded.
+      // Only a stopped thread can no longer write into its root. If it is still inside a synchronous Docker or Git
+      // call, its ownership is already durable (unknown leftovers and the recorded root), and the crashed state
+      // admits no new question, so the waiters can be released; the root is deleted once the thread does stop.
+      const root = this.root;
       if (stopped) this.#removeRoot();
+      else void termination.then(() => { if (this.root === root) this.#removeRoot(); });
     }
     for (const job of this.pending.values()) { clearTimeout(job.watchdog); job.reject(this.crashed); }
     this.pending.clear();

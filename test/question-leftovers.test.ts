@@ -83,7 +83,7 @@ it('keeps Ask off after an unidentifiable leftover until no labelled task storag
   expect(existsSync(path)).toBe(false);
 });
 
-const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number; env?: Record<string, string> } = {}) =>
+const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; env?: Record<string, string> } = {}) =>
   new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), ledger,
     { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' }, ...options });
 const scope = (n: number) => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
@@ -269,4 +269,26 @@ it('keeps an abandoned question pending until its worker thread has stopped', as
   // The thread could not stop before the native call returned, and the question stayed pending until then.
   expect(settledAt - started).toBeGreaterThanOrEqual(500);
   expect(read(path)).toEqual({ leftovers: [], untracked: 1, roots: [] });
+});
+
+it('hands a thread that outlives the wait to the durable record, and deletes its root once it stops', async () => {
+  const path = ledgerPath();
+  // The stub blocks for one second in a native call; give up waiting after 100 ms.
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())), { terminateWaitMs: 100 });
+  const blocked = worker.agent('claude')('block', new AbortController().signal, scope(19), 60_000).catch((error: Error) => error);
+  await expect.poll(async () => (worker as unknown as { pending: Map<string, unknown> }).pending.size).toBe(1);
+  await new Promise(resolve => setTimeout(resolve, 200));
+  await worker.close();
+  expect(((await blocked) as Error).message).toContain('stopped at shutdown');
+  // Released before the thread stopped: the ownership is durable, and the root is still recorded.
+  const record = read(path);
+  expect(record).toMatchObject({ leftovers: [], untracked: 1 });
+  expect(record.roots).toHaveLength(1);
+  const [root] = record.roots;
+  expect(existsSync(root)).toBe(true);
+  // Once the native call returns and the thread stops, the root is deleted and dropped from the record.
+  await expect.poll(() => existsSync(root), { timeout: 5_000 }).toBe(false);
+  expect(read(path)).toEqual({ leftovers: [], untracked: 1, roots: [] });
+  // No new question is admitted meanwhile.
+  await expect(worker.agent('claude')('answer', new AbortController().signal, scope(20), 60_000)).rejects.toThrow('Ask is off');
 });
