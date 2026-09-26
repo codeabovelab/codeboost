@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ReviewService } from './review.ts';
 import { cliQuestionAgent } from './question-agent.ts';
 import type { ReviewNote } from './store.ts';
+import type { ShutdownCapability } from './lifecycle.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal) => Promise<string>;
 export function questionPrompt(view: ReturnType<ReviewService['load']>, note: ReviewNote): string {
   let remaining = 100_000;
@@ -21,7 +22,11 @@ export class Questions {
   private closing = false;
   private service: ReviewService;
   private agent?: QuestionAgent;
-  constructor(service: ReviewService, agent?: QuestionAgent) { this.service=service; this.agent=agent; }
+  /** Settlement writes (finishAnswer after abort) keep working after the Store write gate closes. */
+  private write: <T>(fn: () => T) => T;
+  constructor(service: ReviewService, agent?: QuestionAgent, capability?: ShutdownCapability) {
+    this.service=service; this.agent=agent; this.write = capability ? fn => capability.run(fn) : fn => fn();
+  }
   isRunning(id: string) { return this.running.has(id); }
   start(id: string, view: ReturnType<ReviewService['load']>) {
     if (this.closing) throw new Error('Server is stopping. Reconnect before asking again.');
@@ -43,9 +48,9 @@ export class Questions {
         invocation = agent(questionPrompt(view,note),controller.signal);
         const text=await Promise.race([invocation,aborted]);
         if(typeof text!=='string'||!text.trim()||text.length>24000) throw new Error('Agent returned an empty or oversized answer.');
-        this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'complete',text:text.trim()});
+        this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'complete',text:text.trim()}));
       } catch(error) {
-        this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)});
+        try { this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)})); } catch {}
       } finally {clearTimeout(timeout);}
     })();
     const settled = done.finally(async () => {
