@@ -99,10 +99,12 @@ Ask keeps the contract's identity and cleanup rules:
 - The invocation's `attemptId` is the answer attempt that `Questions` saved, and `referencedCodeHash` is the note's
   `contextId` (the hash of the code assigned to its plan item). An answer is accepted only when the result and the
   worker reply carry that attempt and the captured context. The Store then compares the attempt before saving it.
-- The worker takes a credential snapshot for the adapters, then removes credential-like variables from its own
-  environment, so the image build, clone and other setup subprocesses never inherit them. The leftover Docker
-  queries use the same minimal environment as lane D (`PATH`, `DOCKER_HOST`). Missing sign-in is reported before
-  any Docker work.
+- The worker's environment is an allowlist: `PATH`, `DOCKER_HOST` and its Ask root as `TMPDIR`. Every setup
+  subprocess, including the image build, inherits only that, so no credential, home directory, Docker config or
+  agent socket reaches it. The credential lookup's own variables (`CLAUDE_CODE_OAUTH_TOKEN`,
+  `CODEBOOST_CODEX_AUTH_FILE`, `CODEX_HOME`, `HOME`) reach the worker as data and go only to the adapters. The
+  leftover Docker queries use the same `PATH`/`DOCKER_HOST` environment as lane D. Missing sign-in is reported
+  before any Docker work.
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.

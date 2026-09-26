@@ -1,11 +1,11 @@
-import { parentPort } from 'node:worker_threads';
+import { parentPort, workerData } from 'node:worker_threads';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { askInContainer, isolateCredentials, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
+import { askInContainer, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
 import type { Leftover } from './question-leftovers.ts';
 
 // Lane D setup is synchronous (Docker and Git calls), so it runs here instead of blocking the review server.
@@ -16,8 +16,9 @@ export type WorkerReply = { id: string; attemptId: string; ok: true; text: strin
 /** Reply to `release`: allocations still not removed after a final attempt. */
 export type ReleaseReply = { id: string; remaining: Leftover[]; untracked: number };
 
-// Worker threads get their own copy of process.env; after this, only the adapters receive credentials.
-const credentials = isolateCredentials(process.env);
+// This worker's environment is an allowlist without credentials; the credential variables arrive as data and go
+// only to the adapters.
+const credentials: Readonly<Record<string, string | undefined>> = Object.freeze({ ...(workerData?.credentials ?? {}) });
 const deps: ContainerDependencies = {
   buildImage: buildAgentImage,
   createClone: createTaskClone,

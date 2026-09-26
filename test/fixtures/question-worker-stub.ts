@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { parentPort } from 'node:worker_threads';
+import { parentPort, workerData } from 'node:worker_threads';
 import type { WorkerRequest } from '../../runner/question-worker.ts';
 
 // Stands in for runner/question-worker.ts so the main-thread bridge can be tested without Docker.
@@ -38,6 +38,8 @@ parentPort!.on('message', (message: WorkerRequest) => {
     return;
   }
   // Never replies, like a question whose lane D cleanup does not settle.
+  // Reports what the bridge gave this worker, for the environment allowlist test.
+  if (prompt === 'env') { parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: JSON.stringify({ env: Object.keys(process.env).sort(), credentials: Object.keys(workerData?.credentials ?? {}).sort() }) }); return; }
   if (prompt === 'hang') return;
   if (prompt === 'stick-on-release') { stuckOnRelease = true; parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: 'ok' }); return; }
   // Blocks the thread in a native subprocess call, like lane D's synchronous Docker and Git setup, then never replies.

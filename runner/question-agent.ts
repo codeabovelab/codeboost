@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
-import { questionCredential, type Provider } from './question-container.ts';
+import { credentialEnvironment, questionCredential, workerEnvironment, type Provider } from './question-container.ts';
 import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
 import { removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
@@ -53,7 +53,8 @@ export class QuestionWorker {
     // Durable before any setup: a process killed from here on still leaves a record of this root.
     try { this.ledger?.record([], 0, [root]); } catch (error) { removeAskRoot(root); throw error; }
     this.root = root;
-    const worker = new Worker(this.url, { env: { ...process.env, TMPDIR: root } });
+    const worker = new Worker(this.url, { env: workerEnvironment(process.env, root),
+      workerData: { credentials: credentialEnvironment(this.env) } });
     worker.on('message', (reply: WorkerReply | ReleaseReply) => {
       if ('remaining' in reply) { this.releases.get(reply.id)?.(reply); this.releases.delete(reply.id); return; }
       const job = this.pending.get(reply.id);

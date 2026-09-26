@@ -5,7 +5,7 @@ import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, isolateCredentials, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, credentialEnvironment, RetainedStorage, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
@@ -254,12 +254,25 @@ it('keeps storage whose removal failed, refuses Ask until it is removed, then co
   expect(removed).toHaveLength(2);
 });
 
-it('keeps credentials for the adapters and removes them from the environment other subprocesses inherit', () => {
-  const env: NodeJS.ProcessEnv = { PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', CLAUDE_CODE_OAUTH_TOKEN: 'secret-1',
-    ANTHROPIC_API_KEY: 'secret-2', GITHUB_TOKEN: 'secret-3', SSH_AUTH_SOCK: '/tmp/agent', CODEX_HOME: '/home/codex' };
-  const snapshot = isolateCredentials(env);
-  expect(snapshot).toMatchObject({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1', CODEX_HOME: '/home/codex' });
-  expect(env).toEqual({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', CODEX_HOME: '/home/codex' });
-  expect(JSON.stringify(env)).not.toContain('secret');
+it('gives the worker an allowlisted environment and passes only the credential variables as data', () => {
+  const env = { PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', HOME: '/home/me', CLAUDE_CODE_OAUTH_TOKEN: 'secret-1',
+    SSH_AUTH_SOCK: '/tmp/agent', AWS_ACCESS_KEY_ID: 'secret-2', DOCKER_CONFIG: '/home/me/.docker', CODEX_HOME: '/home/codex' };
+  expect(workerEnvironment(env, '/tmp/codeboost-ask-abc123')).toEqual({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', TMPDIR: '/tmp/codeboost-ask-abc123' });
+  expect(credentialEnvironment(env)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1', CODEX_HOME: '/home/codex', HOME: '/home/me' });
   expect(Object.keys(dockerQueryEnvironment()).sort()).toEqual(['DOCKER_HOST', 'PATH']);
+});
+
+it('starts the real bridge worker with exactly the allowlisted environment', async () => {
+  const saved = { ...process.env };
+  Object.assign(process.env, { SSH_AUTH_SOCK: '/tmp/agent', AWS_ACCESS_KEY_ID: 'secret', DOCKER_CONFIG: '/x' });
+  const worker = stubWorker();
+  try {
+    const seen = JSON.parse(await worker.agent('claude')('env', new AbortController().signal, scope(), 60_000));
+    expect(seen.env.filter((name: string) => !['PATH', 'DOCKER_HOST', 'TMPDIR'].includes(name))).toEqual([]);
+    expect(seen.env).toContain('TMPDIR');
+    expect(seen.credentials).toEqual(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEBOOST_CODEX_AUTH_FILE']);
+  } finally {
+    await worker.close();
+    for (const name of ['SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'DOCKER_CONFIG']) if (!(name in saved)) delete process.env[name];
+  }
 });
