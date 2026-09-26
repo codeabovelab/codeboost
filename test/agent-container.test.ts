@@ -27,7 +27,8 @@ const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();
 
-function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number } = {}) {
+function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number;
+  hostile?: (source: string, root: string) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'agent-container-')); roots.push(root);
   const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
@@ -38,6 +39,7 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
     git(source, 'add', '.'); git(source, 'commit', '-m', 'history');
     rmSync(join(source, 'history.bin'));
   }
+  options.hostile?.(source, root);
   writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '-A'); git(source, 'commit', '-m', 'baseline');
   writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-schema-marker"}\n');
   chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
@@ -138,6 +140,90 @@ describe('real Docker agent isolation', () => {
     const args = profile(fixture(), 'planning', 'noop').args;
     expect(args).toContain('--ipc=private');
     expect(args).toContain('--cgroupns=private');
+  }, 60_000);
+
+  it.each(['planning', 'review', 'execute'] as const)(
+    'keeps Git metadata unchanged under link, alias, truncation and replacement attempts during %s', phase => {
+      expect(runContainer(profile(fixture(), phase, 'metadata-alias'))).toBe('metadata-unchanged');
+    }, 60_000);
+
+  it('enforces byte and inode ceilings on every Codex scratch area', () => {
+    expect(runContainer(profile(fixture(), 'execute', 'scratch-capacity'))).toBe('scratch-bounded');
+  }, 120_000);
+
+  it('enforces byte and inode ceilings on every Claude scratch area', () => {
+    const placeholder = 'offline-placeholder-token';
+    const claude = profile(fixture(), 'execute', 'scratch-capacity', { vendor: 'claude', claudeToken: placeholder });
+    expect(runContainer(claude, 60_000, { CLAUDE_CODE_OAUTH_TOKEN: placeholder })).toBe('scratch-bounded');
+  }, 120_000);
+
+  it.each([
+    ['an absolute link to a host file', (source: string, root: string) => {
+      writeFileSync(join(root, 'host-only.txt'), 'codeboost-host-secret\n');
+      symlinkSync(join(root, 'host-only.txt'), join(source, 'escape'));
+    }],
+    ['an absolute link to the filesystem root', (source: string) => symlinkSync('/', join(source, 'root-link'))],
+    ['a relative link that climbs out of the checkout', (source: string) => {
+      mkdirSync(join(source, 'nested')); symlinkSync('../../..', join(source, 'nested', 'up'));
+    }],
+    ['a chain of in-checkout links that ends outside it', (source: string) => {
+      mkdirSync(join(source, 'deep')); mkdirSync(join(source, 'deep', 'er'));
+      symlinkSync('../..', join(source, 'deep', 'er', 'top'));
+      symlinkSync('deep/er/top/..', join(source, 'chained'));
+    }],
+    ['a chain that leaves through a target this host lacks', (source: string) => {
+      // On the host the final path is missing, but in the container /work/.. is / and the credential mount exists.
+      mkdirSync(join(source, 'deep')); mkdirSync(join(source, 'deep', 'er'));
+      symlinkSync('../..', join(source, 'deep', 'er', 'top'));
+      symlinkSync('deep/er/top/../run/codeboost-auth/codex/auth.json', join(source, 'chained'));
+    }],
+  ] as const)('refuses to seed a repository with %s, before any storage exists', (_label, hostile) => {
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
+      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const before = new Set(owned());
+    expect(() => fixture({ hostile })).toThrow('leaves the checkout');
+    expect(owned().filter(id => !before.has(id))).toEqual([]);
+  }, 60_000);
+
+  it('refuses to seed a clone whose Git metadata contains a link, before any storage exists', () => {
+    const data = fixture();
+    const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-git-link',
+      head: git(data.source, 'rev-parse', 'HEAD') });
+    // /work/.git is mounted read-only, which stops writes but not reads through a link.
+    symlinkSync('/run/codeboost-auth/codex/auth.json', join(clone.directory, '.git', 'credential'));
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
+      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const before = new Set(owned());
+    expect(() => prepareTaskFilesystems(clone, {
+      workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
+    }, imageId)).toThrow('Git metadata contains a link');
+    expect(owned().filter(id => !before.has(id))).toEqual([]);
+  }, 60_000);
+
+  it('seeds links that stay inside the checkout, including loops and not-yet-existing targets', () => {
+    const data = fixture({ hostile: source => {
+      mkdirSync(join(source, 'docs'));
+      writeFileSync(join(source, 'docs', 'guide.md'), 'guide\n');
+      symlinkSync('docs/guide.md', join(source, 'readme-link'));
+      symlinkSync('../docs', join(source, 'docs', 'self'));
+      symlinkSync('.', join(source, 'loop'));
+      symlinkSync('cycle-b', join(source, 'cycle-a'));
+      symlinkSync('cycle-a', join(source, 'cycle-b'));
+      symlinkSync('later.txt', join(source, 'future'));
+    } });
+    const started = performance.now();
+    expect(runContainer(profile(data, 'planning', 'hostile-repo'))).toBe('hostile-repo-contained');
+    expect(performance.now() - started).toBeLessThan(30_000);
+  }, 60_000);
+
+  it('fails closed without leaving storage when a repository exceeds its allocation', () => {
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
+      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const before = new Set(owned());
+    expect(() => fixture({ historyBytes: 4 * 1024 * 1024, limits: {
+      workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 1024 * 1024, metadataInodes: 512,
+    } })).toThrow();
+    expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
   it('persists execution changes while replacing HOME and scratch for each invocation', () => {
@@ -552,11 +638,12 @@ describe('real Docker agent isolation', () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
       const authProfile = profile(data, 'planning', policy => createCodexCommand(policy,
-        'Reply only with this exact marker: codeboost-schema-marker'),
+        'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
       { authProbe: true, codexAuthFile: authFile, deadlineMs: 5 * 60_000 });
-      // The production launch path: create, validate, start and remove.
+      // The production launch path: create, validate, start and remove. Raw stdout can carry more than the final
+      // message, so the value must appear as a complete line; the adapter probe checks the exact file channel.
       const output = runContainer(authProfile, 5 * 60_000);
-      expect(output).toContain('codeboost-schema-marker');
+      expect(output.split(/\r?\n/)).toContain('codeboost-schema-marker');
     }, 6 * 60_000);
 
     it('runs the authenticated Claude startup path with only its OAuth token', () => {
@@ -569,9 +656,7 @@ describe('real Docker agent isolation', () => {
       const output = runContainer(authProfile, 5 * 60_000, { CLAUDE_CODE_OAUTH_TOKEN: token });
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
-      // Tolerate one wrapping pair of backticks or quotes, but nothing else around the value.
-      const value = envelope.result?.trim().replace(/^(`+|"|')([^]*)\1$/, '$2').trim();
-      expect(value).toBe('codeboost-schema-marker');
+      expect(envelope.result?.replace(/\r?\n$/, '')).toBe('codeboost-schema-marker');
     }, 6 * 60_000);
   }
 });
