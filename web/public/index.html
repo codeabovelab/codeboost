@@ -40,12 +40,29 @@
           >codeboost</span
         ><span id="repository"></span>
         <nav aria-label="Main navigation">
-          <span>Issues</span><span>Plans</span><span>Queue</span
+          <a href="/?view=issues" id="issues-link">Issues</a
+          ><span>Plans</span><span>Queue</span
           ><a href="/" aria-current="page" id="review-link">Review</a
           ><span>Lessons</span><span>Learning</span><button id="settings">Settings</button>
         </nav>
         <span class="muted">Local review</span>
       </header>
+      <div id="issues-view" class="view" hidden>
+        <div class="review-strip">
+          <div><strong>Issues</strong> <span id="issues-repository" class="mono muted"></span></div>
+          <div id="issues-status" role="status"></div>
+          <button id="issues-refresh">Refresh issues</button>
+        </div>
+        <main class="issues-pane" aria-label="Ranked issues">
+          <p class="muted issues-help">
+            Ranked by priority label, security and bug labels, reactions, comments and age.
+            Issues from people who are not repository collaborators need your trust before they can be queued.
+            Trusting issues and queueing are not available yet.
+          </p>
+          <div id="issues-list"></div>
+        </main>
+      </div>
+      <div id="review-view" class="view">
       <div class="review-strip">
         <div><strong>Review</strong> <span id="issue">Loading…</span></div>
         <div id="progress" aria-live="polite"></div>
@@ -131,6 +148,7 @@
         ><button id="help">? Keyboard shortcuts</button
         ><span class="muted">Local source files stay unchanged</span>
       </footer>
+      </div>
     </div>
     <dialog id="dialog">
       <div id="dialog-body"></div>
