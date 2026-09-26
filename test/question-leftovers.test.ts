@@ -445,3 +445,18 @@ it('retries the startup scan after it fails', async () => {
     expect(scans).toBe(2);
   } finally { await worker.close(); }
 });
+
+it('waits for an abandonment already in progress when shutdown starts', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())), { abandonAfterDeadlineMs: 50 });
+  const started = Date.now();
+  // The watchdog abandons about one second in, while the thread is inside a three-second native call.
+  const question = worker.agent('claude')('block-long', new AbortController().signal, scope(32), 1_000).catch((error: Error) => error);
+  await new Promise(resolve => setTimeout(resolve, 1_400));
+  await worker.close();
+  // close() returned only after the thread stopped, and then the root is gone and the lock free.
+  expect(Date.now() - started).toBeGreaterThanOrEqual(2_500);
+  expect(((await question) as Error).message).toContain('did not settle');
+  expect(read(path).roots).toEqual([]);
+  expect(lockFree(path)).toBe(true);
+}, 20_000);

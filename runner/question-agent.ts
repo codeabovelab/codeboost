@@ -191,7 +191,8 @@ export class QuestionWorker {
   }
   async #close() {
     const worker = this.worker;
-    if (!worker) return;
+    // An abandonment already in progress (crash or watchdog) owns the worker: wait for its bounded settlement.
+    if (!worker) { await this.#abandoning; return; }
     // Questions still waiting mean lane D has not settled; do not wait on it at shutdown.
     if (this.pending.size) { await this.#abandon('was stopped at shutdown with questions still settling'); return; }
     const id = randomUUID();
