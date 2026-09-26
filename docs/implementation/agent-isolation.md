@@ -125,13 +125,19 @@ Ask keeps the contract's identity and cleanup rules:
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
   allocation IDs (#51 item 3) would let Ask name these resources instead.
+- One process at a time runs Ask for a review: an exclusive lock file next to the record
+  (`<database>.ask-leftovers.json.lock`, holding the PID) is taken before the scan and kept until the worker has
+  stopped. Only the holder scans, starts a worker or writes the record. A lock whose process no longer exists is
+  taken over. Separating different reviews that share one Docker daemon needs runner identity labels (#51 item 3),
+  and the general single-runner lock is F1d (#59).
 - The first question of each process runs that scan even without a record, because a process killed before it
   could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
   process running Ask at the same moment also keeps this one off.
 - Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
   records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
-  finishes first), then rejects the waiting questions, so shutdown cannot hang on D. If the thread is still busy
+  finishes first), then rejects the waiting questions, so shutdown cannot hang on D. A worker that does not answer
+  the final release request at shutdown goes through the same bounded path. If the thread is still busy
   after that wait, its ownership is already durable (unknown leftovers and the recorded root) and no new question is
   admitted; the root is deleted as soon as the thread stops.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a

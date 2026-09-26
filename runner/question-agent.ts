@@ -36,11 +36,14 @@ export class QuestionWorker {
   /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
   private abandonAfterMs: number;
   private terminateWaitMs: number;
+  private releaseTimeoutMs: number;
+  private closed = false;
   private env: Readonly<Record<string, string | undefined>>;
   constructor(url = new URL('./question-worker.ts', import.meta.url), ledger?: LeftoverLedger,
-    options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; env?: Readonly<Record<string, string | undefined>> } = {}) {
+    options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; releaseTimeoutMs?: number; env?: Readonly<Record<string, string | undefined>> } = {}) {
     this.url = url; this.ledger = ledger; this.abandonAfterMs = options.abandonAfterDeadlineMs ?? ABANDON_AFTER_DEADLINE_MS;
     this.terminateWaitMs = options.terminateWaitMs ?? DEFAULT_TERMINATE_WAIT_MS;
+    this.releaseTimeoutMs = options.releaseTimeoutMs ?? RELEASE_TIMEOUT_MS;
     this.env = options.env ?? process.env;
   }
   private start(): Worker {
@@ -102,7 +105,11 @@ export class QuestionWorker {
     const root = this.root;
     if (!root) return;
     this.root = undefined;
-    try { removeAskRoot(root); this.ledger?.forget(root); }
+    try {
+      removeAskRoot(root); this.ledger?.forget(root);
+      // A thread that stopped after close() has no more files to write: the lock can go too.
+      if (this.closed) this.ledger?.release();
+    }
     catch (error) { console.error(`codeboost: could not delete ${root}: ${error instanceof Error ? error.message : error}`); }
   }
   #recordUnknown() {
@@ -114,6 +121,8 @@ export class QuestionWorker {
       if (this.crashed) throw this.crashed;
       // Missing sign-in is reported before any Docker work, including the leftover scan.
       questionCredential(provider, this.env);
+      // Held until close, so no other process can scan, start a worker or write the record for this review.
+      this.ledger?.acquire();
       // The first question of a process also scans for labelled leftovers when there is no record.
       await this.ledger?.assertClear(signal, { startup: !this.scanned, active: this.root });
       this.scanned = true;
@@ -145,6 +154,14 @@ export class QuestionWorker {
    * anything it could not remove before terminating it, because terminating drops the worker's allocation handles.
    */
   async close() {
+    this.closed = true;
+    try { await this.#close(); }
+    finally {
+      // Keep the lock while an abandoned thread may still write into its recorded root.
+      if (!this.root) this.ledger?.release();
+    }
+  }
+  async #close() {
     const worker = this.worker;
     if (!worker) return;
     // Questions still waiting mean lane D has not settled; do not wait on it at shutdown.
@@ -153,15 +170,15 @@ export class QuestionWorker {
     let timer: ReturnType<typeof setTimeout> | undefined;
     const released = await new Promise<Omit<ReleaseReply, 'id'> | null>(resolve => {
       this.releases.set(id, resolve);
-      timer = setTimeout(() => { this.releases.delete(id); resolve(null); }, RELEASE_TIMEOUT_MS);
+      timer = setTimeout(() => { this.releases.delete(id); resolve(null); }, this.releaseTimeoutMs);
       worker.postMessage({ type: 'release', id } satisfies WorkerRequest);
     });
     clearTimeout(timer);
+    // No report means the worker may still be inside a synchronous Docker call: use the bounded abandon path,
+    // which records unknown leftovers and keeps the root recorded until the thread has stopped.
+    if (released === null) { await this.#abandon('did not report its storage before shutdown'); return; }
     this.worker = undefined;
-    try {
-      // No report (timeout or crash) means unknown leftovers, which stay recorded until no task storage remains.
-      if (released === null) this.#recordUnknown();
-      else this.ledger?.record(released.remaining, released.untracked);
-    } finally { await worker.terminate(); this.#removeRoot(); }
+    try { this.ledger?.record(released.remaining, released.untracked); }
+    finally { await worker.terminate(); this.#removeRoot(); }
   }
 }

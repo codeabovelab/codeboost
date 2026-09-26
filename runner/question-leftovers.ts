@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, lstatSync, openSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
 
@@ -77,6 +77,11 @@ export const dockerTaskStorage: ListTaskStorage = async signal => {
 };
 const LABELLED = 'docker ps -a, docker volume ls and docker network ls, each with --filter label=io.codeboost.allocation, label=io.codeboost.invocation or label=io.codeboost.egress';
 
+function processExists(pid: number): boolean {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code === 'EPERM'; }
+}
+
 function parse(text: string): LedgerRecord {
   const value = JSON.parse(text) as { leftovers?: unknown; untracked?: unknown };
   const list = value?.leftovers, untracked = value?.untracked, roots = (value as { roots?: unknown })?.roots;
@@ -98,8 +103,40 @@ function parse(text: string): LedgerRecord {
  */
 export class LeftoverLedger {
   readonly path: string;
+  #locked = false;
   readonly listTaskStorage: ListTaskStorage;
   constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; }
+
+  /**
+   * Exclusive Ask lock for this review database, held for the question worker's lifetime. Only the holder scans,
+   * starts a worker or writes this record, so two processes on one review cannot both pass the startup scan or
+   * overwrite each other's record. A lock left by a process that no longer exists is taken over.
+   */
+  acquire(): void {
+    if (this.#locked) return;
+    const lock = `${this.path}.lock`;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      try {
+        const fd = openSync(lock, 'wx', 0o600);
+        try { writeSync(fd, `${process.pid}\n`); } finally { closeSync(fd); }
+        this.#locked = true;
+        return;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error;
+        const owner = Number.parseInt(readFileSync(lock, 'utf8'), 10);
+        if (!Number.isSafeInteger(owner) || owner <= 0 || processExists(owner)) {
+          throw new Error(`Ask is off: another codeboost process (${Number.isSafeInteger(owner) ? `PID ${owner}` : 'unknown'}) is running Ask for this review. Stop it, or delete ${lock} if that process is gone.`);
+        }
+        rmSync(lock, { force: true });
+      }
+    }
+    throw new Error(`Ask is off: could not take the Ask lock ${lock}.`);
+  }
+  release(): void {
+    if (!this.#locked) return;
+    this.#locked = false;
+    rmSync(`${this.path}.lock`, { force: true });
+  }
 
   #read(): LedgerRecord {
     if (!existsSync(this.path)) return { leftovers: [], untracked: 0, roots: [] };

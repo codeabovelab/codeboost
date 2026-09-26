@@ -83,7 +83,7 @@ it('keeps Ask off after an unidentifiable leftover until no labelled task storag
   expect(existsSync(path)).toBe(false);
 });
 
-const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; env?: Record<string, string> } = {}) =>
+const stubWorker = (ledger: LeftoverLedger, options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; releaseTimeoutMs?: number; env?: Record<string, string> } = {}) =>
   new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), ledger,
     { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' }, ...options });
 const scope = (n: number) => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
@@ -291,4 +291,39 @@ it('hands a thread that outlives the wait to the durable record, and deletes its
   expect(read(path)).toEqual({ leftovers: [], untracked: 1, roots: [] });
   // No new question is admitted meanwhile.
   await expect(worker.agent('claude')('answer', new AbortController().signal, scope(20), 60_000)).rejects.toThrow('Ask is off');
+});
+
+it('lets only one process run Ask for a review, and takes over a lock left by a dead process', async () => {
+  const path = ledgerPath();
+  const first = stubWorker(new LeftoverLedger(path, docker(new Set())));
+  const second = stubWorker(new LeftoverLedger(path, docker(new Set())));
+  try {
+    expect(await first.agent('claude')('answer', new AbortController().signal, scope(21), 60_000)).toBe('claude:answer:n');
+    // Same PID stands in for another live process holding the lock.
+    await expect(second.agent('claude')('answer', new AbortController().signal, scope(22), 60_000)).rejects.toThrow(`PID ${process.pid}`);
+  } finally { await first.close(); await second.close(); }
+  expect(existsSync(`${path}.lock`)).toBe(false);
+  // A lock whose process no longer exists is taken over.
+  writeFileSync(`${path}.lock`, '2147483646\n');
+  const third = stubWorker(new LeftoverLedger(path, docker(new Set())));
+  try { expect(await third.agent('claude')('answer', new AbortController().signal, scope(23), 60_000)).toBe('claude:answer:n'); }
+  finally { await third.close(); }
+  expect(existsSync(`${path}.lock`)).toBe(false);
+});
+
+it('bounds shutdown when the worker does not report, keeping its root recorded until the thread stops', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())), { releaseTimeoutMs: 100, terminateWaitMs: 100 });
+  expect(await worker.agent('claude')('stick-on-release', new AbortController().signal, scope(24), 60_000)).toBe('ok');
+  const started = Date.now();
+  await worker.close();
+  expect(Date.now() - started).toBeLessThan(900);
+  const record = read(path);
+  expect(record).toMatchObject({ leftovers: [], untracked: 1 });
+  const [root] = record.roots;
+  expect(existsSync(root)).toBe(true);
+  // The lock stays while the thread may still write; both go once it stops.
+  expect(existsSync(`${path}.lock`)).toBe(true);
+  await expect.poll(() => existsSync(root), { timeout: 5_000 }).toBe(false);
+  expect(existsSync(`${path}.lock`)).toBe(false);
 });

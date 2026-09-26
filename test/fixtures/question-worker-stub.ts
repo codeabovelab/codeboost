@@ -10,7 +10,10 @@ const waiting = new Map<string, string>();
 // Allocations a question could not remove, as the real worker's RetainedStorage would report them.
 const leaked: { keeper: string; workVolume: string; metadataVolume: string }[] = [];
 let untracked = 0;
+let stuckOnRelease = false;
 parentPort!.on('message', (message: WorkerRequest) => {
+  // Simulates a worker stuck in synchronous cleanup when shutdown asks it to report.
+  if (message.type === 'release' && stuckOnRelease) { spawnSync('sleep', ['1']); return; }
   if (message.type === 'release') {
     parentPort!.postMessage({ id: message.id, remaining: leaked, untracked });
     return;
@@ -36,6 +39,7 @@ parentPort!.on('message', (message: WorkerRequest) => {
   }
   // Never replies, like a question whose lane D cleanup does not settle.
   if (prompt === 'hang') return;
+  if (prompt === 'stick-on-release') { stuckOnRelease = true; parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: 'ok' }); return; }
   // Blocks the thread in a native subprocess call, like lane D's synchronous Docker and Git setup, then never replies.
   if (prompt === 'block') { spawnSync('sleep', ['1']); return; }
   // Leaves a host copy behind, as an interrupted setup would, and reports where the worker's TMPDIR put it.
