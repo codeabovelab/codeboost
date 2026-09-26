@@ -179,6 +179,21 @@ describe('real Docker agent isolation', () => {
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
+  it('refuses to seed a clone whose Git metadata contains a link, before any storage exists', () => {
+    const data = fixture();
+    const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-git-link',
+      head: git(data.source, 'rev-parse', 'HEAD') });
+    // /work/.git is mounted read-only, which stops writes but not reads through a link.
+    symlinkSync('/run/codeboost-auth/codex/auth.json', join(clone.directory, '.git', 'credential'));
+    const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
+      docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
+    const before = new Set(owned());
+    expect(() => prepareTaskFilesystems(clone, {
+      workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
+    }, imageId)).toThrow('Git metadata contains a link');
+    expect(owned().filter(id => !before.has(id))).toEqual([]);
+  }, 60_000);
+
   it('seeds links that stay inside the checkout, including loops and not-yet-existing targets', () => {
     const data = fixture({ hostile: source => {
       mkdirSync(join(source, 'docs'));

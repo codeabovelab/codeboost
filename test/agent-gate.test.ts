@@ -128,6 +128,17 @@ describe('isolation gate detects breaches', () => {
     expect(result.stderr).toContain(breach);
   }, 180_000);
 
+  // Bytes stay bounded so each fill stops at dd; only the file-count limit of one Codex area is missing.
+  it.each([
+    ['CODEX_HOME', [...codexHome('size=4m,nr_inodes=1000000'), ...codexOutput('size=20m,nr_inodes=64')]],
+    ['Codex output directory', [...codexHome('size=4m,nr_inodes=256'), ...codexOutput('size=20m,nr_inodes=1000000')]],
+  ] as const)('fails the scratch probe when %s has no inode limit', (_label, codexMounts) => {
+    const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch, ...codexMounts],
+      probeScript('execute', 'scratch-capacity'), codexEnvironment);
+    expect(result.status, result.stderr).not.toBe(0);
+    expect(result.stdout).not.toContain('scratch-bounded');
+  }, 180_000);
+
   it('fails the scratch probe for a Codex container whose Codex scratch areas are missing', () => {
     // Missing scratch areas must fail the probe, not skip their checks and report the container as bounded.
     const result = runBroken([...bounded, ...writableMetadata, ...boundedScratch],

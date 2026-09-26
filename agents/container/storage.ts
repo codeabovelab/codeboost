@@ -114,20 +114,25 @@ const within = (base: string, path: string) => {
   const rel = relative(base, path);
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
+const LINK_INSPECTION_LIMIT = 200_000;
 /**
- * Refuse a checkout whose symbolic links leave it. The seeder copies links as links, so an absolute or escaping link
- * would let a path-restricted agent tool read container files outside the checkout (for example process environments
- * that hold vendor credentials). Links that stay inside, including loops and not-yet-existing targets, are allowed.
+ * Refuse a checkout whose symbolic links leave it, or whose Git metadata contains any link. The seeder copies links as
+ * links, so an absolute or escaping link would let a path-restricted agent tool read container files outside the
+ * checkout (for example process environments that hold vendor credentials). Worktree links that stay inside, including
+ * loops and not-yet-existing targets, are allowed.
  */
 const assertContainedLinks = (staging: string, remaining: () => number) => {
-  const pending = [staging];
+  const metadata = join(staging, '.git'), pending = [staging];
   let count = 0;
   while (pending.length) {
     remaining();
-    if (++count > 200_000) throw new Error('Repository checkout exceeds the link inspection limit.');
+    count++;
     const path = pending.pop()!, stat = lstatSync(path);
     if (stat.isSymbolicLink()) {
-      const target = readlinkSync(path), name = JSON.stringify(relative(staging, path));
+      const name = JSON.stringify(relative(staging, path));
+      // Git never needs links in its own metadata, which is mounted at /work/.git; refuse any, wherever it points.
+      if (within(metadata, path)) throw new Error(`Repository Git metadata contains a link ${name}.`);
+      const target = readlinkSync(path);
       if (isAbsolute(target) || !within(staging, resolve(dirname(path), target)))
         throw new Error(`Repository link ${name} leaves the checkout.`);
       // realpathSync.native follows POSIX (each link is resolved before a later `..`), as the container kernel does;
@@ -141,11 +146,13 @@ const assertContainedLinks = (staging: string, remaining: () => number) => {
       continue;
     }
     if (!stat.isDirectory()) continue;
-    const directory = opendirSync(path);
+    const directory = opendirSync(path, { bufferSize: 1 });
     try {
       for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-        // Git metadata is copied to its own read-only volume and is not part of the checkout.
-        if (path === staging && entry.name === '.git') continue;
+        // Bound time and memory per entry, so one huge directory cannot defer the deadline or the entry limit.
+        remaining();
+        if (count + pending.length >= LINK_INSPECTION_LIMIT)
+          throw new Error('Repository checkout exceeds the link inspection limit.');
         pending.push(join(path, entry.name));
       }
     } finally { directory.closeSync(); }
