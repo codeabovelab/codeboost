@@ -179,6 +179,13 @@ describe('attempt transitions', () => {
     const next = admit(store); store.markRunning(identity, next.id);
     expect(settle(store, next.id, { result: 'x'.repeat(1024 * 1024 + 1) })).toMatchObject({ state: 'failed', reason: 'The result exceeds 1 MiB.' });
   });
+  it('freezes the task status while an attempt is active, and never completes into a non-running task', () => {
+    const { store, path } = queued(); const attempt = admit(store); store.markRunning(identity, attempt.id);
+    expect(() => store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs amendment')).toThrow(/still active/);
+    const db = new DatabaseSync(path); db.exec(`UPDATE tasks SET status='needs amendment'`); db.close();
+    expect(settle(store, attempt.id, { result: 'late' })).toMatchObject({ state: 'cancelled', reason: 'The task left the running state before the result was saved.' });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+  });
   it('refuses a late settlement from an old attempt after a retry, without touching the retry', () => {
     const { store } = queued(); const old = admit(store);
     store.recordFirstReason(identity, old.id, 'cancelled'); settle(store, old.id);

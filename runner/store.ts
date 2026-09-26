@@ -665,8 +665,10 @@ export class Store {
       const contextCurrent = sameContext(decode<InvocationContext>(row.context), this.#contextOf(key));
       let outcome = classifySettlement({ ...settlement, firstReason, contextCurrent });
       if (outcome.state === 'completed' && row.state !== 'running') throw new GuardRefusal('Only a running attempt can complete.');
-      if (outcome.state === 'completed' && (this.#closed(task.status) || task.cancel_requested !== null))
-        outcome = { state: 'cancelled', reason: 'The task was closed before the result was saved.', timeLimit: false };
+      // The task must still be running; a task never leaves running while an attempt is active, so this is a second safeguard.
+      if (outcome.state === 'completed' && (task.status !== 'running' || task.cancel_requested !== null))
+        outcome = { state: 'cancelled', reason: this.#closed(task.status) || task.cancel_requested !== null
+          ? 'The task was closed before the result was saved.' : 'The task left the running state before the result was saved.', timeLimit: false };
       let result: string | null = null;
       if (outcome.state === 'completed') {
         result = encode(settlement.result ?? null);
