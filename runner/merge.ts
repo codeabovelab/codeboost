@@ -1,4 +1,5 @@
 import type { ReviewService } from './review.ts';
+import { ShuttingDownError, type ShutdownCapability } from './lifecycle.ts';
 import type { MergeAttempt } from './store.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
@@ -30,9 +31,12 @@ export class MergeCoordinator {
   readonly service: ReviewService;
   readonly gateway: MergeGateway;
   readonly operationTimeoutMs: number;
-  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = 14_000) {
+  /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
+  #settle: <T>(fn: () => T) => T;
+  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = 14_000, capability?: ShutdownCapability) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 14_000) throw new Error('Invalid merge operation deadline.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs;
+    this.#settle = capability ? fn => capability.run(fn) : fn => fn();
   }
 
   #attempt(): MergeAttempt | null {
@@ -117,6 +121,7 @@ export class MergeCoordinator {
   async displayStatus(view = this.service.load(), signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
     try { return await this.status(view, false, signal); }
     catch (error) {
+      if (error instanceof ShuttingDownError) throw error;
       if (signal?.aborted) throw signal.reason;
       return { available: true, ready: false, action: null, blockers: [{ code: 'github', message: `Could not read GitHub merge state. ${error instanceof Error ? error.message : 'Unknown error.'}` }], remote: null, queue: this.#queueStatus() };
     }
@@ -171,21 +176,24 @@ export class MergeCoordinator {
         // The enqueue command has already committed externally. A local refresh failure must not
         // report that action as failed; the durable submitting record is recoverable by polling.
         try {
-          if (queueAttempt.kind === 'queue') this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url);
-          else this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged' });
+          const attempt = queueAttempt;
+          this.#settle(() => {
+            if (attempt.kind === 'queue') this.service.store.queueMergeAttempt(this.service.config.identity, attempt.id, result.url);
+            else this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'merged' });
+          });
         } catch {}
       }
       return { status: commandStatus, result };
     } catch (error) {
-      if (queueAttempt) try {
+      if (queueAttempt) try { const attempt = queueAttempt; this.#settle(() => {
         const message = error instanceof Error ? error.message : 'GitHub merge submission outcome is unknown.';
         if (error instanceof MergeSubmissionError && error.outcome === 'refused') {
-          this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, {
+          this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, {
             state: 'failed', reason: message,
             requiresFreshReview: /head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|stale review/i.test(message),
           });
-        } else this.service.store.recordMergeAttemptDiagnostic(this.service.config.identity, queueAttempt.id, message);
-      } catch {}
+        } else this.service.store.recordMergeAttemptDiagnostic(this.service.config.identity, attempt.id, message);
+      }); } catch {}
       if (signal.aborted && signal.reason instanceof Error) throw signal.reason;
       throw error;
     }
@@ -221,6 +229,7 @@ export class MergeCoordinator {
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {
+      if (error instanceof ShuttingDownError) throw error;
       if (signal.aborted) throw signal.reason;
       const message = error instanceof Error ? error.message : 'Could not read the merge queue.';
       if (/head changed after review/i.test(message)) {

@@ -27,13 +27,19 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 /** Attempt, action and allocation IDs are lowercase UUID v4s; anything else is refused before use. */
 export function isUuidV4(value: unknown): value is string { return typeof value === 'string' && UUID_V4.test(value); }
 export function assertUuidV4(value: unknown, name: string): asserts value is string {
-  if (!isUuidV4(value)) throw new GuardRefusal(`${name} must be a lowercase UUID v4.`);
+  if (!isUuidV4(value)) throw new BadRequest(`${name} must be a lowercase UUID v4.`);
 }
 
 /** A guard refused the action. Refusals are definite outcomes and are recorded for replay. */
 export class GuardRefusal extends Error {}
+/** A malformed request, refused before any transaction and never recorded. The server maps it to HTTP 400. */
+export class BadRequest extends GuardRefusal {}
 /** Reusing an action ID for a different request. */
 export class ActionIdReused extends GuardRefusal {}
+/** A Store write after shutdown began. The server maps it to HTTP 503, never to the 409 used for review errors. */
+export class ShuttingDownError extends Error { constructor() { super('The review server is shutting down.'); } }
+/** Lets settling coordinator code write after the gate closes. Only the server hands it out, and never to HTTP handlers. */
+export interface ShutdownCapability { run<T>(fn: () => T): T }
 
 export function bounded(reason: string): string {
   const text = reason.trim() || 'No reason given.';

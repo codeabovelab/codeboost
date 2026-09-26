@@ -6,7 +6,7 @@ import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanConte
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import {
-  ATTEMPT_PHASES, CLOSED_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
@@ -115,11 +115,24 @@ export class Store {
   }
   close(): void { this.#db.close(); }
   #get(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).get(...args); }
-  #run(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).run(...args); }
+  #run(sql: string, ...args: SQLInputValue[]) { this.#checkWrite(); return this.#db.prepare(sql).run(...args); }
+  // Shutdown write gate (runner-lifecycle.md, "Shutdown" step 1).
+  #gateClosed = false; #privileged = 0; #capabilityIssued = false;
+  #checkWrite(): void { if (this.#gateClosed && this.#privileged === 0) throw new ShuttingDownError(); }
+  /** Issued once, to the server, which hands it only to coordinators' settlement and close code. */
+  shutdownCapability(): ShutdownCapability {
+    if (this.#capabilityIssued) throw new Error('The shutdown capability was already issued.');
+    this.#capabilityIssued = true;
+    return Object.freeze({ run: <T>(fn: () => T): T => { this.#privileged++; try { return fn(); } finally { this.#privileged--; } } });
+  }
+  /** Shutdown step 1: from now on, every write without the capability throws ShuttingDownError. Reads still work. */
+  closeWrites(): void { this.#gateClosed = true; }
+  get writesClosed(): boolean { return this.#gateClosed; }
   #depth = 0;
   /** Nested calls join the outer transaction, so a user action can wrap existing Store methods atomically. */
   #transaction<T>(fn: () => T): T {
     if (this.#depth > 0) { this.#depth++; try { return fn(); } finally { this.#depth--; } }
+    this.#checkWrite();
     this.#db.exec('BEGIN IMMEDIATE'); this.#depth = 1;
     try { const result = fn(); this.#db.exec('COMMIT'); return result; }
     catch (error) { this.#db.exec('ROLLBACK'); throw error; }
@@ -736,8 +749,8 @@ export class Store {
         return { response: value, replayed: false };
       });
     } catch (error) {
-      const storage = (error as { code?: string }).code === 'ERR_SQLITE_ERROR';
-      if (!replaying && !storage && !(error instanceof ActionIdReused) && this.#depth === 0) {
+      const storage = (error as { code?: string }).code === 'ERR_SQLITE_ERROR' || error instanceof ShuttingDownError;
+      if (!replaying && !storage && !(error instanceof ActionIdReused) && !(error instanceof BadRequest) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
         this.#transaction(() => { if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message }); });
       }
