@@ -1903,7 +1903,7 @@ This table records merged and open PRs only. A lane is complete only when every 
 | C — guarded merge gate | C1–C4 (PR #23) | — | Done. Remaining build step 4 work belongs to F (#22) |
 | D — agent isolation | D1 (#31), D2 (#40), D3 (#44), D4 (#47), D5 (#50); gate in `docs/implementation/agent-isolation.md` | — | Done. F, G4 and live planning may now use the boundary; F moves Ask into it (#54) |
 | E — planning logic | E1 (#30), E2 (#32), E3 (#35), suggestion lifecycle bindings (#43) | E4 #45 (draft; replaces #37) | Finish E4 with real recordings |
-| F — runner | F1 contract (#49, `docs/implementation/runner-lifecycle.md`) | F1a #53 (Store lifecycle), F1b #56 (coordinator), F1c #57 (shutdown wiring, `/api/runner`), F1d #59 (startup recovery, single-runner lock); Ask in the agent container #54 | Land F1a–F1d in stack order, then F2. #54 ends the interim R1 exception for Ask |
+| F — runner | F1 contract (#49, `docs/implementation/runner-lifecycle.md`) | F1a #53 (Store lifecycle), F1b #56 (coordinator), F1c #57 (shutdown wiring, `/api/runner`), F1d #59 (startup recovery, single-runner lock), F1e #60 (planning API for G4, feedback events); Ask in the agent container #54 | Land F1a–F1e in stack order, then F2. The F1 stack must not merge as a whole until #51's pre-F1 D items land. #54 ends the interim R1 exception for Ask |
 | G — planning screen | — | — | G1 after E4 |
 | H — issue prioritization | H1–H3 (#39), trust fix #42 (issue #41), H4a Issues screen (#55) | — | H4b: the "trust this issue" action, which needs Store persistence through F after F1a. H4a holds the web files until G1 starts. Follow-up #58 (disconnect concern) |
 | I, J | — | — | After F6 |
