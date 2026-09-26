@@ -17,12 +17,12 @@ it('keeps Ask off with removal commands while recorded storage exists, and clear
   const ledger = new LeftoverLedger(path, present(names));
   ledger.record([leftover(1), leftover(2)]);
   ledger.record([leftover(1)]);
-  expect(JSON.parse(readFileSync(path, 'utf8'))).toHaveLength(2);
+  expect(JSON.parse(readFileSync(path, 'utf8')).leftovers).toHaveLength(2);
   await expect(ledger.assertClear()).rejects.toThrow('docker rm -f codeboost-keeper-1 && docker volume rm codeboost-work-1 codeboost-meta-1');
   names.delete('codeboost-keeper-1'); names.delete('codeboost-work-1'); names.delete('codeboost-meta-1');
   // Entry 2 still has one volume, so it stays recorded and Ask stays off.
   await expect(ledger.assertClear()).rejects.toThrow('codeboost-keeper-2');
-  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual([leftover(2)]);
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ leftovers: [leftover(2)], untracked: 0 });
   names.clear();
   await expect(ledger.assertClear()).resolves.toBeUndefined();
   expect(existsSync(path)).toBe(false);
@@ -33,7 +33,9 @@ it('fails closed on an unreadable or tampered record', async () => {
   const ledger = new LeftoverLedger(path, present(new Set()));
   writeFileSync(path, '{not json');
   await expect(ledger.assertClear()).rejects.toThrow('unreadable');
-  writeFileSync(path, JSON.stringify([{ keeper: 'x; rm -rf /', workVolume: 'a', metadataVolume: 'b' }]));
+  writeFileSync(path, JSON.stringify({ leftovers: [{ keeper: 'x; rm -rf /', workVolume: 'a', metadataVolume: 'b' }], untracked: 0 }));
+  await expect(ledger.assertClear()).rejects.toThrow('unreadable');
+  writeFileSync(path, JSON.stringify({ leftovers: [], untracked: -1 }));
   await expect(ledger.assertClear()).rejects.toThrow('unreadable');
   expect(existsSync(path)).toBe(true);
 });
@@ -48,7 +50,7 @@ it('records storage the worker still owns at shutdown, and the next session refu
   const first = stubWorker(new LeftoverLedger(path, present(names)));
   await expect(first.agent('claude')('leak', new AbortController().signal, scope(1), 60_000)).rejects.toThrow('cleanup did not settle');
   await first.close();
-  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual([leftover(1)]);
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ leftovers: [leftover(1)], untracked: 0 });
 
   const second = stubWorker(new LeftoverLedger(path, present(names)));
   try {
@@ -65,4 +67,24 @@ it('writes no record when nothing was left behind', async () => {
   expect(await worker.agent('claude')('answer', new AbortController().signal, scope(4), 60_000)).toBe('claude:answer:n');
   await worker.close();
   expect(existsSync(path)).toBe(false);
+});
+
+it('keeps Ask off after an unidentifiable setup leftover until no labelled task storage remains', async () => {
+  const path = ledgerPath();
+  let storage = true;
+  const ledger = new LeftoverLedger(path, present(new Set()), async () => storage);
+  ledger.record([], 1);
+  await expect(ledger.assertClear()).rejects.toThrow('label=io.codeboost.task-storage');
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ leftovers: [], untracked: 1 });
+  storage = false;
+  await expect(ledger.assertClear()).resolves.toBeUndefined();
+  expect(existsSync(path)).toBe(false);
+});
+
+it('carries an untracked setup failure from the worker into the record at shutdown', async () => {
+  const path = ledgerPath();
+  const first = stubWorker(new LeftoverLedger(path, present(new Set()), async () => true));
+  await expect(first.agent('claude')('lose-setup', new AbortController().signal, scope(5), 60_000)).rejects.toThrow('cleanup did not settle');
+  await first.close();
+  expect(JSON.parse(readFileSync(path, 'utf8'))).toEqual({ leftovers: [], untracked: 1 });
 });

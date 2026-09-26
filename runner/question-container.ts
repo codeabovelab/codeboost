@@ -31,8 +31,12 @@ export interface ContainerQuestion extends QuestionScope {
  */
 export class RetainedStorage {
   readonly #retained = new Set<TaskFilesystems>();
+  #untracked = 0;
   get size() { return this.#retained.size; }
+  /** Allocations whose setup failed and whose cleanup D could not confirm. D returns no handle for them. */
+  get untracked() { return this.#untracked; }
   retain(filesystems: TaskFilesystems) { this.#retained.add(filesystems); }
+  markUntracked() { this.#untracked++; }
   /** Docker names of the retained allocations, for a durable record before this registry is dropped. */
   list(): Leftover[] {
     return [...this.#retained].map(({ keeper, workVolume, metadataVolume }) => ({ keeper, workVolume, metadataVolume }));
@@ -42,6 +46,7 @@ export class RetainedStorage {
     for (const filesystems of [...this.#retained]) {
       try { remove(filesystems); this.#retained.delete(filesystems); } catch { /* still owned; retried next time */ }
     }
+    if (this.#untracked) throw new Error(`Agent storage setup failed and its cleanup was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no \`io.codeboost.task-storage\` containers or volumes remain.`);
     if (this.#retained.size) throw new Error(`Agent storage from an earlier question could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
   }
 }
@@ -122,7 +127,12 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     chmodSync(input, 0o555);
     const clone = deps.createClone({ source: question.repository, parent: staging, taskId: `question-${question.noteId}`,
       head: question.head, timeoutMs: Math.min(120_000, remaining()) });
-    filesystems = deps.prepareFilesystems(clone, QUESTION_STORAGE, image.id, Math.min(60_000, remaining()));
+    try { filesystems = deps.prepareFilesystems(clone, QUESTION_STORAGE, image.id, Math.min(60_000, remaining())); }
+    catch (error) {
+      // D throws an AggregateError only when a failed allocation's own cleanup did not settle; it returns no handle.
+      if (error instanceof AggregateError) retained.markUntracked();
+      throw error;
+    }
     remaining();
     const invocation = deps.capture({ clone, phase: 'questions', vendor: question.provider, approvedArgv: [],
       deadline: question.deadline, attemptId: question.attemptId,

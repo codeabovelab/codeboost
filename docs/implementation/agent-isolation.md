@@ -108,6 +108,10 @@ Ask keeps the contract's identity and cleanup rules:
   refusal shows the `docker rm`/`docker volume rm` commands, and the record clears itself once they are gone. An
   unreadable record, or a Docker daemon that cannot answer, keeps Ask off. Removal goes through D only once D has
   recovery handles (#51 item 4).
+- If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
+  resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
+  restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
+  allocation IDs (#51 item 3) would let Ask name these resources instead.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker; Ask stays off until codeboost restarts. Reclaiming those leftovers after a crash or restart
   needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.

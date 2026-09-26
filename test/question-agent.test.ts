@@ -183,6 +183,22 @@ it.each([
   await expect(askInContainer(question(), fake.deps, new AbortController().signal)).rejects.toThrow(message);
 });
 
+it('turns Ask off when a failed setup leaves storage D cannot hand back', async () => {
+  const retained = new RetainedStorage();
+  const failed = fakeDeps();
+  failed.deps.prepareFilesystems = () => { throw new AggregateError([new Error('seed failed'), new Error('remove failed')], 'Task allocation failed and cleanup did not settle.'); };
+  await expect(askInContainer(question(), failed.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
+  expect(retained.untracked).toBe(1);
+  const next = fakeDeps();
+  await expect(askInContainer(question(), next.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cannot tell which Docker resources');
+  expect(next.events).toEqual([]);
+  // A setup failure whose cleanup D confirmed leaves nothing behind.
+  const clean = new RetainedStorage(), plain = fakeDeps();
+  plain.deps.prepareFilesystems = () => { throw new Error('Repository exceeds its allocation.'); };
+  await expect(askInContainer(question(), plain.deps, new AbortController().signal, {}, clean)).rejects.toThrow('allocation');
+  expect(clean.untracked).toBe(0);
+});
+
 it('keeps storage whose removal failed, refuses Ask until it is removed, then continues', async () => {
   const retained = new RetainedStorage();
   const first = fakeDeps();

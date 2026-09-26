@@ -14,7 +14,7 @@ export type WorkerRequest = { type: 'ask'; id: string; question: ContainerQuesti
   | { type: 'release'; id: string };
 export type WorkerReply = { id: string; attemptId: string; ok: true; text: string } | { id: string; attemptId: string; ok: false; error: string };
 /** Reply to `release`: allocations still not removed after a final attempt. */
-export type ReleaseReply = { id: string; remaining: Leftover[] };
+export type ReleaseReply = { id: string; remaining: Leftover[]; untracked: number };
 
 const deps: ContainerDependencies = {
   buildImage: buildAgentImage,
@@ -35,7 +35,7 @@ parentPort!.on('message', (message: WorkerRequest) => {
   if (message.type === 'release') {
     // Shutdown: one last removal attempt, then report what is still owned so it can be recorded durably.
     try { retained.release(deps.removeFilesystems); } catch { /* reported below */ }
-    parentPort!.postMessage({ id: message.id, remaining: retained.list() } satisfies ReleaseReply);
+    parentPort!.postMessage({ id: message.id, remaining: retained.list(), untracked: retained.untracked } satisfies ReleaseReply);
     return;
   }
   const controller = new AbortController();

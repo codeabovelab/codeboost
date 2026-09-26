@@ -5,9 +5,10 @@ import type { WorkerRequest } from '../../runner/question-worker.ts';
 const waiting = new Map<string, string>();
 // Allocations a question could not remove, as the real worker's RetainedStorage would report them.
 const leaked: { keeper: string; workVolume: string; metadataVolume: string }[] = [];
+let untracked = 0;
 parentPort!.on('message', (message: WorkerRequest) => {
   if (message.type === 'release') {
-    parentPort!.postMessage({ id: message.id, remaining: leaked });
+    parentPort!.postMessage({ id: message.id, remaining: leaked, untracked });
     return;
   }
   if (message.type === 'cancel') {
@@ -22,6 +23,11 @@ parentPort!.on('message', (message: WorkerRequest) => {
   if (prompt === 'leak') {
     leaked.push({ keeper: 'codeboost-keeper-1', workVolume: 'codeboost-work-1', metadataVolume: 'codeboost-meta-1' });
     parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Question container cleanup did not settle.' });
+    return;
+  }
+  if (prompt === 'lose-setup') {
+    untracked++;
+    parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Task allocation failed and cleanup did not settle.' });
     return;
   }
   if (prompt === 'wait') { waiting.set(message.id, attemptId); return; }

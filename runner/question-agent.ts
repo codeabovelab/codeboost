@@ -3,7 +3,7 @@ import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
 import type { Provider } from './question-container.ts';
 import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
-import type { Leftover, LeftoverLedger } from './question-leftovers.ts';
+import type { LeftoverLedger } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
 
 // Leave the worker time to cancel the container and release storage before the review's own timeout fires.
@@ -18,7 +18,7 @@ export class QuestionWorker {
   // Set when the worker dies. Its containers and storage may still exist, and nothing in this process can reclaim
   // them until lane D's scoped recovery exists (#51), so Ask stays off rather than starting a replacement worker.
   private crashed?: Error;
-  private releases = new Map<string, (remaining: Leftover[]) => void>();
+  private releases = new Map<string, (reply: Omit<ReleaseReply, 'id'>) => void>();
   private url: URL;
   private ledger?: LeftoverLedger;
   /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
@@ -28,7 +28,7 @@ export class QuestionWorker {
     if (this.worker) return this.worker;
     const worker = new Worker(this.url);
     worker.on('message', (reply: WorkerReply | ReleaseReply) => {
-      if ('remaining' in reply) { this.releases.get(reply.id)?.(reply.remaining); this.releases.delete(reply.id); return; }
+      if ('remaining' in reply) { this.releases.get(reply.id)?.(reply); this.releases.delete(reply.id); return; }
       const job = this.pending.get(reply.id);
       if (!job) return;
       this.pending.delete(reply.id);
@@ -41,7 +41,7 @@ export class QuestionWorker {
       this.crashed = new Error(`The agent container worker stopped (${error.message}). Its containers and storage may still exist, so Ask is off until codeboost restarts. Check \`docker ps -a\` and \`docker volume ls\` before restarting.`);
       for (const job of this.pending.values()) job.reject(this.crashed);
       this.pending.clear();
-      for (const release of this.releases.values()) release([]);
+      for (const release of this.releases.values()) release({ remaining: [], untracked: 0 });
       this.releases.clear();
     };
     worker.on('error', fail);
@@ -81,7 +81,7 @@ export class QuestionWorker {
     if (!worker) return;
     const id = randomUUID();
     let timer: ReturnType<typeof setTimeout> | undefined;
-    const remaining = await new Promise<Leftover[] | null>(resolve => {
+    const released = await new Promise<Omit<ReleaseReply, 'id'> | null>(resolve => {
       this.releases.set(id, resolve);
       timer = setTimeout(() => { this.releases.delete(id); resolve(null); }, RELEASE_TIMEOUT_MS);
       worker.postMessage({ type: 'release', id } satisfies WorkerRequest);
@@ -89,8 +89,8 @@ export class QuestionWorker {
     clearTimeout(timer);
     this.worker = undefined;
     try {
-      if (remaining === null) console.error('codeboost: the agent container worker did not report its storage before shutdown. Check `docker ps -a` and `docker volume ls` for leftover codeboost resources.');
-      else this.ledger?.record(remaining);
+      if (released === null) console.error('codeboost: the agent container worker did not report its storage before shutdown. Check `docker ps -a` and `docker volume ls` for leftover codeboost resources.');
+      else this.ledger?.record(released.remaining, released.untracked);
     } finally { await worker.terminate(); }
   }
 }
