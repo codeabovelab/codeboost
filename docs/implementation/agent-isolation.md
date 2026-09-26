@@ -10,7 +10,7 @@ The gate needs a running Docker daemon. Run the suites one file at a time, becau
 they share one image tag and one daemon:
 
 ```bash
-npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts
+npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts test/agent-question.test.ts
 ```
 
 The `Agent isolation` workflow runs the same command. The main `CI` workflow skips
@@ -85,6 +85,16 @@ The caller must do the following:
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
+
+## First consumer: Ask
+
+Ask (`runner/question-container.ts`) is the first production caller. It follows the four entry points above in the
+"questions" phase with no approved commands, clones the reviewed snapshot head, and writes a fixed answer schema as the
+only input file. Because every entry point above is synchronous, a worker thread (`runner/question-worker.ts`) owns the
+image, clones and allocations, so the review server keeps serving while Docker and Git run. The worker settles a
+question only after the invocation settles and its storage is removed. `test/agent-question.test.ts` runs this path
+against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Limits of this gate
 

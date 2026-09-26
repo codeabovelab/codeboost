@@ -6,12 +6,14 @@ on:
       - 'agents/**'
       - 'git/clone.ts'
       - 'test/agent-*.test.ts'
+      - 'runner/question-*.ts'
       - '.github/workflows/agent-isolation.yml'
   pull_request:
     paths:
       - 'agents/**'
       - 'git/clone.ts'
       - 'test/agent-*.test.ts'
+      - 'runner/question-*.ts'
       - '.github/workflows/agent-isolation.yml'
 permissions:
   contents: read
@@ -29,4 +31,4 @@ jobs:
       - run: npm ci --ignore-scripts
       - run: npm run typecheck
       # The Docker suites share one image tag and daemon, so run test files one at a time.
-      - run: npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts
+      - run: npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts test/agent-question.test.ts
