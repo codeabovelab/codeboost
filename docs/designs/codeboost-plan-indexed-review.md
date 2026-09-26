@@ -6,6 +6,7 @@ Repo: codeabovelab/codeboost
 Status: APPROVED
 Mode: Builder (open source / research)
 Writing standard: plain language, ISO 24495-1:2023
+Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes")
 
 ## About this document
 
@@ -24,9 +25,9 @@ Writing standard: plain language, ISO 24495-1:2023
 - **What makes it different.** You review the PR one **plan item** at a time. Pick a plan item on the left and see only its code on the right. Code that belongs to no plan item is flagged in a red "Unplanned changes" row.
 - **Why that matters.** Other tools make you read a raw diff and guess what the agent meant. In codeboost, the plan you approved is the index to the code.
 - **How it stays trustworthy.** codeboost records commits in a trusted ledger with either an owning plan item or an explicit foreign/unowned classification. Rewriting a foreign commit never turns it into owned work. It also checks each change against the files the plan item said it would touch. One blind spot remains: an unrelated edit inside a file the plan item declared is caught only by the review agent and by you.
-- **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
+- **How it stays safe.** Agents run inside a container that holds only the task's code and the agent's own sign-in, so your other files and credentials are not there. One exception exists today: Ask still runs the agent CLI on your computer with its tools turned off, until lane F moves it into the container (see "Keeping unattended runs safe"). codeboost needs your approval before its own dependency installation or invocation of changed scripts; containment must also cover commands the agent already ran.
 - **It learns from you.** After each task, codeboost turns your feedback into short lessons. You approve each lesson before agents use it, and a Learning screen shows whether you are repeating yourself less.
-- **What we build first.** The review screen was built first. The remaining roadmap can proceed; optional real-PR validation is tracked separately in #19 and is not a prerequisite.
+- **Where the build is.** Built: the plan and linking library, the SQLite store, the review screen with Ask and change requests, the guarded merge gate with merge-queue support, and the agent isolation boundary (containers, vendor-only network, Claude and Codex adapters). Not built yet: the runner that uses that boundary, rebasing, `cmd:` execution, and the Planning, Queue, Lessons and Learning screens (the ranked Issues screen is built). Optional real-PR validation is tracked separately in #19 and is not a prerequisite.
 
 ## Terms used
 
@@ -216,6 +217,15 @@ It ignores this task's own PR, any draft PRs it opened earlier, and its own comm
 - a dedicated read-only `/run/codeboost-input` mount containing only the registry-selected schema copied by the runner; Codex output is written to a runner-created directory in bounded `/tmp` scratch and collected before teardown, using container-visible paths and no-follow bounded regular-file reads; Claude output uses bounded stdout instead;
 - the agent's own sign-in. For Codex, that is its `auth.json` from `CODEX_HOME`, mounted read-only at `/run/codeboost-auth/codex/auth.json`, with `CODEX_HOME=/run/codeboost-auth/codex` explicitly set inside the container. The CODEX_HOME directory itself is a writable size/inode-limited tmpfs for ephemeral CLI state; only its `auth.json` file is bind-mounted read-only. This location is separate from the empty `HOME`; the startup probe must run the actual authenticated `codex exec` path and confirm output/state creation without printing credentials. If the pinned CLI cannot use this credential layout, refuse the invocation rather than making the host credential writable. For Claude, it is a long-lived token made with `claude setup-token`, passed as an environment variable. (On macOS, Claude keeps its normal sign-in in the keychain, which a container cannot read.)
 
+**Interim exception: Ask (recorded 2026-09-24).** Ask does not yet run in the container. It is the only agent invocation codeboost makes today. `runner/question-agent.ts` starts the installed `claude` or `codex` CLI on your computer, in a new empty temporary folder, with your normal sign-in and environment. It relies on each CLI's own restrictions instead of the container:
+
+| Provider | Restrictions codeboost sets |
+|---|---|
+| Claude | No tools (`--tools ''`), `--safe-mode`, empty strict MCP config, no session saved, no slash commands |
+| Codex | `--sandbox read-only`, approval `never`, web search off, user config and rules ignored, shell tool, apps, plugins, hooks, memories and multi-agent features off |
+
+This is weaker than R1: a CLI flaw or a missed flag would run with your account's access. We accept it only for Ask, because Ask gets bounded, supplied context, answers questions, and changes nothing. Nothing that writes code, runs `cmd:` checks or drafts plans may use this path. Lane D5 merged on 2026-09-25 (PR #50), so the container Ask needs now exists (see `docs/implementation/agent-isolation.md`). The exception ends when lane F moves Ask onto D's invocation contract, in the container, in the "questions" phase (read-only `/work`, no process execution). As of 2026-09-26 that move has not happened. Until it does, README states this limit.
+
 Nothing else from your computer is inside. So `~/.ssh`, `~/.config/gh`, `~/.npmrc`, `~/.aws`, `~/.docker`, and your git credential helper simply are not there. The container's `HOME` is its own empty folder.
 
 **How the container is locked down.** Docker and Podman leave a container's own files writable by default. So codeboost starts every agent container with these settings, and a start-up self-test fails the run if any is missing:
@@ -391,7 +401,7 @@ Added by the design review. Each rule cites the design-review decision (Dn) that
   - "Resolve 3 unplanned changes"
   - "Open failed check"
   - "Send 2 pending change requests"
-- **"Merge anyway…"** sits in the button's side menu. It asks you to type `MERGE`, and the confirmation lists every blocker you are overriding. The override is recorded on the task.
+- There is no "Merge anyway…" (D20 amended 2026-09-24). codeboost never merges while a blocker remains. To override a blocker, merge on GitHub yourself; GitHub's own rules then apply. This keeps one rule for every blocker, including the server-side base protection that no override may bypass (step 9, point 5).
 - In build step 2 (read-only), there is no merge button. The header shows review progress only.
 
 **Status labels (D21).** "Correct" is replaced by two labeled states:
@@ -477,14 +487,14 @@ Approvals on other plan items stay valid, as long as their code did not change.
 - GitHub's required checks pass on the latest code;
 - the "already fixed" check finds nothing.
 
-The top of the screen lists anything that is not yet true. You can still use "Merge anyway." It asks you to confirm, and codeboost records it.
+The top of the screen lists anything that is not yet true. codeboost has no "Merge anyway" (D20, amended 2026-09-24): to merge with a blocker, use GitHub directly.
 
 **What happens when you click "Approve & merge".**
 1. codeboost fetches the latest base branch and PR head, recording both SHAs.
 2. Compare both SHAs with the base/head used for attribution, approvals, and validation. If the head changed even when the base did not, reload the history and ledger, recompute links and approval staleness, and return changed or unplanned items to review. Re-run all `cmd:` checks for any head without current passing results. Continue only after the current head satisfies review and validation; do not skip the rule refresh in step 4 even when both SHAs match.
 3. If the base has moved, codeboost rebases the PR branch (see below) and pushes it. After every rebase, recompute attribution, segment choices, approval staleness, and all merge blockers for the resulting head. If any item is stale or any foreign/ambiguous segment is new, changed, or still unaccepted/unassigned, stop and return to review even when no owned item's code changed. Only after those blockers are cleared, re-run every plan item's `cmd:` checks on the rebased code, in the container. If the base did not move, keep the current head and the validation requirements from step 2. If any check fails, merging stops and you go back to review (engineering review, O3). Test results are tied to the commit they ran on. Results for any other commit are shown as out of date.
 4. codeboost waits for GitHub's required checks on the new code. It reads which checks are required from the branch's rules at that moment (the union of all applicable active rulesets and classic branch protection, preserving check context and required app identity). Only a successfully read, explicitly empty union passes at once; an unreadable or ambiguous source blocks merging as unknown. Code reviews, such as Copilot code review, are not checks and do not count. The screen shows the checks' progress. If they take longer than 30 minutes, the task moves to **approved, merge blocked** (engineering review, R6).
-5. Immediately before merging, re-fetch both head and base; if either differs from the validated pair, restart attribution/rebase/checks instead of merging. Run the "already fixed" check again. The merge backend must also enforce the validated base/head pair atomically on the server (or validate the final merge candidate in a protected server-side merge queue). A final client-side fetch alone cannot close the race. If the repository/backend cannot provide that guarantee, automatic merging is blocked and the person must use GitHub's manual workflow; "Merge anyway" does not bypass this guard. Zero required checks still passes step 4, but does not waive this merge requirement. For a backend that provides the base guard, also pin the head with `gh pr merge --match-head-commit <sha>`. The sha is the commit whose approvals, `cmd:` results, and required checks all passed. If anyone pushed after that, GitHub refuses the merge. codeboost then reloads the PR, recomputes the links, and sends you back to review, with the changed plan items stale (engineering review, O4).
+5. Immediately before merging, re-fetch both head and base; if either differs from the validated pair, restart attribution/rebase/checks instead of merging. Run the "already fixed" check again. The merge backend must also enforce the validated base/head pair atomically on the server (or validate the final merge candidate in a protected server-side merge queue). A final client-side fetch alone cannot close the race. If the repository/backend cannot provide that guarantee, automatic merging is blocked and the person must use GitHub's manual workflow; codeboost has no override for this guard. Zero required checks still passes step 4, but does not waive this merge requirement. For a backend that provides the base guard, also pin the head with `gh pr merge --match-head-commit <sha>`. The sha is the commit whose approvals, `cmd:` results, and required checks all passed. If anyone pushed after that, GitHub refuses the merge. codeboost then reloads the PR, recomputes the links, and sends you back to review, with the changed plan items stale (engineering review, O4).
 
 codeboost also rebases before it first shows you the review. So you always review code that sits on the latest base.
 
@@ -553,27 +563,27 @@ A lesson whose feedback keeps repeating is flagged for rewording or removal.
 
 The numbers below identify delivery milestones, not a requirement to implement them serially. Use the parallel lanes below to schedule work; milestone completion still requires all of its acceptance criteria. Development can proceed in separate worktrees while the product continues to run one task at a time.
 
-1. **Plan format and linking engine.** A code library, tested with sample git histories.
-2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8).
+1. **Plan format and linking engine.** A code library, tested with sample git histories. *Done.*
+2. **Read-only review screen.** It works on any branch whose commits are in the commit ledger, with a plan loaded into the database. It shows rows, segments, the four checks, approvals, and the per-item conversation. It does not merge (engineering review, O8). *Done; the screen has since gained the merge gate from build step 4.*
 3. **Optional validation.** A future real-PR comparison may test the assumptions in "How we will know it works," but it is non-blocking under the superseding decision above.
-4. **Merge gate and merging** (product workflow step 9): the merge rules, the pre-merge sequence, and merging through `gh`. In progress in increments; see the scope and completion criteria below.
-5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6).
-6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3).
+4. **Merge gate and merging** (product workflow step 9): the merge rules, the pre-merge sequence, and merging through `gh`. Increment 1 merged (PR #23), and merge-queue support merged (#38, #46, closing #24); the rest waits for the runner in build step 5. See the scope and completion criteria below.
+5. **Running agents.** Per-task clones, containers, agent adapters, permissions, one invocation per plan item, review rounds, the "already fixed" check, and opening PRs (step 6). Isolation boundary merged (lane D, PRs #31, #40, #44, #47, #50); the runner (lane F) is next.
+6. **Planning screen.** Writing plans with an agent, and approving plan changes (steps 2 and 3). Backend in progress (lane E); no screen yet.
 7. **Queue, schedule, and recovery** (steps 4 and 5).
-8. **Issue list, sorted by how critical each issue is** (step 1).
+8. **Issue list, sorted by how critical each issue is** (step 1). Ranking backend (H1–H3) and the Issues screen (H4a, #55) merged; the "trust this issue" action (H4b) remains.
 9. **Learning from your feedback** (step 10): lessons, the Lessons inbox, and the Learning screen. It needs the reject loop from steps 4 to 7.
 
 ### Build step 4: scope and progress
 
 **Numbering.** Build steps above identify delivery milestones; the parallel lanes define execution order. Product workflow steps describe the user journey. Implementation task IDs (`T1`–`T18`) below identify individual engineering requirements, not delivery order. In particular, **build step 4 is merge gate and merging; T4 is approval fingerprints and dependent staleness**. Use “Build step 4, increment 1” when referring to the current work, rather than “Task 4.”
 
-**Increment 1 — guarded merge gate (in review, [#21](https://github.com/codeabovelab/codeboost/issues/21), [PR #23](https://github.com/codeabovelab/codeboost/pull/23); status checked 2026-09-24).** Add blockers derived from the current review snapshot, trusted GitHub base/head and required-check reads, branch-rule refresh, server-enforced base protection, a head-pinned merge command, and the review UI action. Cover stale or missing approvals, unresolved changes, open change requests, missing or stale acceptance evidence, GitHub refusals, and stale/double submission. Zero required checks does not waive atomic base protection. This increment implements parts of T6, T7, and T12; it does not complete the full build step.
+**Increment 1 — guarded merge gate (merged 2026-09-24 in [PR #23](https://github.com/codeabovelab/codeboost/pull/23), [#21](https://github.com/codeabovelab/codeboost/issues/21); see `docs/implementation/guarded-merge.md`).** Add blockers derived from the current review snapshot, trusted GitHub base/head and required-check reads, branch-rule refresh, server-enforced base protection, a head-pinned merge command, and the review UI action. Cover stale or missing approvals, unresolved changes, open change requests, missing or stale acceptance evidence, GitHub refusals, and stale/double submission. Zero required checks does not waive atomic base protection. This increment implements parts of T6, T7, and T12; it does not complete the full build step.
 
 Until automated rebase and containerized `cmd:` execution exist, a moved base or missing command result **blocks merging and returns to review**. Increment 1 does not automatically rebase, execute acceptance commands, or bypass unavailable evidence.
 
 **Remaining work before build step 4 is complete** (pre-merge automation tracked in [#22](https://github.com/codeabovelab/codeboost/issues/22)):
 
-- [ ] Deliver and validate increment 1 against its final head, including unit/integration and browser regressions, typecheck, and the required review loop.
+- [x] Deliver and validate increment 1 against its final head, including unit/integration and browser regressions, typecheck, and the required review loop.
 - [ ] Add the automated pre-merge rebase path and preserve ledger mappings and attribution. Resolve foreign-commit conflicts under the approved agent policy (T3, T11); return conflicts requiring human action to review.
 - [ ] Integrate runner-controlled, containerized execution of approved `cmd:` argv and bind results to the resulting head (T6; depends on the agent isolation and phase enforcement work in build step 5, including T1, T2, and T9).
 - [ ] Validate the complete pre-merge sequence, including the already-fixed check, approval freshness, refreshed required checks, guarded merge, and races involving either base or head changes (T6, T7, T12).
@@ -582,10 +592,10 @@ Until automated rebase and containerized `cmd:` execution exist, a moved base or
 
 ## Open questions
 
-- **How to rank issues (step 1).** Possible inputs: labels such as `P0`, `bug`, and `security`; reactions and comment counts; age; and an AI triage score. Each issue should say why it ranks where it does, for example "ranked high: security label and 14 reactions." The weights are not decided.
+- **How to rank issues (step 1).** *Decided 2026-09-24 (lane H1).* A fixed additive score from priority labels, `security`, `bug`, reactions, comments and age, with a reason for each signal. AI triage is left out, so the same issues always sort the same way. Trust comes from the repository's collaborator list and never changes the score. Rules: `docs/implementation/issue-prioritization.md`.
 - **Running several tasks at once.** Version 1.0 runs one task at a time. Running several needs a way to spot two tasks that plan to change the same files. This is postponed.
 - **A different agent for each phase.** For example, Codex could review Claude's work. The adapters allow this. The settings screen is postponed.
-- **Reusing AgentDiff.** Read its code before build step 1, and decide whether to borrow from it.
+- **Reusing AgentDiff.** *Decided 2026-09-22.* Its plan checker and diff parser were read before build step 1. They do not give the ledger-backed line history codeboost needs, so no code was copied (`docs/implementation/build-step-1.md`).
 - **A stronger network sandbox.** A later version might run agents in a container that can reach only package registries.
 
 ## How we will know it works
@@ -634,16 +644,16 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## How people will install it
 
-- **One command.** Run `npx codeboost` inside a repo. It starts the local server and opens the app in your browser.
-- **Requirements.** A Node version that CI proves runs `node:sqlite` with no warning (Node 26 confirmed today). codeboost checks for `git`, a signed-in `gh`, a running Docker or Podman, and at least one of `claude` or `codex` with its sign-in (a `claude setup-token` token, or Codex's `auth.json`). It tells you what is missing.
+- **One command (planned).** Run `npx codeboost` inside a repo. It starts the local server and opens the app in your browser. The package is not published yet; today you run `npm start -- --config …` or `npm run demo` from a checkout.
+- **Requirements.** Node 26.7.0 or later: CI proves this version runs `node:sqlite` with no warning, and codeboost refuses older versions with an upgrade message. **Planned, not yet implemented:** codeboost will check for `git`, a signed-in `gh`, a running Docker or Podman, and at least one of `claude` or `codex` with its sign-in (a `claude setup-token` token, or Codex's `auth.json`), and tell you what is missing. **Today** the CLI (`web/cli.ts`) checks only the Node version before it starts; a missing tool shows up later as an error from the feature that needs it.
 - **No compiler needed.** It has no native modules. It uses Node's built-in `node:sqlite`.
 - **Releases.** GitHub Actions runs all tests on every PR. When we tag a version, it publishes to npm and creates a GitHub release.
 - **Later, maybe:** a Homebrew formula.
 
 ## What to do next
 
-1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen.
-2. Continue the remaining roadmap from the current open issues; the cancelled experiment is not a prerequisite.
+1. Done: create the repository, README, plan/linking foundation, persistent store, and read-only review screen. Also done: the guarded merge gate (PR #23), planning audit and authoring contract (E1, E2), suggestion orchestration (E3), issue ranking backend (H1–H3), merge-queue support (K1–K3), the agent isolation boundary (D1–D5), the runner lifecycle contract (F1) and the Issues screen (H4a).
+2. Finish the open lane PRs listed in "Lane status", then continue the roadmap from the current open issues; the cancelled experiment is not a prerequisite.
 3. Optionally run the non-blocking human validation tracked in #19.
 4. The engineering review (2026-09-22) settled how agents run, their container, network, and permissions. Re-run `/plan-eng-review` before implementing code-writing agents if anything in those areas changes.
 5. **Test this document with a reader** (ISO 24495-1 asks for this). Ask one engineer who was not in this session to read the Summary and Terms, then explain codeboost back to you. Fix any part they misread.
@@ -1809,7 +1819,7 @@ Codex (outside voice, completed, 2026-09-22) raised 8 findings. Claude checked e
 ### Not in scope
 
 - **Issue ranking weights, parallel tasks, and a different agent per phase.** These stay in Open questions and do not affect the review idea. The cancelled experiment is not a phase boundary.
-- **Reusing AgentDiff code.** Still an open question. Read its code before build step 1.
+- **Reusing AgentDiff code.** Decided: read, not reused (`docs/implementation/build-step-1.md`).
 - **Windows support.** The container and sign-in design was checked for macOS and Linux only.
 
 ### What already exists
@@ -1883,6 +1893,22 @@ Critical gaps (no test, no handling, and silent): 0.
 
 **Scheduling decision (2026-09-24).** Run up to three implementation tasks concurrently in separate feature branches and worktrees. The foundation and review screen are the baseline, not new assignments. Recheck current main, open PRs, and existing implementations before taking a lane; unchecked historical T-items are not proof that their code is missing. These lanes authorize a development schedule, not simultaneous task execution in the shipped runner.
 
+#### Lane status (checked 2026-09-26, after #55)
+
+This table records merged and open PRs only. A lane is complete only when every step meets its acceptance criteria on `main`.
+
+| Lane | Merged | Open PRs | Next |
+|---|---|---|---|
+| B0 — foundation verification | Evidence recorded under Implementation Tasks: T4, T5, T10, T13, T14 met; E's subset in `docs/implementation/planning-audit.md` | — | T3 rebase part moves to F3 |
+| C — guarded merge gate | C1–C4 (PR #23) | — | Done. Remaining build step 4 work belongs to F (#22) |
+| D — agent isolation | D1 (#31), D2 (#40), D3 (#44), D4 (#47), D5 (#50); gate in `docs/implementation/agent-isolation.md` | — | Done. F, G4 and live planning may now use the boundary; F moves Ask into it (#54) |
+| E — planning logic | E1 (#30), E2 (#32), E3 (#35), suggestion lifecycle bindings (#43) | E4 #45 (draft; replaces #37) | Finish E4 with real recordings |
+| F — runner | F1 contract (#49, `docs/implementation/runner-lifecycle.md`) | F1a #53 (Store lifecycle), F1b #56 (coordinator), F1c #57 (shutdown wiring, `/api/runner`), F1d #59 (startup recovery, single-runner lock), F1e #60 (planning API for G4, feedback events); Ask in the agent container #54 | Land F1a–F1e in stack order, then F2. The F1 stack must not merge as a whole until #51's pre-F1 D items land. #54 ends the interim R1 exception for Ask |
+| G — planning screen | — | — | G1 after E4 |
+| H — issue prioritization | H1–H3 (#39), trust fix #42 (issue #41), H4a Issues screen (#55) | — | H4b: the "trust this issue" action, which needs Store persistence through F after F1a. H4a holds the web files until G1 starts. Follow-up #58 (disconnect concern) |
+| I, J | — | — | After F6 |
+| K — merge-queue compatibility | K1 (#38), K2–K3 (#46, closes #24); see `docs/implementation/merge-queue.md` | — | Done |
+
 #### Task assignment and sequential order
 
 Read each row left to right: finish and validate step 1 before step 2 within that lane. Different rows may proceed concurrently when their prerequisites are met, with at most three active implementation tasks. A lane is a workstream, not necessarily one PR. Split large steps into reviewable PRs without changing the dependency order.
@@ -1893,12 +1919,12 @@ Read each row left to right: finish and validate step 1 before step 2 within tha
 | C — guarded merge gate | **C1.** Required-check and branch-rule reads (T12). **C2.** Snapshot/evidence blockers, with unavailable T6 execution evidence blocking merge. **C3.** Head-pinned, base-protected merge and refusal handling (T7). **C4.** Review UI, race regressions and final #21 / PR #23 review. | Before C1, record B0 evidence for the foundation contracts C consumes; existing work must supply that evidence before C4 completion. Continue existing work rather than restarting implemented steps. Release shared runner/UI files after C4 merges. |
 | D — agent isolation | **D1.** Invocation contract and isolated task clone (T1). **D2.** Pinned, restricted container and startup self-test (T1). **D3.** Vendor-only egress and phase/tool enforcement (T2). **D4.** Claude/Codex adapters, cancellation settlement and bounded output. **D5.** Full real-Docker and hostile-input gate for this boundary (T9). | Can run alongside C and E. F requires D5 merged; G's production invocation requires D5. Add regressions with each step; D5 integrates them rather than postponing testing. |
 | E — planning logic | **E1.** Audit existing T18 schema/parser/prompt behavior and remaining #6 gaps. **E2.** Read-only authoring-provider contract and safe prompt/response handling. **E3.** Identity/revision-bound suggestion orchestration using the existing store interface. **E4.** Import, replay, malformed-response and hostile-input acceptance fixtures (T18). | Can run alongside C and D with injected providers. G consumes E4; live invocation waits for D5. Shared schema/store fixes must go through the assigned integration owner. |
-| F — runner and pre-merge automation | **F1.** Before implementation, publish and review the lifecycle/state-holder contract: pending, running, completed, failed, cancelled, stale and closing; legal transitions; ownership and settlement for persisted records, in-memory jobs, subprocesses, admitted HTTP requests and rendered UI; guarded retry; reject-admission → drain requests → cancel/await jobs → close storage. Then implement it and the feedback-event contract under the AGENTS.md async rules. **F2.** Per-item execution, review/reject rounds, pre-PR already-fixed checks, PR opening and hostile-issue eval (build step 5; T9). **F3.** Trusted rebase and ledger mapping (remaining T3). **F4.** Foreign-commit conflict handling (T11). **F5.** Post-rebase attribution/approval refresh and head-bound command execution (T6). **F6.** Required-check refresh, already-fixed check, guarded merge handoff and #22 integration regressions. F owns common CI after C: integrate every T9 suite (Docker, adapter, hostile-input/issue, recorded-output, unit and browser) into required CI, coordinating D's dedicated workflow. T9 remains incomplete until the combined head demonstrably runs and passes every suite. | Starts after C4 and D5 merge and B0 evidence is handed off for F's consumed contracts. Recheck that evidence against merged main before F1; existing T4/T5/T10 behavior is reused rather than rebuilt. F1 owns planning persistence/API additions needed by G. F2's working reject loop supplies the learning dependency. |
+| F — runner and pre-merge automation | **F1.** Before implementation, publish and review the lifecycle/state-holder contract: pending, running, completed, failed, cancelled, stale and closing; legal transitions; ownership and settlement for persisted records, in-memory jobs, subprocesses, admitted HTTP requests and rendered UI; guarded retry; reject-admission → drain requests → cancel/await jobs → close storage. Then implement it and the feedback-event contract under the AGENTS.md async rules. **F2.** Per-item execution, review/reject rounds, pre-PR already-fixed checks, PR opening and hostile-issue eval (build step 5; T9). **F3.** Trusted rebase and ledger mapping (remaining T3). **F4.** Foreign-commit conflict handling (T11). **F5.** Post-rebase attribution/approval refresh and head-bound command execution (T6). **F6.** Required-check refresh, already-fixed check, guarded merge handoff and #22 integration regressions. F owns common CI after C: integrate every T9 suite (Docker, adapter, hostile-input/issue, recorded-output, unit and browser) into required CI, coordinating D's dedicated workflow. T9 remains incomplete until the combined head demonstrably runs and passes every suite. | Starts after C4 and D5 merge and B0 evidence is handed off for F's consumed contracts. Recheck that evidence against merged main before F1; existing T4/T5/T10 behavior is reused rather than rebuilt. F1 owns planning persistence/API additions needed by G. F2's working reject loop supplies the learning dependency. After D5 merges, F also moves Ask (`runner/question-agent.ts`) onto D's invocation contract, which ends the interim R1 exception. |
 | G — planning screen | **G1.** Import and plan display UI. **G2.** Authoring and suggestion cards. **G3.** Revision-bound Apply and draft/attachment preservation. **G4.** Real provider/store integration and complete T18 browser/adapter acceptance. | G1 starts after E4 and C4 merge; G1–G3 may use fixtures. G4 waits for D5 and F1's production planning API/persistence contract. Release shared web files after G4. |
 | H — issue prioritization | **H1.** Decide and record ranking policy. **H2.** Issue retrieval/normalization. **H3.** Deterministic ranking with reasons and failure/stale states. **H4.** Issue-list UI and end-to-end checks (build step 8). | H1–H3 can run alongside F/G after the issue-access contract is inspected. H4 waits for G4 to release shared web files. No existing T-ID covers this entire milestone. |
 | I — queue, schedule and recovery | **I1.** Queue admission and persisted transitions. **I2.** Run-window scheduling and cancellation. **I3.** Restart recovery, stale attempts and shutdown draining. **I4.** UI integration and controlled race acceptance (build step 7). | Starts after F6; owns shared runner/store files. UI work waits for G/H to release its exact files. No existing T-ID covers this entire milestone. |
 | J — lessons and learning | **J1.** Source-linked feedback distillation and quality fixtures (T15). **J2.** Approved-only lesson persistence and prompt injection (T15). **J3.** Lessons inbox controls and repository scope (T16). **J4.** Metrics, repeated-feedback flags and Learning screen (T17). | Starts after F6, using F2's reject loop. J1 can run alongside I with injected storage. J2 shared wiring waits for I's storage ownership handoff; J3/J4 wait for the web owner. End-to-end reject → lesson → approval → injection is required. |
-| K — merge-queue compatibility | **K1.** Queued/removed/failed/merged adapter contract and fixtures. **K2.** Persisted lifecycle and retry guards. **K3.** Complete #24 acceptance: preserve the exact reviewed head, disable the action while queued, await confirmed MERGED or removal/failure, surface the terminal reason, and test enqueue success, delayed merge, queue removal, head replacement and retry. Enqueue success never completes the merge; a replaced head requires fresh review before retry. | K1 can use a free slot after C4. K2/K3 wait for the runner/web owners to release their exact files; no concurrent edits to F/I or G/H/J integration files. Keep queue merging disabled until K3 passes. |
+| K — merge-queue compatibility | **K1.** Queued/removed/failed/merged adapter contract and fixtures. **K2.** Persisted lifecycle and retry guards. **K3.** Complete #24 acceptance: preserve the exact reviewed head, disable the action while queued, await confirmed MERGED or removal/failure, surface the terminal reason, and test enqueue success, delayed merge, queue removal, head replacement and retry. Enqueue success never completes the merge; a replaced head requires fresh review before retry. | K1 can use a free slot after C4. K2/K3 wait for the runner/web owners to release their exact files; no concurrent edits to F/I or G/H/J integration files. Queue merging stayed disabled until K3 passed; K2 and K3 are complete (#46), and queue merging is enabled for an adapter that implements the K1 observation contract. |
 
 **Complete T-ID mapping:** T1 → D1–D2; T2 → D3; T3 → B0 verification then F3; T4 → B0 (consumed by C/F); T5 → B0 (consumed by C/F); T6 → C2's blocking subset then F5–F6; T7 → C3; T8 → cancelled, no implementation lane (fresh optional validation only in #19); T9 → F6 (common-CI integration and all-suite completion gate), D5 (Docker and adapter probes), C1/C3 (recorded GitHub outputs), E4 (recorded authoring outputs), F2 (hostile-issue eval), and each lane's applicable unit/browser suites; T10 → B0 (consumed by C/F); T11 → F4; T12 → C1 then F6 revalidation; T13 → B0; T14 → B0; T15 → J1–J2; T16 → J3; T17 → J4; T18 → E1–E4 then G1–G4. Shared requirements are complete only after all assigned slices meet the original acceptance criteria.
 
@@ -1908,9 +1934,9 @@ Read each row left to right: finish and validate step 1 before step 2 within tha
 
 | Lane | Scope and requirement mapping | Owned files | Start condition and completion check |
 |---|---|---|---|
-| C — guarded merge gate | Build step 4 increment 1; parts of T6, T7, T12. Continue #21 / PR #23 without starting a duplicate implementation. | `github/`, `runner/merge.ts`, merge tests; temporary integration ownership of shared review/UI files already changed by PR #23 | In progress. Complete issue #21 acceptance, exact-head validation, and the review loop. Missing execution evidence continues to block merge. |
-| D — agent isolation | Build step 5 foundation; T1, T2 and the isolation portion of T9. Task clones, pinned container, vendor egress, phase permissions, cancellation and process settlement. | New `agents/` modules, a dedicated clone helper under `git/`, dedicated container/adapter tests and new `.github/workflows/agent-isolation.yml` only (explicit exception to common-CI ownership) | Can start alongside C. Real-Docker tests prove filesystem/network isolation and phase restrictions; controlled tests prove cancellation keeps ownership until the process terminates. No runner/store or existing question-provider rewiring in this lane. |
-| E — planning logic | Build step 6 preparation; remaining T18 authoring/import/suggestion requirements. Reuse existing schema/parser/store behavior; add missing prompt construction, response validation, and revision-bound suggestion orchestration. | Dedicated new planning modules under `core/`, `prompts/plan-author.md`, planning fixtures and dedicated tests | Can start alongside C and D using an injected provider interface. Tests cover plan identity, revision and replay guards, hostile input, and invalid responses. Production agent invocation and UI Apply remain blocked until integration; fake-provider tests do not satisfy live adapter acceptance. |
+| C — guarded merge gate | Build step 4 increment 1; parts of T6, T7, T12. Merged in PR #23 on 2026-09-24. | `github/`, `runner/merge.ts`, merge tests; temporary integration ownership of shared review/UI files already changed by PR #23 | Done (PR #23). Was: complete issue #21 acceptance, exact-head validation, and the review loop. Missing execution evidence continues to block merge. |
+| D — agent isolation | Build step 5 foundation; T1, T2 and the isolation portion of T9. Task clones, pinned container, vendor egress, phase permissions, cancellation and process settlement. | New `agents/` modules, a dedicated clone helper under `git/`, dedicated container/adapter tests and new `.github/workflows/agent-isolation.yml` only (explicit exception to common-CI ownership) | Done: D1–D5 merged (#31, #40, #44, #47, #50). Real-Docker tests prove filesystem/network isolation and phase restrictions; controlled tests prove cancellation keeps ownership until the process terminates. No runner/store or existing question-provider rewiring in this lane. |
+| E — planning logic | Build step 6 preparation; remaining T18 authoring/import/suggestion requirements. Reuse existing schema/parser/store behavior; add missing prompt construction, response validation, and revision-bound suggestion orchestration. | Dedicated new planning modules under `core/`, `prompts/plan-author.md`, planning fixtures and dedicated tests | E1 (#30), E2 (#32) and E3 (#35) merged; E4 #45 open. Tests cover plan identity, revision and replay guards, hostile input, and invalid responses. Production agent invocation and UI Apply remain blocked until integration; fake-provider tests do not satisfy live adapter acceptance. |
 
 **Before the first edit in D or E:** record the assigned owner, branch, exact file list, done-when command, and interface contract in that lane's issue or PR. New module paths above are proposed ownership boundaries, not claims that those files exist. Compare the assignment against C's current diff. If a shared file is needed, request its integration owner to make the edit or queue it after that owner's PR lands.
 
@@ -1927,7 +1953,7 @@ Read each row left to right: finish and validate step 1 before step 2 within tha
 |---|---|---|---|
 | F — runner and pre-merge automation | C and D merged; invocation contract available | Build step 5 runner plus #22 / remaining build step 4; T3, T6, T11. Own `runner/`, rebase helpers and shared acceptance persistence during this wave. | Preserve ledger attribution through rebase; recompute approval staleness; execute and persist head-bound checks; cover timeout, cancellation, shutdown and collaborator-push races; complete #22 acceptance. |
 | G — planning screen | E merged; C releases shared UI files | Build step 6 UI and T18 integration. Own `web/` and dedicated browser tests during this wave. Route persistence changes through F. UI work can use controlled provider fixtures until D is available. | Import, generation and Apply preserve user drafts and attachments and reject stale/replayed suggestions. Final completion requires real D-backed invocation and integration with F/store, not fixtures alone. |
-| H — issue prioritization | Existing issue-access contract inspected; ranking weights decided and recorded before implementation | Build step 8: issue-fetch/normalization and ranking modules with dedicated tests. Shared shell/navigation integration waits for G. | Stable ranking with a visible reason per issue; unavailable/stale data has explicit states. Ranking policy is an unresolved design input, not a silently chosen default. |
+| H — issue prioritization | Done: access contract inspected and ranking policy recorded in `docs/implementation/issue-prioritization.md` (H1); H2–H3 merged (#39, #42); H4a Issues screen merged (#55) | Build step 8: issue-fetch/normalization and ranking modules with dedicated tests. Shared shell/navigation integration waits for G. | Stable ranking with a visible reason per issue; unavailable/stale data has explicit states. Ranking policy decided in H1; Issues screen merged in #55 (H4a); H4b trust action remains. |
 
 F, G and H can proceed together within these ownership boundaries. If F and G need an incompatible shared storage/API change, land that small prerequisite first; neither edits the other's files in parallel. Merge independent backend modules first, then their shared integration, and rerun checks on the combined head.
 
@@ -1936,7 +1962,7 @@ F, G and H can proceed together within these ownership boundaries. If F and G ne
 - **Queue, scheduling and recovery (build step 7):** starts after F establishes persisted task lifecycle and shutdown ownership. One owner controls the runner/store changes and recovery regressions.
 - **Lessons pipeline (build step 9; T15):** can proceed alongside queue work after F's reject-loop and feedback-event contract lands. Own dedicated lesson modules and tests; inject storage/provider interfaces and queue shared schema or runner wiring behind the queue owner.
 - **Lessons inbox and Learning screen (T16, T17):** follow the lesson persistence/metrics contracts and G's release of shared UI ownership. Require a working reject-to-lesson-to-approved-prompt path before marking the learning milestone complete.
-- **Merge queue support (#24):** remains a separate compatibility follow-up. Its GitHub adapter/fixture work can use a free lane after C; runner/UI lifecycle integration waits for those files' owners. Keep queue-based merging blocked until queued, removed, failed and confirmed-merged states are implemented and tested. Enqueue success is not merge completion.
+- **Merge queue support (#24):** *Done 2026-09-25 (#38, #46); queue merging is enabled only for an adapter that implements the K1 observation contract.* Original plan: a separate compatibility follow-up. Its GitHub adapter/fixture work can use a free lane after C; runner/UI lifecycle integration waits for those files' owners. Queue-based merging stayed blocked until the queued, removed, failed and confirmed-merged states were implemented and tested, which #46 completed. Enqueue success is still not merge completion.
 - **Optional human validation (#19):** may run separately with fresh blinded packages; it is never a dependency for these lanes. Schema extensions #5 and #7 remain separate follow-ups unless a lane explicitly needs them; do not silently expand T18 or duplicate #6 alignment work.
 
 #### Ownership and integration rules
@@ -1952,28 +1978,34 @@ F, G and H can proceed together within these ownership boundaries. If F and G ne
 
 Built from this review's findings. Each task comes from a specific decision above. Run with Claude Code or Codex, and tick each one as you ship it. Effort ratios assumed: features about 30x, tests about 50x, architecture about 5x.
 
+**Status (checked against `main` on 2026-09-26, lane B0).** T1, T2, T4, T5, T10, T13 and T14 meet their Verify lines and are ticked, with evidence under each (T1, T2 and T14 re-checked 2026-09-26 after lane D merged). T9 stays open until lane F6 runs every suite in required CI. The Ask adapter still lives in `runner/question-agent.ts`, outside `agents/`, until lane F moves it. The planned files `core/segments`, `core/choices` and `core/attribution` were never created. That logic lives in `core/linking.ts` (segments and ledger attribution) and `core/approvals.ts` (approvals and duplicate-segment choices). The Files lines below now name the real files.
+
 These `T` IDs are requirement identifiers, not the build-order numbers. Current merge-gate work is **build step 4, increment 1 (#21)** and spans parts of T6, T7, and T12; it is unrelated to the numbering of T4. See “Build step 4: scope and progress” for the current increment and remaining milestone criteria. An increment must not mark a broader requirement complete while any of its acceptance criteria remain deferred.
 
-- [ ] **T1 (P1, human: ~3 days / CC: ~1 hour)** — agents — Build the pinned agent container that mounts only `/work` (with its own `.git`) and the agent's sign-in
+- [x] **T1 (P1, human: ~3 days / CC: ~1 hour)** — agents — Build the pinned agent container that mounts only `/work` (with its own `.git`) and the agent's sign-in
   - Surfaced by: R1 (D2: B), O6 (D16: A)
   - Files: agents/container/, git/clone
   - Verify: real-Docker test shows only `/work` and sign-in; writing to `/`, `/usr/bin`, or the image's tools fails; `/tmp` and `HOME` are empty in each new container; the process is not root and has no capabilities; the start-up self-test refuses a container missing any lock-down setting; `git status` works inside; the main repo path is absent; changing a task-clone object in disposable repos leaves the source object unchanged
-- [ ] **T2 (P1, human: ~1 day / CC: ~30 min)** — agents — Add the vendor-only egress proxy and turn off web and MCP tools
+  - Evidence: `test/agent-container.test.ts` ("runs read-only with no root capabilities, host paths, inherited secrets, or writable tools", "refuses a container missing read-only root before its command runs", "keeps Git metadata read-only, on another filesystem, and mounted against replacement"); `test/agent-clone.test.ts` ("copies objects, ignores dirty source changes, and has no origin or shared metadata"); lane D5 gate, `docs/implementation/agent-isolation.md`
+- [x] **T2 (P1, human: ~1 day / CC: ~30 min)** — agents — Add the vendor-only egress proxy and turn off web and MCP tools
   - Surfaced by: R2 (D3: A)
   - Files: agents/network/, agents/claude, agents/codex
   - Verify: from inside the container, the vendor host is reachable and another host is blocked
+  - Evidence: `test/agent-network.test.ts` ("reaches the vendor through the proxy while blocking other and direct hosts"); `test/agent-policy.test.ts` ("builds Claude and Codex controls with web, MCP and direct shell disabled"); lane D5 gate, PR #50
 - [ ] **T3 (P1, human: ~4 hours / CC: ~20 min)** — runner — Keep the commit ledger and rebase mappings; attribute only ledger commits
   - Surfaced by: O5 (D15: A)
-  - Files: runner/store, git/rebase, core/attribution
+  - Files: runner/store, git/rebase, core/linking.ts (attribution; planned as core/attribution)
   - Verify: a forged trailer lands in Unplanned; rebased ledger commits keep their owner
-- [ ] **T4 (P1, human: ~4 hours / CC: ~20 min)** — core — Bind approvals to the item fingerprint and function context; spread staleness to dependents
+- [x] **T4 (P1, human: ~4 hours / CC: ~20 min)** — core — Bind approvals to the item fingerprint and function context; spread staleness to dependents
   - Surfaced by: O2 (D12: A)
-  - Files: core/approvals
+  - Files: core/approvals.ts
   - Verify: an acceptance-only edit goes stale; moved lines go stale; a line shift stays fresh; dependents go stale
-- [ ] **T5 (P1, human: ~1 day / CC: ~30 min)** — core — Add file-change segments for binary, mode, empty, rename, symlink, and submodule changes
+  - Evidence: `test/history.test.ts` ("keeps approvals after a clean rebase … stales changed checks and dependents", "stales whitespace and function-context changes, but not line numbers")
+- [x] **T5 (P1, human: ~1 day / CC: ~30 min)** — core — Add file-change segments for binary, mode, empty, rename, symlink, and submodule changes
   - Surfaced by: O7 (D17: A)
-  - Files: core/segments, web/review
+  - Files: core/linking.ts (planned as core/segments), web/public
   - Verify: one test case per kind lands in the right row and blocks merge until approved
+  - Evidence: `test/history.test.ts` ("represents binary, executable, empty, rename, symlink and submodule changes", "records typed object identities on real mode-change cards"); unapproved items block the merge gate (`test/merge.test.ts`, "lists every local review blocker before merge")
 - [ ] **T6 (P1, human: ~3 hours / CC: ~15 min)** — runner — Re-run `cmd:` checks after a pre-merge rebase; tie results to the head
   - Surfaced by: O3 (D13: A)
   - Files: runner/merge
@@ -1990,10 +2022,11 @@ These `T` IDs are requirement identifiers, not the build-order numbers. Current 
   - Surfaced by: T1 (D10: A)
   - Files: test/, .github/workflows/
   - Verify: CI runs every suite; the Docker suite fails if isolation breaks, a read-only phase can write `/work`, planning/questions can execute a process, or task/scratch byte and inode caps can be exceeded; hard-link and alias-write attempts from `.git/config` and objects into `/work` or scratch, and mountpoint replacement, must fail with metadata unchanged; both vendor startup probes must read the container schema and return bounded valid output through their documented file/stdout channel
-- [ ] **T10 (P2, human: ~2 hours / CC: ~10 min)** — core — Duplicate-segment key: file, content, copy number, and copy count
+- [x] **T10 (P2, human: ~2 hours / CC: ~10 min)** — core — Duplicate-segment key: file, content, copy number, and copy count
   - Surfaced by: R4 (D5: A), O1 (D11: A)
-  - Files: core/choices
+  - Files: core/approvals.ts `choiceKeys` (planned as core/choices)
   - Verify: accepting copy 1 and then deleting it leaves the other copy undecided
+  - Evidence: `test/history.test.ts` ("assignments stale the target and duplicate-copy count changes invalidate choices")
 - [ ] **T11 (P2, human: ~3 hours / CC: ~15 min)** — git — Resolve conflicts on foreign commits with an agent; keep the lines Unplanned
   - Surfaced by: R5 (D6: B)
   - Files: git/rebase, agents
@@ -2002,14 +2035,16 @@ These `T` IDs are requirement identifiers, not the build-order numbers. Current 
   - Surfaced by: R6 (D7: A)
   - Files: github/checks
   - Verify: recorded-output tests for zero checks, pending then passing, and timeout
-- [ ] **T13 (P2, human: ~1 hour / CC: ~5 min)** — runner — Use `node:sqlite` only; enforce the minimum Node version; add a CI warning check
+- [x] **T13 (P2, human: ~1 hour / CC: ~5 min)** — runner — Use `node:sqlite` only; enforce the minimum Node version; add a CI warning check
   - Surfaced by: R7 (D8: A)
   - Files: runner/store, web/cli
   - Verify: CI fails if `node:sqlite` prints a warning; old Node gets an upgrade message
-- [ ] **T14 (P3, human: ~1 hour / CC: ~5 min)** — layout — Create the 6 modules; `runner/store` is the only writer; `web/cli` is the entry; build step 2 is read-only
+  - Evidence: `runner/store.ts` `requireSupportedNode` (Node 26.7.0 or later, also `engines` in package.json); `test/store.test.ts` ("rejects unsupported Node versions and opens SQLite without warnings") runs in `.github/workflows/ci.yml`
+- [x] **T14 (P3, human: ~1 hour / CC: ~5 min)** — layout — Create the 6 modules; `runner/store` is the only writer; `web/cli` is the entry; build step 2 is read-only
   - Surfaced by: D1 (B), R8 (D9: A), O8 (D18: A)
   - Files: package layout
   - Verify: no module other than `runner` writes task state
+  - Evidence (2026-09-26): all 6 modules exist (`agents` added by lane D); only `runner/store.ts` writes task state; `web/cli.ts` is the entry.
 
 - [ ] **T15 (P2, human: ~1 week / CC: ~1 hour)** — runner, agents — Distill closed-task feedback into lessons linked to their source; inject approved lessons into prompts
   - Surfaced by: L1 (D21: A)
@@ -2070,7 +2105,7 @@ None in this review.
 | D17 | Stale items state their reason, with a "Since approval / Full change" switch | 6A |
 | D18 | Learning: metric definitions, 5-task minimum, task-number axis, 3-repeat flag rule | 7A |
 | D19 | Separate "Ask" and "Request change" tabs; pending changes block merging | 8A |
-| D20 | Blockers link to their fixes; "Merge anyway" needs typing MERGE | 9A |
+| D20 | Blockers link to their fixes. Amended 2026-09-24: no "Merge anyway"; to override, merge on GitHub (matches `docs/implementation/guarded-merge.md`) | 9A, amended |
 | D21 | "Correct" renamed to "Tests" and "AI review" | 10A |
 | D22 | Run `/design-consultation` to create DESIGN.md before build step 2 | 11A |
 | D23 | Status uses icon, word, and color, with 4.5:1 contrast and screen-reader labels | 12A |
@@ -2104,7 +2139,7 @@ Overall (the lowest pass): **1 → 8**. D22 is complete: DESIGN.md defines the r
 
 ### What already exists
 
-No UI code exists. The approved mockups are the only visual references. The written rules above win over any mockup.
+When this review ran, no UI code existed. Since then the review screen has been built in `web/public/` (build step 2 and build step 4, increment 1). The written rules above still win over any mockup or over the current code.
 
 ### TODOS.md updates
 
@@ -2126,6 +2161,12 @@ None proposed. Every fix is in the plan and in the tasks below.
 
 Built from this review's decisions. Tick each one as you ship it.
 
+**Status (checked against `main` on 2026-09-26).** Only DT1 is complete. Most DTs are partly built. Do not tick one until its Verify line passes.
+- Built: two-tab composer and "n pending changes" tags (part of DT4); the notice below 1280px (part of DT13); the `?` shortcut help (part of DT12); a blocker list from the guarded merge gate (part of DT7).
+- Missing: "Send N change requests" and the reject flow (DT4, needs build step 5's reject loop); the merge step list (D16, DT7); menu links for Plans, Queue, Lessons and Learning, which are plain text until their screens exist (DT8, build steps 6 to 9; Issues became a link in #55); Lessons inbox and Learning screen (DT14, DT15, build step 9).
+- Not yet audited against their Verify lines: DT2, DT3, DT5, DT6, DT9, DT10, DT11.
+- File paths in the DTs (`web/review`, `web/shell` and others) are proposed names. Today all UI code is in `web/public/`.
+
 - [x] **DT1 (P1, human: ~1 day / CC: ~30 min)** — design system — Create DESIGN.md with `/design-consultation` before build step 2
   - Surfaced by: D22 · Files: DESIGN.md · Verify: every screen's colors and fonts come from its tokens
 - [ ] **DT2 (P1, human: ~1 day / CC: ~30 min)** — review screen — Approve button by the code, progress count, state-only row circles
@@ -2138,8 +2179,8 @@ Built from this review's decisions. Tick each one as you ship it.
   - Surfaced by: D17 · Files: web/review · Verify: each of the 4 stale reasons shows its own text and before/after
 - [ ] **DT6 (P1, human: ~1 day / CC: ~20 min)** — all screens — Status as icon, word, and color; 4.5:1 contrast; screen-reader labels
   - Surfaced by: D21, D23 · Files: web/components/status · Verify: an automated contrast check; a screen reader reads each status
-- [ ] **DT7 (P2, human: ~1 day / CC: ~20 min)** — merge header — Blocker button and list with links; "Merge anyway…" typed confirmation; merge step list
-  - Surfaced by: D16, D20 (build step 4) · Files: web/review/merge · Verify: each blocker link lands on its fix; typing MERGE is required
+- [ ] **DT7 (P2, human: ~1 day / CC: ~20 min)** — merge header — Blocker button and list with links; merge step list (no "Merge anyway…", D20 amended)
+  - Surfaced by: D16, D20 (build step 4) · Files: web/public · Verify: each blocker link lands on its fix; no control merges while a blocker remains
 - [ ] **DT8 (P2, human: ~4 hours / CC: ~15 min)** — shell — One shared menu and Lessons tabs; remove undefined pages
   - Surfaced by: D13 · Files: web/shell · Verify: the same menu on every screen, with the current page highlighted
 - [ ] **DT9 (P2, human: ~4 hours / CC: ~15 min)** — review screen — Compact rows and the pinned warnings strip
