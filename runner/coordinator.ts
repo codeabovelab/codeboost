@@ -1,7 +1,7 @@
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { captureInvocation, type InvocationHandle, type InvocationInput, type InvocationResult, type StopReason, type TaskClone, type UnreleasedResource } from '../agents/contract.ts';
 import type { AttemptRecord, Store } from './store.ts';
-import { ATTEMPT_PHASES, GuardRefusal, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason } from './lifecycle.ts';
+import { ATTEMPT_PHASES, GuardRefusal, ShuttingDownError, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason, type ShutdownCapability } from './lifecycle.ts';
 
 /** What F's host-side preparation hands to D's start call. */
 export interface PreparedAttempt {
@@ -83,10 +83,15 @@ export class RunnerCoordinator {
   #closing = false;
   /** Set once D settles with `unreleased`: no new work until a restart's recovery confirms their removal. */
   #unreleased: UnreleasedResource[] | null = null;
-  constructor(store: Store, deps: RunnerDeps, limits: SlotLimits = { writable: 1, readOnly: 1 }) {
+  /** Settlement writes run with the shutdown capability, so they still land after the write gate closes. */
+  #write: <T>(fn: () => T) => T;
+  constructor(store: Store, deps: RunnerDeps, limits: SlotLimits = { writable: 1, readOnly: 1 }, capability?: ShutdownCapability) {
     if (![limits.writable, limits.readOnly].every(n => Number.isSafeInteger(n) && n >= 1)) throw new Error('Slot limits must be positive integers.');
     this.#store = store; this.#deps = deps; this.#limits = limits;
+    this.#write = capability ? fn => capability.run(fn) : fn => fn();
   }
+  /** Shutdown step 1: reject admission synchronously, in the same turn as the server flag and the Store gate. */
+  rejectAdmission(): void { this.#closing = true; }
   get closing(): boolean { return this.#closing; }
   /** Resources D could not confirm removed; non-null keeps the runner closed to new work until restart. */
   get unreleased(): readonly UnreleasedResource[] | null { return this.#unreleased; }
@@ -102,7 +107,7 @@ export class RunnerCoordinator {
    * a refused transaction releases the reservation in the same turn.
    */
   start(identity: PlanIdentity, request: StartRequest): AttemptRecord {
-    if (this.#closing) throw new GuardRefusal('The runner is shutting down.');
+    if (this.#closing) throw new ShuttingDownError();
     if (this.#unreleased) throw new GuardRefusal('Needs restart: an agent\'s cleanup could not be confirmed, so its containers or files may remain.');
     const key = identityKey(identity);
     if (this.#jobs.has(key)) throw new GuardRefusal('An attempt is already active for this task.');
@@ -191,7 +196,7 @@ export class RunnerCoordinator {
     if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
     job.firstReason = reason;
     try {
-      if (job.attemptId && !this.#store.recordFirstReason(job.identity, job.attemptId, reason)) {
+      if (job.attemptId && !this.#write(() => this.#store.recordFirstReason(job.identity, job.attemptId, reason))) {
         // Another writer (for example cancel task) recorded a reason first; adopt the durable one.
         const durable = this.#store.getAttempt(job.identity, job.attemptId).firstReason;
         if (durable) job.firstReason = durable;
@@ -264,7 +269,7 @@ export class RunnerCoordinator {
       } catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Launch failed: ${message(error)}` }); }
       job.handle = handle;
       let running: boolean | undefined;
-      try { running = this.#store.markRunning(job.identity, attempt.id); } catch { running = undefined; }
+      try { running = this.#write(() => this.#store.markRunning(job.identity, attempt.id)); } catch { running = undefined; }
       if (running === undefined) {
         // A storage error, not a stop: keep ownership until D settles, then hold the slot under a marker.
         handle.cancel('capture-failure');
@@ -346,7 +351,7 @@ export class RunnerCoordinator {
   }
   #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string }): Classification | undefined {
     try {
-      return this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason });
+      return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason }));
     } catch {
       // The row's outcome is unknown: hold the slot until startup recovery reconciles it.
       this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });
