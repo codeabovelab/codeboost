@@ -129,6 +129,10 @@ Ask keeps the contract's identity and cleanup rules:
   once the worker thread has stopped (clean shutdown, crash or abandon); if that fails, or the process is killed,
   the next check deletes it. Ask stays off while an earlier root remains. The record accepts only direct children
   of the real temp directory with that exact name.
+- Each Ask root carries an `.owner` stamp naming its lock, written before the folder appears under its Ask name. The
+  first check of a process also looks for `codeboost-ask-*` folders the record does not list, for example after the
+  database was renamed and its record stayed behind. It deletes those whose owner lock is free and leaves those whose
+  owner is still running.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided

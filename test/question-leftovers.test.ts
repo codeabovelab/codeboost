@@ -3,7 +3,7 @@ import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, r
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
-import { LeftoverLedger, type ListTaskStorage } from '../runner/question-leftovers.ts';
+import { createAskRoot, LeftoverLedger, type ListTaskStorage } from '../runner/question-leftovers.ts';
 import { RetainedStorage } from '../runner/question-container.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
@@ -494,4 +494,38 @@ it('keeps the lock until a startup scan still in flight has finished', async () 
   release();
   await closing;
   expect(lockFree(path)).toBe(true);
+});
+
+it('finds a host root recorded under the old name after the database was renamed', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'ask-db-')); roots.push(dir);
+  const database = join(dir, 'review.sqlite');
+  writeFileSync(database, '');
+  const before = LeftoverLedger.forDatabase(database, docker(new Set()));
+  // A killed session left a stamped root, recorded only beside the old name.
+  const root = createAskRoot(before.lockPath);
+  writeFileSync(join(root, 'auth.json'), 'secret');
+  before.record([], 0, [root]);
+  expect(readFileSync(join(root, '.owner'), 'utf8').trim()).toBe(before.lockPath);
+  renameSync(database, join(dir, 'renamed.sqlite'));
+  const worker = stubWorker(LeftoverLedger.forDatabase(join(dir, 'renamed.sqlite'), docker(new Set())));
+  try {
+    expect(await worker.agent('claude')('answer', new AbortController().signal, scope(34), 60_000)).toBe('claude:answer:n');
+    expect(existsSync(root)).toBe(false);
+  } finally { await worker.close(); }
+});
+
+it('leaves an unrecorded root alone while its owner holds its lock, and reclaims it once the owner is gone', async () => {
+  const owner = new LeftoverLedger(ledgerPath(), docker(new Set()));
+  owner.acquire();
+  const root = createAskRoot(owner.lockPath);
+  try {
+    const first = stubWorker(new LeftoverLedger(ledgerPath(), docker(new Set())));
+    try { expect(await first.agent('claude')('answer', new AbortController().signal, scope(35), 60_000)).toBe('claude:answer:n'); }
+    finally { await first.close(); }
+    expect(existsSync(root)).toBe(true);
+  } finally { owner.release(); }
+  const second = stubWorker(new LeftoverLedger(ledgerPath(), docker(new Set())));
+  try { expect(await second.agent('claude')('answer', new AbortController().signal, scope(36), 60_000)).toBe('claude:answer:n'); }
+  finally { await second.close(); }
+  expect(existsSync(root)).toBe(false);
 });

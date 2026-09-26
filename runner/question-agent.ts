@@ -1,12 +1,9 @@
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync } from 'node:fs';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
 import { credentialEnvironment, questionCredential, workerEnvironment, type Provider } from './question-container.ts';
 import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
-import { removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
+import { createAskRoot, removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
 
 // Leave the worker time to cancel the container and release storage before the review's own timeout fires.
@@ -49,7 +46,8 @@ export class QuestionWorker {
   private start(): Worker {
     if (this.crashed) throw this.crashed;
     if (this.worker) return this.worker;
-    const root = mkdtempSync(join(tmpdir(), 'codeboost-ask-'));
+    // Stamped with this review's lock, so a later process can find it even if the record is renamed away or lost.
+    const root = createAskRoot(this.ledger?.lockPath ?? '');
     // Durable before any setup: a process killed from here on still leaves a record of this root.
     try { this.ledger?.record([], 0, [root]); } catch (error) { removeAskRoot(root); throw error; }
     let worker: Worker;

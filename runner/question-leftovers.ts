@@ -1,5 +1,5 @@
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
@@ -76,6 +76,32 @@ export const dockerTaskStorage: ListTaskStorage = async signal => {
     list(['network', 'ls', '--format', '{{.Name}}', '--filter', 'label=io.codeboost.egress'])]);
   return { containers: new Set(containers.flat()), volumes: new Set(volumes), networks: new Set(networks) };
 };
+const OWNER_FILE = '.owner';
+/**
+ * Create an Ask root stamped with the lock of the process that owns it. The stamp is written under a preparation name
+ * and the folder is then renamed, so any folder visible under the Ask root name already carries its owner stamp.
+ */
+export function createAskRoot(lockPath: string): string {
+  for (let attempt = 0; attempt < 5; attempt++) {
+    const prep = mkdtempSync(join(tmpdir(), 'codeboost-askprep-'));
+    writeFileSync(join(prep, OWNER_FILE), `${lockPath}\n`, { mode: 0o600, flag: 'wx' });
+    const root = join(tmpdir(), `codeboost-ask-${basename(prep).slice('codeboost-askprep-'.length)}`);
+    if (!existsSync(root)) try { renameSync(prep, root); return root; } catch { /* taken meanwhile; try another name */ }
+    rmSync(prep, { recursive: true, force: true });
+  }
+  throw new Error('Could not create a folder for the Ask worker.');
+}
+/** Whether another process holds an Ask lock file, tested without creating or keeping it. */
+function lockIsHeld(path: string): boolean {
+  const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+  let probe: import('node:sqlite').DatabaseSync | undefined;
+  try {
+    probe = new DatabaseSync(path, { timeout: 0 });
+    probe.exec('BEGIN EXCLUSIVE; ROLLBACK;');
+    return false;
+  } catch { return true; }
+  finally { probe?.close(); }
+}
 const LABELLED = 'docker ps -a, docker volume ls and docker network ls, each with --filter label=io.codeboost.allocation, label=io.codeboost.invocation or label=io.codeboost.egress';
 
 function parse(text: string): LedgerRecord {
@@ -131,6 +157,26 @@ export class LeftoverLedger {
     if (!lock) return;
     this.#lock = undefined;
     try { lock.exec('ROLLBACK'); } finally { lock.close(); }
+  }
+
+  /**
+   * Delete unrecorded Ask roots whose owner is gone. A root outlives its record when the database is renamed or the
+   * record is lost; its `.owner` stamp names the lock of the process that made it. A held lock means a live process
+   * owns the root and it is left alone. A free lock, a missing lock file or a missing stamp means the owner is gone.
+   */
+  #reclaimOrphanRoots(skip: ReadonlySet<string>): string[] {
+    const stuck: string[] = [];
+    for (const name of readdirSync(tmpdir())) {
+      const root = join(tmpdir(), name);
+      if (!isAskRoot(root) || skip.has(root)) continue;
+      let owner = '';
+      try { owner = readFileSync(join(root, OWNER_FILE), 'utf8').trim(); } catch { /* no stamp: its creator stopped first */ }
+      if (owner && !isAbsolute(owner)) owner = '';
+      if (owner && owner !== this.lockPath && existsSync(owner) && lockIsHeld(owner)) continue;
+      // Our own lock is held by us, so our earlier-session roots (not the live one, which is skipped) are reclaimed.
+      try { removeAskRoot(root); } catch { stuck.push(root); }
+    }
+    return stuck;
   }
 
   /**
@@ -191,7 +237,12 @@ export class LeftoverLedger {
     const known = this.#read();
     // At startup a missing record proves nothing: the last process may have been killed before writing it.
     const stored = known.untracked;
-    if (options.startup && !known.untracked) known.untracked = 1;
+    if (options.startup) {
+      // Roots this record does not list (a renamed database, a lost record) are found by their owner stamp.
+      const orphans = this.#reclaimOrphanRoots(new Set([...known.roots, ...(options.active ? [options.active] : [])]));
+      if (orphans.length) throw new Error(`Ask is off: host copies of reviewed code or credentials from an earlier session could not be deleted. Delete them, then retry:\n${orphans.map(root => `rm -rf '${root}'`).join('\n')}`);
+      if (!known.untracked) known.untracked = 1;
+    }
     // Host copies (reviewed code, Codex auth) need no Docker: delete earlier roots first, never the live one.
     const roots = known.roots.filter(root => {
       if (root === options.active) return true;
