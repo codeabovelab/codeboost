@@ -643,7 +643,7 @@ describe('real Docker agent isolation', () => {
       // The production launch path: create, validate, start and remove. Raw stdout can carry more than the final
       // message, so the value must appear as a complete line; the adapter probe checks the exact file channel.
       const output = runContainer(authProfile, 5 * 60_000);
-      expect(output.split('\n').map(line => line.trim())).toContain('codeboost-schema-marker');
+      expect(output.split(/\r?\n/)).toContain('codeboost-schema-marker');
     }, 6 * 60_000);
 
     it('runs the authenticated Claude startup path with only its OAuth token', () => {
@@ -656,7 +656,7 @@ describe('real Docker agent isolation', () => {
       const output = runContainer(authProfile, 5 * 60_000, { CLAUDE_CODE_OAUTH_TOKEN: token });
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
-      expect(envelope.result?.trim()).toBe('codeboost-schema-marker');
+      expect(envelope.result?.replace(/\r?\n$/, '')).toBe('codeboost-schema-marker');
     }, 6 * 60_000);
   }
 });

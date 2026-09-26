@@ -375,8 +375,9 @@ describe('container invocation supervisor', () => {
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
     const schemaPrompt = 'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, '
       + 'without quotes or Markdown formatting.';
-    // Exact value only: the prompt forbids quotes and formatting, so anything around the value fails the probe.
-    const schemaValue = (output: string) => output.trim();
+    // Exact value only, allowing just the single trailing newline a CLI adds; any other surrounding whitespace or
+    // formatting fails the probe.
+    const schemaValue = (output: string) => output.replace(/\r?\n$/, '');
 
     it('runs the production Codex adapter and collects its bounded output file', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
