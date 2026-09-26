@@ -11,7 +11,7 @@ const credential =
   location.hash.slice(1) || sessionStorage.getItem("codeboost-token") || "";
 if (location.hash) {
   sessionStorage.setItem("codeboost-token", credential);
-  history.replaceState(null, "", location.pathname);
+  history.replaceState(null, "", location.pathname + location.search);
 }
 let data,
   selected,
@@ -20,6 +20,7 @@ let data,
   since = false,
   busy = false;
 let reviewGeneration = 0;
+let view = "review";
 let mergeGeneration = 0,
   mergePollTimer = null,
   mergePollState = null,
@@ -484,7 +485,8 @@ $("merge").onclick = async () => {
 };
 $("review-link").onclick = (event) => {
   event.preventDefault();
-  refresh();
+  if (view === "review") refresh();
+  else showView("review");
 };
 $("next").onclick = () => moveChange(1);
 $("previous").onclick = () => moveChange(-1);
@@ -561,6 +563,7 @@ document.addEventListener("keydown", (event) => {
     ["TEXTAREA", "INPUT", "SELECT"].includes(
       document.activeElement?.tagName,
     ) ||
+    view !== "review" ||
     !data
   )
     return;
@@ -785,5 +788,98 @@ new ResizeObserver(() => {
   const width = conversationPane.getBoundingClientRect().width;
   if (width) conversationResize.setAttribute("aria-valuenow", String(Math.round(width)));
 }).observe(conversationPane);
+
+let issuesGeneration = 0,
+  issuesView = null,
+  issuesRequested = false,
+  issuesLoading = false;
+function showView(next) {
+  view = next;
+  $("review-view").hidden = next !== "review";
+  $("issues-view").hidden = next !== "issues";
+  for (const [id, name] of [["review-link", "review"], ["issues-link", "issues"]]) {
+    if (name === next) $(id).setAttribute("aria-current", "page");
+    else $(id).removeAttribute("aria-current");
+  }
+  document.title = `${next === "issues" ? "Issues" : "Review"} · codeboost`;
+  history.replaceState(null, "", next === "issues" ? "/?view=issues" : "/");
+  if (next === "issues" && !issuesRequested) loadIssues();
+}
+const issueTime = (value) => esc(new Date(value).toLocaleString());
+function issueStatus() {
+  if (!issuesView) return ["neutral", "Loading issues…"];
+  if (!issuesView.configured) return ["neutral", `– Not configured. ${esc(issuesView.reason)}`];
+  const state = issuesView.state;
+  if (!state) return ["neutral", issuesView.refreshing ? "Loading issues…" : "– Not loaded yet"];
+  if (state.state === "fresh")
+    return ["good", `✓ Current · retrieved ${issueTime(state.retrievedAt)} · ${state.issues.length} open issue${state.issues.length === 1 ? "" : "s"}`];
+  if (state.state === "stale")
+    return ["warn", `! Stale · showing issues retrieved ${issueTime(state.retrievedAt)}. Refresh failed at ${issueTime(state.failedAt)}: ${esc(state.error)}`];
+  return ["bad", `✕ Unavailable · ${esc(state.error)}`];
+}
+function trustMark(issue) {
+  return issue.trust === "trusted"
+    ? '<span class="good" aria-label="Trust: author is a repository collaborator">✓ Collaborator</span>'
+    : '<span class="warn" aria-label="Trust: needs your trust before queueing, author is not a repository collaborator">! Needs trust</span>';
+}
+function renderIssues() {
+  const [tone, text] = issueStatus();
+  $("issues-status").className = tone;
+  $("issues-status").innerHTML = text;
+  $("issues-repository").textContent = issuesView?.configured ? issuesView.repository : "";
+  const state = issuesView?.configured ? issuesView.state : null;
+  if (!state) {
+    $("issues-list").innerHTML = "";
+    return;
+  }
+  if (!state.issues.length) {
+    $("issues-list").innerHTML =
+      state.state === "unavailable"
+        ? '<div class="empty"><h2>Issues could not load</h2><p>Resolve the error above, then refresh.</p></div>'
+        : '<div class="empty"><h2>No open issues</h2><p>This repository has no open issues to rank.</p></div>';
+    return;
+  }
+  $("issues-list").innerHTML = `<table class="issues-table"><thead><tr><th scope="col">Rank</th><th scope="col">Issue and reasons</th><th scope="col" class="numeric">Score</th><th scope="col">Trust</th><th scope="col">Opened</th></tr></thead><tbody>${state.issues
+    .map(
+      (issue, index) =>
+        `<tr data-issue="${issue.number}"><td class="mono">${index + 1}</td><td><div class="issue-title"><span class="mono muted">#${issue.number}</span> ${/^https:\/\/github\.com\//.test(issue.url) ? `<a href="${esc(issue.url)}" target="_blank" rel="noopener noreferrer">${esc(issue.title)}</a>` : esc(issue.title)}${issue.labels.length ? ` <span class="issue-labels mono">${issue.labels.map(esc).join(" · ")}</span>` : ""}</div><ul class="issue-reasons" aria-label="Why #${issue.number} ranks here">${issue.reasons.map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul></td><td class="mono numeric">${issue.score}</td><td>${trustMark(issue)}</td><td class="mono">${esc(issue.createdAt.slice(0, 10))}</td></tr>`,
+    )
+    .join("")}</tbody></table>`;
+}
+async function loadIssues() {
+  if (issuesLoading) return;
+  const generation = ++issuesGeneration;
+  issuesRequested = true;
+  issuesLoading = true;
+  // aria-disabled, not disabled: disabling the focused button would drop keyboard focus to the page.
+  $("issues-refresh").setAttribute("aria-disabled", "true");
+  $("issues-refresh").textContent = "Refreshing…";
+  if (issuesView?.configured) issuesView = { ...issuesView, refreshing: true };
+  renderIssues();
+  try {
+    const updated = await api("/api/issues", { action: "refresh" });
+    if (generation !== issuesGeneration) return;
+    issuesView = updated;
+    renderIssues();
+  } catch (error) {
+    if (generation !== issuesGeneration) return;
+    if (issuesView?.configured) issuesView = { ...issuesView, refreshing: false };
+    renderIssues();
+    $("issues-status").className = "bad";
+    $("issues-status").textContent = `✕ Could not refresh issues. ${error.message}`;
+  } finally {
+    if (generation === issuesGeneration) {
+      issuesLoading = false;
+      $("issues-refresh").removeAttribute("aria-disabled");
+      $("issues-refresh").textContent = "Refresh issues";
+    }
+  }
+}
+$("issues-link").onclick = (event) => {
+  event.preventDefault();
+  showView("issues");
+};
+$("issues-refresh").onclick = () => loadIssues();
+showView(new URLSearchParams(location.search).get("view") === "issues" ? "issues" : "review");
 
 await refresh();
