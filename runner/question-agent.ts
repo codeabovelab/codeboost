@@ -18,7 +18,7 @@ export class QuestionWorker {
   // Set when the worker dies. Its containers and storage may still exist, and nothing in this process can reclaim
   // them until lane D's scoped recovery exists (#51), so Ask stays off rather than starting a replacement worker.
   private crashed?: Error;
-  private releases = new Map<string, (reply: Omit<ReleaseReply, 'id'>) => void>();
+  private releases = new Map<string, (reply: Omit<ReleaseReply, 'id'> | null) => void>();
   private url: URL;
   private ledger?: LeftoverLedger;
   /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
@@ -39,9 +39,11 @@ export class QuestionWorker {
       if (this.worker !== worker) return;
       this.worker = undefined;
       this.crashed = new Error(`The agent container worker stopped (${error.message}). Its containers and storage may still exist, so Ask is off until codeboost restarts. Check \`docker ps -a\` and \`docker volume ls\` before restarting.`);
+      // The dead worker's allocations are unknown: record that durably now, not only at a clean shutdown.
+      this.#recordUnknown();
       for (const job of this.pending.values()) job.reject(this.crashed);
       this.pending.clear();
-      for (const release of this.releases.values()) release({ remaining: [], untracked: 0 });
+      for (const release of this.releases.values()) release(null);
       this.releases.clear();
     };
     worker.on('error', fail);
@@ -49,9 +51,14 @@ export class QuestionWorker {
     this.worker = worker;
     return worker;
   }
+  #recordUnknown() {
+    try { this.ledger?.record([], 1); }
+    catch (error) { console.error(`codeboost: could not record possible leftover agent storage: ${error instanceof Error ? error.message : error}`); }
+  }
   agent(provider: Provider): QuestionAgent {
     return async (prompt, signal, scope, timeoutMs) => {
-      await this.ledger?.assertClear();
+      if (this.crashed) throw this.crashed;
+      await this.ledger?.assertClear(signal);
       signal.throwIfAborted();
       return this.#ask(provider, prompt, signal, scope, timeoutMs);
     };
@@ -89,7 +96,8 @@ export class QuestionWorker {
     clearTimeout(timer);
     this.worker = undefined;
     try {
-      if (released === null) console.error('codeboost: the agent container worker did not report its storage before shutdown. Check `docker ps -a` and `docker volume ls` for leftover codeboost resources.');
+      // No report (timeout or crash) means unknown leftovers, which stay recorded until no task storage remains.
+      if (released === null) this.#recordUnknown();
       else this.ledger?.record(released.remaining, released.untracked);
     } finally { await worker.terminate(); }
   }

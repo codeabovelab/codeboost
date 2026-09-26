@@ -7,32 +7,25 @@ export interface Leftover {
   readonly workVolume: string;
   readonly metadataVolume: string;
 }
-export type ResourceExists = (kind: 'container' | 'volume', name: string) => Promise<boolean>;
-/** Whether any container or volume labelled as lane D task storage exists. */
-export type AnyTaskStorage = () => Promise<boolean>;
+/** Names of the containers and volumes that carry lane D's task-storage label. */
+export interface TaskStorage { readonly containers: ReadonlySet<string>; readonly volumes: ReadonlySet<string> }
+export type ListTaskStorage = (signal: AbortSignal) => Promise<TaskStorage>;
 interface LedgerRecord { leftovers: Leftover[]; untracked: number }
 
+// One whole check, not per resource: it runs before each question and must not hold it or shutdown for long.
+const CHECK_TIMEOUT_MS = 15_000;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
 const MAX_LEFTOVERS = 100;
 
-/**
- * Read-only check through `docker inspect`. Any answer other than "no such object" counts as still present,
- * so an unreachable daemon keeps Ask off instead of forgetting the leftovers.
- */
-export const dockerResourceExists: ResourceExists = (kind, name) => new Promise(resolve => {
-  execFile('docker', [kind, 'inspect', '--format', '{{.Name}}', name], { timeout: 10_000 }, (error, _stdout, stderr) => {
-    resolve(!error ? true : !/no such (container|volume|object)/i.test(String(stderr)));
-  });
-});
-
-/** Read-only label query. An unreachable daemon counts as "storage exists", so Ask stays off. */
-export const dockerAnyTaskStorage: AnyTaskStorage = async () => {
-  const list = (args: string[]) => new Promise<boolean>(resolve => execFile('docker', args, { timeout: 10_000 },
-    (error, stdout) => resolve(!!error || String(stdout).trim() !== '')));
+/** Two read-only label queries. Any failure rejects, so an unreachable daemon keeps Ask off. */
+export const dockerTaskStorage: ListTaskStorage = async signal => {
+  const list = (args: string[]) => new Promise<Set<string>>((resolve, reject) => execFile('docker', args,
+    { timeout: CHECK_TIMEOUT_MS, signal }, (error, stdout) => error ? reject(error)
+      : resolve(new Set(String(stdout).split('\n').map(line => line.trim()).filter(Boolean)))));
   const [containers, volumes] = await Promise.all([
-    list(['ps', '-a', '-q', '--filter', 'label=io.codeboost.task-storage']),
-    list(['volume', 'ls', '-q', '--filter', 'label=io.codeboost.task-storage'])]);
-  return containers || volumes;
+    list(['ps', '-a', '--format', '{{.Names}}', '--filter', 'label=io.codeboost.task-storage']),
+    list(['volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.task-storage'])]);
+  return { containers, volumes };
 };
 
 function parse(text: string): LedgerRecord {
@@ -55,11 +48,8 @@ function parse(text: string): LedgerRecord {
  */
 export class LeftoverLedger {
   readonly path: string;
-  readonly exists: ResourceExists;
-  readonly anyTaskStorage: AnyTaskStorage;
-  constructor(path: string, exists: ResourceExists = dockerResourceExists, anyTaskStorage: AnyTaskStorage = dockerAnyTaskStorage) {
-    this.path = path; this.exists = exists; this.anyTaskStorage = anyTaskStorage;
-  }
+  readonly listTaskStorage: ListTaskStorage;
+  constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; }
 
   #read(): LedgerRecord {
     if (!existsSync(this.path)) return { leftovers: [], untracked: 0 };
@@ -79,27 +69,40 @@ export class LeftoverLedger {
     if (!leftovers.length && !untracked) return;
     const known = this.#read();
     const keys = new Set(known.leftovers.map(entry => entry.keeper));
-    this.#write({ leftovers: [...known.leftovers, ...leftovers.filter(entry => !keys.has(entry.keeper))].slice(0, MAX_LEFTOVERS),
-      untracked: known.untracked + untracked });
+    const merged = [...known.leftovers, ...leftovers.filter(entry => !keys.has(entry.keeper))];
+    // Never drop evidence: entries beyond the cap become unnamed, which keeps Ask off until no task storage remains.
+    this.#write({ leftovers: merged.slice(0, MAX_LEFTOVERS),
+      untracked: known.untracked + untracked + Math.max(0, merged.length - MAX_LEFTOVERS) });
   }
 
-  /** Drop entries whose resources are all gone. Throws, with removal commands, while any remain. */
-  async assertClear(): Promise<void> {
+  /**
+   * Drop entries whose resources are all gone. Throws, with removal commands, while any remain, and also when
+   * Docker cannot be checked within the time limit or `signal` aborts.
+   */
+  async assertClear(signal?: AbortSignal): Promise<void> {
     const known = this.#read();
     if (!known.leftovers.length && !known.untracked) return;
-    const remaining: Leftover[] = [];
-    for (const entry of known.leftovers) {
-      const present = await Promise.all([this.exists('container', entry.keeper),
-        this.exists('volume', entry.workVolume), this.exists('volume', entry.metadataVolume)]);
-      if (present.some(Boolean)) remaining.push(entry);
+    const limit = AbortSignal.timeout(CHECK_TIMEOUT_MS);
+    let storage: TaskStorage;
+    try { storage = await this.listTaskStorage(signal ? AbortSignal.any([signal, limit]) : limit); }
+    catch (error) {
+      signal?.throwIfAborted();
+      throw new Error(`Ask is off: codeboost could not check Docker for agent storage left by an earlier session (${error instanceof Error ? error.message.slice(0, 200) : 'unknown error'}). Start Docker, then retry.`);
     }
-    // Untracked leftovers have no names, so only "no task storage at all" proves they are gone.
-    const untracked = known.untracked && await this.anyTaskStorage() ? known.untracked : 0;
+    const commands: string[] = [], remaining: Leftover[] = [];
+    for (const entry of known.leftovers) {
+      const keeper = storage.containers.has(entry.keeper);
+      const volumes = [entry.workVolume, entry.metadataVolume].filter(name => storage.volumes.has(name));
+      if (!keeper && !volumes.length) continue;
+      remaining.push(entry);
+      // Only what still exists, so a command never fails on an already removed keeper.
+      if (keeper) commands.push(`docker rm -f ${entry.keeper}`);
+      if (volumes.length) commands.push(`docker volume rm ${volumes.join(' ')}`);
+    }
+    // Unnamed leftovers are gone only when no task storage exists at all.
+    const untracked = known.untracked && (storage.containers.size || storage.volumes.size) ? known.untracked : 0;
     this.#write({ leftovers: remaining, untracked });
     if (untracked) throw new Error('Ask is off: agent storage setup failed in an earlier session and its leftovers could not be identified. Remove the containers and volumes listed by `docker ps -a --filter label=io.codeboost.task-storage` and `docker volume ls --filter label=io.codeboost.task-storage`, then retry.');
-    if (remaining.length) {
-      const commands = remaining.map(entry => `docker rm -f ${entry.keeper} && docker volume rm ${entry.workVolume} ${entry.metadataVolume}`);
-      throw new Error(`Ask is off: agent storage from an earlier session was not removed. Remove it, then retry:\n${commands.join('\n')}`);
-    }
+    if (remaining.length) throw new Error(`Ask is off: agent storage from an earlier session was not removed. Remove it, then retry:\n${commands.join('\n')}`);
   }
 }

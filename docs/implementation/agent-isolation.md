@@ -104,16 +104,19 @@ Ask keeps the contract's identity and cleanup rules:
   question, and refuses Ask while any removal is unconfirmed.
 - At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
   anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
-  Ask stays off while any recorded container or volume still exists (a read-only `docker inspect` check). The
-  refusal shows the `docker rm`/`docker volume rm` commands, and the record clears itself once they are gone. An
-  unreadable record, or a Docker daemon that cannot answer, keeps Ask off. Removal goes through D only once D has
+  Ask stays off while any recorded container or volume still exists. The check is two read-only label queries
+  (`docker ps` and `docker volume ls`) with a 15-second limit, and the question can cancel it. The refusal shows
+  `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
+  they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
+  at shutdown keeps Ask off. Entries beyond the record's cap of 100 count as unidentified, never dropped. Removal goes through D only once D has
   recovery handles (#51 item 4).
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided
   allocation IDs (#51 item 3) would let Ask name these resources instead.
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
-  replacement worker; Ask stays off until codeboost restarts. Reclaiming those leftovers after a crash or restart
+  replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
+  while any `io.codeboost.task-storage` container or volume exists. Reclaiming those leftovers after a crash or restart
   needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.
 
 `test/agent-question.test.ts` runs this path
