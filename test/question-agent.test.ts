@@ -1,3 +1,4 @@
+import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -5,7 +6,7 @@ import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, credentialEnvironment, RetainedStorage, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, credentialEnvironment, measureGitRepository, RetainedStorage, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
@@ -40,6 +41,7 @@ function fakeDeps(result: Partial<InvocationResult> = {}, env: Record<string, st
     createClone: options => { events.push('clone'); return { id: 'clone', taskId: options.taskId, directory: options.parent, head: options.head }; },
     prepareFilesystems: () => { events.push('prepare'); return filesystems; },
     removeFilesystems: value => { expect(value).toBe(filesystems); events.push('remove'); },
+    measureRepository: () => ({ checkoutBytes: 1_024, entries: 3, objectBytes: 2_048 }),
     capture: input => { captured.push(input); return Object.freeze(input); },
     startClaude: start('claude'), startCodex: start('codex'), env,
   };
@@ -275,4 +277,29 @@ it('starts the real bridge worker with exactly the allowlisted environment', asy
     await worker.close();
     for (const name of ['SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'DOCKER_CONFIG']) if (!(name in saved)) delete process.env[name];
   }
+});
+
+it.each([
+  ['checkout bytes', { checkoutBytes: 513 * 1024 * 1024, entries: 1, objectBytes: 1 }],
+  ['entries', { checkoutBytes: 1, entries: 131_073, objectBytes: 1 }],
+  ['Git objects', { checkoutBytes: 1, entries: 1, objectBytes: 513 * 1024 * 1024 }],
+] as const)('refuses a repository too large in %s before anything is copied to the host', async (_label, size) => {
+  const fake = fakeDeps();
+  fake.deps.measureRepository = () => size;
+  await expect(askInContainer(question(), fake.deps, new AbortController().signal)).rejects.toThrow('too large for Ask');
+  expect(fake.events).not.toContain('clone');
+  expect(fake.events).not.toContain('prepare');
+});
+
+it('measures the checkout at the reviewed head and the object store with Git', () => {
+  const repo = mkdtempSync(join(tmpdir(), 'measure-')); roots.push(repo);
+  const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repo, encoding: 'utf8' }).trim();
+  git('init', '-q'); git('config', 'user.name', 'T'); git('config', 'user.email', 't@example.com');
+  mkdirSync(join(repo, 'dir')); writeFileSync(join(repo, 'dir', 'a.txt'), 'x'.repeat(1000)); writeFileSync(join(repo, 'b.txt'), 'y'.repeat(24));
+  git('add', '.'); git('commit', '-qm', 'base');
+  const size = measureGitRepository(repo, git('rev-parse', 'HEAD'), 10_000);
+  // Entries: dir, dir/a.txt and b.txt.
+  expect(size).toMatchObject({ checkoutBytes: 1024, entries: 3 });
+  expect(size.objectBytes).toBeGreaterThan(0);
+  expect(() => measureGitRepository(repo, 'not-a-sha', 10_000)).toThrow('Invalid reviewed head');
 });

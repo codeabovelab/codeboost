@@ -82,7 +82,13 @@ export class QuestionWorker {
    * Used after a crash and when lane D does not settle in time. Ask stays off until codeboost restarts, and after
    * the restart until no labelled resources remain.
    */
-  async #abandon(why: string) {
+  #abandoning?: Promise<void>;
+  /** Every caller (crash, watchdog, shutdown) waits on the same bounded termination and handoff. */
+  #abandon(why: string): Promise<void> {
+    this.#abandoning ??= this.#abandonOnce(why);
+    return this.#abandoning;
+  }
+  async #abandonOnce(why: string) {
     const worker = this.worker;
     this.worker = undefined;
     this.crashed ??= new Error(`The agent container worker ${why}. Its containers and storage may still exist, so Ask is off until codeboost restarts. Check \`docker ps -a\` and \`docker volume ls\` before restarting.`);

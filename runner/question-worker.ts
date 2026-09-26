@@ -5,7 +5,7 @@ import { captureInvocation } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { askInContainer, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
+import { askInContainer, measureGitRepository, RetainedStorage, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
 import type { Leftover } from './question-leftovers.ts';
 
 // Lane D setup is synchronous (Docker and Git calls), so it runs here instead of blocking the review server.
@@ -24,6 +24,7 @@ const deps: ContainerDependencies = {
   createClone: createTaskClone,
   prepareFilesystems: prepareTaskFilesystems,
   removeFilesystems: removeTaskFilesystems,
+  measureRepository: measureGitRepository,
   capture: input => captureInvocation(input),
   startClaude: startClaudeInvocation,
   startCodex: startCodexInvocation,

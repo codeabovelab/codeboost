@@ -1,3 +1,4 @@
+import { spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -58,12 +59,48 @@ export class RetainedStorage {
     if (this.#retained.size) throw new Error(`Agent storage from an earlier question could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
   }
 }
+export interface RepositorySize { readonly checkoutBytes: number; readonly entries: number; readonly objectBytes: number }
+const GIT_ENV = () => ({ PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_TERMINAL_PROMPT: '0' });
+// A tree listing larger than this is itself too large to review; refuse rather than read it.
+const TREE_LISTING_LIMIT = 64 * 1024 * 1024;
+/** Read-only size measurement with Git's own plumbing: tree entries and blob sizes at `head`, plus object storage. */
+export function measureGitRepository(source: string, head: string, timeoutMs: number): RepositorySize {
+  if (!/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Invalid reviewed head.');
+  const git = (args: string[]) => {
+    const result = spawnSync('git', ['--no-pager', '-C', source, ...args], { env: GIT_ENV(), timeout: timeoutMs,
+      killSignal: 'SIGKILL', maxBuffer: TREE_LISTING_LIMIT, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+    if (result.error || result.status !== 0) throw new Error('The repository is too large to review, or Git could not measure it.');
+    return result.stdout;
+  };
+  let checkoutBytes = 0, entries = 0;
+  for (const line of git(['ls-tree', '-r', '-t', '-l', '--full-tree', head]).split('\n')) {
+    if (!line) continue;
+    entries++;
+    const size = Number(line.split(/\s+/)[3]);
+    if (Number.isSafeInteger(size)) checkoutBytes += size;
+  }
+  let objectBytes = 0;
+  for (const line of git(['count-objects', '-v']).split('\n')) {
+    const [key, value] = line.split(':').map(part => part.trim());
+    if ((key === 'size' || key === 'size-pack' || key === 'size-garbage') && Number.isSafeInteger(Number(value))) objectBytes += Number(value) * 1024;
+  }
+  return { checkoutBytes, entries, objectBytes };
+}
+/** Refuse a repository whose staging copy would exceed the question's storage, before any host copy is made. */
+export function assertFitsQuestionStorage(size: RepositorySize): void {
+  if (size.checkoutBytes > QUESTION_STORAGE.workBytes || size.entries > QUESTION_STORAGE.workInodes
+    || size.objectBytes > QUESTION_STORAGE.metadataBytes)
+    throw new Error(`The repository is too large for Ask (checkout ${Math.ceil(size.checkoutBytes / 1048576)} MiB in ${size.entries} entries, Git objects ${Math.ceil(size.objectBytes / 1048576)} MiB; the limit is ${QUESTION_STORAGE.workBytes / 1048576} MiB and ${QUESTION_STORAGE.workInodes} entries).`);
+}
+
 /** Lane D entry points. Injected so the orchestration can be tested without Docker. */
 export interface ContainerDependencies {
   buildImage(timeoutMs: number): string;
   createClone(options: { source: string; parent: string; taskId: string; head: string; timeoutMs: number }): TaskClone;
   prepareFilesystems(clone: TaskClone, limits: TaskStorageLimits, imageId: string, timeoutMs: number): TaskFilesystems;
   removeFilesystems(filesystems: TaskFilesystems): void;
+  /** Size of the checkout at `head` and of the object store, measured before anything is copied to the host. */
+  measureRepository(source: string, head: string, timeoutMs: number): RepositorySize;
   capture(input: InvocationInput): InvocationInput;
   startClaude(request: AgentAdapterRequest, token: string): InvocationHandle;
   startCodex(request: AgentAdapterRequest, authFile: string): InvocationHandle;
@@ -147,6 +184,8 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     mkdirSync(staging); mkdirSync(input);
     writeFileSync(join(input, 'schema.json'), ANSWER_SCHEMA, { mode: 0o444 });
     chmodSync(input, 0o555);
+    // The clone is a full host copy with no byte limit of its own, so the repository must fit before it is made.
+    assertFitsQuestionStorage(deps.measureRepository(question.repository, question.head, Math.min(60_000, remaining())));
     const clone = deps.createClone({ source: question.repository, parent: staging, taskId: `question-${question.noteId}`,
       head: question.head, timeoutMs: Math.min(120_000, remaining()) });
     try { filesystems = deps.prepareFilesystems(clone, QUESTION_STORAGE, image.id, Math.min(60_000, remaining())); }

@@ -369,3 +369,16 @@ it('cleans up its root and releases the lock when the worker cannot be construct
   await worker.close();
   expect(lockFree(path)).toBe(true);
 });
+
+it('serializes abandonment, so a second trigger cannot release questions before the thread stops', async () => {
+  const path = ledgerPath();
+  const worker = stubWorker(new LeftoverLedger(path, docker(new Set())), { abandonAfterDeadlineMs: 50 });
+  const started = Date.now();
+  const settle = (prompt: string, n: number) => worker.agent('claude')(prompt, new AbortController().signal, scope(n), 1_000)
+    .then(() => Date.now(), () => Date.now());
+  // Both watchdogs fire about one second in, while the thread is inside a three-second native call.
+  const [first, second] = await Promise.all([settle('block-long', 26), settle('hang', 27)]);
+  expect(first - started).toBeGreaterThanOrEqual(2_500);
+  expect(second - started).toBeGreaterThanOrEqual(2_500);
+  await worker.close();
+}, 20_000);

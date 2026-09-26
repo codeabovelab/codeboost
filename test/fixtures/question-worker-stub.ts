@@ -44,6 +44,7 @@ parentPort!.on('message', (message: WorkerRequest) => {
   if (prompt === 'stick-on-release') { stuckOnRelease = true; parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: 'ok' }); return; }
   // Blocks the thread in a native subprocess call, like lane D's synchronous Docker and Git setup, then never replies.
   if (prompt === 'block') { spawnSync('sleep', ['1']); return; }
+  if (prompt === 'block-long') { spawnSync('sleep', ['3']); return; }
   // Leaves a host copy behind, as an interrupted setup would, and reports where the worker's TMPDIR put it.
   if (prompt === 'leave-copy') {
     const staging = mkdtempSync(join(tmpdir(), 'codeboost-question-'));

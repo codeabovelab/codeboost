@@ -105,6 +105,10 @@ Ask keeps the contract's identity and cleanup rules:
   `CODEBOOST_CODEX_AUTH_FILE`, `CODEX_HOME`, `HOME`) reach the worker as data and go only to the adapters. The
   leftover Docker queries use the same `PATH`/`DOCKER_HOST` environment as lane D. Missing sign-in is reported
   before any Docker work.
+- Lane D's clone is a full host copy with no byte limit of its own. Before cloning, Ask measures the checkout at the
+  reviewed head (`git ls-tree -r -t -l`) and the object store (`git count-objects -v`) and refuses a repository
+  that would not fit the question's 512 MiB and 131,072-entry allocation. A bounded, D-owned clone would replace
+  this check.
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.
@@ -137,7 +141,8 @@ Ask keeps the contract's identity and cleanup rules:
 - The first question of each process runs that scan even without a record, because a process killed before it
   could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
   process running Ask at the same moment also keeps this one off.
-- Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled 30 seconds after its
+- Lane D's settlement can retry cleanup without limit (#51 item 1). Abandonment happens once: a crash, a watchdog and shutdown all wait on
+  the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
   records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
   finishes first), then rejects the waiting questions, so shutdown cannot hang on D. A worker that does not answer
