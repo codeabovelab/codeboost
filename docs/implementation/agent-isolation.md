@@ -115,9 +115,12 @@ Ask keeps the contract's identity and cleanup rules:
   they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
   at shutdown keeps Ask off. Entries beyond the record's cap of 100 count as unidentified, never dropped. Removal goes through D only once D has
   recovery handles (#51 item 4).
-- The host staging directory (a copy of the reviewed code) is owned the same way. If it cannot be deleted, the
-  worker keeps its path and retries before the next question, shutdown records it, and the next check deletes it.
-  Ask stays off while any copy remains. The record accepts only `codeboost-question-*` staging paths.
+- Host copies are owned through one Ask root per worker, `<tmp>/codeboost-ask-XXXXXX`. The bridge creates it and
+  records it before the worker starts, and runs the worker with it as `TMPDIR`. So the reviewed clone, lane D's
+  input directory and its Codex auth copy all land inside it. The root is deleted, read-only directories included,
+  once the worker thread has stopped (clean shutdown, crash or abandon); if that fails, or the process is killed,
+  the next check deletes it. Ask stays off while an earlier root remains. The record accepts only direct children
+  of the real temp directory with that exact name.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any `io.codeboost.task-storage` container or volume exists. Caller-provided

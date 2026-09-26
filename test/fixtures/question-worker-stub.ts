@@ -1,4 +1,7 @@
 import { spawnSync } from 'node:child_process';
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { parentPort } from 'node:worker_threads';
 import type { WorkerRequest } from '../../runner/question-worker.ts';
 
@@ -7,10 +10,9 @@ const waiting = new Map<string, string>();
 // Allocations a question could not remove, as the real worker's RetainedStorage would report them.
 const leaked: { keeper: string; workVolume: string; metadataVolume: string }[] = [];
 let untracked = 0;
-const stuckPaths: string[] = [];
 parentPort!.on('message', (message: WorkerRequest) => {
   if (message.type === 'release') {
-    parentPort!.postMessage({ id: message.id, remaining: leaked, untracked, paths: stuckPaths });
+    parentPort!.postMessage({ id: message.id, remaining: leaked, untracked });
     return;
   }
   if (message.type === 'cancel') {
@@ -36,9 +38,11 @@ parentPort!.on('message', (message: WorkerRequest) => {
   if (prompt === 'hang') return;
   // Blocks the thread in a native subprocess call, like lane D's synchronous Docker and Git setup, then never replies.
   if (prompt === 'block') { spawnSync('sleep', ['1']); return; }
-  if (prompt.startsWith('stuck-path:')) {
-    stuckPaths.push(prompt.slice('stuck-path:'.length));
-    parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Question container cleanup did not settle.' });
+  // Leaves a host copy behind, as an interrupted setup would, and reports where the worker's TMPDIR put it.
+  if (prompt === 'leave-copy') {
+    const staging = mkdtempSync(join(tmpdir(), 'codeboost-question-'));
+    writeFileSync(join(staging, 'auth.json'), 'secret');
+    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: staging });
     return;
   }
   if (prompt === 'wait') { waiting.set(message.id, attemptId); return; }

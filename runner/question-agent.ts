@@ -1,9 +1,12 @@
 import { randomUUID } from 'node:crypto';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
 import { questionCredential, type Provider } from './question-container.ts';
 import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
-import type { LeftoverLedger } from './question-leftovers.ts';
+import { removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
 
 // Leave the worker time to cancel the container and release storage before the review's own timeout fires.
@@ -19,6 +22,8 @@ const TERMINATE_WAIT_MS = 15_000;
 /** One worker owns every Ask container, so lane D's trusted image and allocations stay in one registry. */
 export class QuestionWorker {
   private worker?: Worker;
+  // The worker's TMPDIR. Recorded before the worker starts, deleted after it stops.
+  private root?: string;
   private pending = new Map<string, { attemptId: string; resolve: (text: string) => void; reject: (error: Error) => void;
     watchdog: ReturnType<typeof setTimeout> }>();
   private scanned = false;
@@ -39,7 +44,11 @@ export class QuestionWorker {
   private start(): Worker {
     if (this.crashed) throw this.crashed;
     if (this.worker) return this.worker;
-    const worker = new Worker(this.url);
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-ask-'));
+    // Durable before any setup: a process killed from here on still leaves a record of this root.
+    try { this.ledger?.record([], 0, [root]); } catch (error) { removeAskRoot(root); throw error; }
+    this.root = root;
+    const worker = new Worker(this.url, { env: { ...process.env, TMPDIR: root } });
     worker.on('message', (reply: WorkerReply | ReleaseReply) => {
       if ('remaining' in reply) { this.releases.get(reply.id)?.(reply); this.releases.delete(reply.id); return; }
       const job = this.pending.get(reply.id);
@@ -72,11 +81,22 @@ export class QuestionWorker {
     // in progress finishes first. Asynchronous children it leaves are covered by the unknown-leftover record.
     if (worker) {
       let timer: ReturnType<typeof setTimeout> | undefined;
-      await Promise.race([worker.terminate().catch(() => undefined), new Promise(resolve => { timer = setTimeout(resolve, TERMINATE_WAIT_MS); })]);
+      const stopped = await Promise.race([worker.terminate().then(() => true, () => true),
+        new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), TERMINATE_WAIT_MS); })]);
       clearTimeout(timer);
+      // Only a stopped thread can no longer write into its root; otherwise the root stays recorded.
+      if (stopped) this.#removeRoot();
     }
     for (const job of this.pending.values()) { clearTimeout(job.watchdog); job.reject(this.crashed); }
     this.pending.clear();
+  }
+  /** Delete the worker's root and drop it from the record; if deletion fails it stays recorded for the next check. */
+  #removeRoot() {
+    const root = this.root;
+    if (!root) return;
+    this.root = undefined;
+    try { removeAskRoot(root); this.ledger?.forget(root); }
+    catch (error) { console.error(`codeboost: could not delete ${root}: ${error instanceof Error ? error.message : error}`); }
   }
   #recordUnknown() {
     try { this.ledger?.record([], 1); }
@@ -88,7 +108,7 @@ export class QuestionWorker {
       // Missing sign-in is reported before any Docker work, including the leftover scan.
       questionCredential(provider, this.env);
       // The first question of a process also scans for labelled leftovers when there is no record.
-      await this.ledger?.assertClear(signal, { startup: !this.scanned });
+      await this.ledger?.assertClear(signal, { startup: !this.scanned, active: this.root });
       this.scanned = true;
       signal.throwIfAborted();
       return this.#ask(provider, prompt, signal, scope, timeoutMs);
@@ -134,7 +154,7 @@ export class QuestionWorker {
     try {
       // No report (timeout or crash) means unknown leftovers, which stay recorded until no task storage remains.
       if (released === null) this.#recordUnknown();
-      else this.ledger?.record(released.remaining, released.untracked, released.paths);
-    } finally { await worker.terminate(); }
+      else this.ledger?.record(released.remaining, released.untracked);
+    } finally { await worker.terminate(); this.#removeRoot(); }
   }
 }

@@ -128,8 +128,11 @@ it('stops before starting the container once the deadline has passed', async () 
 let attempts = 0;
 const scope = () => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
   attemptId: `attempt-${++attempts}`, contextId: 'c'.repeat(64) });
+// The bridge checks sign-in before asking, so the stub needs both credentials (and must not depend on ~/.codex).
+const codexAuth = join(mkdtempSync(join(tmpdir(), 'codex-auth-')), 'auth.json');
+writeFileSync(codexAuth, '{}');
 const stubWorker = () => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), undefined,
-  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' } });
+  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token', CODEBOOST_CODEX_AUTH_FILE: codexAuth } });
 
 it('returns the worker answer and forwards cancellation, settling only when the worker replies', async () => {
   const worker = stubWorker();
@@ -187,26 +190,28 @@ it.each([
 
 it.skipIf(process.getuid?.() === 0)('keeps a host copy of the code it could not delete and refuses Ask until it is gone', async () => {
   const retained = new RetainedStorage();
+  // Stage inside a parent we control; making that parent read-only stops the staging directory from being removed.
+  const parent = mkdtempSync(join(tmpdir(), 'ask-tmp-'));
+  const saved = process.env.TMPDIR;
+  process.env.TMPDIR = parent;
   const fake = fakeDeps();
-  let locked = '';
   const clone = fake.deps.createClone;
-  fake.deps.createClone = options => {
-    // A directory without permissions cannot be emptied by a non-root user, so deleting the staging root fails.
-    locked = join(options.parent, 'locked'); mkdirSync(locked); writeFileSync(join(locked, 'file'), 'x'); chmodSync(locked, 0o000);
-    return clone(options);
-  };
+  fake.deps.createClone = options => { chmodSync(parent, 0o555); return clone(options); };
   try {
     await expect(askInContainer(question(), fake.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
-    const root = dirname(dirname(locked));
-    expect(retained.paths()).toEqual([root]);
-    expect(existsSync(root)).toBe(true);
+    const [root] = retained.paths();
+    expect(dirname(root!)).toBe(parent);
+    expect(existsSync(root!)).toBe(true);
     const next = fakeDeps();
     await expect(askInContainer(question(), next.deps, new AbortController().signal, {}, retained)).rejects.toThrow('could not be deleted');
     expect(next.events).toEqual([]);
-    chmodSync(locked, 0o700);
+    chmodSync(parent, 0o700);
     expect(await askInContainer(question(), fakeDeps().deps, new AbortController().signal, {}, retained)).toBe('The cap bounds latency.');
-    expect(existsSync(root)).toBe(false);
-  } finally { if (locked && existsSync(locked)) { chmodSync(locked, 0o700); rmSync(dirname(dirname(locked)), { recursive: true, force: true }); } }
+    expect(existsSync(root!)).toBe(false);
+  } finally {
+    if (saved === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = saved;
+    chmodSync(parent, 0o700); rmSync(parent, { recursive: true, force: true });
+  }
 });
 
 it('turns Ask off when a failed setup leaves storage D cannot hand back', async () => {

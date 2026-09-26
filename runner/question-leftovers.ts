@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
-import { basename, isAbsolute, join } from 'node:path';
+import { chmodSync, existsSync, lstatSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, dirname, isAbsolute, join } from 'node:path';
 
 /** Docker resources of one Ask storage allocation that codeboost could not remove. */
 export interface Leftover {
@@ -18,21 +19,45 @@ export interface TaskStorage {
   readonly networks?: ReadonlySet<string>;
 }
 export type ListTaskStorage = (signal: AbortSignal) => Promise<TaskStorage>;
-interface LedgerRecord { leftovers: Leftover[]; untracked: number; paths: string[] }
+interface LedgerRecord { leftovers: Leftover[]; untracked: number; roots: string[] }
 
 // One whole check, not per resource: it runs before each question and must not hold it or shutdown for long.
 const CHECK_TIMEOUT_MS = 15_000;
 const DOCKER_NAME = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,254}$/;
-// Ask's host staging directory, as created by mkdtemp(join(tmpdir(), 'codeboost-question-')).
-const STAGING_NAME = /^codeboost-question-[A-Za-z0-9]{6}$/;
-export const isStagingPath = (path: unknown): path is string =>
-  typeof path === 'string' && path.length <= 4096 && isAbsolute(path) && STAGING_NAME.test(basename(path));
+/** A temporary directory created by mkdtemp(join(tmpdir(), prefix)): a direct child of `parent` with that name. */
+const isTemporary = (path: unknown, prefix: string, parent: string): path is string =>
+  typeof path === 'string' && path.length <= 4096 && isAbsolute(path) && dirname(path) === parent
+  && new RegExp(`^${prefix}[A-Za-z0-9]{6}$`).test(basename(path));
+/**
+ * The Ask root: one directory per question worker, set as the worker's TMPDIR, so every host copy it or lane D makes
+ * (reviewed clone, input, the Codex auth copy) lives inside it. Only this exact shape is accepted from the record.
+ */
+export const isAskRoot = (path: unknown): path is string => isTemporary(path, 'codeboost-ask-', tmpdir());
+/** A question's staging directory, inside the worker's TMPDIR (the Ask root). */
+export const isStagingPath = (path: unknown): path is string => isTemporary(path, 'codeboost-question-', tmpdir());
 
-/** Remove Ask's host staging directory (reviewed clone and read-only input). Throws if it cannot be removed. */
+/** Delete a tree that may contain read-only directories (staged input). Links are removed, never followed. */
+function removeTree(path: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (!stat) return;
+  if (stat.isDirectory() && !stat.isSymbolicLink()) {
+    chmodSync(path, 0o700);
+    for (const entry of readdirSync(path)) {
+      const child = join(path, entry);
+      if (lstatSync(child).isDirectory()) removeTree(child);
+    }
+  }
+  rmSync(path, { recursive: true, force: true });
+}
+/** Remove a question's staging directory (reviewed clone and read-only input). Throws if it cannot be removed. */
 export function removeStaging(root: string): void {
   if (!isStagingPath(root)) throw new Error('Refusing to remove a path that is not an Ask staging directory.');
-  try { chmodSync(join(root, 'input'), 0o700); } catch { /* not created or already gone */ }
-  rmSync(root, { recursive: true, force: true });
+  removeTree(root);
+}
+/** Remove an Ask root and everything in it. Throws if it cannot be removed. */
+export function removeAskRoot(root: string): void {
+  if (!isAskRoot(root)) throw new Error('Refusing to remove a path that is not an Ask root.');
+  removeTree(root);
 }
 const MAX_LEFTOVERS = 100;
 
@@ -54,11 +79,11 @@ const LABELLED = 'docker ps -a, docker volume ls and docker network ls, each wit
 
 function parse(text: string): LedgerRecord {
   const value = JSON.parse(text) as { leftovers?: unknown; untracked?: unknown };
-  const list = value?.leftovers, untracked = value?.untracked, paths = (value as { paths?: unknown })?.paths ?? [];
+  const list = value?.leftovers, untracked = value?.untracked, roots = (value as { roots?: unknown })?.roots;
   if (!Array.isArray(list) || list.length > MAX_LEFTOVERS || !Number.isSafeInteger(untracked) || (untracked as number) < 0
-    || !Array.isArray(paths) || paths.length > MAX_LEFTOVERS || !paths.every(isStagingPath))
+    || !Array.isArray(roots) || roots.length > MAX_LEFTOVERS || !roots.every(isAskRoot))
     throw new Error('invalid record');
-  return { untracked: untracked as number, paths: paths as string[], leftovers: list.map(entry => {
+  return { untracked: untracked as number, roots: roots as string[], leftovers: list.map(entry => {
     const { keeper, workVolume, metadataVolume } = (entry ?? {}) as Record<string, unknown>;
     if (![keeper, workVolume, metadataVolume].every(name => typeof name === 'string' && DOCKER_NAME.test(name)))
       throw new Error('invalid entry');
@@ -77,44 +102,54 @@ export class LeftoverLedger {
   constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; }
 
   #read(): LedgerRecord {
-    if (!existsSync(this.path)) return { leftovers: [], untracked: 0, paths: [] };
+    if (!existsSync(this.path)) return { leftovers: [], untracked: 0, roots: [] };
     try { return parse(readFileSync(this.path, 'utf8')); }
     catch { throw new Error(`Ask is off: the record of leftover agent storage (${this.path}) is unreadable. Check \`docker ps -a\` and \`docker volume ls\` for codeboost resources, remove them, then delete that file.`); }
   }
 
   #write(record: LedgerRecord): void {
-    if (!record.leftovers.length && !record.untracked && !record.paths.length) { rmSync(this.path, { force: true }); return; }
+    if (!record.leftovers.length && !record.untracked && !record.roots.length) { rmSync(this.path, { force: true }); return; }
     const temporary = `${this.path}.${process.pid}.tmp`;
     writeFileSync(temporary, `${JSON.stringify(record, null, 2)}\n`, { mode: 0o600 });
     renameSync(temporary, this.path);
   }
 
-  /** Add allocations and host staging directories that could not be removed, and unnamed failures. */
-  record(leftovers: readonly Leftover[], untracked = 0, paths: readonly string[] = []): void {
-    if (!leftovers.length && !untracked && !paths.length) return;
+  /** Add allocations that could not be removed, unnamed failures, and Ask roots that may still hold host copies. */
+  record(leftovers: readonly Leftover[], untracked = 0, roots: readonly string[] = []): void {
+    if (!leftovers.length && !untracked && !roots.length) return;
     const known = this.#read();
     const keys = new Set(known.leftovers.map(entry => entry.keeper));
     const merged = [...known.leftovers, ...leftovers.filter(entry => !keys.has(entry.keeper))];
     // Never drop evidence: entries beyond the cap become unnamed, which keeps Ask off until no task storage remains.
-    const mergedPaths = [...new Set([...known.paths, ...paths.filter(isStagingPath)])];
-    this.#write({ leftovers: merged.slice(0, MAX_LEFTOVERS), paths: mergedPaths.slice(0, MAX_LEFTOVERS),
-      untracked: known.untracked + untracked + Math.max(0, merged.length - MAX_LEFTOVERS) + Math.max(0, mergedPaths.length - MAX_LEFTOVERS) });
+    const mergedRoots = [...new Set([...known.roots, ...roots.filter(isAskRoot)])];
+    this.#write({ leftovers: merged.slice(0, MAX_LEFTOVERS), roots: mergedRoots.slice(0, MAX_LEFTOVERS),
+      untracked: known.untracked + untracked + Math.max(0, merged.length - MAX_LEFTOVERS) + Math.max(0, mergedRoots.length - MAX_LEFTOVERS) });
+  }
+
+  /** Drop an Ask root from the record after it has been deleted. */
+  forget(root: string): void {
+    const known = this.#read();
+    if (known.roots.includes(root)) this.#write({ ...known, roots: known.roots.filter(entry => entry !== root) });
   }
 
   /**
    * Drop entries whose resources are all gone. Throws, with removal commands, while any remain, and also when
    * Docker cannot be checked within the time limit or `signal` aborts.
    */
-  async assertClear(signal?: AbortSignal, options: { startup?: boolean } = {}): Promise<void> {
+  async assertClear(signal?: AbortSignal, options: { startup?: boolean; active?: string } = {}): Promise<void> {
     const known = this.#read();
     // At startup a missing record proves nothing: the last process may have been killed before writing it.
     const stored = known.untracked;
     if (options.startup && !known.untracked) known.untracked = 1;
-    // Host copies of reviewed code need no Docker: remove them first and keep only what still resists.
-    const paths = known.paths.filter(path => { try { removeStaging(path); return false; } catch { return true; } });
-    if (paths.length !== known.paths.length) this.#write({ ...known, paths, untracked: stored });
-    if (paths.length) throw new Error(`Ask is off: copies of reviewed code from an earlier question could not be deleted. Delete them, then retry:\n${paths.map(path => `rm -rf '${path}'`).join('\n')}`);
-    known.paths = [];
+    // Host copies (reviewed code, Codex auth) need no Docker: delete earlier roots first, never the live one.
+    const roots = known.roots.filter(root => {
+      if (root === options.active) return true;
+      try { removeAskRoot(root); return false; } catch { return true; }
+    });
+    if (roots.length !== known.roots.length) this.#write({ ...known, roots, untracked: stored });
+    const stuck = roots.filter(root => root !== options.active);
+    if (stuck.length) throw new Error(`Ask is off: host copies of reviewed code or credentials from an earlier session could not be deleted. Delete them, then retry:\n${stuck.map(root => `rm -rf '${root}'`).join('\n')}`);
+    known.roots = roots;
     if (!known.leftovers.length && !known.untracked) return;
     const limit = AbortSignal.timeout(CHECK_TIMEOUT_MS);
     let storage: TaskStorage;
@@ -136,7 +171,7 @@ export class LeftoverLedger {
     // Unnamed leftovers are gone only when no task storage exists at all.
     const labelled = storage.containers.size + storage.volumes.size + (storage.networks?.size ?? 0);
     const untracked = known.untracked && labelled ? known.untracked : 0;
-    this.#write({ leftovers: remaining, untracked, paths: [] });
+    this.#write({ leftovers: remaining, untracked, roots: known.roots });
     if (untracked) throw new Error(`Ask is off: an earlier codeboost session may have left agent containers, volumes or networks that cannot be identified (${labelled} labelled resource${labelled === 1 ? '' : 's'} found). List them with ${LABELLED}. Remove them if no other codeboost is running, then retry.`);
     if (remaining.length) throw new Error(`Ask is off: agent storage from an earlier session was not removed. Remove it, then retry:\n${commands.join('\n')}`);
   }

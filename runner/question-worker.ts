@@ -14,7 +14,7 @@ export type WorkerRequest = { type: 'ask'; id: string; question: ContainerQuesti
   | { type: 'release'; id: string };
 export type WorkerReply = { id: string; attemptId: string; ok: true; text: string } | { id: string; attemptId: string; ok: false; error: string };
 /** Reply to `release`: allocations still not removed after a final attempt. */
-export type ReleaseReply = { id: string; remaining: Leftover[]; untracked: number; paths: string[] };
+export type ReleaseReply = { id: string; remaining: Leftover[]; untracked: number };
 
 // Worker threads get their own copy of process.env; after this, only the adapters receive credentials.
 const credentials = isolateCredentials(process.env);
@@ -37,7 +37,7 @@ parentPort!.on('message', (message: WorkerRequest) => {
   if (message.type === 'release') {
     // Shutdown: one last removal attempt, then report what is still owned so it can be recorded durably.
     try { retained.release(deps.removeFilesystems); } catch { /* reported below */ }
-    parentPort!.postMessage({ id: message.id, remaining: retained.list(), untracked: retained.untracked, paths: retained.paths() } satisfies ReleaseReply);
+    parentPort!.postMessage({ id: message.id, remaining: retained.list(), untracked: retained.untracked } satisfies ReleaseReply);
     return;
   }
   const controller = new AbortController();
