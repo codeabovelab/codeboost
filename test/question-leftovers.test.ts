@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -460,3 +460,38 @@ it('waits for an abandonment already in progress when shutdown starts', async ()
   expect(read(path).roots).toEqual([]);
   expect(lockFree(path)).toBe(true);
 }, 20_000);
+
+it('keeps one lock for a review database across a rename', () => {
+  const root = mkdtempSync(join(tmpdir(), 'ask-db-')); roots.push(root);
+  const database = join(root, 'review.sqlite');
+  writeFileSync(database, '');
+  const before = LeftoverLedger.forDatabase(database);
+  before.acquire();
+  try {
+    renameSync(database, join(root, 'renamed.sqlite'));
+    const after = LeftoverLedger.forDatabase(join(root, 'renamed.sqlite'));
+    expect(after.lockPath).toBe(before.lockPath);
+    expect(() => after.acquire()).toThrow('another codeboost process');
+  } finally { before.release(); }
+});
+
+it('keeps the lock until a startup scan still in flight has finished', async () => {
+  const path = ledgerPath();
+  let release!: () => void, scanning = false;
+  const gate = new Promise<void>(resolve => { release = resolve; });
+  const worker = stubWorker(new LeftoverLedger(path, async () => { scanning = true; await gate; return { containers: new Set(), volumes: new Set() }; }));
+  const controller = new AbortController();
+  const question = worker.agent('claude')('answer', controller.signal, scope(33), 60_000).catch((error: Error) => error);
+  await expect.poll(() => scanning).toBe(true);
+  controller.abort(new Error('Server stopped. Retry the question.'));
+  expect(((await question) as Error).message).toBe('Server stopped. Retry the question.');
+  let closed = false;
+  const closing = worker.close().then(() => { closed = true; });
+  await new Promise(resolve => setTimeout(resolve, 50));
+  // The caller has gone, but the scan still runs under the lock.
+  expect(closed).toBe(false);
+  expect(lockFree(path)).toBe(false);
+  release();
+  await closing;
+  expect(lockFree(path)).toBe(true);
+});

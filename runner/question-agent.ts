@@ -185,6 +185,8 @@ export class QuestionWorker {
     this.closed = true;
     try { await this.#close(); }
     finally {
+      // A shared startup scan may still be running and could write the record; it must finish under the lock.
+      await this.#scanning?.catch(() => undefined);
       // Keep the lock while an abandoned thread may still write into its recorded root.
       if (!this.root) this.ledger?.release();
     }

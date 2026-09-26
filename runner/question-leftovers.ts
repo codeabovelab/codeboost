@@ -102,7 +102,9 @@ export class LeftoverLedger {
   #lock?: import('node:sqlite').DatabaseSync;
   #refusal?: string;
   readonly listTaskStorage: ListTaskStorage;
-  constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; }
+  /** Where the exclusive lock lives; for a review database it is keyed by the file's identity (see forDatabase). */
+  lockPath: string;
+  constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) { this.path = path; this.listTaskStorage = listTaskStorage; this.lockPath = `${path}.lock`; }
 
   /**
    * Exclusive Ask lock for this review database, held for the question worker's lifetime. Only the holder scans,
@@ -114,7 +116,7 @@ export class LeftoverLedger {
     if (this.#lock) return;
     if (this.#refusal) throw new Error(this.#refusal);
     const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
-    const lock = new DatabaseSync(`${this.path}.lock`, { timeout: 0 });
+    const lock = new DatabaseSync(this.lockPath, { timeout: 0 });
     try { lock.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;'); }
     catch (error) {
       lock.close();
@@ -138,7 +140,11 @@ export class LeftoverLedger {
   static forDatabase(database: string, listTaskStorage?: ListTaskStorage): LeftoverLedger {
     const canonical = realpathSync(database);
     const ledger = new LeftoverLedger(`${canonical}.ask-leftovers.json`, listTaskStorage);
-    if (statSync(canonical).nlink > 1)
+    const identity = statSync(canonical);
+    // The lock only excludes, so it may live in the temp directory; keyed by device and inode, every spelling and
+    // every later name of this database file (including an atomic rename while a server runs) finds the same lock.
+    ledger.lockPath = join(tmpdir(), `codeboost-asklock-${identity.dev}-${identity.ino}.sqlite`);
+    if (identity.nlink > 1)
       ledger.#refusal = `Ask is off: the review database ${canonical} has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.`;
     return ledger;
   }
