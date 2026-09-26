@@ -3,7 +3,13 @@ import type { WorkerRequest } from '../../runner/question-worker.ts';
 
 // Stands in for runner/question-worker.ts so the main-thread bridge can be tested without Docker.
 const waiting = new Map<string, string>();
+// Allocations a question could not remove, as the real worker's RetainedStorage would report them.
+const leaked: { keeper: string; workVolume: string; metadataVolume: string }[] = [];
 parentPort!.on('message', (message: WorkerRequest) => {
+  if (message.type === 'release') {
+    parentPort!.postMessage({ id: message.id, remaining: leaked });
+    return;
+  }
   if (message.type === 'cancel') {
     if (waiting.has(message.id)) {
       parentPort!.postMessage({ id: message.id, attemptId: waiting.get(message.id)!, ok: false, error: `cancelled:${message.reason}` });
@@ -13,6 +19,11 @@ parentPort!.on('message', (message: WorkerRequest) => {
   }
   const { prompt, provider, noteId, attemptId } = message.question;
   if (prompt === 'crash') throw new Error('stub crashed');
+  if (prompt === 'leak') {
+    leaked.push({ keeper: 'codeboost-keeper-1', workVolume: 'codeboost-work-1', metadataVolume: 'codeboost-meta-1' });
+    parentPort!.postMessage({ id: message.id, attemptId, ok: false, error: 'Question container cleanup did not settle.' });
+    return;
+  }
   if (prompt === 'wait') { waiting.set(message.id, attemptId); return; }
   // Simulates a reply that carries another attempt's identity.
   const replied = prompt === 'wrong-attempt' ? `${attemptId}-other` : attemptId;

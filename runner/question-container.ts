@@ -4,6 +4,7 @@ import { join } from 'node:path';
 import type { InvocationContext, InvocationHandle, InvocationInput, InvocationResult, StopReason, TaskClone } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
+import type { Leftover } from './question-leftovers.ts';
 
 export type Provider = 'claude' | 'codex';
 /** What the review knows about a question when it asks the agent. */
@@ -32,6 +33,10 @@ export class RetainedStorage {
   readonly #retained = new Set<TaskFilesystems>();
   get size() { return this.#retained.size; }
   retain(filesystems: TaskFilesystems) { this.#retained.add(filesystems); }
+  /** Docker names of the retained allocations, for a durable record before this registry is dropped. */
+  list(): Leftover[] {
+    return [...this.#retained].map(({ keeper, workVolume, metadataVolume }) => ({ keeper, workVolume, metadataVolume }));
+  }
   /** Retry removal of every retained allocation. Throws while any removal is still unconfirmed. */
   release(remove: (filesystems: TaskFilesystems) => void): void {
     for (const filesystems of [...this.#retained]) {

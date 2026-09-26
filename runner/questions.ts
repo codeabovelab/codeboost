@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import type { ReviewService } from './review.ts';
 import { QuestionWorker } from './question-agent.ts';
+import { LeftoverLedger } from './question-leftovers.ts';
 import type { QuestionScope } from './question-container.ts';
 import type { ReviewNote } from './store.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal, scope?: QuestionScope, timeoutMs?: number) => Promise<string>;
@@ -23,8 +24,12 @@ export class Questions {
   private closing = false;
   private service: ReviewService;
   private agent?: QuestionAgent;
-  private worker = new QuestionWorker();
-  constructor(service: ReviewService, agent?: QuestionAgent) { this.service=service; this.agent=agent; }
+  private worker: QuestionWorker;
+  constructor(service: ReviewService, agent?: QuestionAgent) {
+    this.service=service; this.agent=agent;
+    // Beside the review database, so a restart of the same review finds storage an earlier session could not remove.
+    this.worker=new QuestionWorker(undefined,new LeftoverLedger(`${service.config.database}.ask-leftovers.json`));
+  }
   isRunning(id: string) { return this.running.has(id); }
   start(id: string, view: ReturnType<ReviewService['load']>) {
     if (this.closing) throw new Error('Server is stopping. Reconnect before asking again.');

@@ -102,6 +102,12 @@ Ask keeps the contract's identity and cleanup rules:
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.
+- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
+  anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
+  Ask stays off while any recorded container or volume still exists (a read-only `docker inspect` check). The
+  refusal shows the `docker rm`/`docker volume rm` commands, and the record clears itself once they are gone. An
+  unreadable record, or a Docker daemon that cannot answer, keeps Ask off. Removal goes through D only once D has
+  recovery handles (#51 item 4).
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker; Ask stays off until codeboost restarts. Reclaiming those leftovers after a crash or restart
   needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.

@@ -189,6 +189,7 @@ it('keeps storage whose removal failed, refuses Ask until it is removed, then co
   first.deps.removeFilesystems = () => { throw new Error('Docker did not confirm removal.'); };
   await expect(askInContainer(question(), first.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
   expect(retained.size).toBe(1);
+  expect(retained.list().map(entry => entry.keeper)).toEqual(['keeper']);
 
   const blocked = fakeDeps();
   blocked.deps.removeFilesystems = () => { throw new Error('Docker is still down.'); };
