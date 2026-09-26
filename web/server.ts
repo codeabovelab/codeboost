@@ -8,11 +8,19 @@ import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { BadRequest, GuardRefusal, ShuttingDownError, sameContext } from '../runner/lifecycle.ts';
+import { SuggestionCoordinator, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
+import type { AuthorProvider } from '../core/planning-author.ts';
+/** Live planning runs only through D (G4 after #51). Until a provider is injected, starting a suggestion is refused. */
+export interface PlanningDeps {
+  provider: AuthorProvider;
+  /** Trusted repository, issue and approved-lesson inputs for a suggestion request. */
+  describe(): Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
+}
 const publicRoot = new URL('./public/', import.meta.url);
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500, runnerDeps?: RunnerDeps) {
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500, runnerDeps?: RunnerDeps, planning?: PlanningDeps) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > 14_500) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
-  let questions: Questions, merges: MergeCoordinator | null, runner: RunnerCoordinator | null;
+  let questions: Questions, merges: MergeCoordinator | null, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
   const capability = service.store.shutdownCapability();
   try {
@@ -21,6 +29,16 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), 14_000, capability) : null;
     // The runner starts only with an injected D; until #51 lands, runner actions report that it is unavailable.
     runner = runnerDeps ? new RunnerCoordinator(service.store, runnerDeps, undefined, capability) : null;
+    // E3's settlement writes (completeSuggestions, settleSuggestion in close()) run with the shutdown capability.
+    const store = service.store;
+    const suggestionStore: SuggestionStore = {
+      getPlan: identity => store.getPlan(identity), getSnapshot: identity => store.getSnapshot(identity),
+      beginSuggestions: (identity, expected) => store.beginSuggestions(identity, expected),
+      completeSuggestions: (identity, id, reply) => capability.run(() => store.completeSuggestions(identity, id, reply)),
+      settleSuggestion: (identity, id, expected, outcome) => capability.run(() => store.settleSuggestion(identity, id, expected, outcome)),
+      getSuggestions: (identity, id) => store.getSuggestions(identity, id),
+    };
+    suggestions = planning ? new SuggestionCoordinator(suggestionStore, planning.provider) : null;
   } catch (error) { service.close(); throw error; }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
   const load=async(signal?:AbortSignal)=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
@@ -58,6 +76,43 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       return { outcome: 'started', attemptId: retry.id };
     }).response;
   };
+  /** Handles of suggestion requests started by this process, removed once their outcome settles. */
+  const suggestionHandles = new Map<string, SuggestionHandle>();
+  const requireAction = (input: Record<string, unknown>) => { if (input.actionId === undefined) throw new BadRequest('actionId is required for this action.'); return input.actionId as string; };
+  const planningAction = (path: string, input: Record<string, unknown>) => {
+    const actionId = requireAction(input), { actionId: _omit, ...request } = input;
+    const imported = path === '/api/plan/import', started = path === '/api/plan/suggestions';
+    const match = /^\/api\/plan\/suggestions\/([0-9a-f-]{36})\/(cancel|apply)$/.exec(path);
+    const kind = imported ? 'plan-import' : started ? 'suggestion-start' : `suggestion-${match![2]}`;
+    return service.store.userAction(identity, { actionId, kind, request }, () => {
+      if (imported) {
+        if (typeof input.source !== 'string' || !['json', 'yaml'].includes(input.format as string) || !Number.isSafeInteger(input.expectedRevision)) throw new BadRequest('source, format and expectedRevision are required.');
+        return { revision: service.store.importRevision(input.source, input.format as 'json' | 'yaml', service.planContext(), input.expectedRevision as number).revision };
+      }
+      if (started) {
+        if (!suggestions || !planning) throw new GuardRefusal('Planning agent not available yet.');
+        const plan = service.store.getPlan(identity), snapshot = service.store.getSnapshot(identity);
+        if (input.expectedRevision !== plan.revision || input.snapshotId !== snapshot.id) throw new GuardRefusal('Stale plan revision or snapshot. Reload before asking for suggestions.');
+        if (typeof input.feedback !== 'string' || input.feedback.length > 4000) throw new BadRequest('feedback must be text of 4000 characters or fewer.');
+        const context = service.planContext(), described = planning.describe();
+        const handle = suggestions.start({ context, revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
+          repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } });
+        suggestionHandles.set(handle.id, handle);
+        void handle.result.finally(() => suggestionHandles.delete(handle.id));
+        return { requestId: handle.id };
+      }
+      const id = match![1]!;
+      if (match![2] === 'cancel') {
+        const handle = suggestionHandles.get(id), current = service.store.getSuggestions(identity, id);
+        if (current.state === 'pending' && handle) { handle.cancel('Cancelled by the user.'); return { state: 'cancelling' }; }
+        // No handle in this process: startup recovery has already stopped any provider (planning runs only through D).
+        service.store.cancelSuggestions(identity, id, 'Cancelled by the user.');
+        return { state: service.store.getSuggestions(identity, id).state };
+      }
+      if (!Number.isSafeInteger(input.index)) throw new BadRequest('index is required.');
+      return { revision: service.store.applySuggestion(identity, id, input.index as number, service.planContext()).revision };
+    }).response;
+  };
   let stopping = false;
   const activeRequests=new Set<{abort:AbortController;request:IncomingMessage;readingBody:boolean}>();
   const server = createServer(async (req, res) => {
@@ -79,7 +134,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
         if (req.method === 'GET' && path === '/api/runner') { json(200, runnerView()); return; }
-        if (req.method !== 'POST' || !['/api/action','/api/settings','/api/runner'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
+        const suggestionRead = /^\/api\/plan\/suggestions\/([0-9a-f-]{36})$/.exec(path);
+        if (req.method === 'GET' && suggestionRead) { json(200, service.store.getSuggestions(identity, suggestionRead[1]!)); return; }
+        const planningPath = path === '/api/plan/import' || path === '/api/plan/suggestions' || /^\/api\/plan\/suggestions\/[0-9a-f-]{36}\/(cancel|apply)$/.test(path);
+        if (req.method !== 'POST' || !(['/api/action','/api/settings','/api/runner'].includes(path) || planningPath) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
         activeRequest.readingBody=true;
         try { for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
@@ -89,6 +147,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         // Admitted requests drain normally (AGENTS.md); only the irreversible merge boundary rechecks the flag.
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/runner') { json(200, { result: runnerAction(input), runner: runnerView() }); return; }
+        if(planningPath) { json(200, { result: planningAction(path, input) }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
@@ -101,8 +160,19 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
         }
-        const view=service.act(input);
-        if(view.createdNoteId && input.kind==='question') {
+        // Feedback-producing actions need an actionId: the action and its feedback event share one transaction.
+        const feedback = input.action==='accept' || input.action==='assign' || (input.action==='note' && input.kind==='change');
+        if (feedback) requireAction(input);
+        let view: ReturnType<typeof service.act>, replayed = false;
+        if (input.actionId !== undefined) {
+          const { actionId, ...request } = input;
+          const outcome = service.store.userAction(identity, { actionId, kind: `review-${String(input.action).replace(/[^a-z-]/g, '')}`, request }, () => {
+            const acted = service.act(input, actionId); return { createdNoteId: acted.createdNoteId ?? null };
+          });
+          replayed = outcome.replayed;
+          view = { ...service.load(), createdNoteId: outcome.response.createdNoteId ?? undefined };
+        } else view=service.act(input);
+        if(view.createdNoteId && input.kind==='question' && !replayed) {
           try {questions.start(view.createdNoteId,view);} catch(error) {
             // The saved question remains visible and retryable when capacity is reached.
           }
@@ -156,6 +226,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     await runner?.close();
     await closing;
     await questions.close();
+    await suggestions?.close();
     service.close();
   } };
 }

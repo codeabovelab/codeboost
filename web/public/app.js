@@ -189,7 +189,8 @@ async function act(command) {
   renderAttachment();
   try {
     rememberDraft();
-    const updated = await api("/api/action", { ...command, token: data.token });
+    // One action ID per user action: the server replays it exactly and records feedback with it.
+    const updated = await api("/api/action", { ...command, token: data.token, actionId: crypto.randomUUID() });
     rememberDraft();
     data = updated;
     render();
