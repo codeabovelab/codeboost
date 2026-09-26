@@ -6,14 +6,20 @@ import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
+import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
+import { demoIssueGateway } from '../scripts/demo-issues.ts';
+import { IssueBoard } from './issues.ts';
 const publicRoot = new URL('./public/', import.meta.url);
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500) {
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500, issueGateway?: IssueGateway) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > 14_500) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
-  let questions: Questions, merges: MergeCoordinator | null;
+  let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard;
   try {
     if (!config.demo && config.github && config.github.issue !== service.store.getPlan(config.identity).issue) throw new Error('The GitHub merge issue must match the stored plan issue.');
     questions=new Questions(service,questionAgent);
+    // Issue retrieval is read-only, so demos may show it; they use a local fixture and never contact GitHub.
+    issues = new IssueBoard(issueGateway ?? (config.demo ? demoIssueGateway() : config.github ? new GhIssueGateway(config.github.repository) : null),
+      'Issue ranking needs a GitHub repository. Add a github block with a repository to the review configuration.');
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!)) : null;
   } catch (error) { service.close(); throw error; }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
@@ -40,8 +46,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (req.method === 'GET' && path === '/api/settings') { json(200,{questionProvider:service.store.questionProvider()});return; }
         if (req.method === 'GET' && path === '/api/questions') { json(200,{notes:answerStatuses()});return; }
         if (req.method === 'GET' && path === '/api/merge') { if(!merges)throw new Error('Merging is not configured for this review.');json(200,{queue:await merges.pollQueue()});return; }
+        if (req.method === 'GET' && path === '/api/issues') { json(200, issues.view()); return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
-        if (req.method !== 'POST' || !['/api/action','/api/settings'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
+        if (req.method !== 'POST' || !['/api/action','/api/settings','/api/issues'].includes(path) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
         activeRequest.readingBody=true;
         try { for await (const chunk of req) { size += chunk.length; if (size > 16384) { json(413, { error: 'Request too large.' }); return; } chunks.push(chunk); } }
@@ -49,6 +56,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const body = new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks));
         const input=JSON.parse(body);
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
+        if(path==='/api/issues') {
+          if(input?.action!=='refresh')throw new Error('Unsupported issue action.');
+          json(200,await issues.refresh(requestAbort.signal));return;
+        }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
@@ -96,7 +107,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       active.abort.abort(reason);
       if(active.readingBody)active.request.destroy(reason);
     }
-    await merges?.close();
+    // Abort the issue refresh now; its close settles without rejecting, so it is always awaited.
+    const issuesClosed=issues.close();
+    try { await merges?.close(); } finally { await issuesClosed; }
     await closing;
     await questions.close();
     service.close();
