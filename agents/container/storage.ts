@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, opendirSync, readlinkSync, realpathSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
+import { lstatSync, opendirSync, readlinkSync } from 'node:fs';
+import { dirname, isAbsolute, join, relative } from 'node:path';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
@@ -115,6 +115,35 @@ const within = (base: string, path: string) => {
   return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
 };
 const LINK_INSPECTION_LIMIT = 200_000;
+// The Linux kernel gives up after 40 link hops (ELOOP); a cycle never resolves, so it cannot reach anything.
+const MAXIMUM_LINK_HOPS = 40;
+/**
+ * Resolve a link as the container kernel will, with the checkout standing for /work. Each existing link along the way
+ * is followed, `..` is applied to the resolved path, and the path must stay inside the checkout after every step.
+ * Components that do not exist here are applied textually: /work mirrors the checkout, so they are missing there too,
+ * and a target the host lacks (such as a container mount under /run) cannot hide an escape.
+ */
+const linkStaysInside = (staging: string, link: string) => {
+  let current = dirname(link), hops = 0, exists = true;
+  const components = readlinkSync(link).split('/');
+  if (components[0] === '') return false;
+  while (components.length) {
+    const component = components.shift()!;
+    if (component === '' || component === '.') continue;
+    current = component === '..' ? dirname(current) : join(current, component);
+    if (!within(staging, current)) return false;
+    if (!exists || component === '..') continue;
+    const stat = lstatSync(current, { throwIfNoEntry: false });
+    if (!stat) { exists = false; continue; }
+    if (!stat.isSymbolicLink()) continue;
+    if (++hops > MAXIMUM_LINK_HOPS) return true;
+    const target = readlinkSync(current);
+    if (target.startsWith('/')) return false;
+    components.unshift(...target.split('/'));
+    current = dirname(current);
+  }
+  return true;
+};
 /**
  * Refuse a checkout whose symbolic links leave it, or whose Git metadata contains any link. The seeder copies links as
  * links, so an absolute or escaping link would let a path-restricted agent tool read container files outside the
@@ -132,17 +161,7 @@ const assertContainedLinks = (staging: string, remaining: () => number) => {
       const name = JSON.stringify(relative(staging, path));
       // Git never needs links in its own metadata, which is mounted at /work/.git; refuse any, wherever it points.
       if (within(metadata, path)) throw new Error(`Repository Git metadata contains a link ${name}.`);
-      const target = readlinkSync(path);
-      if (isAbsolute(target) || !within(staging, resolve(dirname(path), target)))
-        throw new Error(`Repository link ${name} leaves the checkout.`);
-      // realpathSync.native follows POSIX (each link is resolved before a later `..`), as the container kernel does;
-      // the JavaScript realpathSync cancels `..` textually first and would miss an escape through a chain of links.
-      let real: string | undefined;
-      try { real = realpathSync.native(path); }
-      // A missing target or a cycle of links never resolves, so it cannot reach anything; direct escapes were already
-      // refused by the lexical check above.
-      catch (error) { if (!['ENOENT', 'ELOOP'].includes((error as NodeJS.ErrnoException).code ?? '')) throw error; }
-      if (real !== undefined && !within(staging, real)) throw new Error(`Repository link ${name} leaves the checkout.`);
+      if (!linkStaysInside(staging, path)) throw new Error(`Repository link ${name} leaves the checkout.`);
       continue;
     }
     if (!stat.isDirectory()) continue;

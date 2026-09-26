@@ -171,6 +171,12 @@ describe('real Docker agent isolation', () => {
       symlinkSync('../..', join(source, 'deep', 'er', 'top'));
       symlinkSync('deep/er/top/..', join(source, 'chained'));
     }],
+    ['a chain that leaves through a target this host lacks', (source: string) => {
+      // On the host the final path is missing, but in the container /work/.. is / and the credential mount exists.
+      mkdirSync(join(source, 'deep')); mkdirSync(join(source, 'deep', 'er'));
+      symlinkSync('../..', join(source, 'deep', 'er', 'top'));
+      symlinkSync('deep/er/top/../run/codeboost-auth/codex/auth.json', join(source, 'chained'));
+    }],
   ] as const)('refuses to seed a repository with %s, before any storage exists', (_label, hostile) => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
