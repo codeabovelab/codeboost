@@ -610,7 +610,7 @@ export class Store {
   /** Admission, including retry: status, state version, requeue claim, active attempt and captured context are checked in one transaction. */
   admitAttempt(identity: PlanIdentity, input: {
     expectedStateVersion: number; kind: AttemptKind; item?: string | null; expectedContext: InvocationContext;
-    deadline: number; budgetMs?: number; retryOf?: string; now?: number;
+    deadline: number; budgetMs?: number; retryOf?: string; now?: number; claimRequeue?: boolean;
   }): AttemptRecord {
     const now = input.now ?? Date.now(), budgetMs = input.budgetMs ?? DEFAULT_TASK_BUDGET_MS;
     if (!(input.kind in ATTEMPT_PHASES)) throw new GuardRefusal('Unknown attempt kind.');
@@ -622,7 +622,9 @@ export class Store {
       const task = this.#task(key);
       if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
       if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
-      if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
+      // Requeue claim: exactly one path (I3's requeue, or the user's Resume) clears it, by CAS in this admitting transaction.
+      if (task.requeue_pending === 1 && !input.claimRequeue) throw new GuardRefusal('Recovery is requeueing this task.');
+      if (input.claimRequeue && task.requeue_pending !== 1) throw new GuardRefusal('The requeue was already claimed.');
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
       const current = this.#contextOf(key);
@@ -637,7 +639,7 @@ export class Store {
       const id = randomUUID(), created = new Date(now).toISOString();
       this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
         id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
-      this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+      this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', requeue_pending=0, budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
       this.#touch(key);
       return this.getAttempt(identity, id);
     });
@@ -782,6 +784,125 @@ export class Store {
       snapshotId: row.snapshot_id as string | null, item: row.item as string | null, kind: row.kind as FeedbackKind, text: row.text as string | null,
       sourceRef: row.source_ref as string, supersedes: row.supersedes as string | null, createdAt: row.created_at as string,
     }));
+  }
+
+  // ---- F1d: startup recovery (runner-lifecycle.md, "Startup recovery") ----
+  /**
+   * The per-database runner owner token, tied to the database file's device and inode.
+   * A stored value that is malformed is refused; a copied database (different file identity) gets a new token.
+   */
+  runnerOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    const identity = { dev: String(file.dev), ino: String(file.ino) };
+    return this.#transaction(() => {
+      const row = this.#get("SELECT value FROM app_settings WHERE key='runner_owner'");
+      if (row) {
+        let stored: { token?: unknown; dev?: unknown; ino?: unknown };
+        try { stored = decode(row.value); } catch { throw new Error('Stored runner owner token is malformed. Refusing to start.'); }
+        if (typeof stored.token !== 'string' || !/^[0-9a-f]{32}$/.test(stored.token)) throw new Error('Stored runner owner token is malformed. Refusing to start.');
+        if (stored.dev === identity.dev && stored.ino === identity.ino) return stored.token;
+      }
+      const token = randomUUID().replace(/-/g, '');
+      this.#run("INSERT INTO app_settings VALUES ('runner_owner',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", encode({ token, ...identity }));
+      return token;
+    });
+  }
+  /** "Preparation starting": saved before any preparation subprocess is spawned. */
+  markPreparationStarting(identity: PlanIdentity, id: string, startedAt: number): void {
+    const key = identityKey(identity);
+    if (this.#run(`UPDATE attempts SET preparation_started_at=? WHERE plan_key=? AND id=? AND state='pending'`, startedAt, key, id).changes !== 1)
+      throw new GuardRefusal('Only a pending attempt can start preparation.');
+  }
+  /** The spawn failed synchronously: no child exists, so the "starting" marker must not block the next startup. */
+  cancelPreparationStart(identity: PlanIdentity, id: string): void {
+    this.#run(`UPDATE attempts SET preparation_started_at=NULL WHERE plan_key=? AND id=? AND preparation_pgid IS NULL AND state='pending'`, identityKey(identity), id);
+  }
+  /** Saved in the same synchronous turn as the spawn. */
+  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number): void {
+    if (!Number.isSafeInteger(pgid) || pgid < 2) throw new GuardRefusal('Invalid process group.');
+    if (this.#run(`UPDATE attempts SET preparation_pgid=? WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`, pgid, identityKey(identity), id).changes !== 1)
+      throw new GuardRefusal('Preparation was not marked as starting.');
+  }
+  /** F chooses the allocation ID and saves it before the asynchronous allocation starts. */
+  recordAllocation(identity: PlanIdentity, id: string, allocationId: string): void {
+    assertUuidV4(allocationId, 'Allocation ID');
+    if (this.#run(`UPDATE attempts SET allocation_id=? WHERE plan_key=? AND id=? AND state='pending' AND allocation_id IS NULL`, allocationId, identityKey(identity), id).changes !== 1)
+      throw new GuardRefusal('Allocation can be recorded once, for a pending attempt.');
+  }
+  /** Every non-terminal attempt, across all plans, with the fields recovery needs. */
+  interruptedAttempts(): (AttemptRecord & { planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; allocationId: string | null })[] {
+    return this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => ({
+      ...this.#attemptRecord(row), planKey: row.plan_key as string, preparationPgid: row.preparation_pgid as number | null,
+      preparationStartedAt: row.preparation_started_at as number | null, allocationId: row.allocation_id as string | null,
+    }));
+  }
+  /**
+   * Startup recovery step 3, finalization phase: one transaction. Applies the settlement precedence to every
+   * leftover attempt, keeps the closed-task and pending-cancel guards, and sets the requeue claim.
+   */
+  recoverInterrupted(now: number, exports: Readonly<Record<string, { diagnosticRef?: string; failure?: string }>> = {}): { attemptId: string; planKey: string; state: string; requeued: boolean }[] {
+    const gated = ['needs human', 'needs amendment', 'needs approval', 'possibly already fixed'];
+    return this.#transaction(() => this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => {
+      const key = row.plan_key as string, task = this.#task(key);
+      const contextCurrent = sameContext(decode<InvocationContext>(row.context), this.#contextOf(key));
+      let firstReason = row.first_reason as FirstReason | null;
+      if (firstReason === null && contextCurrent && task.budget_deadline !== null && now >= (task.budget_deadline as number)) firstReason = 'time-limit';
+      const deadlinePassed = firstReason === null && now >= (row.deadline as number);
+      const outcome = classifySettlement({
+        firstReason, contextCurrent, exitCode: null, valid: false,
+        stopReason: (row.stop_reason as StopReason | null) ?? (deadlinePassed ? 'timeout' : undefined),
+        detail: 'Interrupted: codeboost stopped while this was running',
+      });
+      const exported = exports[row.id as string];
+      const diagnostic = exported?.failure ? `${outcome.reason ?? ''} Partial output could not be exported: ${exported.failure}`.trim() : outcome.reason;
+      this.#run(`UPDATE attempts SET state=?, first_reason=?, diagnostic=?, diagnostic_ref=COALESCE(?, diagnostic_ref), settled_at=? WHERE id=?`,
+        outcome.state, firstReason, bounded(diagnostic ?? ''), exported?.diagnosticRef ?? null, new Date(now).toISOString(), row.id!);
+      let requeued = false;
+      if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
+      else {
+        if (outcome.timeLimit && !this.#closed(task.status)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+        const status = this.#task(key).status as string;
+        const interrupted = outcome.state === 'failed' && (outcome.reason ?? '').startsWith('Interrupted');
+        const shutdown = outcome.state === 'cancelled' && firstReason === 'shutdown';
+        if (!this.#closed(status) && !gated.includes(status) && (interrupted || shutdown)) {
+          this.#run('UPDATE tasks SET requeue_pending=1 WHERE plan_key=?', key); requeued = true;
+        }
+        this.#touch(key);
+      }
+      return { attemptId: row.id as string, planKey: key, state: outcome.state, requeued };
+    }));
+  }
+  /** Tasks whose confirmed merge lacks its closed status or task-closed event (recovery step 5). */
+  reconcileMergedTasks(): string[] {
+    return this.#transaction(() => {
+      const repaired: string[] = [];
+      for (const task of this.#db.prepare('SELECT plan_key, status FROM tasks').all()) {
+        const key = task.plan_key as string;
+        const latest = this.#get('SELECT id,data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', key);
+        if (!latest || decode<MergeAttempt>(latest.data).state !== 'merged') continue;
+        const hasEvent = this.#get("SELECT 1 FROM feedback_events WHERE plan_key=? AND kind='task-closed'", key);
+        if (task.status === 'merged' && hasEvent) continue;
+        this.#closeTask(key, 'merged', latest.id as string); repaired.push(key);
+      }
+      return repaired;
+    });
+  }
+
+  /** Which plan owns an attempt ID, across all plans; null if none. */
+  attemptOwner(attemptId: string): string | null {
+    return (this.#get('SELECT plan_key FROM attempts WHERE id=?', attemptId)?.plan_key as string | undefined) ?? null;
+  }
+  /** Interrupted rebases recorded by F3 (none exist before F3). */
+  rebasesInProgress(): { planKey: string; marker: unknown }[] {
+    return this.#db.prepare('SELECT plan_key, rebase_in_progress FROM tasks WHERE rebase_in_progress IS NOT NULL').all()
+      .map(row => ({ planKey: row.plan_key as string, marker: decode(row.rebase_in_progress) }));
+  }
+  /** After --release-preparation verified the directory is unused: clear the "starting" marker of a terminal attempt. */
+  clearPreparationMarker(attemptId: string): boolean {
+    return this.#run(`UPDATE attempts SET preparation_started_at=NULL WHERE id=? AND preparation_pgid IS NULL AND state NOT IN ('pending','running')`, attemptId).changes === 1;
+  }
+  /** Terminal attempts whose preparation started but whose process group was never saved. */
+  unownedPreparations(): string[] {
+    return this.#db.prepare(`SELECT id FROM attempts WHERE preparation_started_at IS NOT NULL AND preparation_pgid IS NULL AND state NOT IN ('pending','running')`).all().map(row => row.id as string);
   }
 
 }
