@@ -4,6 +4,9 @@ import { isDeepStrictEqual } from 'node:util';
 import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
+import { execFileSync } from 'node:child_process';
+import { isolatedGitEnvironment } from '../scripts/git-environment.ts';
+import type { BaseEntry, PlanContext } from '../core/plan.ts';
 import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys } from '../core/approvals.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
@@ -87,7 +90,25 @@ export class ReviewService {
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
     return { repository: basename(repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
-  act(input: unknown) {
+  /** The trusted plan context for import and Apply: base entries from the snapshot's base tree, and the configured path identity. */
+  planContext(): PlanContext {
+    const { identity, repository, pathIdentity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const pathKey = (path: string) => {
+      if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
+      const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
+      return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
+    };
+    const listing = execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'ls-tree', '-rz', snapshot.base], { cwd: repository, env: isolatedGitEnvironment(), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    const baseEntries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
+      const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
+      if (mode === '160000') return { path, kind: 'gitlink' };
+      if (mode === '120000') return { path, kind: 'symlink', target: execFileSync('git', ['cat-file', 'blob', oid!], { cwd: repository, env: isolatedGitEnvironment(), encoding: 'utf8' }) };
+      return { path, kind: 'file' };
+    });
+    return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
+  }
+  /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
+  act(input: unknown, actionId?: string) {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');
     const command = input as Record<string, unknown>;
     const view = this.load();
@@ -105,6 +126,11 @@ export class ReviewService {
       const item = command.action === 'assign' && typeof command.item === 'string' ? command.item : null;
       const storedKey = choiceKeys(view.segments, identity)[view.segments.indexOf(segment)]!;
       this.store.saveReview(identity, view.expected, [], [{ key: storedKey, action: command.action, item }]);
+      // Choice keys embed segment content and are unbounded; the event's source is a stable fixed-size fingerprint of the key.
+      const sourceRef = `choice:${createHash('sha256').update(storedKey).digest('hex')}`;
+      if (actionId) this.store.recordFeedback(identity, actionId, command.action === 'assign'
+        ? { kind: 'segment-assign', item, sourceRef, supersedeLatest: true }
+        : { kind: 'segment-accept', sourceRef, supersedeLatest: true });
     } else if (command.action === 'note' && typeof command.item === 'string' && typeof command.text === 'string' && (command.kind === 'question' || command.kind === 'change')) {
       let reference: SnippetReference | undefined;
       if (command.reference !== undefined) {
@@ -121,6 +147,7 @@ export class ReviewService {
         reference = { key: segment.key, path: segment.operation === '-' ? segment.oldPath ?? segment.path : segment.path, side: segment.operation === '+' ? 'new' : 'old', start, end, text, head: view.snapshot.head, base: view.snapshot.base };
       }
       createdNoteId = this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text, reference).id;
+      if (actionId && command.kind === 'change') this.store.recordFeedback(identity, actionId, { kind: 'change-request', item: command.item, text: command.text.trim(), sourceRef: createdNoteId });
     } else throw new Error('Unknown review command.');
     return { ...this.load(), createdNoteId };
   }

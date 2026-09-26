@@ -15,6 +15,8 @@ import type { RunnerDeps } from '../runner/coordinator.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { MergeGateway, MergeQueueGateway, RemoteMergeState } from '../github/merge.ts';
 
+// Integration tests against the real server and git: each review load reads git history, so allow more than vitest's 5 s default.
+vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [];
 const cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
@@ -123,7 +125,7 @@ describe('server shutdown', () => {
   it('lets an admitted request finish during the drain (AGENTS.md: drain admitted requests)', async () => {
     const { app, config, close } = await serve();
     const view = (await api(app, 'GET', '/api/review')).body;
-    const sent = partialPost(app, '/api/action', { action: 'note', kind: 'change', item: 'P1', text: 'admitted note', token: view.token });
+    const sent = partialPost(app, '/api/action', { action: 'note', kind: 'change', item: 'P1', text: 'admitted note', token: view.token, actionId: randomUUID() });
     await tick();
     const closing = close();
     await tick();
@@ -136,7 +138,7 @@ describe('server shutdown', () => {
   it('destroys a request still reading its body after the drain limit, and writes nothing', async () => {
     const { app, config, close } = await serve();
     const view = (await api(app, 'GET', '/api/review')).body;
-    const sent = partialPost(app, '/api/action', { action: 'note', kind: 'change', item: 'P1', text: 'never finished', token: view.token });
+    const sent = partialPost(app, '/api/action', { action: 'note', kind: 'change', item: 'P1', text: 'never finished', token: view.token, actionId: randomUUID() });
     sent.response.catch(() => undefined);
     await tick();
     await close();
@@ -148,7 +150,7 @@ describe('server shutdown', () => {
     const { app, close } = await serve();
     const view = (await api(app, 'GET', '/api/review')).body;
     const closing = close();
-    const late = await fetch(`${origin(app)}/api/action`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'note', kind: 'change', item: 'P1', text: 'late', token: view.token }) }).then(r => r.status, () => 'refused');
+    const late = await fetch(`${origin(app)}/api/action`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'note', kind: 'change', item: 'P1', text: 'late', token: view.token, actionId: randomUUID() }) }).then(r => r.status, () => 'refused');
     expect([503, 'refused']).toContain(late);
     await closing;
   });

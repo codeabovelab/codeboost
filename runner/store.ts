@@ -760,13 +760,16 @@ export class Store {
     }
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
-  recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null }): FeedbackEvent {
+  recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null; supersedeLatest?: boolean }): FeedbackEvent {
     assertUuidV4(actionId, 'Action ID');
     if (this.#depth === 0) throw new Error('Feedback events are written inside their user action.');
     if (!FEEDBACK_KINDS.includes(event.kind) || event.kind === ('task-closed' as FeedbackKind)) throw new GuardRefusal('Invalid feedback kind.');
     if (event.text != null && (typeof event.text !== 'string' || event.text.length > 4000)) throw new GuardRefusal('Feedback text is limited to 4000 characters.');
     if (typeof event.sourceRef !== 'string' || !event.sourceRef || event.sourceRef.length > 200) throw new GuardRefusal('Invalid feedback source.');
     const key = identityKey(identity), plan = this.#current(key);
+    // A changed segment choice links to the latest earlier event for the same choice key.
+    if (event.supersedeLatest && event.supersedes == null)
+      event = { ...event, supersedes: (this.#get("SELECT id FROM feedback_events WHERE plan_key=? AND source_ref=? AND kind IN ('segment-accept','segment-assign') ORDER BY rowid DESC LIMIT 1", key, event.sourceRef)?.id as string | undefined) ?? null };
     if (event.supersedes != null && !this.#get('SELECT 1 FROM feedback_events WHERE plan_key=? AND id=? AND source_ref=?', key, event.supersedes, event.sourceRef))
       throw new GuardRefusal('A superseded event must belong to the same source.');
     const id = randomUUID(), createdAt = new Date().toISOString();

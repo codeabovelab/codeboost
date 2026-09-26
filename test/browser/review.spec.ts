@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { test, expect } from '@playwright/test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -138,7 +139,7 @@ test('shows an honest history error and keeps markup in notes as text',async({pa
 test('can assign a large foreign change without sending its content back in the command',async({request})=>{
  const repository=app.service.config.repository;writeFileSync(join(repository,'debug.log'),'x'.repeat(20000)+'\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Large foreign change'],{cwd:repository,stdio:'pipe'});
  const base=app.url.split('#')[0]!,headers={'x-codeboost-token':app.token};const view=await(await request.get(base+'api/review',{headers})).json();const segment=view.segments.find((s:{content:string;row:string})=>s.row==='Unplanned'&&s.content.length>19000);
- const response=await request.post(base+'api/action',{headers:{...headers,'Content-Type':'application/json'},data:{action:'assign',item:'P1',key:segment.key,token:view.token}});
+ const response=await request.post(base+'api/action',{headers:{...headers,'Content-Type':'application/json'},data:{action:'assign',item:'P1',key:segment.key,token:view.token,actionId:randomUUID()}});
  expect(response.status()).toBe(200);
 });
 test('shows bounded raster previews and byte sizes for file-change cards',async({page})=>{
