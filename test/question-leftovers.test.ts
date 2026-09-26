@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -353,5 +353,19 @@ it('bounds shutdown when the worker does not report, keeping its root recorded u
   // The lock stays while the thread may still write; both go once it stops.
   expect(lockFree(path)).toBe(false);
   await expect.poll(() => existsSync(root), { timeout: 5_000 }).toBe(false);
+  expect(lockFree(path)).toBe(true);
+});
+
+it('cleans up its root and releases the lock when the worker cannot be constructed', async () => {
+  const path = ledgerPath();
+  const before = new Set(readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-ask-')));
+  // A worker URL that is not a file makes the Worker constructor throw synchronously.
+  const worker = new QuestionWorker(new URL('https://example.invalid/worker.js'), new LeftoverLedger(path, docker(new Set())),
+    { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' } });
+  await expect(worker.agent('claude')('answer', new AbortController().signal, scope(25), 60_000)).rejects.toThrow();
+  const after = readdirSync(tmpdir()).filter(name => name.startsWith('codeboost-ask-') && !before.has(name));
+  expect(after).toEqual([]);
+  expect(existsSync(path)).toBe(false);
+  await worker.close();
   expect(lockFree(path)).toBe(true);
 });

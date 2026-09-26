@@ -52,9 +52,16 @@ export class QuestionWorker {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-ask-'));
     // Durable before any setup: a process killed from here on still leaves a record of this root.
     try { this.ledger?.record([], 0, [root]); } catch (error) { removeAskRoot(root); throw error; }
+    let worker: Worker;
+    try {
+      worker = new Worker(this.url, { env: workerEnvironment(process.env, root),
+        workerData: { credentials: credentialEnvironment(this.env) } });
+    } catch (error) {
+      // Nothing ran in the root yet: delete it and drop the record, so close() can release the lock.
+      removeAskRoot(root); this.ledger?.forget(root);
+      throw error;
+    }
     this.root = root;
-    const worker = new Worker(this.url, { env: workerEnvironment(process.env, root),
-      workerData: { credentials: credentialEnvironment(this.env) } });
     worker.on('message', (reply: WorkerReply | ReleaseReply) => {
       if ('remaining' in reply) { this.releases.get(reply.id)?.(reply); this.releases.delete(reply.id); return; }
       const job = this.pending.get(reply.id);
