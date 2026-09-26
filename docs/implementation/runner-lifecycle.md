@@ -2,7 +2,7 @@
 
 **Status:** contract proposed; the four open decisions are approved (2026-09-25). Nothing in this document is implemented yet.
 **Lane and step:** lane F (runner and pre-merge automation), step F1. Related issue: #22.
-**Baseline:** `main` at `5881a43` (D1–D4 merged; D5 not started).
+**Baseline:** `main` at `af8f3c2` (D1–D5 merged). The D changes this contract needs are tracked in #51.
 
 ## About this document
 
@@ -16,7 +16,7 @@
 - the order of steps when the program shuts down;
 - the feedback events that the learning lane (J) will read.
 
-**When implementation starts.** The plan starts F implementation after D5 merges. Review this contract now so that F1 code can start as soon as D5 lands. The attempt lifecycle itself uses only the D interface already on `main` (`agents/contract.ts`), which D4 (#47) did not change. Preparation, shutdown and startup recovery need D changes that do **not** exist yet: bounded settlement; `runnerOwner` (and the attempt ID) on `InvocationInput` and on every allocator that runs before an invocation; a scoped `recoverLeftovers` API that returns authenticated storage handles; and asynchronous, abortable versions of both preparation helpers, `createTaskClone` and `prepareTaskFilesystems`. They are listed as prerequisites under "Shutdown". The F1 implementation may start against fakes, but it must not merge until D delivers them.
+**When implementation starts.** The plan starts F implementation after D5 merges, and D5 merged as #50. F1 code can start now. The attempt lifecycle itself uses only the D interface already on `main` (`agents/contract.ts`), which D4 (#47) did not change. Preparation, shutdown and startup recovery need D changes that do **not** exist yet: bounded settlement; `runnerOwner` (and the attempt ID) on `InvocationInput` and on every allocator that runs before an invocation; a scoped `recoverLeftovers` API that returns authenticated storage handles; and asynchronous, abortable versions of both preparation helpers, `createTaskClone` and `prepareTaskFilesystems`. They are listed as prerequisites under "Shutdown". D5 delivered none of them: it did not change `agents/contract.ts`, and its hand-off doc confirms that the supervisor still retries cleanup until settlement (`docs/implementation/agent-isolation.md`). They are tracked in #51. The F1 implementation may start against fakes, but it must not merge until #51's pre-F1 items land.
 
 ## Summary
 
