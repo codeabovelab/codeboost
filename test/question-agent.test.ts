@@ -236,6 +236,13 @@ it('turns Ask off when D settles with resources it could not confirm removed', a
   const next = fakeDeps();
   await expect(askInContainer(question(), next.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cannot tell which Docker resources');
   expect(next.events).toEqual([]);
+  // An empty list still means D stopped retrying before cleanup was confirmed.
+  const empty = new RetainedStorage(), unnamed = fakeDeps({ stopReason: 'capture-failure' });
+  const unnamedAnswer = askInContainer(question(), unnamed.deps, new AbortController().signal, {}, empty);
+  await vi.waitFor(() => expect(unnamed.captured).toHaveLength(1));
+  unnamed.settle({ stopReason: 'capture-failure', unreleased: [] });
+  await expect(unnamedAnswer).rejects.toThrow();
+  expect(empty.untracked).toBe(1);
   // A stop whose cleanup D confirmed leaves Ask on.
   const clean = new RetainedStorage(), stopped = fakeDeps({ stopReason: 'cancelled' });
   const stoppedAnswer = askInContainer(question(), stopped.deps, new AbortController().signal, {}, clean);

@@ -23,8 +23,8 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   try { network = createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining())); }
   catch (error) {
     if (error instanceof VendorNetworkCreationCleanupError)
-      return retainSetupCleanup(request.invocation, error.retryCleanup, error.startupError, error,
-        'network creation cleanup', error.resources);
+      return retainSetupCleanup(request.invocation, budget => error.retryCleanup(budget), error.startupError, error,
+        'network creation cleanup', () => error.resources);
     throw error;
   }
   try {
@@ -38,13 +38,13 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
     if (error instanceof ProfileCreationCleanupError) {
       const retryCleanup = (networkTimeoutMs = 30_000) => {
         const failures: unknown[] = [];
-        try { error.retryCleanup(); } catch (cleanupError) { failures.push(cleanupError); }
+        try { error.retryCleanup(networkTimeoutMs); } catch (cleanupError) { failures.push(cleanupError); }
         try { removeVendorNetwork(network, networkTimeoutMs); } catch (cleanupError) { failures.push(cleanupError); }
         if (failures.length) throw new AggregateError(failures, 'Adapter setup cleanup did not settle.');
       };
       try { retryCleanup(Math.min(30_000, remaining())); }
-      catch (cleanupError) { return retainSetupCleanup(request.invocation, () => retryCleanup(),
-        error.startupError, cleanupError, 'profile and network cleanup', error.resources); }
+      catch (cleanupError) { return retainSetupCleanup(request.invocation, budget => retryCleanup(budget),
+        error.startupError, cleanupError, 'profile and network cleanup', () => error.resources); }
       throw error.startupError;
     }
     try { removeVendorNetwork(network, Math.min(30_000, remaining())); }

@@ -20,17 +20,19 @@ interface NetworkIdentity { readonly allocationId: string; readonly imageId: str
   readonly networkId: string; readonly proxyId: string }
 export class VendorNetworkCreationCleanupError extends AggregateError {
   readonly startupError: unknown;
-  readonly retryCleanup: () => void;
-  /** The network and proxy this creation may have left behind. */
-  readonly resources: readonly UnreleasedResource[];
+  /** Retry the cleanup within `budgetMs` (default 30 s). */
+  readonly retryCleanup: (budgetMs?: number) => void;
+  readonly #resources: () => readonly UnreleasedResource[];
 
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void,
-    resources: readonly UnreleasedResource[] = []) {
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: (budgetMs?: number) => void,
+    resources: () => readonly UnreleasedResource[] = () => []) {
     super([startupError, cleanupError], 'Vendor network creation and cleanup failed.');
     this.startupError = startupError;
     this.retryCleanup = retryCleanup;
-    this.resources = Object.freeze([...resources]);
+    this.#resources = resources;
   }
+  /** The network and proxy this creation may still have left behind, as of now. */
+  get resources(): readonly UnreleasedResource[] { return this.#resources(); }
 }
 // IDs are absent only for a create whose client was killed before it returned one.
 const networkResources = (name: string, proxyContainer: string, allocationId: string, networkId?: string,
@@ -42,12 +44,15 @@ const networkResources = (name: string, proxyContainer: string, allocationId: st
   ]);
 };
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
+// Parts of a network whose removal is already confirmed, while the other part is still being retried.
+const removedParts = new WeakMap<VendorNetwork, Set<UnreleasedResource['kind']>>();
 /** The daemon objects a vendor network still owns, for reporting when their removal is not confirmed. */
 export function vendorNetworkResources(network: VendorNetwork): readonly UnreleasedResource[] {
   const identity = identities.get(network);
   if (!identity) return Object.freeze([]);
-  return networkResources(network.name, network.proxyContainer, identity.allocationId, identity.networkId,
-    identity.proxyId);
+  const removed = removedParts.get(network);
+  return Object.freeze(networkResources(network.name, network.proxyContainer, identity.allocationId,
+    identity.networkId, identity.proxyId).filter(resource => !removed?.has(resource.kind)));
 }
 const removedNetworks = new WeakSet<VendorNetwork>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
@@ -200,6 +205,8 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   };
   // The first cleanup shares the caller's overall deadline; a later retry gets its own budget. Killed
   // creates get a settle window, bounded by whatever that budget has left.
+  // Objects whose removal (or absence) cleanup has confirmed.
+  let proxyGone = false, networkGone = false;
   const cleanupPlannedResources = (budget: () => number = deadline(30_000)) => {
     let budgetLeft = 0;
     try { budgetLeft = budget(); } catch { /* the budget is spent */ }
@@ -208,12 +215,16 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     const failures: unknown[] = [];
     // Target the created IDs; names only for a create whose ID never came back, which alone gets a settle window.
     const proxyTarget = proxyId ?? proxyContainer, networkTarget = networkId ?? name;
-    if (proxyPlanned) try { remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
-      budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer)); }
-    catch (cleanupError) { failures.push(cleanupError); }
-    if (networkPlanned) try { remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
-      budget, 'vendor network', allocationId, networkId ? 0 : settleBy(name)); }
-    catch (cleanupError) { failures.push(cleanupError); }
+    if (proxyPlanned && !proxyGone) try {
+      remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
+        budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer));
+      proxyGone = true;
+    } catch (cleanupError) { failures.push(cleanupError); }
+    if (networkPlanned && !networkGone) try {
+      remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
+        budget, 'vendor network', allocationId, networkId ? 0 : settleBy(name));
+      networkGone = true;
+    } catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   };
   try {
@@ -246,9 +257,14 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   } catch (error) {
     try { cleanupPlannedResources(overall); }
     catch (cleanupError) {
-      throw new VendorNetworkCreationCleanupError(error, cleanupError, () => cleanupPlannedResources(),
-        networkResources(name, proxyContainer, allocationId, networkId, proxyId)
-          .filter(resource => resource.kind === 'network' ? networkPlanned : proxyPlanned));
+      // An object may exist only if its create returned an ID or its client was killed before the daemon answered.
+      const mayExist = (kind: UnreleasedResource['kind']) => kind === 'network'
+        ? networkPlanned && !networkGone && (networkId !== undefined || unsettled.has(name))
+        : proxyPlanned && !proxyGone && (proxyId !== undefined || unsettled.has(proxyContainer));
+      throw new VendorNetworkCreationCleanupError(error, cleanupError,
+        (budgetMs = 30_000) => cleanupPlannedResources(deadline(budgetMs)),
+        () => networkResources(name, proxyContainer, allocationId, networkId, proxyId)
+          .filter(resource => mayExist(resource.kind)));
     }
     throw error;
   }
@@ -264,10 +280,18 @@ export function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30_000):
   const allocationId = identity.allocationId;
   const remaining = deadline(timeoutMs), failures: unknown[] = [];
   // Remove by the captured IDs; a same-named replacement is not ours to delete and keeps the network busy.
-  try { remove(['rm', '--force', identity.proxyId], ['container', 'inspect', identity.proxyId],
-    remaining, 'vendor proxy', allocationId); } catch (error) { failures.push(error); }
-  try { remove(['network', 'rm', identity.networkId], ['network', 'inspect', identity.networkId],
-    remaining, 'vendor network', allocationId); } catch (error) { failures.push(error); }
+  const removed = removedParts.get(network) ?? new Set<UnreleasedResource['kind']>();
+  removedParts.set(network, removed);
+  if (!removed.has('container')) try {
+    remove(['rm', '--force', identity.proxyId], ['container', 'inspect', identity.proxyId],
+      remaining, 'vendor proxy', allocationId);
+    removed.add('container');
+  } catch (error) { failures.push(error); }
+  if (!removed.has('network')) try {
+    remove(['network', 'rm', identity.networkId], ['network', 'inspect', identity.networkId],
+      remaining, 'vendor network', allocationId);
+    removed.add('network');
+  } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   identities.delete(network);
   removedNetworks.add(network);

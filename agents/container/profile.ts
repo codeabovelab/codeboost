@@ -41,17 +41,19 @@ export interface ProfileOptions {
 
 export class ProfileCreationCleanupError extends AggregateError {
   readonly startupError: unknown;
-  readonly retryCleanup: () => void;
-  /** The staging directories and network this creation may have left behind. */
-  readonly resources: readonly UnreleasedResource[];
+  /** Retry the cleanup; `budgetMs` (default 30 s) bounds the network removal. */
+  readonly retryCleanup: (budgetMs?: number) => void;
+  readonly #resources: () => readonly UnreleasedResource[];
 
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void,
-    resources: readonly UnreleasedResource[] = []) {
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: (budgetMs?: number) => void,
+    resources: () => readonly UnreleasedResource[] = () => []) {
     super([startupError, cleanupError], 'Profile creation and cleanup both failed.');
     this.startupError = startupError;
     this.retryCleanup = retryCleanup;
-    this.resources = Object.freeze([...resources]);
+    this.#resources = resources;
   }
+  /** The staging directories and network this creation may still have left behind, as of now. */
+  get resources(): readonly UnreleasedResource[] { return this.#resources(); }
 }
 
 interface FileIdentity {
@@ -293,16 +295,16 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
-    const cleanupProfileResources = () => {
+    const cleanupProfileResources = (budgetMs = 30_000) => {
       const failures: unknown[] = [];
       try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
-      try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
+      try { removeVendorNetwork(options.network, budgetMs); } catch (cleanupError) { failures.push(cleanupError); }
       if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
     };
     try { cleanupProfileResources(); }
     catch (cleanupError) {
-      throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources, [
-        ...vendorNetworkResources(options.network), ...directoryResources(cleanupDirectories)]);
+      throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources, () => Object.freeze([
+        ...vendorNetworkResources(options.network), ...directoryResources(cleanupDirectories)]));
     }
     throw error;
   }
