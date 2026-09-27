@@ -646,3 +646,31 @@ it('leaves an unstamped lookalike Ask folder in place', async () => {
     expect(readFileSync(join(root, 'someone-elses-file'), 'utf8')).toBe('keep me');
   } finally { await worker.close(); rmSync(root, { recursive: true, force: true }); }
 });
+
+it('treats a record path that is a link as unreadable, and never acts on the record it points to', async () => {
+  const path = ledgerPath();
+  const other = ledgerPath();
+  const othersRoot = createAskRoot(new LeftoverLedger(other, docker(new Set())).lockPath);
+  new LeftoverLedger(other, docker(new Set())).record([], 0, [othersRoot]);
+  symlinkSync(other, path);
+  try {
+    await expect(new LeftoverLedger(path, docker(new Set())).assertClear()).rejects.toThrow('unreadable');
+    expect(existsSync(othersRoot)).toBe(true);
+  } finally { rmSync(othersRoot, { recursive: true, force: true }); }
+});
+
+it('leaves a folder alone when its owner stamp is a link', async () => {
+  const gone = new LeftoverLedger(ledgerPath(), docker(new Set()));
+  gone.acquire(); gone.release();
+  const root = createAskRoot(gone.lockPath);
+  // The stamp is replaced by a link to a file that names a free lock, which would otherwise authorize deletion.
+  const decoy = join(dirname(ledgerPath()), 'stamp');
+  writeFileSync(decoy, `${gone.lockPath}\n`);
+  rmSync(join(root, '.owner'));
+  symlinkSync(decoy, join(root, '.owner'));
+  const worker = stubWorker(new LeftoverLedger(ledgerPath(), docker(new Set())));
+  try {
+    expect(await worker.agent('claude')('answer', new AbortController().signal, scope(42), 60_000)).toBe('claude:answer:n');
+    expect(existsSync(root)).toBe(true);
+  } finally { await worker.close(); rmSync(root, { recursive: true, force: true }); }
+});

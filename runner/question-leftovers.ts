@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, constants, existsSync, fstatSync, lstatSync, mkdirSync, mkdtempSync, openSync, readSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
@@ -78,6 +78,27 @@ export const dockerTaskStorage: ListTaskStorage = async signal => {
   return { containers: new Set(containers.flat()), volumes: new Set(volumes), networks: new Set(networks) };
 };
 const OWNER_FILE = '.owner';
+// Well above any valid record (100 allocations, 100 roots) or stamp.
+const MAX_READ_BYTES = 1024 * 1024;
+/**
+ * Read a file without following a link: opened with O_NOFOLLOW and accepted only as a regular, single-link file within
+ * the size limit. Returns undefined when the file does not exist; throws for a link or any other shape.
+ */
+function readNoFollow(path: string): string | undefined {
+  let fd: number;
+  try { fd = openSync(path, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0)); }
+  catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return undefined; throw error; }
+  try {
+    const stat = fstatSync(fd);
+    if (!stat.isFile() || stat.nlink !== 1 || stat.size > MAX_READ_BYTES) throw new Error(`${path} is not a plain file.`);
+    // Platforms without O_NOFOLLOW: refuse if the name is a link now.
+    if (!constants.O_NOFOLLOW && lstatSync(path).isSymbolicLink()) throw new Error(`${path} is a link.`);
+    const buffer = Buffer.alloc(stat.size);
+    let offset = 0;
+    while (offset < buffer.length) { const read = readSync(fd, buffer, offset, buffer.length - offset, offset); if (!read) break; offset += read; }
+    return buffer.subarray(0, offset).toString('utf8');
+  } finally { closeSync(fd); }
+}
 /** A codeboost Ask lock: a direct child of the temp directory with the lock name, so a stamp cannot aim elsewhere. */
 export const isAskLock = (path: unknown): path is string => typeof path === 'string' && path.length <= 4096
   && isAbsolute(path) && dirname(path) === lockDirectoryPath() && /^codeboost-asklock-[0-9a-f]+(?:-[0-9]+)?\.sqlite$/.test(basename(path));
@@ -202,7 +223,7 @@ export class LeftoverLedger {
       const stat = lstatSync(root, { throwIfNoEntry: false });
       if (!stat || !stat.isDirectory() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
       let owner = '';
-      try { owner = readFileSync(join(root, OWNER_FILE), 'utf8').trim(); } catch { continue; }
+      try { owner = readNoFollow(join(root, OWNER_FILE))?.trim() ?? ''; } catch { continue; }
       if (!isAskLock(owner)) continue;
       if (owner !== this.lockPath && existsSync(owner) && lockIsHeld(owner)) continue;
       // Our own lock is held by us, so our earlier-session roots (not the live one, which is skipped) are reclaimed.
@@ -228,8 +249,13 @@ export class LeftoverLedger {
   }
 
   #read(): LedgerRecord {
-    if (!existsSync(this.path)) return { leftovers: [], untracked: 0, roots: [] };
-    try { return parse(readFileSync(this.path, 'utf8')); }
+    let text: string | undefined;
+    try {
+      // A planted link here could make this review act on another review's record: never follow one.
+      text = readNoFollow(this.path);
+      if (text === undefined) return { leftovers: [], untracked: 0, roots: [] };
+      return parse(text);
+    }
     catch { throw new Error(`Ask is off: the record of leftover agent storage (${this.path}) is unreadable. Check \`docker ps -a\` and \`docker volume ls\` for codeboost resources, remove them, then delete that file.`); }
   }
 
