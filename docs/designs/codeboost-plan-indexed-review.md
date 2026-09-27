@@ -539,7 +539,7 @@ If codeboost is stopped or crashes during a rebase, it always cancels the rebase
 Added by the engineering review (L1 to L4). The agent tools cannot be retrained, so codeboost learns by adding approved lessons to its prompts.
 
 **How a lesson is made (L1).**
-1. A task closes: it is merged, cancelled, or rejected.
+1. A task closes: it is merged, or you cancel it. "Reject with feedback" does not close a task: it creates the next plan revision and puts the task back in the queue (step 8). Each reject round's feedback stays with the task and is included when the task finally closes.
 2. An agent reads your feedback on that task: rejection notes, change requests, and your accept, assign, and "accepted finding" choices. It never reads issue text or comments from other people.
 3. It writes short lessons, such as "In this repo, every retry change needs a test for the 5xx path." Each lesson links to the feedback it came from.
 
@@ -643,8 +643,8 @@ Report the declared-file catch rate for both methods, with no pass bar. It shows
 
 ## How people will install it
 
-- **One command.** Run `npx codeboost` inside a repo. It starts the local server and opens the app in your browser.
-- **Requirements.** Node 26.7.0 or later: CI proves this version runs `node:sqlite` with no warning, and codeboost refuses older versions with an upgrade message. codeboost checks for `git`, a signed-in `gh`, a running Docker or Podman, and at least one of `claude` or `codex` with its sign-in (a `claude setup-token` token, or Codex's `auth.json`). It tells you what is missing.
+- **One command (planned).** Run `npx codeboost` inside a repo. It starts the local server and opens the app in your browser. The package is not published yet; today you run `npm start -- --config …` or `npm run demo` from a checkout.
+- **Requirements.** Node 26.7.0 or later: CI proves this version runs `node:sqlite` with no warning, and codeboost refuses older versions with an upgrade message. **Planned, not yet implemented:** codeboost will check for `git`, a signed-in `gh`, a running Docker or Podman, and at least one of `claude` or `codex` with its sign-in (a `claude setup-token` token, or Codex's `auth.json`), and tell you what is missing. **Today** the CLI (`web/cli.ts`) checks only the Node version before it starts; a missing tool shows up later as an error from the feature that needs it.
 - **No compiler needed.** It has no native modules. It uses Node's built-in `node:sqlite`.
 - **Releases.** GitHub Actions runs all tests on every PR. When we tag a version, it publishes to npm and creates a GitHub release.
 - **Later, maybe:** a Homebrew formula.
