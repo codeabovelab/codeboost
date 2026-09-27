@@ -156,7 +156,13 @@ export class MergeCoordinator {
     // A refused or removed merge replays as the failure the first response reported, never as a submission.
     if (saved.response.state === 'failed' || saved.response.state === 'removed')
       return Promise.reject(new Error(saved.response.reason ?? 'GitHub did not merge this pull request.'));
-    return this.displayStatus(this.service.load()).then(status => ({ status, result: { url: saved.response.url ?? '' } }));
+    // The saved outcome is committed; a failing local refresh must not turn it into a blocked merge.
+    const result = { url: saved.response.url ?? '' };
+    const unavailable = (error: unknown): MergeUnavailableStatus => ({ available: true, ready: false, action: null, remote: null, queue: null,
+      blockers: [{ code: 'refresh', message: `Merge was submitted. Refresh to confirm GitHub state. ${error instanceof Error ? error.message : ''}`.trim() }] });
+    let view: ReviewView;
+    try { view = this.service.load(); } catch (error) { return Promise.resolve({ status: unavailable(error), result }); }
+    return this.displayStatus(view).then(status => ({ status, result }), error => ({ status: unavailable(error), result }));
   }
 
   async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {

@@ -237,6 +237,20 @@ it('replays a refusal made before admission, even after the review becomes merge
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('returns a committed merge on replay even when the local review cannot be reloaded', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    vi.mocked(h.service.load).mockImplementation(() => { throw new Error('checkout unreadable'); });
+    const replay = await h.coordinator.merge(h.view().token, actionId);
+    expect(replay.result).toEqual({ url: 'https://github.example/pr/1' });
+    expect(replay.status).toMatchObject({ ready: false, blockers: [{ code: 'refresh' }] });
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));
