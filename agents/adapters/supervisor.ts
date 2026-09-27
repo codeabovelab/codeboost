@@ -252,16 +252,22 @@ export function launchInvocation(invocation: InvocationInput, budget: () => numb
       else abort.abort();
     } });
   const release = () => { if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId); };
+  const left = () => { try { return budget(); } catch { return 0; } };
+  // The invocation budget bounds the whole launch, not only setup: at expiry the in-flight Docker call is killed,
+  // or the handle setup handed off to is stopped, even if that handle was started with a longer budget.
+  const timer = setTimeout(() => {
+    cancelReason ??= 'timeout';
+    if (inner) inner.cancel('timeout');
+    else abort.abort();
+  }, Math.max(1, left()));
+  timer.unref();
+  void settled.then(() => clearTimeout(timer));
   const follow = (next: InvocationHandle) => {
     inner = next;
     if (cancelReason) next.cancel(cancelReason);
     void next.settled.then(resolveSettled);
     return next;
   };
-  const left = () => { try { return budget(); } catch { return 0; } };
-  // The invocation budget also bounds setup: at expiry the in-flight Docker call is killed.
-  const timer = setTimeout(() => { cancelReason ??= 'timeout'; if (!inner) abort.abort(); }, Math.max(1, left()));
-  timer.unref();
   const start: ProfileStarter = (profile, options) => {
     // Hand ownership of the attempt to the supervisor in the same turn, so no other start can slip in.
     release();
@@ -285,8 +291,6 @@ export function launchInvocation(invocation: InvocationInput, budget: () => numb
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context, exitCode: null,
         signal: null, stopReason: reason, stdout: '',
         stderr: diagnosticFor(reason, `Adapter setup failed: ${String(startupError)}`).toString('utf8') }));
-    } finally {
-      clearTimeout(timer);
     }
   })();
   return handle;

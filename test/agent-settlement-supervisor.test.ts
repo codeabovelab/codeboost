@@ -166,4 +166,19 @@ describe('startProfileInvocation bounded cleanup', () => {
     expect(state.spawned).toBe(0);
     expect(isInvocationActive('handoff-cancel')).toBe(false);
   });
+
+  it('stops the handed-off supervisor when the launch budget ends, even if it was given a longer one', async () => {
+    state.createHangs = true; state.disposeOk = true;
+    const profile = fakeProfile('handoff-deadline');
+    const invocation = (profile.policy as unknown as { invocation: never }).invocation;
+    const handle = launchInvocation(invocation, () => 3_000, async (_signal, start) =>
+      start(profile, { timeoutMs: 10 * 60_000 })); // no invocationBudget: the supervisor alone would wait 10 min
+    const box = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(2_000);
+    expect(state.createSignals[0]?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1_500);
+    expect(state.createSignals[0]?.aborted).toBe(true);
+    expect(box.result?.stopReason).toBe('timeout');
+    expect(isInvocationActive('handoff-deadline')).toBe(false);
+  });
 });
