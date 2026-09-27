@@ -300,6 +300,37 @@ it('leaves a deadline-stopped click unsaved and resendable with the same key', a
   } finally { await slow.close(); await h.coordinator.close(); h.store.close(); }
 });
 
+it('keeps an attempt aborted during the GitHub command in flight instead of reporting nothing applied', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async (_head, options) => new Promise<never>((_, reject) => options?.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true })));
+  const slow = new MergeCoordinator(h.service, h.client, 250);
+  try {
+    const error = await slow.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).not.toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/deadline/i);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'submitting' });
+  } finally { await slow.close(); await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a click refused while another merge was running, even after a retry would be allowed', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  let refuse!: () => void;
+  h.client.merge = vi.fn(async () => { await new Promise<void>(resolve => { refuse = resolve; }); throw new MergeSubmissionError('Required status check is expected.', 'refused'); });
+  const second = randomUUID();
+  try {
+    const first = h.coordinator.merge(h.view().token, randomUUID()).catch(error => error);
+    await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
+    await expect(h.coordinator.merge(h.view().token, second)).rejects.toThrow(/already running/);
+    refuse();
+    await first;
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed' });
+    await expect(h.coordinator.merge(h.view().token, second)).rejects.toThrow(/already running/);
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

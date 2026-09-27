@@ -149,7 +149,11 @@ export class MergeCoordinator {
     const replay = typeof token === 'string' && typeof actionId === 'string' ? this.#replay(token, actionId) : undefined;
     if (replay) return replay;
     if (this.#closing) throw new MergeNotApplied('Merge coordinator is shutting down.');
-    if (this.#active) throw new Error('A merge attempt is already running.');
+    if (this.#active) {
+      const refusal = new Error('A merge attempt is already running.');
+      if (typeof token === 'string' && typeof actionId === 'string') this.#recordRefusal({ actionId, kind: 'merge', request: { token } }, refusal);
+      throw refusal;
+    }
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(new Error('Merge request deadline exceeded.')), this.operationTimeoutMs);
@@ -162,6 +166,12 @@ export class MergeCoordinator {
     this.#active = attempt;
     this.#activeClick = typeof actionId === 'string' ? { actionId, token } : null;
     return attempt;
+  }
+
+  /** Save a definite refusal as this click's outcome, so a resend replays it instead of being evaluated again. */
+  #recordRefusal(action: { actionId: string; kind: string; request: unknown } | null, refusal: unknown): void {
+    if (!action || !this.service.store || !this.service.config) return;
+    try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); } catch {}
   }
 
   /** The saved outcome of this click, if it has one. Validation never runs again for a replay. */
@@ -244,11 +254,11 @@ export class MergeCoordinator {
       } catch {}
       // A definite refusal before admission is this click's outcome; a resend replays it. Aborts, the deadline and
       // shutdown applied nothing for a passing reason, so the same click may be sent again.
-      if (action && !queueAttempt && !signal.aborted && this.service.store && this.service.config) {
-        const refusal = error;
-        try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); } catch {}
-      }
-      if (signal.aborted) throw new MergeNotApplied(signal.reason instanceof Error ? signal.reason.message : 'Merge request stopped.', { cause: signal.reason });
+      if (!queueAttempt && !signal.aborted) this.#recordRefusal(action, error);
+      // Before admission an abort applied nothing, so the click may be resent (503). After admission the GitHub outcome
+      // is unknown: the durable attempt stays in flight and reconciles on refresh, so report the original error.
+      if (signal.aborted && !queueAttempt) throw new MergeNotApplied(signal.reason instanceof Error ? signal.reason.message : 'Merge request stopped.', { cause: signal.reason });
+      if (signal.aborted && signal.reason instanceof Error) throw signal.reason;
       throw error;
     }
   }
