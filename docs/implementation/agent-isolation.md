@@ -133,8 +133,9 @@ Ask keeps the contract's identity and cleanup rules:
   of the real temp directory with that exact name.
 - Each Ask root carries an `.owner` stamp naming its lock, written before the folder appears under its Ask name. The
   first check of a process also looks for `codeboost-ask-*` folders the record does not list, for example after the
-  database was renamed and its record stayed behind. It deletes those whose owner lock is free and leaves those whose
-  owner is still running.
+  database was renamed and its record stayed behind. It deletes only folders this user owns whose stamp names a lock
+  in the private lock directory and whose owner lock is free. It leaves folders whose owner is still running, and
+  folders with a missing, malformed or foreign stamp, because Ask did not provably create those.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any container, volume or network labelled `io.codeboost.allocation`,
