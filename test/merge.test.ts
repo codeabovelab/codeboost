@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
-import { MergeCoordinator, MergeNotApplied } from '../runner/merge.ts';
+import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
 import { Store, mergeActionResponse } from '../runner/store.ts';
 
@@ -383,6 +383,25 @@ it('reports a refusal it could not save as resendable, not as a definite 409', a
     h.store.userAction = userAction;
     expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })).toBeUndefined();
     expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps the key-bearing attempt in flight after an unknown outcome, then replays the reconciled URL', async () => {
+  const h = queueHarness([]);
+  let merged = false;
+  h.client.inspect = vi.fn(async () => merged
+    ? { ...remote(h.view()), pullRequestState: 'MERGED' as const, url: 'https://github.example/pr/7' }
+    : remote(h.view()));
+  h.client.merge = vi.fn(async () => { merged = true; throw new MergeSubmissionError('Direct merge response was lost.', 'unknown'); });
+  const actionId = randomUUID();
+  try {
+    const error = await h.coordinator.merge(h.view().token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'submitting', actionId });
+    await h.coordinator.status(h.view());
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'merged', url: 'https://github.example/pr/7' });
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/7' } });
+    expect(h.client.merge).toHaveBeenCalledOnce();
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 

@@ -19,6 +19,8 @@ export interface RemoteMergeState {
   mergeQueue: boolean;
   requiredChecks: RequiredCheck[];
   alreadyFixed: 'clear' | 'found' | 'unknown';
+  /** The pull request's web URL, when GitHub reports a valid one. Display only; never used to decide readiness. */
+  url?: string;
 }
 
 export interface MergeResult { url: string; }
@@ -139,7 +141,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   }
 
   async #inspectNow(signal?: AbortSignal): Promise<RemoteMergeState> {
-    const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup'], signal) as Record<string, unknown>;
+    const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url'], signal) as Record<string, unknown>;
     if (typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || !['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !['MERGEABLE','CONFLICTING','UNKNOWN'].includes(String(pr.mergeable)) || !Array.isArray(pr.statusCheckRollup))
       throw new Error('GitHub returned an incomplete pull request state.');
     const branch = encodeURIComponent(pr.baseRefName);
@@ -233,6 +235,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       base: fullSha(pr.baseRefOid, 'base SHA'), head: fullSha(pr.headRefOid, 'head SHA'),
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
       rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks, alreadyFixed: await this.#alreadyFixed(signal),
+      ...(typeof pr.url === 'string' && pr.url.length <= 2048 && /^https:\/\//.test(pr.url) ? { url: pr.url } : {}),
     };
   }
 

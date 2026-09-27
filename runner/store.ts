@@ -147,6 +147,8 @@ export class Store {
     if (identityKey(context.identity) !== key || context.issue !== this.#current(key).issue) throw new Error('Plan context identity/issue mismatch.');
   }
   #savePlan(key: string, plan: Plan, expected: number): void {
+    // A plan edit must not land while GitHub may still merge the head reviewed against the current revision.
+    if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
     if (this.#run('UPDATE plans SET revision=? WHERE key=? AND revision=?', plan.revision, key, expected).changes !== 1) throw new Error('Stale plan revision.');
     this.#run('INSERT INTO revisions VALUES (?,?,?)', key, plan.revision, encode(plan));
     this.#bumpContext(key);
@@ -312,7 +314,10 @@ export class Store {
         occurredAt: outcome.occurredAt ?? null, requiresFreshReview: outcome.requiresFreshReview === true,
         ...(outcome.url !== undefined ? { url: outcome.url } : {}),
       }));
-      if (changed && outcome.state === 'merged') this.#closeTask(identityKey(identity), 'merged', id);
+      if (changed && outcome.state === 'merged') {
+        const merged = this.getMergeAttempt(identity)!;
+        this.#closeTask(identityKey(identity), 'merged', id, { revision: merged.revision, snapshotId: merged.snapshotId });
+      }
       return changed;
     });
   }
@@ -576,8 +581,10 @@ export class Store {
     };
   }
   #closed(status: unknown): boolean { return CLOSED_STATUSES.includes(status as TaskStatus); }
-  #closeTask(key: string, status: 'merged' | 'cancelled', actionId: string): void {
-    const plan = this.#current(key);
+  #closeTask(key: string, status: 'merged' | 'cancelled', actionId: string, context?: { revision: number; snapshotId: string }): void {
+    // A merge closes the task in the context it merged, even if HEAD was observed to move during the merge.
+    const current = this.#current(key);
+    const plan = context ? { ...current, revision: context.revision, snapshot_id: context.snapshotId } : current;
     this.#run('UPDATE tasks SET status=?, cancel_requested=NULL WHERE plan_key=?', status, key);
     this.#run(`INSERT INTO feedback_events (id,plan_key,action_id,plan_revision,snapshot_id,item,kind,text,source_ref,supersedes,created_at)
       VALUES (?,?,?,?,?,NULL,'task-closed',NULL,?,NULL,?) ON CONFLICT(plan_key,kind,action_id) DO NOTHING`,

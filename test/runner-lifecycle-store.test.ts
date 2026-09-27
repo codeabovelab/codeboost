@@ -253,6 +253,18 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses plan edits during a merge and closes the task in the context it merged', () => {
+    const { store } = fixture();
+    const reviewed = store.getSnapshot(identity).id;
+    const state = { revision: 1, snapshotId: reviewed, reviewVersion: store.reviewVersion(identity) };
+    const merge = store.beginMergeAttempt(identity, state, oid(2), null, 'direct');
+    expect(() => store.importRevision(JSON.stringify(plan('Late edit')), 'json', context, 1)).toThrow(/merge is in progress/);
+    // HEAD observation still works during the merge; the merge stays pinned to the reviewed head.
+    store.recordHistory(identity, { revision: 1, snapshotId: reviewed }, oid(1), oid(4), []);
+    expect(store.getSnapshot(identity).id).not.toBe(reviewed);
+    store.finishMergeAttempt(identity, merge.id, { state: 'merged' });
+    expect(store.feedbackEvents(identity)).toMatchObject([{ kind: 'task-closed', planRevision: 1, snapshotId: reviewed }]);
+  });
   it('refuses reassignment while a merge is in flight and counts merge changes in the state version', () => {
     const { store } = fixture();
     const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };

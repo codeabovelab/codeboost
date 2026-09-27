@@ -49,7 +49,7 @@ async function api(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const value = await response.json();
-  if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status });
+  if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status, outcomeUnknown: value.outcomeUnknown === true });
   return value;
 }
 function rememberDraft() {
@@ -482,9 +482,9 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
-    // Only a parsed server answer with a definite status resolves this click. No response, an unreadable body, or
-    // 503 (nothing applied) keeps the key, so the next click resends the same action.
-    if (typeof error.status === "number" && error.status !== 503) mergeActionId = null;
+    // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
+    // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.
+    if (typeof error.status === "number" && error.status !== 503 && !error.outcomeUnknown) mergeActionId = null;
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
