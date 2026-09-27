@@ -6,6 +6,8 @@ import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type M
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
+/** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
+export class MergeNotApplied extends Error {}
 export interface MergeQueueStatus {
   kind: MergeAttempt['kind']; state: MergeAttempt['state']; reviewedHead: string; url: string | null; reason: string | null;
   phase: MergeAttempt['phase']; position: number | null; occurredAt: string | null; retryable: boolean;
@@ -146,7 +148,7 @@ export class MergeCoordinator {
     // Otherwise replay before every other guard, shutdown included: a resend after a lost response is not a second click.
     const replay = typeof token === 'string' && typeof actionId === 'string' ? this.#replay(token, actionId) : undefined;
     if (replay) return replay;
-    if (this.#closing) throw new Error('Merge coordinator is shutting down.');
+    if (this.#closing) throw new MergeNotApplied('Merge coordinator is shutting down.');
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();
@@ -246,7 +248,7 @@ export class MergeCoordinator {
         const refusal = error;
         try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); } catch {}
       }
-      if (signal.aborted && signal.reason instanceof Error) throw signal.reason;
+      if (signal.aborted) throw new MergeNotApplied(signal.reason instanceof Error ? signal.reason.message : 'Merge request stopped.', { cause: signal.reason });
       throw error;
     }
   }

@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
-import { MergeCoordinator } from '../runner/merge.ts';
+import { MergeCoordinator, MergeNotApplied } from '../runner/merge.ts';
 import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
 import { Store } from '../runner/store.ts';
 
@@ -281,6 +281,23 @@ it('reports a task that is not in review as a merge blocker, so Merge PR is not 
     expect(status.ready).toBe(false);
     expect(status.blockers).toContainEqual({ code: 'task', message: 'The task is needs human; merge it from review.' });
   } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('leaves a deadline-stopped click unsaved and resendable with the same key', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  const inspect = h.client.inspect;
+  h.client.inspect = vi.fn(async (options: Parameters<typeof inspect>[0]) => new Promise<never>((_, reject) => options?.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true })));
+  const slow = new MergeCoordinator(h.service, h.client, 250);
+  try {
+    const error = await slow.merge(h.view().token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/deadline/i);
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token: h.view().token } })).toBeUndefined();
+    h.client.inspect = vi.fn(async () => remote(h.view(), { mergeQueue: true }));
+    await expect(slow.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    expect(h.merges).toHaveLength(1);
+  } finally { await slow.close(); await h.coordinator.close(); h.store.close(); }
 });
 
 it('replays a refused merge as the same failure, not as a submission', async () => {

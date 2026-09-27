@@ -52,6 +52,16 @@ test('mints a new merge key for a retry once the attempt started by a retained k
  await page.getByRole('button',{name:'Retry merge',exact:true}).click();await expect.poll(()=>keys.length).toBe(2);
  expect(keys[1]).not.toBe(keys[0]);
 });
+test('answers 503 when the merge deadline stops a click, so the browser may resend its key',async()=>{
+ test.setTimeout(60_000);
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async options=>new Promise((_,reject)=>options?.signal?.addEventListener('abort',()=>reject(options.signal!.reason),{once:true})),merge:async()=>{throw new Error('The deadline stops the click before any merge.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const response=await fetch(new URL('/api/action',app.url),{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json'},body:JSON.stringify({action:'merge',token:view.token,actionId:randomUUID()})});
+ expect(response.status).toBe(503);expect((await response.json()).error).toMatch(/deadline/i);
+ expect(app.service.store.getMergeAttempt(app.service.config.identity)).toBeNull();
+});
 test('refuses a merge request without an idempotency key before doing any work',async()=>{
  const view=app.service.load(),post=(body:object)=>fetch(new URL('/api/action',app.url),{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json'},body:JSON.stringify(body)});
  for(const actionId of [undefined,'not-a-uuid']){const response=await post({action:'merge',token:view.token,actionId});expect(response.status).toBe(400);expect((await response.json()).error).toMatch(/actionId/);}
