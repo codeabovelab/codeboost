@@ -259,11 +259,26 @@ describe('user actions', () => {
     expect(store.getTask(identity).status).toBe('cancelled');
     expect(store.feedbackEvents(identity).filter(event => event.kind === 'task-closed')).toHaveLength(1);
   });
+  it('refuses a merge while an attempt runs or the task is not in review', () => {
+    const { store } = queued();
+    const state = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    expect(() => store.beginMergeAttempt(identity, state(), oid(2), null, 'direct')).toThrow(/queued; merge it from review/);
+    admit(store);
+    expect(() => store.beginMergeAttempt(identity, state(), oid(2), null, 'direct')).toThrow(/cannot be merged|merge it from review/);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+  it('refuses a feedback event whose action ID is not the enclosing user action', () => {
+    const { store } = fixture(); const actionId = randomUUID(), other = randomUUID();
+    expect(() => store.userAction(identity, { actionId, kind: 'assign', request: { item: 'P1' } },
+      () => store.recordFeedback(identity, other, { kind: 'segment-assign', item: 'P1', sourceRef: 'choice-1' }))).toThrow(/with its action ID/);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    expect(store.feedbackEvents(identity).map(event => event.kind)).toEqual(['task-closed']);
+  });
   it('refuses a merge whose expected task state version has moved on', () => {
     const { store } = fixture();
     const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
     const loaded = store.getTask(identity).stateVersion;
-    store.transitionTask(identity, loaded, 'queued');
+    store.transitionTask(identity, loaded, 'approved but merge blocked');
     expect(() => store.beginMergeAttempt(identity, state, oid(2), null, 'direct', null, loaded)).toThrow(/Stale task state/);
     expect(store.getMergeAttempt(identity)).toBeNull();
     expect(store.beginMergeAttempt(identity, state, oid(2), null, 'direct', null, store.getTask(identity).stateVersion).state).toBe('submitting');

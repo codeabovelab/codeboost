@@ -6,7 +6,7 @@ import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanConte
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import {
-  ATTEMPT_PHASES, CLOSED_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  ATTEMPT_PHASES, CLOSED_STATUSES, MERGEABLE_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
@@ -123,6 +123,8 @@ export class Store {
   #get(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).get(...args); }
   #run(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).run(...args); }
   #depth = 0;
+  /** The user action whose transaction is open, so its events can prove they belong to it. */
+  #action: { key: string; actionId: string } | null = null;
   /** Nested calls join the outer transaction, so a user action can wrap existing Store methods atomically. */
   #transaction<T>(fn: () => T): T {
     if (this.#depth > 0) { this.#depth++; try { return fn(); } finally { this.#depth--; } }
@@ -246,6 +248,8 @@ export class Store {
       const task = this.#task(key);
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be merged.');
+      if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
       if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
@@ -749,7 +753,10 @@ export class Store {
     try {
       return this.#transaction(() => {
         const prior = saved(); if (prior) { replaying = true; return prior; }
-        const value = apply();
+        const outer = this.#action;
+        this.#action = { key, actionId: action.actionId };
+        let value: T;
+        try { value = apply(); } finally { this.#action = outer; }
         record({ ok: true, value });
         return { response: value, replayed: false };
       });
@@ -765,7 +772,8 @@ export class Store {
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
   recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null }): FeedbackEvent {
     assertUuidV4(actionId, 'Action ID');
-    if (this.#depth === 0) throw new Error('Feedback events are written inside their user action.');
+    if (this.#depth === 0 || this.#action?.key !== identityKey(identity) || this.#action.actionId !== actionId)
+      throw new Error('Feedback events are written inside their user action, with its action ID.');
     if (!FEEDBACK_KINDS.includes(event.kind) || event.kind === ('task-closed' as FeedbackKind)) throw new GuardRefusal('Invalid feedback kind.');
     if (event.text != null && (typeof event.text !== 'string' || event.text.length > 4000)) throw new GuardRefusal('Feedback text is limited to 4000 characters.');
     if (typeof event.sourceRef !== 'string' || !event.sourceRef || event.sourceRef.length > 200) throw new GuardRefusal('Invalid feedback source.');

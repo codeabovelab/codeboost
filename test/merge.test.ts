@@ -180,7 +180,7 @@ it('aborts and awaits an active merge command during shutdown', async () => {
 
 it.each([
   ['cancelled', (h: ReturnType<typeof queueHarness>) => h.store.cancelTask(h.identity, h.store.getTask(h.identity).stateVersion, randomUUID()), /cancelled; it cannot be merged/],
-  ['changed', (h: ReturnType<typeof queueHarness>) => h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'queued'), /Stale task state/],
+  ['changed', (h: ReturnType<typeof queueHarness>) => h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'approved but merge blocked'), /Stale task state/],
 ] as const)('does not merge when the task is %s during merge validation', async (_label, change, message) => {
   const h = queueHarness([]);
   h.client.queueWatermark = vi.fn(async () => { change(h); return 'CURSOR_before'; });

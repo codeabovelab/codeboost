@@ -11,6 +11,8 @@ export type TaskStatus = 'queued' | 'running' | 'needs human' | 'needs amendment
 export const TASK_STATUSES: readonly TaskStatus[] = ['queued', 'running', 'needs human', 'needs amendment', 'needs approval',
   'possibly already fixed', 'in review', 'approved but merge blocked', 'merged', 'cancelled'];
 export const CLOSED_STATUSES: readonly TaskStatus[] = ['merged', 'cancelled'];
+/** A merge starts only from review; every other status is closed, running, queued or waiting for a person. */
+export const MERGEABLE_STATUSES: readonly TaskStatus[] = ['in review', 'approved but merge blocked'];
 export const TERMINAL_STATES: readonly AttemptState[] = ['completed', 'failed', 'cancelled', 'stale'];
 export const FIRST_REASONS: readonly FirstReason[] = ['cancelled', 'shutdown', 'stale', 'time-limit'];
 /** Each F attempt kind runs under exactly one existing D phase. */
