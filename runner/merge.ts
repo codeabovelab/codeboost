@@ -1,5 +1,6 @@
 import type { ReviewService } from './review.ts';
-import type { MergeAttempt } from './store.ts';
+import { mergeActionResponse, type MergeAttempt } from './store.ts';
+import { assertUuidV4 } from './lifecycle.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -22,7 +23,7 @@ function queueGateway(gateway: MergeGateway): gateway is QueueGateway {
 }
 
 export class MergeCoordinator {
-  #active: Promise<{ status: MergeStatus; result: MergeResult }> | null = null;
+  #active: Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | null = null;
   #abort: AbortController | null = null;
   #queuePoll: Promise<MergeQueueStatus | null> | null = null;
   #queueAbort: AbortController | null = null;
@@ -122,14 +123,19 @@ export class MergeCoordinator {
     }
   }
 
-  async merge(token: unknown): Promise<{ status: MergeStatus; result: MergeResult }> {
+  /**
+   * `actionId` is the click's idempotency key. A resend with the same key (after a lost response) returns the saved
+   * attempt's current outcome and never submits again.
+   */
+  async merge(token: unknown, actionId?: unknown): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
+    if (actionId !== undefined) assertUuidV4(actionId, 'Action ID');
     if (this.#closing) throw new Error('Merge coordinator is shutting down.');
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();
     const timer = setTimeout(() => abort.abort(new Error('Merge request deadline exceeded.')), this.operationTimeoutMs);
     this.#abort = abort;
-    const attempt = this.#merge(token, abort.signal).finally(() => {
+    const attempt = this.#merge(token, abort.signal, actionId as string | undefined).finally(() => {
       clearTimeout(timer);
       if (this.#active === attempt) this.#active = null;
       if (this.#abort === abort) this.#abort = null;
@@ -138,8 +144,14 @@ export class MergeCoordinator {
     return attempt;
   }
 
-  async #merge(token: string, signal: AbortSignal): Promise<{ status: MergeStatus; result: MergeResult }> {
+  async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     let queueAttempt: MergeAttempt | null = null;
+    const action = actionId ? { actionId, kind: 'merge', request: { token } } : null;
+    // Replay before any validation: the first click already decided the outcome.
+    if (action && this.service.store && this.service.config) {
+      const saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity, action);
+      if (saved) return { status: await this.displayStatus(this.service.load(), signal), result: { url: saved.response.url ?? '' } };
+    }
     try {
       // Captured when the request arrives and re-checked in the admission transaction after the final await.
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
@@ -166,8 +178,17 @@ export class MergeCoordinator {
       }
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
-      if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined)
-        queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion }, commandStatus.remote.head, queueWatermark, commandStatus.remote.mergeQueue ? 'queue' : 'direct', null, taskStateVersion);
+      if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
+        const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
+        const begin = () => store.beginMergeAttempt(config.identity, { ...view.expected, reviewVersion }, commandStatus.remote.head, queueWatermark,
+          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion);
+        let begun: MergeAttempt | null = null;
+        // The attempt and the click's saved response commit in one transaction, or neither does.
+        if (action) store.userAction(config.identity, action, () => mergeActionResponse(begun = begin()));
+        else begun = begin();
+        if (!begun) throw new Error('This merge click was already submitted. Refresh to see its outcome.');
+        queueAttempt = begun;
+      }
       const result = await this.gateway.merge(commandStatus.remote.head, { signal });
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not

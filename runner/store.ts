@@ -736,14 +736,7 @@ export class Store {
     assertUuidV4(action.actionId, 'Action ID');
     if (typeof action.kind !== 'string' || !/^[a-z][a-z-]{0,39}$/.test(action.kind)) throw new GuardRefusal('Invalid action kind.');
     const key = identityKey(identity), hash = requestHash(action.kind, action.request);
-    const saved = () => {
-      const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId);
-      if (!row) return undefined;
-      if (row.request_hash !== hash) throw new ActionIdReused('Action ID already used for a different request.');
-      const outcome = decode<{ ok: boolean; value?: T; error?: string }>(row.response);
-      if (!outcome.ok) throw new GuardRefusal(outcome.error!);
-      return { response: outcome.value as T, replayed: true };
-    };
+    const saved = () => this.savedAction<T>(identity, action);
     const record = (outcome: object) => {
       const response = encode(outcome);
       if (response.length > 65536) throw new Error('Action response is too large to record.');
@@ -768,6 +761,19 @@ export class Store {
       }
       throw error;
     }
+  }
+  /**
+   * The saved outcome of a user action, or undefined if it has none. Lets a caller replay before slow validation.
+   * Throws ActionIdReused for a different request under the same ID, and the saved refusal for a refused action.
+   */
+  savedAction<T>(identity: PlanIdentity, action: { actionId: string; kind: string; request: unknown }): { response: T; replayed: true } | undefined {
+    assertUuidV4(action.actionId, 'Action ID');
+    const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', identityKey(identity), action.actionId);
+    if (!row) return undefined;
+    if (row.request_hash !== requestHash(action.kind, action.request)) throw new ActionIdReused('Action ID already used for a different request.');
+    const outcome = decode<{ ok: boolean; value?: T; error?: string }>(row.response);
+    if (!outcome.ok) throw new GuardRefusal(outcome.error!);
+    return { response: outcome.value as T, replayed: true };
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
   recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null }): FeedbackEvent {

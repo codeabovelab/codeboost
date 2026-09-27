@@ -458,6 +458,8 @@ $("merge-details").onclick = () => {
     `<h2>${queue ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
   );
 };
+// Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
+let mergeActionId = null;
 $("merge").onclick = async () => {
   if (busy || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
   busy = true;
@@ -467,7 +469,9 @@ $("merge").onclick = async () => {
   $("merge").disabled = true;
   try {
     rememberDraft();
-    const updated = await api("/api/action", { action: "merge", token: data.token });
+    mergeActionId ??= crypto.randomUUID();
+    const updated = await api("/api/action", { action: "merge", token: data.token, actionId: mergeActionId });
+    mergeActionId = null;
     const queued = updated.mergeQueue?.state === "queued" || updated.mergeQueue?.state === "submitting";
     const blocker = { code: queued ? "queue-active" : "merge-submitted", message: queued ? "The reviewed head is queued. Waiting for GitHub to confirm the outcome." : "Merge was submitted. Refresh to confirm GitHub state." };
     data = updated.mergeRefreshRequired
@@ -476,6 +480,8 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
+    // fetch rejects with a TypeError when no response arrived; any other error is the server's definite answer.
+    if (!(error instanceof TypeError)) mergeActionId = null;
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;

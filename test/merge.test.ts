@@ -191,6 +191,22 @@ it.each([
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('replays a resent merge click after a lost response instead of submitting again', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    const attempt = h.store.getMergeAttempt(h.identity)!;
+    expect(attempt).toMatchObject({ state: 'queued', actionId });
+    const resent = await h.coordinator.merge(h.view().token, actionId);
+    expect(resent.result).toEqual({ url: 'https://github.example/pr/1' });
+    expect(h.merges).toHaveLength(1);
+    expect(h.store.getMergeAttempt(h.identity)!.id).toBe(attempt.id);
+    await expect(h.coordinator.merge('another-token', actionId)).rejects.toThrow(/already used/);
+    await expect(h.coordinator.merge(h.view().token, 'not-a-uuid')).rejects.toThrow(/UUID v4/);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('persists enqueue success as queued and waits for a separate confirmed merge', async () => {
   const h = queueHarness([
     { state: 'queued', reviewedHead: sha('b'), entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2, enqueuedAt: '2026-09-24T08:00:00Z', queueHead: sha('b') },

@@ -73,7 +73,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         }
         if(input.action==='merge') {
           if(!merges)throw new Error('Merging is not configured for this review.');
-          const merged=await merges.merge(input.token);
+          const merged=await merges.merge(input.token,input.actionId);
           try { const mergeQueue=merges.queueSnapshot();json(200,{...loadReview(),merge:{...merged.status,queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
           catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
