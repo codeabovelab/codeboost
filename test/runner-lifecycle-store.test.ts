@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it } from 'vitest';
-import { Store } from '../runner/store.ts';
+import { Store, mergeActionResponse } from '../runner/store.ts';
 import { ActionIdReused, GuardRefusal, classifySettlement, requestHash } from '../runner/lifecycle.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -249,6 +249,25 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('replays a lost merge click as the attempt\'s current outcome, not the saved "in progress"', () => {
+    const { store } = fixture();
+    const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
+    const actionId = randomUUID(), otherId = randomUUID();
+    store.userAction(identity, { actionId: otherId, kind: 'note', request: { text: 'unrelated' } }, () => 'kept');
+    let starts = 0;
+    const click = () => store.userAction(identity, { actionId, kind: 'merge', request: { head: oid(2) } },
+      () => { starts += 1; return mergeActionResponse(store.beginMergeAttempt(identity, state, oid(2), 'cursor', 'queue', actionId)); });
+    const first = click().response;
+    expect(first).toMatchObject({ state: 'submitting', reason: null, url: null });
+    store.queueMergeAttempt(identity, first.attemptId, 'https://github.com/o/r/pull/1');
+    expect(click()).toEqual({ replayed: true, response: { attemptId: first.attemptId, state: 'queued', reason: null, url: 'https://github.com/o/r/pull/1' } });
+    store.finishMergeAttempt(identity, first.attemptId, { state: 'merged' });
+    expect(click()).toEqual({ replayed: true, response: { attemptId: first.attemptId, state: 'merged', reason: null, url: 'https://github.com/o/r/pull/1' } });
+    expect(starts).toBe(1);
+    expect(store.userAction(identity, { actionId: otherId, kind: 'note', request: { text: 'unrelated' } }, () => 'changed'))
+      .toEqual({ response: 'kept', replayed: true });
+    expect(() => store.beginMergeAttempt(identity, state, oid(2), null, 'direct', 'not-a-uuid')).toThrow(/UUID v4/);
+  });
   it('replays the saved response without applying the action again', () => {
     const { store } = queued(); const actionId = randomUUID(); let applied = 0;
     const run = () => store.userAction(identity, { actionId, kind: 'note', request: { text: 'hi' } }, () => ++applied);

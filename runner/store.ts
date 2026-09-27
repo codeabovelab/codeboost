@@ -30,6 +30,12 @@ export interface MergeAttempt {
   url: string | null; reason: string | null; requiresFreshReview: boolean; entryId: string | null;
   phase: 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED' | null; position: number | null;
   occurredAt: string | null; createdAt: string; updatedAt: string;
+  /** The user action that started this attempt; its saved replay response follows the attempt. */
+  actionId?: string | null;
+}
+/** Saved replay response for the user action that started a merge; refreshed on every attempt change. */
+export function mergeActionResponse(attempt: MergeAttempt) {
+  return { attemptId: attempt.id, state: attempt.state, reason: attempt.reason, url: attempt.url };
 }
 export interface TaskRecord {
   planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
@@ -225,8 +231,9 @@ export class Store {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
-  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue'): MergeAttempt {
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null): MergeAttempt {
     sha(reviewedHead);
+    if (actionId !== null) assertUuidV4(actionId, 'Action ID');
     if (!['queue','direct'].includes(kind)) throw new Error('Invalid merge attempt kind.');
     if (queueWatermark !== null && (typeof queueWatermark !== 'string' || !queueWatermark || queueWatermark.length > 512)) throw new Error('Invalid merge-queue event cursor.');
     if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for merging.');
@@ -240,7 +247,7 @@ export class Store {
       const attempt: MergeAttempt = {
         id: randomUUID(), kind, state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
         reviewVersion: expected.reviewVersion, reviewedHead, queueWatermark, url: null, reason: null, requiresFreshReview: false,
-        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now,
+        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now, actionId,
       };
       this.#run('INSERT INTO merge_attempts VALUES (?,?,?)', attempt.id, key, encode(attempt));
       return attempt;
@@ -253,8 +260,12 @@ export class Store {
       if (!latest || latest.id !== id) return false;
       const attempt = decode<MergeAttempt>(latest.data);
       if (!allowed.includes(attempt.state)) return false;
-      const next = change(attempt);
-      return this.#run('UPDATE merge_attempts SET data=? WHERE id=? AND key=?', encode({ ...next, updatedAt: new Date().toISOString() }), id, key).changes === 1;
+      const next = { ...change(attempt), updatedAt: new Date().toISOString() };
+      if (this.#run('UPDATE merge_attempts SET data=? WHERE id=? AND key=?', encode(next), id, key).changes !== 1) return false;
+      // The same transaction refreshes the starting action's replay, so a resent merge click reports this outcome.
+      if (next.actionId) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND json_extract(response,'$.ok')=1`,
+        encode({ ok: true, value: mergeActionResponse(next) }), key, next.actionId);
+      return true;
     });
   }
   queueMergeAttempt(identity: PlanIdentity, id: string, url: string): boolean {
