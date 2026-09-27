@@ -229,6 +229,7 @@ export class MergeCoordinator {
         // The attempt and the click's saved response commit in one transaction, or neither does.
         if (action) store.userAction(config.identity, action, () => mergeActionResponse(begun = begin()));
         else begun = begin();
+        // Saved meanwhile by another coordinator on this database: the catch below replays its outcome.
         if (!begun) throw new Error('This merge click was already submitted. Refresh to see its outcome.');
         queueAttempt = begun;
       }
@@ -254,7 +255,12 @@ export class MergeCoordinator {
       } catch {}
       // A definite refusal before admission is this click's outcome; a resend replays it. Aborts, the deadline and
       // shutdown applied nothing for a passing reason, so the same click may be sent again.
-      if (!queueAttempt && !signal.aborted) this.#recordRefusal(action, error);
+      if (!queueAttempt && !signal.aborted && action) {
+        // If another coordinator saved this click meanwhile, its outcome is the answer, not this refusal.
+        const replay = this.#replay(token, action.actionId);
+        if (replay) return await replay;
+        this.#recordRefusal(action, error);
+      }
       // Before admission an abort applied nothing, so the click may be resent (503). After admission the GitHub outcome
       // is unknown: the durable attempt stays in flight and reconciles on refresh, so report the original error.
       if (signal.aborted && !queueAttempt) throw new MergeNotApplied(signal.reason instanceof Error ? signal.reason.message : 'Merge request stopped.', { cause: signal.reason });

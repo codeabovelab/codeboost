@@ -3,7 +3,7 @@ import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator, MergeNotApplied } from '../runner/merge.ts';
 import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
-import { Store } from '../runner/store.ts';
+import { Store, mergeActionResponse } from '../runner/store.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 const sha = (digit: string) => digit.repeat(40);
@@ -328,6 +328,45 @@ it('replays a click refused while another merge was running, even after a retry 
     expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed' });
     await expect(h.coordinator.merge(h.view().token, second)).rejects.toThrow(/already running/);
     expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('returns the saved outcome when another coordinator saves the same click during validation', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  h.client.queueWatermark = vi.fn(async () => {
+    // A second coordinator on the same database admits and saves this click first.
+    const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
+    h.store.userAction(h.identity, { actionId, kind: 'merge', request: { token } },
+      () => mergeActionResponse(h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_other', 'queue', actionId)));
+    return 'CURSOR_before';
+  });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('returns the saved outcome when another coordinator saves the click just before admission', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  const inspect = h.client.inspect;
+  let inspections = 0, armed = false, injected = false;
+  h.client.inspect = vi.fn(async (...args: Parameters<typeof inspect>) => { if (++inspections === 3) armed = true; return inspect(...args); });
+  vi.mocked(h.service.load).mockImplementation(() => {
+    const view = h.view();
+    if (armed) {
+      armed = false; injected = true;
+      const expected = { ...view.expected, reviewVersion: view.expected.reviewVersion! };
+      h.store.userAction(h.identity, { actionId, kind: 'merge', request: { token } },
+        () => mergeActionResponse(h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_other', 'queue', actionId)));
+    }
+    return view;
+  });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    expect(injected).toBe(true);
+    expect(h.merges).toEqual([]);
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
