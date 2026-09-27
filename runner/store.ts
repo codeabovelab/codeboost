@@ -296,8 +296,9 @@ export class Store {
     }));
   }
   finishMergeAttempt(identity: PlanIdentity, id: string, outcome: {
-    state: 'merged' | 'removed' | 'failed'; reason?: string; occurredAt?: string; requiresFreshReview?: boolean;
+    state: 'merged' | 'removed' | 'failed'; reason?: string; occurredAt?: string; requiresFreshReview?: boolean; url?: string;
   }): boolean {
+    if (outcome.url !== undefined && (typeof outcome.url !== 'string' || outcome.url.length > 2048 || !/^https:\/\//.test(outcome.url))) throw new Error('Invalid merge result URL.');
     if (!['merged','removed','failed'].includes(outcome.state)) throw new Error('Invalid merge-queue outcome.');
     if (outcome.state !== 'merged' && (typeof outcome.reason !== 'string' || !outcome.reason.trim() || outcome.reason.length > 4000)) throw new Error('A bounded terminal merge reason is required.');
     if (outcome.occurredAt !== undefined && (!Number.isFinite(Date.parse(outcome.occurredAt)) || outcome.occurredAt.length > 64)) throw new Error('Invalid merge-queue timestamp.');
@@ -306,6 +307,7 @@ export class Store {
       const changed = this.#changeMergeAttempt(identity, id, ['submitting','queued'], attempt => ({
         ...attempt, state: outcome.state, reason: outcome.state === 'merged' ? null : outcome.reason!.trim(),
         occurredAt: outcome.occurredAt ?? null, requiresFreshReview: outcome.requiresFreshReview === true,
+        ...(outcome.url !== undefined ? { url: outcome.url } : {}),
       }));
       if (changed && outcome.state === 'merged') this.#closeTask(identityKey(identity), 'merged', id);
       return changed;

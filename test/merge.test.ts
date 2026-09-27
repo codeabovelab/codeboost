@@ -207,6 +207,48 @@ it('replays a resent merge click after a lost response instead of submitting aga
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('replays a resend that arrives while the first merge command is still running', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  let release!: () => void;
+  h.client.merge = vi.fn(async head => { await new Promise<void>(resolve => { release = resolve; }); h.merges.push(head); return { url: 'https://github.example/pr/1' }; });
+  try {
+    const first = h.coordinator.merge(h.view().token, actionId);
+    await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    release();
+    await first;
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a refusal made before admission, even after the review becomes mergeable', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  const watermark = h.client.queueWatermark;
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).rejects.toThrow(/Review changed/);
+    h.client.queueWatermark = watermark;
+    h.changeToken(token);
+    await expect(h.coordinator.merge(token, actionId)).rejects.toThrow(/Review changed/);
+    expect(h.merges).toEqual([]);
+    expect(h.store.getMergeAttempt(h.identity)).toBeNull();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps a direct merge URL for a replayed click', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'merged', url: 'https://github.example/pr/1' });
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('persists enqueue success as queued and waits for a separate confirmed merge', async () => {
   const h = queueHarness([
     { state: 'queued', reviewedHead: sha('b'), entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2, enqueuedAt: '2026-09-24T08:00:00Z', queueHead: sha('b') },

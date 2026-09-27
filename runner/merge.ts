@@ -130,6 +130,9 @@ export class MergeCoordinator {
   async merge(token: unknown, actionId?: unknown): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     if (actionId !== undefined) assertUuidV4(actionId, 'Action ID');
     if (this.#closing) throw new Error('Merge coordinator is shutting down.');
+    // Replay before the active guard: a resend after a lost response must not look like a second click.
+    const replay = typeof token === 'string' && typeof actionId === 'string' ? this.#replay(token, actionId) : undefined;
+    if (replay) return replay;
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();
@@ -144,14 +147,17 @@ export class MergeCoordinator {
     return attempt;
   }
 
+  /** The saved outcome of this click, if it has one. Validation never runs again for a replay. */
+  #replay(token: string, actionId: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | undefined {
+    if (!this.service.store || !this.service.config) return undefined;
+    const saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity,
+      { actionId, kind: 'merge', request: { token } });
+    return saved && this.displayStatus(this.service.load()).then(status => ({ status, result: { url: saved.response.url ?? '' } }));
+  }
+
   async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     let queueAttempt: MergeAttempt | null = null;
     const action = actionId ? { actionId, kind: 'merge', request: { token } } : null;
-    // Replay before any validation: the first click already decided the outcome.
-    if (action && this.service.store && this.service.config) {
-      const saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity, action);
-      if (saved) return { status: await this.displayStatus(this.service.load(), signal), result: { url: saved.response.url ?? '' } };
-    }
     try {
       // Captured when the request arrives and re-checked in the admission transaction after the final await.
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
@@ -195,7 +201,7 @@ export class MergeCoordinator {
         // report that action as failed; the durable submitting record is recoverable by polling.
         try {
           if (queueAttempt.kind === 'queue') this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url);
-          else this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged' });
+          else this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged', url: result.url });
         } catch {}
       }
       return { status: commandStatus, result };
@@ -209,6 +215,12 @@ export class MergeCoordinator {
           });
         } else this.service.store.recordMergeAttemptDiagnostic(this.service.config.identity, queueAttempt.id, message);
       } catch {}
+      // A definite refusal before admission is this click's outcome; a resend replays it. Aborts, the deadline and
+      // shutdown applied nothing for a passing reason, so the same click may be sent again.
+      if (action && !queueAttempt && !signal.aborted && this.service.store && this.service.config) {
+        const refusal = error;
+        try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); } catch {}
+      }
       if (signal.aborted && signal.reason instanceof Error) throw signal.reason;
       throw error;
     }
