@@ -29,6 +29,8 @@ const mergePollMaximumDelay = 30000;
 const drafts = new Map();
 const attachments = new Map();
 let snippetSelection = null;
+// Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
+let mergeActionId = null;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -119,6 +121,8 @@ function renderMerge() {
   $("merge").hidden = !merge?.available;
   $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
   if (!merge?.available) return;
+  // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
+  if (mergeActionId && merge.queue?.actionId === mergeActionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeActionId = null;
   $("merge").disabled = !merge.ready;
   $("merge").textContent = merge.action === "retry"
     ? "Retry merge"
@@ -458,8 +462,6 @@ $("merge-details").onclick = () => {
     `<h2>${queue ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
   );
 };
-// Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
-let mergeActionId = null;
 $("merge").onclick = async () => {
   if (busy || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
   busy = true;

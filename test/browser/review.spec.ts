@@ -34,6 +34,24 @@ test('resends the same merge key after a 503 or a lost response, and a new key a
  for(let click=0;click<4;click++){await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>keys.length).toBe(click+1);await expect(page.locator('#banner')).toContainText('Merge blocked');}
  expect(keys[0]).toMatch(/^[0-9a-f-]{36}$/);expect(keys[1]).toBe(keys[0]);expect(keys[2]).toBe(keys[0]);expect(keys[3]).not.toBe(keys[2]);
 });
+test('mints a new merge key for a retry once the attempt started by a retained key has ended',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const keys:string[]=[];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}keys.push(body.actionId);
+  if(keys.length===1){await route.abort('failed');return;}
+  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Merge is blocked.'})});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>keys.length).toBe(1);await expect(page.locator('#banner')).toContainText('Merge blocked');
+ // The lost click did reach GitHub (its response was lost), and that attempt later ends as refused.
+ const expected={...view.expected,reviewVersion:view.expected.reviewVersion!};const attempt=app.service.store.beginMergeAttempt(config.identity,expected,view.snapshot.head,null,'direct',keys[0]);
+ app.service.store.finishMergeAttempt(config.identity,attempt.id,{state:'failed',reason:'Required status check is expected.'});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();await expect.poll(()=>keys.length).toBe(2);
+ expect(keys[1]).not.toBe(keys[0]);
+});
 test('refuses a merge request without an idempotency key before doing any work',async()=>{
  const view=app.service.load(),post=(body:object)=>fetch(new URL('/api/action',app.url),{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json'},body:JSON.stringify(body)});
  for(const actionId of [undefined,'not-a-uuid']){const response=await post({action:'merge',token:view.token,actionId});expect(response.status).toBe(400);expect((await response.json()).error).toMatch(/actionId/);}

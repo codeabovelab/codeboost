@@ -179,7 +179,7 @@ it('aborts and awaits an active merge command during shutdown', async () => {
 });
 
 it.each([
-  ['cancelled', (h: ReturnType<typeof queueHarness>) => h.store.cancelTask(h.identity, h.store.getTask(h.identity).stateVersion, randomUUID()), /cancelled; it cannot be merged/],
+  ['cancelled', (h: ReturnType<typeof queueHarness>) => h.store.cancelTask(h.identity, h.store.getTask(h.identity).stateVersion, randomUUID()), /task is cancelled/],
   ['changed', (h: ReturnType<typeof queueHarness>) => h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'approved but merge blocked'), /Stale task state/],
 ] as const)('does not merge when the task is %s during merge validation', async (_label, change, message) => {
   const h = queueHarness([]);
@@ -269,6 +269,17 @@ it('joins a resend that arrives while the first click is still validating, befor
     const [a, b] = await Promise.all([first, resend]);
     expect(b).toBe(a);
     expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('reports a task that is not in review as a merge blocker, so Merge PR is not ready', async () => {
+  const h = queueHarness([]);
+  try {
+    expect((await h.coordinator.status(h.view())).ready).toBe(true);
+    h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'needs human');
+    const status = await h.coordinator.status(h.view());
+    expect(status.ready).toBe(false);
+    expect(status.blockers).toContainEqual({ code: 'task', message: 'The task is needs human; merge it from review.' });
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 

@@ -1,6 +1,6 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
-import { ActionIdReused, assertUuidV4 } from './lifecycle.ts';
+import { ActionIdReused, MERGEABLE_STATUSES, assertUuidV4 } from './lifecycle.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -9,6 +9,8 @@ export interface MergeBlocker { code: string; message: string; }
 export interface MergeQueueStatus {
   kind: MergeAttempt['kind']; state: MergeAttempt['state']; reviewedHead: string; url: string | null; reason: string | null;
   phase: MergeAttempt['phase']; position: number | null; occurredAt: string | null; retryable: boolean;
+  /** The click that started this attempt, so the browser can tell when a retained key has been resolved. */
+  actionId: string | null;
   observationError?: string;
 }
 export interface MergeStatus {
@@ -54,7 +56,7 @@ export class MergeCoordinator {
     if (!attempt) return null;
     return {
       kind: attempt.kind, state: attempt.state, reviewedHead: attempt.reviewedHead, url: attempt.url, reason: attempt.reason,
-      phase: attempt.phase, position: attempt.position, occurredAt: attempt.occurredAt,
+      phase: attempt.phase, position: attempt.position, occurredAt: attempt.occurredAt, actionId: attempt.actionId ?? null,
       retryable: (attempt.state === 'removed' || attempt.state === 'failed') && !attempt.requiresFreshReview && this.#current(attempt),
       ...(observationError ? { observationError } : {}),
     };
@@ -82,6 +84,11 @@ export class MergeCoordinator {
     if (unplanned) blockers.push({ code: 'unplanned', message: `${unplanned} unplanned change${unplanned === 1 ? '' : 's'} remain.` });
     const changes = view.notes.filter(note => note.kind === 'change' && note.revision === view.plan.revision && note.snapshotId === view.snapshot.id).length;
     if (changes) blockers.push({ code: 'changes', message: `${changes} change request${changes === 1 ? '' : 's'} remain open.` });
+    // Readiness follows the same task-status gate as admission, so Merge PR never renders ready for runner work.
+    if (this.service.store && this.service.config) {
+      const task = this.service.store.getTask(this.service.config.identity);
+      if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
+    }
     const remote = await this.gateway.inspect({ fresh, timeoutMs: fresh ? 6_000 : undefined, signal });
     if (signal?.aborted) throw signal.reason;
     if (remote.pullRequestState !== 'OPEN') blockers.push({ code: 'pr-state', message: `Pull request is ${remote.pullRequestState.toLowerCase()}.` });
