@@ -597,7 +597,9 @@ export class Store {
       throw new GuardRefusal('Invalid assignment.');
     const key = identityKey(identity);
     this.#transaction(() => {
-      if (this.#task(key).state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      const task = this.#task(key);
+      if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal('A closed task never changes.');
       this.#run('UPDATE tasks SET assignment_id=?, referenced_code_hash=? WHERE plan_key=?', assignmentId, referencedCodeHash, key);
       this.#bumpContext(key);
     });

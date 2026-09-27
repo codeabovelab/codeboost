@@ -250,6 +250,13 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses to reassign work on a closed task', () => {
+    const { store } = fixture();
+    store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    const closed = store.getTask(identity);
+    expect(() => store.setAssignment(identity, closed.stateVersion, 'late', 'late-hash')).toThrow(/closed task never changes/);
+    expect(store.getTask(identity)).toMatchObject({ assignmentId: closed.assignmentId, referencedCodeHash: closed.referencedCodeHash, stateVersion: closed.stateVersion });
+  });
   it('keeps the budget handoff when the refused admission runs inside a user action', () => {
     const { store } = queued(); const start = Date.now(), actionId = randomUUID();
     const first = admit(store, { budgetMs: 1_000, now: start });
