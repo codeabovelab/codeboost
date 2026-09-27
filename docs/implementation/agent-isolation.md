@@ -10,7 +10,7 @@ The gate needs a running Docker daemon. Run the suites one file at a time, becau
 they share one image tag and one daemon:
 
 ```bash
-npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts
+npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts test/agent-question.test.ts
 ```
 
 The `Agent isolation` workflow runs the same command. The main `CI` workflow skips
@@ -85,6 +85,94 @@ The caller must do the following:
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
+
+## First consumer: Ask
+
+Ask (`runner/question-container.ts`) is the first production caller. It follows the four entry points above in the
+"questions" phase with no approved commands, clones the reviewed snapshot head, and writes a fixed answer schema as the
+only input file. Because every entry point above is synchronous, a worker thread (`runner/question-worker.ts`) owns the
+image, clones and allocations, so the review server keeps serving while Docker and Git run. The worker settles a
+question only after the invocation settles and its storage is removed.
+
+Ask keeps the contract's identity and cleanup rules:
+
+- The invocation's `attemptId` is the answer attempt that `Questions` saved, and `referencedCodeHash` is the note's
+  `contextId` (the hash of the code assigned to its plan item). An answer is accepted only when the result and the
+  worker reply carry that attempt and the captured context. The Store then compares the attempt before saving it.
+- The worker's environment is an allowlist: `PATH`, `DOCKER_HOST` and its Ask root as `TMPDIR`. Every setup
+  subprocess, including the image build, inherits only that, so no credential, home directory, Docker config or
+  agent socket reaches it. The credential lookup's own variables (`CLAUDE_CODE_OAUTH_TOKEN`,
+  `CODEBOOST_CODEX_AUTH_FILE`, `CODEX_HOME`, `HOME`) reach the worker as data and go only to the adapters. The
+  leftover Docker queries use the same `PATH`/`DOCKER_HOST` environment as lane D. Missing sign-in is reported
+  before any Docker work.
+- Lane D's clone is a full host copy with no byte limit of its own. Before cloning, Ask measures the checkout at the
+  reviewed head (`git ls-tree -r -t -l`) and the object store (`git count-objects -v`) and refuses a repository
+  that would not fit the question's 512 MiB and 131,072-entry allocation. A bounded, D-owned clone would replace
+  this check.
+- The stop reason (timeout, shutdown or cancellation) travels as a typed value (`StopError`) from `Questions`
+  through the worker message to `handle.cancel()`, separate from the message shown to the user.
+- Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
+- If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
+  question, and refuses Ask while any removal is unconfirmed.
+- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
+  anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
+  Ask stays off while any recorded container or volume still exists. The check is read-only label queries
+  (`docker ps`, `docker volume ls` and `docker network ls` for `io.codeboost.allocation`, `io.codeboost.invocation`
+  and `io.codeboost.egress`) with one 15-second limit, and the question can cancel it. The refusal shows
+  `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
+  they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
+  at shutdown keeps Ask off. Allocations beyond the record's cap of 100 count as unidentified, never dropped; Ask
+  roots are never dropped, and recording one past the cap is refused. Any labelled resource that is not part of a
+  still-listed allocation keeps the unidentified marker until none remain. Removal goes through D only once D has
+  recovery handles (#51 item 4).
+- Host copies are owned through one Ask root per worker, `<tmp>/codeboost-ask-XXXXXX`. The bridge creates it and
+  records it before the worker starts, and runs the worker with it as `TMPDIR`. So the reviewed clone, lane D's
+  input directory and its Codex auth copy all land inside it. The root is deleted, read-only directories included,
+  once the worker thread has stopped (clean shutdown, crash or abandon); if that fails, or the process is killed,
+  the next check deletes it. Ask stays off while an earlier root remains. The record accepts only direct children
+  of the real temp directory with that exact name.
+- Each Ask root carries an `.owner` stamp naming its lock, written before the folder appears under its Ask name. The
+  first check of a process also looks for `codeboost-ask-*` folders the record does not list, for example after the
+  database was renamed and its record stayed behind. It deletes only folders this user owns whose stamp names a lock
+  in the private lock directory and whose owner lock is free. It leaves folders whose owner is still running, and
+  folders with a missing, malformed or foreign stamp, because Ask did not provably create those.
+- If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
+  resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
+  restart, Ask stays off while any container, volume or network labelled `io.codeboost.allocation`,
+  `io.codeboost.invocation` or `io.codeboost.egress` exists. Caller-provided
+  allocation IDs (#51 item 3) would let Ask name these resources instead.
+- One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on a lock file keyed by
+  the database file's identity (device and inode), in a private directory (`<tmp>/codeboost-asklocks-<uid>`, mode
+  0700, checked to be owned by you). A lock path that is a symlink is refused, never followed. It is an OS file lock that the operating
+  system releases when its process ends, so every spelling and every later name of the database, including an
+  atomic rename while a server runs, finds the same lock. It is taken before the scan and kept until the worker
+  and any startup scan still in flight have finished. Only the holder scans, starts a worker or writes the
+  record. The record itself is kept next to the database's canonical path (`realpath`), so relative,
+absolute and symlinked spellings share them. A database with other hard links is refused. Separating different
+  reviews that share one Docker daemon needs runner identity labels (#51 item 3), and the general single-runner
+  lock is F1d (#59).
+- The first question of each process runs that scan even without a record, because a process killed before it
+  could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
+  process running Ask at the same moment also keeps this one off.
+- Lane D's settlement can retry cleanup without limit (#51 item 1). Abandonment happens once: a crash, a watchdog and shutdown all wait on
+  the same bounded termination. A question not settled 30 seconds after its
+  deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
+  records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
+  finishes first), then rejects the waiting questions, so shutdown cannot hang on D. A worker that does not answer
+  the final release request at shutdown goes through the same bounded path. If the thread is still busy
+  after that wait, its ownership is already durable (unknown leftovers and the recorded root) and no new question is
+  admitted; the root is deleted as soon as the thread stops. After any abandonment the review lock is kept until the
+  process exits: Docker CLI children the thread started can outlive it and cannot be awaited until lane D exposes
+  process groups (#51 item 5).
+- If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
+  replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
+  while any container, volume or network labelled `io.codeboost.allocation`,
+  `io.codeboost.invocation` or `io.codeboost.egress` exists. Reclaiming those leftovers after a crash or restart
+  needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.
+
+`test/agent-question.test.ts` runs this path
+against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
+`CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Limits of this gate
 

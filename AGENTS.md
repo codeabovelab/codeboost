@@ -24,6 +24,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Clear a submitted draft only if its current value and attachment still match what was submitted. Treat this as compare-and-swap behavior.
 - Preserve completed historical results, but visibly mark them stale when their snapshot, plan revision, assignment, or referenced code no longer matches.
 - When polling updates one part of the screen, update only that state. Preserve scroll position unless the user was already following the bottom.
+- While a request is in flight, do not disable the control that has keyboard focus; disabling it drops focus to the page. Mark it `aria-disabled`, ignore repeat activation with an in-flight guard, and test that focus stays on the control after the response.
 - When a row or control's visual selection determines the current content or input, expose the same state with the appropriate accessibility attribute, such as `aria-current` or `aria-selected`, and test it across navigation.
 
 ## Required race regressions
@@ -80,6 +81,13 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - If the external lifecycle mechanism or mode changes between validation passes, abort before the irreversible command. Create durable lifecycle ownership from the final stable mode, never from an earlier observation.
 - When an irreversible command has an ambiguous timeout, cancellation, transport, or unknown outcome, retain durable in-flight ownership and reconcile external state before enabling retry. Only a confirmed refusal may become retryable failure.
 - Correlate retry observations to the current attempt with an immutable external identity or event boundary, and fail closed when multiple post-boundary action sequences appear. Matching only the resource or commit identity can replay another attempt's terminal event.
+
+## Owned host and Docker resources
+
+- Treat the cleanup handle of an external resource (container, volume, network, temporary directory) as owned state. If removal fails, keep the handle, record it durably before its in-memory owner can be dropped (shutdown, crash, abandon, restart), and fail closed until removal is confirmed. Never delete the durable evidence before the final release report has been saved.
+- Give every subprocess an explicit allowlisted environment. Pass credentials only to the component that needs them, through a separate channel. Name-based scrubbing of an inherited environment is not isolation. Run Git with the repository's hardened invocation: no user or system config, no hooks, no lazy fetch, no network protocols.
+- Treat paths read from a durable record or discovered on disk as untrusted. Before deleting, opening or probing one, validate its exact location and name, not only its basename, and never follow a link to it. Keep files that other local users must not plant or swap, such as lock files, in a directory only the current user can write. Write durable records through a unique temporary file opened exclusively, and delete it if the write fails.
+- Exclude other processes with an OS-level lock held for the owner's lifetime, keyed by the resource's stable identity rather than a path spelling. A PID liveness check never authorizes taking over a lock. Run shared one-time startup work single-flight under that lock, and keep the lock until the work has finished.
 
 ## Blinded experiments
 
