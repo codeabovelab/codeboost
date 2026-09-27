@@ -405,6 +405,21 @@ it('keeps the key-bearing attempt in flight after an unknown outcome, then repla
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('answers resend when the saved merge outcome cannot be read', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    const savedAction = h.store.savedAction.bind(h.store);
+    h.store.savedAction = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+    const error = await h.coordinator.merge(h.view().token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    h.store.savedAction = savedAction;
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

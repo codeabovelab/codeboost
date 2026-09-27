@@ -186,8 +186,17 @@ export class MergeCoordinator {
   /** The saved outcome of this click, if it has one. Validation never runs again for a replay. */
   #replay(token: string, actionId: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | undefined {
     if (!this.service.store || !this.service.config) return undefined;
-    const saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity,
-      { actionId, kind: 'merge', request: { token } });
+    let saved: { response: ReturnType<typeof mergeActionResponse> } | undefined;
+    try {
+      saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity,
+        { actionId, kind: 'merge', request: { token } });
+    } catch (error) {
+      // A storage failure says nothing about this click: answer "resend" (503) so the browser keeps its key.
+      // A saved refusal or a reused key is a definite answer and passes through.
+      if ((error as { code?: string }).code === 'ERR_SQLITE_ERROR')
+        throw new MergeNotApplied('The saved merge outcome could not be read. Try again.', { cause: error });
+      throw error;
+    }
     if (!saved) return undefined;
     // A refused or removed merge replays as the failure the first response reported, never as a submission.
     if (saved.response.state === 'failed' || saved.response.state === 'removed')
