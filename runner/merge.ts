@@ -1,6 +1,6 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
-import { ActionIdReused, MERGEABLE_STATUSES, assertUuidV4 } from './lifecycle.ts';
+import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, assertUuidV4 } from './lifecycle.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -171,7 +171,13 @@ export class MergeCoordinator {
   /** Save a definite refusal as this click's outcome, so a resend replays it instead of being evaluated again. */
   #recordRefusal(action: { actionId: string; kind: string; request: unknown } | null, refusal: unknown): void {
     if (!action || !this.service.store || !this.service.config) return;
-    try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); } catch {}
+    try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); }
+    catch (error) {
+      // userAction re-raises the refusal once saved, or a saved outcome's refusal for this key: both are settled.
+      if (error === refusal || error instanceof GuardRefusal) return;
+      // Anything else (a busy or failed database) left the refusal unsaved: nothing was applied, so resend.
+      throw new MergeNotApplied('The merge refusal could not be saved. Try again.', { cause: error });
+    }
   }
 
   /** The saved outcome of this click, if it has one. Validation never runs again for a replay. */

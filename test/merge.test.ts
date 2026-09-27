@@ -370,6 +370,22 @@ it('returns the saved outcome when another coordinator saves the click just befo
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('reports a refusal it could not save as resendable, not as a definite 409', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
+  const userAction = h.store.userAction.bind(h.store);
+  h.store.userAction = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  try {
+    const error = await h.coordinator.merge(token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/could not be saved/);
+    h.store.userAction = userAction;
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })).toBeUndefined();
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));
