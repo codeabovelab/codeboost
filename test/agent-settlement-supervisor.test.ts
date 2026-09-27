@@ -44,6 +44,7 @@ vi.mock('../agents/container/run.ts', () => ({
     state.budgets.push(budget);
     if (!state.disposeOk) throw new Error('Cannot connect to the Docker daemon');
   },
+  agentContainerId: (profile: object) => state.created.has(profile) ? 'c'.repeat(64) : undefined,
   agentContainerResources: (profile: { name: string }) => state.created.has(profile)
     ? [{ kind: 'container', name: profile.name, id: 'c'.repeat(64),
       owner: { label: 'io.codeboost.invocation', value: 'own' } }] : [],

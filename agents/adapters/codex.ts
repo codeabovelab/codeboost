@@ -1,10 +1,18 @@
 import type { InvocationHandle } from '../contract.ts';
+import type { ContainerProfile } from '../container/profile.ts';
+import { agentContainerId } from '../container/run.ts';
 import { createCodexCommand, createPhasePolicy } from '../policy.ts';
 import { launchInvocation, readBoundedContainerFile } from './supervisor.ts';
 import { setUpProfile } from './setup.ts';
 import { createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
+// Read the output from the container this invocation created, by ID; a same-named replacement must not answer.
+const codexContainer = (profile: ContainerProfile) => {
+  const id = agentContainerId(profile);
+  if (!id) throw new Error('The Codex container ID is unknown.');
+  return id;
+};
 
 export async function readCodexOutput(container: string, maximumBytes: number, timeoutMs = 30_000,
   signal?: AbortSignal) {
@@ -23,5 +31,5 @@ export function startCodexInvocation(request: AgentAdapterRequest,
       codexAuthFile: authFile, deferredOutput: true }),
     profile => start(profile, { ...options, invocationBudget: remaining,
       decode: (current, _raw, maximum, timeoutMs, decodeSignal) =>
-        readCodexOutput(current.name, maximum, timeoutMs, decodeSignal) })));
+        readCodexOutput(codexContainer(current), maximum, timeoutMs, decodeSignal) })));
 }

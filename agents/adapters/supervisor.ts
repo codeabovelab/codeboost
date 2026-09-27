@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason,
   UnreleasedResource } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
-import { agentContainerResources, createValidatedContainer, disposeValidatedContainer,
+import { agentContainerId, agentContainerResources, createValidatedContainer, disposeValidatedContainer,
   validateContainer } from '../container/run.ts';
 import { assertContainerProfileAuthenticity, containerProfileResources, disposeContainerProfile,
   isContainerProfileAuthentic, type ContainerProfile } from '../container/profile.ts';
@@ -405,6 +405,9 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   // Setup (container create and validation) runs inside the handle; a stop kills its in-flight Docker call.
   const setupAbort = new AbortController();
   let child: ChildProcess | undefined;
+  // Every call after the create targets the container's immutable ID, never its reusable name. Set once the
+  // create returns, before anything can use it.
+  let container = '';
   const timers = new Set<ReturnType<typeof setTimeout>>();
   const controls = new Set<Promise<boolean>>();
   const runControl = (args: readonly string[], timeoutMs = 5_000) => {
@@ -434,7 +437,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       "if(!stat.isFile()||stat.nlink!==1n)throw new Error('UNSAFE_ACK')}finally{if(fd!==undefined)fs.closeSync(fd);",
       'if(dirfd!==undefined)fs.closeSync(dirfd)}',
     ].join('');
-    return runControl(['exec', '--user', '0', profile.name, 'node', '-e', script, token]);
+    return runControl(['exec', '--user', '0', container, 'node', '-e', script, token]);
   };
   const later = (callback: () => void, delay: number) => {
     const timer = setTimeout(() => { timers.delete(timer); callback(); }, delay);
@@ -445,11 +448,11 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     terminating = true;
     const current = child;
     current.stdout?.resume(); current.stderr?.resume();
-    void runControl(['stop', '--signal=TERM', '--time=1', profile.name]);
-    later(() => { if (!closed) void runControl(['kill', '--signal=KILL', profile.name]); }, 1_500);
+    void runControl(['stop', '--signal=TERM', '--time=1', container]);
+    later(() => { if (!closed) void runControl(['kill', '--signal=KILL', container]); }, 1_500);
     later(() => {
       if (!closed) {
-        void runControl(['rm', '--force', profile.name]);
+        void runControl(['rm', '--force', container]);
         current.kill('SIGKILL');
       }
     }, 4_000);
@@ -725,7 +728,9 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   void (async () => {
     try {
       await createValidatedContainer(profile, remaining(), options.secrets ?? {}, setupAbort.signal);
-      await validateContainer(profile.name, profile, remaining(), setupAbort.signal);
+      container = agentContainerId(profile) ?? '';
+      if (!container) throw new Error('Docker did not return the created agent container ID.');
+      await validateContainer(container, profile, remaining(), setupAbort.signal);
       if (stopReason) throw new Error('Invocation was stopped during setup.');
     } catch (error) {
       closed = true;
@@ -736,7 +741,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       await settleWith(null, null, Buffer.alloc(0), Buffer.alloc(0));
       return;
     }
-    attach(spawn('docker', ['start', '--attach', profile.name], {
+    attach(spawn('docker', ['start', '--attach', container], {
       env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
     }));
   })();
