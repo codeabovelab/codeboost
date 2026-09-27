@@ -121,7 +121,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const issuesClosed=issues.close();
     try { await merges?.close(); } finally { await issuesClosed; }
     await closing;
-    await questions.close();
-    service.close();
+    // Close the store even if Ask's cleanup fails, then report that failure.
+    try { await questions.close(); } finally { service.close(); }
   } };
 }

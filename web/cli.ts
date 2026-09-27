@@ -15,5 +15,5 @@ if (values.help || (!values.demo && !values.config)) {
   const app = await startServer(config, port);
   console.log(`Review ready: ${app.url}\nRepository: ${config.repository}\nDatabase: ${config.database}\nSource files are read-only. Press Ctrl+C to stop.`);
   let stopping=false;
-  for(const signal of ['SIGINT','SIGTERM'] as const) process.on(signal,()=>{if(!stopping){stopping=true;void app.close().then(()=>process.exit(0));}});
+  for(const signal of ['SIGINT','SIGTERM'] as const) process.on(signal,()=>{if(!stopping){stopping=true;void app.close().then(()=>process.exit(0),error=>{console.error(error instanceof Error?error.message:error);process.exit(1);});}});
 }

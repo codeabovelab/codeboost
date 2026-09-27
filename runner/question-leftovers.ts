@@ -1,6 +1,6 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { execFile } from 'node:child_process';
-import { chmodSync, existsSync, lstatSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { basename, dirname, isAbsolute, join } from 'node:path';
@@ -80,7 +80,25 @@ export const dockerTaskStorage: ListTaskStorage = async signal => {
 const OWNER_FILE = '.owner';
 /** A codeboost Ask lock: a direct child of the temp directory with the lock name, so a stamp cannot aim elsewhere. */
 export const isAskLock = (path: unknown): path is string => typeof path === 'string' && path.length <= 4096
-  && isAbsolute(path) && dirname(path) === tmpdir() && /^codeboost-asklock-[0-9a-f]+(?:-[0-9]+)?\.sqlite$/.test(basename(path));
+  && isAbsolute(path) && dirname(path) === lockDirectoryPath() && /^codeboost-asklock-[0-9a-f]+(?:-[0-9]+)?\.sqlite$/.test(basename(path));
+/**
+ * Lock files live in a directory only this user can write, so no other local user can plant or swap one (for example
+ * a symlink to an unrelated database) between the name check and SQLite opening it. Refused if it is not ours.
+ */
+const lockDirectoryPath = () => join(tmpdir(), `codeboost-asklocks-${process.getuid?.() ?? 'user'}`);
+function lockDirectory(): string {
+  const directory = lockDirectoryPath();
+  try { mkdirSync(directory, { mode: 0o700 }); } catch (error) { if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error; }
+  const stat = lstatSync(directory);
+  if (!stat.isDirectory() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0)
+    throw new Error(`Ask is off: the lock directory ${directory} is not a private directory owned by you. Remove it, then retry.`);
+  return directory;
+}
+/** Open a lock file only if it is a regular file or absent; a symlink or other file type is refused, never followed. */
+function assertPlainLockFile(path: string): void {
+  const stat = lstatSync(path, { throwIfNoEntry: false });
+  if (stat && (!stat.isFile() || stat.isSymbolicLink())) throw new Error(`Ask is off: ${path} is not a plain lock file. Remove it, then retry.`);
+}
 /**
  * Create an Ask root stamped with the lock of the process that owns it. The stamp is written under a preparation name
  * and the folder is then renamed, so any folder visible under the Ask root name already carries its owner stamp.
@@ -100,6 +118,7 @@ function lockIsHeld(path: string): boolean {
   const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
   let probe: import('node:sqlite').DatabaseSync | undefined;
   try {
+    assertPlainLockFile(path);
     probe = new DatabaseSync(path, { timeout: 0 });
     probe.exec('BEGIN EXCLUSIVE; ROLLBACK;');
     return false;
@@ -136,7 +155,7 @@ export class LeftoverLedger {
   lockPath: string;
   constructor(path: string, listTaskStorage: ListTaskStorage = dockerTaskStorage) {
     this.path = path; this.listTaskStorage = listTaskStorage;
-    this.lockPath = join(tmpdir(), `codeboost-asklock-${createHash('sha256').update(path).digest('hex').slice(0, 32)}.sqlite`);
+    this.lockPath = join(lockDirectoryPath(), `codeboost-asklock-${createHash('sha256').update(path).digest('hex').slice(0, 32)}.sqlite`);
   }
 
   /**
@@ -149,6 +168,8 @@ export class LeftoverLedger {
     if (this.#lock) return;
     if (this.#refusal) throw new Error(this.#refusal);
     const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
+    lockDirectory();
+    assertPlainLockFile(this.lockPath);
     const lock = new DatabaseSync(this.lockPath, { timeout: 0 });
     try { lock.exec('PRAGMA locking_mode=EXCLUSIVE; BEGIN EXCLUSIVE;'); }
     catch (error) {
@@ -197,7 +218,7 @@ export class LeftoverLedger {
     const identity = statSync(canonical);
     // The lock only excludes, so it may live in the temp directory; keyed by device and inode, every spelling and
     // every later name of this database file (including an atomic rename while a server runs) finds the same lock.
-    ledger.lockPath = join(tmpdir(), `codeboost-asklock-${identity.dev}-${identity.ino}.sqlite`);
+    ledger.lockPath = join(lockDirectoryPath(), `codeboost-asklock-${identity.dev}-${identity.ino}.sqlite`);
     if (identity.nlink > 1)
       ledger.#refusal = `Ask is off: the review database ${canonical} has other hard links, so codeboost cannot tell whether another process is using it. Use a database file without hard links.`;
     return ledger;

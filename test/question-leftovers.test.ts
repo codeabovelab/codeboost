@@ -1,5 +1,5 @@
 import { spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, linkSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, linkSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, renameSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -350,10 +350,11 @@ it('bounds shutdown when the worker does not report, keeping its root recorded u
   expect(record).toMatchObject({ leftovers: [], untracked: 1 });
   const [root] = record.roots;
   expect(existsSync(root)).toBe(true);
-  // The lock stays while the thread may still write; both go once it stops.
+  // The root goes once the thread stops. The lock stays for the life of this process: Docker children the abandoned
+  // thread started cannot be seen or awaited, so only process exit releases it.
   expect(lockFree(path)).toBe(false);
   await expect.poll(() => existsSync(root), { timeout: 5_000 }).toBe(false);
-  expect(lockFree(path)).toBe(true);
+  expect(lockFree(path)).toBe(false);
 });
 
 it('cleans up its root and releases the lock when the worker cannot be constructed', async () => {
@@ -454,11 +455,11 @@ it('waits for an abandonment already in progress when shutdown starts', async ()
   const question = worker.agent('claude')('block-long', new AbortController().signal, scope(32), 1_000).catch((error: Error) => error);
   await new Promise(resolve => setTimeout(resolve, 1_400));
   await worker.close();
-  // close() returned only after the thread stopped, and then the root is gone and the lock free.
+  // close() returned only after the thread stopped; the root is gone, and the lock stays until the process exits.
   expect(Date.now() - started).toBeGreaterThanOrEqual(2_500);
   expect(((await question) as Error).message).toContain('did not settle');
   expect(read(path).roots).toEqual([]);
-  expect(lockFree(path)).toBe(true);
+  expect(lockFree(path)).toBe(false);
 }, 20_000);
 
 it('keeps one lock for a review database across a rename', () => {
@@ -607,4 +608,29 @@ it('keeps the root recorded and the lock held when terminating an abandoned work
   expect(lockFree(path)).toBe(false);
   await terminate();
   rmSync(root, { recursive: true, force: true });
+});
+
+it('refuses a lock path that is a symlink instead of opening what it points to', () => {
+  const path = ledgerPath();
+  const ledger = new LeftoverLedger(path, docker(new Set()));
+  ledger.acquire(); ledger.release();
+  const victim = join(dirname(path), 'victim.sqlite');
+  writeFileSync(victim, 'not a database');
+  rmSync(ledger.lockPath, { force: true });
+  symlinkSync(victim, ledger.lockPath);
+  try {
+    expect(() => new LeftoverLedger(path, docker(new Set())).acquire()).toThrow('not a plain lock file');
+    expect(readFileSync(victim, 'utf8')).toBe('not a database');
+  } finally { rmSync(ledger.lockPath, { force: true }); }
+});
+
+it('keeps lock files in a private directory owned by this user', () => {
+  const ledger = new LeftoverLedger(ledgerPath(), docker(new Set()));
+  ledger.acquire(); ledger.release();
+  const directory = dirname(ledger.lockPath);
+  expect(dirname(directory)).toBe(tmpdir());
+  const stat = lstatSync(directory);
+  expect(stat.isDirectory() && !stat.isSymbolicLink()).toBe(true);
+  expect(stat.mode & 0o077).toBe(0);
+  if (process.getuid) expect(stat.uid).toBe(process.getuid());
 });

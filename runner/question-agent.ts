@@ -120,8 +120,8 @@ export class QuestionWorker {
     this.root = undefined;
     try {
       removeAskRoot(root); this.ledger?.forget(root);
-      // A thread that stopped after close() has no more files to write: the lock can go too.
-      if (this.closed) this.ledger?.release();
+      // A thread that stopped after close() has no more files to write; the lock still stays if it was abandoned.
+      if (this.closed && !this.#abandoning) this.ledger?.release();
     }
     catch (error) { console.error(`codeboost: could not delete ${root}: ${error instanceof Error ? error.message : error}`); }
   }
@@ -186,8 +186,10 @@ export class QuestionWorker {
     finally {
       // A shared startup scan may still be running and could write the record; it must finish under the lock.
       await this.#scanning?.catch(() => undefined);
-      // Keep the lock while an abandoned thread may still write into its recorded root.
-      if (!this.root) this.ledger?.release();
+      // Keep the lock while an abandoned thread may still write into its recorded root. After any abandonment, keep it
+      // until this process exits: Docker CLI children the thread started can outlive it, and nothing here can see or
+      // await them (that needs lane D's process groups, #51 item 5). The OS releases the lock when the process ends.
+      if (!this.root && !this.#abandoning) this.ledger?.release();
     }
   }
   async #close() {

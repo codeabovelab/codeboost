@@ -139,7 +139,8 @@ Ask keeps the contract's identity and cleanup rules:
   `io.codeboost.invocation` or `io.codeboost.egress` exists. Caller-provided
   allocation IDs (#51 item 3) would let Ask name these resources instead.
 - One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on a lock file keyed by
-  the database file's identity (device and inode) in the temp directory. It is an OS file lock that the operating
+  the database file's identity (device and inode), in a private directory (`<tmp>/codeboost-asklocks-<uid>`, mode
+  0700, checked to be owned by you). A lock path that is a symlink is refused, never followed. It is an OS file lock that the operating
   system releases when its process ends, so every spelling and every later name of the database, including an
   atomic rename while a server runs, finds the same lock. It is taken before the scan and kept until the worker
   and any startup scan still in flight have finished. Only the holder scans, starts a worker or writes the
@@ -157,7 +158,9 @@ absolute and symlinked spellings share them. A database with other hard links is
   finishes first), then rejects the waiting questions, so shutdown cannot hang on D. A worker that does not answer
   the final release request at shutdown goes through the same bounded path. If the thread is still busy
   after that wait, its ownership is already durable (unknown leftovers and the recorded root) and no new question is
-  admitted; the root is deleted as soon as the thread stops.
+  admitted; the root is deleted as soon as the thread stops. After any abandonment the review lock is kept until the
+  process exits: Docker CLI children the thread started can outlive it and cannot be awaited until lane D exposes
+  process groups (#51 item 5).
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
   while any container, volume or network labelled `io.codeboost.allocation`,

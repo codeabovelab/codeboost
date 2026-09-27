@@ -324,3 +324,19 @@ it('does not start an Ask for a question whose request finishes arriving after s
   await Promise.all([app.close(), completed.catch(() => 0)]);
   expect(asked).toBe(0);
 }, 30_000);
+
+it('closes the review store even when Ask cleanup fails at shutdown', async () => {
+  const { createDemo } = await import('../scripts/demo.ts');
+  const { startServer } = await import('../web/server.ts');
+  const { Questions } = await import('../runner/questions.ts');
+  const root = mkdtempSync(join(tmpdir(), 'ask-close-')); roots.push(root);
+  const app = await startServer(createDemo(join(root, 'demo')), 0);
+  const closeQuestions = Questions.prototype.close;
+  Questions.prototype.close = async () => { throw new Error('disk full'); };
+  let storeClosed = false;
+  const closeStore = app.service.close.bind(app.service);
+  app.service.close = () => { storeClosed = true; closeStore(); };
+  try { await expect(app.close()).rejects.toThrow('disk full'); }
+  finally { Questions.prototype.close = closeQuestions; }
+  expect(storeClosed).toBe(true);
+}, 30_000);
