@@ -761,6 +761,8 @@ export class Store {
    */
   settleAttempt(identity: PlanIdentity, id: string, settlement: Omit<Settlement, 'contextCurrent'> & {
     signal?: string | null; result?: unknown; diagnosticRef?: string | null;
+    /** Writable attempts: the runner's commit, recorded with `completed` in this same transaction. */
+    history?: { base: string; head: string; entries: readonly LedgerEntry[] };
   }): Classification {
     if (settlement.firstReason !== null && !FIRST_REASONS.includes(settlement.firstReason)) throw new GuardRefusal('Unknown stop reason.');
     const key = identityKey(identity);
@@ -783,6 +785,11 @@ export class Store {
       this.#run(`UPDATE attempts SET state=?, first_reason=?, stop_reason=?, exit_code=?, signal=?, result=?, diagnostic=?, diagnostic_ref=?, settled_at=? WHERE id=?`,
         outcome.state, firstReason, settlement.stopReason ?? null, settlement.exitCode, settlement.signal ?? null, result,
         outcome.reason, settlement.diagnosticRef ?? null, new Date().toISOString(), id);
+      // The guards above ran first; recording history now advances the context without invalidating this attempt.
+      if (outcome.state === 'completed' && settlement.history) {
+        const context = decode<InvocationContext>(row.context);
+        this.recordHistory(identity, { revision: context.planRevision, snapshotId: context.snapshotId }, settlement.history.base, settlement.history.head, settlement.history.entries);
+      }
       // A pending cancel task wins over everything, including the time limit.
       if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
       else {

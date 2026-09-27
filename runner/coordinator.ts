@@ -1,6 +1,6 @@
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { captureInvocation, type InvocationHandle, type InvocationInput, type InvocationResult, type StopReason, type TaskClone, type UnreleasedResource } from '../agents/contract.ts';
-import type { AttemptRecord, Store } from './store.ts';
+import type { AttemptRecord, LedgerEntry, Store } from './store.ts';
 import { ATTEMPT_PHASES, GuardRefusal, ShuttingDownError, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason, type ShutdownCapability, settleWith } from './lifecycle.ts';
 
 /** What F's host-side preparation hands to D's start call. */
@@ -8,7 +8,13 @@ export interface PreparedAttempt {
   readonly clone: TaskClone;
   readonly vendor: 'claude' | 'codex';
   readonly approvedArgv: readonly (readonly string[])[];
+  /** Opaque data the deps keep for their own finish/release steps (for example the task workspace). */
+  readonly private?: unknown;
 }
+/** The ledger record saved with `completed` in the same transaction (runner-lifecycle.md, publication step 3). */
+export interface HistoryRecord { readonly base: string; readonly head: string; readonly entries: readonly LedgerEntry[] }
+/** A finish step's failure with its own actionable diagnostic (for example a safety violation). */
+export class FinishFailure extends Error {}
 export interface RunnerDeps {
   /**
    * The runner token D labels every resource with (32 lowercase hex characters). `prepare` must allocate task storage
@@ -29,6 +35,14 @@ export interface RunnerDeps {
   start(input: InvocationInput, prepared: PreparedAttempt): InvocationHandle;
   /** Validate a clean result; throw with an actionable reason if it is invalid. Returns the value to persist. */
   validate(attempt: AttemptRecord, result: InvocationResult): unknown;
+  /**
+   * Optional asynchronous replacement for validate, used by writable attempts: audit, make the runner commit inside
+   * task storage, and return the value plus the ledger record. Nothing is written to the Store here; the record is
+   * saved with `completed` in one transaction. Throw FinishFailure with an actionable diagnostic to fail the attempt.
+   */
+  finish?(attempt: AttemptRecord, result: InvocationResult, prepared: PreparedAttempt, signal: AbortSignal): Promise<{ value: unknown; history?: HistoryRecord }>;
+  /** Optional: remove task storage after the terminal write and before the slot is freed. A failure keeps the slot under a marker. */
+  release?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void>;
   now?(): number;
 }
 export interface SlotLimits { readonly writable: number; readonly readOnly: number }
@@ -246,27 +260,27 @@ export class RunnerCoordinator {
       let prepared: PreparedAttempt;
       try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
       catch (error) { return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error)); }
-      if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job));
+      if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
       // Launch check: one synchronous turn, no await between the checks and D's start call.
       const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
-      if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
+      if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {}, prepared);
       // A context change comes before both time checks, as in the settlement order and startup recovery.
       if (!sameContext(row.context, this.#store.currentContext(job.identity))) {
         // Recorded like any stale stop, so the row keeps it even if a cancel task lands during cleanup.
         this.#requestStop(job, 'stale');
-        return await this.#endBeforeLaunch(job, attempt, {});
+        return await this.#endBeforeLaunch(job, attempt, {}, prepared);
       }
-      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}); }
-      if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }); }
+      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}, prepared); }
+      if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }, prepared); }
       // Fail closed: once D reported resources it could not remove, no new invocation starts, even one already admitted.
-      if (this.#unreleased) return await this.#endBeforeLaunch(job, attempt, { detail: NOT_STARTED_UNRELEASED });
+      if (this.#unreleased) return await this.#endBeforeLaunch(job, attempt, { detail: NOT_STARTED_UNRELEASED }, prepared);
       let handle: InvocationHandle;
       try {
         const input = captureInvocation({ clone: prepared.clone, phase: ATTEMPT_PHASES[attempt.kind], vendor: prepared.vendor,
           approvedArgv: prepared.approvedArgv, deadline: attempt.deadline, attemptId: attempt.id, runnerOwner: this.#deps.runnerOwner, context: attempt.context }, now);
         handle = this.#deps.start(input, prepared);
-      } catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Launch failed: ${message(error)}` }); }
+      } catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Launch failed: ${message(error)}` }, prepared); }
       job.handle = handle;
       let running: boolean | undefined;
       try { running = this.#write(() => this.#store.markRunning(job.identity, attempt.id)); } catch { running = undefined; }
@@ -291,20 +305,27 @@ export class RunnerCoordinator {
       // Accept only the result of this exact invocation, as the question path does. Anything else is never validated
       // or saved: the attempt fails closed.
       if (result.attemptId !== attempt.id || !result.context || !sameContext(result.context, attempt.context)) {
-        this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false,
+        const foreignSaved = this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false,
           detail: job.firstReason === 'stale' ? job.staleCause : FOREIGN_RESULT });
         job.decided = true;
+        // Task storage waits for the terminal write, as on every other path.
+        if (foreignSaved) await this.#release(job, attempt, prepared);
         return;
       }
-      let valid = false, value: unknown, detail = result.stderr ? bounded(result.stderr) : undefined;
+      let valid = false, value: unknown, history: HistoryRecord | undefined, detail = result.stderr ? bounded(result.stderr) : undefined;
       if (!job.firstReason && result.exitCode === 0 && !result.stopReason) {
-        try { value = this.#deps.validate(attempt, result); valid = true; }
-        catch (error) { detail = `Invalid output: ${message(error)}`; }
+        try {
+          if (this.#deps.finish) { const done = await this.#deps.finish(attempt, result, prepared, job.controller.signal); value = done.value; history = done.history; }
+          else value = this.#deps.validate(attempt, result);
+          valid = true;
+        } catch (error) { detail = error instanceof FinishFailure ? bounded(error.message) : `Invalid output: ${message(error)}`; }
       }
       // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
       if (job.firstReason === 'stale') detail = job.staleCause;
-      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
+      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail, history });
       job.decided = true;
+      // Task storage goes after the terminal write too; a failed removal holds the slot under a marker.
+      if (saved) await this.#release(job, attempt, prepared);
       // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
       if (saved && !(await this.#removePreparation(job, attempt))) this.#holdForPreparation(job);
     } catch (error) {
@@ -327,11 +348,13 @@ export class RunnerCoordinator {
     return error === undefined || job.firstReason ? {} : { detail: `Preparation failed: ${message(error)}` };
   }
   /** Ending without a handle: host-side cleanup, then the terminal write from the first reason. */
-  async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }): Promise<void> {
+  async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }, prepared?: PreparedAttempt): Promise<void> {
     // Stops that land while preparation finishes are taken into account; once the job is ending, the outcome is fixed.
     job.decided = true;
     const removed = await this.#removePreparation(job, attempt);
-    this.#settle(job, { exitCode: null, signal: null, valid: false, detail: job.firstReason === 'stale' ? job.staleCause : s.detail });
+    const saved = this.#settle(job, { exitCode: null, signal: null, valid: false, detail: job.firstReason === 'stale' ? job.staleCause : s.detail });
+    // Task storage (if preparation allocated it) waits for the terminal write, like every other path.
+    if (saved && prepared) await this.#release(job, attempt, prepared);
     if (!removed) this.#holdForPreparation(job);
   }
   /**
@@ -349,7 +372,13 @@ export class RunnerCoordinator {
   #holdForPreparation(job: Job): void {
     if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'preparation-not-removed' });
   }
-  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string }): Classification | undefined {
+  /** After the terminal write: remove task storage, then the slot is freed. A failure keeps the slot under a marker. */
+  async #release(job: Job, attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void> {
+    if (!this.#deps.release) return;
+    try { await this.#deps.release(attempt, prepared); }
+    catch { if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' }); }
+  }
+  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord }): Classification | undefined {
     try {
       return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason }));
     } catch {
