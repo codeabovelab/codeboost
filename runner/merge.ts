@@ -152,7 +152,11 @@ export class MergeCoordinator {
     if (!this.service.store || !this.service.config) return undefined;
     const saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity,
       { actionId, kind: 'merge', request: { token } });
-    return saved && this.displayStatus(this.service.load()).then(status => ({ status, result: { url: saved.response.url ?? '' } }));
+    if (!saved) return undefined;
+    // A refused or removed merge replays as the failure the first response reported, never as a submission.
+    if (saved.response.state === 'failed' || saved.response.state === 'removed')
+      return Promise.reject(new Error(saved.response.reason ?? 'GitHub did not merge this pull request.'));
+    return this.displayStatus(this.service.load()).then(status => ({ status, result: { url: saved.response.url ?? '' } }));
   }
 
   async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {

@@ -250,6 +250,17 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('keeps the budget handoff when the refused admission runs inside a user action', () => {
+    const { store } = queued(); const start = Date.now(), actionId = randomUUID();
+    const first = admit(store, { budgetMs: 1_000, now: start });
+    settle(store, first.id, { exitCode: 1 });
+    const retry = () => store.userAction(identity, { actionId, kind: 'retry', request: { attemptId: first.id } },
+      () => admit(store, { retryOf: first.id, now: start + 1_000 }).id);
+    expect(retry).toThrow(/budget has run out/);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)).toHaveLength(1);
+    expect(retry).toThrow(/budget has run out/);
+  });
   it('refuses admission once the whole-task budget has run out, and hands the task to a person', () => {
     const { store } = queued(); const start = Date.now();
     const first = admit(store, { budgetMs: 1_000, now: start });

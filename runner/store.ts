@@ -6,7 +6,7 @@ import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanConte
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import {
-  ATTEMPT_PHASES, CLOSED_STATUSES, MERGEABLE_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  ATTEMPT_PHASES, CLOSED_STATUSES, MERGEABLE_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
@@ -629,38 +629,46 @@ export class Store {
     if (!Number.isSafeInteger(budgetMs) || budgetMs < 1) throw new GuardRefusal('Invalid task budget.');
     if (input.retryOf !== undefined) assertUuidV4(input.retryOf, 'Retried attempt ID');
     const key = identityKey(identity);
-    const admitted = this.#transaction((): AttemptRecord | null => {
+    // Re-checked when committed: only a still-open, idle task whose budget has passed moves to needs human.
+    const expire = () => {
       const task = this.#task(key);
-      if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
-      if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
-      if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
-      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
-      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
-      // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
-      if (task.budget_deadline !== null && (task.budget_deadline as number) <= now) {
-        this.#run("UPDATE tasks SET status='needs human' WHERE plan_key=?", key);
-        this.#touch(key);
-        return null;
-      }
-      const current = this.#contextOf(key);
-      if (!sameContext(input.expectedContext, current)) throw new GuardRefusal('The plan, snapshot, assignment or referenced code changed. Reload before starting.');
-      if (input.retryOf !== undefined) {
-        const last = task.current_attempt_id === input.retryOf ? this.#get('SELECT * FROM attempts WHERE plan_key=? AND id=?', key, input.retryOf) : undefined;
-        if (!last || (last.state !== 'failed' && last.state !== 'cancelled')) throw new GuardRefusal('Only the latest failed or cancelled attempt can be retried.');
-        if (!sameContext(decode<InvocationContext>(last.context), current)) throw new GuardRefusal('The retried attempt is out of date. Start a new request on the current code.');
-      }
-      if (input.item !== undefined && input.item !== null && !this.getPlan(identity).items.some(entry => entry.id === input.item))
-        throw new GuardRefusal('Unknown plan item.');
-      const id = randomUUID(), created = new Date(now).toISOString();
-      this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
-        id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
-      this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+      if ((task.status !== 'running' && task.status !== 'queued') || task.budget_deadline === null
+        || (task.budget_deadline as number) > now || this.#activeAttempt(key)) return;
+      this.#run("UPDATE tasks SET status='needs human' WHERE plan_key=?", key);
       this.#touch(key);
-      return this.getAttempt(identity, id);
-    });
-    // Committed above so the move to needs human survives the refusal.
-    if (!admitted) throw new GuardRefusal('The task time budget has run out; it needs a person.');
-    return admitted;
+    };
+    try {
+      return this.#transaction((): AttemptRecord => {
+        const task = this.#task(key);
+        if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
+        if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+        if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
+        if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
+        if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
+        // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
+        if (task.budget_deadline !== null && (task.budget_deadline as number) <= now)
+          throw new RefusalWithEffect('The task time budget has run out; it needs a person.', expire);
+        const current = this.#contextOf(key);
+        if (!sameContext(input.expectedContext, current)) throw new GuardRefusal('The plan, snapshot, assignment or referenced code changed. Reload before starting.');
+        if (input.retryOf !== undefined) {
+          const last = task.current_attempt_id === input.retryOf ? this.#get('SELECT * FROM attempts WHERE plan_key=? AND id=?', key, input.retryOf) : undefined;
+          if (!last || (last.state !== 'failed' && last.state !== 'cancelled')) throw new GuardRefusal('Only the latest failed or cancelled attempt can be retried.');
+          if (!sameContext(decode<InvocationContext>(last.context), current)) throw new GuardRefusal('The retried attempt is out of date. Start a new request on the current code.');
+        }
+        if (input.item !== undefined && input.item !== null && !this.getPlan(identity).items.some(entry => entry.id === input.item))
+          throw new GuardRefusal('Unknown plan item.');
+        const id = randomUUID(), created = new Date(now).toISOString();
+        this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
+          id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
+        this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+        this.#touch(key);
+        return this.getAttempt(identity, id);
+      });
+    } catch (error) {
+      // Inside userAction the effect commits with the saved refusal instead (depth > 0 here).
+      if (error instanceof RefusalWithEffect && this.#depth === 0) this.#transaction(error.effect);
+      throw error;
+    }
   }
   /** The "Stopping" transition: sets the first reason once, keeps the state. */
   recordFirstReason(identity: PlanIdentity, id: string, reason: FirstReason): boolean {
@@ -768,7 +776,10 @@ export class Store {
       const storage = (error as { code?: string }).code === 'ERR_SQLITE_ERROR';
       if (!replaying && !storage && !(error instanceof ActionIdReused) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
-        this.#transaction(() => { if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message }); });
+        this.#transaction(() => {
+          if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message });
+          if (error instanceof RefusalWithEffect) error.effect();
+        });
       }
       throw error;
     }

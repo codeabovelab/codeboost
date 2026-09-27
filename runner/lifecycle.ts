@@ -36,6 +36,14 @@ export function assertUuidV4(value: unknown, name: string): asserts value is str
 export class GuardRefusal extends Error {}
 /** Reusing an action ID for a different request. */
 export class ActionIdReused extends GuardRefusal {}
+/**
+ * A refusal whose state change must outlive the rollback of the refused transaction. The Store commits `effect`
+ * with the saved refusal inside userAction, or in its own transaction when there is no enclosing action.
+ */
+export class RefusalWithEffect extends GuardRefusal {
+  readonly effect: () => void;
+  constructor(message: string, effect: () => void) { super(message); this.effect = effect; }
+}
 
 export function bounded(reason: string): string {
   const text = reason.trim() || 'No reason given.';

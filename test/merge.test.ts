@@ -237,6 +237,19 @@ it('replays a refusal made before admission, even after the review becomes merge
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('replays a refused merge as the same failure, not as a submission', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Required status check is expected.', 'refused'); });
+  const actionId = randomUUID();
+  try {
+    await expect(h.coordinator.merge(h.view().token, actionId)).rejects.toThrow(/Required status check/);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed', actionId });
+    await expect(h.coordinator.merge(h.view().token, actionId)).rejects.toThrow(/Required status check/);
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('keeps a direct merge URL for a replayed click', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));
