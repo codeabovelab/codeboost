@@ -29,8 +29,8 @@ export async function setUpProfile(request: AgentAdapterRequest, remaining: () =
     if (error instanceof ProfileCreationCleanupError) throw error;
     try { await removeVendorNetwork(network, CLEANUP_TIMEOUT_MS); }
     catch (cleanupError) {
-      throw new AdapterSetupCleanupError(error, cleanupError, () => removeVendorNetwork(network, CLEANUP_TIMEOUT_MS),
-        vendorNetworkResources(network));
+      throw new AdapterSetupCleanupError(error, cleanupError,
+        (budgetMs = CLEANUP_TIMEOUT_MS) => removeVendorNetwork(network, budgetMs), () => vendorNetworkResources(network));
     }
     throw error;
   }

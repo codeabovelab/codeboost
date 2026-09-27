@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS,
+import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS, vendorNetworkResources,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 
@@ -93,6 +93,23 @@ describe('vendor-only egress', () => {
     spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
     expect(impostor).toMatch(/^codeboost-proxy-/);
     expect(survived).toBe(true);
+  }, 60_000);
+
+  it('reports only the part of a network whose removal is still unconfirmed', async () => {
+    const partial = captureInvocation({ ...invocation, attemptId: `partial-removal-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const created = await createVendorNetwork(partial, imageId), blocker = `codeboost-blocker-${randomUUID()}`;
+    const [proxy, net] = vendorNetworkResources(created);
+    expect(proxy).toMatchObject({ kind: 'container', name: created.proxyContainer });
+    expect(net).toMatchObject({ kind: 'network', name: created.name });
+    // A foreign endpoint keeps the network busy, so the proxy is removed but `network rm` fails.
+    docker('run', '--detach', '--name', blocker, '--network', created.name, '--entrypoint', 'sleep', imageId, '300');
+    try {
+      await expect(removeVendorNetwork(created, 10_000)).rejects.toThrow('did not settle');
+      expect(vendorNetworkResources(created)).toEqual([net]);
+    } finally { spawnSync('docker', ['rm', '--force', blocker], { stdio: 'ignore' }); }
+    await removeVendorNetwork(created);
+    expect(vendorNetworkResources(created)).toEqual([]);
   }, 60_000);
 
   it('pins the host list with each vendor profile', async () => {

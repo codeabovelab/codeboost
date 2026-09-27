@@ -138,9 +138,11 @@ const retainCleanup = (invocation: InvocationInput, cleanup: (budgetMs: number) 
     if (complete) return;
     // A cancel during an attempt asks for one more attempt as soon as this one ends.
     if (cleaning) { retryAgain = true; return; }
+    const budget = giveUpAt === undefined ? 30_000 : cleanupBudget(giveUpAt);
+    // No attempt starts once the window has ended, so none can run past it.
+    if (budget < 1) { finish(true); return; }
     cleaning = true;
     retryAgain = false;
-    const budget = giveUpAt === undefined ? 30_000 : cleanupBudget(giveUpAt);
     void (async () => { await cleanup(budget); })().then(() => {
       cleaning = false;
       finish(false);
@@ -165,9 +167,8 @@ const retainCleanup = (invocation: InvocationInput, cleanup: (budgetMs: number) 
   else schedule();
   return handle;
 };
-/** A retry's Docker budget: what is left of the window, at most the usual 30 s, and at least 1 s. */
-const cleanupBudget = (giveUpAt: number) =>
-  Math.max(1_000, Math.min(30_000, Math.ceil(giveUpAt - performance.now())));
+/** A retry's Docker budget: what is left of the window, at most the usual 30 s; below 1 when the window has ended. */
+const cleanupBudget = (giveUpAt: number) => Math.min(30_000, Math.floor(giveUpAt - performance.now()));
 /** Everything a profile may still own, including its agent container only if this profile created one. */
 const profileResources = (profile: ContainerProfile) =>
   Object.freeze([...agentContainerResources(profile), ...containerProfileResources(profile)]);
@@ -189,19 +190,27 @@ const rejectProfile = (profile: ContainerProfile, error: unknown, register = tru
     }, { immediate: true, reason });
 };
 
-/** Retain attempt ownership while retrying resources allocated during adapter setup. */
-export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: () => void | Promise<void>,
-  startupError: unknown, cleanupError: unknown, kind = 'setup cleanup',
-  resources: readonly UnreleasedResource[] = [], reason?: StopReason): InvocationHandle {
-  return retainCleanup(invocation, () => retryCleanup(),
+/**
+ * Retain attempt ownership while retrying resources allocated during adapter setup. `retryCleanup` receives the
+ * budget left in the retry window and must not run past it. `resources` is read when the window ends, so it reports
+ * only what is still unconfirmed then.
+ */
+export function retainSetupCleanup(invocation: InvocationInput,
+  retryCleanup: (budgetMs: number) => void | Promise<void>, startupError: unknown, cleanupError: unknown,
+  kind = 'setup cleanup', resources: readonly UnreleasedResource[] | (() => readonly UnreleasedResource[]) = [],
+  reason?: StopReason): InvocationHandle {
+  return retainCleanup(invocation, budget => retryCleanup(budget),
     `Adapter startup failed and ${kind} remains unsettled: ${String(startupError)}; ${String(cleanupError)}`,
-    () => resources, !ownsAttempt(invocation.attemptId), undefined, { reason });
+    typeof resources === 'function' ? resources : () => resources, !ownsAttempt(invocation.attemptId), undefined,
+    { reason });
 }
 
 /** A setup failure whose own cleanup failed; the launcher keeps retrying `retryCleanup`. */
 export interface SetupCleanupFailure {
   readonly startupError: unknown;
-  readonly retryCleanup: () => Promise<void>;
+  /** Retry within `budgetMs` (default 30 s). */
+  readonly retryCleanup: (budgetMs?: number) => Promise<void>;
+  /** What may still be left, as of now. */
   readonly resources: readonly UnreleasedResource[];
 }
 const isSetupCleanupFailure = (error: unknown): error is SetupCleanupFailure & Error => error instanceof Error
@@ -209,15 +218,16 @@ const isSetupCleanupFailure = (error: unknown): error is SetupCleanupFailure & E
   && Array.isArray((error as Partial<SetupCleanupFailure>).resources);
 export class AdapterSetupCleanupError extends AggregateError implements SetupCleanupFailure {
   readonly startupError: unknown;
-  readonly retryCleanup: () => Promise<void>;
-  readonly resources: readonly UnreleasedResource[];
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => Promise<void>,
-    resources: readonly UnreleasedResource[]) {
+  readonly retryCleanup: (budgetMs?: number) => Promise<void>;
+  readonly #resources: () => readonly UnreleasedResource[];
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: (budgetMs?: number) => Promise<void>,
+    resources: readonly UnreleasedResource[] | (() => readonly UnreleasedResource[])) {
     super([startupError, cleanupError], 'Adapter setup failed and its cleanup did not settle.');
     this.startupError = startupError;
     this.retryCleanup = retryCleanup;
-    this.resources = Object.freeze([...resources]);
+    this.#resources = typeof resources === 'function' ? resources : () => resources;
   }
+  get resources(): readonly UnreleasedResource[] { return this.#resources(); }
 }
 /** Hands a finished profile to the supervisor from inside `launchInvocation` setup. */
 export type ProfileStarter = (profile: ContainerProfile, options?: SupervisorOptions) => InvocationHandle;
@@ -268,8 +278,8 @@ export function launchInvocation(invocation: InvocationInput, budget: () => numb
       const reason: StopReason = cancelReason ?? (left() < 1 ? 'timeout' : 'capture-failure');
       const startupError = isSetupCleanupFailure(error) ? error.startupError : error;
       if (isSetupCleanupFailure(error)) {
-        follow(retainSetupCleanup(invocation, error.retryCleanup, startupError, error, 'setup cleanup',
-          error.resources, reason));
+        follow(retainSetupCleanup(invocation, budget => error.retryCleanup(budget), startupError, error,
+          'setup cleanup', () => error.resources, reason));
         return;
       }
       resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context, exitCode: null,
@@ -620,8 +630,17 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     let giveUpAt: number | undefined, unreleased: readonly UnreleasedResource[] | undefined;
     // A failed setup may already have released everything, which also ends the profile's authenticity.
     while (isContainerProfileAuthentic(profile)) {
+      const budget = giveUpAt === undefined ? 30_000 : cleanupBudget(giveUpAt);
+      if (budget < 1) {
+        // The window ended between attempts: report instead of starting one that would run past it.
+        unreleased = profileResources(profile);
+        spentProfiles.add(profile);
+        failureDetail = `${cleanupWindowDetail()}: ${failureDetail}`;
+        wakeCleanup = undefined;
+        break;
+      }
       try {
-        await disposeValidatedContainer(profile, giveUpAt === undefined ? 30_000 : cleanupBudget(giveUpAt));
+        await disposeValidatedContainer(profile, budget);
         wakeCleanup = undefined;
         break;
       } catch (error) {

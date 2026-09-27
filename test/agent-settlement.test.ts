@@ -74,4 +74,36 @@ describe('bounded cleanup settlement', () => {
     expect(state.result).not.toHaveProperty('unreleased');
     expect(isInvocationActive(invocation.attemptId)).toBe(false);
   });
+
+  it('gives every retry only what is left of the window, and starts none after it ends', async () => {
+    const invocation = captured('bounded-budgets');
+    const calls: { at: number; budget: number }[] = [];
+    const handle = retainSetupCleanup(invocation, budget => {
+      calls.push({ at: performance.now(), budget });
+      throw new Error('daemon unreachable');
+    }, new Error('startup failed'), new Error('cleanup failed'), 'setup cleanup', resources);
+    const started = performance.now();
+    const state = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(CLEANUP_RETRY_WINDOW_MS + 5_000);
+    expect(state.result?.unreleased).toEqual(resources);
+    expect(calls.length).toBeGreaterThan(1);
+    for (const call of calls) {
+      expect(call.budget).toBeGreaterThanOrEqual(1);
+      expect(call.at + call.budget).toBeLessThanOrEqual(started + CLEANUP_RETRY_WINDOW_MS);
+    }
+    expect(calls[0]!.budget).toBe(30_000);
+  });
+
+  it('reports only what is still unconfirmed when the window ends', async () => {
+    const invocation = captured('bounded-partial');
+    let proxyRemoved = false;
+    const handle = retainSetupCleanup(invocation, () => {
+      proxyRemoved = true; // the proxy goes, the network keeps failing
+      throw new Error('network has active endpoints');
+    }, new Error('startup failed'), new Error('cleanup failed'), 'network cleanup',
+    () => resources.filter(resource => !(proxyRemoved && resource.kind === 'container')));
+    const state = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(CLEANUP_RETRY_WINDOW_MS + 2_000);
+    expect(state.result?.unreleased).toEqual([resources[1]]);
+  });
 });

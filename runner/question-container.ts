@@ -222,7 +222,8 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     finally { signal.removeEventListener('abort', cancel); }
     // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so the
     // worker reports them at release and no new question starts until a restart finds none left.
-    if (result.unreleased?.length) retained.markUntracked();
+    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed.
+    if (result.unreleased !== undefined) retained.markUntracked();
     return answerFromResult(question.provider, result, invocation);
   } finally {
     const failures: unknown[] = [];
