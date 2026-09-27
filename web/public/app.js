@@ -482,9 +482,9 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
-    // Keep the key when no response arrived (fetch's TypeError) or the server was shutting down (503, nothing
-    // applied), so the next click resends the same action. Any other error is the server's definite answer.
-    if (!(error instanceof TypeError) && error.status !== 503) mergeActionId = null;
+    // Only a parsed server answer with a definite status resolves this click. No response, an unreadable body, or
+    // 503 (nothing applied) keeps the key, so the next click resends the same action.
+    if (typeof error.status === "number" && error.status !== 503) mergeActionId = null;
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
