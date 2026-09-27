@@ -82,6 +82,13 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - When an irreversible command has an ambiguous timeout, cancellation, transport, or unknown outcome, retain durable in-flight ownership and reconcile external state before enabling retry. Only a confirmed refusal may become retryable failure.
 - Correlate retry observations to the current attempt with an immutable external identity or event boundary, and fail closed when multiple post-boundary action sequences appear. Matching only the resource or commit identity can replay another attempt's terminal event.
 
+## Owned host and Docker resources
+
+- Treat the cleanup handle of an external resource (container, volume, network, temporary directory) as owned state. If removal fails, keep the handle, record it durably before its in-memory owner can be dropped (shutdown, crash, abandon, restart), and fail closed until removal is confirmed. Never delete the durable evidence before the final release report has been saved.
+- Give every subprocess an explicit allowlisted environment. Pass credentials only to the component that needs them, through a separate channel. Name-based scrubbing of an inherited environment is not isolation. Run Git with the repository's hardened invocation: no user or system config, no hooks, no lazy fetch, no network protocols.
+- Treat paths read from a durable record or discovered on disk as untrusted. Before deleting, opening or probing one, validate its exact location and name, not only its basename, and never follow a link to it. Keep files that other local users must not plant or swap, such as lock files, in a directory only the current user can write. Write durable records through a unique temporary file opened exclusively, and delete it if the write fails.
+- Exclude other processes with an OS-level lock held for the owner's lifetime, keyed by the resource's stable identity rather than a path spelling. A PID liveness check never authorizes taking over a lock. Run shared one-time startup work single-flight under that lock, and keep the lock until the work has finished.
+
 ## Blinded experiments
 
 - Keep experimental PRs as drafts with automated review disabled until the assigned human decision is recorded. An automated review invalidates reviewer blindness; replace the affected package rather than reusing it.

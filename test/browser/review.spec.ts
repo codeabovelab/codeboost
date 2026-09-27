@@ -454,7 +454,8 @@ test('drains an in-flight question request before closing its agent manager',asy
  const reopened=new ReviewService(config);
  try {
   const note=reopened.load().notes.find(note=>note.text==='Question during shutdown');
-  expect(calls).toBe(1);expect(note?.answer?.status).toBe('failed');expect(note?.answer?.error).toMatch(/Server stopped/);
+  // Shutdown had begun, so no agent was started; the saved question still gets a retryable failed answer.
+  expect(calls).toBe(0);expect(note?.answer?.status).toBe('failed');expect(note?.answer?.error).toMatch(/Server stopped/);
   expect(JSON.parse(response).notes.some((candidate:{text:string})=>candidate.text==='Question during shutdown')).toBe(true);
  } finally {reopened.close();app=await startServer(config,0);}
 });
