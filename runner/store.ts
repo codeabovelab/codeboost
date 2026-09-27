@@ -261,6 +261,7 @@ export class Store {
         entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now, actionId,
       };
       this.#run('INSERT INTO merge_attempts VALUES (?,?,?)', attempt.id, key, encode(attempt));
+      this.#touch(key);
       return attempt;
     });
   }
@@ -273,6 +274,8 @@ export class Store {
       if (!allowed.includes(attempt.state)) return false;
       const next = { ...change(attempt), updatedAt: new Date().toISOString() };
       if (this.#run('UPDATE merge_attempts SET data=? WHERE id=? AND key=?', encode(next), id, key).changes !== 1) return false;
+      // A merge attempt change is a durable task change: bump the state version, not the context generation.
+      this.#touch(key);
       // The same transaction refreshes the starting action's replay, so a resent merge click reports this outcome.
       if (next.actionId) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND json_extract(response,'$.ok')=1`,
         encode({ ok: true, value: mergeActionResponse(next) }), key, next.actionId);
@@ -600,6 +603,7 @@ export class Store {
       const task = this.#task(key);
       if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal('A closed task never changes.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
       this.#run('UPDATE tasks SET assignment_id=?, referenced_code_hash=? WHERE plan_key=?', assignmentId, referencedCodeHash, key);
       this.#bumpContext(key);
     });

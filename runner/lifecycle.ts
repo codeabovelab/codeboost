@@ -90,7 +90,8 @@ export function classifySettlement(s: Settlement): Classification {
     case 'time-limit': return { state: 'cancelled', reason: 'Task time limit reached', timeLimit: true };
   }
   if (!s.contextCurrent) return { state: 'stale', reason: 'The plan, snapshot, assignment or referenced code changed.', timeLimit: false };
-  if (dFailure) return { state: 'failed', reason: dReason(), timeLimit: false };
+  // With no first reason, any D stop reason means the agent did not finish normally, even with exit 0.
+  if (dFailure || s.stopReason) return { state: 'failed', reason: dReason(), timeLimit: false };
   if (s.exitCode === 0 && s.valid) return { state: 'completed', reason: null, timeLimit: false };
   return { state: 'failed', reason: bounded(s.detail ?? `Agent exited with code ${s.exitCode ?? 'none'}.`), timeLimit: false };
 }

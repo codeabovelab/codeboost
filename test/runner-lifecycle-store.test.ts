@@ -37,6 +37,9 @@ describe('settlement precedence', () => {
     expect(classifySettlement({ ...base, firstReason: 'cancelled', exitCode: 1 }).state).toBe('cancelled');
     expect(classifySettlement({ ...base, firstReason: 'stale' }).state).toBe('stale');
     expect(classifySettlement({ ...base, firstReason: 'time-limit' })).toMatchObject({ state: 'cancelled', reason: 'Task time limit reached', timeLimit: true });
+    // Without a first reason, any D stop reason is not a normal finish, even with exit 0 and valid output.
+    for (const stopReason of ['cancelled', 'shutdown'] as const)
+      expect(classifySettlement({ ...base, firstReason: null, stopReason })).toMatchObject({ state: 'failed', reason: `Agent stopped: ${stopReason}.` });
     // A D stop that came before shutdown wins; otherwise shutdown cancels.
     expect(classifySettlement({ ...base, firstReason: 'shutdown', stopReason: 'timeout' })).toMatchObject({ state: 'failed', reason: 'Timed out.' });
     expect(classifySettlement({ ...base, firstReason: 'shutdown', stopReason: 'shutdown' })).toMatchObject({ state: 'cancelled', reason: 'Stopped by shutdown' });
@@ -250,6 +253,23 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses reassignment while a merge is in flight and counts merge changes in the state version', () => {
+    const { store } = fixture();
+    const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
+    const before = store.getTask(identity);
+    const merge = store.beginMergeAttempt(identity, state, oid(2), 'cursor', 'queue');
+    const begun = store.getTask(identity);
+    expect(begun.stateVersion).toBe(before.stateVersion + 1);
+    expect(begun.contextGeneration).toBe(before.contextGeneration);
+    expect(() => store.setAssignment(identity, begun.stateVersion, 'other', 'other-hash')).toThrow(/merge is in progress/);
+    store.queueMergeAttempt(identity, merge.id, 'https://github.com/o/r/pull/1');
+    expect(store.getTask(identity).stateVersion).toBe(begun.stateVersion + 1);
+    store.finishMergeAttempt(identity, merge.id, { state: 'removed', reason: 'Removed from the queue.' });
+    const finished = store.getTask(identity);
+    expect(finished.stateVersion).toBe(begun.stateVersion + 2);
+    expect(finished.contextGeneration).toBe(before.contextGeneration);
+    store.setAssignment(identity, finished.stateVersion, 'other', 'other-hash');
+  });
   it('refuses to reassign work on a closed task', () => {
     const { store } = fixture();
     store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
