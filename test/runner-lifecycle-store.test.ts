@@ -253,6 +253,16 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses plan edits on a closed task and keeps its counters while HEAD is still observed', () => {
+    const { store } = fixture();
+    store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    const closed = store.getTask(identity);
+    expect(() => store.importRevision(JSON.stringify(plan('After close')), 'json', context, 1)).toThrow(/closed task never changes/);
+    expect(store.getPlan(identity).revision).toBe(1);
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(5), []);
+    expect(store.getSnapshot(identity).head).toBe(oid(5));
+    expect(store.getTask(identity)).toMatchObject({ status: 'cancelled', stateVersion: closed.stateVersion, contextGeneration: closed.contextGeneration });
+  });
   it('refuses plan edits during a merge and closes the task in the context it merged', () => {
     const { store } = fixture();
     const reviewed = store.getSnapshot(identity).id;

@@ -149,6 +149,7 @@ export class Store {
   #savePlan(key: string, plan: Plan, expected: number): void {
     // A plan edit must not land while GitHub may still merge the head reviewed against the current revision.
     if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
     if (this.#run('UPDATE plans SET revision=? WHERE key=? AND revision=?', plan.revision, key, expected).changes !== 1) throw new Error('Stale plan revision.');
     this.#run('INSERT INTO revisions VALUES (?,?,?)', key, plan.revision, encode(plan));
     this.#bumpContext(key);
@@ -196,7 +197,8 @@ export class Store {
     const snapshot = { id: randomUUID(), base, head };
     this.#run('INSERT INTO snapshots VALUES (?,?,?)', key, snapshot.id, encode(snapshot));
     this.#run('UPDATE plans SET snapshot_id=? WHERE key=?', snapshot.id, key);
-    this.#bumpContext(key);
+    // HEAD is still observed after a task closes (the review screen reads it), but a closed task never changes.
+    if (!this.#taskClosed(key)) this.#bumpContext(key);
     this.#run("UPDATE requests SET state='invalidated',reason='Repository snapshot changed.' WHERE key=? AND state IN ('pending','ready')", key);
     return snapshot;
   }
@@ -569,6 +571,11 @@ export class Store {
     this.#run('UPDATE tasks SET state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
   }
   /** A change an attempt depends on increases both counters in the caller's transaction. */
+  /** Whether the task is merged or cancelled. False before createPlan has inserted the task row. */
+  #taskClosed(key: string): boolean {
+    const row = this.#get('SELECT status FROM tasks WHERE plan_key=?', key);
+    return !!row && this.#closed(row.status as TaskStatus);
+  }
   #bumpContext(key: string): void {
     this.#run('UPDATE tasks SET context_generation=context_generation+1, state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
   }
