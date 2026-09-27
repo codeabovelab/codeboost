@@ -6,6 +6,7 @@ import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
+import { isUuidV4 } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
@@ -72,6 +73,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           questions.start(input.id,view);json(200,await load(requestAbort.signal));return;
         }
         if(input.action==='merge') {
+          // Every merge click carries its idempotency key; a request without one would bypass replay.
+          if(!isUuidV4(input.actionId)) { json(400,{error:'A merge request needs a UUID v4 actionId.'}); return; }
           if(!merges)throw new Error('Merging is not configured for this review.');
           const merged=await merges.merge(input.token,input.actionId);
           try { const mergeQueue=merges.queueSnapshot();json(200,{...loadReview(),merge:{...merged.status,queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }

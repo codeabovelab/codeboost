@@ -21,6 +21,11 @@ function requestAdmitted(server: typeof app.server) {
 function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
 test.afterEach(async () => { await app.close();rmSync(root,{recursive:true,force:true}); });
+test('refuses a merge request without an idempotency key before doing any work',async()=>{
+ const view=app.service.load(),post=(body:object)=>fetch(new URL('/api/action',app.url),{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json'},body:JSON.stringify(body)});
+ for(const actionId of [undefined,'not-a-uuid']){const response=await post({action:'merge',token:view.token,actionId});expect(response.status).toBe(400);expect((await response.json()).error).toMatch(/actionId/);}
+ expect(app.service.store.getMergeAttempt(app.service.config.identity)).toBeNull();
+});
 test('reviews real changes, persists approval and conversation, and assigns foreign code',async({page})=>{
   const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
@@ -464,7 +469,7 @@ test('drains an admitted merge request before closing its coordinator',async()=>
  const commandStarted=new Promise<void>(resolve=>{started=resolve;}),held=new Promise<void>(resolve=>{release=resolve;});
  const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async(_head,options)=>{commandSignal=options?.signal;started();await held;return {url:'https://github.com/example/repo/pull/24'};}};
  app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'merge',token:view.token});let status=0;
+ const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'merge',token:view.token,actionId:randomUUID()});let status=0;
  const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.resume();res.on('end',resolve);});req.on('error',reject);req.end(body);});
  await commandStarted;const closing=app.close();await new Promise(resolve=>setTimeout(resolve,25));expect(commandSignal?.aborted).toBe(false);release();await Promise.all([closing,completed]);expect(status).toBe(200);app=await startServer(config,0);
 });
@@ -495,7 +500,7 @@ test('blocks a partially received merge request when shutdown starts',async()=>{
  app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();
  for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});
  for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const body=JSON.stringify({action:'merge',token:view.token}),endpoint=new URL('/api/action',app.url);let status=0,response='',finish!:()=>void;const {admitted,marker}=requestAdmitted(app.server);
+ const body=JSON.stringify({action:'merge',token:view.token,actionId:randomUUID()}),endpoint=new URL('/api/action',app.url);let status=0,response='',finish!:()=>void;const {admitted,marker}=requestAdmitted(app.server);
  // Another client, such as a polling tab, reaches the server first; shutdown must still wait for the merge request itself.
  expect((await fetch(new URL('/api/settings',app.url),{headers:{'x-codeboost-token':app.token}})).status).toBe(200);
  const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{...marker,'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);});req.on('error',reject);req.write(body.slice(0,1));finish=()=>req.end(body.slice(1));});
