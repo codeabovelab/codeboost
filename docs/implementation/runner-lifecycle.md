@@ -16,7 +16,7 @@
 - the order of steps when the program shuts down;
 - the feedback events that the learning lane (J) will read.
 
-**When implementation starts.** The plan starts F implementation after D5 merges, and D5 merged as #50. F1 code can start now. The attempt lifecycle itself uses only the D interface already on `main` (`agents/contract.ts`), which D4 (#47) did not change. Preparation, shutdown and startup recovery need D changes. Bounded settlement is done (#51 item 1). These do **not** exist yet: `runnerOwner` (and the attempt ID) on `InvocationInput` and on every allocator that runs before an invocation; a scoped `recoverLeftovers` API that returns authenticated storage handles; and asynchronous, abortable versions of both preparation helpers, `createTaskClone` and `prepareTaskFilesystems`. They are listed as prerequisites under "Shutdown". D5 delivered none of them. They are tracked in #51. The F1 implementation may start against fakes, but it must not merge until #51's pre-F1 items land.
+**When implementation starts.** The plan starts F implementation after D5 merges, and D5 merged as #50. F1 code can start now. The attempt lifecycle itself uses only the D interface already on `main` (`agents/contract.ts`), which D4 (#47) did not change. Preparation, shutdown and startup recovery need D changes. Bounded settlement (#51 item 1) and asynchronous launch (#51 item 2) are done. These do **not** exist yet: `runnerOwner` (and the attempt ID) on `InvocationInput` and on every allocator that runs before an invocation; a scoped `recoverLeftovers` API that returns authenticated storage handles; and asynchronous, abortable versions of both preparation helpers, `createTaskClone` and `prepareTaskFilesystems`. They are listed as prerequisites under "Shutdown". D5 delivered none of them. They are tracked in #51. The F1 implementation may start against fakes, but it must not merge until #51's pre-F1 items land.
 
 ## Summary
 
@@ -146,7 +146,7 @@ A `pending` attempt has no `settled` promise, so the slot rules need a separate 
 
 In every case, a failed terminal write leaves an unresolved marker (see "Slots and concurrency", rule 5).
 
-**Launch setup must not block the server.** The D4 adapters do their Docker setup synchronously inside the start call: `createVendorNetwork`, profile creation and `startProfileInvocation` use `execFileSync` and `spawnSync` (`agents/network/network.ts`, `agents/container/`). While that runs, the event loop cannot set `closing`, cancel the launch, or begin the HTTP drain. **Prerequisite:** D's start call must return its handle at once and do the Docker setup asynchronously inside that handle's lifecycle. Then `cancel()` works during setup, and `settled` resolves only after setup cleanup. It is listed with the other D prerequisites under "Shutdown".
+**Launch setup does not block the server.** Done in #51 item 2. D's start calls (`startClaudeInvocation`, `startCodexInvocation`, `startProfileInvocation`) return their handle at once and run the Docker setup (vendor network, container profile, container create and validation) asynchronously inside that handle's lifecycle. `cancel()` during setup kills the in-flight Docker call, and `settled` resolves only after setup cleanup; the invocation deadline also bounds setup. A start call now throws only when it allocated nothing: invalid input, an expired budget, or an attempt ID that another handle still owns. Every other setup failure settles the handle with a `stopReason` and a diagnostic. Task storage and the clone are still prepared synchronously (item 5).
 
 **Rule for D.** D's start call must keep this shape: it either throws with nothing left running, or it returns a handle that settles only after everything it started has stopped. An adapter that needs an asynchronous start must still follow this rule. Changing it is a change to D's contract.
 
@@ -258,7 +258,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 This belongs to D (D5 or a D follow-up), not F. It changes `agents/contract.ts`, so it goes through D's contract tests.
 
-**Also before F1 merges: asynchronous launch.** D's start call must return a handle immediately and run its Docker setup asynchronously and abortably (see "Launch setup must not block the server").
+**Also before F1 merges: asynchronous launch.** Done in #51 item 2 (see "Launch setup does not block the server").
 
 **Third prerequisite before F1 merges: abortable preparation helpers.** Both preparation helpers are synchronous today. `createTaskClone` runs git with `execFileSync`, and `prepareTaskFilesystems` runs `docker` with `execFileSync` and `spawnSync` (`agents/container/storage.ts`). Either would block the event loop, and cancel or shutdown could not abort it. D must add asynchronous variants of both that take an `AbortSignal`, spawn their subprocesses in their own process group, expose the group ID, and settle only after those processes have exited. Storage allocation must also label its volumes with the runner owner and attempt ID before it returns (see "Recovered storage handles"), so that storage allocated just before a crash is found by recovery.
 

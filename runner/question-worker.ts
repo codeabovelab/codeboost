@@ -8,7 +8,7 @@ import { createTaskClone } from '../git/clone.ts';
 import { askInContainer, measureGitRepository, RetainedStorage, StopError, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
 import type { Leftover } from './question-leftovers.ts';
 
-// Lane D setup is synchronous (Docker and Git calls), so it runs here instead of blocking the review server.
+// Lane D's image build, clone and storage allocation are synchronous (Docker and Git calls), so they run here instead of blocking the review server.
 // Its trust registries (built image, clones, allocations, captured invocations) live in this worker's modules.
 export type WorkerRequest = { type: 'ask'; id: string; question: ContainerQuestion } | { type: 'cancel'; id: string; reason: string; stop: StopError['stop'] }
   | { type: 'release'; id: string };

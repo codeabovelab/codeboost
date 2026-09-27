@@ -9,11 +9,16 @@ import type { ContainerProfile } from '../agents/container/profile.ts';
 const state = vi.hoisted(() => ({
   created: new WeakSet<object>(),
   createFails: false,
+  createHangs: false,
+  createSignals: [] as AbortSignal[],
+  disposeOk: false,
+  spawned: 0,
   budgets: [] as number[],
 }));
 vi.mock('node:child_process', () => ({
   execFile: vi.fn(),
   spawn: vi.fn(() => {
+    state.spawned += 1;
     const child = Object.assign(new EventEmitter(), { stdout: new PassThrough(), stderr: new PassThrough(), kill: vi.fn() });
     process.nextTick(() => child.emit('close', 0, null));
     return child;
@@ -27,20 +32,24 @@ vi.mock('../agents/container/profile.ts', () => ({
   containerProfileResources: (profile: { resources: readonly UnreleasedResource[] }) => profile.resources,
 }));
 vi.mock('../agents/container/run.ts', () => ({
-  createValidatedContainer: (profile: object) => {
+  createValidatedContainer: async (profile: object, _timeoutMs: number, _secrets: object, signal: AbortSignal) => {
+    state.createSignals.push(signal);
+    if (state.createHangs) await new Promise((_resolve, reject) =>
+      signal.addEventListener('abort', () => reject(new Error('docker create was cancelled.'))));
     if (state.createFails) throw new Error('Conflict. The container name is already in use by another invocation.');
     state.created.add(profile);
   },
   validateContainer: () => {},
-  disposeValidatedContainer: (_profile: object, budget: number) => {
+  disposeValidatedContainer: async (_profile: object, budget: number) => {
     state.budgets.push(budget);
-    throw new Error('Cannot connect to the Docker daemon');
+    if (!state.disposeOk) throw new Error('Cannot connect to the Docker daemon');
   },
   agentContainerResources: (profile: { name: string }) => state.created.has(profile)
     ? [{ kind: 'container', name: profile.name, id: 'c'.repeat(64),
       owner: { label: 'io.codeboost.invocation', value: 'own' } }] : [],
 }));
-const { CLEANUP_RETRY_WINDOW_MS, isInvocationActive, startProfileInvocation } = await import('../agents/adapters/supervisor.ts');
+const { CLEANUP_RETRY_WINDOW_MS, isInvocationActive, launchInvocation,
+  startProfileInvocation } = await import('../agents/adapters/supervisor.ts');
 
 describe('startProfileInvocation bounded cleanup', () => {
   const networkAndStaging: readonly UnreleasedResource[] = [
@@ -61,7 +70,8 @@ describe('startProfileInvocation bounded cleanup', () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-    state.createFails = false; state.budgets = [];
+    Object.assign(state, { createFails: false, createHangs: false, createSignals: [], disposeOk: false, spawned: 0,
+      budgets: [] });
   });
   afterEach(() => { vi.useRealTimers(); });
 
@@ -104,5 +114,56 @@ describe('startProfileInvocation bounded cleanup', () => {
     await vi.advanceTimersByTimeAsync(CLEANUP_RETRY_WINDOW_MS + 2_000);
     expect(box.result?.stopReason).toBe('capture-failure');
     expect(box.result?.unreleased).toBeDefined();
+  });
+
+  it('returns before container setup finishes, and a cancel during setup kills it before anything starts', async () => {
+    state.createHangs = true; state.disposeOk = true;
+    let turned = false;
+    const handle = startProfileInvocation(fakeProfile('setup-cancel'));
+    setTimeout(() => { turned = true; }, 0);
+    await vi.advanceTimersByTimeAsync(0);
+    // Setup is still in flight, yet the event loop moved on and the attempt is owned.
+    expect(turned).toBe(true);
+    expect(isInvocationActive('setup-cancel')).toBe(true);
+    expect(state.createSignals[0]?.aborted).toBe(false);
+    const box = watch(handle.settled);
+    handle.cancel('shutdown');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(state.createSignals[0]?.aborted).toBe(true);
+    expect(box.result?.stopReason).toBe('shutdown');
+    expect(box.result).not.toHaveProperty('unreleased');
+    expect(state.budgets).toEqual([30_000]); // everything the profile owns was released before settling
+    expect(state.spawned).toBe(0);
+    expect(isInvocationActive('setup-cancel')).toBe(false);
+  });
+
+  it('reports a timeout when the deadline passes during setup', async () => {
+    state.createHangs = true; state.disposeOk = true;
+    const profile = fakeProfile('setup-deadline');
+    const handle = startProfileInvocation(profile, { timeoutMs: 5_000 });
+    const box = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(5_001);
+    expect(state.createSignals[0]?.aborted).toBe(true);
+    expect(box.result?.stopReason).toBe('timeout');
+    expect(state.spawned).toBe(0);
+  });
+
+  it('forwards a cancel made during adapter setup to the supervisor it hands off to', async () => {
+    state.disposeOk = true;
+    const profile = fakeProfile('handoff-cancel');
+    let release!: () => void;
+    const ready = new Promise<void>(resolve => { release = resolve; });
+    const invocation = (profile.policy as unknown as { invocation: never }).invocation;
+    const handle = launchInvocation(invocation, () => 60_000, async (_signal, start) => {
+      await ready; // setup finished its Docker work just as the cancel arrived
+      return start(profile);
+    });
+    const box = watch(handle.settled);
+    handle.cancel('cancelled');
+    release();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(box.result?.stopReason).toBe('cancelled');
+    expect(state.spawned).toBe(0);
+    expect(isInvocationActive('handoff-cancel')).toBe(false);
   });
 });

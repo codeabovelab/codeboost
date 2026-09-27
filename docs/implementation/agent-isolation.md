@@ -65,8 +65,11 @@ Use only these entry points to run an agent:
    on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
-4. `startCodexInvocation` or `startClaudeInvocation` runs the agent and returns a
-   handle. Pass the vendor credential only as the function argument.
+4. `startCodexInvocation` or `startClaudeInvocation` returns a handle at once and runs
+   the Docker setup and the agent inside it. It throws only when it allocated nothing
+   (invalid input, an expired budget, or an attempt ID that is still owned); every
+   later failure settles the handle. `cancel()` during setup kills the in-flight Docker
+   call. Pass the vendor credential only as the function argument.
 
 The boundary guarantees the following:
 
@@ -98,8 +101,9 @@ The caller must do the following:
 
 Ask (`runner/question-container.ts`) is the first production caller. It follows the four entry points above in the
 "questions" phase with no approved commands, clones the reviewed snapshot head, and writes a fixed answer schema as the
-only input file. Because every entry point above is synchronous, a worker thread (`runner/question-worker.ts`) owns the
-image, clones and allocations, so the review server keeps serving while Docker and Git run. The worker settles a
+only input file. Because the image build, the clone and storage allocation are still synchronous (#51 item 5), a worker thread
+(`runner/question-worker.ts`) owns the image, clones and allocations, so the review server keeps serving while Docker
+and Git run. The adapters' start calls are asynchronous (#51 item 2). The worker settles a
 question only after the invocation settles and its storage is removed.
 
 Ask keeps the contract's identity and cleanup rules:

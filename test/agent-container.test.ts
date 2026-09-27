@@ -18,7 +18,7 @@ import { createClaudeCommand, createCodexCommand, createIsolationProbeCommand, c
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
 const containers = new Set<string>();
-const profiles: ReturnType<typeof createContainerProfile>[] = [];
+const profiles: Awaited<ReturnType<typeof createContainerProfile>>[] = [];
 let imageId = '';
 const vendorNetworks: VendorNetwork[] = [];
 const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
@@ -59,22 +59,22 @@ function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, ven
     context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
       referencedCodeHash: 'code-1', stateVersion: 1 } });
 }
-const governed = (captured: InvocationInput, probe: IsolationProbe = 'noop') => {
-  const policy = createPhasePolicy(captured), network = createVendorNetwork(captured, imageId);
+const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop') => {
+  const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId);
   vendorNetworks.push(network);
   return { invocation: captured, policy, network, command: createIsolationProbeCommand(policy, probe) };
 };
 
-function profile(data: ReturnType<typeof fixture>, phase: Phase,
+async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
   vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
-  const policy = createPhasePolicy(captured), network = createVendorNetwork(captured, imageId);
+  const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId);
   vendorNetworks.push(network);
   const trustedCommand = typeof command === 'string' ? createIsolationProbeCommand(policy, command) : command(policy);
-  const base = createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
+  const base = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
     inputDirectory: data.input, command: trustedCommand, imageId,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
@@ -82,17 +82,17 @@ function profile(data: ReturnType<typeof fixture>, phase: Phase,
   return base;
 }
 
-beforeAll(() => {
+beforeAll(async () => {
   imageId = buildAgentImage();
 }, 10 * 60_000);
-afterEach(() => {
-  for (const network of vendorNetworks.splice(0).reverse()) removeVendorNetwork(network);
+afterEach(async () => {
+  for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
 }, 120_000);
-afterAll(() => {
+afterAll(async () => {
   for (const container of containers) spawnSync('docker', ['rm', '--force', container], { stdio: 'ignore' });
   for (const filesystems of taskFilesystems.reverse()) removeTaskFilesystems(filesystems);
-  for (const profile of profiles) disposeContainerProfile(profile);
-  for (const network of vendorNetworks.splice(0).reverse()) removeVendorNetwork(network);
+  for (const profile of profiles) await disposeContainerProfile(profile);
+  for (const network of vendorNetworks.splice(0).reverse()) await removeVendorNetwork(network);
   for (const root of roots.reverse()) {
     chmodSync(join(root, 'input'), 0o700);
     rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
@@ -101,60 +101,60 @@ afterAll(() => {
 
 describe('real Docker agent isolation', () => {
   it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(
-    '%s applies its enforced worktree access profile', phase => {
+    '%s applies its enforced worktree access profile', async phase => {
       const data = fixture();
-      expect(runContainer(profile(data, phase, 'phase-worktree'))).toBe('');
+      expect(await runContainer(await profile(data, phase, 'phase-worktree'))).toBe('');
     }, 60_000);
 
-  it('removes the invocation proxy and network after the container settles', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
-    expect(runContainer(valid)).toBe('');
+  it('removes the invocation proxy and network after the container settles', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
+    expect(await runContainer(valid)).toBe('');
     expect(spawnSync('docker', ['container', 'inspect', valid.network.proxyContainer]).status).not.toBe(0);
     expect(spawnSync('docker', ['network', 'inspect', valid.network.name]).status).not.toBe(0);
   }, 60_000);
 
-  it('runs read-only with no root capabilities, host paths, inherited secrets, or writable tools', () => {
+  it('runs read-only with no root capabilities, host paths, inherited secrets, or writable tools', async () => {
     const data = fixture();
     process.env.HOST_SECRET_SENTINEL = 'must-not-reach-container';
     try {
-      const output = runContainer(profile(data, 'planning', 'read-only-isolation'));
+      const output = await runContainer(await profile(data, 'planning', 'read-only-isolation'));
       expect(output).toBe('isolated');
     } finally { delete process.env.HOST_SECRET_SENTINEL; }
   }, 60_000);
 
-  it('seeds Git history larger than the work allocation into the metadata volume only', () => {
+  it('seeds Git history larger than the work allocation into the metadata volume only', async () => {
     const data = fixture({ historyBytes: 4 * 1024 * 1024, limits: {
       workBytes: 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
     } });
-    expect(runContainer(profile(data, 'execute', 'metadata'))).toBe('metadata-safe');
+    expect(await runContainer(await profile(data, 'execute', 'metadata'))).toBe('metadata-safe');
   }, 60_000);
 
-  it('accepts byte limits that tmpfs rounds up to a whole page', () => {
+  it('accepts byte limits that tmpfs rounds up to a whole page', async () => {
     const data = fixture({ limits: {
       workBytes: 16 * 1024 * 1024 + 1, workInodes: 512, metadataBytes: 16 * 1024 * 1024 + 1, metadataInodes: 512,
     } });
-    expect(runContainer(profile(data, 'execute', 'noop'))).toBe('');
+    expect(await runContainer(await profile(data, 'execute', 'noop'))).toBe('');
   }, 60_000);
 
-  it('requests private IPC and cgroup namespaces instead of relying on daemon defaults', () => {
-    const args = profile(fixture(), 'planning', 'noop').args;
+  it('requests private IPC and cgroup namespaces instead of relying on daemon defaults', async () => {
+    const args = (await profile(fixture(), 'planning', 'noop')).args;
     expect(args).toContain('--ipc=private');
     expect(args).toContain('--cgroupns=private');
   }, 60_000);
 
   it.each(['planning', 'review', 'execute'] as const)(
-    'keeps Git metadata unchanged under link, alias, truncation and replacement attempts during %s', phase => {
-      expect(runContainer(profile(fixture(), phase, 'metadata-alias'))).toBe('metadata-unchanged');
+    'keeps Git metadata unchanged under link, alias, truncation and replacement attempts during %s', async phase => {
+      expect(await runContainer(await profile(fixture(), phase, 'metadata-alias'))).toBe('metadata-unchanged');
     }, 60_000);
 
-  it('enforces byte and inode ceilings on every Codex scratch area', () => {
-    expect(runContainer(profile(fixture(), 'execute', 'scratch-capacity'))).toBe('scratch-bounded');
+  it('enforces byte and inode ceilings on every Codex scratch area', async () => {
+    expect(await runContainer(await profile(fixture(), 'execute', 'scratch-capacity'))).toBe('scratch-bounded');
   }, 120_000);
 
-  it('enforces byte and inode ceilings on every Claude scratch area', () => {
+  it('enforces byte and inode ceilings on every Claude scratch area', async () => {
     const placeholder = 'offline-placeholder-token';
-    const claude = profile(fixture(), 'execute', 'scratch-capacity', { vendor: 'claude', claudeToken: placeholder });
-    expect(runContainer(claude, 60_000, { CLAUDE_CODE_OAUTH_TOKEN: placeholder })).toBe('scratch-bounded');
+    const claude = await profile(fixture(), 'execute', 'scratch-capacity', { vendor: 'claude', claudeToken: placeholder });
+    expect(await runContainer(claude, 60_000, { CLAUDE_CODE_OAUTH_TOKEN: placeholder })).toBe('scratch-bounded');
   }, 120_000);
 
   it.each([
@@ -177,7 +177,7 @@ describe('real Docker agent isolation', () => {
       symlinkSync('../..', join(source, 'deep', 'er', 'top'));
       symlinkSync('deep/er/top/../run/codeboost-auth/codex/auth.json', join(source, 'chained'));
     }],
-  ] as const)('refuses to seed a repository with %s, before any storage exists', (_label, hostile) => {
+  ] as const)('refuses to seed a repository with %s, before any storage exists', async (_label, hostile) => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
@@ -185,7 +185,7 @@ describe('real Docker agent isolation', () => {
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
-  it('refuses to seed a clone whose Git metadata contains a link, before any storage exists', () => {
+  it('refuses to seed a clone whose Git metadata contains a link, before any storage exists', async () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-git-link',
       head: git(data.source, 'rev-parse', 'HEAD') });
@@ -200,7 +200,7 @@ describe('real Docker agent isolation', () => {
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
-  it('seeds links that stay inside the checkout, including loops and not-yet-existing targets', () => {
+  it('seeds links that stay inside the checkout, including loops and not-yet-existing targets', async () => {
     const data = fixture({ hostile: source => {
       mkdirSync(join(source, 'docs'));
       writeFileSync(join(source, 'docs', 'guide.md'), 'guide\n');
@@ -212,11 +212,11 @@ describe('real Docker agent isolation', () => {
       symlinkSync('later.txt', join(source, 'future'));
     } });
     const started = performance.now();
-    expect(runContainer(profile(data, 'planning', 'hostile-repo'))).toBe('hostile-repo-contained');
+    expect(await runContainer(await profile(data, 'planning', 'hostile-repo'))).toBe('hostile-repo-contained');
     expect(performance.now() - started).toBeLessThan(30_000);
   }, 60_000);
 
-  it('fails closed without leaving storage when a repository exceeds its allocation', () => {
+  it('fails closed without leaving storage when a repository exceeds its allocation', async () => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
@@ -226,91 +226,91 @@ describe('real Docker agent isolation', () => {
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
-  it('persists execution changes while replacing HOME and scratch for each invocation', () => {
+  it('persists execution changes while replacing HOME and scratch for each invocation', async () => {
     const data = fixture();
-    expect(runContainer(profile(data, 'execute', 'persist-write'))).toBe('first');
-    const output = runContainer(profile(data, 'execute', 'persist-read'));
+    expect(await runContainer(await profile(data, 'execute', 'persist-write'))).toBe('first');
+    const output = await runContainer(await profile(data, 'execute', 'persist-read'));
     expect(output).toContain('?? generated.txt');
   }, 60_000);
 
-  it('enforces work byte and inode ceilings before writes can exceed the allocation', () => {
+  it('enforces work byte and inode ceilings before writes can exceed the allocation', async () => {
     const data = fixture();
-    const output = runContainer(profile(data, 'execute', 'capacity'));
+    const output = await runContainer(await profile(data, 'execute', 'capacity'));
     expect(output).toBe('bounded');
   }, 60_000);
 
-  it('keeps Git metadata read-only, on another filesystem, and mounted against replacement', () => {
+  it('keeps Git metadata read-only, on another filesystem, and mounted against replacement', async () => {
     const data = fixture();
-    const output = runContainer(profile(data, 'execute', 'metadata'));
+    const output = await runContainer(await profile(data, 'execute', 'metadata'));
     expect(output).toBe('metadata-safe');
   }, 60_000);
 
-  it('refuses a container missing read-only root before its command runs', () => {
+  it('refuses a container missing read-only root before its command runs', async () => {
     const data = fixture();
-    const valid = profile(data, 'planning', 'must-not-run');
+    const valid = await profile(data, 'planning', 'must-not-run');
     const args = valid.args.filter(value => value !== '--read-only');
     docker(...args);
     containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     const result = spawnSync('docker', ['start', '--attach', valid.name], { encoding: 'utf8', timeout: 30_000 });
     expect(result.status).not.toBe(0);
     containers.delete(valid.name); docker('rm', '--force', valid.name);
   }, 60_000);
 
-  it('rejects mixed credentials and unsupported command/profile inputs', () => {
+  it('rejects mixed credentials and unsupported command/profile inputs', async () => {
     const data = fixture();
-    expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning', 'codex')),
+    await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning', 'codex')),
       filesystems: data.filesystems, inputDirectory: data.input, codexAuthFile: data.fakeAuth,
-      claudeToken: 'must-not-combine', imageId })).toThrow('only');
-    expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning', 'claude')),
-      filesystems: data.filesystems, inputDirectory: data.input, imageId })).toThrow('OAuth');
-    const claudeProfile = createContainerProfile({ ...governed(invocation(data.clone, 'planning', 'claude')),
+      claudeToken: 'must-not-combine', imageId })).rejects.toThrow('only');
+    await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning', 'claude')),
+      filesystems: data.filesystems, inputDirectory: data.input, imageId })).rejects.toThrow('OAuth');
+    const claudeProfile = await createContainerProfile({ ...await governed(invocation(data.clone, 'planning', 'claude')),
       filesystems: data.filesystems, inputDirectory: data.input, imageId, claudeToken: 'serialization-sentinel' });
     expect(JSON.stringify(claudeProfile)).not.toContain('serialization-sentinel');
-    expect(() => createValidatedContainer(claudeProfile)).toThrow('OAuth environment credential');
-    const untrusted = governed(invocation(data.clone, 'planning'));
-    expect(() => createContainerProfile({ ...untrusted, command: { argv: ['true'] }, filesystems: data.filesystems,
-      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).toThrow('not generated');
-    expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning')),
+    await expect(createValidatedContainer(claudeProfile)).rejects.toThrow('OAuth environment credential');
+    const untrusted = await governed(invocation(data.clone, 'planning'));
+    await expect(createContainerProfile({ ...untrusted, command: { argv: ['true'] }, filesystems: data.filesystems,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('not generated');
+    await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')),
       filesystems: data.filesystems, inputDirectory: data.input, codexAuthFile: data.fakeAuth,
-      imageId: AGENT_IMAGE })).toThrow('immutable built image ID');
+      imageId: AGENT_IMAGE })).rejects.toThrow('immutable built image ID');
     chmodSync(data.input, 0o755); writeFileSync(join(data.input, 'extra.json'), '{}'); chmodSync(data.input, 0o555);
-    expect(() => profile(data, 'planning', 'noop')).toThrow('only one bounded');
+    await expect(profile(data, 'planning', 'noop')).rejects.toThrow('only one bounded');
   }, 60_000);
 
-  it('rejects unexpected host mounts and unbounded task volumes after Docker resolves them', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects unexpected host mounts and unbounded task volumes after Docker resolves them', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     const extraMountArgs = [...valid.args.slice(0, imageIndex), '--mount',
       'type=bind,source=/tmp,target=/unexpected,readonly', ...valid.args.slice(imageIndex)];
     docker(...extraMountArgs); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('unexpected external mount');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('unexpected external mount');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
     const rogue = `codeboost-work-${randomUUID()}`; docker('volume', 'create', rogue);
     try {
       const rogueArgs = valid.args.map(value => value.replace(data.filesystems.workVolume, rogue));
       docker(...rogueArgs); containers.add(valid.name);
-      expect(() => validateContainer(valid.name, valid)).toThrow('captured identity');
+      await expect(validateContainer(valid.name, valid)).rejects.toThrow('captured identity');
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     } finally { spawnSync('docker', ['volume', 'rm', '--force', rogue], { stdio: 'ignore' }); }
   }, 60_000);
 
-  it('rejects cloned profiles while sealed snapshots ignore later host changes', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'input-marker');
+  it('rejects cloned profiles while sealed snapshots ignore later host changes', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'input-marker');
     const forged = Object.freeze({ ...valid, inputDirectory: '/',
       args: Object.freeze(valid.args.map(value => value.includes(`source=${data.input},`)
         ? value.replace(`source=${data.input},`, 'source=/,') : value)) });
-    expect(() => createValidatedContainer(forged)).toThrow('trusted profile builder');
+    await expect(createValidatedContainer(forged)).rejects.toThrow('trusted profile builder');
 
-    expect(() => createContainerProfile({ ...governed(invocation(data.clone, 'planning')),
+    await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')),
       filesystems: { ...data.filesystems }, inputDirectory: data.input, codexAuthFile: data.fakeAuth,
-      imageId })).toThrow('trusted allocator');
+      imageId })).rejects.toThrow('trusted allocator');
 
     const other = fixture();
-    expect(() => createContainerProfile({ ...governed(invocation(other.clone, 'planning')),
+    await expect(createContainerProfile({ ...await governed(invocation(other.clone, 'planning')),
       filesystems: data.filesystems, inputDirectory: other.input, codexAuthFile: other.fakeAuth,
-      imageId })).toThrow('do not belong to the invocation clone');
+      imageId })).rejects.toThrow('do not belong to the invocation clone');
 
     writeFileSync(data.fakeAuth, '{"changed":true}');
     expect(valid.codexAuthFile).not.toBe(data.fakeAuth);
@@ -322,42 +322,42 @@ describe('real Docker agent isolation', () => {
     writeFileSync(join(data.input, 'schema.json'), '{"probe":"changed"}\n');
     writeFileSync(join(data.input, 'extra.json'), '{}');
     chmodSync(join(data.input, 'schema.json'), 0o444); chmodSync(data.input, 0o555);
-    expect(runContainer(valid)).toBe('');
+    expect(await runContainer(valid)).toBe('');
     chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
   }, 60_000);
 
-  it('rejects extra security policies and environment paths that can escape bounded storage', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects extra security policies and environment paths that can escape bounded storage', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     const securityArgs = [...valid.args.slice(0, imageIndex), '--security-opt', 'seccomp=unconfined',
       ...valid.args.slice(imageIndex)];
     docker(...securityArgs); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
     const pathArgs = [...valid.args.slice(0, imageIndex), '--env', 'PATH=/work', ...valid.args.slice(imageIndex)];
     docker(...pathArgs); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow(/environment|PATH/);
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow(/environment|PATH/);
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
     for (const changedPath of ['npm_config_cache=/work/npm-cache', 'XDG_CACHE_HOME=/work/xdg-cache',
       'CODEX_HOME=/work', 'HTTPS_PROXY=http://example.com:3128']) {
       const changedArgs = [...valid.args.slice(0, imageIndex), '--env', changedPath, ...valid.args.slice(imageIndex)];
       docker(...changedArgs); containers.add(valid.name);
-      expect(() => validateContainer(valid.name, valid)).toThrow(/isolation environment|Credential profiles/);
+      await expect(validateContainer(valid.name, valid)).rejects.toThrow(/isolation environment|Credential profiles/);
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     }
   }, 60_000);
 
-  it('does not remove an active container when a duplicate attempt name collides', () => {
+  it('does not remove an active container when a duplicate attempt name collides', async () => {
     const data = fixture(), captured = invocation(data.clone, 'planning');
-    const first = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
+    const first = await createContainerProfile({ ...await governed(captured), filesystems: data.filesystems,
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
-    const duplicate = createContainerProfile({ ...governed(captured), filesystems: data.filesystems,
+    const duplicate = await createContainerProfile({ ...await governed(captured), filesystems: data.filesystems,
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
-    expect(() => createValidatedContainer(duplicate)).toThrow('Container creation failed and cleanup did not settle.');
+    await expect(createValidatedContainer(duplicate)).rejects.toThrow('Container creation failed and cleanup did not settle.');
     expect(existsSync(duplicate.codexAuthFile!)).toBe(true);
     expect(isContainerProfileAuthentic(duplicate)).toBe(true);
     const state = JSON.parse(docker('container', 'inspect', first.name))[0] as { State: { Status: string } };
@@ -365,8 +365,8 @@ describe('real Docker agent isolation', () => {
     docker('rm', '--force', first.name); containers.delete(first.name);
   }, 60_000);
 
-  it('releases a killed create once its settle window passes with no container', () => {
-    const data = fixture(), unsettled = profile(data, 'planning', 'noop');
+  it('releases a killed create once its settle window passes with no container', async () => {
+    const data = fixture(), unsettled = await profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
     // The create client hangs until its deadline kills it, so the daemon outcome stays unknown.
@@ -376,15 +376,15 @@ describe('real Docker agent isolation', () => {
     process.env.PATH = `${shim}:${path}`;
     const started = performance.now();
     // The create path waits out the settle window, then treats absence as settled and releases the profile.
-    try { expect(() => createValidatedContainer(unsettled, 3_000)).toThrow('ETIMEDOUT'); }
+    try { await expect(createValidatedContainer(unsettled, 3_000)).rejects.toThrow('ETIMEDOUT'); }
     finally { process.env.PATH = path; }
     expect(performance.now() - started).toBeGreaterThanOrEqual(10_000);
     expect(isContainerProfileAuthentic(unsettled)).toBe(false);
     expect(existsSync(unsettled.codexAuthFile!)).toBe(false);
   }, 60_000);
 
-  it('keeps a killed create unsettled for later cleanup until its settle window passes', () => {
-    const data = fixture(), unsettled = profile(data, 'planning', 'noop');
+  it('keeps a killed create unsettled for later cleanup until its settle window passes', async () => {
+    const data = fixture(), unsettled = await profile(data, 'planning', 'noop');
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const created = join(shim, 'created'), failed = join(shim, 'failed');
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -398,15 +398,15 @@ describe('real Docker agent isolation', () => {
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
     try {
-      expect(() => createValidatedContainer(unsettled, 3_000)).toThrow('cleanup did not settle');
+      await expect(createValidatedContainer(unsettled, 3_000)).rejects.toThrow('cleanup did not settle');
       // A follow-up cleanup inside the window must not treat absence as proof and release the profile.
-      expect(() => disposeValidatedContainer(unsettled)).toThrow('did not settle');
+      await expect(disposeValidatedContainer(unsettled)).rejects.toThrow('did not settle');
     } finally { process.env.PATH = path; }
     expect(isContainerProfileAuthentic(unsettled)).toBe(true);
     expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
   }, 60_000);
 
-  it('refuses to seed a clone whose staging directory was replaced after creation', () => {
+  it('refuses to seed a clone whose staging directory was replaced after creation', async () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-2',
       head: git(data.source, 'rev-parse', 'HEAD') });
@@ -417,14 +417,14 @@ describe('real Docker agent isolation', () => {
     }, imageId)).toThrow('replaced after it was created');
   }, 60_000);
 
-  it('rejects a container that relies on the daemon default seccomp profile', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects a container that relies on the daemon default seccomp profile', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     docker(...valid.args.filter(arg => arg !== '--security-opt=seccomp=builtin')); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
-  it('startup probe refuses to exec when seccomp filtering is disabled', () => {
+  it('startup probe refuses to exec when seccomp filtering is disabled', async () => {
     const result = spawnSync('docker', ['run', '--rm', '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=unconfined', '--network=none', imageId, 'true'],
       { encoding: 'utf8', timeout: 60_000 });
@@ -432,7 +432,7 @@ describe('real Docker agent isolation', () => {
     expect(result.stderr).toContain('seccomp syscall filter must be enforced');
   }, 60_000);
 
-  it('removes a keeper that lands in the daemon after its run client was killed', () => {
+  it('removes a keeper that lands in the daemon after its run client was killed', async () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-late',
       head: git(data.source, 'rev-parse', 'HEAD') });
@@ -459,92 +459,92 @@ describe('real Docker agent isolation', () => {
     expect(orphans).toEqual([]);
   }, 60_000);
 
-  it('rejects a task keeper whose restart policy was changed', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects a task keeper whose restart policy was changed', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     docker('update', '--restart=always', data.filesystems.keeper);
     try {
       docker(...valid.args); containers.add(valid.name);
-      expect(() => validateContainer(valid.name, valid)).toThrow('trusted keeper');
+      await expect(validateContainer(valid.name, valid)).rejects.toThrow('trusted keeper');
     } finally { docker('update', '--restart=no', data.filesystems.keeper); }
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
-  it('bounds profile revalidation by the invocation deadline, even with the default budget', () => {
-    const data = fixture(), captured = Date.now(), late = profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
+  it('bounds profile revalidation by the invocation deadline, even with the default budget', async () => {
+    const data = fixture(), captured = Date.now(), late = await profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
     execFileSync('sleep', [String(Math.max(0, captured + 6_500 - Date.now()) / 1000)]);
-    expect(() => assertContainerProfile(late)).toThrow('deadline has passed');
+    await expect(assertContainerProfile(late)).rejects.toThrow('deadline has passed');
   }, 60_000);
 
-  it('refuses to launch once the captured invocation deadline has passed', () => {
-    const data = fixture(), captured = Date.now(), late = profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
+  it('refuses to launch once the captured invocation deadline has passed', async () => {
+    const data = fixture(), captured = Date.now(), late = await profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
     execFileSync('sleep', [String(Math.max(0, captured + 6_500 - Date.now()) / 1000)]);
-    expect(() => runContainer(late, 60_000)).toThrow('deadline has passed');
+    await expect(runContainer(late, 60_000)).rejects.toThrow('deadline has passed');
   }, 60_000);
 
-  it('refuses to build a profile once the invocation deadline has passed', () => {
-    const data = fixture(), trusted = governed(invocation(data.clone, 'planning', 'codex', 5_000));
+  it('refuses to build a profile once the invocation deadline has passed', async () => {
+    const data = fixture(), trusted = await governed(invocation(data.clone, 'planning', 'codex', 5_000));
     const wait = Math.max(0, trusted.invocation.deadline - Date.now() + 500);
     execFileSync('sleep', [String(wait / 1000)]);
     const started = performance.now();
-    expect(() => createContainerProfile({ ...trusted, filesystems: data.filesystems, inputDirectory: data.input,
-      codexAuthFile: data.fakeAuth, imageId })).toThrow('deadline has passed');
+    await expect(createContainerProfile({ ...trusted, filesystems: data.filesystems, inputDirectory: data.input,
+      codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('deadline has passed');
     expect(performance.now() - started).toBeLessThan(2_000);
   }, 60_000);
 
-  it('refuses an invocation copied from a captured request with a different phase', () => {
-    const data = fixture(), trusted = governed(invocation(data.clone, 'review'));
+  it('refuses an invocation copied from a captured request with a different phase', async () => {
+    const data = fixture(), trusted = await governed(invocation(data.clone, 'review'));
     const forged = { ...trusted.invocation, phase: 'execute' as Phase };
-    expect(() => createContainerProfile({ ...trusted, invocation: forged, filesystems: data.filesystems,
-      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).toThrow('captured');
+    await expect(createContainerProfile({ ...trusted, invocation: forged, filesystems: data.filesystems,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('captured');
   }, 60_000);
 
-  it('removes the claimed vendor network when profile creation fails after the claim', () => {
+  it('removes the claimed vendor network when profile creation fails after the claim', async () => {
     const data = fixture();
-    expect(() => profile(data, 'planning', 'noop', { codexAuthFile: join(data.root, 'missing-auth.json') })).toThrow();
+    await expect(profile(data, 'planning', 'noop', { codexAuthFile: join(data.root, 'missing-auth.json') })).rejects.toThrow();
     const orphan = vendorNetworks.at(-1)!;
     expect(spawnSync('docker', ['network', 'inspect', orphan.name], { stdio: 'ignore' }).status).not.toBe(0);
     expect(spawnSync('docker', ['container', 'inspect', orphan.proxyContainer], { stdio: 'ignore' }).status).not.toBe(0);
   }, 60_000);
 
-  it('does not let a copied profile start or remove the original container', () => {
-    const data = fixture(), live = profile(data, 'planning', 'noop');
-    expect(createValidatedContainer(live)).toBe(live.name); containers.add(live.name);
+  it('does not let a copied profile start or remove the original container', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'noop');
+    expect(await createValidatedContainer(live)).toBe(live.name); containers.add(live.name);
     const copy = Object.freeze({ ...live });
-    expect(() => startValidatedContainer(copy)).toThrow('trusted profile builder');
-    expect(() => runContainer(copy)).toThrow('trusted profile builder');
+    await expect(startValidatedContainer(copy)).rejects.toThrow('trusted profile builder');
+    await expect(runContainer(copy)).rejects.toThrow('trusted profile builder');
     expect(spawnSync('docker', ['container', 'inspect', live.name], { stdio: 'ignore' }).status).toBe(0);
     docker('rm', '--force', live.name); containers.delete(live.name);
   }, 60_000);
 
-  it('refuses a Codex auth path that is a link without resolving it', () => {
+  it('refuses a Codex auth path that is a link without resolving it', async () => {
     const data = fixture(), link = join(data.root, 'auth-link.json');
     symlinkSync(data.fakeAuth, link);
-    expect(() => profile(data, 'planning', 'noop', { codexAuthFile: link })).toThrow('not a link');
+    await expect(profile(data, 'planning', 'noop', { codexAuthFile: link })).rejects.toThrow('not a link');
   }, 60_000);
 
-  it('rejects an alternate Docker runtime that may not honour the checked isolation', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects an alternate Docker runtime that may not honour the checked isolation', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     docker(...valid.args.map(arg => arg === '--runtime=runc' ? '--runtime=io.containerd.runc.v2' : arg));
     containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
-  it('rejects a restart policy that could relaunch the agent after it exits', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects a restart policy that could relaunch the agent after it exits', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     docker(...valid.args.slice(0, imageIndex), '--restart=always', ...valid.args.slice(imageIndex));
     containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
-  it('rejects added capabilities and conflicting or duplicate filesystem options', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects added capabilities and conflicting or duplicate filesystem options', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
     const args = [...valid.args.slice(0, imageIndex), '--cap-add=SYS_ADMIN', ...valid.args.slice(imageIndex)];
     docker(...args); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     const state = JSON.parse(docker('container', 'inspect', valid.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
@@ -556,67 +556,67 @@ describe('real Docker agent isolation', () => {
     expect(hasExactOptions([...expected, 'nosuid'].join(','), expected)).toBe(false);
   }, 60_000);
 
-  it('rejects an unauthorized network before the container can start', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('rejects an unauthorized network before the container can start', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     const args = valid.args.map(value => value.startsWith('--network=') ? '--network=bridge' : value);
     docker(...args); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     const state = JSON.parse(docker('container', 'inspect', valid.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
     const dnsArgs = valid.args.map(value => value === '--dns=127.0.0.1' ? '--dns=8.8.8.8' : value);
     docker(...dnsArgs); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('DNS configuration');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('DNS configuration');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
     for (const extra of [['--add-host=api.openai.com:127.0.0.1'], ['--publish=127.0.0.1::3128']]) {
       const changedArgs = [...valid.args.slice(0, valid.args.indexOf(imageId)), ...extra,
         ...valid.args.slice(valid.args.indexOf(imageId))];
       docker(...changedArgs); containers.add(valid.name);
-      expect(() => validateContainer(valid.name, valid)).toThrow('host or port configuration');
+      await expect(validateContainer(valid.name, valid)).rejects.toThrow('host or port configuration');
       docker('rm', '--force', valid.name); containers.delete(valid.name);
     }
 
     const imageIndex = valid.args.indexOf(imageId);
     const namespaceArgs = [...valid.args.slice(0, imageIndex), '--uts=host', ...valid.args.slice(imageIndex)];
     docker(...namespaceArgs); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
 
     const resourceArgs = [...valid.args.slice(0, imageIndex), '--memory-swap=-1', ...valid.args.slice(imageIndex)];
     docker(...resourceArgs); containers.add(valid.name);
-    expect(() => validateContainer(valid.name, valid)).toThrow('lockdown');
+    await expect(validateContainer(valid.name, valid)).rejects.toThrow('lockdown');
     docker('rm', '--force', valid.name); containers.delete(valid.name);
   }, 60_000);
 
-  it('rejects a new endpoint attached to the invocation network before launch', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'must-not-run');
+  it('rejects a new endpoint attached to the invocation network before launch', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'must-not-run');
     const rogue = `codeboost-rogue-${randomUUID()}`;
     try {
       docker('run', '--detach', '--name', rogue, `--network=${valid.network.name}`, '--entrypoint', 'node', imageId,
         '-e', 'setInterval(()=>{},1000)');
-      expect(() => createValidatedContainer(valid)).toThrow('cleanup did not settle');
+      await expect(createValidatedContainer(valid)).rejects.toThrow('cleanup did not settle');
       const absent = spawnSync('docker', ['container', 'inspect', valid.name], { encoding: 'utf8' });
       expect(absent.status).not.toBe(0);
     } finally {
       spawnSync('docker', ['rm', '--force', rogue], { stdio: 'ignore' });
-      disposeContainerProfile(valid);
+      await disposeContainerProfile(valid);
     }
   }, 60_000);
 
-  it('revalidates the agent attachment immediately before start', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'must-not-run');
-    createValidatedContainer(valid); containers.add(valid.name);
+  it('revalidates the agent attachment immediately before start', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'must-not-run');
+    await createValidatedContainer(valid); containers.add(valid.name);
     docker('network', 'disconnect', valid.network.name, valid.name);
     docker('network', 'connect', 'bridge', valid.name);
-    expect(() => startValidatedContainer(valid)).toThrow(/network attachment|lockdown/);
+    await expect(startValidatedContainer(valid)).rejects.toThrow(/network attachment|lockdown/);
     containers.delete(valid.name);
     expect(spawnSync('docker', ['container', 'inspect', valid.name]).status).not.toBe(0);
   }, 60_000);
 
-  it('creates containers from the captured immutable image rather than its mutable tag', () => {
-    const data = fixture(), valid = profile(data, 'planning', 'noop');
+  it('creates containers from the captured immutable image rather than its mutable tag', async () => {
+    const data = fixture(), valid = await profile(data, 'planning', 'noop');
     expect(valid.expectedImage).toBe(imageId);
     expect(valid.args).toContain(imageId);
     expect(valid.args).not.toContain(AGENT_IMAGE);
@@ -634,26 +634,26 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
-    it('runs the authenticated Codex startup path with isolated writable state', () => {
+    it('runs the authenticated Codex startup path with isolated writable state', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
-      const authProfile = profile(data, 'planning', policy => createCodexCommand(policy,
+      const authProfile = await profile(data, 'planning', policy => createCodexCommand(policy,
         'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
       { authProbe: true, codexAuthFile: authFile, deadlineMs: 5 * 60_000 });
       // The production launch path: create, validate, start and remove. Raw stdout can carry more than the final
       // message, so the value must appear as a complete line; the adapter probe checks the exact file channel.
-      const output = runContainer(authProfile, 5 * 60_000);
+      const output = await runContainer(authProfile, 5 * 60_000);
       expect(output.split(/\r?\n/)).toContain('codeboost-schema-marker');
     }, 6 * 60_000);
 
-    it('runs the authenticated Claude startup path with only its OAuth token', () => {
+    it('runs the authenticated Claude startup path with only its OAuth token', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
-      const authProfile = profile(data, 'planning', policy => createClaudeCommand(policy,
+      const authProfile = await profile(data, 'planning', policy => createClaudeCommand(policy,
         'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
         { vendor: 'claude', authProbe: true, claudeToken: token, deadlineMs: 5 * 60_000 });
       // The production launch path, with the token passed only as the Claude profile's secret.
-      const output = runContainer(authProfile, 5 * 60_000, { CLAUDE_CODE_OAUTH_TOKEN: token });
+      const output = await runContainer(authProfile, 5 * 60_000, { CLAUDE_CODE_OAUTH_TOKEN: token });
       const envelope = JSON.parse(output) as { result?: string; is_error?: boolean };
       expect(envelope.is_error).not.toBe(true);
       expect(envelope.result?.replace(/\r?\n$/, '')).toBe('codeboost-schema-marker');

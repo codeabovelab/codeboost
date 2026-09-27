@@ -37,15 +37,17 @@ export interface ProfileOptions {
   readonly deferredOutput?: boolean;
   /** Remaining invocation budget for Docker-backed profile validation. */
   readonly timeoutMs?: number;
+  /** Cancels creation; whatever was staged is removed before the promise rejects. */
+  readonly signal?: AbortSignal;
 }
 
 export class ProfileCreationCleanupError extends AggregateError {
   readonly startupError: unknown;
-  readonly retryCleanup: () => void;
+  readonly retryCleanup: () => Promise<void>;
   /** The staging directories and network this creation may have left behind. */
   readonly resources: readonly UnreleasedResource[];
 
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void,
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => Promise<void>,
     resources: readonly UnreleasedResource[] = []) {
     super([startupError, cleanupError], 'Profile creation and cleanup both failed.');
     this.startupError = startupError;
@@ -142,12 +144,14 @@ export function isContainerProfileAuthentic(profile: ContainerProfile): boolean 
 }
 
 /** Internal authenticity and host-file revalidation used at every launch boundary. */
-export function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000): void {
+export async function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000,
+  signal?: AbortSignal): Promise<void> {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
   assertTaskFilesystems(expected.filesystems, expected.clone);
   // Every caller, including those using the default budget, is bounded by the invocation deadline.
-  assertVendorNetwork(expected.network, expected.invocation, profile.name, profileTimeout(profile, timeoutMs));
+  await assertVendorNetwork(expected.network, expected.invocation, profile.name, profileTimeout(profile, timeoutMs),
+    signal);
   assertPhasePolicy(expected.policy, expected.invocation);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
@@ -183,12 +187,12 @@ export function containerProfileResources(profile: ContainerProfile): readonly U
 }
 
 /** Remove runner-owned credential staging after this one-shot profile settles. */
-export function disposeContainerProfile(profile: ContainerProfile, networkTimeoutMs = 30_000): void {
+export async function disposeContainerProfile(profile: ContainerProfile, networkTimeoutMs = 30_000): Promise<void> {
   const identity = identities.get(profile);
   if (!identity) return;
   const failures: unknown[] = [];
   try { removeOwnedDirectories(identity.cleanupDirectories); } catch (error) { failures.push(error); }
-  try { removeVendorNetwork(identity.network, networkTimeoutMs); } catch (error) { failures.push(error); }
+  try { await removeVendorNetwork(identity.network, networkTimeoutMs); } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
   identities.delete(profile);
 }
@@ -204,7 +208,7 @@ const mountSource = (path: string, kind: string) => {
   return path;
 };
 
-export function createContainerProfile(options: ProfileOptions): ContainerProfile {
+export async function createContainerProfile(options: ProfileOptions): Promise<ContainerProfile> {
   const { invocation, filesystems } = options;
   // Phase, vendor and deadline drive mount modes and credentials, so they must come from a captured request.
   assertCapturedInvocation(invocation);
@@ -214,13 +218,15 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
   assertTaskFilesystems(filesystems, invocation.clone);
   const invocationLeft = Math.floor(invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
-  assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft));
+  await assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft),
+    options.signal);
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
   // Own the network from here on, so any later failure removes it rather than leaking it.
   claimedNetworks.add(options.network);
   const cleanupDirectories: string[] = [];
   let codexAuthFile: string | undefined, authIdentity: FileIdentity | undefined;
   try {
+    options.signal?.throwIfAborted();
     assertPhasePolicy(options.policy, invocation);
     const command = assertAgentCommand(options.command, options.policy, invocation.vendor);
     const sourceInput = captureInput(options.inputDirectory);
@@ -293,13 +299,13 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
-    const cleanupProfileResources = () => {
+    const cleanupProfileResources = async () => {
       const failures: unknown[] = [];
       try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
-      try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
+      try { await removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
       if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
     };
-    try { cleanupProfileResources(); }
+    try { await cleanupProfileResources(); }
     catch (cleanupError) {
       throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources, [
         ...vendorNetworkResources(options.network), ...directoryResources(cleanupDirectories)]);

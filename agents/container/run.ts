@@ -1,6 +1,6 @@
-import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
 import type { UnreleasedResource } from '../contract.ts';
+import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
   isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
@@ -9,9 +9,6 @@ import { taskFilesystemAllocationId } from './storage.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
 export type { TaskFilesystems, TaskStorageLimits } from './storage.ts';
 
-const dockerEnvironment = (secrets: Readonly<Record<string, string>> = {}) => ({
-  PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST, ...secrets,
-});
 const validateSecrets = (profile: ContainerProfile, secrets: Readonly<Record<string, string>>) => {
   const keys = Object.keys(secrets);
   if (profile.vendor === 'codex' && keys.length) throw new Error('Codex profile must not receive environment credentials.');
@@ -19,9 +16,9 @@ const validateSecrets = (profile: ContainerProfile, secrets: Readonly<Record<str
     || !secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.CLAUDE_CODE_OAUTH_TOKEN.includes('\0')))
     throw new Error('Claude profile requires only its OAuth environment credential.');
 };
-const docker = (args: readonly string[], options: { timeoutMs?: number; secrets?: Readonly<Record<string, string>> } = {}) =>
-  execFileSync('docker', [...args], { encoding: 'utf8', timeout: options.timeoutMs ?? 30_000,
-    killSignal: 'SIGKILL', env: dockerEnvironment(options.secrets), stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const docker = (args: readonly string[], options: { timeoutMs?: number; secrets?: Readonly<Record<string, string>>;
+  signal?: AbortSignal } = {}) => runDockerCommand(args, { timeoutMs: options.timeoutMs ?? 30_000,
+  secrets: options.secrets, signal: options.signal });
 const validLimit = (value: number, name: string) => {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer.`);
 };
@@ -49,7 +46,6 @@ const canonicalDockerBindSource = (source: string) => {
 };
 /** How long a killed `docker create` may still materialize its container in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
-const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 // When a killed `docker create` for a profile stops counting as possibly in flight (performance.now() timestamp).
 const unsettledCreates = new WeakMap<ContainerProfile, number>();
 // Profiles whose `docker create` succeeded (with the returned ID) or whose client was killed (ID unknown). Only these
@@ -63,20 +59,19 @@ export function agentContainerResources(profile: ContainerProfile): readonly Unr
   return Object.freeze([Object.freeze({ kind: 'container' as const, name: profile.name, ...(id ? { id } : {}),
     owner: Object.freeze({ label: 'io.codeboost.invocation', value: profile.ownershipId }) })]);
 }
-const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false, timeoutMs = 30_000) => {
+// Cleanup is never cancelled: it runs to its own deadline so nothing is dropped.
+const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle = false, timeoutMs = 30_000) => {
   // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
   if (!isContainerProfileAuthentic(profile))
     throw new Error('Container profile was not created by the trusted profile builder.');
   const settleUntil = unsettledCreates.get(profile) ?? 0;
   const remaining = createDeadline(timeoutMs + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
-  let before: ReturnType<typeof spawnSync>;
+  let before: DockerOutcome;
   for (;;) {
-    before = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
+    before = await runDocker(['container', 'inspect', profile.name], { timeoutMs: remaining() });
     if (before.status === 0) break;
-    const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
+    const missing = before.status !== null && !before.error
+      && /No such (?:object|container)/i.test(`${before.stdout}\n${before.stderr}`);
     if (!missing) throw new Error('Failed to establish ownership of the agent container; staged credentials were retained.');
     // A killed create may still land in the daemon; absence only counts once its settle window has passed, on every
     // path. Only the create path waits here; later cleanup (such as a supervisor recovery) reports "not settled"
@@ -84,40 +79,34 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
     if (performance.now() >= settleUntil) {
       unsettledCreates.delete(profile);
       createdContainers.delete(profile);
-      disposeContainerProfile(profile, remaining());
+      await disposeContainerProfile(profile, remaining());
       return;
     }
     if (!waitForSettle) throw new Error('Agent container creation did not settle; staged credentials were retained.');
-    sleep(250);
+    await pause(250);
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
   if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
-  const result = spawnSync('docker', ['rm', '--force', profile.name], {
-    encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
+  const result = await runDocker(['rm', '--force', profile.name], { timeoutMs: remaining() });
   if (result.status !== 0) {
-    const inspect = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
-      stdio: ['ignore', 'pipe', 'pipe'],
-    });
-    const absent = inspect.status !== 0 && !inspect.error
-      && /No such (?:object|container)/i.test(`${inspect.stdout ?? ''}\n${inspect.stderr ?? ''}`);
+    const inspect = await runDocker(['container', 'inspect', profile.name], { timeoutMs: remaining() });
+    const absent = inspect.status !== null && inspect.status !== 0 && !inspect.error
+      && /No such (?:object|container)/i.test(`${inspect.stdout}\n${inspect.stderr}`);
     if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
   }
   unsettledCreates.delete(profile);
   createdContainers.delete(profile);
-  disposeContainerProfile(profile, remaining());
+  await disposeContainerProfile(profile, remaining());
 };
 
 /**
  * Remove a validated invocation container, then its profile-owned staging and network resources. `timeoutMs` bounds
  * the container step and, separately, the network step.
  */
-export function disposeValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000): void {
+export async function disposeValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000): Promise<void> {
   assertContainerProfileAuthenticity(profile);
-  removeContainerOrThrow(profile, false, timeoutMs);
+  await removeContainerOrThrow(profile, false, timeoutMs);
 }
 
 type Inspect = {
@@ -145,12 +134,14 @@ type Inspect = {
 };
 
 /** Validate daemon-resolved configuration before starting an agent. */
-export function validateContainer(container: string, profile: ContainerProfile, timeoutMs = 30_000): void {
+export async function validateContainer(container: string, profile: ContainerProfile, timeoutMs = 30_000,
+  signal?: AbortSignal): Promise<void> {
   const remaining = createDeadline(timeoutMs);
-  assertContainerProfile(profile, remaining());
-  const inspect = JSON.parse(docker(['container', 'inspect', container], { timeoutMs: remaining() }))[0] as Inspect | undefined;
+  await assertContainerProfile(profile, remaining(), signal);
+  const inspect = JSON.parse(await docker(['container', 'inspect', container], { timeoutMs: remaining(), signal }))[0] as
+    Inspect | undefined;
   if (!inspect) throw new Error('Docker did not return the created container.');
-  const image = JSON.parse(docker(['image', 'inspect', profile.expectedImage], { timeoutMs: remaining() }))[0] as
+  const image = JSON.parse(await docker(['image', 'inspect', profile.expectedImage], { timeoutMs: remaining(), signal }))[0] as
     { Id?: string; Config?: { User?: string; Env?: string[]; Entrypoint?: string[]; Labels?: Record<string, string> } } | undefined;
   const imageId = image?.Id, labels = image?.Config?.Labels ?? {};
   const host = inspect.HostConfig;
@@ -225,7 +216,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
   if (work.Name !== profile.filesystems.workVolume || metadata.Name !== profile.filesystems.metadataVolume)
     throw new Error('Container task volumes do not match their captured identity.');
   if (work.Source === metadata.Source) throw new Error('Worktree and Git metadata must use separate filesystems.');
-  const volumes = JSON.parse(docker(['volume', 'inspect', work.Name!, metadata.Name!], { timeoutMs: remaining() })) as
+  const volumes = JSON.parse(await docker(['volume', 'inspect', work.Name!, metadata.Name!],
+    { timeoutMs: remaining(), signal })) as
     Array<{ Name: string; Driver: string; Labels: Record<string, string> | null; Options: Record<string, string> | null }>;
   const allocationId = taskFilesystemAllocationId(profile.filesystems);
   const expectedVolumes = new Map([
@@ -241,7 +233,8 @@ export function validateContainer(container: string, profile: ContainerProfile, 
         'uid=10001', 'gid=10001', 'mode=0755', 'nosuid', 'nodev']))
       throw new Error('Task volume does not match its bounded tmpfs allocation.');
   }
-  const keeper = JSON.parse(docker(['container', 'inspect', profile.filesystems.keeper], { timeoutMs: remaining() }))[0] as
+  const keeper = JSON.parse(await docker(['container', 'inspect', profile.filesystems.keeper],
+    { timeoutMs: remaining(), signal }))[0] as
     { State?: { Running?: boolean }; Config?: { Image?: string; User?: string; Labels?: Record<string, string> };
       HostConfig?: { ReadonlyRootfs?: boolean; Privileged?: boolean; NetworkMode?: string; CapDrop?: string[] | null;
         CapAdd?: string[] | null; SecurityOpt?: string[] | null;
@@ -299,20 +292,25 @@ export function validateContainer(container: string, profile: ContainerProfile, 
     throw new Error('Credential profiles must not be combined or redirected.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
     throw new Error('Credential profiles must not be combined.');
-  assertContainerProfile(profile, remaining());
+  await assertContainerProfile(profile, remaining(), signal);
   remaining();
 }
 
-export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
-  secrets: Readonly<Record<string, string>> = {}): string {
+/**
+ * Create and validate the agent container. `signal` cancels creation: the in-flight Docker call is killed, and the
+ * container (if the create may have landed) is removed before the promise rejects.
+ */
+export async function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
+  secrets: Readonly<Record<string, string>> = {}, signal?: AbortSignal): Promise<string> {
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let createUnsettled = false;
   try {
     validateSecrets(profile, secrets);
-    assertContainerProfile(profile, remaining());
+    await assertContainerProfile(profile, remaining(), signal);
+    signal?.throwIfAborted();
     const createTimeout = remaining();
     createUnsettled = true;
-    try { createdContainers.set(profile, docker(profile.args, { timeoutMs: createTimeout, secrets })); }
+    try { createdContainers.set(profile, await docker(profile.args, { timeoutMs: createTimeout, secrets, signal })); }
     catch (error) {
       // A nonzero exit means the daemon answered; a killed client leaves the request in flight.
       createUnsettled = typeof (error as { status?: unknown }).status !== 'number';
@@ -320,32 +318,33 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
       throw error;
     }
     createUnsettled = false;
-    validateContainer(profile.name, profile, remaining());
-    assertContainerProfile(profile, remaining());
+    await validateContainer(profile.name, profile, remaining(), signal);
+    await assertContainerProfile(profile, remaining(), signal);
     remaining();
+    signal?.throwIfAborted();
     return profile.name;
   } catch (error) {
     if (createUnsettled) unsettledCreates.set(profile, performance.now() + CREATE_SETTLE_MS);
-    try { removeContainerOrThrow(profile, createUnsettled); }
+    try { await removeContainerOrThrow(profile, createUnsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Container creation failed and cleanup did not settle.'); }
     throw error;
   }
 }
 
-export function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
-  secrets: Readonly<Record<string, string>> = {}): string {
+export async function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
+  secrets: Readonly<Record<string, string>> = {}): Promise<string> {
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let failure: unknown;
   try {
     validateSecrets(profile, secrets);
-    validateContainer(profile.name, profile, remaining());
-    const output = docker(['start', '--attach', profile.name], { timeoutMs: remaining(), secrets });
+    await validateContainer(profile.name, profile, remaining());
+    const output = await docker(['start', '--attach', profile.name], { timeoutMs: remaining(), secrets });
     remaining();
     return output;
   }
   catch (error) { failure = error; throw error; }
   finally {
-    try { removeContainerOrThrow(profile); }
+    try { await removeContainerOrThrow(profile); }
     catch (cleanupError) {
       if (failure) throw new AggregateError([failure, cleanupError], 'Agent invocation failed and cleanup did not settle.');
       throw cleanupError;
@@ -353,14 +352,14 @@ export function startValidatedContainer(profile: ContainerProfile, timeoutMs = 6
   }
 }
 
-export function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
-  secrets: Readonly<Record<string, string>> = {}): string {
+export async function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
+  secrets: Readonly<Record<string, string>> = {}): Promise<string> {
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
-  createValidatedContainer(profile, remaining(), secrets);
+  await createValidatedContainer(profile, remaining(), secrets);
   let startBudget: number;
   try { startBudget = remaining(); }
   catch (error) {
-    try { removeContainerOrThrow(profile); }
+    try { await removeContainerOrThrow(profile); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Agent deadline and cleanup both failed.'); }
     throw error;
   }

@@ -66,6 +66,10 @@ export interface InvocationResult {
  * Closing rejects admission before draining requests, cancelling, and awaiting
  * settlement. No retry may replace an active invocation, even after lease expiry.
  */
+/**
+ * Start calls (`startClaudeInvocation`, `startCodexInvocation`, `startProfileInvocation`) return a handle at once and
+ * run Docker setup inside it: they throw only when they allocated nothing, and every later failure settles the handle.
+ */
 export interface InvocationHandle {
   readonly attemptId: string;
   readonly settled: Promise<InvocationResult>;
