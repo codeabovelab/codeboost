@@ -6,7 +6,7 @@ import { afterEach, expect, it } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, credentialEnvironment, measureGitRepository, RetainedStorage, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, credentialEnvironment, measureGitRepository, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
@@ -71,14 +71,21 @@ it('builds the agent image once per worker', async () => {
   expect(fake.events.filter(event => event === 'build')).toHaveLength(1);
 });
 
-it.each([['Agent timed out. Try again.', 'timeout'], ['Server stopped. Retry the question.', 'shutdown'], ['Anything else', 'cancelled']] as const)(
-  'cancels the container with the matching reason and waits for it to settle: %s', async (message, reason) => {
+// The stop reason is read from the typed value; a message that merely mentions a timeout stays a cancellation.
+it.each([
+  [new StopError('Agent timed out. Try again.', 'timeout'), 'timeout'],
+  [new StopError('Server stopped. Retry the question.', 'shutdown'), 'shutdown'],
+  [new StopError('Please stop', 'cancelled'), 'cancelled'],
+  [new Error('Agent timed out. Try again.'), 'cancelled'],
+  [new Error('Server stopped. Retry the question.'), 'cancelled'],
+] as const)(
+  'cancels the container with the typed reason and waits for it to settle: %s', async (abortReason, reason) => {
     const fake = fakeDeps({ stopReason: reason });
     const controller = new AbortController();
     let done = false;
     const answer = askInContainer(question(), fake.deps, controller.signal).catch((error: Error) => error).finally(() => { done = true; });
     await new Promise(resolve => setTimeout(resolve, 10));
-    controller.abort(new Error(message));
+    controller.abort(abortReason);
     await new Promise(resolve => setTimeout(resolve, 10));
     expect(fake.cancels).toEqual([reason]);
     expect(done).toBe(false);
@@ -145,8 +152,8 @@ it('returns the worker answer and forwards cancellation, settling only when the 
     const pending = worker.agent('codex')('wait', controller.signal, scope(), 60_000).catch((error: Error) => error).finally(() => { done = true; });
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(done).toBe(false);
-    controller.abort(new Error('Agent timed out. Try again.'));
-    expect(((await pending) as Error).message).toBe('cancelled:Agent timed out. Try again.');
+    controller.abort(new StopError('Agent timed out. Try again.', 'timeout'));
+    expect(((await pending) as Error).message).toBe('cancelled:timeout:Agent timed out. Try again.');
   } finally { await worker.close(); }
 });
 

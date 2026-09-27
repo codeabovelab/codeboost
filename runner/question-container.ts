@@ -142,6 +142,16 @@ export function questionCredential(provider: Provider, env: ContainerDependencie
   return authFile;
 }
 
+/**
+ * Why a question stopped, carried as a value next to the message shown to the user. Lane D's stop reason is read from
+ * `stop`, never inferred from the wording of `message`.
+ */
+export class StopError extends Error {
+  readonly stop: Extract<StopReason, 'timeout' | 'shutdown' | 'cancelled'>;
+  constructor(message: string, stop: StopError['stop']) { super(message); this.stop = stop; }
+}
+export const stopOf = (reason: unknown): StopError['stop'] => reason instanceof StopError ? reason.stop : 'cancelled';
+
 const stopMessages: Record<StopReason, string> = {
   cancelled: 'Agent cancelled.', timeout: 'Agent timed out. Try again.', shutdown: 'Server stopped. Retry the question.',
   'output-limit': 'Agent output exceeded its limit.', 'capture-failure': 'The agent container failed. Try again.',
@@ -205,8 +215,7 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
         stateVersion: 0 } });
     const request = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: question.prompt };
     const handle = question.provider === 'claude' ? deps.startClaude(request, credential) : deps.startCodex(request, credential);
-    const cancel = () => handle.cancel(signal.reason instanceof Error && /timed out/.test(signal.reason.message) ? 'timeout'
-      : signal.reason instanceof Error && /Server stopped/.test(signal.reason.message) ? 'shutdown' : 'cancelled');
+    const cancel = () => handle.cancel(stopOf(signal.reason));
     if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
     try { return answerFromResult(question.provider, await handle.settled, invocation); }
     finally { signal.removeEventListener('abort', cancel); }

@@ -20,7 +20,7 @@ parentPort!.on('message', (message: WorkerRequest) => {
   }
   if (message.type === 'cancel') {
     if (waiting.has(message.id)) {
-      parentPort!.postMessage({ id: message.id, attemptId: waiting.get(message.id)!, ok: false, error: `cancelled:${message.reason}` });
+      parentPort!.postMessage({ id: message.id, attemptId: waiting.get(message.id)!, ok: false, error: `cancelled:${message.stop}:${message.reason}` });
       waiting.delete(message.id);
     }
     return;

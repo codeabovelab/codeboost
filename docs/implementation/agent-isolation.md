@@ -109,6 +109,8 @@ Ask keeps the contract's identity and cleanup rules:
   reviewed head (`git ls-tree -r -t -l`) and the object store (`git count-objects -v`) and refuses a repository
   that would not fit the question's 512 MiB and 131,072-entry allocation. A bounded, D-owned clone would replace
   this check.
+- The stop reason (timeout, shutdown or cancellation) travels as a typed value (`StopError`) from `Questions`
+  through the worker message to `handle.cancel()`, separate from the message shown to the user.
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.

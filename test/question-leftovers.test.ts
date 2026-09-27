@@ -543,9 +543,9 @@ it('never probes an owner stamp that is not a codeboost lock in the temp directo
   finally { await worker.close(); }
   const cleanup = () => rmSync(root, { recursive: true, force: true });
   try {
-  // The stamp was not trusted: the named file was never opened, and the root was treated as ownerless.
+  // The stamp was not trusted: the named file was never opened, and the unauthenticated folder was left in place.
   expect(readFileSync(outside, 'utf8')).toBe('not a lock');
-  expect(existsSync(root)).toBe(false);
+  expect(existsSync(root)).toBe(true);
   } finally { cleanup(); }
 });
 
@@ -633,4 +633,16 @@ it('keeps lock files in a private directory owned by this user', () => {
   expect(stat.isDirectory() && !stat.isSymbolicLink()).toBe(true);
   expect(stat.mode & 0o077).toBe(0);
   if (process.getuid) expect(stat.uid).toBe(process.getuid());
+});
+
+it('leaves an unstamped lookalike Ask folder in place', async () => {
+  const lookalike = mkdtempSync(join(tmpdir(), 'codeboost-askprep-'));
+  const root = join(tmpdir(), `codeboost-ask-${basename(lookalike).slice(-6)}`);
+  renameSync(lookalike, root);
+  writeFileSync(join(root, 'someone-elses-file'), 'keep me');
+  const worker = stubWorker(new LeftoverLedger(ledgerPath(), docker(new Set())));
+  try {
+    expect(await worker.agent('claude')('answer', new AbortController().signal, scope(41), 60_000)).toBe('claude:answer:n');
+    expect(readFileSync(join(root, 'someone-elses-file'), 'utf8')).toBe('keep me');
+  } finally { await worker.close(); rmSync(root, { recursive: true, force: true }); }
 });

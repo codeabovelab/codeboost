@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
-import { credentialEnvironment, questionCredential, workerEnvironment, type Provider } from './question-container.ts';
+import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, type Provider } from './question-container.ts';
 import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
 import { createAskRoot, removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
@@ -171,7 +171,7 @@ export class QuestionWorker {
       this.pending.set(id, { attemptId: scope.attemptId, resolve, reject, watchdog });
       worker.postMessage({ type: 'ask', id, question } satisfies WorkerRequest);
       // The promise settles only when the worker reports that the container and its storage are gone.
-      const cancel = () => worker.postMessage({ type: 'cancel', id,
+      const cancel = () => worker.postMessage({ type: 'cancel', id, stop: stopOf(signal.reason),
         reason: signal.reason instanceof Error ? signal.reason.message : 'Agent cancelled.' } satisfies WorkerRequest);
       if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
     });

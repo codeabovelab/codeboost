@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import type { ReviewService } from './review.ts';
 import { QuestionWorker } from './question-agent.ts';
 import { LeftoverLedger } from './question-leftovers.ts';
-import type { QuestionScope } from './question-container.ts';
+import { StopError, type QuestionScope } from './question-container.ts';
 import type { ReviewNote } from './store.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal, scope?: QuestionScope, timeoutMs?: number) => Promise<string>;
 const QUESTION_TIMEOUT_MS = 120_000;
@@ -55,7 +55,7 @@ export class Questions {
     const attempt=randomUUID(), controller=new AbortController();
     this.service.store.beginAnswer(this.service.config.identity,id,attempt,provider??undefined,note.contextId);
     if(this.running.size>=2){this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:'Two questions are already running. Retry when one finishes.'});return;}
-    const timeout=setTimeout(()=>controller.abort(new Error('Agent timed out. Try again.')),QUESTION_TIMEOUT_MS);
+    const timeout=setTimeout(()=>controller.abort(new StopError('Agent timed out. Try again.','timeout')),QUESTION_TIMEOUT_MS);
     let invocation: Promise<string> | undefined;
     const done=(async()=>{
       try {
@@ -80,7 +80,7 @@ export class Questions {
   stopAdmission() { this.closing = true; }
   async close() {
     this.closing = true;
-    for(const job of this.running.values())job.controller.abort(new Error('Server stopped. Retry the question.'));
+    for(const job of this.running.values())job.controller.abort(new StopError('Server stopped. Retry the question.','shutdown'));
     const settled=Promise.all([...this.running.values()].map(job=>job.done));
     // Lane D may never settle (#51 item 1). After the grace period the worker is abandoned, which records its
     // allocations as unknown and rejects the waiting questions, so shutdown cannot hang here.

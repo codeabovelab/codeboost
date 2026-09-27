@@ -197,11 +197,14 @@ export class LeftoverLedger {
     for (const name of readdirSync(tmpdir())) {
       const root = join(tmpdir(), name);
       if (!isAskRoot(root) || skip.has(root)) continue;
+      // Only a folder this user owns, carrying a valid stamp from createAskRoot, is ours to judge. createAskRoot stamps
+      // every root before it becomes visible, so an unstamped, tampered or foreign folder is left in place.
+      const stat = lstatSync(root, { throwIfNoEntry: false });
+      if (!stat || !stat.isDirectory() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid())) continue;
       let owner = '';
-      try { owner = readFileSync(join(root, OWNER_FILE), 'utf8').trim(); } catch { /* no stamp: its creator stopped first */ }
-      // Only a codeboost lock file in the temp directory is ever probed; anything else counts as no owner.
-      if (!isAskLock(owner)) owner = '';
-      if (owner && owner !== this.lockPath && existsSync(owner) && lockIsHeld(owner)) continue;
+      try { owner = readFileSync(join(root, OWNER_FILE), 'utf8').trim(); } catch { continue; }
+      if (!isAskLock(owner)) continue;
+      if (owner !== this.lockPath && existsSync(owner) && lockIsHeld(owner)) continue;
       // Our own lock is held by us, so our earlier-session roots (not the live one, which is skipped) are reclaimed.
       try { removeAskRoot(root); } catch { stuck.push(root); }
     }
