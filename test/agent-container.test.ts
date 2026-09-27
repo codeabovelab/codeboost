@@ -422,6 +422,20 @@ describe('real Docker agent isolation', () => {
     expect(isContainerProfileAuthentic(live)).toBe(false);
   }, 60_000);
 
+  it('starts the agent container by its ID, never a same-named replacement', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'finite-output');
+    await createValidatedContainer(live);
+    const originalId = docker('container', 'inspect', '--format', '{{.Id}}', live.name);
+    const moved = `${live.name}-moved`, replacement = live.name;
+    docker('rename', live.name, moved); containers.add(moved);
+    docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
+      '--entrypoint', 'true', imageId); containers.add(replacement);
+    expect(await startValidatedContainer(live)).toBe('stdout-marker');
+    // The replacement was never started, and cleanup removed only ours.
+    expect(docker('container', 'inspect', '--format', '{{.State.StartedAt}}', replacement)).toBe('0001-01-01T00:00:00Z');
+    expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
+  }, 60_000);
+
   it('refuses to seed a clone whose staging directory was replaced after creation', async () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-2',

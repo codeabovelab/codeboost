@@ -61,6 +61,12 @@ export function agentContainerId(profile: ContainerProfile): string | undefined 
   return createdContainers.get(profile);
 }
 
+const requireContainerId = (profile: ContainerProfile) => {
+  const id = createdContainers.get(profile);
+  if (!id) throw new Error('Docker did not return the created agent container ID.');
+  return id;
+};
+
 /** The agent container this profile may have created, for reporting when its removal is not confirmed. */
 export function agentContainerResources(profile: ContainerProfile): readonly UnreleasedResource[] {
   if (!createdContainers.has(profile)) return Object.freeze([]);
@@ -339,7 +345,7 @@ export async function createValidatedContainer(profile: ContainerProfile, timeou
       throw error;
     }
     createUnsettled = false;
-    await validateContainer(profile.name, profile, remaining(), signal);
+    await validateContainer(requireContainerId(profile), profile, remaining(), signal);
     await assertContainerProfile(profile, remaining(), signal);
     remaining();
     signal?.throwIfAborted();
@@ -358,8 +364,10 @@ export async function startValidatedContainer(profile: ContainerProfile, timeout
   let failure: unknown;
   try {
     validateSecrets(profile, secrets);
-    await validateContainer(profile.name, profile, remaining());
-    const output = await docker(['start', '--attach', profile.name], { timeoutMs: remaining(), secrets });
+    // Validate and start the container this profile created, by ID: a same-named replacement must never run.
+    const id = requireContainerId(profile);
+    await validateContainer(id, profile, remaining());
+    const output = await docker(['start', '--attach', id], { timeoutMs: remaining(), secrets });
     remaining();
     return output;
   }
