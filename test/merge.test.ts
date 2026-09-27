@@ -207,7 +207,7 @@ it('replays a resent merge click after a lost response instead of submitting aga
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
-it('replays a resend that arrives while the first merge command is still running', async () => {
+it('joins a resend that arrives while the first merge command is still running, returning its final result', async () => {
   const h = queueHarness([]);
   const actionId = randomUUID();
   let release!: () => void;
@@ -215,9 +215,11 @@ it('replays a resend that arrives while the first merge command is still running
   try {
     const first = h.coordinator.merge(h.view().token, actionId);
     await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
-    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    const resend = h.coordinator.merge(h.view().token, actionId);
     release();
-    await first;
+    const [a, b] = await Promise.all([first, resend]);
+    expect(b).toBe(a);
+    expect(b.result).toEqual({ url: 'https://github.example/pr/1' });
     expect(h.client.merge).toHaveBeenCalledOnce();
   } finally { await h.coordinator.close(); h.store.close(); }
 });
