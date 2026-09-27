@@ -374,6 +374,17 @@ describe('user actions', () => {
       .toEqual({ response: 'kept', replayed: true });
     expect(() => store.beginMergeAttempt(identity, state, oid(2), null, 'direct', 'not-a-uuid')).toThrow(/UUID v4/);
   });
+  it('does not save a busy or locked database as a refusal, so the same action may be resent', () => {
+    const { path, store } = fixture(); const actionId = randomUUID();
+    // A second connection writing while this Store holds its transaction gets SQLite's real "database is locked".
+    const other = new DatabaseSync(path, { timeout: 0 });
+    try {
+      expect(() => store.userAction(identity, { actionId, kind: 'note', request: { text: 'hi' } },
+        () => other.exec("INSERT INTO app_settings VALUES ('probe','1')"))).toThrow(/database is locked/);
+    } finally { other.close(); }
+    expect(store.savedAction(identity, { actionId, kind: 'note', request: { text: 'hi' } })).toBeUndefined();
+    expect(store.userAction(identity, { actionId, kind: 'note', request: { text: 'hi' } }, () => 'applied')).toEqual({ response: 'applied', replayed: false });
+  });
   it('replays the saved response without applying the action again', () => {
     const { store } = queued(); const actionId = randomUUID(); let applied = 0;
     const run = () => store.userAction(identity, { actionId, kind: 'note', request: { text: 'hi' } }, () => ++applied);
