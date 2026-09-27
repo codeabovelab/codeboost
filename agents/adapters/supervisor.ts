@@ -2,7 +2,8 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason,
   UnreleasedResource } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
-import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
+import { agentContainerResources, createValidatedContainer, disposeValidatedContainer,
+  validateContainer } from '../container/run.ts';
 import { assertContainerProfileAuthenticity, containerProfileResources, disposeContainerProfile,
   isContainerProfileAuthentic, type ContainerProfile } from '../container/profile.ts';
 import { removeVendorNetwork, vendorNetworkResources, type VendorNetwork } from '../network/network.ts';
@@ -17,6 +18,8 @@ const CAPTURE_ABORT_GRACE_MS = 1_000;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
 const activeProfiles = new WeakSet<ContainerProfile>();
+// Profiles that settled with cleanup unconfirmed. They stay authentic, so this stops a second launch from reusing one.
+const spentProfiles = new WeakSet<ContainerProfile>();
 const cleanupRecoveries = new Set<InvocationHandle>();
 const hasCleanupRecovery = (attemptId: string) =>
   Array.from(cleanupRecoveries).some(handle => handle.attemptId === attemptId);
@@ -101,10 +104,11 @@ const cleanupWindowDetail = () => `cleanup was not confirmed within ${CLEANUP_RE
 
 /**
  * Own an attempt while retrying cleanup that has already failed once. Settles when cleanup succeeds, or when the
- * retry window ends, with `unreleased` listing what may remain.
+ * retry window ends, with `unreleased` listing what may remain. `cleanup` receives the budget left in the window.
  */
-const retainCleanup = (invocation: InvocationInput, cleanup: () => void, detail: string,
-  resources: readonly UnreleasedResource[], register: boolean, released?: () => void): InvocationHandle => {
+const retainCleanup = (invocation: InvocationInput, cleanup: (budgetMs: number) => void, detail: string,
+  resources: () => readonly UnreleasedResource[], register: boolean,
+  released?: (unreleased: boolean) => void): InvocationHandle => {
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
   let cancelReason: StopReason | undefined;
   let handle!: InvocationHandle;
@@ -117,12 +121,13 @@ const retainCleanup = (invocation: InvocationInput, cleanup: () => void, detail:
     complete = true;
     if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
     cleanupRecoveries.delete(handle);
-    released?.();
+    const remainingResources = unreleased ? resources() : [];
+    released?.(unreleased);
     const reason = cancelReason ?? 'capture-failure';
     resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
       exitCode: null, signal: null, stopReason: reason, stdout: '',
       stderr: diagnosticFor(reason, unreleased ? `${cleanupWindowDetail()}: ${detail}` : detail).toString('utf8'),
-      ...(unreleased ? { unreleased: resources } : {}) }));
+      ...(unreleased ? { unreleased: remainingResources } : {}) }));
   };
   const schedule = () => {
     if (timer || complete) return;
@@ -131,7 +136,7 @@ const retainCleanup = (invocation: InvocationInput, cleanup: () => void, detail:
   const retry = () => {
     if (cleaning || complete) return;
     cleaning = true;
-    try { cleanup(); }
+    try { cleanup(cleanupBudget(giveUpAt)); }
     catch {
       cleaning = false;
       if (performance.now() >= giveUpAt) finish(true);
@@ -153,32 +158,41 @@ const retainCleanup = (invocation: InvocationInput, cleanup: () => void, detail:
   schedule();
   return handle;
 };
+/** A retry's Docker budget: what is left of the window, at most the usual 30 s, and at least 1 s. */
+const cleanupBudget = (giveUpAt: number) =>
+  Math.max(1_000, Math.min(30_000, Math.ceil(giveUpAt - performance.now())));
+/** Everything a profile may still own, including its agent container only if this profile created one. */
+const profileResources = (profile: ContainerProfile) =>
+  Object.freeze([...agentContainerResources(profile), ...containerProfileResources(profile)]);
 
 // `cleanup` is what recovery retries: container-level disposal by default, or profile-only disposal for a
 // rejection that happened before this profile created any container.
 const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true,
-  cleanup: (profile: ContainerProfile) => void = disposeValidatedContainer): InvocationHandle => {
+  cleanup: (profile: ContainerProfile, budgetMs: number) => void = disposeValidatedContainer): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
   activeProfiles.add(profile);
-  return retainCleanup(invocation, () => cleanup(profile), detail,
-    containerProfileResources(profile, cleanup === disposeValidatedContainer), register,
-    () => activeProfiles.delete(profile));
+  return retainCleanup(invocation, budget => cleanup(profile, budget), detail, () => profileResources(profile),
+    register, unreleased => {
+      activeProfiles.delete(profile);
+      if (unreleased) spentProfiles.add(profile);
+    });
 };
 
 /** Retain attempt ownership while retrying a network allocated before profile construction failed. */
 export function retainNetworkCleanup(invocation: InvocationInput, network: VendorNetwork,
   startupError: unknown, cleanupError: unknown): InvocationHandle {
-  return retainSetupCleanup(invocation, () => removeVendorNetwork(network), startupError, cleanupError,
-    'network cleanup', vendorNetworkResources(network));
+  return retainCleanup(invocation, budget => removeVendorNetwork(network, budget),
+    `Adapter startup failed and network cleanup remains unsettled: ${String(startupError)}; ${String(cleanupError)}`,
+    () => vendorNetworkResources(network), !ownsAttempt(invocation.attemptId));
 }
 
 /** Retain attempt ownership while retrying resources allocated during synchronous adapter setup. */
 export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: () => void,
   startupError: unknown, cleanupError: unknown, kind = 'setup cleanup',
   resources: readonly UnreleasedResource[] = []): InvocationHandle {
-  return retainCleanup(invocation, retryCleanup,
+  return retainCleanup(invocation, () => retryCleanup(),
     `Adapter startup failed and ${kind} remains unsettled: ${String(startupError)}; ${String(cleanupError)}`,
-    resources, !ownsAttempt(invocation.attemptId));
+    () => resources, !ownsAttempt(invocation.attemptId));
 }
 const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason, limits: CaptureLimits,
   detail?: string) => {
@@ -239,6 +253,8 @@ export function isInvocationActive(attemptId: string): boolean {
 
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
   assertContainerProfileAuthenticity(profile);
+  if (spentProfiles.has(profile))
+    throw new Error('This container profile settled without confirmed cleanup; start a new profile.');
   const invocation = assertPhasePolicy(profile.policy);
   // Rejections before container creation own no container, so they release (and retry) only the profile's own
   // staging and network; a name held by another invocation or a failing inspect cannot block that.
@@ -561,7 +577,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     let giveUpAt: number | undefined, unreleased: readonly UnreleasedResource[] | undefined;
     while (true) {
       try {
-        disposeValidatedContainer(profile);
+        disposeValidatedContainer(profile, giveUpAt === undefined ? 30_000 : cleanupBudget(giveUpAt));
         wakeCleanup = undefined;
         break;
       } catch (error) {
@@ -570,7 +586,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         giveUpAt ??= performance.now() + CLEANUP_RETRY_WINDOW_MS;
         if (performance.now() >= giveUpAt) {
           wakeCleanup = undefined;
-          unreleased = containerProfileResources(profile, true);
+          unreleased = profileResources(profile);
+          spentProfiles.add(profile);
           failureDetail = `${cleanupWindowDetail()}: ${failureDetail}`;
           break;
         }

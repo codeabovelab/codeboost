@@ -1,7 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
@@ -137,32 +137,89 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('cancelled')).toBe(false);
   }, 60_000);
 
-  it('settles with unreleased resources when the daemon becomes unreachable during cleanup', async () => {
-    const current = profile(fixture(), 'ignore-term', 'unreachable-daemon');
-    const handle = startProfileInvocation(current, { timeoutMs: 3 * 60_000 });
-    for (let tries = 0; spawnSync('docker', ['container', 'inspect', '--format', '{{.State.Running}}', current.name],
-      { encoding: 'utf8' }).stdout.trim() !== 'true'; tries += 1) {
+  // Every resource the profile owns, exactly, with the IDs and labels recovery needs.
+  const inventory = (current: ContainerProfile, withAgent: boolean) => {
+    const inspect = (kind: 'container' | 'network', name: string, format: string) =>
+      execFileSync('docker', [kind, 'inspect', '--format', format, name], { encoding: 'utf8' }).trim();
+    const egress = { label: 'io.codeboost.egress',
+      value: inspect('network', current.network.name, '{{index .Labels "io.codeboost.egress"}}') };
+    return [
+      ...(withAgent ? [{ kind: 'container', name: current.name, id: inspect('container', current.name, '{{.Id}}'),
+        owner: { label: 'io.codeboost.invocation', value: current.ownershipId } }] : []),
+      { kind: 'container', name: current.network.proxyContainer,
+        id: inspect('container', current.network.proxyContainer, '{{.Id}}'), owner: egress },
+      { kind: 'network', name: current.network.name, id: inspect('network', current.network.name, '{{.Id}}'), owner: egress },
+      { kind: 'directory', name: current.inputDirectory },
+      { kind: 'directory', name: dirname(current.codexAuthFile!) },
+    ];
+  };
+  const waitRunning = async (name: string) => {
+    for (let tries = 0; spawnSync('docker', ['container', 'inspect', '--format', '{{.State.Running}}', name],
+      { encoding: 'utf8', timeout: 10_000, killSignal: 'SIGKILL' }).stdout?.trim() !== 'true'; tries += 1) {
       if (tries > 100) throw new Error('Agent container did not start.');
       await new Promise(resolve => setTimeout(resolve, 100));
     }
-    const original = process.env.DOCKER_HOST;
-    process.env.DOCKER_HOST = `unix://${join(tmpdir(), 'codeboost-no-daemon.sock')}`;
-    try {
+  };
+  const withEnvironment = async <T>(name: 'DOCKER_HOST' | 'PATH', value: string, run: () => Promise<T>) => {
+    const original = process.env[name];
+    process.env[name] = value;
+    try { return await run(); }
+    finally { if (original === undefined) delete process.env[name]; else process.env[name] = original; }
+  };
+
+  it('settles with the exact unreleased inventory when the daemon becomes unreachable during cleanup', async () => {
+    const current = profile(fixture(), 'ignore-term', 'unreachable-daemon');
+    const handle = startProfileInvocation(current, { timeoutMs: 3 * 60_000 });
+    await waitRunning(current.name);
+    const expected = inventory(current, true);
+    const result = await withEnvironment('DOCKER_HOST', `unix://${join(tmpdir(), 'codeboost-no-daemon.sock')}`, () => {
       handle.cancel('shutdown');
-      const result = await handle.settled;
-      expect(result.stopReason).toBe('shutdown');
-      expect(result.stderr).toContain('cleanup was not confirmed within 60 s');
-      expect(result.unreleased).toEqual(expect.arrayContaining([
-        { kind: 'container', name: current.name },
-        { kind: 'container', name: current.network.proxyContainer },
-        { kind: 'network', name: current.network.name }]));
-      expect(isInvocationActive('unreachable-daemon')).toBe(false);
-    } finally {
-      if (original === undefined) delete process.env.DOCKER_HOST; else process.env.DOCKER_HOST = original;
-    }
+      return handle.settled;
+    });
+    expect(result.stopReason).toBe('shutdown');
+    expect(result.stderr).toContain('cleanup was not confirmed within 60 s');
+    expect(result.unreleased).toEqual(expected);
+    expect(isInvocationActive('unreachable-daemon')).toBe(false);
+    expect(() => startProfileInvocation(current)).toThrow('settled without confirmed cleanup');
     // The container ignored SIGTERM and the stop never reached the daemon, so it is still there to remove.
     disposeValidatedContainer(current);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
+  }, 3 * 60_000);
+
+  it('settles when every Docker client hangs and ignores SIGTERM', async () => {
+    const current = profile(fixture(), 'ignore-term', 'hung-docker-client');
+    const handle = startProfileInvocation(current, { timeoutMs: 4 * 60_000 });
+    await waitRunning(current.name);
+    const expected = inventory(current, true);
+    const fakeBin = mkdtempSync(join(tmpdir(), 'codeboost-hung-docker-')); roots.push(fakeBin);
+    mkdirSync(join(fakeBin, 'input')); // afterAll resets this path's mode
+    writeFileSync(join(fakeBin, 'docker'), "#!/bin/sh\ntrap '' TERM\nexec sleep 600\n", { mode: 0o755 });
+    const started = performance.now();
+    const result = await withEnvironment('PATH', `${fakeBin}:${process.env.PATH}`, () => {
+      handle.cancel('shutdown');
+      return handle.settled;
+    });
+    expect(result.stopReason).toBe('shutdown');
+    expect(result.unreleased).toEqual(expected);
+    // One 30 s attempt, the 60 s window, and the kill escalation: well under the four-minute test limit.
+    expect(performance.now() - started).toBeLessThan(150_000);
+    disposeValidatedContainer(current);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
+  }, 4 * 60_000);
+
+  it('never reports a same-named container that another invocation owns', async () => {
+    const current = profile(fixture(), 'finite-output', 'foreign-name');
+    execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
+      '--entrypoint', 'true', imageId], { stdio: 'ignore' });
+    try {
+      const expected = inventory(current, false);
+      const result = await startProfileInvocation(current).settled;
+      expect(result.unreleased).toEqual(expected);
+      expect(execFileSync('docker', ['container', 'inspect', '--format',
+        '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
+    } finally {
+      execFileSync('docker', ['rm', '--force', current.name], { stdio: 'ignore' });
+    }
   }, 3 * 60_000);
 
   it('enforces a finite wall deadline and force-settles the container', async () => {

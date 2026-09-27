@@ -167,26 +167,28 @@ export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now
   return Math.min(timeoutMs, left);
 }
 
+// Never throws: this runs while a handle settles. A directory whose state cannot be read is still reported.
+const directoryResources = (directories: readonly string[]) => directories.filter(directory => {
+  try { return lstatSync(directory, { throwIfNoEntry: false }) !== undefined; } catch { return true; }
+}).map(name => Object.freeze({ kind: 'directory' as const, name }));
+
 /**
- * The resources a profile owns, for reporting when their removal is not confirmed. The agent container is listed
- * only when this profile may have created it: before creation, its name can belong to another invocation.
+ * The staging directories and network a profile still owns, for reporting when their removal is not confirmed. The
+ * agent container is reported separately (`agentContainerResources`), because only a create makes it this profile's.
  */
-export function containerProfileResources(profile: ContainerProfile, container: boolean): readonly UnreleasedResource[] {
+export function containerProfileResources(profile: ContainerProfile): readonly UnreleasedResource[] {
   const identity = identities.get(profile);
-  return Object.freeze([
-    ...(container ? [Object.freeze({ kind: 'container' as const, name: profile.name })] : []),
-    ...vendorNetworkResources(profile.network),
-    ...(identity?.cleanupDirectories ?? []).map(name => Object.freeze({ kind: 'directory' as const, name })),
-  ]);
+  if (!identity) return Object.freeze([]);
+  return Object.freeze([...vendorNetworkResources(identity.network), ...directoryResources(identity.cleanupDirectories)]);
 }
 
 /** Remove runner-owned credential staging after this one-shot profile settles. */
-export function disposeContainerProfile(profile: ContainerProfile): void {
+export function disposeContainerProfile(profile: ContainerProfile, networkTimeoutMs = 30_000): void {
   const identity = identities.get(profile);
   if (!identity) return;
   const failures: unknown[] = [];
   try { removeOwnedDirectories(identity.cleanupDirectories); } catch (error) { failures.push(error); }
-  try { removeVendorNetwork(identity.network); } catch (error) { failures.push(error); }
+  try { removeVendorNetwork(identity.network, networkTimeoutMs); } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
   identities.delete(profile);
 }
@@ -300,8 +302,7 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
     try { cleanupProfileResources(); }
     catch (cleanupError) {
       throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources, [
-        ...vendorNetworkResources(options.network),
-        ...cleanupDirectories.map(name => Object.freeze({ kind: 'directory' as const, name }))]);
+        ...vendorNetworkResources(options.network), ...directoryResources(cleanupDirectories)]);
     }
     throw error;
   }

@@ -82,10 +82,14 @@ The caller must do the following:
 
 - Keep ownership until `settled` resolves. It resolves after the container has
   stopped and its cleanup has finished. If cleanup keeps failing, the supervisor retries it every second for
-  60 seconds after the first failure, then settles anyway. That result has a `stopReason` and lists the
-  resources it could not confirm removed in `unreleased`; the container may still be running.
+  60 seconds after the first failure, then settles anyway. Retries after the first get only what is left of
+  the window, and each cleanup subprocess is killed at its deadline. That result has a `stopReason` and lists
+  the resources it could not confirm removed in `unreleased`; the container may still be running.
 - When `unreleased` is present, record those resources durably and keep them owned until their removal is
-  confirmed.
+  confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
+  if both still match. The agent container is listed only if this invocation's `docker create` ran, so a
+  same-named container that belongs to another invocation is never reported.
+- A profile that settled with `unreleased` cannot be started again.
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
@@ -158,7 +162,7 @@ absolute and symlinked spellings share them. A database with other hard links is
 - The first question of each process runs that scan even without a record, because a process killed before it
   could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
   process running Ask at the same moment also keeps this one off.
-- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1), but Ask's own abandonment path predates that and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
+- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off (it counts as untracked leftovers) until a restart finds no labelled resources. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
   the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
   records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call

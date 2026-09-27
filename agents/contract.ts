@@ -26,10 +26,18 @@ export interface InvocationInput {
   readonly context: InvocationContext;
 }
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
-/** A resource D created for an attempt and could not confirm removed. */
+/**
+ * A resource D created for an attempt and could not confirm removed. A name alone does not prove ownership: remove a
+ * Docker object only if its `id` (when present) and its `owner` label both still match.
+ */
 export interface UnreleasedResource {
   readonly kind: 'container' | 'network' | 'directory';
+  /** Docker name, or the absolute host path of a staging directory. */
   readonly name: string;
+  /** Docker object ID captured at creation; absent when the create's outcome is unknown. */
+  readonly id?: string;
+  /** The label that marks D's ownership of a Docker object; absent for host directories. */
+  readonly owner?: { readonly label: string; readonly value: string };
 }
 export interface InvocationResult {
   readonly attemptId: string;
@@ -40,9 +48,11 @@ export interface InvocationResult {
   readonly stdout: string;
   readonly stderr: string;
   /**
-   * Present only when cleanup was still failing when D's bounded retry window ended. These resources may still
-   * exist, and the agent container may still be running. `stopReason` is always set. The caller must record them
-   * durably and keep them owned until their removal is confirmed.
+   * Present only when cleanup was still failing when D's bounded retry window ended (`CLEANUP_RETRY_WINDOW_MS`,
+   * 60 s after the first failure). Retries after the first are limited to what is left of the window, and every
+   * cleanup subprocess is killed at its deadline, so settlement ends within about twice the window. These resources
+   * may still exist, and the agent container may still be running. `stopReason` is always set. The caller must
+   * record them durably and keep them owned until their removal is confirmed.
    */
   readonly unreleased?: readonly UnreleasedResource[];
 }

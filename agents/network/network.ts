@@ -32,13 +32,23 @@ export class VendorNetworkCreationCleanupError extends AggregateError {
     this.resources = Object.freeze([...resources]);
   }
 }
-/** The daemon objects a vendor network owns, for reporting when their removal is not confirmed. */
-export const vendorNetworkResources = (network: Pick<VendorNetwork, 'name' | 'proxyContainer'>):
-  readonly UnreleasedResource[] => Object.freeze([
-  Object.freeze({ kind: 'container' as const, name: network.proxyContainer }),
-  Object.freeze({ kind: 'network' as const, name: network.name }),
-]);
+// IDs are absent only for a create whose client was killed before it returned one.
+const networkResources = (name: string, proxyContainer: string, allocationId: string, networkId?: string,
+  proxyId?: string): readonly UnreleasedResource[] => {
+  const owner = Object.freeze({ label: 'io.codeboost.egress', value: allocationId });
+  return Object.freeze([
+    Object.freeze({ kind: 'container' as const, name: proxyContainer, ...(proxyId ? { id: proxyId } : {}), owner }),
+    Object.freeze({ kind: 'network' as const, name, ...(networkId ? { id: networkId } : {}), owner }),
+  ]);
+};
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
+/** The daemon objects a vendor network still owns, for reporting when their removal is not confirmed. */
+export function vendorNetworkResources(network: VendorNetwork): readonly UnreleasedResource[] {
+  const identity = identities.get(network);
+  if (!identity) return Object.freeze([]);
+  return networkResources(network.name, network.proxyContainer, identity.allocationId, identity.networkId,
+    identity.proxyId);
+}
 const removedNetworks = new WeakSet<VendorNetwork>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const deadline = (timeoutMs: number) => {
@@ -237,7 +247,8 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     try { cleanupPlannedResources(overall); }
     catch (cleanupError) {
       throw new VendorNetworkCreationCleanupError(error, cleanupError, () => cleanupPlannedResources(),
-        vendorNetworkResources({ name, proxyContainer }));
+        networkResources(name, proxyContainer, allocationId, networkId, proxyId)
+          .filter(resource => resource.kind === 'network' ? networkPlanned : proxyPlanned));
     }
     throw error;
   }

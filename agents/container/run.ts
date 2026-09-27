@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import type { UnreleasedResource } from '../contract.ts';
 import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
   isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
@@ -51,16 +52,28 @@ const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 // When a killed `docker create` for a profile stops counting as possibly in flight (performance.now() timestamp).
 const unsettledCreates = new WeakMap<ContainerProfile, number>();
-const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false) => {
+// Profiles whose `docker create` succeeded (with the returned ID) or whose client was killed (ID unknown). Only these
+// may own a container named `profile.name`; before that the name can belong to another invocation.
+const createdContainers = new WeakMap<ContainerProfile, string | undefined>();
+
+/** The agent container this profile may have created, for reporting when its removal is not confirmed. */
+export function agentContainerResources(profile: ContainerProfile): readonly UnreleasedResource[] {
+  if (!createdContainers.has(profile)) return Object.freeze([]);
+  const id = createdContainers.get(profile);
+  return Object.freeze([Object.freeze({ kind: 'container' as const, name: profile.name, ...(id ? { id } : {}),
+    owner: Object.freeze({ label: 'io.codeboost.invocation', value: profile.ownershipId }) })]);
+}
+const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false, timeoutMs = 30_000) => {
   // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
   if (!isContainerProfileAuthentic(profile))
     throw new Error('Container profile was not created by the trusted profile builder.');
   const settleUntil = unsettledCreates.get(profile) ?? 0;
-  const remaining = createDeadline(30_000 + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
+  const remaining = createDeadline(timeoutMs + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
     before = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (before.status === 0) break;
     const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
@@ -70,7 +83,8 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
     // inside the window and retries later.
     if (performance.now() >= settleUntil) {
       unsettledCreates.delete(profile);
-      disposeContainerProfile(profile);
+      createdContainers.delete(profile);
+      disposeContainerProfile(profile, remaining());
       return;
     }
     if (!waitForSettle) throw new Error('Agent container creation did not settle; staged credentials were retained.');
@@ -80,24 +94,30 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
   if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
   const result = spawnSync('docker', ['rm', '--force', profile.name], {
-    encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+    encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
     const inspect = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+      encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     const absent = inspect.status !== 0 && !inspect.error
       && /No such (?:object|container)/i.test(`${inspect.stdout ?? ''}\n${inspect.stderr ?? ''}`);
     if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
   }
   unsettledCreates.delete(profile);
-  disposeContainerProfile(profile);
+  createdContainers.delete(profile);
+  disposeContainerProfile(profile, remaining());
 };
 
-/** Remove a validated invocation container, then its profile-owned staging and network resources. */
-export function disposeValidatedContainer(profile: ContainerProfile): void {
+/**
+ * Remove a validated invocation container, then its profile-owned staging and network resources. `timeoutMs` bounds
+ * the container step and, separately, the network step.
+ */
+export function disposeValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000): void {
   assertContainerProfileAuthenticity(profile);
-  removeContainerOrThrow(profile);
+  removeContainerOrThrow(profile, false, timeoutMs);
 }
 
 type Inspect = {
@@ -292,10 +312,11 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     assertContainerProfile(profile, remaining());
     const createTimeout = remaining();
     createUnsettled = true;
-    try { docker(profile.args, { timeoutMs: createTimeout, secrets }); }
+    try { createdContainers.set(profile, docker(profile.args, { timeoutMs: createTimeout, secrets })); }
     catch (error) {
       // A nonzero exit means the daemon answered; a killed client leaves the request in flight.
       createUnsettled = typeof (error as { status?: unknown }).status !== 'number';
+      if (createUnsettled) createdContainers.set(profile, undefined);
       throw error;
     }
     createUnsettled = false;
