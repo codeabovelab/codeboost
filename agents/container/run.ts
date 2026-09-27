@@ -82,6 +82,12 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
   // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
   if (!isContainerProfileAuthentic(profile))
     throw new Error('Container profile was not created by the trusted profile builder.');
+  // A profile whose `docker create` never ran, or was refused by the daemon, owns no container: the name may belong
+  // to another invocation, which must neither be inspected as ours nor block this profile's own cleanup.
+  if (!createdContainers.has(profile)) {
+    disposeContainerProfile(profile, timeoutMs);
+    return;
+  }
   const settleUntil = unsettledCreates.get(profile) ?? 0;
   const remaining = createDeadline(timeoutMs + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
   // Look up by the captured ID; the name only for a create whose ID never came back.

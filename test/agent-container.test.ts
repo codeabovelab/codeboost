@@ -357,9 +357,11 @@ describe('real Docker agent isolation', () => {
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
-    expect(() => createValidatedContainer(duplicate)).toThrow('Container creation failed and cleanup did not settle.');
-    expect(existsSync(duplicate.codexAuthFile!)).toBe(true);
-    expect(isContainerProfileAuthentic(duplicate)).toBe(true);
+    // The refused create made no container, so the duplicate releases its own staging without touching the name.
+    expect(() => createValidatedContainer(duplicate)).toThrow(/already in use|Conflict/);
+    expect(existsSync(duplicate.codexAuthFile!)).toBe(false);
+    expect(isContainerProfileAuthentic(duplicate)).toBe(false);
+    expect(spawnSync('docker', ['network', 'inspect', duplicate.network.name], { stdio: 'ignore' }).status).not.toBe(0);
     const state = JSON.parse(docker('container', 'inspect', first.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', first.name); containers.delete(first.name);

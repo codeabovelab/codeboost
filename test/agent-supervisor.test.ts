@@ -207,14 +207,16 @@ describe('container invocation supervisor', () => {
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
   }, 4 * 60_000);
 
-  it('never reports a same-named container that another invocation owns', async () => {
+  it('releases its own resources, and leaves a same-named container another invocation owns', async () => {
     const current = profile(fixture(), 'finite-output', 'foreign-name');
     execFileSync('docker', ['create', '--name', current.name, '--label', 'io.codeboost.invocation=foreign',
       '--entrypoint', 'true', imageId], { stdio: 'ignore' });
     try {
-      const expected = inventory(current, false);
-      const result = await startProfileInvocation(current).settled;
-      expect(result.unreleased).toEqual(expected);
+      // Nothing is left running, so the synchronous start may throw.
+      expect(() => startProfileInvocation(current)).toThrow(/already in use|Conflict/);
+      expect(isInvocationActive('foreign-name')).toBe(false);
+      expect(isContainerProfileAuthentic(current)).toBe(false);
+      expect(spawnSync('docker', ['network', 'inspect', current.network.name], { stdio: 'ignore' }).status).not.toBe(0);
       expect(execFileSync('docker', ['container', 'inspect', '--format',
         '{{index .Config.Labels "io.codeboost.invocation"}}', current.name], { encoding: 'utf8' }).trim()).toBe('foreign');
     } finally {
