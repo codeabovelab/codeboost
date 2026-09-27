@@ -136,7 +136,8 @@ describe('admission', () => {
     const budget = store.getTask(identity).budgetDeadline;
     expect(budget).toBe(1_001_000);
     settle(store, first.id, { exitCode: 1 });
-    admit(store, { retryOf: first.id });
+    // Inside the budget; an expired budget refuses admission (see "refuses admission once the whole-task budget...").
+    admit(store, { retryOf: first.id, now: 1_000_500 });
     expect(store.getTask(identity).budgetDeadline).toBe(budget);
   });
 });
@@ -249,6 +250,16 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses admission once the whole-task budget has run out, and hands the task to a person', () => {
+    const { store } = queued(); const start = Date.now();
+    const first = admit(store, { budgetMs: 1_000, now: start });
+    settle(store, first.id, { exitCode: 1 });
+    expect(store.getTask(identity).status).toBe('running');
+    expect(() => admit(store, { retryOf: first.id, now: start + 1_000 })).toThrow(/budget has run out/);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)).toHaveLength(1);
+    expect(() => admit(store, { now: start + 1_000 })).toThrow(/needs human/);
+  });
   it('refuses a stale merge after the task was cancelled, so a closed task never closes twice', () => {
     const { store } = fixture();
     const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };

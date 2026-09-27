@@ -629,13 +629,19 @@ export class Store {
     if (!Number.isSafeInteger(budgetMs) || budgetMs < 1) throw new GuardRefusal('Invalid task budget.');
     if (input.retryOf !== undefined) assertUuidV4(input.retryOf, 'Retried attempt ID');
     const key = identityKey(identity);
-    return this.#transaction(() => {
+    const admitted = this.#transaction((): AttemptRecord | null => {
       const task = this.#task(key);
       if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
       if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
+      // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
+      if (task.budget_deadline !== null && (task.budget_deadline as number) <= now) {
+        this.#run("UPDATE tasks SET status='needs human' WHERE plan_key=?", key);
+        this.#touch(key);
+        return null;
+      }
       const current = this.#contextOf(key);
       if (!sameContext(input.expectedContext, current)) throw new GuardRefusal('The plan, snapshot, assignment or referenced code changed. Reload before starting.');
       if (input.retryOf !== undefined) {
@@ -652,6 +658,9 @@ export class Store {
       this.#touch(key);
       return this.getAttempt(identity, id);
     });
+    // Committed above so the move to needs human survives the refusal.
+    if (!admitted) throw new GuardRefusal('The task time budget has run out; it needs a person.');
+    return admitted;
   }
   /** The "Stopping" transition: sets the first reason once, keeps the state. */
   recordFirstReason(identity: PlanIdentity, id: string, reason: FirstReason): boolean {
