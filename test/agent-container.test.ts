@@ -406,6 +406,22 @@ describe('real Docker agent isolation', () => {
     expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
   }, 60_000);
 
+  it('removes the agent container by its ID, never a same-named replacement', () => {
+    const data = fixture(), live = profile(data, 'planning', 'noop');
+    createValidatedContainer(live);
+    const originalId = docker('container', 'inspect', '--format', '{{.Id}}', live.name);
+    const moved = `${live.name}-moved`, replacement = live.name;
+    // Someone renames our container and puts a same-named, same-labelled container in its place.
+    docker('rename', live.name, moved); containers.add(moved);
+    docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
+      '--entrypoint', 'true', imageId); containers.add(replacement);
+    const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
+    disposeValidatedContainer(live);
+    expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
+    expect(docker('container', 'inspect', '--format', '{{.Id}}', replacement)).toBe(replacementId);
+    expect(isContainerProfileAuthentic(live)).toBe(false);
+  }, 60_000);
+
   it('refuses to seed a clone whose staging directory was replaced after creation', () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-2',

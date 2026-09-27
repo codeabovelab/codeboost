@@ -56,6 +56,15 @@ const unsettledCreates = new WeakMap<ContainerProfile, number>();
 // may own a container named `profile.name`; before that the name can belong to another invocation.
 const createdContainers = new WeakMap<ContainerProfile, string | undefined>();
 
+const CONTAINER_ID = /^[0-9a-f]{64}$/;
+/**
+ * The immutable ID of the agent container this profile created, when `docker create` returned one. Every operation
+ * after the create should use it: the name can be taken over by a replacement container.
+ */
+export function agentContainerId(profile: ContainerProfile): string | undefined {
+  return createdContainers.get(profile);
+}
+
 /** The agent container this profile may have created, for reporting when its removal is not confirmed. */
 export function agentContainerResources(profile: ContainerProfile): readonly UnreleasedResource[] {
   if (!createdContainers.has(profile)) return Object.freeze([]);
@@ -69,9 +78,11 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
     throw new Error('Container profile was not created by the trusted profile builder.');
   const settleUntil = unsettledCreates.get(profile) ?? 0;
   const remaining = createDeadline(timeoutMs + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
+  // Look up by the captured ID; the name only for a create whose ID never came back.
+  const capturedId = createdContainers.get(profile), target = capturedId ?? profile.name;
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
-    before = spawnSync('docker', ['container', 'inspect', profile.name], {
+    before = spawnSync('docker', ['container', 'inspect', target], {
       encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -90,15 +101,21 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
     if (!waitForSettle) throw new Error('Agent container creation did not settle; staged credentials were retained.');
     sleep(250);
   }
-  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
+  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
+    { Id?: string; Config?: { Labels?: Record<string, string> } } | undefined;
   if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
-  const result = spawnSync('docker', ['rm', '--force', profile.name], {
+  // Remove and confirm by the ID the daemon just reported for our container, never by the name: a same-named
+  // replacement created after this inspect must not be deleted.
+  const id = inspected.Id;
+  if (!id || !CONTAINER_ID.test(id) || (capturedId && id !== capturedId))
+    throw new Error('Failed to establish the agent container identity; staged credentials were retained.');
+  const result = spawnSync('docker', ['rm', '--force', id], {
     encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
     stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
-    const inspect = spawnSync('docker', ['container', 'inspect', profile.name], {
+    const inspect = spawnSync('docker', ['container', 'inspect', id], {
       encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
       stdio: ['ignore', 'pipe', 'pipe'],
     });
@@ -312,7 +329,11 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     assertContainerProfile(profile, remaining());
     const createTimeout = remaining();
     createUnsettled = true;
-    try { createdContainers.set(profile, docker(profile.args, { timeoutMs: createTimeout, secrets })); }
+    try {
+      const id = docker(profile.args, { timeoutMs: createTimeout, secrets });
+      // An unexpected create output leaves the ID unknown, so cleanup falls back to a verified name lookup.
+      createdContainers.set(profile, CONTAINER_ID.test(id) ? id : undefined);
+    }
     catch (error) {
       // A nonzero exit means the daemon answered; a killed client leaves the request in flight.
       createUnsettled = typeof (error as { status?: unknown }).status !== 'number';

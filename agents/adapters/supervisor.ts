@@ -2,7 +2,7 @@ import { execFile, spawn, type ChildProcess } from 'node:child_process';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason,
   UnreleasedResource } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
-import { agentContainerResources, createValidatedContainer, disposeValidatedContainer,
+import { agentContainerId, agentContainerResources, createValidatedContainer, disposeValidatedContainer,
   validateContainer } from '../container/run.ts';
 import { assertContainerProfileAuthenticity, containerProfileResources, disposeContainerProfile,
   isContainerProfileAuthentic, type ContainerProfile } from '../container/profile.ts';
@@ -324,7 +324,12 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   let decodeAbort: AbortController | undefined;
   let protocolToken: string | undefined, protocolStarted = false, protocolReady = false;
   let protocolBuffer = Buffer.alloc(0);
-  try { validateContainer(profile.name, profile, remaining()); }
+  // Every call after the create targets the container's immutable ID, never its reusable name.
+  const container = agentContainerId(profile);
+  try {
+    if (!container) throw new Error('Docker did not return the created agent container ID.');
+    validateContainer(container, profile, remaining());
+  }
   catch (error) {
     try { disposeValidatedContainer(profile); }
     catch (cleanupError) {
@@ -333,7 +338,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     }
     throw error;
   }
-  const child = spawn('docker', ['start', '--attach', profile.name], {
+  const child = spawn('docker', ['start', '--attach', container], {
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
   });
   const timers = new Set<ReturnType<typeof setTimeout>>();
@@ -365,7 +370,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       "if(!stat.isFile()||stat.nlink!==1n)throw new Error('UNSAFE_ACK')}finally{if(fd!==undefined)fs.closeSync(fd);",
       'if(dirfd!==undefined)fs.closeSync(dirfd)}',
     ].join('');
-    return runControl(['exec', '--user', '0', profile.name, 'node', '-e', script, token]);
+    return runControl(['exec', '--user', '0', container, 'node', '-e', script, token]);
   };
   const later = (callback: () => void, delay: number) => {
     const timer = setTimeout(() => { timers.delete(timer); callback(); }, delay);
@@ -375,11 +380,11 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     if (terminating || closed) return;
     terminating = true;
     child.stdout?.resume(); child.stderr?.resume();
-    void runControl(['stop', '--signal=TERM', '--time=1', profile.name]);
-    later(() => { if (!closed) void runControl(['kill', '--signal=KILL', profile.name]); }, 1_500);
+    void runControl(['stop', '--signal=TERM', '--time=1', container]);
+    later(() => { if (!closed) void runControl(['kill', '--signal=KILL', container]); }, 1_500);
     later(() => {
       if (!closed) {
-        void runControl(['rm', '--force', profile.name]);
+        void runControl(['rm', '--force', container]);
         child.kill('SIGKILL');
       }
     }, 4_000);

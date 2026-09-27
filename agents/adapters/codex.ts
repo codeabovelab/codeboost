@@ -1,5 +1,6 @@
 import type { InvocationHandle } from '../contract.ts';
-import { createContainerProfile, ProfileCreationCleanupError } from '../container/profile.ts';
+import { createContainerProfile, ProfileCreationCleanupError, type ContainerProfile } from '../container/profile.ts';
+import { agentContainerId } from '../container/run.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../network/network.ts';
 import { createCodexCommand, createPhasePolicy } from '../policy.ts';
@@ -8,6 +9,12 @@ import { readBoundedContainerFile, retainNetworkCleanup, retainSetupCleanup,
 import { createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
+// Read the output from the container this invocation created, by ID; a same-named replacement must not answer.
+const codexContainer = (profile: ContainerProfile) => {
+  const id = agentContainerId(profile);
+  if (!id) throw new Error('The Codex container ID is unknown.');
+  return id;
+};
 
 export async function readCodexOutput(container: string, maximumBytes: number, timeoutMs = 30_000,
   signal?: AbortSignal) {
@@ -36,7 +43,7 @@ export function startCodexInvocation(request: AgentAdapterRequest,
     return startProfileInvocation(profile, { ...options,
       invocationBudget: remaining,
       decode: (current, _raw, maximum, timeoutMs, signal) =>
-        readCodexOutput(current.name, maximum, timeoutMs, signal) });
+        readCodexOutput(codexContainer(current), maximum, timeoutMs, signal) });
   } catch (error) {
     if (error instanceof ProfileCreationCleanupError) {
       const retryCleanup = (networkTimeoutMs = 30_000) => {
