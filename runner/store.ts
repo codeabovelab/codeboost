@@ -231,15 +231,22 @@ export class Store {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
-  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null): MergeAttempt {
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null): MergeAttempt {
     sha(reviewedHead);
     if (actionId !== null) assertUuidV4(actionId, 'Action ID');
     if (!['queue','direct'].includes(kind)) throw new Error('Invalid merge attempt kind.');
     if (queueWatermark !== null && (typeof queueWatermark !== 'string' || !queueWatermark || queueWatermark.length > 512)) throw new Error('Invalid merge-queue event cursor.');
     if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for merging.');
     const key = identityKey(identity);
+    if (expectedTaskStateVersion !== null && (!Number.isSafeInteger(expectedTaskStateVersion) || expectedTaskStateVersion < 0))
+      throw new Error('Invalid expected task state version.');
     return this.#transaction(() => {
       this.#expect(key, expected);
+      // A merge is irreversible: a closed task, a pending cancel or any task change since the click refuses it.
+      const task = this.#task(key);
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be merged.');
+      if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
       if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');

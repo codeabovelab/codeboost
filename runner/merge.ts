@@ -141,6 +141,8 @@ export class MergeCoordinator {
   async #merge(token: string, signal: AbortSignal): Promise<{ status: MergeStatus; result: MergeResult }> {
     let queueAttempt: MergeAttempt | null = null;
     try {
+      // Captured when the request arrives and re-checked in the admission transaction after the final await.
+      const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
       const status = await this.#statusForMerge(view, signal);
@@ -165,7 +167,7 @@ export class MergeCoordinator {
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined)
-        queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion }, commandStatus.remote.head, queueWatermark, commandStatus.remote.mergeQueue ? 'queue' : 'direct');
+        queueAttempt = this.service.store.beginMergeAttempt(this.service.config.identity, { ...view.expected, reviewVersion: view.expected.reviewVersion }, commandStatus.remote.head, queueWatermark, commandStatus.remote.mergeQueue ? 'queue' : 'direct', null, taskStateVersion);
       const result = await this.gateway.merge(commandStatus.remote.head, { signal });
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not

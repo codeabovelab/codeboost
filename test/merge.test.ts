@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
@@ -175,6 +176,19 @@ it('aborts and awaits an active merge command during shutdown', async () => {
   await expect(merging).rejects.toThrow(/shutdown/i);
   expect(commandSettled).toBe(true);
   await expect(coordinator.merge(view.token)).rejects.toThrow(/shutting down/i);
+});
+
+it.each([
+  ['cancelled', (h: ReturnType<typeof queueHarness>) => h.store.cancelTask(h.identity, h.store.getTask(h.identity).stateVersion, randomUUID()), /cancelled; it cannot be merged/],
+  ['changed', (h: ReturnType<typeof queueHarness>) => h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'queued'), /Stale task state/],
+] as const)('does not merge when the task is %s during merge validation', async (_label, change, message) => {
+  const h = queueHarness([]);
+  h.client.queueWatermark = vi.fn(async () => { change(h); return 'CURSOR_before'; });
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(message);
+    expect(h.merges).toEqual([]);
+    expect(h.store.getMergeAttempt(h.identity)).toBeNull();
+  } finally { await h.coordinator.close(); h.store.close(); }
 });
 
 it('persists enqueue success as queued and waits for a separate confirmed merge', async () => {

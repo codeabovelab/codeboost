@@ -249,6 +249,25 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses a stale merge after the task was cancelled, so a closed task never closes twice', () => {
+    const { store } = fixture();
+    const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
+    const loaded = store.getTask(identity).stateVersion;
+    expect(store.cancelTask(identity, loaded, randomUUID())).toBe('closed');
+    expect(() => store.beginMergeAttempt(identity, state, oid(2), null, 'direct')).toThrow(/cancelled; it cannot be merged/);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(store.feedbackEvents(identity).filter(event => event.kind === 'task-closed')).toHaveLength(1);
+  });
+  it('refuses a merge whose expected task state version has moved on', () => {
+    const { store } = fixture();
+    const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
+    const loaded = store.getTask(identity).stateVersion;
+    store.transitionTask(identity, loaded, 'queued');
+    expect(() => store.beginMergeAttempt(identity, state, oid(2), null, 'direct', null, loaded)).toThrow(/Stale task state/);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+    expect(store.beginMergeAttempt(identity, state, oid(2), null, 'direct', null, store.getTask(identity).stateVersion).state).toBe('submitting');
+  });
   it('replays a lost merge click as the attempt\'s current outcome, not the saved "in progress"', () => {
     const { store } = fixture();
     const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
