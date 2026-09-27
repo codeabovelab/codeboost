@@ -137,6 +137,34 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('cancelled')).toBe(false);
   }, 60_000);
 
+  it('settles with unreleased resources when the daemon becomes unreachable during cleanup', async () => {
+    const current = profile(fixture(), 'ignore-term', 'unreachable-daemon');
+    const handle = startProfileInvocation(current, { timeoutMs: 3 * 60_000 });
+    for (let tries = 0; spawnSync('docker', ['container', 'inspect', '--format', '{{.State.Running}}', current.name],
+      { encoding: 'utf8' }).stdout.trim() !== 'true'; tries += 1) {
+      if (tries > 100) throw new Error('Agent container did not start.');
+      await new Promise(resolve => setTimeout(resolve, 100));
+    }
+    const original = process.env.DOCKER_HOST;
+    process.env.DOCKER_HOST = `unix://${join(tmpdir(), 'codeboost-no-daemon.sock')}`;
+    try {
+      handle.cancel('shutdown');
+      const result = await handle.settled;
+      expect(result.stopReason).toBe('shutdown');
+      expect(result.stderr).toContain('cleanup was not confirmed within 60 s');
+      expect(result.unreleased).toEqual(expect.arrayContaining([
+        { kind: 'container', name: current.name },
+        { kind: 'container', name: current.network.proxyContainer },
+        { kind: 'network', name: current.network.name }]));
+      expect(isInvocationActive('unreachable-daemon')).toBe(false);
+    } finally {
+      if (original === undefined) delete process.env.DOCKER_HOST; else process.env.DOCKER_HOST = original;
+    }
+    // The container ignored SIGTERM and the stop never reached the daemon, so it is still there to remove.
+    disposeValidatedContainer(current);
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
+  }, 3 * 60_000);
+
   it('enforces a finite wall deadline and force-settles the container', async () => {
     const started = Date.now();
     const handle = startProfileInvocation(profile(fixture(), 'ignore-term', 'timeout', 8_000), { timeoutMs: 30_000 });

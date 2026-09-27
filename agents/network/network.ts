@@ -1,6 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { assertCapturedInvocation, type InvocationInput } from '../contract.ts';
+import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 
 export const VENDOR_HOSTS = Object.freeze({
@@ -21,13 +21,23 @@ interface NetworkIdentity { readonly allocationId: string; readonly imageId: str
 export class VendorNetworkCreationCleanupError extends AggregateError {
   readonly startupError: unknown;
   readonly retryCleanup: () => void;
+  /** The network and proxy this creation may have left behind. */
+  readonly resources: readonly UnreleasedResource[];
 
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void) {
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void,
+    resources: readonly UnreleasedResource[] = []) {
     super([startupError, cleanupError], 'Vendor network creation and cleanup failed.');
     this.startupError = startupError;
     this.retryCleanup = retryCleanup;
+    this.resources = Object.freeze([...resources]);
   }
 }
+/** The daemon objects a vendor network owns, for reporting when their removal is not confirmed. */
+export const vendorNetworkResources = (network: Pick<VendorNetwork, 'name' | 'proxyContainer'>):
+  readonly UnreleasedResource[] => Object.freeze([
+  Object.freeze({ kind: 'container' as const, name: network.proxyContainer }),
+  Object.freeze({ kind: 'network' as const, name: network.name }),
+]);
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 const removedNetworks = new WeakSet<VendorNetwork>();
 const environment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
@@ -226,7 +236,8 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
   } catch (error) {
     try { cleanupPlannedResources(overall); }
     catch (cleanupError) {
-      throw new VendorNetworkCreationCleanupError(error, cleanupError, () => cleanupPlannedResources());
+      throw new VendorNetworkCreationCleanupError(error, cleanupError, () => cleanupPlannedResources(),
+        vendorNetworkResources({ name, proxyContainer }));
     }
     throw error;
   }

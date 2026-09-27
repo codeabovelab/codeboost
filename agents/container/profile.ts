@@ -3,10 +3,11 @@ import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, ope
   readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assertCapturedInvocation, type InvocationInput, type Phase } from '../contract.ts';
+import { assertCapturedInvocation, type InvocationInput, type Phase, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
-import { assertVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
+import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
+  type VendorNetwork } from '../network/network.ts';
 import { assertAgentCommand, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
 export interface ContainerProfile {
   readonly name: string;
@@ -41,11 +42,15 @@ export interface ProfileOptions {
 export class ProfileCreationCleanupError extends AggregateError {
   readonly startupError: unknown;
   readonly retryCleanup: () => void;
+  /** The staging directories and network this creation may have left behind. */
+  readonly resources: readonly UnreleasedResource[];
 
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void) {
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void,
+    resources: readonly UnreleasedResource[] = []) {
     super([startupError, cleanupError], 'Profile creation and cleanup both failed.');
     this.startupError = startupError;
     this.retryCleanup = retryCleanup;
+    this.resources = Object.freeze([...resources]);
   }
 }
 
@@ -160,6 +165,19 @@ export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now
   const left = Math.floor(expected.deadline - now);
   if (left < 1) throw new Error('Invocation deadline has passed.');
   return Math.min(timeoutMs, left);
+}
+
+/**
+ * The resources a profile owns, for reporting when their removal is not confirmed. The agent container is listed
+ * only when this profile may have created it: before creation, its name can belong to another invocation.
+ */
+export function containerProfileResources(profile: ContainerProfile, container: boolean): readonly UnreleasedResource[] {
+  const identity = identities.get(profile);
+  return Object.freeze([
+    ...(container ? [Object.freeze({ kind: 'container' as const, name: profile.name })] : []),
+    ...vendorNetworkResources(profile.network),
+    ...(identity?.cleanupDirectories ?? []).map(name => Object.freeze({ kind: 'directory' as const, name })),
+  ]);
 }
 
 /** Remove runner-owned credential staging after this one-shot profile settles. */
@@ -280,7 +298,11 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
     };
     try { cleanupProfileResources(); }
-    catch (cleanupError) { throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources); }
+    catch (cleanupError) {
+      throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources, [
+        ...vendorNetworkResources(options.network),
+        ...cleanupDirectories.map(name => Object.freeze({ kind: 'directory' as const, name }))]);
+    }
     throw error;
   }
 }

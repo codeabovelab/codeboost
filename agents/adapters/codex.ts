@@ -26,7 +26,7 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   catch (error) {
     if (error instanceof VendorNetworkCreationCleanupError)
       return retainSetupCleanup(request.invocation, error.retryCleanup, error.startupError, error,
-        'network creation cleanup');
+        'network creation cleanup', error.resources);
     throw error;
   }
   try {
@@ -47,7 +47,7 @@ export function startCodexInvocation(request: AgentAdapterRequest,
       };
       try { retryCleanup(Math.min(30_000, remaining())); }
       catch (cleanupError) { return retainSetupCleanup(request.invocation, () => retryCleanup(),
-        error.startupError, cleanupError, 'profile and network cleanup'); }
+        error.startupError, cleanupError, 'profile and network cleanup', error.resources); }
       throw error.startupError;
     }
     try { removeVendorNetwork(network, Math.min(30_000, remaining())); }

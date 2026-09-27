@@ -80,8 +80,12 @@ The boundary guarantees the following:
 
 The caller must do the following:
 
-- Keep ownership until `settled` resolves. It resolves only after the container has
-  stopped and its cleanup has finished. The supervisor retries cleanup until then.
+- Keep ownership until `settled` resolves. It resolves after the container has
+  stopped and its cleanup has finished. If cleanup keeps failing, the supervisor retries it every second for
+  60 seconds after the first failure, then settles anyway. That result has a `stopReason` and lists the
+  resources it could not confirm removed in `unreleased`; the container may still be running.
+- When `unreleased` is present, record those resources durably and keep them owned until their removal is
+  confirmed.
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
@@ -154,7 +158,7 @@ absolute and symlinked spellings share them. A database with other hard links is
 - The first question of each process runs that scan even without a record, because a process killed before it
   could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
   process running Ask at the same moment also keeps this one off.
-- Lane D's settlement can retry cleanup without limit (#51 item 1). Abandonment happens once: a crash, a watchdog and shutdown all wait on
+- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1), but Ask's own abandonment path predates that and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
   the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
   records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call

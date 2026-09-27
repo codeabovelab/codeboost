@@ -26,6 +26,11 @@ export interface InvocationInput {
   readonly context: InvocationContext;
 }
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
+/** A resource D created for an attempt and could not confirm removed. */
+export interface UnreleasedResource {
+  readonly kind: 'container' | 'network' | 'directory';
+  readonly name: string;
+}
 export interface InvocationResult {
   readonly attemptId: string;
   readonly context: InvocationContext;
@@ -34,11 +39,18 @@ export interface InvocationResult {
   readonly stopReason?: StopReason;
   readonly stdout: string;
   readonly stderr: string;
+  /**
+   * Present only when cleanup was still failing when D's bounded retry window ended. These resources may still
+   * exist, and the agent container may still be running. `stopReason` is always set. The caller must record them
+   * durably and keep them owned until their removal is confirmed.
+   */
+  readonly unreleased?: readonly UnreleasedResource[];
 }
 /**
  * F owns persisted pending/stale and admission; D owns running invocations.
  * cancel() records the first reason and requests termination, never settlement.
- * settled resolves only after the container AND capture processes terminate.
+ * settled resolves only after the container AND capture processes terminate, or, when cleanup keeps failing, once
+ * D's bounded cleanup retries end with `unreleased` set.
  * completed/failed/cancelled records are published by F using attemptId + context
  * CAS; discarded stale output still must settle before releasing D's slot.
  * Closing rejects admission before draining requests, cancelling, and awaiting

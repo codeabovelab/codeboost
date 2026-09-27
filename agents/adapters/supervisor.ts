@@ -1,10 +1,11 @@
 import { execFile, spawn, type ChildProcess } from 'node:child_process';
-import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../contract.ts';
+import type { InvocationHandle, InvocationInput, InvocationResult, StopReason,
+  UnreleasedResource } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { createValidatedContainer, disposeValidatedContainer, validateContainer } from '../container/run.ts';
-import { assertContainerProfileAuthenticity, disposeContainerProfile, isContainerProfileAuthentic,
-  type ContainerProfile } from '../container/profile.ts';
-import { removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
+import { assertContainerProfileAuthenticity, containerProfileResources, disposeContainerProfile,
+  isContainerProfileAuthentic, type ContainerProfile } from '../container/profile.ts';
+import { removeVendorNetwork, vendorNetworkResources, type VendorNetwork } from '../network/network.ts';
 
 export const OUTPUT_LIMITS = Object.freeze({
   stdoutBytes: 16 * 1024 * 1024,
@@ -89,40 +90,56 @@ export class ByteCollector {
   get blockCount(): number { return this.blocks.length; }
 }
 
-// `cleanup` is what recovery retries: container-level disposal by default, or profile-only disposal for a
-// rejection that happened before this profile created any container.
-const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true,
-  cleanup: (profile: ContainerProfile) => void = disposeValidatedContainer): InvocationHandle => {
-  const invocation = assertPhasePolicy(profile.policy);
+/** How often unconfirmed cleanup is retried. */
+const CLEANUP_RETRY_INTERVAL_MS = 1_000;
+/**
+ * How long cleanup is retried after its first failure before the handle settles anyway, reporting what it could not
+ * remove. Without this bound an unreachable daemon would keep `settled` pending forever.
+ */
+export const CLEANUP_RETRY_WINDOW_MS = 60_000;
+const cleanupWindowDetail = () => `cleanup was not confirmed within ${CLEANUP_RETRY_WINDOW_MS / 1_000} s`;
+
+/**
+ * Own an attempt while retrying cleanup that has already failed once. Settles when cleanup succeeds, or when the
+ * retry window ends, with `unreleased` listing what may remain.
+ */
+const retainCleanup = (invocation: InvocationInput, cleanup: () => void, detail: string,
+  resources: readonly UnreleasedResource[], register: boolean, released?: () => void): InvocationHandle => {
   let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
   let cancelReason: StopReason | undefined;
   let handle!: InvocationHandle;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  const giveUpAt = performance.now() + CLEANUP_RETRY_WINDOW_MS;
   const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
+  const finish = (unreleased: boolean) => {
+    if (timer) clearTimeout(timer);
+    timer = undefined;
+    complete = true;
+    if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
+    cleanupRecoveries.delete(handle);
+    released?.();
+    const reason = cancelReason ?? 'capture-failure';
+    resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
+      exitCode: null, signal: null, stopReason: reason, stdout: '',
+      stderr: diagnosticFor(reason, unreleased ? `${cleanupWindowDetail()}: ${detail}` : detail).toString('utf8'),
+      ...(unreleased ? { unreleased: resources } : {}) }));
+  };
   const schedule = () => {
-    if (timer) return;
-    timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
+    if (timer || complete) return;
+    timer = setTimeout(() => { timer = undefined; retry(); }, CLEANUP_RETRY_INTERVAL_MS);
   };
   const retry = () => {
     if (cleaning || complete) return;
     cleaning = true;
-    try {
-      cleanup(profile);
-      if (timer) clearTimeout(timer);
-      timer = undefined;
-      complete = true;
-      if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
-      activeProfiles.delete(profile);
-      cleanupRecoveries.delete(handle);
-      resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
-        exitCode: null, signal: null, stopReason: cancelReason ?? 'capture-failure', stdout: '',
-        stderr: diagnosticFor(cancelReason ?? 'capture-failure', detail).toString('utf8') }));
-    } catch {
+    try { cleanup(); }
+    catch {
       cleaning = false;
-      schedule();
+      if (performance.now() >= giveUpAt) finish(true);
+      else schedule();
       return;
     }
     cleaning = false;
+    finish(false);
   };
   handle = Object.freeze({ attemptId: invocation.attemptId, settled,
     cancel: (reason: StopReason) => {
@@ -131,63 +148,37 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
       timer = undefined;
       retry();
     } });
-  activeProfiles.add(profile);
   if (register) active.set(invocation.attemptId, handle);
   else cleanupRecoveries.add(handle);
   schedule();
   return handle;
 };
 
+// `cleanup` is what recovery retries: container-level disposal by default, or profile-only disposal for a
+// rejection that happened before this profile created any container.
+const retainCleanupOwnership = (profile: ContainerProfile, detail: string, register = true,
+  cleanup: (profile: ContainerProfile) => void = disposeValidatedContainer): InvocationHandle => {
+  const invocation = assertPhasePolicy(profile.policy);
+  activeProfiles.add(profile);
+  return retainCleanup(invocation, () => cleanup(profile), detail,
+    containerProfileResources(profile, cleanup === disposeValidatedContainer), register,
+    () => activeProfiles.delete(profile));
+};
+
 /** Retain attempt ownership while retrying a network allocated before profile construction failed. */
 export function retainNetworkCleanup(invocation: InvocationInput, network: VendorNetwork,
   startupError: unknown, cleanupError: unknown): InvocationHandle {
   return retainSetupCleanup(invocation, () => removeVendorNetwork(network), startupError, cleanupError,
-    'network cleanup');
+    'network cleanup', vendorNetworkResources(network));
 }
 
 /** Retain attempt ownership while retrying resources allocated during synchronous adapter setup. */
 export function retainSetupCleanup(invocation: InvocationInput, retryCleanup: () => void,
-  startupError: unknown, cleanupError: unknown, kind = 'setup cleanup'): InvocationHandle {
-  const register = !ownsAttempt(invocation.attemptId);
-  let resolveSettled!: (result: InvocationResult) => void, cleaning = false, complete = false;
-  let cancelReason: StopReason | undefined;
-  let handle!: InvocationHandle;
-  let timer: ReturnType<typeof setTimeout> | undefined;
-  const settled = new Promise<InvocationResult>(resolve => { resolveSettled = resolve; });
-  const detail = `Adapter startup failed and ${kind} remains unsettled: ${String(startupError)}; ${String(cleanupError)}`;
-  const retry = () => {
-    if (cleaning || complete) return;
-    cleaning = true;
-    try {
-      retryCleanup();
-      if (timer) clearTimeout(timer);
-      timer = undefined;
-      complete = true;
-      if (active.get(invocation.attemptId) === handle) active.delete(invocation.attemptId);
-      cleanupRecoveries.delete(handle);
-      resolveSettled(Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
-        exitCode: null, signal: null, stopReason: cancelReason ?? 'capture-failure', stdout: '',
-        stderr: diagnosticFor(cancelReason ?? 'capture-failure', detail).toString('utf8') }));
-    } catch {
-      cleaning = false;
-      if (!timer) {
-        timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
-      }
-      return;
-    }
-    cleaning = false;
-  };
-  handle = Object.freeze({ attemptId: invocation.attemptId, settled,
-    cancel: (reason: StopReason) => {
-      cancelReason ??= reason;
-      if (timer) clearTimeout(timer);
-      timer = undefined;
-      retry();
-    } });
-  if (register) active.set(invocation.attemptId, handle);
-  else cleanupRecoveries.add(handle);
-  timer = setTimeout(() => { timer = undefined; retry(); }, 1_000);
-  return handle;
+  startupError: unknown, cleanupError: unknown, kind = 'setup cleanup',
+  resources: readonly UnreleasedResource[] = []): InvocationHandle {
+  return retainCleanup(invocation, retryCleanup,
+    `Adapter startup failed and ${kind} remains unsettled: ${String(startupError)}; ${String(cleanupError)}`,
+    resources, !ownsAttempt(invocation.attemptId));
 }
 const withDiagnostic = (stderr: Buffer, stdoutBytes: number, reason: StopReason, limits: CaptureLimits,
   detail?: string) => {
@@ -567,6 +558,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       if (decodedOutput.providerFailed) exitCode = exitCode === 0 ? 1 : exitCode;
     }
     await Promise.all([...controls]);
+    let giveUpAt: number | undefined, unreleased: readonly UnreleasedResource[] | undefined;
     while (true) {
       try {
         disposeValidatedContainer(profile);
@@ -575,10 +567,17 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       } catch (error) {
         stopReason ??= 'capture-failure';
         failureDetail ??= error instanceof Error ? error.message : String(error);
+        giveUpAt ??= performance.now() + CLEANUP_RETRY_WINDOW_MS;
+        if (performance.now() >= giveUpAt) {
+          wakeCleanup = undefined;
+          unreleased = containerProfileResources(profile, true);
+          failureDetail = `${cleanupWindowDetail()}: ${failureDetail}`;
+          break;
+        }
         await new Promise<void>(resolve => {
           let finished = false;
           const wake = () => { if (finished) return; finished = true; clearTimeout(timer); resolve(); };
-          const timer = setTimeout(wake, 1_000);
+          const timer = setTimeout(wake, CLEANUP_RETRY_INTERVAL_MS);
           wakeCleanup = wake;
         });
       }
@@ -600,7 +599,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     if (stopReason) finalStderr = withDiagnostic(finalStderr, finalStdout.length, stopReason, limits, failureDetail);
     const result = Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
       exitCode, signal: finalSignal, ...(stopReason ? { stopReason } : {}),
-      stdout: finalStdout.toString('utf8'), stderr: finalStderr.toString('utf8') });
+      stdout: finalStdout.toString('utf8'), stderr: finalStderr.toString('utf8'), ...(unreleased ? { unreleased } : {}) });
     settlementComplete = true;
     activeProfiles.delete(profile);
     active.delete(invocation.attemptId);
