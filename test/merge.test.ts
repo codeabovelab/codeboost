@@ -251,6 +251,25 @@ it('returns a committed merge on replay even when the local review cannot be rel
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('joins a resend that arrives while the first click is still validating, before its action is saved', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  let release!: () => void;
+  const inspect = h.client.inspect;
+  h.client.inspect = vi.fn(async (...args: Parameters<typeof inspect>) => { await new Promise<void>(resolve => { release = resolve; }); h.client.inspect = inspect; return inspect(...args); });
+  try {
+    const first = h.coordinator.merge(h.view().token, actionId);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const resend = h.coordinator.merge(h.view().token, actionId);
+    await expect(h.coordinator.merge('different-token', actionId)).rejects.toThrow(/already used/);
+    await expect(h.coordinator.merge(h.view().token, randomUUID())).rejects.toThrow(/already running/);
+    release();
+    const [a, b] = await Promise.all([first, resend]);
+    expect(b).toBe(a);
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

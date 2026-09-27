@@ -1,6 +1,6 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
-import { assertUuidV4 } from './lifecycle.ts';
+import { ActionIdReused, assertUuidV4 } from './lifecycle.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -24,6 +24,8 @@ function queueGateway(gateway: MergeGateway): gateway is QueueGateway {
 
 export class MergeCoordinator {
   #active: Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | null = null;
+  /** The click the active merge serves; a resend of it joins that merge before its action is saved. */
+  #activeClick: { actionId: string; token: string } | null = null;
   #abort: AbortController | null = null;
   #queuePoll: Promise<MergeQueueStatus | null> | null = null;
   #queueAbort: AbortController | null = null;
@@ -132,6 +134,10 @@ export class MergeCoordinator {
     // Replay before every other guard, shutdown included: a resend after a lost response is not a second click.
     const replay = typeof token === 'string' && typeof actionId === 'string' ? this.#replay(token, actionId) : undefined;
     if (replay) return replay;
+    if (this.#active && typeof actionId === 'string' && this.#activeClick?.actionId === actionId) {
+      if (this.#activeClick.token !== token) throw new ActionIdReused('Action ID already used for a different request.');
+      return this.#active;
+    }
     if (this.#closing) throw new Error('Merge coordinator is shutting down.');
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
@@ -140,10 +146,11 @@ export class MergeCoordinator {
     this.#abort = abort;
     const attempt = this.#merge(token, abort.signal, actionId as string | undefined).finally(() => {
       clearTimeout(timer);
-      if (this.#active === attempt) this.#active = null;
+      if (this.#active === attempt) { this.#active = null; this.#activeClick = null; }
       if (this.#abort === abort) this.#abort = null;
     });
     this.#active = attempt;
+    this.#activeClick = typeof actionId === 'string' ? { actionId, token } : null;
     return attempt;
   }
 
