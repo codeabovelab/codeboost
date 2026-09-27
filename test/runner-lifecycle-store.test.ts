@@ -281,6 +281,17 @@ describe('user actions', () => {
     expect(store.getTask(identity).status).toBe('cancelled');
     expect(store.feedbackEvents(identity).filter(event => event.kind === 'task-closed')).toHaveLength(1);
   });
+  it('refuses runner status changes while a merge is submitting or queued', () => {
+    const { store } = fixture();
+    const state = { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) };
+    const merge = store.beginMergeAttempt(identity, state, oid(2), 'cursor', 'queue');
+    expect(() => store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued')).toThrow(/merge is in progress/);
+    store.queueMergeAttempt(identity, merge.id, 'https://github.com/o/r/pull/1');
+    expect(() => store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued')).toThrow(/merge is in progress/);
+    store.finishMergeAttempt(identity, merge.id, { state: 'removed', reason: 'Removed from the queue.' });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect(store.getTask(identity).status).toBe('queued');
+  });
   it('refuses a merge while an attempt runs or the task is not in review', () => {
     const { store } = queued();
     const state = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });

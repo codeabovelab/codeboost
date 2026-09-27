@@ -129,10 +129,10 @@ export class MergeCoordinator {
    */
   async merge(token: unknown, actionId?: unknown): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {
     if (actionId !== undefined) assertUuidV4(actionId, 'Action ID');
-    if (this.#closing) throw new Error('Merge coordinator is shutting down.');
-    // Replay before the active guard: a resend after a lost response must not look like a second click.
+    // Replay before every other guard, shutdown included: a resend after a lost response is not a second click.
     const replay = typeof token === 'string' && typeof actionId === 'string' ? this.#replay(token, actionId) : undefined;
     if (replay) return replay;
+    if (this.#closing) throw new Error('Merge coordinator is shutting down.');
     if (this.#active) throw new Error('A merge attempt is already running.');
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
     const abort = new AbortController();

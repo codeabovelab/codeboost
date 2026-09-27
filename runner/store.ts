@@ -611,9 +611,15 @@ export class Store {
       if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (this.#closed(task.status)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
       this.#run('UPDATE tasks SET status=? WHERE plan_key=?', to, key);
       this.#touch(key);
     });
+  }
+  /** GitHub may still merge the reviewed head while the latest merge attempt is submitting or queued. */
+  #activeMerge(key: string): boolean {
+    const row = this.#get('SELECT data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', key);
+    return !!row && ['submitting', 'queued'].includes(decode<MergeAttempt>(row.data).state);
   }
   #activeAttempt(key: string) {
     return this.#get("SELECT * FROM attempts WHERE plan_key=? AND state IN ('pending','running')", key);
@@ -645,6 +651,7 @@ export class Store {
         if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
+        if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
         // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
         if (task.budget_deadline !== null && (task.budget_deadline as number) <= now)
           throw new RefusalWithEffect('The task time budget has run out; it needs a person.', expire);

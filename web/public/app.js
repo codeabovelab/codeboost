@@ -47,7 +47,7 @@ async function api(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const value = await response.json();
-  if (!response.ok) throw new Error(value.error || "Request failed.");
+  if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status });
   return value;
 }
 function rememberDraft() {
@@ -480,8 +480,9 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
-    // fetch rejects with a TypeError when no response arrived; any other error is the server's definite answer.
-    if (!(error instanceof TypeError)) mergeActionId = null;
+    // Keep the key when no response arrived (fetch's TypeError) or the server was shutting down (503, nothing
+    // applied), so the next click resends the same action. Any other error is the server's definite answer.
+    if (!(error instanceof TypeError) && error.status !== 503) mergeActionId = null;
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;

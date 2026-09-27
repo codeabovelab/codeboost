@@ -264,6 +264,19 @@ it('replays a refused merge as the same failure, not as a submission', async () 
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('replays a saved merge click after shutdown has started', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    await h.coordinator.close();
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    await expect(h.coordinator.merge(h.view().token, randomUUID())).rejects.toThrow(/shutting down/);
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('keeps a direct merge URL for a replayed click', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));
