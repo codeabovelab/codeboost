@@ -24,7 +24,7 @@ export interface UnownedResource extends RecoveredResource {
   readonly reason: 'no-runner-label' | 'unknown-kind' | 'inconsistent-storage';
 }
 export interface RecoveryReport {
-  /** Agent containers, egress proxies, seeders and networks of this runner, now confirmed gone. */
+  /** Agent containers, egress proxies, seeders, export containers and networks of this runner, now confirmed gone. */
   readonly removed: readonly RecoveredResource[];
   /** One handle per task-storage allocation of this runner, kept whole for export and `removeTaskFilesystems`. */
   readonly storage: readonly RecoveredTaskStorage[];
@@ -180,7 +180,9 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   for (const resource of owned.container) {
     const kind = kindOf(resource);
     if (kind === 'storage:keeper') keep(resource, 'keeper');
-    else if (kind === 'storage:seeder' || kind === 'agent' || kind === 'egress') remove.push(resource);
+    // Seeders and export containers are transient: a leftover one is removed, never kept with the storage.
+    else if (kind === 'storage:seeder' || kind === 'storage:export' || kind === 'agent' || kind === 'egress')
+      remove.push(resource);
     else unknown(resource);
   }
   for (const resource of owned.volume) {

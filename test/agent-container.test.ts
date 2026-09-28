@@ -12,7 +12,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner } from '../agents/container/storage.ts';
+import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -738,6 +738,63 @@ describe('real Docker agent isolation', () => {
     const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
     for (const pgid of pgids) expect(groupAlive(pgid)).toBe(false);
   }, 90_000);
+
+  // What an agent leaves in task storage: a commit of its own, an edit to a tracked file, and a new untracked file.
+  const agentChanges = (filesystems: ReturnType<typeof prepareTaskFilesystems>) => docker('run', '--rm', '--network=none',
+    '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
+    '--mount', `type=volume,source=${filesystems.workVolume},target=/work`,
+    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'bash', imageId, '-c', [
+      'set -e', 'cd /work',
+      'g() { git -c user.name=agent -c user.email=agent@example.com -c core.hooksPath=/dev/null "$@"; }',
+      'printf "committed\\n" > committed.txt', 'g add committed.txt', 'g commit -qm agent',
+      'printf "changed\\n" > file.txt', 'printf "brand new\\n" > untracked.txt'].join('\n'));
+
+  it('exports the diff against the last codeboost commit, bounded and without writing to the storage', async () => {
+    const data = fixture(), filesystems = data.filesystems;
+    agentChanges(filesystems);
+    const exported = await exportTaskDiff(filesystems, { base: data.clone.head, imageId });
+    const text = exported.diff.toString('utf8');
+    expect(exported.truncated).toBe(false);
+    // The agent's own commit, an unstaged edit and an untracked file all appear against the base.
+    expect(text).toContain('b/committed.txt');
+    expect(text).toContain('+committed');
+    expect(text).toContain('-trusted');
+    expect(text).toContain('+changed');
+    expect(text).toContain('b/untracked.txt');
+    expect(text).toContain('+brand new');
+    const cut = await exportTaskDiff(filesystems, { base: data.clone.head, imageId, maxBytes: 20 });
+    expect(cut).toEqual({ diff: exported.diff.subarray(0, 20), truncated: true });
+    await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');
+    // No export container is left, and the storage still validates for the next launch.
+    expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
+      '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');
+  }, 120_000);
+
+  it('on abort, removes a running export container whose client ignores SIGTERM', async () => {
+    const data = fixture(), filesystems = data.filesystems, marker = join(data.root, 'export-started');
+    const allocationId = taskFilesystemOwner(filesystems).allocationId;
+    // The export container really starts (a long sleep in place of the diff), then the client ignores SIGTERM.
+    const stubborn = [
+      "if (args.includes('io.codeboost.task-storage=export')) {",
+      "  const at = args.indexOf('-c'); args.splice(at, 2, '-c', 'sleep 300'); args.splice(1, 0, '--detach');",
+      '  result = run(args);',
+      `  require('node:fs').writeFileSync(${JSON.stringify(marker)}, '');`,
+      "  process.on('SIGTERM', () => {});",
+      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+      '} else result = run(args);',
+    ].join('\n');
+    const controller = new AbortController();
+    const waitForStart = setInterval(() => { if (existsSync(marker)) controller.abort(); }, 20);
+    const began = performance.now();
+    try {
+      const error = await withDockerShim(['run', '--rm'], stubborn, () => exportTaskDiff(filesystems,
+        { base: data.clone.head, imageId, signal: controller.signal }).then(() => undefined, caught => caught));
+      expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    } finally { clearInterval(waitForStart); }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
+    expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
+      '--filter', `label=io.codeboost.allocation=${allocationId}`)).toBe('');
+  }, 120_000);
 
   it('keeps a failed allocation whose cleanup did not settle live, so recovery in this process refuses its runner', async () => {
     const data = fixture(), runnerOwner = randomBytes(16).toString('hex');

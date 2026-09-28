@@ -500,3 +500,121 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
   allocations.delete(allocated);
   liveAllocations.delete(owner.allocationId);
 }
+
+/** At most this much diff is returned; the caller saves it as a stopped attempt's partial output. */
+export const MAXIMUM_EXPORT_BYTES = 1024 * 1024;
+export interface TaskDiff {
+  /** The diff's raw bytes, at most `maxBytes`. It is not necessarily valid UTF-8. */
+  readonly diff: Buffer;
+  /** Whether the diff was longer than `maxBytes` and was cut. */
+  readonly truncated: boolean;
+}
+export interface ExportOptions extends PreparationOptions {
+  /** The last commit codeboost made in this storage (or the clone's head): a full commit ID. */
+  readonly base: string;
+  /** The immutable ID of the built agent image, whose Git runs the export. */
+  readonly imageId: string;
+  /** Default and maximum `MAXIMUM_EXPORT_BYTES`. */
+  readonly maxBytes?: number;
+  /** Overall deadline for the Docker work, cleanup excluded. Default 60 s. */
+  readonly timeoutMs?: number;
+}
+// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff` compares
+// `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every commit) and
+// never refreshes the index (GIT_OPTIONAL_LOCKS=0); new untracked files are diffed against /dev/null. Output stops at
+// `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
+const EXPORT_SCRIPT = [
+  'set -eu',
+  'base=$1 limit=$2',
+  'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
+  'cd /work',
+  'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }',
+  'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
+  '{',
+  '  g diff --no-color --no-ext-diff --no-textconv "$base" --',
+  '  g ls-files -z --others --exclude-standard | while IFS= read -r -d "" path; do',
+  '    g diff --no-color --no-ext-diff --no-textconv --no-index -- /dev/null "$path" || [ $? -eq 1 ]',
+  '  done',
+  '} | head -c "$limit" | base64 -w0',
+].join('\n');
+
+function* exportSteps(workVolume: string, metadataVolume: string, owner: ResourceOwner, options: ExportOptions,
+  maxBytes: number): Steps<TaskDiff> {
+  const remaining = createDeadline(options.timeoutMs ?? 60_000);
+  // Mount nothing that is not this storage: each volume must still carry its kind and all three owner labels.
+  for (const [name, kind] of [[workVolume, 'work'], [metadataVolume, 'metadata']] as const) {
+    const inspect = yield* run(['volume', 'inspect', name], remaining(), true);
+    if (inspect.status === null) throw new DockerError(['volume', 'inspect', name], inspect);
+    if (inspect.status !== 0) throw new Error(`Task ${kind} volume is missing; the diff cannot be exported.`);
+    const labels = (JSON.parse(inspect.stdout || '[]')[0] as { Labels?: Record<string, string> } | undefined)?.Labels;
+    if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
+      throw new Error(`Task ${kind} volume does not carry this storage's labels.`);
+  }
+  const name = `codeboost-export-${randomUUID()}`;
+  let unsettled = false;
+  try {
+    const args = ['run', '--rm', '--name', name, '--label', 'io.codeboost.task-storage=export', ...ownerLabelArgs(owner),
+      '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+      '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=256m', '--cpus=.5',
+      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=16m',
+      '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
+      '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
+      '--entrypoint', 'bash', options.imageId, '-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1)];
+    const outcome = yield* run(args, remaining(), true);
+    if (outcome.status !== 0) {
+      const error = new DockerError(args, outcome);
+      // A client stopped before the daemon answered may still have started the container.
+      unsettled = createOutcomeUnknown(error);
+      throw error;
+    }
+    const bytes = Buffer.from(outcome.stdout.trim(), 'base64');
+    return Object.freeze({ diff: bytes.subarray(0, maxBytes), truncated: bytes.length > maxBytes });
+  } catch (error) {
+    // `--rm` removes a container that ran to completion; one whose client was killed is still running, so remove it
+    // by name once its labels are confirmed, uncancelled, before the export settles.
+    try { yield* cleanup([name], [], owner, unsettled ? new Set([name]) : new Set()); }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'Task diff export failed and its container cleanup did not settle.');
+    }
+    throw error;
+  }
+}
+
+/**
+ * Export the diff of task storage against `base`, the last commit codeboost made there, for a stopped attempt's partial
+ * output (#51 item 6). It accepts the value `prepareTaskFilesystems` returned or a recovery handle, runs Git in a
+ * read-only container that has no network, and returns at most `maxBytes` (1 MiB at most) with `truncated` set when
+ * the diff was longer. `maxBytes` bounds the returned data; `timeoutMs` and `signal` bound the Docker work. On abort or
+ * at the deadline the `docker run` client is stopped and the export container, which outlives a killed client, is
+ * removed; the promise settles only after both. An abort rejects with an `AbortError`, unless that container's
+ * cleanup did not settle, which rejects with an `AggregateError`.
+ */
+export async function exportTaskDiff(storage: TaskFilesystems | RecoveredTaskStorage,
+  options: ExportOptions): Promise<TaskDiff> {
+  const maxBytes = options.maxBytes ?? MAXIMUM_EXPORT_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAXIMUM_EXPORT_BYTES)
+    throw new Error(`maxBytes must be a positive integer of at most ${MAXIMUM_EXPORT_BYTES}.`);
+  if (typeof options.base !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.base))
+    throw new Error('base must be a full commit ID.');
+  if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId)) throw new Error('Export requires the immutable built image ID.');
+  assertBuiltAgentImage(options.imageId);
+  let owner: ResourceOwner, workVolume: string | undefined, metadataVolume: string | undefined;
+  const recovered = recoveredStorage.get(storage as RecoveredTaskStorage);
+  if (recovered) {
+    owner = recovered.owner;
+    ({ workVolume, metadataVolume } = storage as RecoveredTaskStorage);
+  } else {
+    const allocated = storage as TaskFilesystems;
+    owner = taskFilesystemOwner(allocated);
+    ({ workVolume, metadataVolume } = allocated);
+  }
+  if (!workVolume || !metadataVolume) throw new Error('Task storage has no work or metadata volume; nothing to export.');
+  if (options.signal?.aborted)
+    throw Object.assign(new Error('Task diff export was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
+  try { return await runStepsAsync(exportSteps(workVolume, metadataVolume, owner, options, maxBytes), options); }
+  catch (error) {
+    if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
+      throw Object.assign(new Error('Task diff export was cancelled.', { cause: error }), { name: 'AbortError', code: 'ABORT_ERR' });
+    throw error;
+  }
+}
