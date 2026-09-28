@@ -90,9 +90,12 @@ The caller must do the following:
   the resources it could not confirm removed in `unreleased`; the container may still be running.
 - When `unreleased` is present, record those resources durably and keep them owned until their removal is
   confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
-  if both still match. The agent container is listed only if this invocation's `docker create` ran, so a
-  same-named container that belongs to another invocation is never reported.
-- A profile that settled with `unreleased` cannot be started again.
+  if both still match. An object is listed only if this invocation created it or may have (its create succeeded,
+  or its client was killed before the daemon answered). A create the daemon refused, for example because another
+  invocation holds the name, made nothing, so that name is never reported or touched. The egress proxy is created
+  and started as two steps for this reason. Directory entries are host paths under the caller's `TMPDIR`.
+- A profile that settled with `unreleased` is retired: every launch path (`startProfileInvocation`,
+  `createValidatedContainer`, `startValidatedContainer`, `runContainer`) refuses it, while its cleanup still runs.
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.

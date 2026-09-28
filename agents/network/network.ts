@@ -201,9 +201,8 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     return value;
   };
   // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.
-  // `answeredFailureMayCreate`: a command such as `docker run --detach` that can create the object and then exit
-  // nonzero (the start failed), so even a daemon-answered failure leaves the object possibly present.
-  const create = async (object: string, args: readonly string[], answeredFailureMayCreate = false) => {
+  // Each create is a pure create, so a daemon-answered failure (such as a name held by someone else) made nothing.
+  const create = async (object: string, args: readonly string[]) => {
     const timeout = remaining();
     try {
       const output = await docker(args, timeout, signal);
@@ -211,7 +210,6 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
       return output;
     } catch (error) {
       if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
-      else if (answeredFailureMayCreate) created.add(object);
       throw error;
     }
   };
@@ -253,11 +251,13 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     networkId = createdId(await create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
       '--label', `io.codeboost.egress=${allocationId}`, name]), 'network');
     proxyPlanned = true;
-    proxyId = createdId(await create(proxyContainer, ['run', '--detach', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
+    // Create and start separately: a refused create made nothing, while a failed start leaves a container we own by ID.
+    proxyId = createdId(await create(proxyContainer, ['create', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
-      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs'], true), 'proxy');
+      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']), 'proxy');
+    await docker(['start', proxyId], remaining(), signal);
     await docker(['network', 'connect', 'bridge', proxyId], remaining(), signal);
     await docker(['exec', proxyId, 'node', '-e', [
       "const net=require('node:net');let attempts=0;",

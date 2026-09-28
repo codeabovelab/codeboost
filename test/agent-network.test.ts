@@ -101,24 +101,50 @@ describe('vendor-only egress', () => {
   it('removes a proxy that was created even though its start failed', async () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'proxy');
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
-    // `docker run --detach` creates the proxy, then the start fails: the client exits nonzero with a daemon answer.
+    // The proxy container is created, then its start fails: a container this allocation owns by ID.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
-      `if [ "$1" = run ] && [ "$2" = --detach ]; then shift 2; printf %s "$2" > '${recorded}'; `
-        + `'${realDocker}' create "$@" >/dev/null; echo 'Error response from daemon: failed to start' >&2; exit 125; fi`,
+      `if [ "$1" = start ] && [ "$2" != --attach ]; then printf %s "$2" > '${recorded}'; `
+        + `echo 'Error response from daemon: failed to start' >&2; exit 1; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const failing = captureInvocation({ ...invocation, attemptId: `proxy-start-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
-    let proxy = '';
+    let proxyId = '';
     try {
       await expect(createVendorNetwork(failing, imageId)).rejects.toThrow('failed to start');
-      proxy = readFileSync(recorded, 'utf8');
+      proxyId = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
-    const leaked = spawnSync('docker', ['container', 'inspect', proxy], { stdio: 'ignore' }).status === 0;
-    if (leaked) spawnSync('docker', ['rm', '--force', proxy], { stdio: 'ignore' });
-    expect(proxy).toMatch(/^codeboost-proxy-/);
+    const leaked = spawnSync('docker', ['container', 'inspect', proxyId], { stdio: 'ignore' }).status === 0;
+    if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore' });
+    expect(proxyId).toMatch(/^[0-9a-f]{64}$/);
     expect(leaked).toBe(false);
+  }, 60_000);
+
+  it('neither reports nor removes a same-named proxy when the daemon refuses the create', async () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = create ] && [ "$2" = --name ] && case "$3" in codeboost-proxy-*) true;; *) false;; esac; then `
+        + `'${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; printf %s "$3" > '${recorded}'; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const refused = captureInvocation({ ...invocation, attemptId: `refused-proxy-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let foreign = '', error: unknown;
+    try {
+      try { await createVendorNetwork(refused, imageId); } catch (caught) { error = caught; }
+      foreign = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+    spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
+    // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
+    expect(String(error)).toMatch(/already in use|Conflict/);
+    expect(survived).toBe(true);
   }, 60_000);
 
   it('does not delete a same-named stand-in when setup fails after the proxy exists', async () => {

@@ -222,7 +222,10 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     finally { signal.removeEventListener('abort', cancel); }
     // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so the
     // worker reports them at release and no new question starts until a restart finds none left.
-    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed.
+    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed. Docker
+    // leftovers are found again by their labels. Host leftovers (D's input and auth staging directories) are covered by
+    // the Ask root: the worker's TMPDIR is that root, D stages under tmpdir(), and the root is recorded durably before
+    // setup and deleted at startup before Ask is enabled again.
     if (result.unreleased !== undefined) retained.markUntracked();
     return answerFromResult(question.provider, result, invocation);
   } finally {
