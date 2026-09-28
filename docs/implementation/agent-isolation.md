@@ -87,7 +87,13 @@ The caller must do the following:
   stopped and its cleanup has finished. If cleanup keeps failing, the supervisor retries it every second for
   60 seconds after the first failure, then settles anyway. Retries after the first get only what is left of
   the window, and each cleanup subprocess is killed at its deadline. That result has a `stopReason` and lists
-  the resources it could not confirm removed in `unreleased`; the container may still be running.
+  the resources it could not confirm removed in `unreleased`; the container may still be running. Worst case,
+  settlement ends about 90 seconds after cleanup starts: up to 30 seconds for the first, failed attempt, then
+  the 60-second window. Cleanup retries are asynchronous Docker calls (#51 item 2), so the event loop stays free
+  and a cancel or shutdown is handled while a retry runs; the window bounds the total wait.
+- Every Docker setup failure settles the start call's handle rather than throwing (#51 item 2). If profile creation
+  fails and its own cleanup fails too, that handle keeps retrying the cleanup and settles with `capture-failure`
+  (plus `unreleased` if the window ends), so callers must not rely on a throw for this case.
 - When `unreleased` is present, record those resources durably and keep them owned until their removal is
   confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
   if both still match. An object is listed only if this invocation created it or may have (its create succeeded,

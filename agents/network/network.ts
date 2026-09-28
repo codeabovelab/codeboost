@@ -1,6 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
-import { createOutcomeUnknown } from '../client-outcome.ts';
+import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 
@@ -92,7 +92,7 @@ const remove = async (object: 'container' | 'network', target: string, remaining
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
   if (labels?.['io.codeboost.egress'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
   const id = inspected?.Id;
-  if (!id || !/^[0-9a-f]{64}$/.test(id) || (/^[0-9a-f]{64}$/.test(target) && id !== target))
+  if (!id || !DOCKER_ID.test(id) || (DOCKER_ID.test(target) && id !== target))
     throw new Error(`Failed to establish the identity of ${kind}.`);
   const result = await runDocker(object === 'container' ? ['rm', '--force', id] : ['network', 'rm', id],
     { timeoutMs: remaining() });
@@ -199,7 +199,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   let networkId: string | undefined, proxyId: string | undefined, registered: VendorNetwork | undefined;
   const unsettled = new Set<string>(), created = new Set<string>();
   const createdId = (value: string, kind: string) => {
-    if (!/^[0-9a-f]{64}$/.test(value)) throw new Error(`Docker did not return the created ${kind} ID.`);
+    if (!DOCKER_ID.test(value)) throw new Error(`Docker did not return the created ${kind} ID.`);
     return value;
   };
   // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.

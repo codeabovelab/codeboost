@@ -1,5 +1,5 @@
 import { realpathSync } from 'node:fs';
-import { createOutcomeUnknown } from '../client-outcome.ts';
+import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import type { UnreleasedResource } from '../contract.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
@@ -55,7 +55,6 @@ const unsettledCreates = new WeakMap<ContainerProfile, number>();
 // network or staging cleanup is profile-only and never looks the name up again.
 const createdContainers = new WeakMap<ContainerProfile, string | undefined>();
 
-const CONTAINER_ID = /^[0-9a-f]{64}$/;
 /**
  * The immutable ID of the agent container this profile created, when `docker create` returned one. Every operation
  * after the create should use it: the name can be taken over by a replacement container.
@@ -130,7 +129,7 @@ const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle =
   // Remove and confirm by the ID the daemon just reported for our container, never by the name: a same-named
   // replacement created after this inspect must not be deleted.
   const id = inspected.Id;
-  if (!id || !CONTAINER_ID.test(id) || (capturedId && id !== capturedId))
+  if (!id || !DOCKER_ID.test(id) || (capturedId && id !== capturedId))
     throw new Error('Failed to establish the agent container identity; staged credentials were retained.');
   const result = await runDocker(['rm', '--force', id], { timeoutMs: remaining() });
   if (result.status !== 0) {
@@ -146,7 +145,7 @@ const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle =
 
 /**
  * Remove a validated invocation container, then its profile-owned staging and network resources. `timeoutMs` bounds
- * the container step and, separately, the network step.
+ * the whole removal: the container step and the network step share one deadline.
  */
 export async function disposeValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000): Promise<void> {
   assertContainerProfileAuthenticity(profile);
@@ -358,7 +357,7 @@ export async function createValidatedContainer(profile: ContainerProfile, timeou
     try {
       const id = await docker(profile.args, { timeoutMs: createTimeout, secrets, signal });
       // An unexpected create output leaves the ID unknown, so cleanup falls back to a verified name lookup.
-      createdContainers.set(profile, CONTAINER_ID.test(id) ? id : undefined);
+      createdContainers.set(profile, DOCKER_ID.test(id) ? id : undefined);
     }
     catch (error) {
       // A nonzero exit means the daemon answered; a killed client leaves the request in flight.

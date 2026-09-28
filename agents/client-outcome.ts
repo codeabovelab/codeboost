@@ -1,3 +1,6 @@
+/** A full Docker object ID. Every ownership check compares against this form, never against a reusable name. */
+export const DOCKER_ID = /^[0-9a-f]{64}$/;
+
 /** Spawn errors: the Docker client process never started, so it cannot have sent any request to the daemon. */
 // `ENOTSTARTED` is agents/docker.ts's code for a call it refused before spawning (already cancelled, bad deadline).
 const NOT_STARTED = new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'EMFILE', 'ENFILE', 'ENOMEM', 'E2BIG', 'ENOEXEC',
