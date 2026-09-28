@@ -61,7 +61,9 @@ Use only these entry points to run an agent:
 2. `prepareTaskFilesystems` copies that clone into bounded task storage, labelled with the owner you pass: your
    runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Use each allocation
    ID once: before creating anything, D refuses an ID that another allocation in this process holds, or that any
-   container, volume or network still carries (so a reuse after a restart is caught too). Call
+   container, volume or network still carries (so a reuse after a restart is caught too). That check and the first
+   create are not atomic, so right after its first create D checks again that its object is the only one with the ID;
+   if not, it removes what it made and refuses. Cleanup removes an object only if all three owner labels match. Call
    `removeTaskFilesystems` when the task ends. It refuses a repository that has a
    symbolic link with an absolute target or a target outside the checkout, before it
    creates any storage. Report this to the user as a repository the agent cannot run

@@ -78,3 +78,23 @@ describe('adapter profile-creation cleanup', () => {
     expect(state.profileDisposals).toBe(1);
   });
 });
+
+describe('adapter start input', () => {
+  it.each(['codex', 'claude'] as const)('refuses a %s network allocation ID that is not a lowercase UUID v4 synchronously',
+    async vendor => {
+      const { startClaudeInvocation } = await import('../agents/adapters/claude.ts');
+      const { isInvocationActive } = await import('../agents/adapters/supervisor.ts');
+      for (const networkAllocationId of [randomUUID().toUpperCase(), '6ba7b810-9dad-11d1-80b4-00c04fd430c8', '']) {
+        const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
+          clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
+          phase: 'planning', vendor, approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId: randomUUID(),
+          context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
+        });
+        const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
+          imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId };
+        expect(() => vendor === 'codex' ? startCodexInvocation(request, '/unused/auth.json')
+          : startClaudeInvocation(request, 'token')).toThrow('lowercase UUID v4');
+        expect(isInvocationActive(invocation.attemptId)).toBe(false);
+      }
+    });
+});

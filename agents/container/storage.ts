@@ -6,8 +6,8 @@ import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown } from '../client-outcome.ts';
-import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, ownerLabelArgs,
-  releaseAllocationId, type ResourceOwner } from '../labels.ts';
+import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
+  ownerLabelArgs, releaseAllocationId, type ResourceOwner } from '../labels.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -57,7 +57,7 @@ const absent = (result: ReturnType<typeof spawnSync>) => result.status !== 0 && 
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 const remove = (args: readonly string[], inspectArgs: readonly string[], remaining: () => number, kind: string,
-  allocationId: string, settleBy = 0) => {
+  owner: ResourceOwner, settleBy = 0) => {
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
     before = spawnSync('docker', [...inspectArgs], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
@@ -71,7 +71,8 @@ const remove = (args: readonly string[], inspectArgs: readonly string[], remaini
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
-  if (labels?.['io.codeboost.allocation'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
+  // All three owner labels must match: the allocation ID alone is caller-chosen and could be reused elsewhere.
+  if (!hasOwnerLabels(labels, owner)) throw new Error(`Refused to remove unowned ${kind}.`);
   const result = spawnSync('docker', [...args], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (result.status === 0) return;
@@ -79,17 +80,17 @@ const remove = (args: readonly string[], inspectArgs: readonly string[], remaini
     env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (!absent(inspect)) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
-const cleanup = (containers: readonly string[], volumes: readonly string[], allocationId: string,
+const cleanup = (containers: readonly string[], volumes: readonly string[], owner: ResourceOwner,
   unsettled: ReadonlySet<string> = new Set(), timeoutMs = 30_000) => {
   const remaining = createDeadline(timeoutMs + (unsettled.size ? CREATE_SETTLE_MS : 0)), failures: unknown[] = [];
   const settleBy = (name: string) => unsettled.has(name) ? performance.now() + CREATE_SETTLE_MS : 0;
   for (const container of containers) {
     try { remove(['rm', '--force', container], ['container', 'inspect', container], remaining,
-      'task container', allocationId, settleBy(container)); }
+      'task container', owner, settleBy(container)); }
     catch (error) { failures.push(error); }
   }
   for (const volume of volumes) {
-    try { remove(['volume', 'rm', '--force', volume], ['volume', 'inspect', volume], remaining, 'task volume', allocationId,
+    try { remove(['volume', 'rm', '--force', volume], ['volume', 'inspect', volume], remaining, 'task volume', owner,
       settleBy(volume)); }
     catch (error) { failures.push(error); }
   }
@@ -113,11 +114,6 @@ export function assertTaskFilesystems(filesystems: TaskFilesystems, clone?: Task
 export function taskFilesystemOwner(filesystems: TaskFilesystems): ResourceOwner {
   assertTaskFilesystems(filesystems);
   return allocations.get(filesystems)!.owner;
-}
-
-export function taskFilesystemAllocationId(filesystems: TaskFilesystems): string {
-  assertTaskFilesystems(filesystems);
-  return allocations.get(filesystems)!.owner.allocationId;
 }
 
 const within = (base: string, path: string) => {
@@ -188,13 +184,15 @@ const assertContainedLinks = (staging: string, remaining: () => number) => {
   }
 };
 
-// Fails closed: an unanswered list cannot prove the ID is unused.
-const assertAllocationUnused = (allocationId: string, remaining: () => number) => {
+// Fails closed: an unanswered list cannot prove the ID is unused. Throws when more than `expected` objects carry it.
+const assertAllocationObjects = (allocationId: string, expected: number, remaining: () => number) => {
+  let found = 0;
   for (const command of allocationListCommands(allocationId)) {
     const result = spawnSync('docker', [...command], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
       env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
     if (result.status !== 0) throw new Error('Could not confirm that allocationId is unused.');
-    if (String(result.stdout).trim()) throw new Error(ALLOCATION_IN_USE);
+    found += String(result.stdout).split('\n').filter(line => line.trim()).length;
+    if (found > expected) throw new Error(ALLOCATION_IN_USE);
   }
 };
 
@@ -216,7 +214,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   assertContainedLinks(staging, remaining);
   const allocationId = claimAllocationId(owner.allocationId);
   // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
-  try { assertAllocationUnused(allocationId, remaining); }
+  try { assertAllocationObjects(allocationId, 0, remaining); }
   catch (error) { releaseAllocationId(allocationId); throw error; }
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
@@ -237,6 +235,9 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       allocate(name, ['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
         '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
         '--label', `io.codeboost.task-storage=${kind}`, ...labels, name]);
+      // The check above and this create are not atomic across processes. Once our first object exists, it must be
+      // the only one carrying the ID: of two racing allocations, the later check sees both and backs out.
+      if (kind === 'work') assertAllocationObjects(allocationId, 1, remaining);
     }
     // Copy metadata straight to its own volume so the work allocation never holds both at once.
     const seed = ['set -eu',
@@ -264,7 +265,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     releaseAllocationId(allocationId);
     return filesystems;
   } catch (error) {
-    try { cleanup([seeder, keeper], createdVolumes.reverse(), allocationId, unsettled); }
+    try { cleanup([seeder, keeper], createdVolumes.reverse(), owner, unsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
     releaseAllocationId(allocationId);
     throw error;
@@ -273,7 +274,6 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
 
 export function removeTaskFilesystems(filesystems: TaskFilesystems): void {
   assertTaskFilesystems(filesystems);
-  const allocationId = taskFilesystemAllocationId(filesystems);
-  cleanup([filesystems.keeper], [filesystems.metadataVolume, filesystems.workVolume], allocationId);
+  cleanup([filesystems.keeper], [filesystems.metadataVolume, filesystems.workVolume], taskFilesystemOwner(filesystems));
   allocations.delete(filesystems);
 }

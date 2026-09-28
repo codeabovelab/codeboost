@@ -46,14 +46,16 @@ const networkResources = (name: string, proxyContainer: string, owner: ResourceO
     Object.freeze({ kind: 'network' as const, name, ...(networkId ? { id: networkId } : {}), labels }),
   ]);
 };
-// Fails closed: an unanswered list cannot prove the ID is unused.
+// Fails closed: an unanswered list cannot prove the ID is unused. Throws when more than `expected` objects carry it.
 // The three lists are independent, so they run in parallel.
-const assertAllocationUnused = async (allocationId: string, remaining: () => number, signal?: AbortSignal) => {
+const assertAllocationObjects = async (allocationId: string, expected: number, remaining: () => number,
+  signal?: AbortSignal) => {
   const timeoutMs = remaining();
   const results = await Promise.all(allocationListCommands(allocationId)
     .map(command => runDocker(command, { timeoutMs, signal })));
   if (results.some(result => result.status !== 0)) throw new Error('Could not confirm that allocationId is unused.');
-  if (results.some(result => result.stdout.trim())) throw new Error(ALLOCATION_IN_USE);
+  const found = results.reduce((count, result) => count + result.stdout.split('\n').filter(line => line.trim()).length, 0);
+  if (found > expected) throw new Error(ALLOCATION_IN_USE);
 };
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 // Parts of a network whose removal is already confirmed, while the other part is still being retried.
@@ -84,10 +86,10 @@ const absent = (result: DockerOutcome) => result.status !== 0 && result.status !
 const CREATE_SETTLE_MS = 10_000;
 // Cleanup is never cancelled: it runs to its own deadline so nothing is dropped.
 // Remove one owned object. Looks it up by `target` (its ID, or its name for a create whose ID never came back),
-// checks the ownership label, then removes and confirms by the ID the daemon just reported: a same-named replacement
+// checks the egress label and all three owner labels, then removes and confirms by the ID the daemon just reported: a same-named replacement
 // created after the lookup is never touched.
 const remove = async (object: 'container' | 'network', target: string, remaining: () => number, kind: string,
-  allocationId: string, settleBy = 0) => {
+  owner: ResourceOwner, settleBy = 0) => {
   const inspect = (ref: string) => runDocker([object, 'inspect', ref], { timeoutMs: remaining() });
   let before: DockerOutcome;
   for (;;) {
@@ -101,7 +103,8 @@ const remove = async (object: 'container' | 'network', target: string, remaining
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
-  if (labels?.['io.codeboost.egress'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
+  if (labels?.['io.codeboost.egress'] !== owner.allocationId || !hasOwnerLabels(labels, owner))
+    throw new Error(`Refused to remove unowned ${kind}.`);
   const id = inspected?.Id;
   if (!id || !DOCKER_ID.test(id) || (DOCKER_ID.test(target) && id !== target))
     throw new Error(`Failed to establish the identity of ${kind}.`);
@@ -254,25 +257,28 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     if (!mayExist('network')) networkGone = true;
     if (proxyPlanned && !proxyGone) try {
       await remove('container', proxyTarget,
-        budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer));
+        budget, 'vendor proxy', owner, proxyId ? 0 : settleBy(proxyContainer));
       proxyGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
     if (networkPlanned && !networkGone) try {
       await remove('network', networkTarget,
-        budget, 'vendor network', allocationId, networkId ? 0 : settleBy(name));
+        budget, 'vendor network', owner, networkId ? 0 : settleBy(name));
       networkGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   };
   claimAllocationId(allocationId);
   // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
-  try { await assertAllocationUnused(allocationId, remaining, signal); }
+  try { await assertAllocationObjects(allocationId, 0, remaining, signal); }
   catch (error) { releaseAllocationId(allocationId); throw error; }
   try {
     networkPlanned = true;
     signal?.throwIfAborted();
     networkId = createdId(await create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
       '--label', `io.codeboost.egress=${allocationId}`, ...labels, name]), 'network');
+    // The check above and this create are not atomic across processes. Once our network exists, it must be the only
+    // object carrying the ID: of two racing allocations, the later check sees both and backs out.
+    await assertAllocationObjects(allocationId, 1, remaining, signal);
     proxyPlanned = true;
     // Create and start separately: a refused create made nothing, while a failed start leaves a container we own by ID.
     proxyId = createdId(await create(proxyContainer, ['create', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
@@ -326,19 +332,18 @@ export async function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30
     throw new Error('Vendor network was not created by the trusted network builder.');
   }
   assertBuiltAgentImage(identity.imageId);
-  const allocationId = identity.allocationId;
   const remaining = deadline(timeoutMs), failures: unknown[] = [];
   // Remove by the captured IDs; a same-named replacement is not ours to delete and keeps the network busy.
   const removed = removedParts.get(network) ?? new Set<UnreleasedResource['kind']>();
   removedParts.set(network, removed);
   if (!removed.has('container')) try {
     await remove('container', identity.proxyId,
-      remaining, 'vendor proxy', allocationId);
+      remaining, 'vendor proxy', identity.owner);
     removed.add('container');
   } catch (error) { failures.push(error); }
   if (!removed.has('network')) try {
     await remove('network', identity.networkId,
-      remaining, 'vendor network', allocationId);
+      remaining, 'vendor network', identity.owner);
     removed.add('network');
   } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');

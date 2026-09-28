@@ -1,5 +1,7 @@
 import type { InvocationInput } from '../contract.ts';
 import type { TaskFilesystems } from '../container/storage.ts';
+import { assertBuiltAgentImage } from '../container/image.ts';
+import { assertResourceOwner } from '../labels.ts';
 import type { CaptureLimits } from './supervisor.ts';
 
 export interface AgentAdapterRequest {
@@ -13,6 +15,12 @@ export interface AgentAdapterRequest {
    * call so recovery can match them to the attempt (#51 item 3).
    */
   readonly networkAllocationId: string;
+}
+/** Check a start call's synchronous input, so invalid input throws before a handle exists. */
+export function assertAdapterRequest(request: AgentAdapterRequest): void {
+  assertBuiltAgentImage(request.imageId);
+  assertResourceOwner({ runnerOwner: request.invocation.runnerOwner, attemptId: request.invocation.attemptId,
+    allocationId: request.networkAllocationId });
 }
 export interface AgentAdapterOptions {
   readonly timeoutMs?: number;

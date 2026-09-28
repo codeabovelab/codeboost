@@ -13,7 +13,8 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { taskFilesystemOwner } from '../agents/container/storage.ts';
-import { createVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../agents/network/network.ts';
+import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
+  type VendorNetwork } from '../agents/network/network.ts';
 import { createClaudeCommand, createCodexCommand, createIsolationProbeCommand, createPhasePolicy,
   assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
@@ -539,6 +540,92 @@ describe('real Docker agent isolation', () => {
     expect(() => prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
       metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId, reused)).toThrow('still labels a Docker object');
     expect(docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused.allocationId}`)).toBe(before);
+  }, 60_000);
+
+  // A docker wrapper that runs `after` (a script body with `args`, `run` and `result` in scope) once the real command
+  // matching `prefix` has finished, to act as a concurrent process or a killed client.
+  const withDockerShim = async <T>(prefix: string[], after: string, run: () => Promise<T> | T): Promise<T> => {
+    const shim = mkdtempSync(join(tmpdir(), 'codeboost-shim-docker-')); roots.push(shim);
+    mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    writeFileSync(join(shim, 'docker'), [`#!${process.execPath}`,
+      "const { spawnSync } = require('node:child_process');",
+      'const args = process.argv.slice(2);',
+      `const run = rest => spawnSync(${JSON.stringify(realDocker)}, rest, { encoding: 'utf8' });`,
+      `if (!${JSON.stringify(prefix)}.every((word, i) => args[i] === word)) {`,
+      `  process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: 'inherit' }).status ?? 1); }`,
+      'let result = run(args);',
+      after,
+      'process.stdout.write(result.stdout); process.stderr.write(result.stderr); process.exit(result.status ?? 1);',
+    ].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    try { return await run(); } finally { process.env.PATH = path; }
+  };
+  // After our create, another process creates a volume carrying the same allocation ID: both passed the check first.
+  const racer = (name: string) => [
+    "const allocation = args.find(arg => arg.startsWith('io.codeboost.allocation='));",
+    `run(['volume', 'create', '--label', 'io.codeboost.runner=${'f'.repeat(32)}', '--label', allocation, '${name}']);`,
+  ].join('\n');
+  const byAllocation = (allocationId: string) => ['volume', 'network'].flatMap(kind => docker(kind, 'ls', '--quiet',
+    '--filter', `label=io.codeboost.allocation=${allocationId}`).split('\n').filter(Boolean))
+    .concat(docker('ps', '--all', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`).split('\n')
+      .filter(Boolean));
+
+  it('backs out of task storage when a concurrent process claims the same allocation ID', async () => {
+    const data = fixture(), owner = testOwner('storage-race'), rival = `codeboost-race-${randomUUID()}`;
+    try {
+      await withDockerShim(['volume', 'create'], racer(rival), () => expect(() => prepareTaskFilesystems(data.clone,
+        { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 },
+        imageId, owner)).toThrow('still labels a Docker object'));
+      expect(byAllocation(owner.allocationId)).toEqual([rival]);
+    } finally { spawnSync('docker', ['volume', 'rm', '--force', rival], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('backs out of a vendor network when a concurrent process claims the same allocation ID', async () => {
+    const data = fixture(), allocationId = randomUUID(), rival = `codeboost-race-${randomUUID()}`;
+    try {
+      await withDockerShim(['network', 'create'], racer(rival), () => expect(createVendorNetwork(
+        invocation(data.clone, 'planning'), imageId, allocationId)).rejects.toThrow('still labels a Docker object'));
+      expect(byAllocation(allocationId)).toEqual([rival]);
+    } finally { spawnSync('docker', ['volume', 'rm', '--force', rival], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('never removes a network found by name after a killed create when its runner label differs', async () => {
+    const data = fixture(), allocationId = randomUUID();
+    // The create lands with another runner's label, and its client is killed before it reports the ID.
+    const foreign = [
+      `const at = args.findIndex(arg => arg.startsWith('io.codeboost.runner='));`,
+      `args[at] = 'io.codeboost.runner=${'f'.repeat(32)}';`,
+      'result = run(args);',
+      "process.kill(process.pid, 'SIGKILL');",
+    ].join('\n');
+    const created = await withDockerShim(['network', 'create'], foreign, () =>
+      createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
+    const left = docker('network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${allocationId}`);
+    try {
+      expect(created).toBeInstanceOf(VendorNetworkCreationCleanupError);
+      const cleanup = (created as VendorNetworkCreationCleanupError).errors[1] as AggregateError;
+      expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
+      expect(left).not.toBe('');
+    } finally { if (left) spawnSync('docker', ['network', 'rm', ...left.split('\n')], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
+    const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
+    taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
+    docker('rm', '--force', filesystems.keeper);
+    docker('run', '--detach', '--name', filesystems.keeper, '--label', `io.codeboost.runner=${'f'.repeat(32)}`,
+      '--label', `io.codeboost.attempt=${owner.attemptId}`, '--label', `io.codeboost.allocation=${owner.allocationId}`,
+      '--network=none', '--entrypoint', 'sleep', imageId, 'infinity');
+    try {
+      expect(() => removeTaskFilesystems(filesystems)).toThrow('did not settle');
+      expect(docker('container', 'inspect', '--format', '{{.State.Running}}', filesystems.keeper)).toBe('true');
+      expect(spawnSync('docker', ['volume', 'inspect', filesystems.workVolume]).status).not.toBe(0);
+    } finally {
+      docker('rm', '--force', filesystems.keeper);
+      removeTaskFilesystems(filesystems);
+    }
   }, 60_000);
 
   it('refuses task storage that belongs to another runner', async () => {
