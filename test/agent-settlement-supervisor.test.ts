@@ -10,6 +10,7 @@ const state = vi.hoisted(() => ({
   created: new WeakSet<object>(),
   createFails: false,
   createHangs: false,
+  createTimesOutAfter: undefined as number | undefined,
   createSignals: [] as AbortSignal[],
   disposeOk: false,
   spawned: 0,
@@ -34,6 +35,10 @@ vi.mock('../agents/container/profile.ts', () => ({
 vi.mock('../agents/container/run.ts', () => ({
   createValidatedContainer: async (profile: object, _timeoutMs: number, _secrets: object, signal: AbortSignal) => {
     state.createSignals.push(signal);
+    if (state.createTimesOutAfter !== undefined) {
+      await new Promise(resolve => setTimeout(resolve, state.createTimesOutAfter));
+      throw Object.assign(new Error('docker create ETIMEDOUT after 4999 ms.'), { code: 'ETIMEDOUT' });
+    }
     if (state.createHangs) await new Promise((_resolve, reject) =>
       signal.addEventListener('abort', () => reject(new Error('docker create was cancelled.'))));
     if (state.createFails) throw new Error('Conflict. The container name is already in use by another invocation.');
@@ -71,7 +76,8 @@ describe('startProfileInvocation bounded cleanup', () => {
 
   beforeEach(() => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
-    Object.assign(state, { createFails: false, createHangs: false, createSignals: [], disposeOk: false, spawned: 0,
+    Object.assign(state, { createFails: false, createHangs: false, createTimesOutAfter: undefined, createSignals: [],
+      disposeOk: false, spawned: 0,
       budgets: [] });
   });
   afterEach(() => { vi.useRealTimers(); });
@@ -181,5 +187,17 @@ describe('startProfileInvocation bounded cleanup', () => {
     expect(state.createSignals[0]?.aborted).toBe(true);
     expect(box.result?.stopReason).toBe('timeout');
     expect(isInvocationActive('handoff-deadline')).toBe(false);
+  });
+
+  it.each([
+    ['timeout', 4_999],
+    ['capture-failure', 1_000],
+  ] as const)('reports %s for a Docker timeout during setup %i ms into a 5 s budget', async (reason, after) => {
+    state.createTimesOutAfter = after; state.disposeOk = true;
+    // The create's client is killed by its own budget, just before (or long before) the supervisor's deadline timer.
+    const handle = startProfileInvocation(fakeProfile(`setup-etimedout-${after}`), { timeoutMs: 5_000 });
+    const box = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(after);
+    expect(box.result?.stopReason).toBe(reason);
   });
 });

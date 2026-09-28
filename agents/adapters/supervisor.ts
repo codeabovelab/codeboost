@@ -167,6 +167,22 @@ const retainCleanup = (invocation: InvocationInput, cleanup: (budgetMs: number) 
   else schedule();
   return handle;
 };
+/**
+ * A Docker client killed at its budget, or an expired invocation budget, can reject a moment before the invocation's
+ * own deadline timer fires. Within this much of the deadline, such an error is the deadline itself.
+ */
+const DEADLINE_SLACK_MS = 1_000;
+/** Whether a setup error was caused by a deadline. For `[startup, cleanup]` aggregates only the startup error counts. */
+const isDeadlineError = (error: unknown, seen = new Set<unknown>()): boolean => {
+  if (!error || typeof error !== 'object' || seen.has(error)) return false;
+  seen.add(error);
+  const value = error as { code?: unknown; message?: unknown; cause?: unknown; errors?: unknown };
+  if (value.code === 'ETIMEDOUT' || (typeof value.message === 'string' && /\bdeadline\b|ETIMEDOUT/i.test(value.message)))
+    return true;
+  const startup = error instanceof AggregateError ? (value as { startupError?: unknown }).startupError
+    ?? (Array.isArray(value.errors) ? value.errors[0] : undefined) : undefined;
+  return isDeadlineError(value.cause, seen) || isDeadlineError(startup, seen);
+};
 /** A retry's Docker budget: what is left of the window, at most the usual 30 s; below 1 when the window has ended. */
 const cleanupBudget = (giveUpAt: number) => Math.min(30_000, Math.floor(giveUpAt - performance.now()));
 /** Everything a profile may still own, including its agent container only if this profile created one. */
@@ -281,7 +297,8 @@ export function launchInvocation(invocation: InvocationInput, budget: () => numb
     } catch (error) {
       if (inner) return; // The supervisor owns the attempt and settles it.
       release();
-      const reason: StopReason = cancelReason ?? (left() < 1 ? 'timeout' : 'capture-failure');
+      const reason: StopReason = cancelReason
+        ?? (left() < 1 || (left() < DEADLINE_SLACK_MS && isDeadlineError(error)) ? 'timeout' : 'capture-failure');
       const startupError = isSetupCleanupFailure(error) ? error.startupError : error;
       if (isSetupCleanupFailure(error)) {
         follow(retainSetupCleanup(invocation, budget => error.retryCleanup(budget), startupError, error,
@@ -380,7 +397,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       throw new Error('invocationBudget cannot exceed the production ten-minute ceiling.');
   } catch (error) {
     return rejectProfile(profile, error, true, disposeContainerProfile,
-      /deadline expired/i.test(String(error)) ? 'timeout' : undefined);
+      isDeadlineError(error) ? 'timeout' : undefined);
   }
   const wallRemaining = invocation.deadline - Date.now();
   if (!Number.isSafeInteger(wallRemaining) || wallRemaining < 1) {
@@ -735,7 +752,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     } catch (error) {
       closed = true;
       if (!stopReason) {
-        stopReason = performance.now() >= deadline ? 'timeout' : 'capture-failure';
+        const left = deadline - performance.now();
+        stopReason = left <= 0 || (left < DEADLINE_SLACK_MS && isDeadlineError(error)) ? 'timeout' : 'capture-failure';
         failureDetail ??= `Container setup failed: ${error instanceof Error ? error.message : String(error)}`;
       }
       await settleWith(null, null, Buffer.alloc(0), Buffer.alloc(0));

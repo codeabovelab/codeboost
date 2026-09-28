@@ -99,4 +99,19 @@ describe('asynchronous launch', () => {
     expect(box.result?.stderr).toContain('profile refused');
     expect(isInvocationActive('launch-cleanup')).toBe(false);
   });
+
+  it.each([
+    ['timeout', 2_999],
+    ['capture-failure', 100],
+  ] as const)('reports %s when setup fails from a Docker timeout %i ms into a 3 s budget', async (reason, after) => {
+    const end = performance.now() + 3_000;
+    const handle = launchInvocation(captured(`launch-etimedout-${after}`), () => Math.ceil(end - performance.now()),
+      async () => {
+        await new Promise(resolve => setTimeout(resolve, after));
+        throw Object.assign(new Error('docker network ETIMEDOUT after 60000 ms.'), { code: 'ETIMEDOUT' });
+      });
+    const box = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(after);
+    expect(box.result?.stopReason).toBe(reason);
+  });
 });
