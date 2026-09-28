@@ -21,6 +21,72 @@ function requestAdmitted(server: typeof app.server) {
 function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
 test.afterEach(async () => { await app.close();rmSync(root,{recursive:true,force:true}); });
+test('resends the same merge key after a 503, a lost response, an unreadable body or an unknown outcome, and a new key after a definite answer',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const keys:string[]=[],answers:Array<'503'|'lost'|'garbled'|'unknown'|'409'>=['503','lost','garbled','unknown','409','409'];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}keys.push(body.actionId);const answer=answers[keys.length-1];
+  if(answer==='lost'){await route.abort('failed');return;}
+  if(answer==='unknown'){await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Direct merge response was lost.',outcomeUnknown:true})});return;}
+  if(answer==='garbled'){await route.fulfill({status:200,contentType:'application/json',body:'{"mergeResult":'});return;}
+  await route.fulfill({status:answer==='503'?503:409,contentType:'application/json',body:JSON.stringify({error:answer==='503'?'The review server is shutting down.':'Merge is blocked.'})});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ for(let click=0;click<6;click++){await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>keys.length).toBe(click+1);await expect(page.locator('#banner')).toContainText('Merge blocked');}
+ expect(keys[0]).toMatch(/^[0-9a-f-]{36}$/);expect(keys.slice(1,5)).toEqual([keys[0],keys[0],keys[0],keys[0]]);expect(keys[5]).not.toBe(keys[4]);
+});
+test('mints a new merge key for a retry once the attempt started by a retained key has ended',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const keys:string[]=[];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}keys.push(body.actionId);
+  if(keys.length===1){await route.abort('failed');return;}
+  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Merge is blocked.'})});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>keys.length).toBe(1);await expect(page.locator('#banner')).toContainText('Merge blocked');
+ // The lost click did reach GitHub (its response was lost), and that attempt later ends as refused.
+ const expected={...view.expected,reviewVersion:view.expected.reviewVersion!};const attempt=app.service.store.beginMergeAttempt(config.identity,expected,view.snapshot.head,null,'direct',keys[0]);
+ app.service.store.finishMergeAttempt(config.identity,attempt.id,{state:'failed',reason:'Required status check is expected.'});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByRole('button',{name:'Retry merge',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'Retry merge',exact:true}).click();await expect.poll(()=>keys.length).toBe(2);
+ expect(keys[1]).not.toBe(keys[0]);
+});
+test('answers 503 when the merge deadline stops a click, so the browser may resend its key',async()=>{
+ test.setTimeout(60_000);
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async options=>new Promise((_,reject)=>options?.signal?.addEventListener('abort',()=>reject(options.signal!.reason),{once:true})),merge:async()=>{throw new Error('The deadline stops the click before any merge.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const response=await fetch(new URL('/api/action',app.url),{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json'},body:JSON.stringify({action:'merge',token:view.token,actionId:randomUUID()})});
+ expect(response.status).toBe(503);expect((await response.json()).error).toMatch(/deadline/i);
+ expect(app.service.store.getMergeAttempt(app.service.config.identity)).toBeNull();
+});
+test('resends a retained merge key with the request it was made for, even after a review edit and Refresh',async({page})=>{
+ const config={...app.service.config,demo:false};await app.close();removeDemoOutOfScope(config);
+ const gateway:MergeGateway={inspect:async()=>{const snapshot=app.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async()=>{throw new Error('The browser test answers every merge request itself.');}};
+ app=await startServer(config,0,undefined,gateway);
+ let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ const sent:{actionId:string;token:string}[]=[];
+ await page.route('**/api/action',async route=>{const body=route.request().postDataJSON();if(body.action!=='merge'){await route.continue();return;}sent.push({actionId:body.actionId,token:body.token});
+  if(sent.length===1){await route.abort('failed');return;}
+  await route.fulfill({status:409,contentType:'application/json',body:JSON.stringify({error:'Merge is blocked.'})});});
+ await page.goto(app.url);page.on('dialog',dialog=>dialog.accept());
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>sent.length).toBe(1);await expect(page.locator('#banner')).toContainText('Merge blocked');
+ // A review edit changes the token the next Refresh shows.
+ view=app.service.load();app.service.act({action:'note',item:view.items[0]!.id,kind:'question',text:'Edited after the lost click.',token:view.token});
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByRole('button',{name:'Merge PR',exact:true})).toBeEnabled();
+ await page.getByRole('button',{name:'Merge PR',exact:true}).click();await expect.poll(()=>sent.length).toBe(2);
+ expect(sent[1]).toEqual(sent[0]);
+ expect(app.service.load().token).not.toBe(sent[0]!.token);
+});
+test('refuses a merge request without an idempotency key before doing any work',async()=>{
+ const view=app.service.load(),post=(body:object)=>fetch(new URL('/api/action',app.url),{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json'},body:JSON.stringify(body)});
+ for(const actionId of [undefined,'not-a-uuid']){const response=await post({action:'merge',token:view.token,actionId});expect(response.status).toBe(400);expect((await response.json()).error).toMatch(/actionId/);}
+ expect(app.service.store.getMergeAttempt(app.service.config.identity)).toBeNull();
+});
 test('reviews real changes, persists approval and conversation, and assigns foreign code',async({page})=>{
   const errors:string[]=[];page.on('pageerror',e=>errors.push(e.message));
   await page.goto(app.url);await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();
@@ -464,7 +530,7 @@ test('drains an admitted merge request before closing its coordinator',async()=>
  const commandStarted=new Promise<void>(resolve=>{started=resolve;}),held=new Promise<void>(resolve=>{release=resolve;});
  const gateway:MergeGateway={inspect:async()=>{const snapshot=appRef.service.load().snapshot;return {base:snapshot.base,head:snapshot.head,pullRequestState:'OPEN',mergeable:'MERGEABLE',rulesKnown:true,atomicBaseGuard:true,mergeQueue:false,requiredChecks:[],alreadyFixed:'clear'};},merge:async(_head,options)=>{commandSignal=options?.signal;started();await held;return {url:'https://github.com/example/repo/pull/24'};}};
  app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'merge',token:view.token});let status=0;
+ const endpoint=new URL('/api/action',app.url),body=JSON.stringify({action:'merge',token:view.token,actionId:randomUUID()});let status=0;
  const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.resume();res.on('end',resolve);});req.on('error',reject);req.end(body);});
  await commandStarted;const closing=app.close();await new Promise(resolve=>setTimeout(resolve,25));expect(commandSignal?.aborted).toBe(false);release();await Promise.all([closing,completed]);expect(status).toBe(200);app=await startServer(config,0);
 });
@@ -495,7 +561,7 @@ test('blocks a partially received merge request when shutdown starts',async()=>{
  app=appRef=await startServer(config,0,undefined,gateway);let view=app.service.load();
  for(const segment of view.segments.filter(value=>value.row==='Unplanned'||value.row==='Ambiguous'))view=app.service.act({action:'accept',key:segment.key,token:view.token});
  for(const item of view.items)view=app.service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
- const body=JSON.stringify({action:'merge',token:view.token}),endpoint=new URL('/api/action',app.url);let status=0,response='',finish!:()=>void;const {admitted,marker}=requestAdmitted(app.server);
+ const body=JSON.stringify({action:'merge',token:view.token,actionId:randomUUID()}),endpoint=new URL('/api/action',app.url);let status=0,response='',finish!:()=>void;const {admitted,marker}=requestAdmitted(app.server);
  // Another client, such as a polling tab, reaches the server first; shutdown must still wait for the merge request itself.
  expect((await fetch(new URL('/api/settings',app.url),{headers:{'x-codeboost-token':app.token}})).status).toBe(200);
  const completed=new Promise<void>((resolve,reject)=>{const req=httpRequest(endpoint,{method:'POST',headers:{...marker,'x-codeboost-token':app.token,'content-type':'application/json','content-length':Buffer.byteLength(body)}},res=>{status=res.statusCode??0;res.setEncoding('utf8');res.on('data',chunk=>response+=chunk);res.on('end',resolve);});req.on('error',reject);req.write(body.slice(0,1));finish=()=>req.end(body.slice(1));});

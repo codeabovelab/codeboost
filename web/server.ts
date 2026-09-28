@@ -5,7 +5,8 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
-import { MergeCoordinator } from '../runner/merge.ts';
+import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
+import { isUuidV4 } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
@@ -72,8 +73,18 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           questions.start(input.id,view);json(200,await load(requestAbort.signal));return;
         }
         if(input.action==='merge') {
+          // Every merge click carries its idempotency key; a request without one would bypass replay.
+          if(!isUuidV4(input.actionId)) { json(400,{error:'A merge request needs a UUID v4 actionId.'}); return; }
           if(!merges)throw new Error('Merging is not configured for this review.');
-          const merged=await merges.merge(input.token);
+          let merged: Awaited<ReturnType<MergeCoordinator['merge']>>;
+          // A merge stopped for a passing reason applied nothing, so answer 503 and the browser resends the same key.
+          try { merged=await merges.merge(input.token,input.actionId); }
+          catch (error) {
+            if (error instanceof MergeNotApplied) { json(503,{error:error.message}); return; }
+            // Admitted but unresolved: the browser keeps its key until the attempt ends.
+            if (error instanceof MergeOutcomeUnknown) { json(409,{error:error.message,outcomeUnknown:true}); return; }
+            throw error;
+          }
           try { const mergeQueue=merges.queueSnapshot();json(200,{...loadReview(),merge:{...merged.status,queue:mergeQueue},mergeResult:merged.result,mergeQueue,mergeRefreshRequired:false}); }
           catch { json(200,{mergeResult:merged.result,mergeQueue:null,mergeRefreshRequired:true}); }
           return;
