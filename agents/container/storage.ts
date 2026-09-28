@@ -230,12 +230,18 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   // create the daemon refused made nothing, and its name may belong to someone else.
   const made = new Set<string>(), unsettled = new Set<string>();
   const mine = (names: readonly string[]) => names.filter(name => made.has(name) || unsettled.has(name));
-  // Run one allocation step; a client killed by its deadline leaves the daemon outcome for `name` unknown.
+  // Run one allocation step; a client killed by its deadline leaves the daemon outcome for `name` unknown. A pure
+  // create the daemon refused made nothing. A `docker run` is different: the daemon can create the container and then
+  // fail to start it, so after any failure of a run whose client started, `name` may exist and cleanup checks it.
   const allocate = (name: string, args: readonly string[]) => {
     const timeout = remaining();
-    try { docker(args, timeout); made.add(name); }
-    catch (error) {
+    try {
+      const output = docker(args, timeout);
+      made.add(name);
+      return output;
+    } catch (error) {
       if (createOutcomeUnknown(error)) unsettled.add(name);
+      else if (args[0] === 'run' && typeof (error as { status?: unknown }).status === 'number') made.add(name);
       throw error;
     }
   };
@@ -255,11 +261,14 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
         + ' -exec cp -a --no-preserve=ownership,timestamps -t /work/ {} +',
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
       'chown -R 10001:10001 /work /metadata'].join('; ');
-    allocate(keeper, ['run', '--detach', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
+    // Create and start separately: once the create returns, the keeper is ours by ID even if its start fails.
+    const keeperId = allocate(keeper, ['create', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m', '--cpus=.25',
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
       '--label', 'io.codeboost.task-storage=keeper', ...labels,
       '--entrypoint', 'sleep', imageId, 'infinity']);
+    if (!DOCKER_ID.test(keeperId)) throw new Error('Docker did not return the created keeper ID.');
+    docker(['start', keeperId], remaining());
     allocate(seeder, ['run', '--rm', '--name', seeder, ...labels,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32',

@@ -532,7 +532,7 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   it('rejects a keeper without its runner label before the agent starts', async () => {
-    const data = await withoutRunnerLabel([['run', '--detach', '--name']], () => fixture());
+    const data = await withoutRunnerLabel([['create', '--name']], () => fixture());
     const live = await profile(data, 'planning', 'must-not-run');
     await expect(createValidatedContainer(live)).rejects.toThrow('trusted keeper');
     refuseThenRemove(data.filesystems, [['rm', '--force', data.filesystems.keeper]]);
@@ -691,6 +691,29 @@ describe('real Docker agent isolation', () => {
     vendorNetworks.push(again);
   }, 120_000);
 
+  const storageLimits = { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024,
+    metadataInodes: 512 };
+
+  it('removes a keeper that was created but failed to start, and the volumes it holds', async () => {
+    const data = fixture(), owner = testOwner('keeper-start');
+    const refuseStart = "result = { status: 1, stdout: '', stderr: 'OCI runtime start failed' };";
+    await withDockerShim(['start'], refuseStart, () =>
+      expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId, owner)).toThrow('docker start'));
+    expect(byAllocation(owner.allocationId)).toEqual([]);
+  }, 60_000);
+
+  it('removes a seeder that docker run created but could not start, and the volumes it holds', async () => {
+    const data = fixture(), owner = testOwner('seeder-start');
+    // The daemon creates the seeder, then answers the run with a start failure.
+    const createOnly = [
+      "run(['create', ...args.slice(1)]);",
+      "result = { status: 125, stdout: '', stderr: 'OCI runtime create failed' };",
+    ].join('\n');
+    await withDockerShim(['run', '--rm'], createOnly, () =>
+      expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId, owner)).toThrow('docker run'));
+    expect(byAllocation(owner.allocationId)).toEqual([]);
+  }, 60_000);
+
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
     taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
@@ -753,9 +776,9 @@ describe('real Docker agent isolation', () => {
     const before = keepers();
     const shim = join(data.root, 'docker-shim'); mkdirSync(shim);
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
-    // The keeper's run client hangs until killed, and the real run lands in the daemon afterwards.
+    // The keeper's create client hangs until killed, and the real create lands in the daemon afterwards.
     writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
-      `if [ "$1" = run ] && [ "$2" = --detach ]; then ( sleep 10; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
+      `if [ "$1" = create ] && [ "$2" = --name ]; then ( sleep 10; exec '${realDocker}' "$@" ) >/dev/null 2>&1 </dev/null & exec sleep 30; fi`,
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const path = process.env.PATH;
     process.env.PATH = `${shim}:${path}`;
