@@ -535,7 +535,9 @@ export class Store {
         COALESCE((SELECT json_extract(s.data,'$.head') FROM snapshots s WHERE s.key=p.key AND s.id=p.snapshot_id),'none'), ?, ?
       FROM plans p`, now, now);
     this.#run(`INSERT INTO feedback_events (id,plan_key,action_id,plan_revision,snapshot_id,item,kind,text,source_ref,supersedes,created_at)
-      SELECT lower(hex(randomblob(16))), p.key, ${latestMerge('m.id')}, p.revision, p.snapshot_id, NULL, 'task-closed', NULL, p.key, NULL, ?
+      SELECT lower(hex(randomblob(16))), p.key, ${latestMerge('m.id')},
+        COALESCE(${latestMerge("json_extract(m.data,'$.revision')")}, p.revision),
+        COALESCE(${latestMerge("json_extract(m.data,'$.snapshotId')")}, p.snapshot_id), NULL, 'task-closed', NULL, p.key, NULL, ?
       FROM plans p JOIN tasks t ON t.plan_key=p.key WHERE t.status='merged'
         AND NOT EXISTS (SELECT 1 FROM feedback_events e WHERE e.plan_key=p.key AND e.kind='task-closed')`, now);
     this.#db.exec('PRAGMA user_version=6;');

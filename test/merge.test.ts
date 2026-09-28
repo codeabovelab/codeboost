@@ -420,6 +420,35 @@ it('answers resend when the saved merge outcome cannot be read', async () => {
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('answers a replay from the outcome its own status refresh reconciled', async () => {
+  const h = queueHarness([]);
+  let merged = false;
+  h.client.inspect = vi.fn(async () => merged
+    ? { ...remote(h.view()), pullRequestState: 'MERGED' as const, url: 'https://github.example/pr/8' }
+    : remote(h.view()));
+  h.client.merge = vi.fn(async () => { merged = true; throw new MergeSubmissionError('Direct merge response was lost.', 'unknown'); });
+  const actionId = randomUUID();
+  try {
+    await expect(h.coordinator.merge(h.view().token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    // No status call in between: the replay's own refresh reconciles the merge and must report its URL.
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/8' } });
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'merged', url: 'https://github.example/pr/8' });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers resend when the attempt cannot be stored at admission', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.store.beginMergeAttempt = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  const actionId = randomUUID(), token = h.view().token;
+  try {
+    const error = await h.coordinator.merge(token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })).toBeUndefined();
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

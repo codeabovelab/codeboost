@@ -6,6 +6,7 @@ import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type M
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
+const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
 /** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
 export class MergeNotApplied extends Error {}
 /** The click was admitted but GitHub's outcome is unknown; its attempt stays in flight, so the key must be kept. */
@@ -176,6 +177,8 @@ export class MergeCoordinator {
     if (!action || !this.service.store || !this.service.config) return;
     try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); }
     catch (error) {
+      // A storage error, whether it was the refusal itself or the failed save, recorded nothing: resend.
+      if (storageError(refusal) || storageError(error)) throw new MergeNotApplied('The merge outcome could not be saved. Try again.', { cause: error });
       // userAction re-raises the refusal once saved, or a saved outcome's refusal for this key: both are settled.
       if (error === refusal || error instanceof GuardRefusal) return;
       // Anything else (a busy or failed database) left the refusal unsaved: nothing was applied, so resend.
@@ -186,28 +189,33 @@ export class MergeCoordinator {
   /** The saved outcome of this click, if it has one. Validation never runs again for a replay. */
   #replay(token: string, actionId: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> | undefined {
     if (!this.service.store || !this.service.config) return undefined;
-    let saved: { response: ReturnType<typeof mergeActionResponse> } | undefined;
-    try {
-      saved = this.service.store.savedAction<ReturnType<typeof mergeActionResponse>>(this.service.config.identity,
-        { actionId, kind: 'merge', request: { token } });
-    } catch (error) {
-      // A storage failure says nothing about this click: answer "resend" (503) so the browser keeps its key.
-      // A saved refusal or a reused key is a definite answer and passes through.
-      if ((error as { code?: string }).code === 'ERR_SQLITE_ERROR')
-        throw new MergeNotApplied('The saved merge outcome could not be read. Try again.', { cause: error });
-      throw error;
-    }
+    const { store, config } = this.service;
+    const read = () => {
+      try { return store.savedAction<ReturnType<typeof mergeActionResponse>>(config.identity, { actionId, kind: 'merge', request: { token } }); }
+      catch (error) {
+        // A storage failure says nothing about this click: answer "resend" (503) so the browser keeps its key.
+        // A saved refusal or a reused key is a definite answer and passes through.
+        if (storageError(error)) throw new MergeNotApplied('The saved merge outcome could not be read. Try again.', { cause: error });
+        throw error;
+      }
+    };
+    const saved = read();
     if (!saved) return undefined;
     // A refused or removed merge replays as the failure the first response reported, never as a submission.
+    const answer = (response: ReturnType<typeof mergeActionResponse>, status: MergeStatus | MergeUnavailableStatus) => {
+      if (response.state === 'failed' || response.state === 'removed') throw new Error(response.reason ?? 'GitHub did not merge this pull request.');
+      return { status, result: { url: response.url ?? '' } };
+    };
     if (saved.response.state === 'failed' || saved.response.state === 'removed')
       return Promise.reject(new Error(saved.response.reason ?? 'GitHub did not merge this pull request.'));
     // The saved outcome is committed; a failing local refresh must not turn it into a blocked merge.
-    const result = { url: saved.response.url ?? '' };
     const unavailable = (error: unknown): MergeUnavailableStatus => ({ available: true, ready: false, action: null, remote: null, queue: null,
       blockers: [{ code: 'refresh', message: `Merge was submitted. Refresh to confirm GitHub state. ${error instanceof Error ? error.message : ''}`.trim() }] });
+    // The status refresh may reconcile the attempt (merged URL, queue failure), so answer from the record re-read after it.
+    const current = () => { try { return read()?.response ?? saved.response; } catch { return saved.response; } };
     let view: ReviewView;
-    try { view = this.service.load(); } catch (error) { return Promise.resolve({ status: unavailable(error), result }); }
-    return this.displayStatus(view).then(status => ({ status, result }), error => ({ status: unavailable(error), result }));
+    try { view = this.service.load(); } catch (error) { return Promise.resolve().then(() => answer(current(), unavailable(error))); }
+    return this.displayStatus(view).then(status => answer(current(), status), error => answer(current(), unavailable(error)));
   }
 
   async #merge(token: string, signal: AbortSignal, actionId?: string): Promise<{ status: MergeStatus | MergeUnavailableStatus; result: MergeResult }> {

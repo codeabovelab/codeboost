@@ -81,6 +81,23 @@ describe('schema v6', () => {
   });
 });
 
+describe('schema v6 backfill context', () => {
+  it('attributes a backfilled closure to the snapshot that merged, not to a later HEAD observation', () => {
+    const { store, path } = fixture();
+    const merged = store.getSnapshot(identity).id;
+    const state = { revision: 1, snapshotId: merged, reviewVersion: store.reviewVersion(identity) };
+    const merge = store.beginMergeAttempt(identity, state, oid(2), null, 'direct');
+    store.finishMergeAttempt(identity, merge.id, { state: 'merged' });
+    store.recordHistory(identity, { revision: 1, snapshotId: merged }, oid(1), oid(6), []);
+    expect(store.getSnapshot(identity).id).not.toBe(merged);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const legacy = new DatabaseSync(path);
+    legacy.exec('DROP TABLE feedback_events; DROP TABLE user_actions; DROP TABLE tasks; DROP TABLE attempts; PRAGMA user_version=5;');
+    legacy.close();
+    expect(open(path).feedbackEvents(identity)).toMatchObject([{ kind: 'task-closed', actionId: merge.id, planRevision: 1, snapshotId: merged }]);
+  });
+});
+
 describe('state version and context generation', () => {
   it('increase both on context changes, and only the state version on lifecycle changes', () => {
     const { store } = queued();

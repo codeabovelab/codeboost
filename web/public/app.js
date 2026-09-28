@@ -30,7 +30,8 @@ const drafts = new Map();
 const attachments = new Map();
 let snippetSelection = null;
 // Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
-let mergeActionId = null;
+// The key travels with the exact request it was made for: a later Refresh changes data.token, not this request.
+let mergeAction = null;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -122,7 +123,7 @@ function renderMerge() {
   $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
   if (!merge?.available) return;
   // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
-  if (mergeActionId && merge.queue?.actionId === mergeActionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeActionId = null;
+  if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
   $("merge").disabled = !merge.ready;
   $("merge").textContent = merge.action === "retry"
     ? "Retry merge"
@@ -471,9 +472,9 @@ $("merge").onclick = async () => {
   $("merge").disabled = true;
   try {
     rememberDraft();
-    mergeActionId ??= crypto.randomUUID();
-    const updated = await api("/api/action", { action: "merge", token: data.token, actionId: mergeActionId });
-    mergeActionId = null;
+    mergeAction ??= { actionId: crypto.randomUUID(), token: data.token };
+    const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
+    mergeAction = null;
     const queued = updated.mergeQueue?.state === "queued" || updated.mergeQueue?.state === "submitting";
     const blocker = { code: queued ? "queue-active" : "merge-submitted", message: queued ? "The reviewed head is queued. Waiting for GitHub to confirm the outcome." : "Merge was submitted. Refresh to confirm GitHub state." };
     data = updated.mergeRefreshRequired
@@ -484,7 +485,7 @@ $("merge").onclick = async () => {
   } catch (error) {
     // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
     // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.
-    if (typeof error.status === "number" && error.status !== 503 && !error.outcomeUnknown) mergeActionId = null;
+    if (typeof error.status === "number" && error.status !== 503 && !error.outcomeUnknown) mergeAction = null;
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
