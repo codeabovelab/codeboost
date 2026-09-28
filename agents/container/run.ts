@@ -1,5 +1,6 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import { createOutcomeUnknown } from '../client-outcome.ts';
 import type { UnreleasedResource } from '../contract.ts';
 import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
   isContainerProfileAuthentic, profileTimeout,
@@ -363,7 +364,7 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     }
     catch (error) {
       // A nonzero exit means the daemon answered; a killed client leaves the request in flight.
-      createUnsettled = typeof (error as { status?: unknown }).status !== 'number';
+      createUnsettled = createOutcomeUnknown(error);
       if (createUnsettled) createdContainers.set(profile, undefined);
       throw error;
     }

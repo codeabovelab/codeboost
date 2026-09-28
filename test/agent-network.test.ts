@@ -147,6 +147,23 @@ describe('vendor-only egress', () => {
     expect(survived).toBe(true);
   }, 60_000);
 
+  it('reports a Docker client that could not start as a plain failure, with nothing to clean up', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-'));
+    // A `docker` that cannot be executed: the create never reached the daemon, so nothing can exist.
+    writeFileSync(join(shim, 'docker'), '#!/bin/sh\n', { mode: 0o644 });
+    const blocked = captureInvocation({ ...invocation, attemptId: `unstartable-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH, started = performance.now();
+    process.env.PATH = shim;
+    let error: unknown;
+    try { try { createVendorNetwork(blocked, imageId); } catch (caught) { error = caught; } }
+    finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
+    // No settle window was waited out for a create that never happened.
+    expect(performance.now() - started).toBeLessThan(5_000);
+  }, 60_000);
+
   it('does not delete a same-named stand-in when setup fails after the proxy exists', () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();

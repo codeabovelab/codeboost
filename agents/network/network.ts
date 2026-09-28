@@ -1,6 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
+import { createOutcomeUnknown } from '../client-outcome.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 
 export const VENDOR_HOSTS = Object.freeze({
@@ -208,7 +209,7 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       created.add(object);
       return output;
     } catch (error) {
-      if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
+      if (createOutcomeUnknown(error)) unsettled.add(object);
       throw error;
     }
   };
