@@ -288,7 +288,8 @@ export class Store {
   }
   queueMergeAttempt(identity: PlanIdentity, id: string, url: string): boolean {
     if (typeof url !== 'string' || url.length > 2048 || !/^https:\/\//.test(url)) throw new Error('Invalid merge result URL.');
-    return this.#changeMergeAttempt(identity, id, ['submitting'], attempt => ({ ...attempt, state: 'queued', url, reason: null }));
+    // Idempotent from 'queued': a poll may have observed the queue entry first, and the URL must still be saved.
+    return this.#changeMergeAttempt(identity, id, ['submitting', 'queued'], attempt => ({ ...attempt, state: 'queued', url, reason: null }));
   }
   recordMergeAttemptDiagnostic(identity: PlanIdentity, id: string, reason: string): boolean {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('A bounded merge diagnostic is required.');

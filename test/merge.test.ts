@@ -539,6 +539,36 @@ it('keeps a confirmed refusal resendable until its failed state is saved', async
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('saves the queue URL even when a poll observed the queue entry first', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  h.client.merge = vi.fn(async head => {
+    // A concurrent poll sees the queue entry before the enqueue command returns.
+    h.store.observeQueuedMerge(h.identity, h.store.getMergeAttempt(h.identity)!.id, { entryId: 'MQE_1', phase: 'QUEUED', position: 1 });
+    h.merges.push(head); return { url: 'https://github.example/pr/9' };
+  });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/9' } });
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'queued', url: 'https://github.example/pr/9', entryId: 'MQE_1' });
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })?.response).toMatchObject({ state: 'queued', url: 'https://github.example/pr/9' });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers with the failure a concurrent poll committed, not with the command\'s success', async () => {
+  const h = queueHarness([]);
+  h.client.merge = vi.fn(async head => {
+    // A concurrent poll sees GitHub drop the entry before the enqueue command returns.
+    h.store.finishMergeAttempt(h.identity, h.store.getMergeAttempt(h.identity)!.id, { state: 'removed', reason: 'Removed from the merge queue.' });
+    h.merges.push(head); return { url: 'https://github.example/pr/9' };
+  });
+  try {
+    const error = await h.coordinator.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(error.message).toBe('Removed from the merge queue.');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

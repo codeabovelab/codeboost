@@ -9,6 +9,8 @@ export interface MergeBlocker { code: string; message: string; }
 const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
 /** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
 export class MergeNotApplied extends Error {}
+/** A concurrent poll already committed this attempt's terminal failure; it is the answer, passed through as is. */
+class CommittedFailure extends Error {}
 /** The click was admitted but GitHub's outcome is unknown; its attempt stays in flight, so the key must be kept. */
 export class MergeOutcomeUnknown extends Error {}
 export interface MergeQueueStatus {
@@ -278,13 +280,22 @@ export class MergeCoordinator {
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not
         // report that action as failed; the durable submitting record is recoverable by polling.
+        let applied = true;
         try {
-          if (queueAttempt.kind === 'queue') this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url);
-          else this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged', url: result.url });
+          applied = queueAttempt.kind === 'queue'
+            ? this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url)
+            : this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged', url: result.url });
         } catch {}
+        // Not applied: a concurrent poll changed the attempt first. A committed failure is the answer, not this success.
+        if (!applied) {
+          const current = this.service.store.getMergeAttempt(this.service.config.identity);
+          if (current?.id === queueAttempt.id && (current.state === 'failed' || current.state === 'removed'))
+            throw new CommittedFailure(current.reason ?? 'GitHub did not merge this pull request.');
+        }
       }
       return { status: commandStatus, result };
     } catch (error) {
+      if (error instanceof CommittedFailure) throw error;
       // GitHub's refusal is definite only once the attempt's failed state (and the click's saved answer) is durable.
       let refusalSaved = false;
       if (queueAttempt) try {
