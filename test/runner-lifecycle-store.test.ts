@@ -270,6 +270,19 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses rebase and ledger writes during a merge and after closing, but still observes HEAD', () => {
+    const { store } = fixture();
+    const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id });
+    const merge = store.beginMergeAttempt(identity, { ...reviewed(), reviewVersion: store.reviewVersion(identity) }, oid(2), null, 'direct');
+    const entry = { sha: oid(7), owner: 'P1', origin: 'owned' as const, sourceSha: null };
+    expect(() => store.recordRebase(identity, reviewed(), oid(1), oid(7), [{ oldSha: oid(2), newSha: oid(7) }])).toThrow(/merge is in progress/);
+    expect(() => store.recordHistory(identity, reviewed(), oid(1), oid(7), [entry])).toThrow(/merge is in progress/);
+    expect(store.getLedger(identity).map(e => e.sha)).not.toContain(oid(7));
+    store.recordHistory(identity, reviewed(), oid(1), oid(8), []);
+    expect(store.getSnapshot(identity).head).toBe(oid(8));
+    store.finishMergeAttempt(identity, merge.id, { state: 'merged' });
+    expect(() => store.recordRebase(identity, reviewed(), oid(1), oid(9), [{ oldSha: oid(8), newSha: oid(9) }])).toThrow(/closed task never changes/);
+  });
   it('refuses plan edits on a closed task and keeps its counters while HEAD is still observed', () => {
     const { store } = fixture();
     store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());

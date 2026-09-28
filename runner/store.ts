@@ -368,6 +368,8 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      // Only the review screen's HEAD observation (no ledger entries) may run during a merge or after closing.
+      if (entries.length) this.#assertContextWritable(key);
       const plan = this.getPlan(identity);
       for (const entry of entries) {
         const existing = this.#get('SELECT sha FROM ledger WHERE key=? AND sha=?', key, entry.sha);
@@ -390,6 +392,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      this.#assertContextWritable(key);
       const ledger = new Map(this.getLedger(identity).map(entry => [entry.sha, entry]));
       const snapshot = this.#snapshot(key, base, head);
       const destinations = new Set<string>();
@@ -573,6 +576,11 @@ export class Store {
     this.#run('UPDATE tasks SET state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
   }
   /** A change an attempt depends on increases both counters in the caller's transaction. */
+  /** Runner writes that change the reviewed context (rebase, ledger owners) wait for a merge and never follow a close. */
+  #assertContextWritable(key: string): void {
+    if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
+  }
   /** Whether the task is merged or cancelled. False before createPlan has inserted the task row. */
   #taskClosed(key: string): boolean {
     const row = this.#get('SELECT status FROM tasks WHERE plan_key=?', key);
