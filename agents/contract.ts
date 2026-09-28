@@ -34,8 +34,10 @@ export interface InvocationInput {
 }
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
 /**
- * A resource D created for an attempt and could not confirm removed. A name alone does not prove ownership: remove a
- * Docker object only if its `id` (when present) and all of its `labels` still match.
+ * A resource D created for an attempt and could not confirm removed. When `id` is present it proves ownership on its
+ * own (D captured it at create, and Docker never reuses IDs): remove the object by that ID, whatever its labels say.
+ * A name alone proves nothing: without `id`, look the object up by name and remove it by the ID that lookup returns
+ * only if all of its `labels` match.
  */
 export interface UnreleasedResource {
   readonly kind: 'container' | 'network' | 'directory';
