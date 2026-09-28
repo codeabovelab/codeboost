@@ -22,6 +22,8 @@ const ALLOCATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const ATTEMPT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 export const isRunnerOwner = (value: unknown): value is string => typeof value === 'string' && RUNNER_OWNER.test(value);
+/** Whether a value is an allocation ID as D writes it: a lowercase UUID v4. */
+export const isAllocationId = (value: unknown): value is string => typeof value === 'string' && ALLOCATION_ID.test(value);
 /** Whether an attempt ID can be written as an ownership label. */
 export const isLabelAttemptId = (value: unknown): value is string => typeof value === 'string' && ATTEMPT_ID.test(value);
 
@@ -30,7 +32,7 @@ export function assertResourceOwner(owner: ResourceOwner): ResourceOwner {
   if (!owner || !isRunnerOwner(owner.runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
   if (!isLabelAttemptId(owner.attemptId))
     throw new Error('attemptId cannot be written as an ownership label.');
-  if (typeof owner.allocationId !== 'string' || !ALLOCATION_ID.test(owner.allocationId))
+  if (!isAllocationId(owner.allocationId))
     throw new Error('allocationId must be a lowercase UUID v4 chosen by the caller.');
   return Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId, allocationId: owner.allocationId });
 }

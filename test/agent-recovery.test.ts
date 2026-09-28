@@ -149,6 +149,26 @@ describe('recoverLeftovers', () => {
     expect(names()).toEqual(odd.map(object => object.name).sort());
   });
 
+  it('leaves runtime objects of this runner whose owner labels are incomplete or disagree', async () => {
+    const allocation = randomUUID();
+    const odd: FakeObject[] = [
+      { kind: 'network', id: id(), name: 'egress-without-owner', labels: { 'io.codeboost.runner': A,
+        'io.codeboost.egress': allocation } },
+      { kind: 'network', id: id(), name: 'egress-other-allocation', labels: { ...owner(A, 'attempt', allocation),
+        'io.codeboost.egress': randomUUID() } },
+      { kind: 'container', id: id(), name: 'proxy-without-attempt', labels: { 'io.codeboost.runner': A,
+        'io.codeboost.allocation': allocation, 'io.codeboost.egress': allocation } },
+      { kind: 'container', id: id(), name: 'agent-bad-allocation', labels: { ...owner(A, 'attempt', 'not-a-uuid'),
+        'io.codeboost.invocation': 'x' } },
+    ];
+    daemon.objects.push(...odd);
+    const report = await recoverLeftovers(A);
+    expect(report.removed).toEqual([]);
+    expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
+      .toEqual(odd.map(object => [object.name, 'unknown-kind']).sort());
+    expect(names()).toEqual(odd.map(object => object.name).sort());
+  });
+
   it('fails closed on a container the daemon reports without an ID', async () => {
     daemon.objects.push({ kind: 'container', name: 'no-full-id',
       labels: { 'io.codeboost.runner': A, 'io.codeboost.invocation': 'x' } });

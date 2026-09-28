@@ -1,6 +1,7 @@
 import { DOCKER_ID } from './client-outcome.ts';
 import { runDocker, type DockerOutcome } from './docker.ts';
-import { ALLOCATION_LABEL, ATTEMPT_LABEL, isRunnerOwner, RUNNER_LABEL } from './labels.ts';
+import { ALLOCATION_LABEL, ATTEMPT_LABEL, isAllocationId, isLabelAttemptId, isRunnerOwner,
+  RUNNER_LABEL } from './labels.ts';
 import { adoptRecoveredTaskStorage, hasLiveTaskStorage, type RecoveredTaskStorage,
   type TaskStorageParts } from './container/storage.ts';
 
@@ -146,13 +147,18 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
     group.resources.push(resource);
     storage.set(allocationId, group);
   };
-  // D writes exactly one kind label on each object; any other combination is not D's and fails closed.
+  // D writes exactly one kind label on each object, with complete owner labels (an egress object's egress label is its
+  // allocation ID). Recovery has no creation-time ID to prove ownership, so any other combination is not D's and is
+  // left alone.
   const kindOf = (resource: RecoveredResource) => {
-    const present = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL].filter(label => label in resource.labels);
+    const labels = resource.labels;
+    if (!isLabelAttemptId(labels[ATTEMPT_LABEL]) || !isAllocationId(labels[ALLOCATION_LABEL])) return undefined;
+    const present = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL].filter(label => label in labels);
     if (present.length !== 1) return undefined;
     const label = present[0]!;
-    if (label === STORAGE_LABEL) return `storage:${resource.labels[STORAGE_LABEL]}`;
-    return label === INVOCATION_LABEL ? 'agent' : 'egress';
+    if (label === STORAGE_LABEL) return `storage:${labels[STORAGE_LABEL]}`;
+    if (label === INVOCATION_LABEL) return labels[INVOCATION_LABEL] ? 'agent' : undefined;
+    return labels[EGRESS_LABEL] === labels[ALLOCATION_LABEL] ? 'egress' : undefined;
   };
   const unknown = (resource: RecoveredResource) => unowned.push(Object.freeze({ ...resource, reason: 'unknown-kind' }));
   for (const resource of owned.container) {
