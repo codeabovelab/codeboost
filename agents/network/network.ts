@@ -168,7 +168,8 @@ const validateVendorNetwork = async (network: VendorNetwork, invocation: Invocat
   remaining();
 };
 
-export function assertVendorNetwork(network: VendorNetwork, invocation?: InvocationInput, agentName?: string,
+// Async, so an invalid deadline rejects like every other failure instead of throwing synchronously.
+export async function assertVendorNetwork(network: VendorNetwork, invocation?: InvocationInput, agentName?: string,
   timeoutMs = 30_000, signal?: AbortSignal): Promise<void> {
   return validateVendorNetwork(network, invocation, agentName, deadline(timeoutMs), signal);
 }
