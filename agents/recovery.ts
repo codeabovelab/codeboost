@@ -88,8 +88,10 @@ const inspectBatch = async (kind: Kind, refs: readonly string[], remaining: () =
   const objects = JSON.parse(result.stdout || '[]') as Array<{ Id?: string; Name?: string;
     Labels?: Record<string, string> | null; Config?: { Labels?: Record<string, string> | null } }>;
   return objects.map(object => {
+    // Containers and networks are removed by ID, so a missing or short one fails closed.
     const id = kind === 'volume' ? undefined : object.Id;
-    if (id !== undefined && !DOCKER_ID.test(id)) throw new Error(`Recovery found a ${kind} without a full ID.`);
+    if (kind !== 'volume' && (typeof id !== 'string' || !DOCKER_ID.test(id)))
+      throw new Error(`Recovery found a ${kind} without a full ID.`);
     return Object.freeze({ kind, name: String(object.Name ?? '').replace(/^\//, ''), ...(id ? { id } : {}),
       labels: Object.freeze({ ...(object.Labels ?? object.Config?.Labels ?? {}) }) });
   });
@@ -144,22 +146,30 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
     group.resources.push(resource);
     storage.set(allocationId, group);
   };
+  // D writes exactly one kind label on each object; any other combination is not D's and fails closed.
+  const kindOf = (resource: RecoveredResource) => {
+    const present = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL].filter(label => label in resource.labels);
+    if (present.length !== 1) return undefined;
+    const label = present[0]!;
+    if (label === STORAGE_LABEL) return `storage:${resource.labels[STORAGE_LABEL]}`;
+    return label === INVOCATION_LABEL ? 'agent' : 'egress';
+  };
+  const unknown = (resource: RecoveredResource) => unowned.push(Object.freeze({ ...resource, reason: 'unknown-kind' }));
   for (const resource of owned.container) {
-    const storageKind = resource.labels[STORAGE_LABEL];
-    if (storageKind === 'keeper') keep(resource, 'keeper');
-    else if (storageKind === 'seeder' || INVOCATION_LABEL in resource.labels || EGRESS_LABEL in resource.labels)
-      remove.push(resource);
-    else unowned.push(Object.freeze({ ...resource, reason: 'unknown-kind' }));
+    const kind = kindOf(resource);
+    if (kind === 'storage:keeper') keep(resource, 'keeper');
+    else if (kind === 'storage:seeder' || kind === 'agent' || kind === 'egress') remove.push(resource);
+    else unknown(resource);
   }
   for (const resource of owned.volume) {
-    const storageKind = resource.labels[STORAGE_LABEL];
-    if (storageKind === 'work') keep(resource, 'workVolume');
-    else if (storageKind === 'metadata') keep(resource, 'metadataVolume');
-    else unowned.push(Object.freeze({ ...resource, reason: 'unknown-kind' }));
+    const kind = kindOf(resource);
+    if (kind === 'storage:work') keep(resource, 'workVolume');
+    else if (kind === 'storage:metadata') keep(resource, 'metadataVolume');
+    else unknown(resource);
   }
   const networks = owned.network.filter(resource => {
-    if (EGRESS_LABEL in resource.labels) return true;
-    unowned.push(Object.freeze({ ...resource, reason: 'unknown-kind' }));
+    if (kindOf(resource) === 'egress') return true;
+    unknown(resource);
     return false;
   });
 

@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage).
-interface FakeObject { kind: 'container' | 'volume' | 'network'; id: string; name: string; labels: Record<string, string> }
+interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string> }
 const daemon = vi.hoisted(() => ({ objects: [] as FakeObject[], refuseRemoval: new Set<string>(), calls: [] as string[][] }));
 const answer = (args: string[]): { status: number; stdout: string; stderr: string } => {
   daemon.calls.push(args);
@@ -15,7 +15,7 @@ const answer = (args: string[]): { status: number; stdout: string; stderr: strin
       : [filter, undefined];
     const matches = daemon.objects.filter(object => object.kind === kind && key! in object.labels
       && (value === undefined || object.labels[key!] === value));
-    return { status: 0, stdout: matches.map(object => kind === 'volume' ? object.name : object.id).join('\n'), stderr: '' };
+    return { status: 0, stdout: matches.map(object => kind === 'volume' ? object.name : object.id ?? object.name).join('\n'), stderr: '' };
   }
   if (args[1] === 'inspect') {
     const found = args.slice(2).map(ref => find(args[0]!, ref));
@@ -128,6 +128,43 @@ describe('recoverLeftovers', () => {
     const report = await recoverLeftovers(A);
     expect(report.unowned).toMatchObject([{ name: 'someone-elses', reason: 'unknown-kind' }]);
     expect(names()).toEqual(['someone-elses']);
+  });
+
+  it('leaves an object whose kind labels D never writes together, even with this runner label', async () => {
+    const odd: FakeObject[] = [
+      { kind: 'container', id: id(), name: 'agent-and-storage', labels: { 'io.codeboost.runner': A,
+        'io.codeboost.invocation': 'x', 'io.codeboost.task-storage': 'work' } },
+      { kind: 'container', id: id(), name: 'agent-and-egress', labels: { 'io.codeboost.runner': A,
+        'io.codeboost.invocation': 'x', 'io.codeboost.egress': 'y' } },
+      { kind: 'network', id: id(), name: 'network-and-storage', labels: { 'io.codeboost.runner': A,
+        'io.codeboost.egress': 'y', 'io.codeboost.task-storage': 'work' } },
+      { kind: 'volume', id: '', name: 'volume-and-agent', labels: { 'io.codeboost.runner': A,
+        'io.codeboost.task-storage': 'work', 'io.codeboost.invocation': 'x' } },
+    ];
+    daemon.objects.push(...odd);
+    const report = await recoverLeftovers(A);
+    expect(report.removed).toEqual([]);
+    expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
+      .toEqual(odd.map(object => [object.name, 'unknown-kind']).sort());
+    expect(names()).toEqual(odd.map(object => object.name).sort());
+  });
+
+  it('fails closed on a container the daemon reports without an ID', async () => {
+    daemon.objects.push({ kind: 'container', name: 'no-full-id',
+      labels: { 'io.codeboost.runner': A, 'io.codeboost.invocation': 'x' } });
+    await expect(recoverLeftovers(A)).rejects.toThrow('without a full ID');
+    expect(names()).toEqual(['no-full-id']);
+  });
+
+  it('issues a handle for storage left with a single volume, and removes it by that handle', async () => {
+    const allocation = randomUUID(), work = `codeboost-work-${randomUUID()}`;
+    daemon.objects.push({ kind: 'volume', id: '', name: work,
+      labels: { ...owner(A, 'attempt-partial', allocation), 'io.codeboost.task-storage': 'work' } });
+    const report = await recoverLeftovers(A);
+    expect(report.storage).toEqual([{ runnerOwner: A, attemptId: 'attempt-partial', allocationId: allocation,
+      workVolume: work }]);
+    removeTaskFilesystems(report.storage[0]!);
+    expect(names()).toEqual([]);
   });
 
   it('rejects with a bounded diagnostic and adopts nothing when a removal is not confirmed', async () => {
