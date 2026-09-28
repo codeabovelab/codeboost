@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { randomUUID } from 'node:crypto';
-import { ALLOCATION_LABEL, assertResourceOwner, ATTEMPT_LABEL, claimAllocationId, hasOwnerLabels, ownerLabelArgs,
-  RUNNER_LABEL } from '../agents/labels.ts';
+import { ALLOCATION_LABEL, allocationListCommands, assertResourceOwner, ATTEMPT_LABEL, claimAllocationId,
+  hasOwnerLabels, ownerLabelArgs, releaseAllocationId, RUNNER_LABEL } from '../agents/labels.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 
 // Every Docker object D creates is labelled with its runner, attempt and allocation (#51 item 3).
@@ -45,9 +45,19 @@ describe('ownership labels', () => {
     expect(captureInvocation(base(owner.runnerOwner)).runnerOwner).toBe(owner.runnerOwner);
   });
 
-  it('lets each allocation ID name only one allocation', () => {
+  it('lets each allocation ID name only one allocation in progress, and releases it once finished', () => {
     const id = randomUUID();
     expect(claimAllocationId(id)).toBe(id);
     expect(() => claimAllocationId(id)).toThrow('already used');
+    releaseAllocationId(id);
+    // Once finished, the daemon check (objects still labelled with the ID) is what refuses reuse.
+    expect(claimAllocationId(id)).toBe(id);
+    releaseAllocationId(id);
+  });
+
+  it('asks Docker for every kind of object labelled with the allocation', () => {
+    const id = randomUUID(), filter = ['--quiet', '--filter', `label=io.codeboost.allocation=${id}`];
+    expect(allocationListCommands(id)).toEqual([['ps', '--all', ...filter], ['volume', 'ls', ...filter],
+      ['network', 'ls', ...filter]]);
   });
 });

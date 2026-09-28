@@ -86,7 +86,7 @@ describe('asynchronous launch', () => {
 
   it('keeps retrying setup cleanup that failed, then reports what it could not remove', async () => {
     const resources = [{ kind: 'network' as const, name: 'codeboost-egress-codex-x', id: 'n'.repeat(64),
-      owner: { label: 'io.codeboost.egress', value: 'a' } }];
+      labels: { 'io.codeboost.egress': 'a' } }];
     let retries = 0;
     const handle = launchInvocation(captured('launch-cleanup'), budget, async () => {
       throw new AdapterSetupCleanupError(new Error('profile refused'), new Error('daemon unreachable'),

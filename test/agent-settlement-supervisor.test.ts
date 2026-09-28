@@ -55,15 +55,15 @@ vi.mock('../agents/container/run.ts', () => ({
   agentContainerId: (profile: object) => state.created.has(profile) ? 'c'.repeat(64) : undefined,
   agentContainerResources: (profile: { name: string }) => state.created.has(profile)
     ? [{ kind: 'container', name: profile.name, id: 'c'.repeat(64),
-      owner: { label: 'io.codeboost.invocation', value: 'own' } }] : [],
+      labels: { 'io.codeboost.invocation': 'own' } }] : [],
 }));
 const { CLEANUP_RETRY_WINDOW_MS, isInvocationActive, launchInvocation,
   startProfileInvocation } = await import('../agents/adapters/supervisor.ts');
 
 describe('startProfileInvocation bounded cleanup', () => {
   const networkAndStaging: readonly UnreleasedResource[] = [
-    { kind: 'container', name: 'codeboost-proxy-codex-x', id: 'p'.repeat(64), owner: { label: 'io.codeboost.egress', value: 'a' } },
-    { kind: 'network', name: 'codeboost-egress-codex-x', id: 'n'.repeat(64), owner: { label: 'io.codeboost.egress', value: 'a' } },
+    { kind: 'container', name: 'codeboost-proxy-codex-x', id: 'p'.repeat(64), labels: { 'io.codeboost.egress': 'a' } },
+    { kind: 'network', name: 'codeboost-egress-codex-x', id: 'n'.repeat(64), labels: { 'io.codeboost.egress': 'a' } },
     { kind: 'directory', name: '/tmp/codeboost-input-x' },
   ];
   const fakeProfile = (attemptId: string) => ({
@@ -97,7 +97,7 @@ describe('startProfileInvocation bounded cleanup', () => {
     expect(box.result?.stderr).toContain('cleanup was not confirmed within 60 s');
     expect(box.result?.unreleased).toEqual([
       { kind: 'container', name: 'codeboost-agent-exit-unreachable', id: 'c'.repeat(64),
-        owner: { label: 'io.codeboost.invocation', value: 'own' } },
+        labels: { 'io.codeboost.invocation': 'own' } },
       ...networkAndStaging]);
     expect(isInvocationActive('exit-unreachable')).toBe(false);
     // Retries after the first run only on what is left of the window.

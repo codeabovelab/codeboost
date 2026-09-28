@@ -1,8 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
-import { assertResourceOwner, claimAllocationId, hasOwnerLabels, ownerLabelArgs,
-  type ResourceOwner } from '../labels.ts';
+import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
+  ownerLabelArgs, ownerLabels, releaseAllocationId, type ResourceOwner } from '../labels.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 
@@ -38,13 +38,21 @@ export class VendorNetworkCreationCleanupError extends AggregateError {
   get resources(): readonly UnreleasedResource[] { return this.#resources(); }
 }
 // IDs are absent only for a create whose client was killed before it returned one.
-const networkResources = (name: string, proxyContainer: string, allocationId: string, networkId?: string,
+const networkResources = (name: string, proxyContainer: string, owner: ResourceOwner, networkId?: string,
   proxyId?: string): readonly UnreleasedResource[] => {
-  const owner = Object.freeze({ label: 'io.codeboost.egress', value: allocationId });
+  const labels = Object.freeze({ 'io.codeboost.egress': owner.allocationId, ...ownerLabels(owner) });
   return Object.freeze([
-    Object.freeze({ kind: 'container' as const, name: proxyContainer, ...(proxyId ? { id: proxyId } : {}), owner }),
-    Object.freeze({ kind: 'network' as const, name, ...(networkId ? { id: networkId } : {}), owner }),
+    Object.freeze({ kind: 'container' as const, name: proxyContainer, ...(proxyId ? { id: proxyId } : {}), labels }),
+    Object.freeze({ kind: 'network' as const, name, ...(networkId ? { id: networkId } : {}), labels }),
   ]);
+};
+// Fails closed: an unanswered list cannot prove the ID is unused.
+const assertAllocationUnused = async (allocationId: string, remaining: () => number, signal?: AbortSignal) => {
+  for (const command of allocationListCommands(allocationId)) {
+    const result = await runDocker(command, { timeoutMs: remaining(), signal });
+    if (result.status !== 0) throw new Error('Could not confirm that allocationId is unused.');
+    if (result.stdout.trim()) throw new Error(ALLOCATION_IN_USE);
+  }
 };
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 // Parts of a network whose removal is already confirmed, while the other part is still being retried.
@@ -54,7 +62,7 @@ export function vendorNetworkResources(network: VendorNetwork): readonly Unrelea
   const identity = identities.get(network);
   if (!identity) return Object.freeze([]);
   const removed = removedParts.get(network);
-  return Object.freeze(networkResources(network.name, network.proxyContainer, identity.allocationId,
+  return Object.freeze(networkResources(network.name, network.proxyContainer, identity.owner,
     identity.networkId, identity.proxyId).filter(resource => !removed?.has(resource.kind)));
 }
 const removedNetworks = new WeakSet<VendorNetwork>();
@@ -190,7 +198,6 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   const owner = assertResourceOwner({ runnerOwner: invocation.runnerOwner, attemptId: invocation.attemptId,
     allocationId });
   const labels = ownerLabelArgs(owner);
-  claimAllocationId(allocationId);
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
   // No allocation may outlive the invocation it serves.
@@ -256,6 +263,10 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     } catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   };
+  claimAllocationId(allocationId);
+  // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
+  try { await assertAllocationUnused(allocationId, remaining, signal); }
+  catch (error) { releaseAllocationId(allocationId); throw error; }
   try {
     networkPlanned = true;
     signal?.throwIfAborted();
@@ -289,17 +300,20 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     await validateVendorNetwork(network, invocation, undefined, remaining, signal);
     remaining();
     signal?.throwIfAborted();
+    releaseAllocationId(allocationId);
     return network;
   } catch (error) {
     // A network registered before a late failure or abort is never handed out, so it must not stay trusted.
     if (registered) identities.delete(registered);
     try { await cleanupPlannedResources(overall); }
     catch (cleanupError) {
+      // The claim is kept: a killed create may still land under this allocation ID.
       throw new VendorNetworkCreationCleanupError(error, cleanupError,
         (budgetMs = 30_000) => cleanupPlannedResources(deadline(budgetMs)),
-        () => networkResources(name, proxyContainer, allocationId, networkId, proxyId)
+        () => networkResources(name, proxyContainer, owner, networkId, proxyId)
           .filter(resource => mayExist(resource.kind)));
     }
+    releaseAllocationId(allocationId);
     throw error;
   }
 }

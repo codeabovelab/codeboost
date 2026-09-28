@@ -485,11 +485,59 @@ describe('real Docker agent isolation', () => {
     }
   }, 60_000);
 
-  it('refuses a reused allocation ID before creating any storage', () => {
+  // A docker wrapper that drops our runner label from commands starting with one of `prefixes`, so the object it
+  // creates is genuinely mislabelled and only the owner-label checks can catch it.
+  const withoutRunnerLabel = async <T>(prefixes: string[][], run: () => Promise<T> | T): Promise<T> => {
+    const shim = mkdtempSync(join(tmpdir(), 'codeboost-unlabelled-docker-')); roots.push(shim);
+    mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    writeFileSync(join(shim, 'docker'), [`#!${process.execPath}`,
+      "const { spawnSync } = require('node:child_process');",
+      'const args = process.argv.slice(2);',
+      `const strip = ${JSON.stringify(prefixes)}.some(prefix => prefix.every((word, i) => args[i] === word));`,
+      'const out = [];',
+      "for (let i = 0; i < args.length; i++) { if (strip && args[i] === '--label' && String(args[i + 1]).startsWith('io.codeboost.runner=')) { i++; continue; } out.push(args[i]); }",
+      `const result = spawnSync(${JSON.stringify(realDocker)}, out, { stdio: 'inherit' });`,
+      'process.exit(result.status ?? 1);'].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    try { return await run(); } finally { process.env.PATH = path; }
+  };
+
+  it('rejects a vendor network or proxy without its runner label, and removes them', async () => {
+    const data = fixture(), egress = () => docker('network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress');
+    const before = egress();
+    await withoutRunnerLabel([['network', 'create']], () => expect(createVendorNetwork(invocation(data.clone, 'planning'),
+      imageId, randomUUID())).rejects.toThrow('changed after allocation'));
+    await withoutRunnerLabel([['create', '--name']], () => expect(createVendorNetwork(invocation(data.clone, 'planning'),
+      imageId, randomUUID())).rejects.toThrow('changed after allocation'));
+    expect(egress()).toBe(before);
+  }, 120_000);
+
+  it('rejects task volumes without their runner label before the agent starts', async () => {
+    const data = await withoutRunnerLabel([['volume', 'create']], () => fixture());
+    const live = await profile(data, 'planning', 'must-not-run');
+    await expect(createValidatedContainer(live)).rejects.toThrow('bounded tmpfs allocation');
+  }, 60_000);
+
+  it('rejects a keeper without its runner label before the agent starts', async () => {
+    const data = await withoutRunnerLabel([['run', '--detach', '--name']], () => fixture());
+    const live = await profile(data, 'planning', 'must-not-run');
+    await expect(createValidatedContainer(live)).rejects.toThrow('trusted keeper');
+  }, 60_000);
+
+  it('rejects an agent container without its runner label before it starts', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
+    await withoutRunnerLabel([['create', '--name']], () =>
+      expect(createValidatedContainer(live)).rejects.toThrow('lockdown'));
+    expect(spawnSync('docker', ['container', 'inspect', live.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it('refuses an allocation ID that still labels Docker objects, as after a restart, before creating any storage', () => {
     const data = fixture(), reused = taskFilesystemOwner(data.filesystems);
     const before = docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused.allocationId}`);
     expect(() => prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
-      metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId, reused)).toThrow('already used');
+      metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId, reused)).toThrow('still labels a Docker object');
     expect(docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused.allocationId}`)).toBe(before);
   }, 60_000);
 

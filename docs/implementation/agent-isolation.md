@@ -60,7 +60,8 @@ Use only these entry points to run an agent:
 1. `createTaskClone` creates a committed, standalone staging clone.
 2. `prepareTaskFilesystems` copies that clone into bounded task storage, labelled with the owner you pass: your
    runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Use each allocation
-   ID once: D refuses a reused one, for task storage or the vendor network, before creating anything. Call
+   ID once: before creating anything, D refuses an ID that another allocation in this process holds, or that any
+   container, volume or network still carries (so a reuse after a restart is caught too). Call
    `removeTaskFilesystems` when the task ends. It refuses a repository that has a
    symbolic link with an absolute target or a target outside the checkout, before it
    creates any storage. Report this to the user as a repository the agent cannot run
@@ -98,8 +99,8 @@ The caller must do the following:
   fails and its own cleanup fails too, that handle keeps retrying the cleanup and settles with `capture-failure`
   (plus `unreleased` if the window ends), so callers must not rely on a throw for this case.
 - When `unreleased` is present, record those resources durably and keep them owned until their removal is
-  confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
-  if both still match. An object is listed only if this invocation created it or may have (its create succeeded,
+  confirmed. Each Docker entry has its creation-time ID (when known) and its ownership labels (`labels`: runner,
+  attempt, allocation, and `io.codeboost.invocation` or `io.codeboost.egress`); remove one only if all still match. An object is listed only if this invocation created it or may have (its create succeeded,
   or its client was killed before the daemon answered). A create the daemon refused, for example because another
   invocation holds the name, made nothing, so that name is never reported or touched. The egress proxy is created
   and started as two steps for this reason. Directory entries are host paths under the caller's `TMPDIR`.

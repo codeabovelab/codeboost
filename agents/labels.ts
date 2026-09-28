@@ -35,16 +35,28 @@ export function assertResourceOwner(owner: ResourceOwner): ResourceOwner {
   return Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId, allocationId: owner.allocationId });
 }
 
-// Allocation IDs claimed by any allocator in this process. Recovery groups resources by allocation, so one ID must
-// never name two allocations, whether two task storages or a task storage and a vendor network.
+// Recovery groups resources by allocation, so one ID must never name two live allocations, whether two task storages
+// or a task storage and a vendor network. Two checks enforce it: this set covers allocations in progress in this
+// process (their objects may not exist yet), and `allocationListCommands` asks the daemon, which covers every earlier
+// process. An entry is released once its allocation finished cleanly, so the set stays bounded.
 const claimedAllocations = new Set<string>();
-/** Claim an allocation ID for one allocation. Refuses a reused ID; a claim is kept even if the allocation fails. */
+/** Claim an allocation ID for an allocation that is starting. Refuses an ID another allocation here holds. */
 export function claimAllocationId(allocationId: string): string {
   if (claimedAllocations.has(allocationId))
     throw new Error('allocationId was already used; every allocation needs a new allocation ID.');
   claimedAllocations.add(allocationId);
   return allocationId;
 }
+/**
+ * Release a claim once the allocation succeeded or its failure cleanup settled: from then on its objects (if any) are
+ * found by the daemon check. Keep the claim when cleanup did not settle, since a killed create may still land.
+ */
+export function releaseAllocationId(allocationId: string): void { claimedAllocations.delete(allocationId); }
+/** Docker commands that list any container, volume or network still labelled with this allocation ID. */
+export const allocationListCommands = (allocationId: string): readonly (readonly string[])[] =>
+  (['ps --all', 'volume ls', 'network ls'] as const).map(command => Object.freeze([...command.split(' '), '--quiet',
+    '--filter', `label=${ALLOCATION_LABEL}=${allocationId}`]));
+export const ALLOCATION_IN_USE = 'allocationId still labels a Docker object; every allocation needs a new allocation ID.';
 
 /** `docker create`/`run`/`volume create`/`network create` arguments that apply the owner labels. */
 export const ownerLabelArgs = (owner: ResourceOwner): readonly string[] => Object.freeze([
@@ -52,6 +64,11 @@ export const ownerLabelArgs = (owner: ResourceOwner): readonly string[] => Objec
   '--label', `${ATTEMPT_LABEL}=${owner.attemptId}`,
   '--label', `${ALLOCATION_LABEL}=${owner.allocationId}`,
 ]);
+
+/** The owner as a label map, for reporting a resource whose removal is not confirmed. */
+export const ownerLabels = (owner: ResourceOwner): Readonly<Record<string, string>> => Object.freeze({
+  [RUNNER_LABEL]: owner.runnerOwner, [ATTEMPT_LABEL]: owner.attemptId, [ALLOCATION_LABEL]: owner.allocationId,
+});
 
 /** Whether inspected labels carry exactly this owner. */
 export const hasOwnerLabels = (labels: Readonly<Record<string, string>> | null | undefined, owner: ResourceOwner) =>

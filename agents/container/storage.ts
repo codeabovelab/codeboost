@@ -6,7 +6,8 @@ import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown } from '../client-outcome.ts';
-import { assertResourceOwner, claimAllocationId, ownerLabelArgs, type ResourceOwner } from '../labels.ts';
+import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, ownerLabelArgs,
+  releaseAllocationId, type ResourceOwner } from '../labels.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -187,6 +188,16 @@ const assertContainedLinks = (staging: string, remaining: () => number) => {
   }
 };
 
+// Fails closed: an unanswered list cannot prove the ID is unused.
+const assertAllocationUnused = (allocationId: string, remaining: () => number) => {
+  for (const command of allocationListCommands(allocationId)) {
+    const result = spawnSync('docker', [...command], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
+      env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    if (result.status !== 0) throw new Error('Could not confirm that allocationId is unused.');
+    if (String(result.stdout).trim()) throw new Error(ALLOCATION_IN_USE);
+  }
+};
+
 /**
  * Copy a staging clone into bounded, engine-owned task storage and keep it mounted. `owner` is recorded by the caller
  * before this call: every volume and container is labelled with its runner, attempt and allocation, so recovery after
@@ -204,6 +215,9 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
   assertContainedLinks(staging, remaining);
   const allocationId = claimAllocationId(owner.allocationId);
+  // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
+  try { assertAllocationUnused(allocationId, remaining); }
+  catch (error) { releaseAllocationId(allocationId); throw error; }
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
   const createdVolumes: string[] = [], unsettled = new Set<string>();
@@ -247,10 +261,12 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
     allocations.set(filesystems, Object.freeze({ owner, trustedClone: clone,
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
+    releaseAllocationId(allocationId);
     return filesystems;
   } catch (error) {
     try { cleanup([seeder, keeper], createdVolumes.reverse(), allocationId, unsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
+    releaseAllocationId(allocationId);
     throw error;
   }
 }

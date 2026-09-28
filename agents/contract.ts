@@ -35,7 +35,7 @@ export interface InvocationInput {
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
 /**
  * A resource D created for an attempt and could not confirm removed. A name alone does not prove ownership: remove a
- * Docker object only if its `id` (when present) and its `owner` label both still match.
+ * Docker object only if its `id` (when present) and all of its `labels` still match.
  */
 export interface UnreleasedResource {
   readonly kind: 'container' | 'network' | 'directory';
@@ -43,8 +43,12 @@ export interface UnreleasedResource {
   readonly name: string;
   /** Docker object ID captured at creation; absent when the create's outcome is unknown. */
   readonly id?: string;
-  /** The label that marks D's ownership of a Docker object; absent for host directories. */
-  readonly owner?: { readonly label: string; readonly value: string };
+  /**
+   * The ownership labels the object carries: `io.codeboost.runner`, `io.codeboost.attempt` and
+   * `io.codeboost.allocation`, plus its kind's own label (`io.codeboost.invocation` or `io.codeboost.egress`).
+   * Absent for host directories.
+   */
+  readonly labels?: Readonly<Record<string, string>>;
 }
 export interface InvocationResult {
   readonly attemptId: string;

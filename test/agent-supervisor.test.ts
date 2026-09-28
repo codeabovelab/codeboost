@@ -153,14 +153,21 @@ describe('container invocation supervisor', () => {
   const inventory = (current: ContainerProfile, withAgent: boolean) => {
     const inspect = (kind: 'container' | 'network', name: string, format: string) =>
       execFileSync('docker', [kind, 'inspect', '--format', format, name], { encoding: 'utf8' }).trim();
-    const egress = { label: 'io.codeboost.egress',
-      value: inspect('network', current.network.name, '{{index .Labels "io.codeboost.egress"}}') };
+    // The ownership labels D reports must be exactly the ones Docker holds for the object.
+    const owned = (kind: 'container' | 'network', name: string, own: string) => {
+      const all = JSON.parse(inspect(kind, name, kind === 'container' ? '{{json .Config.Labels}}' : '{{json .Labels}}')) as
+        Record<string, string>;
+      return Object.fromEntries(['io.codeboost.runner', 'io.codeboost.attempt', 'io.codeboost.allocation', own]
+        .map(key => [key, all[key]]));
+    };
     return [
       ...(withAgent ? [{ kind: 'container', name: current.name, id: inspect('container', current.name, '{{.Id}}'),
-        owner: { label: 'io.codeboost.invocation', value: current.ownershipId } }] : []),
+        labels: owned('container', current.name, 'io.codeboost.invocation') }] : []),
       { kind: 'container', name: current.network.proxyContainer,
-        id: inspect('container', current.network.proxyContainer, '{{.Id}}'), owner: egress },
-      { kind: 'network', name: current.network.name, id: inspect('network', current.network.name, '{{.Id}}'), owner: egress },
+        id: inspect('container', current.network.proxyContainer, '{{.Id}}'),
+        labels: owned('container', current.network.proxyContainer, 'io.codeboost.egress') },
+      { kind: 'network', name: current.network.name, id: inspect('network', current.network.name, '{{.Id}}'),
+        labels: owned('network', current.network.name, 'io.codeboost.egress') },
       { kind: 'directory', name: current.inputDirectory },
       { kind: 'directory', name: dirname(current.codexAuthFile!) },
     ];
