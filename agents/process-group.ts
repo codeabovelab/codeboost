@@ -115,7 +115,8 @@ export function runInProcessGroup(file: string, args: readonly string[],
     // An abort raised during onProcessGroup came before the listener existed, and an aborted signal never fires again.
     else if (options.signal?.aborted) stop('cancelled');
     let spawnError: Error | undefined;
-    const closed = new Promise<void>(resolveClosed => child.once('close', () => resolveClosed()));
+    let pipesClosed = false;
+    const closed = new Promise<void>(resolveClosed => child.once('close', () => { pipesClosed = true; resolveClosed(); }));
     // Settle from the leader's exit, not from 'close': 'close' also waits for every holder of the pipes, which can
     // include a process that left the group and so survives the group kill.
     let finished = false;
@@ -132,12 +133,23 @@ export function runInProcessGroup(file: string, args: readonly string[],
         await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
         // Cleared so a finished call never keeps the process alive.
         clearTimeout(stdioTimer);
+        // Timers run before I/O in each event-loop turn: after a long block the timer can win while the rest of the
+        // output is already waiting. One more turn lets that I/O (and the end of the pipes) be read first.
+        if (!pipesClosed) await new Promise(resolveTurn => setImmediate(resolveTurn));
         child.stdout!.destroy();
         child.stderr!.destroy();
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
         if (!drained) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
             new Error(`${file} left processes in its group that did not exit after SIGKILL.`), { code: 'EGROUPALIVE' }) });
+          return;
+        }
+        if (!pipesClosed) {
+          // Only a process outside the group can still hold the pipes; the output may be incomplete, so this is not a
+          // successful result even if the leader exited 0.
+          resolve({ status: null, stdout, stderr, error: Object.assign(new Error(
+            `${file} exited, but a process outside its group still holds its output; the output may be incomplete.`),
+            { code: 'ESTDIOHELD' }) });
           return;
         }
         if (stopped === 'unrecorded') {

@@ -88,7 +88,9 @@ describe('runInProcessGroup', () => {
     try {
       const began = performance.now();
       const outcome = await runInProcessGroup(process.execPath, ['-e', escape], { env, timeoutMs: 30_000 });
-      expect(outcome).toMatchObject({ status: 0, stdout: 'leader done\n' });
+      // The output may be incomplete, so it is not reported as a success; what was read is kept.
+      expect(outcome).toMatchObject({ status: null, stdout: 'leader done\n' });
+      expect((outcome.error as NodeJS.ErrnoException).code).toBe('ESTDIOHELD');
       expect(performance.now() - began).toBeLessThan(10_000);
     } finally {
       try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
