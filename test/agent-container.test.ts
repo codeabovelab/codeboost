@@ -12,7 +12,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { isRecoveredTaskStorage, taskFilesystemOwner } from '../agents/container/storage.ts';
+import { isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -714,6 +714,28 @@ describe('real Docker agent isolation', () => {
       expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId, owner)).toThrow('docker run'));
     expect(byAllocation(owner.allocationId)).toEqual([]);
   }, 60_000);
+
+  it('aborts storage allocation while a Docker call ignores SIGTERM, and removes what it created before settling', async () => {
+    const data = fixture(), owner = testOwner('abort-allocation'), marker = join(data.root, 'start-began');
+    // The keeper really starts, then the client ignores SIGTERM and never returns.
+    const stubborn = [
+      'result = run(args);',
+      `require('node:fs').writeFileSync(${JSON.stringify(marker)}, '');`,
+      "process.on('SIGTERM', () => {});",
+      'Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+    ].join('\n');
+    const controller = new AbortController(), pgids: number[] = [];
+    const waitForStart = setInterval(() => { if (existsSync(marker)) controller.abort(); }, 20);
+    const began = performance.now();
+    try {
+      await withDockerShim(['start'], stubborn, () => expect(prepareTaskFilesystemsAsync(data.clone, storageLimits,
+        imageId, owner, { signal: controller.signal, onProcessGroup: group => { pgids.push(group.pgid); } }))
+        .rejects.toThrow('cancelled'));
+    } finally { clearInterval(waitForStart); }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
+    expect(byAllocation(owner.allocationId)).toEqual([]);
+    for (const pgid of pgids) expect(spawnSync('kill', ['-0', `-${pgid}`]).status).not.toBe(0);
+  }, 90_000);
 
   it('keeps a failed allocation whose cleanup did not settle live, so recovery in this process refuses its runner', async () => {
     const data = fixture(), runnerOwner = randomBytes(16).toString('hex');
