@@ -6,8 +6,9 @@ import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
+import { runDocker } from '../docker.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
-  ownerLabelArgs, releaseAllocationId, type ResourceOwner } from '../labels.ts';
+  ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -34,6 +35,13 @@ interface AllocationIdentity {
   readonly limits: Readonly<TaskStorageLimits>;
 }
 const allocations = new WeakMap<TaskFilesystems, AllocationIdentity>();
+// Storage this process is allocating or has allocated, and has not confirmed removed (including a failed allocation
+// whose cleanup did not settle), as allocation ID to runner token. Recovery never runs for a
+// runner that has any, and never issues a handle for one: a running agent may mount it.
+const liveAllocations = new Map<string, string>();
+/** Whether this process holds task storage of this runner that it allocated and has not removed. */
+export const hasLiveTaskStorage = (runnerOwner: string): boolean =>
+  [...liveAllocations.values()].includes(runnerOwner);
 const dockerEnvironment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const validLimit = (value: number, name: string) => {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer.`);
@@ -224,6 +232,8 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
   try { assertAllocationObjects(allocationId, 0, remaining); }
   catch (error) { releaseAllocationId(allocationId); throw error; }
+  // Live from before the first create: a failed allocation whose cleanup does not settle still owns what it made.
+  liveAllocations.set(allocationId, owner.runnerOwner);
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
   // Names whose create succeeded, or whose client was killed so the object may exist. Cleanup touches only these: a
@@ -269,7 +279,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       '--entrypoint', 'sleep', imageId, 'infinity']);
     if (!DOCKER_ID.test(keeperId)) throw new Error('Docker did not return the created keeper ID.');
     docker(['start', keeperId], remaining());
-    allocate(seeder, ['run', '--rm', '--name', seeder, ...labels,
+    allocate(seeder, ['run', '--rm', '--name', seeder, '--label', 'io.codeboost.task-storage=seeder', ...labels,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
@@ -285,14 +295,112 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     return filesystems;
   } catch (error) {
     try { cleanup(mine([seeder, keeper]), mine([metadataVolume, workVolume]), owner, unsettled); }
+    // Still live: this process owns whatever cleanup could not remove, and reports it through the error.
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
+    liveAllocations.delete(allocationId);
     releaseAllocationId(allocationId);
     throw error;
   }
 }
 
-export function removeTaskFilesystems(filesystems: TaskFilesystems): void {
-  assertTaskFilesystems(filesystems);
-  cleanup([filesystems.keeper], [filesystems.metadataVolume, filesystems.workVolume], taskFilesystemOwner(filesystems));
-  allocations.delete(filesystems);
+/**
+ * Task storage that `recoverLeftovers` found after a restart, when the `TaskFilesystems` value that allocated it is
+ * gone. A crash during allocation can leave any subset of the parts, so each is optional. D issues a handle only after
+ * checking that every part carries this runner, attempt and allocation, and only a handle D issued is accepted.
+ */
+export interface RecoveredTaskStorage {
+  readonly runnerOwner: string;
+  readonly attemptId: string;
+  readonly allocationId: string;
+  readonly workVolume?: string;
+  readonly metadataVolume?: string;
+  readonly keeper?: string;
+}
+export type TaskStorageParts = Pick<RecoveredTaskStorage, 'workVolume' | 'metadataVolume' | 'keeper'>;
+// Each issued handle's owner, and the keeper's ID from the inspect that checked it: cleanup removes that keeper by ID,
+// so a same-named replacement created later is never touched.
+const recoveredStorage = new WeakMap<RecoveredTaskStorage, { owner: ResourceOwner; keeperId?: string }>();
+/** The daemon answered, and the storage is not what D creates for this owner; unlike a failed inspect, retrying won't help. */
+export class RecoveredStorageRejected extends Error {}
+const STORAGE_PARTS = Object.freeze([
+  // Exactly the names `prepareTaskFilesystems` generates: a fixed prefix and a UUID v4.
+  ['workVolume', 'volume', 'work', new RegExp(`^codeboost-work-${UUID_V4}$`)],
+  ['metadataVolume', 'volume', 'metadata', new RegExp(`^codeboost-metadata-${UUID_V4}$`)],
+  ['keeper', 'container', 'keeper', new RegExp(`^codeboost-keeper-${UUID_V4}$`)],
+] as const);
+
+/**
+ * Issue a recovery handle for task storage left by an earlier process. Each named part is inspected now and must be
+ * the task-storage object of its kind carrying all three owner labels; otherwise nothing is issued. Storage this
+ * process allocated and has not removed is refused, since a running agent may still mount it.
+ */
+export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: TaskStorageParts,
+  timeoutMs = 30_000, keeperId?: string): Promise<RecoveredTaskStorage> {
+  try { owner = assertResourceOwner(owner); }
+  catch (error) { throw new RecoveredStorageRejected((error as Error).message); }
+  if (liveAllocations.has(owner.allocationId))
+    throw new Error('Task storage is still live in this process; only leftovers of an earlier process are recovered.');
+  if (keeperId !== undefined && (!DOCKER_ID.test(keeperId) || parts.keeper === undefined))
+    throw new RecoveredStorageRejected('A keeper ID needs the keeper it names, as a full ID.');
+  const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
+  // Only an ID the keeper inspection below confirms is kept for cleanup.
+  let confirmedKeeperId: string | undefined;
+  for (const [field, object, kind, pattern] of STORAGE_PARTS) {
+    const name = parts[field];
+    if (name === undefined) continue;
+    if (typeof name !== 'string' || !pattern.test(name))
+      throw new RecoveredStorageRejected(`Recovered task ${kind} has an unexpected name.`);
+    // A keeper the caller already identified is looked up by that ID, never by its reusable name: a keeper removed and
+    // recreated under the same name since then is a different object, and is refused.
+    const target = object === 'container' && keeperId ? keeperId : name;
+    const inspect = await runDocker([object, 'inspect', target], { timeoutMs: remaining() });
+    if (inspect.status !== 0) {
+      if (absent(inspect as unknown as ReturnType<typeof spawnSync>))
+        throw new RecoveredStorageRejected(`Recovered task ${kind} is gone.`);
+      throw new Error(`Recovered task ${kind} could not be inspected.`);
+    }
+    const inspected = JSON.parse(inspect.stdout || '[]')[0] as { Id?: string; Name?: string;
+      Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    if (object === 'container' && inspected?.Name?.replace(/^\//, '') !== name)
+      throw new RecoveredStorageRejected(`Recovered task ${kind} no longer has its name.`);
+    const labels = inspected?.Labels ?? inspected?.Config?.Labels;
+    if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
+      throw new RecoveredStorageRejected(`Recovered task ${kind} does not carry this owner's task-storage labels.`);
+    if (object === 'container') {
+      if (!inspected?.Id || !DOCKER_ID.test(inspected.Id) || (keeperId && inspected.Id !== keeperId))
+        throw new RecoveredStorageRejected(`Recovered task ${kind} has no full ID, or changed.`);
+      confirmedKeeperId = inspected.Id;
+    }
+    found[field] = name;
+  }
+  if (!Object.keys(found).length) throw new RecoveredStorageRejected('Recovered task storage names no parts.');
+  const handle: RecoveredTaskStorage = Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId,
+    allocationId: owner.allocationId, ...found });
+  recoveredStorage.set(handle, { owner, keeperId: confirmedKeeperId });
+  return handle;
+}
+
+/** Whether a value is a recovery handle D issued and has not yet released. */
+export const isRecoveredTaskStorage = (value: unknown): value is RecoveredTaskStorage =>
+  typeof value === 'object' && value !== null && recoveredStorage.has(value as RecoveredTaskStorage);
+
+/**
+ * Remove task storage: the value `prepareTaskFilesystems` returned, or a recovery handle from `recoverLeftovers`.
+ * Every part must still carry its owner labels; the handle stays valid until removal is confirmed.
+ */
+export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTaskStorage): void {
+  const recovered = recoveredStorage.get(filesystems as RecoveredTaskStorage);
+  if (recovered) {
+    const handle = filesystems as RecoveredTaskStorage;
+    cleanup(recovered.keeperId ? [recovered.keeperId] : [],
+      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner);
+    recoveredStorage.delete(handle);
+    return;
+  }
+  const allocated = filesystems as TaskFilesystems;
+  assertTaskFilesystems(allocated);
+  const owner = taskFilesystemOwner(allocated);
+  cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner);
+  allocations.delete(allocated);
+  liveAllocations.delete(owner.allocationId);
 }

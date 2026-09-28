@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -39,7 +39,10 @@ describe('create outcome classification', () => {
       .then(() => undefined, (error: unknown) => error);
     expect(createOutcomeUnknown(before)).toBe(false);
     // A cancel that kills a client already in flight leaves the outcome unknown.
-    writeFileSync(join(dir, 'docker'), '#!/bin/sh\nexec sleep 5\n', { mode: 0o755 });
+    // The first test left a non-executable `docker` here, and `mode` applies only when a file is created, so set it:
+    // otherwise the real Docker CLI further down PATH runs instead, and the outcome depends on its daemon.
+    writeFileSync(join(dir, 'docker'), '#!/bin/sh\nexec sleep 5\n');
+    chmodSync(join(dir, 'docker'), 0o755);
     const path = process.env.PATH; process.env.PATH = `${dir}:${path}`;
     try {
       const inflight = new AbortController();

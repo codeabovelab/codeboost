@@ -77,6 +77,19 @@ Use only these entry points to run an agent:
    later failure settles the handle. `cancel()` during setup kills the in-flight Docker
    call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
    credential only as the function argument.
+5. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
+   database's single-runner lock and before admitting work. It touches only objects labelled with that runner
+   token. It removes agent containers, egress proxies, seeders and networks, and resolves once they are gone. It keeps
+   task storage whole (both volumes and the keeper) and returns one recovery handle per allocation, carrying its
+   attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
+   `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
+   a runner label (from older builds), objects of this runner that D does not create, and storage whose parts
+   disagree are listed in `unowned` and never touched. An object counts as D's only with exactly one kind label,
+   the value D writes for it, and complete owner labels. A storage check that cannot reach Docker rejects the whole
+   recovery rather than reporting the storage. It refuses to run while this process still holds task
+   storage of that runner, since every agent mounts storage; the lock is what excludes other processes. If any
+   removal is not confirmed, it rejects with a `RecoveryError` whose message is about 1 KB at most and whose
+   `removed` lists what it did remove, and issues no handle; running it again retries.
 
 The boundary guarantees the following:
 
@@ -151,8 +164,9 @@ Ask keeps the contract's identity and cleanup rules:
   they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
   at shutdown keeps Ask off. Allocations beyond the record's cap of 100 count as unidentified, never dropped; Ask
   roots are never dropped, and recording one past the cap is refused. Any labelled resource that is not part of a
-  still-listed allocation keeps the unidentified marker until none remain. Removal goes through D only once D has
-  recovery handles (#51 item 4).
+  still-listed allocation keeps the unidentified marker until none remain. D now has scoped recovery (#51 item 4),
+  but Ask cannot use it yet: it labels resources with a random per-session runner owner, so a later process does not
+  know the token to recover (#59).
 - Host copies are owned through one Ask root per worker, `<tmp>/codeboost-ask-XXXXXX`. The bridge creates it and
   records it before the worker starts, and runs the worker with it as `TMPDIR`. So the reviewed clone, lane D's
   input directory and its Codex auth copy all land inside it. The root is deleted, read-only directories included,
@@ -195,8 +209,9 @@ absolute and symlinked spellings share them. A database with other hard links is
 - If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
   replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
   while any container, volume or network labelled `io.codeboost.allocation`,
-  `io.codeboost.invocation` or `io.codeboost.egress` exists. Reclaiming those leftovers after a crash or restart
-  needs lane D's labelled resources and scoped recovery (#51, item 4), which do not exist yet.
+  `io.codeboost.invocation` or `io.codeboost.egress` exists. Lane D's scoped recovery (#51 item 4) can reclaim
+  leftovers by runner token, but Ask's per-session token is lost with the process until F1d's per-database token
+  exists (#59).
 
 `test/agent-question.test.ts` runs this path
 against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
