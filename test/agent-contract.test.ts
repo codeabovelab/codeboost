@@ -5,6 +5,7 @@ let attempt = 0;
 const request = (): InvocationInput => ({
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tasks/one', head: 'a'.repeat(40) },
   vendor: 'codex', phase: 'review', approvedArgv: [['npm', 'test']], deadline: 2000, attemptId: `attempt-${++attempt}`,
+  runnerOwner: '0123456789abcdef0123456789abcdef',
   context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
     referencedCodeHash: 'hash-1', stateVersion: 3 },
 });

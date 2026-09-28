@@ -1,3 +1,5 @@
+import { isLabelAttemptId, isRunnerOwner } from './labels.ts';
+
 /** Lane D/F boundary. Only the runner may construct requests after admission. */
 export interface TaskClone {
   readonly id: string;
@@ -23,12 +25,19 @@ export interface InvocationInput {
   readonly approvedArgv: readonly (readonly string[])[];
   readonly deadline: number;
   readonly attemptId: string;
+  /**
+   * The runner token of the database this attempt belongs to: 32 lowercase hex characters, created once per database.
+   * Every Docker object D creates for the invocation carries it as `io.codeboost.runner` (#51 item 3).
+   */
+  readonly runnerOwner: string;
   readonly context: InvocationContext;
 }
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
 /**
- * A resource D created for an attempt and could not confirm removed. A name alone does not prove ownership: remove a
- * Docker object only if its `id` (when present) and its `owner` label both still match.
+ * A resource D created for an attempt and could not confirm removed. When `id` is present it proves ownership on its
+ * own (D captured it at create, and Docker never reuses IDs): remove the object by that ID, whatever its labels say.
+ * A name alone proves nothing: without `id`, look the object up by name and remove it by the ID that lookup returns
+ * only if all of its `labels` match.
  */
 export interface UnreleasedResource {
   readonly kind: 'container' | 'network' | 'directory';
@@ -36,8 +45,14 @@ export interface UnreleasedResource {
   readonly name: string;
   /** Docker object ID captured at creation; absent when the create's outcome is unknown. */
   readonly id?: string;
-  /** The label that marks D's ownership of a Docker object; absent for host directories. */
-  readonly owner?: { readonly label: string; readonly value: string };
+  /**
+   * The ownership labels D wrote on the object: `io.codeboost.runner`, `io.codeboost.attempt` and
+   * `io.codeboost.allocation`, plus its kind's own label (`io.codeboost.invocation` or `io.codeboost.egress`).
+   * These are what the object must carry, not what was observed: when `id` is absent, an object found by `name` is
+   * D's only if it carries every one of them, and one that does not is someone else's and must be left alone.
+   * Absent for host directories.
+   */
+  readonly labels?: Readonly<Record<string, string>>;
 }
 export interface InvocationResult {
   readonly attemptId: string;
@@ -94,9 +109,12 @@ export function captureInvocation(input: InvocationInput, now = Date.now()): Inv
   if (!input || !input.clone || !input.context) throw new Error('Missing invocation context.');
   if (!['planning', 'questions', 'review', 'execute', 'fix'].includes(input.phase)
     || !['claude', 'codex'].includes(input.vendor)) throw new Error('Unsupported invocation profile.');
+  if (!isRunnerOwner(input.runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
   if (!nonempty(input.attemptId) || !nonempty(input.clone.id) || !nonempty(input.clone.taskId)
     || !nonempty(input.clone.directory) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.clone.head))
     throw new Error('Invalid task clone or attempt identity.');
+  // Checked here, not first inside setup: every Docker object is labelled with it, and invalid input must throw.
+  if (!isLabelAttemptId(input.attemptId)) throw new Error('attemptId cannot be written as an ownership label.');
   if (!Number.isFinite(now) || !Number.isSafeInteger(input.deadline) || input.deadline <= now)
     throw new Error('Invocation requires a finite future deadline.');
   const context = input.context;

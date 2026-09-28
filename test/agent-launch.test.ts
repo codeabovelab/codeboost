@@ -1,13 +1,15 @@
+import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AdapterSetupCleanupError, CLEANUP_RETRY_WINDOW_MS, isInvocationActive,
   launchInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationHandle, type InvocationResult } from '../agents/contract.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { startCodexInvocation } from '../agents/adapters/codex.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 // The start call returns its handle at once and runs setup inside it (#51 item 2). These run without Docker.
 describe('asynchronous launch', () => {
-  const captured = (attemptId: string) => captureInvocation({
+  const captured = (attemptId: string) => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
     clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
     phase: 'planning', vendor: 'codex', approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId,
     context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
@@ -84,7 +86,7 @@ describe('asynchronous launch', () => {
 
   it('keeps retrying setup cleanup that failed, then reports what it could not remove', async () => {
     const resources = [{ kind: 'network' as const, name: 'codeboost-egress-codex-x', id: 'n'.repeat(64),
-      owner: { label: 'io.codeboost.egress', value: 'a' } }];
+      labels: { 'io.codeboost.egress': 'a' } }];
     let retries = 0;
     const handle = launchInvocation(captured('launch-cleanup'), budget, async () => {
       throw new AdapterSetupCleanupError(new Error('profile refused'), new Error('daemon unreachable'),
@@ -120,7 +122,7 @@ describe('asynchronous launch', () => {
   it.each(['codex', 'claude'] as const)('refuses an untrusted %s image synchronously, allocating nothing', vendor => {
     const invocation = captured(`untrusted-image-${vendor}`);
     const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
-      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused' };
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() };
     const start = () => vendor === 'codex'
       ? startCodexInvocation(request, '/unused/auth.json')
       : startClaudeInvocation(request, 'token');

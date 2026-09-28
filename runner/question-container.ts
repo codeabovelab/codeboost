@@ -1,10 +1,12 @@
 import { spawnSync } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { InvocationContext, InvocationHandle, InvocationInput, InvocationResult, StopReason, TaskClone } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
+import type { ResourceOwner } from '../agents/labels.ts';
 import { removeStaging, type Leftover } from './question-leftovers.ts';
 
 export type Provider = 'claude' | 'codex';
@@ -25,6 +27,8 @@ export interface ContainerQuestion extends QuestionScope {
   readonly provider: Provider;
   readonly prompt: string;
   readonly deadline: number;
+  /** Written as `io.codeboost.runner` on every Docker object this question creates (#51 item 3). */
+  readonly runnerOwner: string;
 }
 /**
  * Task storage whose removal Docker did not confirm. The only handle to a D allocation must not be dropped:
@@ -100,7 +104,8 @@ export function assertFitsQuestionStorage(size: RepositorySize): void {
 export interface ContainerDependencies {
   buildImage(timeoutMs: number): string;
   createClone(options: { source: string; parent: string; taskId: string; head: string; timeoutMs: number }): TaskClone;
-  prepareFilesystems(clone: TaskClone, limits: TaskStorageLimits, imageId: string, timeoutMs: number): TaskFilesystems;
+  prepareFilesystems(clone: TaskClone, limits: TaskStorageLimits, imageId: string, owner: ResourceOwner,
+    timeoutMs: number): TaskFilesystems;
   removeFilesystems(filesystems: TaskFilesystems): void;
   /** Size of the checkout at `head` and of the object store, measured before anything is copied to the host. */
   measureRepository(source: string, head: string, timeoutMs: number): RepositorySize;
@@ -201,7 +206,8 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     assertFitsQuestionStorage(deps.measureRepository(question.repository, question.head, Math.min(60_000, remaining())));
     const clone = deps.createClone({ source: question.repository, parent: staging, taskId: `question-${question.noteId}`,
       head: question.head, timeoutMs: Math.min(120_000, remaining()) });
-    try { filesystems = deps.prepareFilesystems(clone, QUESTION_STORAGE, image.id, Math.min(60_000, remaining())); }
+    const owner = { runnerOwner: question.runnerOwner, attemptId: question.attemptId, allocationId: randomUUID() };
+    try { filesystems = deps.prepareFilesystems(clone, QUESTION_STORAGE, image.id, owner, Math.min(60_000, remaining())); }
     catch (error) {
       // D throws an AggregateError only when a failed allocation's own cleanup did not settle; it returns no handle.
       if (error instanceof AggregateError) retained.markUntracked();
@@ -209,11 +215,12 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     }
     remaining();
     const invocation = deps.capture({ clone, phase: 'questions', vendor: question.provider, approvedArgv: [],
-      deadline: question.deadline, attemptId: question.attemptId,
+      deadline: question.deadline, attemptId: question.attemptId, runnerOwner: question.runnerOwner,
       context: { snapshotId: question.snapshotId, planId: question.planId, planRevision: question.planRevision,
         assignmentId: question.noteId, referencedCodeHash: question.contextId,
         stateVersion: 0 } });
-    const request = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: question.prompt };
+    const request = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: question.prompt,
+      networkAllocationId: randomUUID() };
     const handle = question.provider === 'claude' ? deps.startClaude(request, credential) : deps.startCodex(request, credential);
     const cancel = () => handle.cancel(stopOf(signal.reason));
     if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });

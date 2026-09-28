@@ -19,7 +19,8 @@ const CLEANUP_TIMEOUT_MS = 30_000;
 export async function setUpProfile(request: AgentAdapterRequest, remaining: () => number, signal: AbortSignal,
   profileOptions: (network: VendorNetwork) => Omit<ProfileOptions, 'timeoutMs' | 'signal'>,
   start: (profile: ContainerProfile) => InvocationHandle): Promise<InvocationHandle> {
-  const network = await createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining()), signal);
+  const network = await createVendorNetwork(request.invocation, request.imageId, request.networkAllocationId,
+    Math.min(60_000, remaining()), signal);
   let profile: ContainerProfile;
   try {
     profile = await createContainerProfile({ ...profileOptions(network), timeoutMs: Math.min(60_000, remaining()),

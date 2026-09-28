@@ -1,4 +1,4 @@
-import { randomUUID } from 'node:crypto';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
 import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, type Provider } from './question-container.ts';
@@ -24,6 +24,9 @@ export class QuestionWorker {
   private pending = new Map<string, { attemptId: string; resolve: (text: string) => void; reject: (error: Error) => void;
     watchdog: ReturnType<typeof setTimeout> }>();
   private scanned = false;
+  // Written as `io.codeboost.runner` on every Docker object Ask creates (#51 item 3). Interim: one random owner per
+  // session. The runner's per-database token (F1d) replaces it; Ask's own leftovers ledger does not depend on it.
+  private readonly runnerOwner = randomBytes(16).toString('hex');
   // Set when the worker dies. Its containers and storage may still exist, and nothing in this process can reclaim
   // them until lane D's scoped recovery exists (#51), so Ask stays off rather than starting a replacement worker.
   private crashed?: Error;
@@ -163,7 +166,7 @@ export class QuestionWorker {
       let worker: Worker;
       try { worker = this.start(); } catch (error) { reject(error as Error); return; }
       const id = randomUUID();
-      const question = { ...scope, provider, prompt,
+      const question = { ...scope, provider, prompt, runnerOwner: this.runnerOwner,
         deadline: Date.now() + Math.max(1_000, (timeoutMs ?? 120_000) - SETTLE_MARGIN_MS) };
       const watchdog = setTimeout(() => { if (this.pending.has(id)) void this.#abandon('did not settle a question after its deadline'); },
         question.deadline - Date.now() + this.abandonAfterMs);

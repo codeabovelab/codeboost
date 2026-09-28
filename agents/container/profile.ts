@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { assertCapturedInvocation, type InvocationInput, type Phase, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
-import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
+import { assertTaskFilesystems, taskFilesystemOwner, type TaskFilesystems } from './storage.ts';
+import { ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
   type VendorNetwork } from '../network/network.ts';
 import { assertAgentCommand, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
@@ -136,6 +137,12 @@ const captureInput = (directory: string): InputCapture => {
   return Object.freeze({ inputDirectory: canonical, schema, content: captured.content });
 };
 
+/** The labels on an invocation's agent container: its runner and attempt, and the task-storage allocation it mounts. */
+export function agentContainerOwner(invocation: InvocationInput, filesystems: TaskFilesystems): ResourceOwner {
+  return Object.freeze({ runnerOwner: invocation.runnerOwner, attemptId: invocation.attemptId,
+    allocationId: taskFilesystemOwner(filesystems).allocationId });
+}
+
 /** Prove that a profile object is the exact capability issued by this module. */
 export function assertContainerProfileAuthenticity(profile: ContainerProfile): void {
   if (!identities.has(profile)) throw new Error('Container profile was not created by the trusted profile builder.');
@@ -218,6 +225,11 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     throw new Error('Container profile requires the immutable built image ID.');
   assertBuiltAgentImage(options.imageId);
   assertTaskFilesystems(filesystems, invocation.clone);
+  // The storage must belong to this runner. The agent container is labelled with its own attempt and the allocation
+  // it mounts, so recovery can find both from the container.
+  const storageOwner = taskFilesystemOwner(filesystems);
+  if (storageOwner.runnerOwner !== invocation.runnerOwner) throw new Error('Task filesystems belong to another runner.');
+  const containerOwner = agentContainerOwner(invocation, filesystems);
   const invocationLeft = Math.floor(invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   await assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft),
@@ -265,7 +277,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       '--cpus=1', '--shm-size=16m', '--ipc=private', '--cgroupns=private',
       `--network=${options.network.name}`, '--dns=127.0.0.1', '--env', 'HOME=/home/codeboost',
       '--env', `CODEBOOST_PHASE=${invocation.phase}`,
-      '--label', `io.codeboost.invocation=${ownershipId}`,
+      '--label', `io.codeboost.invocation=${ownershipId}`, ...ownerLabelArgs(containerOwner),
       '--env', `CODEBOOST_VENDOR=${invocation.vendor}`, '--env', 'npm_config_cache=/tmp/npm-cache',
       '--env', `HTTPS_PROXY=${options.network.proxyUrl}`, '--env', `HTTP_PROXY=${options.network.proxyUrl}`,
       '--env', 'NO_PROXY=localhost,127.0.0.1',

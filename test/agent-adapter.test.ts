@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { describe, expect, it, vi } from 'vitest';
 import { parseClaudeOutput, startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { CODEX_OUTPUT_FILE, startCodexInvocation } from '../agents/adapters/codex.ts';
@@ -5,10 +6,11 @@ import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents
 import { createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { createCodexCommand, createPhasePolicy } from '../agents/policy.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 describe('production agent adapters', () => {
   const capturedInvocation = (attemptId: string, deadline: number, vendor: 'codex' | 'claude' = 'codex') =>
-    captureInvocation({
+    captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
       phase: 'planning', vendor, approvedArgv: [], deadline, attemptId,
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a',
@@ -26,7 +28,7 @@ describe('production agent adapters', () => {
   });
 
   it('routes Codex final output to the bounded scratch directory', () => {
-    const invocation = captureInvocation({
+    const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
       phase: 'planning', vendor: 'codex', approvedArgv: [], deadline: 2_000, attemptId: 'adapter-command',
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
@@ -45,7 +47,7 @@ describe('production agent adapters', () => {
   it.each(['codex', 'claude'] as const)('rejects expired %s setup before allocating a network', vendor => {
     const invocation = capturedInvocation(`expired-${vendor}`, Date.now() - 1, vendor);
     const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
-      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused' };
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() };
     const start = () => vendor === 'codex'
       ? startCodexInvocation(request, '/unused/auth.json')
       : startClaudeInvocation(request, 'token');

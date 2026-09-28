@@ -2,11 +2,13 @@ import { realpathSync } from 'node:fs';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import type { UnreleasedResource } from '../contract.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
-import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
+import { agentContainerOwner, assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
   isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
-import { taskFilesystemAllocationId } from './storage.ts';
+import { taskFilesystemOwner } from './storage.ts';
+import { hasOwnerLabels, ownerLabels } from '../labels.ts';
+import { assertPhasePolicy } from '../policy.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
 export type { TaskFilesystems, TaskStorageLimits } from './storage.ts';
 
@@ -54,6 +56,8 @@ const unsettledCreates = new WeakMap<ContainerProfile, number>();
 // removed only once the container's removal (or absence) is confirmed, so any later retry of the profile's own
 // network or staging cleanup is profile-only and never looks the name up again.
 const createdContainers = new WeakMap<ContainerProfile, string | undefined>();
+// The ownership labels written on each profile's agent container, for reporting it if its removal is not confirmed.
+const containerLabels = new WeakMap<ContainerProfile, Readonly<Record<string, string>>>();
 
 /**
  * The immutable ID of the agent container this profile created, when `docker create` returned one. Every operation
@@ -85,8 +89,9 @@ const assertLaunchable = (profile: ContainerProfile) => {
 export function agentContainerResources(profile: ContainerProfile): readonly UnreleasedResource[] {
   if (!createdContainers.has(profile)) return Object.freeze([]);
   const id = createdContainers.get(profile);
+  // Labels captured at create time: this runs while a handle settles and must never throw.
   return Object.freeze([Object.freeze({ kind: 'container' as const, name: profile.name, ...(id ? { id } : {}),
-    owner: Object.freeze({ label: 'io.codeboost.invocation', value: profile.ownershipId }) })]);
+    labels: containerLabels.get(profile) ?? Object.freeze({ 'io.codeboost.invocation': profile.ownershipId }) })]);
 }
 // Cleanup is never cancelled: it runs to its own deadline so nothing is dropped.
 const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle = false, timeoutMs = 30_000) => {
@@ -124,11 +129,16 @@ const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle =
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Id?: string; Config?: { Labels?: Record<string, string> } } | undefined;
-  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
+  // A captured ID proves the container is the one this profile created (Docker never reuses IDs), so it is removed
+  // even if validation refused its labels. A container found by name (its create's ID never came back) must carry
+  // every label this profile wrote.
+  const expected = containerLabels.get(profile) ?? { 'io.codeboost.invocation': profile.ownershipId };
+  if (!capturedId && (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
+    || Object.entries(expected).some(([label, value]) => inspected?.Config?.Labels?.[label] !== value)))
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
   // Remove and confirm by the ID the daemon just reported for our container, never by the name: a same-named
   // replacement created after this inspect must not be deleted.
-  const id = inspected.Id;
+  const id = inspected?.Id;
   if (!id || !DOCKER_ID.test(id) || (capturedId && id !== capturedId))
     throw new Error('Failed to establish the agent container identity; staged credentials were retained.');
   const result = await runDocker(['rm', '--force', id], { timeoutMs: remaining() });
@@ -201,6 +211,7 @@ export async function validateContainer(container: string, profile: ContainerPro
     || JSON.stringify(inspect.Config.Entrypoint) !== JSON.stringify(['/usr/local/bin/codeboost-container-probe'])
     || JSON.stringify(inspect.Config.Cmd) !== JSON.stringify(profile.command)
     || inspect.Config.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
+    || !hasOwnerLabels(inspect.Config.Labels, agentContainerOwner(assertPhasePolicy(profile.policy), profile.filesystems))
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactSecurityOptions(host.SecurityOpt)
@@ -262,7 +273,8 @@ export async function validateContainer(container: string, profile: ContainerPro
   const volumes = JSON.parse(await docker(['volume', 'inspect', work.Name!, metadata.Name!],
     { timeoutMs: remaining(), signal })) as
     Array<{ Name: string; Driver: string; Labels: Record<string, string> | null; Options: Record<string, string> | null }>;
-  const allocationId = taskFilesystemAllocationId(profile.filesystems);
+  // One owner for the whole check: the storage's runner, attempt and allocation label every volume and the keeper.
+  const storageOwner = taskFilesystemOwner(profile.filesystems);
   const expectedVolumes = new Map([
     [work.Name!, ['work', String(profile.filesystems.workBytes), String(profile.filesystems.workInodes)]],
     [metadata.Name!, ['metadata', String(profile.filesystems.metadataBytes), String(profile.filesystems.metadataInodes)]],
@@ -271,7 +283,7 @@ export async function validateContainer(container: string, profile: ContainerPro
     const expected = expectedVolumes.get(volume.Name), options = volume.Options ?? {}, optionString = options.o ?? '';
     if (!expected || volume.Driver !== 'local' || options.type !== 'tmpfs' || options.device !== 'tmpfs'
       || volume.Labels?.['io.codeboost.task-storage'] !== expected[0]
-      || volume.Labels?.['io.codeboost.allocation'] !== allocationId
+      || !hasOwnerLabels(volume.Labels, storageOwner)
       || !hasExactOptions(optionString, [`size=${expected[1]}`, `nr_inodes=${expected[2]}`,
         'uid=10001', 'gid=10001', 'mode=0755', 'nosuid', 'nodev']))
       throw new Error('Task volume does not match its bounded tmpfs allocation.');
@@ -286,7 +298,7 @@ export async function validateContainer(container: string, profile: ContainerPro
   const keeperVolumes = new Map((keeper?.Mounts ?? []).filter(item => item.Type === 'volume').map(item => [item.Destination, item]));
   if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
     || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper'
-    || keeper.Config?.Labels?.['io.codeboost.allocation'] !== allocationId || !keeper.HostConfig?.ReadonlyRootfs
+    || !hasOwnerLabels(keeper.Config?.Labels, storageOwner) || !keeper.HostConfig?.ReadonlyRootfs
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
@@ -349,6 +361,8 @@ export async function createValidatedContainer(profile: ContainerProfile, timeou
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let createUnsettled = false;
   try {
+    containerLabels.set(profile, Object.freeze({ 'io.codeboost.invocation': profile.ownershipId,
+      ...ownerLabels(agentContainerOwner(assertPhasePolicy(profile.policy), profile.filesystems)) }));
     validateSecrets(profile, secrets);
     await assertContainerProfile(profile, remaining(), signal);
     signal?.throwIfAborted();

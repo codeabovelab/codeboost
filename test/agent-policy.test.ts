@@ -2,9 +2,10 @@ import { describe, expect, it, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { assertAgentCommand, assertAgentTool, codexBaseArguments, createClaudeCommand, createCodexCommand,
   createPhasePolicy, dispatchApprovedCommand } from '../agents/policy.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 let attempt = 0;
-const request = (phase: Phase, vendor: 'claude' | 'codex' = 'claude'): InvocationInput => captureInvocation({
+const request = (phase: Phase, vendor: 'claude' | 'codex' = 'claude'): InvocationInput => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tmp/task', head: 'a'.repeat(40) },
   vendor, phase, approvedArgv: ['planning', 'questions'].includes(phase) ? [] : [['npm', 'test']],
   deadline: 2000, attemptId: `attempt-${phase}-${++attempt}`,

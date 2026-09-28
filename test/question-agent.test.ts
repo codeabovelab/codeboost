@@ -16,7 +16,7 @@ afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: 
 const question = (overrides: Partial<ContainerQuestion> = {}): ContainerQuestion => ({
   repository: '/repo', head: 'a'.repeat(40), snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 3, noteId: 'note-1',
   provider: 'claude', prompt: 'Why cap the retry delay?', attemptId: `attempt-${Math.random()}`, contextId: 'c'.repeat(64),
-  deadline: Date.now() + 60_000,
+  deadline: Date.now() + 60_000, runnerOwner: '0123456789abcdef0123456789abcdef',
   ...overrides,
 });
 
