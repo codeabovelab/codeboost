@@ -71,11 +71,15 @@ const absent = (result: DockerOutcome) => result.status !== 0 && result.status !
 /** How long a network or proxy whose create client was killed may still materialize in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
 // Cleanup is never cancelled: it runs to its own deadline so nothing is dropped.
-const remove = async (args: readonly string[], inspect: readonly string[], remaining: () => number, kind: string,
+// Remove one owned object. Looks it up by `target` (its ID, or its name for a create whose ID never came back),
+// checks the ownership label, then removes and confirms by the ID the daemon just reported: a same-named replacement
+// created after the lookup is never touched.
+const remove = async (object: 'container' | 'network', target: string, remaining: () => number, kind: string,
   allocationId: string, settleBy = 0) => {
+  const inspect = (ref: string) => runDocker([object, 'inspect', ref], { timeoutMs: remaining() });
   let before: DockerOutcome;
   for (;;) {
-    before = await runDocker(inspect, { timeoutMs: remaining() });
+    before = await inspect(target);
     if (before.status === 0) break;
     if (!absent(before)) throw new Error(`Failed to establish ownership of ${kind}.`);
     // A killed create may still land; only absence after the settle window counts.
@@ -83,13 +87,16 @@ const remove = async (args: readonly string[], inspect: readonly string[], remai
     await pause(250);
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
-    { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
   if (labels?.['io.codeboost.egress'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
-  const result = await runDocker(args, { timeoutMs: remaining() });
+  const id = inspected?.Id;
+  if (!id || !/^[0-9a-f]{64}$/.test(id) || (/^[0-9a-f]{64}$/.test(target) && id !== target))
+    throw new Error(`Failed to establish the identity of ${kind}.`);
+  const result = await runDocker(object === 'container' ? ['rm', '--force', id] : ['network', 'rm', id],
+    { timeoutMs: remaining() });
   if (result.status === 0) return;
-  const check = await runDocker(inspect, { timeoutMs: remaining() });
-  if (!absent(check)) throw new Error(`Failed to confirm removal of ${kind}.`);
+  if (!absent(await inspect(id))) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
 
 const validateVendorNetwork = async (network: VendorNetwork, invocation: InvocationInput | undefined,
@@ -194,7 +201,9 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     return value;
   };
   // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.
-  const create = async (object: string, args: readonly string[]) => {
+  // `answeredFailureMayCreate`: a command such as `docker run --detach` that can create the object and then exit
+  // nonzero (the start failed), so even a daemon-answered failure leaves the object possibly present.
+  const create = async (object: string, args: readonly string[], answeredFailureMayCreate = false) => {
     const timeout = remaining();
     try {
       const output = await docker(args, timeout, signal);
@@ -202,6 +211,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
       return output;
     } catch (error) {
       if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
+      else if (answeredFailureMayCreate) created.add(object);
       throw error;
     }
   };
@@ -226,12 +236,12 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     if (!mayExist('container')) proxyGone = true;
     if (!mayExist('network')) networkGone = true;
     if (proxyPlanned && !proxyGone) try {
-      await remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
+      await remove('container', proxyTarget,
         budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer));
       proxyGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
     if (networkPlanned && !networkGone) try {
-      await remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
+      await remove('network', networkTarget,
         budget, 'vendor network', allocationId, networkId ? 0 : settleBy(name));
       networkGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
@@ -247,7 +257,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
-      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']), 'proxy');
+      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs'], true), 'proxy');
     await docker(['network', 'connect', 'bridge', proxyId], remaining(), signal);
     await docker(['exec', proxyId, 'node', '-e', [
       "const net=require('node:net');let attempts=0;",
@@ -294,12 +304,12 @@ export async function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30
   const removed = removedParts.get(network) ?? new Set<UnreleasedResource['kind']>();
   removedParts.set(network, removed);
   if (!removed.has('container')) try {
-    await remove(['rm', '--force', identity.proxyId], ['container', 'inspect', identity.proxyId],
+    await remove('container', identity.proxyId,
       remaining, 'vendor proxy', allocationId);
     removed.add('container');
   } catch (error) { failures.push(error); }
   if (!removed.has('network')) try {
-    await remove(['network', 'rm', identity.networkId], ['network', 'inspect', identity.networkId],
+    await remove('network', identity.networkId,
       remaining, 'vendor network', allocationId);
     removed.add('network');
   } catch (error) { failures.push(error); }
