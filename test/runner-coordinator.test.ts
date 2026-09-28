@@ -10,6 +10,7 @@ import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
 const oid = (n: number) => n.toString(16).padStart(40, '0');
+const RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const plan = (summary = 'Example'): Plan => ({ schema_version: 1, revision: 1, issue: 1, summary, questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
 const ctx = (identity: PlanIdentity): PlanContext => ({ identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] });
 const A = { repositoryId: 'repo', taskId: 'task-a', planId: 'plan' }, B = { repositoryId: 'repo', taskId: 'task-b', planId: 'plan' };
@@ -29,6 +30,7 @@ function fakeD(options: { prepareIgnoresAbort?: boolean } = {}) {
   let cleaned = 0, startError: Error | undefined;
   const prepared = (attemptId: string): PreparedAttempt => ({ clone: { id: `clone-${attemptId}`, taskId: 'task', directory: '/tmp/x', head: oid(2) }, vendor: 'claude', approvedArgv: [] });
   const deps: RunnerDeps = {
+    runnerOwner: RUNNER_OWNER,
     prepare: (attempt, signal) => new Promise((resolve, reject) => {
       preparations.push({ attemptId: attempt.id, signal, resolve: () => resolve(prepared(attempt.id)), reject });
       if (!options.prepareIgnoresAbort) signal.addEventListener('abort', () => reject(signal.reason), { once: true });
@@ -74,6 +76,7 @@ describe('admission and slots', () => {
     const attempt = runner.start(A, request(store, A));
     await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
     await until(() => launches.length === 1, 'launch');
+    expect(launches[0]!.input.runnerOwner).toBe(RUNNER_OWNER);
     expect(store.getAttempt(A, attempt.id).state).toBe('running');
     launches[0]!.settle();
     await runner.settled(A);

@@ -11,6 +11,11 @@ export interface PreparedAttempt {
 }
 export interface RunnerDeps {
   /**
+   * The runner token D labels every resource with (32 lowercase hex characters). `prepare` must allocate task storage
+   * under the same token, because D refuses storage owned by another runner.
+   */
+  readonly runnerOwner: string;
+  /**
    * Host-side preparation (clone, prompt). On abort it must stop and await every subprocess it started, then reject.
    * It never leaves work running after it settles.
    */
@@ -172,7 +177,7 @@ export class RunnerCoordinator {
       let handle: InvocationHandle;
       try {
         const input = captureInvocation({ clone: prepared.clone, phase: ATTEMPT_PHASES[attempt.kind], vendor: prepared.vendor,
-          approvedArgv: prepared.approvedArgv, deadline: attempt.deadline, attemptId: attempt.id, context: attempt.context }, now);
+          approvedArgv: prepared.approvedArgv, deadline: attempt.deadline, attemptId: attempt.id, runnerOwner: this.#deps.runnerOwner, context: attempt.context }, now);
         handle = this.#deps.start(input, prepared);
       } catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Launch failed: ${message(error)}` }); }
       job.handle = handle;
