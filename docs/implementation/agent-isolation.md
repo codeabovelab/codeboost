@@ -57,8 +57,10 @@ metadata, read-only isolation and capacity probes had this defect.
 
 Use only these entry points to run an agent:
 
-1. `createTaskClone` creates a committed, standalone staging clone.
-2. `prepareTaskFilesystems` copies that clone into bounded task storage, labelled with the owner you pass: your
+1. `createTaskClone` creates a committed, standalone staging clone. The runner uses `createTaskCloneAsync`, which
+   takes an `AbortSignal` and reports each Git process group through `onProcessGroup` (#51 item 5).
+2. `prepareTaskFilesystems` (or `prepareTaskFilesystemsAsync`, which takes `signal` and `onProcessGroup` in the same
+   way) copies that clone into bounded task storage, labelled with the owner you pass: your
    runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Use each allocation
    ID once: before creating anything, D refuses an ID that another allocation in this process holds, or that any
    container, volume or network still carries (so a reuse after a restart is caught too). That check and the first
