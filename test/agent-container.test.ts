@@ -640,6 +640,24 @@ describe('real Docker agent isolation', () => {
     } finally { spawnSync('docker', ['rm', '--force', live.name], { stdio: 'ignore' }); }
   }, 60_000);
 
+  it('removes a task keeper by the ID it inspected, never a same-named replacement created after the inspect', async () => {
+    const data = fixture(), filesystems = data.filesystems, swapped = join(data.root, 'swapped');
+    taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
+    // Right after cleanup inspects the keeper, its name is taken over by another container.
+    const swap = [
+      'result = run(args);',
+      `if (args[2] === ${JSON.stringify(filesystems.keeper)} && !require('node:fs').existsSync(${JSON.stringify(swapped)})) {`,
+      `  require('node:fs').writeFileSync(${JSON.stringify(swapped)}, '');`,
+      `  run(['rm', '--force', args[2]]);`,
+      `  run(['run', '--detach', '--name', args[2], '--network=none', '--entrypoint', 'sleep', ${JSON.stringify(imageId)}, 'infinity']);`,
+      '}',
+    ].join('\n');
+    try {
+      await withDockerShim(['container', 'inspect'], swap, () => removeTaskFilesystems(filesystems));
+      expect(docker('container', 'inspect', '--format', '{{.State.Running}}', filesystems.keeper)).toBe('true');
+    } finally { spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' }); }
+  }, 60_000);
+
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
     taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);

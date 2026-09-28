@@ -5,7 +5,7 @@ import { dirname, isAbsolute, join, relative } from 'node:path';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
-import { createOutcomeUnknown } from '../client-outcome.ts';
+import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, releaseAllocationId, type ResourceOwner } from '../labels.ts';
 
@@ -56,8 +56,13 @@ const absent = (result: ReturnType<typeof spawnSync>) => result.status !== 0 && 
 /** How long an object whose create client was killed may still materialize in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const remove = (args: readonly string[], inspectArgs: readonly string[], remaining: () => number, kind: string,
+// Remove one storage object found by the name this allocation gave it, once it carries all three owner labels. A
+// container is then removed and confirmed by the ID just inspected, so a same-named replacement created after the
+// inspect is never touched. A volume's name is its only identity and Docker has no conditional remove, so a volume
+// replaced between the inspect and the remove could still be deleted; that needs someone to have deleted ours first.
+const remove = (object: 'container' | 'volume', name: string, remaining: () => number, kind: string,
   owner: ResourceOwner, settleBy = 0) => {
+  const inspectArgs = [object, 'inspect', name];
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
     before = spawnSync('docker', [...inspectArgs], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
@@ -69,15 +74,20 @@ const remove = (args: readonly string[], inspectArgs: readonly string[], remaini
     sleep(250);
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
-    { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
   // All three owner labels must match: the allocation ID alone is caller-chosen and could be reused elsewhere.
   if (!hasOwnerLabels(labels, owner)) throw new Error(`Refused to remove unowned ${kind}.`);
-  const result = spawnSync('docker', [...args], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-    env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+  let target = name;
+  if (object === 'container') {
+    if (!inspected?.Id || !DOCKER_ID.test(inspected.Id)) throw new Error(`Failed to establish the identity of ${kind}.`);
+    target = inspected.Id;
+  }
+  const result = spawnSync('docker', object === 'container' ? ['rm', '--force', target] : ['volume', 'rm', '--force', target],
+    { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (result.status === 0) return;
-  const inspect = spawnSync('docker', [...inspectArgs], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-    env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+  const inspect = spawnSync('docker', [object, 'inspect', target], { encoding: 'utf8', timeout: remaining(),
+    killSignal: 'SIGKILL', env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (!absent(inspect)) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
 const cleanup = (containers: readonly string[], volumes: readonly string[], owner: ResourceOwner,
@@ -85,13 +95,11 @@ const cleanup = (containers: readonly string[], volumes: readonly string[], owne
   const remaining = createDeadline(timeoutMs + (unsettled.size ? CREATE_SETTLE_MS : 0)), failures: unknown[] = [];
   const settleBy = (name: string) => unsettled.has(name) ? performance.now() + CREATE_SETTLE_MS : 0;
   for (const container of containers) {
-    try { remove(['rm', '--force', container], ['container', 'inspect', container], remaining,
-      'task container', owner, settleBy(container)); }
+    try { remove('container', container, remaining, 'task container', owner, settleBy(container)); }
     catch (error) { failures.push(error); }
   }
   for (const volume of volumes) {
-    try { remove(['volume', 'rm', '--force', volume], ['volume', 'inspect', volume], remaining, 'task volume', owner,
-      settleBy(volume)); }
+    try { remove('volume', volume, remaining, 'task volume', owner, settleBy(volume)); }
     catch (error) { failures.push(error); }
   }
   if (failures.length) throw new AggregateError(failures, 'Task filesystem cleanup did not settle.');
