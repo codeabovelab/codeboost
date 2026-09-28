@@ -113,10 +113,14 @@ export function runInProcessGroup(file: string, args: readonly string[],
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
       void drainGroup(pgid).then(async drained => {
-        await Promise.race([closed, pause(STDIO_CLOSE_MS)]);
+        // The group is empty (or given up on): a later SIGKILL could reach a new group that reuses the ID.
+        clearTimeout(graceTimer);
+        let stdioTimer: ReturnType<typeof setTimeout> | undefined;
+        await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
+        // Cleared so a finished call never keeps the process alive.
+        clearTimeout(stdioTimer);
         child.stdout.destroy();
         child.stderr.destroy();
-        clearTimeout(graceTimer);
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
         if (!drained) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
