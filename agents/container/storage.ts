@@ -314,6 +314,8 @@ export interface RecoveredTaskStorage {
 }
 export type TaskStorageParts = Pick<RecoveredTaskStorage, 'workVolume' | 'metadataVolume' | 'keeper'>;
 const recoveredStorage = new WeakMap<RecoveredTaskStorage, ResourceOwner>();
+/** The daemon answered, and the storage is not what D creates for this owner; unlike a failed inspect, retrying won't help. */
+export class RecoveredStorageRejected extends Error {}
 const STORAGE_PARTS = Object.freeze([
   ['workVolume', 'volume', 'work', /^codeboost-work-[0-9a-f-]{36}$/],
   ['metadataVolume', 'volume', 'metadata', /^codeboost-metadata-[0-9a-f-]{36}$/],
@@ -327,24 +329,26 @@ const STORAGE_PARTS = Object.freeze([
  */
 export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: TaskStorageParts,
   timeoutMs = 30_000): Promise<RecoveredTaskStorage> {
-  owner = assertResourceOwner(owner);
+  try { owner = assertResourceOwner(owner); }
+  catch (error) { throw new RecoveredStorageRejected((error as Error).message); }
   if (liveAllocations.has(owner.allocationId))
     throw new Error('Task storage is still live in this process; only leftovers of an earlier process are recovered.');
   const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
   for (const [field, object, kind, pattern] of STORAGE_PARTS) {
     const name = parts[field];
     if (name === undefined) continue;
-    if (typeof name !== 'string' || !pattern.test(name)) throw new Error(`Recovered task ${kind} has an unexpected name.`);
+    if (typeof name !== 'string' || !pattern.test(name))
+      throw new RecoveredStorageRejected(`Recovered task ${kind} has an unexpected name.`);
     const inspect = await runDocker([object, 'inspect', name], { timeoutMs: remaining() });
     if (inspect.status !== 0) throw new Error(`Recovered task ${kind} could not be inspected.`);
     const inspected = JSON.parse(inspect.stdout || '[]')[0] as
       { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
     const labels = inspected?.Labels ?? inspected?.Config?.Labels;
     if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
-      throw new Error(`Recovered task ${kind} does not carry this owner's task-storage labels.`);
+      throw new RecoveredStorageRejected(`Recovered task ${kind} does not carry this owner's task-storage labels.`);
     found[field] = name;
   }
-  if (!Object.keys(found).length) throw new Error('Recovered task storage names no parts.');
+  if (!Object.keys(found).length) throw new RecoveredStorageRejected('Recovered task storage names no parts.');
   const handle: RecoveredTaskStorage = Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId,
     allocationId: owner.allocationId, ...found });
   recoveredStorage.set(handle, owner);

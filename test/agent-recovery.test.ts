@@ -3,7 +3,8 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 // A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage).
 interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string> }
-const daemon = vi.hoisted(() => ({ objects: [] as FakeObject[], refuseRemoval: new Set<string>(), calls: [] as string[][] }));
+const daemon = vi.hoisted(() => ({ objects: [] as FakeObject[], refuseRemoval: new Set<string>(), calls: [] as string[][],
+  failSingleInspect: new Set<string>() }));
 const answer = (args: string[]): { status: number; stdout: string; stderr: string } => {
   daemon.calls.push(args);
   const kindOf = (word: string) => word === 'ps' || word === 'container' || word === 'rm' ? 'container' : word;
@@ -18,6 +19,9 @@ const answer = (args: string[]): { status: number; stdout: string; stderr: strin
     return { status: 0, stdout: matches.map(object => kind === 'volume' ? object.name : object.id ?? object.name).join('\n'), stderr: '' };
   }
   if (args[1] === 'inspect') {
+    // Only a one-object inspect (storage adoption) fails, as when the daemon stops answering mid-recovery.
+    if (args.length === 3 && daemon.failSingleInspect.has(args[2]!))
+      return { status: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' };
     const found = args.slice(2).map(ref => find(args[0]!, ref));
     const json = found.filter(Boolean).map(object => object!.kind === 'container'
       ? { Id: object!.id, Name: `/${object!.name}`, Config: { Labels: object!.labels } }
@@ -70,7 +74,9 @@ const names = (kind?: FakeObject['kind']) => daemon.objects.filter(object => !ki
   .map(object => object.name).sort();
 
 describe('recoverLeftovers', () => {
-  beforeEach(() => { daemon.objects = []; daemon.refuseRemoval = new Set(); daemon.calls = []; });
+  beforeEach(() => {
+    daemon.objects = []; daemon.refuseRemoval = new Set(); daemon.calls = []; daemon.failSingleInspect = new Set();
+  });
 
   it('removes only its own runtime objects, keeps its storage whole, and never touches another runner', async () => {
     const mine = attempt(A, 'attempt-a'), theirs = attempt(B, 'attempt-b');
@@ -159,7 +165,9 @@ describe('recoverLeftovers', () => {
       { kind: 'container', id: id(), name: 'proxy-without-attempt', labels: { 'io.codeboost.runner': A,
         'io.codeboost.allocation': allocation, 'io.codeboost.egress': allocation } },
       { kind: 'container', id: id(), name: 'agent-bad-allocation', labels: { ...owner(A, 'attempt', 'not-a-uuid'),
-        'io.codeboost.invocation': 'x' } },
+        'io.codeboost.invocation': randomUUID() } },
+      { kind: 'container', id: id(), name: 'agent-bad-invocation', labels: { ...owner(A, 'attempt', allocation),
+        'io.codeboost.invocation': 'not-a-uuid' } },
     ];
     daemon.objects.push(...odd);
     const report = await recoverLeftovers(A);
@@ -167,6 +175,13 @@ describe('recoverLeftovers', () => {
     expect(report.unowned.map(resource => [resource.name, resource.reason]).sort())
       .toEqual(odd.map(object => [object.name, 'unknown-kind']).sort());
     expect(names()).toEqual(odd.map(object => object.name).sort());
+  });
+
+  it('fails closed, rather than reporting the storage as inconsistent, when checking it cannot reach Docker', async () => {
+    const mine = attempt(A, 'attempt-a');
+    daemon.failSingleInspect.add(mine.objects[0]!.name);
+    await expect(recoverLeftovers(A)).rejects.toThrow('could not be inspected');
+    expect(names('volume')).toHaveLength(2);
   });
 
   it('fails closed on a container the daemon reports without an ID', async () => {

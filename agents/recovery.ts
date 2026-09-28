@@ -2,7 +2,7 @@ import { DOCKER_ID } from './client-outcome.ts';
 import { runDocker, type DockerOutcome } from './docker.ts';
 import { ALLOCATION_LABEL, ATTEMPT_LABEL, isAllocationId, isLabelAttemptId, isRunnerOwner,
   RUNNER_LABEL } from './labels.ts';
-import { adoptRecoveredTaskStorage, hasLiveTaskStorage, type RecoveredTaskStorage,
+import { adoptRecoveredTaskStorage, hasLiveTaskStorage, RecoveredStorageRejected, type RecoveredTaskStorage,
   type TaskStorageParts } from './container/storage.ts';
 
 /** A Docker object recovery found, with the labels it carries. */
@@ -157,7 +157,8 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
     if (present.length !== 1) return undefined;
     const label = present[0]!;
     if (label === STORAGE_LABEL) return `storage:${labels[STORAGE_LABEL]}`;
-    if (label === INVOCATION_LABEL) return labels[INVOCATION_LABEL] ? 'agent' : undefined;
+    // The invocation label is a UUID v4 D generates per profile, the same form as an allocation ID.
+    if (label === INVOCATION_LABEL) return isAllocationId(labels[INVOCATION_LABEL]) ? 'agent' : undefined;
     return labels[EGRESS_LABEL] === labels[ALLOCATION_LABEL] ? 'egress' : undefined;
   };
   const unknown = (resource: RecoveredResource) => unowned.push(Object.freeze({ ...resource, reason: 'unknown-kind' }));
@@ -200,12 +201,14 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
       for (const resource of group.resources) unowned.push(Object.freeze({ ...resource, reason: 'inconsistent-storage' }));
       continue;
     }
-    // Adoption re-checks every part's labels, and the owner's format; a group that fails is reported, not adopted.
+    // Adoption re-checks every part's labels and the owner's format. A group the daemon shows is not D's is reported,
+    // not adopted; a failed or timed-out inspect is not evidence either way, so it fails recovery closed.
     const budget = remaining();
     try {
       handles.push(await adoptRecoveredTaskStorage({ runnerOwner, attemptId: group.attemptId, allocationId },
         group.parts, budget));
-    } catch {
+    } catch (error) {
+      if (!(error instanceof RecoveredStorageRejected)) throw error;
       for (const resource of group.resources) unowned.push(Object.freeze({ ...resource, reason: 'inconsistent-storage' }));
     }
   }
