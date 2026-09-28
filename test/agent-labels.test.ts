@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
-import { ALLOCATION_LABEL, assertResourceOwner, ATTEMPT_LABEL, hasOwnerLabels, ownerLabelArgs,
+import { randomUUID } from 'node:crypto';
+import { ALLOCATION_LABEL, assertResourceOwner, ATTEMPT_LABEL, claimAllocationId, hasOwnerLabels, ownerLabelArgs,
   RUNNER_LABEL } from '../agents/labels.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 
@@ -37,7 +38,16 @@ describe('ownership labels', () => {
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
     }) as unknown as InvocationInput;
     expect(() => captureInvocation(base(undefined))).toThrow('runnerOwner');
+    // An attempt ID that cannot be a label is refused at capture, before any setup could run.
+    const badAttempt = { ...base(owner.runnerOwner), attemptId: 'attempt one/two' };
+    expect(() => captureInvocation(badAttempt)).toThrow('ownership label');
     expect(() => captureInvocation(base('0123456789ABCDEF0123456789ABCDEF'))).toThrow('runnerOwner');
     expect(captureInvocation(base(owner.runnerOwner)).runnerOwner).toBe(owner.runnerOwner);
+  });
+
+  it('lets each allocation ID name only one allocation', () => {
+    const id = randomUUID();
+    expect(claimAllocationId(id)).toBe(id);
+    expect(() => claimAllocationId(id)).toThrow('already used');
   });
 });

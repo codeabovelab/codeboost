@@ -22,15 +22,28 @@ const ALLOCATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[
 const ATTEMPT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
 export const isRunnerOwner = (value: unknown): value is string => typeof value === 'string' && RUNNER_OWNER.test(value);
+/** Whether an attempt ID can be written as an ownership label. */
+export const isLabelAttemptId = (value: unknown): value is string => typeof value === 'string' && ATTEMPT_ID.test(value);
 
 /** Validate an owner before it is written into labels; returns a frozen copy. */
 export function assertResourceOwner(owner: ResourceOwner): ResourceOwner {
   if (!owner || !isRunnerOwner(owner.runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
-  if (typeof owner.attemptId !== 'string' || !ATTEMPT_ID.test(owner.attemptId))
+  if (!isLabelAttemptId(owner.attemptId))
     throw new Error('attemptId cannot be written as an ownership label.');
   if (typeof owner.allocationId !== 'string' || !ALLOCATION_ID.test(owner.allocationId))
     throw new Error('allocationId must be a lowercase UUID v4 chosen by the caller.');
   return Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId, allocationId: owner.allocationId });
+}
+
+// Allocation IDs claimed by any allocator in this process. Recovery groups resources by allocation, so one ID must
+// never name two allocations, whether two task storages or a task storage and a vendor network.
+const claimedAllocations = new Set<string>();
+/** Claim an allocation ID for one allocation. Refuses a reused ID; a claim is kept even if the allocation fails. */
+export function claimAllocationId(allocationId: string): string {
+  if (claimedAllocations.has(allocationId))
+    throw new Error('allocationId was already used; every allocation needs a new allocation ID.');
+  claimedAllocations.add(allocationId);
+  return allocationId;
 }
 
 /** `docker create`/`run`/`volume create`/`network create` arguments that apply the owner labels. */

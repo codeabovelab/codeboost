@@ -59,7 +59,8 @@ Use only these entry points to run an agent:
 
 1. `createTaskClone` creates a committed, standalone staging clone.
 2. `prepareTaskFilesystems` copies that clone into bounded task storage, labelled with the owner you pass: your
-   runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Call
+   runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Use each allocation
+   ID once: D refuses a reused one, for task storage or the vendor network, before creating anything. Call
    `removeTaskFilesystems` when the task ends. It refuses a repository that has a
    symbolic link with an absolute target or a target outside the checkout, before it
    creates any storage. Report this to the user as a repository the agent cannot run

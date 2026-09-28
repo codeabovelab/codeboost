@@ -485,6 +485,14 @@ describe('real Docker agent isolation', () => {
     }
   }, 60_000);
 
+  it('refuses a reused allocation ID before creating any storage', () => {
+    const data = fixture(), reused = taskFilesystemOwner(data.filesystems);
+    const before = docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused.allocationId}`);
+    expect(() => prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
+      metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId, reused)).toThrow('already used');
+    expect(docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused.allocationId}`)).toBe(before);
+  }, 60_000);
+
   it('refuses task storage that belongs to another runner', async () => {
     const data = fixture();
     const foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,

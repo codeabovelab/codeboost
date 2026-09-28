@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
-import { assertResourceOwner, hasOwnerLabels, ownerLabelArgs, type ResourceOwner } from '../labels.ts';
+import { assertResourceOwner, claimAllocationId, hasOwnerLabels, ownerLabelArgs,
+  type ResourceOwner } from '../labels.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 
@@ -189,6 +190,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   const owner = assertResourceOwner({ runnerOwner: invocation.runnerOwner, attemptId: invocation.attemptId,
     allocationId });
   const labels = ownerLabelArgs(owner);
+  claimAllocationId(allocationId);
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
   // No allocation may outlive the invocation it serves.

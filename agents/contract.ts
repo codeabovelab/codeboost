@@ -1,4 +1,4 @@
-import { isRunnerOwner } from './labels.ts';
+import { isLabelAttemptId, isRunnerOwner } from './labels.ts';
 
 /** Lane D/F boundary. Only the runner may construct requests after admission. */
 export interface TaskClone {
@@ -105,6 +105,8 @@ export function captureInvocation(input: InvocationInput, now = Date.now()): Inv
   if (!nonempty(input.attemptId) || !nonempty(input.clone.id) || !nonempty(input.clone.taskId)
     || !nonempty(input.clone.directory) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.clone.head))
     throw new Error('Invalid task clone or attempt identity.');
+  // Checked here, not first inside setup: every Docker object is labelled with it, and invalid input must throw.
+  if (!isLabelAttemptId(input.attemptId)) throw new Error('attemptId cannot be written as an ownership label.');
   if (!Number.isFinite(now) || !Number.isSafeInteger(input.deadline) || input.deadline <= now)
     throw new Error('Invocation requires a finite future deadline.');
   const context = input.context;

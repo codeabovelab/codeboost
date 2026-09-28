@@ -6,7 +6,7 @@ import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown } from '../client-outcome.ts';
-import { assertResourceOwner, ownerLabelArgs, type ResourceOwner } from '../labels.ts';
+import { assertResourceOwner, claimAllocationId, ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -25,7 +25,6 @@ export interface TaskStorageLimits {
 }
 
 interface AllocationIdentity {
-  readonly allocationId: string;
   /** The runner, attempt and allocation written on every volume and container of this allocation. */
   readonly owner: ResourceOwner;
   readonly clone: Readonly<TaskClone>;
@@ -117,7 +116,7 @@ export function taskFilesystemOwner(filesystems: TaskFilesystems): ResourceOwner
 
 export function taskFilesystemAllocationId(filesystems: TaskFilesystems): string {
   assertTaskFilesystems(filesystems);
-  return allocations.get(filesystems)!.allocationId;
+  return allocations.get(filesystems)!.owner.allocationId;
 }
 
 const within = (base: string, path: string) => {
@@ -188,14 +187,15 @@ const assertContainedLinks = (staging: string, remaining: () => number) => {
   }
 };
 
-/** Allocate bounded, engine-owned task filesystems and keep them mounted. */
 /**
- * Copy a staging clone into bounded task storage. `owner` is recorded by the caller before this call: every volume and
- * container is labelled with its runner, attempt and allocation, so recovery after a crash finds exactly this storage.
+ * Copy a staging clone into bounded, engine-owned task storage and keep it mounted. `owner` is recorded by the caller
+ * before this call: every volume and container is labelled with its runner, attempt and allocation, so recovery after
+ * a crash finds exactly this storage. An allocation ID is used once; a reused ID is refused before anything is created.
  */
 export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimits,
   imageId: string, owner: ResourceOwner, timeoutMs = 60_000): TaskFilesystems {
-  const labels = ownerLabelArgs(assertResourceOwner(owner));
+  owner = assertResourceOwner(owner);
+  const labels = ownerLabelArgs(owner);
   for (const [name, value] of Object.entries(limits)) validLimit(value, name);
   if (!/^sha256:[0-9a-f]{64}$/.test(imageId)) throw new Error('Task filesystems require the immutable built image ID.');
   assertBuiltAgentImage(imageId);
@@ -203,7 +203,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
   assertContainedLinks(staging, remaining);
-  const allocationId = owner.allocationId;
+  const allocationId = claimAllocationId(owner.allocationId);
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
   const createdVolumes: string[] = [], unsettled = new Set<string>();
@@ -245,7 +245,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     assertTaskClone(clone);
     remaining();
     const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
-    allocations.set(filesystems, Object.freeze({ allocationId, owner: assertResourceOwner(owner), trustedClone: clone,
+    allocations.set(filesystems, Object.freeze({ owner, trustedClone: clone,
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
     return filesystems;
   } catch (error) {
