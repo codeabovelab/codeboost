@@ -84,7 +84,14 @@ The caller must do the following:
   stopped and its cleanup has finished. If cleanup keeps failing, the supervisor retries it every second for
   60 seconds after the first failure, then settles anyway. Retries after the first get only what is left of
   the window, and each cleanup subprocess is killed at its deadline. That result has a `stopReason` and lists
-  the resources it could not confirm removed in `unreleased`; the container may still be running.
+  the resources it could not confirm removed in `unreleased`; the container may still be running. Worst case,
+  settlement ends about 90 seconds after cleanup starts: up to 30 seconds for the first, failed attempt, then
+  the 60-second window. Cleanup retries are still synchronous Docker calls of up to 30 seconds each, so a cancel
+  or shutdown waits behind a retry that is already running. The window bounds the total wait, not how quickly
+  the process responds; asynchronous D helpers (#51 item 2) address that.
+- If profile creation fails and its own cleanup fails too, the Claude and Codex start calls return a handle that
+  keeps retrying that cleanup and settles with `capture-failure` (plus `unreleased` if the window ends). They no
+  longer retry once and re-throw the startup error, so callers must not rely on a throw for this case.
 - When `unreleased` is present, record those resources durably and keep them owned until their removal is
   confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
   if both still match. An object is listed only if this invocation created it or may have (its create succeeded,

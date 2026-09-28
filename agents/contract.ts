@@ -50,7 +50,8 @@ export interface InvocationResult {
   /**
    * Present only when cleanup was still failing when D's bounded retry window ended (`CLEANUP_RETRY_WINDOW_MS`,
    * 60 s after the first failure). Retries after the first are limited to what is left of the window, and every
-   * cleanup subprocess is killed at its deadline, so settlement ends within about twice the window. These resources
+   * cleanup subprocess is killed at its deadline, so settlement ends within about 90 s of cleanup starting: at most
+   * 30 s for the first, failed attempt, then the 60 s window, which no retry outlasts. These resources
    * may still exist, and the agent container may still be running. `stopReason` is always set. The caller must
    * record them durably and keep them owned until their removal is confirmed.
    */
