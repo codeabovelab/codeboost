@@ -11,7 +11,8 @@ import { captureInvocation, type InvocationInput, type InvocationResult } from '
 import { buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile, isContainerProfileAuthentic,
   type ContainerProfile } from '../agents/container/profile.ts';
-import { disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
+import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
+  startValidatedContainer } from '../agents/container/run.ts';
 import { createVendorNetwork } from '../agents/network/network.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
 import { createTaskClone } from '../git/clone.ts';
@@ -189,6 +190,11 @@ describe('container invocation supervisor', () => {
     expect(result.unreleased).toEqual(expected);
     expect(isInvocationActive('unreachable-daemon')).toBe(false);
     expect(() => startProfileInvocation(current)).toThrow('settled without confirmed cleanup');
+    // Every launch path refuses it, before touching the leftover container that recovery still owns.
+    await expect(startValidatedContainer(current)).rejects.toThrow('settled without confirmed cleanup');
+    await expect(createValidatedContainer(current)).rejects.toThrow('settled without confirmed cleanup');
+    await expect(runContainer(current)).rejects.toThrow('settled without confirmed cleanup');
+    expect(spawnSync('docker', ['container', 'inspect', current.name]).status).toBe(0);
     // The container ignored SIGTERM and the stop never reached the daemon, so it is still there to remove.
     await disposeValidatedContainer(current);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);

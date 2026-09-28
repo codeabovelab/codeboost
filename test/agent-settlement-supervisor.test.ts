@@ -8,6 +8,7 @@ import type { ContainerProfile } from '../agents/container/profile.ts';
 // so cleanup can be made to fail forever, and the container exits as soon as it starts.
 const state = vi.hoisted(() => ({
   created: new WeakSet<object>(),
+  retired: new WeakSet<object>(),
   createFails: false,
   createHangs: false,
   createTimesOutAfter: undefined as number | undefined,
@@ -49,6 +50,8 @@ vi.mock('../agents/container/run.ts', () => ({
     state.budgets.push(budget);
     if (!state.disposeOk) throw new Error('Cannot connect to the Docker daemon');
   },
+  retireContainerProfile: (profile: object) => { state.retired.add(profile); },
+  isContainerProfileRetired: (profile: object) => state.retired.has(profile),
   agentContainerId: (profile: object) => state.created.has(profile) ? 'c'.repeat(64) : undefined,
   agentContainerResources: (profile: { name: string }) => state.created.has(profile)
     ? [{ kind: 'container', name: profile.name, id: 'c'.repeat(64),

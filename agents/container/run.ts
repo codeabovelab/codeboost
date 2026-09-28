@@ -69,6 +69,18 @@ const requireContainerId = (profile: ContainerProfile) => {
   return id;
 };
 
+// Profiles that settled with cleanup unconfirmed. They stay authentic so their cleanup can still run and be recovered,
+// but no launch path may create or start a container for one again.
+const retiredProfiles = new WeakSet<ContainerProfile>();
+/** Mark a profile whose invocation settled with `unreleased` resources: it can be cleaned up, never launched. */
+export function retireContainerProfile(profile: ContainerProfile): void { retiredProfiles.add(profile); }
+export function isContainerProfileRetired(profile: ContainerProfile): boolean { return retiredProfiles.has(profile); }
+// Checked before any launch work, so a refusal owns nothing and triggers no cleanup.
+const assertLaunchable = (profile: ContainerProfile) => {
+  if (retiredProfiles.has(profile))
+    throw new Error('This container profile settled without confirmed cleanup; start a new profile.');
+};
+
 /** The agent container this profile may have created, for reporting when its removal is not confirmed. */
 export function agentContainerResources(profile: ContainerProfile): readonly UnreleasedResource[] {
   if (!createdContainers.has(profile)) return Object.freeze([]);
@@ -333,6 +345,7 @@ export async function validateContainer(container: string, profile: ContainerPro
  */
 export async function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
   secrets: Readonly<Record<string, string>> = {}, signal?: AbortSignal): Promise<string> {
+  assertLaunchable(profile);
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let createUnsettled = false;
   try {
@@ -368,6 +381,7 @@ export async function createValidatedContainer(profile: ContainerProfile, timeou
 
 export async function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): Promise<string> {
+  assertLaunchable(profile);
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let failure: unknown;
   try {
