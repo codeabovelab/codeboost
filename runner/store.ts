@@ -1,9 +1,15 @@
-import type { DatabaseSync, SQLInputValue } from 'node:sqlite';
+import type { DatabaseSync, SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
+import type { InvocationContext, StopReason } from '../agents/contract.ts';
+import {
+  ATTEMPT_PHASES, CLOSED_STATUSES, MERGEABLE_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
+  type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
+} from './lifecycle.ts';
 
 export function requireSupportedNode(version = process.versions.node): void {
   const [major, minor] = version.split('.').map(Number);
@@ -24,6 +30,28 @@ export interface MergeAttempt {
   url: string | null; reason: string | null; requiresFreshReview: boolean; entryId: string | null;
   phase: 'AWAITING_CHECKS' | 'LOCKED' | 'MERGEABLE' | 'QUEUED' | null; position: number | null;
   occurredAt: string | null; createdAt: string; updatedAt: string;
+  /** The user action that started this attempt; its saved replay response follows the attempt. */
+  actionId?: string | null;
+}
+/** Saved replay response for the user action that started a merge; refreshed on every attempt change. */
+export function mergeActionResponse(attempt: MergeAttempt) {
+  return { attemptId: attempt.id, state: attempt.state, reason: attempt.reason, url: attempt.url };
+}
+export interface TaskRecord {
+  planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
+  currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
+  createdAt: string; updatedAt: string;
+}
+export interface AttemptRecord {
+  id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
+  firstReason: FirstReason | null; stopReason: StopReason | null; exitCode: number | null; signal: string | null; result: unknown;
+  diagnostic: string | null; diagnosticRef: string | null; createdAt: string; startedAt: string | null; settledAt: string | null;
+}
+export type FeedbackKind = 'reject' | 'change-request' | 'segment-accept' | 'segment-assign' | 'finding-accept' | 'needs-human-guidance' | 'task-closed';
+const FEEDBACK_KINDS: readonly FeedbackKind[] = ['reject', 'change-request', 'segment-accept', 'segment-assign', 'finding-accept', 'needs-human-guidance', 'task-closed'];
+export interface FeedbackEvent {
+  id: string; planKey: string; actionId: string; planRevision: number; snapshotId: string | null; item: string | null;
+  kind: FeedbackKind; text: string | null; sourceRef: string; supersedes: string | null; createdAt: string;
 }
 export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
 export interface Checkpoint {
@@ -49,9 +77,9 @@ export class Store {
     try {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
-        const version = this.#get('PRAGMA user_version')!.user_version;
-        if (version !== 0 && version !== 1 && version !== 2 && version !== 3 && version !== 4 && version !== 5) throw new Error('Unsupported store schema version.');
-        if (version === 5) return;
+        const version = this.#get('PRAGMA user_version')!.user_version as number;
+        if (![0, 1, 2, 3, 4, 5, 6].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 6) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -79,6 +107,7 @@ export class Store {
             data TEXT NOT NULL
           );
           PRAGMA user_version=5;`);
+        if (version < 6) this.#migrateV6();
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -93,10 +122,16 @@ export class Store {
   close(): void { this.#db.close(); }
   #get(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).get(...args); }
   #run(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).run(...args); }
+  #depth = 0;
+  /** The user action whose transaction is open, so its events can prove they belong to it. */
+  #action: { key: string; actionId: string } | null = null;
+  /** Nested calls join the outer transaction, so a user action can wrap existing Store methods atomically. */
   #transaction<T>(fn: () => T): T {
-    this.#db.exec('BEGIN IMMEDIATE');
+    if (this.#depth > 0) { this.#depth++; try { return fn(); } finally { this.#depth--; } }
+    this.#db.exec('BEGIN IMMEDIATE'); this.#depth = 1;
     try { const result = fn(); this.#db.exec('COMMIT'); return result; }
     catch (error) { this.#db.exec('ROLLBACK'); throw error; }
+    finally { this.#depth = 0; }
   }
   #current(key: string) {
     const row = this.#get('SELECT * FROM plans WHERE key=?', key);
@@ -112,8 +147,12 @@ export class Store {
     if (identityKey(context.identity) !== key || context.issue !== this.#current(key).issue) throw new Error('Plan context identity/issue mismatch.');
   }
   #savePlan(key: string, plan: Plan, expected: number): void {
+    // A plan edit must not land while GitHub may still merge the head reviewed against the current revision.
+    if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
     if (this.#run('UPDATE plans SET revision=? WHERE key=? AND revision=?', plan.revision, key, expected).changes !== 1) throw new Error('Stale plan revision.');
     this.#run('INSERT INTO revisions VALUES (?,?,?)', key, plan.revision, encode(plan));
+    this.#bumpContext(key);
     this.#run("UPDATE requests SET state='invalidated',reason='Plan revision changed.' WHERE key=? AND state IN ('pending','ready')", key);
     const items = new Set(plan.items.map(item => item.id));
     for (const row of this.#db.prepare('SELECT item FROM approvals WHERE key=?').all(key)) {
@@ -132,6 +171,9 @@ export class Store {
       this.#run('INSERT INTO plans (key,issue,revision,snapshot_id) VALUES (?,?,?,NULL)', key, plan.issue, 0);
       this.#savePlan(key, plan, 0);
       this.#snapshot(key, base, head);
+      const now = new Date().toISOString();
+      this.#run(`INSERT INTO tasks (plan_key,status,state_version,context_generation,assignment_id,referenced_code_hash,created_at,updated_at)
+        VALUES (?,'in review',0,0,'unassigned',?,?,?)`, key, head, now, now);
       return plan;
     });
   }
@@ -155,6 +197,8 @@ export class Store {
     const snapshot = { id: randomUUID(), base, head };
     this.#run('INSERT INTO snapshots VALUES (?,?,?)', key, snapshot.id, encode(snapshot));
     this.#run('UPDATE plans SET snapshot_id=? WHERE key=?', snapshot.id, key);
+    // HEAD is still observed after a task closes (the review screen reads it), but a closed task never changes.
+    if (!this.#taskClosed(key)) this.#bumpContext(key);
     this.#run("UPDATE requests SET state='invalidated',reason='Repository snapshot changed.' WHERE key=? AND state IN ('pending','ready')", key);
     return snapshot;
   }
@@ -193,14 +237,24 @@ export class Store {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
-  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue'): MergeAttempt {
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null): MergeAttempt {
     sha(reviewedHead);
+    if (actionId !== null) assertUuidV4(actionId, 'Action ID');
     if (!['queue','direct'].includes(kind)) throw new Error('Invalid merge attempt kind.');
     if (queueWatermark !== null && (typeof queueWatermark !== 'string' || !queueWatermark || queueWatermark.length > 512)) throw new Error('Invalid merge-queue event cursor.');
     if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for merging.');
     const key = identityKey(identity);
+    if (expectedTaskStateVersion !== null && (!Number.isSafeInteger(expectedTaskStateVersion) || expectedTaskStateVersion < 0))
+      throw new Error('Invalid expected task state version.');
     return this.#transaction(() => {
       this.#expect(key, expected);
+      // A merge is irreversible: a closed task, a pending cancel or any task change since the click refuses it.
+      const task = this.#task(key);
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be merged.');
+      if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
+      if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
       if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');
@@ -208,9 +262,10 @@ export class Store {
       const attempt: MergeAttempt = {
         id: randomUUID(), kind, state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
         reviewVersion: expected.reviewVersion, reviewedHead, queueWatermark, url: null, reason: null, requiresFreshReview: false,
-        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now,
+        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now, actionId,
       };
       this.#run('INSERT INTO merge_attempts VALUES (?,?,?)', attempt.id, key, encode(attempt));
+      this.#touch(key);
       return attempt;
     });
   }
@@ -221,13 +276,20 @@ export class Store {
       if (!latest || latest.id !== id) return false;
       const attempt = decode<MergeAttempt>(latest.data);
       if (!allowed.includes(attempt.state)) return false;
-      const next = change(attempt);
-      return this.#run('UPDATE merge_attempts SET data=? WHERE id=? AND key=?', encode({ ...next, updatedAt: new Date().toISOString() }), id, key).changes === 1;
+      const next = { ...change(attempt), updatedAt: new Date().toISOString() };
+      if (this.#run('UPDATE merge_attempts SET data=? WHERE id=? AND key=?', encode(next), id, key).changes !== 1) return false;
+      // A merge attempt change is a durable task change: bump the state version, not the context generation.
+      this.#touch(key);
+      // The same transaction refreshes the starting action's replay, so a resent merge click reports this outcome.
+      if (next.actionId) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND json_extract(response,'$.ok')=1`,
+        encode({ ok: true, value: mergeActionResponse(next) }), key, next.actionId);
+      return true;
     });
   }
   queueMergeAttempt(identity: PlanIdentity, id: string, url: string): boolean {
     if (typeof url !== 'string' || url.length > 2048 || !/^https:\/\//.test(url)) throw new Error('Invalid merge result URL.');
-    return this.#changeMergeAttempt(identity, id, ['submitting'], attempt => ({ ...attempt, state: 'queued', url, reason: null }));
+    // Idempotent from 'queued': a poll may have observed the queue entry first, and the URL must still be saved.
+    return this.#changeMergeAttempt(identity, id, ['submitting', 'queued'], attempt => ({ ...attempt, state: 'queued', url, reason: null }));
   }
   recordMergeAttemptDiagnostic(identity: PlanIdentity, id: string, reason: string): boolean {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('A bounded merge diagnostic is required.');
@@ -242,15 +304,25 @@ export class Store {
     }));
   }
   finishMergeAttempt(identity: PlanIdentity, id: string, outcome: {
-    state: 'merged' | 'removed' | 'failed'; reason?: string; occurredAt?: string; requiresFreshReview?: boolean;
+    state: 'merged' | 'removed' | 'failed'; reason?: string; occurredAt?: string; requiresFreshReview?: boolean; url?: string;
   }): boolean {
+    if (outcome.url !== undefined && (typeof outcome.url !== 'string' || outcome.url.length > 2048 || !/^https:\/\//.test(outcome.url))) throw new Error('Invalid merge result URL.');
     if (!['merged','removed','failed'].includes(outcome.state)) throw new Error('Invalid merge-queue outcome.');
     if (outcome.state !== 'merged' && (typeof outcome.reason !== 'string' || !outcome.reason.trim() || outcome.reason.length > 4000)) throw new Error('A bounded terminal merge reason is required.');
     if (outcome.occurredAt !== undefined && (!Number.isFinite(Date.parse(outcome.occurredAt)) || outcome.occurredAt.length > 64)) throw new Error('Invalid merge-queue timestamp.');
-    return this.#changeMergeAttempt(identity, id, ['submitting','queued'], attempt => ({
-      ...attempt, state: outcome.state, reason: outcome.state === 'merged' ? null : outcome.reason!.trim(),
-      occurredAt: outcome.occurredAt ?? null, requiresFreshReview: outcome.requiresFreshReview === true,
-    }));
+    // A confirmed merge closes the task and records task-closed in the same transaction (feedback-event rule 2).
+    return this.#transaction(() => {
+      const changed = this.#changeMergeAttempt(identity, id, ['submitting','queued'], attempt => ({
+        ...attempt, state: outcome.state, reason: outcome.state === 'merged' ? null : outcome.reason!.trim(),
+        occurredAt: outcome.occurredAt ?? null, requiresFreshReview: outcome.requiresFreshReview === true,
+        ...(outcome.url !== undefined ? { url: outcome.url } : {}),
+      }));
+      if (changed && outcome.state === 'merged') {
+        const merged = this.getMergeAttempt(identity)!;
+        this.#closeTask(identityKey(identity), 'merged', id, { revision: merged.revision, snapshotId: merged.snapshotId });
+      }
+      return changed;
+    });
   }
   getMergeAttempt(identity: PlanIdentity): MergeAttempt | null {
     this.#current(identityKey(identity));
@@ -297,6 +369,8 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      // Only the review screen's HEAD observation (no ledger entries) may run during a merge or after closing.
+      if (entries.length) this.#assertContextWritable(key);
       const plan = this.getPlan(identity);
       for (const entry of entries) {
         const existing = this.#get('SELECT sha FROM ledger WHERE key=? AND sha=?', key, entry.sha);
@@ -319,6 +393,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      this.#assertContextWritable(key);
       const ledger = new Map(this.getLedger(identity).map(entry => [entry.sha, entry]));
       const snapshot = this.#snapshot(key, base, head);
       const destinations = new Set<string>();
@@ -342,7 +417,11 @@ export class Store {
   saveReview(identity: PlanIdentity, expected: ReviewState, approvals: readonly Approval[], choices: readonly SegmentChoice[]): void {
     const key = identityKey(identity);
     this.#transaction(() => {
-      this.#expect(key, expected); const plan = this.getPlan(identity);
+      this.#expect(key, expected);
+      if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
+      // Approvals and choices must not change the reviewed state while GitHub may still merge it.
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      const plan = this.getPlan(identity);
       for (const approval of approvals) {
         if (!plan.items.some(item => item.id === approval.item) || !approval.fingerprint) throw new Error('Invalid approval.');
         this.#run('INSERT OR REPLACE INTO approvals VALUES (?,?,?)', key, approval.item, encode({ ...approval, ...expected }));
@@ -359,6 +438,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
       if (!this.getPlan(identity).items.some(entry => entry.id === item) || !['question', 'change'].includes(kind) || typeof text !== 'string' || !text.trim() || text.length > 4000) throw new Error('Invalid review note.');
       const note = { id: randomUUID(), item, kind, text: text.trim(), ...(reference ? { reference } : {}), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
       this.#run('INSERT INTO review_notes VALUES (?,?,?)', key, note.id, encode(note));
@@ -427,4 +507,367 @@ export class Store {
     this.getCheckpoint(identity, checkpointId);
     return (this.#get('SELECT MAX(revision) AS revision FROM continuations WHERE key=? AND checkpoint_id=?', identityKey(identity), checkpointId)?.revision as number | null) ?? null;
   }
+  // ---- F1 runner lifecycle (docs/implementation/runner-lifecycle.md) ----
+  #migrateV6(): void {
+    const list = (values: readonly string[]) => values.map(value => `'${value}'`).join(',');
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS tasks (
+        plan_key TEXT PRIMARY KEY REFERENCES plans(key),
+        status TEXT NOT NULL CHECK (status IN (${list(TASK_STATUSES)})),
+        state_version INTEGER NOT NULL DEFAULT 0, context_generation INTEGER NOT NULL DEFAULT 0,
+        assignment_id TEXT NOT NULL, referenced_code_hash TEXT NOT NULL,
+        current_attempt_id TEXT, requeue_pending INTEGER NOT NULL DEFAULT 0, cancel_requested TEXT, rebase_in_progress TEXT,
+        budget_deadline INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        FOREIGN KEY (plan_key, current_attempt_id) REFERENCES attempts(plan_key, id));
+      CREATE TABLE IF NOT EXISTS attempts (
+        id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key),
+        kind TEXT NOT NULL, phase TEXT NOT NULL, item TEXT,
+        state TEXT NOT NULL CHECK (state IN ('pending','running','completed','failed','cancelled','stale')),
+        context TEXT NOT NULL, deadline INTEGER NOT NULL,
+        first_reason TEXT CHECK (first_reason IS NULL OR first_reason IN (${list(FIRST_REASONS)})),
+        stop_reason TEXT, exit_code INTEGER, signal TEXT, result TEXT, diagnostic TEXT, diagnostic_ref TEXT,
+        preparation_pgid INTEGER, preparation_started_at INTEGER, allocation_id TEXT,
+        created_at TEXT NOT NULL, started_at TEXT, settled_at TEXT, UNIQUE (plan_key, id));
+      CREATE TABLE IF NOT EXISTS user_actions (
+        plan_key TEXT NOT NULL REFERENCES plans(key), action_id TEXT NOT NULL, kind TEXT NOT NULL,
+        request_hash TEXT NOT NULL, response TEXT NOT NULL, created_at TEXT NOT NULL, PRIMARY KEY (plan_key, action_id));
+      CREATE TABLE IF NOT EXISTS feedback_events (
+        id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES plans(key), action_id TEXT NOT NULL,
+        plan_revision INTEGER NOT NULL, snapshot_id TEXT, item TEXT,
+        kind TEXT NOT NULL CHECK (kind IN (${list(FEEDBACK_KINDS)})), text TEXT, source_ref TEXT NOT NULL,
+        supersedes TEXT REFERENCES feedback_events(id), created_at TEXT NOT NULL, UNIQUE (plan_key, kind, action_id));`);
+    // Backfill: one task per existing plan; a merged plan also gets its task-closed event.
+    const now = new Date().toISOString();
+    const latestMerge = (column: string) => `(SELECT ${column} FROM merge_attempts m WHERE m.key=p.key ORDER BY m.rowid DESC LIMIT 1)`;
+    this.#run(`INSERT OR IGNORE INTO tasks (plan_key,status,state_version,context_generation,assignment_id,referenced_code_hash,created_at,updated_at)
+      SELECT p.key, CASE WHEN ${latestMerge("json_extract(m.data,'$.state')")}='merged' THEN 'merged' ELSE 'in review' END, 0, 0, 'unassigned',
+        COALESCE((SELECT json_extract(s.data,'$.head') FROM snapshots s WHERE s.key=p.key AND s.id=p.snapshot_id),'none'), ?, ?
+      FROM plans p`, now, now);
+    this.#run(`INSERT INTO feedback_events (id,plan_key,action_id,plan_revision,snapshot_id,item,kind,text,source_ref,supersedes,created_at)
+      SELECT lower(hex(randomblob(16))), p.key, ${latestMerge('m.id')},
+        COALESCE(${latestMerge("json_extract(m.data,'$.revision')")}, p.revision),
+        COALESCE(${latestMerge("json_extract(m.data,'$.snapshotId')")}, p.snapshot_id), NULL, 'task-closed', NULL, p.key, NULL, ?
+      FROM plans p JOIN tasks t ON t.plan_key=p.key WHERE t.status='merged'
+        AND NOT EXISTS (SELECT 1 FROM feedback_events e WHERE e.plan_key=p.key AND e.kind='task-closed')`, now);
+    this.#db.exec('PRAGMA user_version=6;');
+  }
+  #task(key: string) {
+    const row = this.#get('SELECT * FROM tasks WHERE plan_key=?', key);
+    if (!row) throw new Error('Unknown task.');
+    return row;
+  }
+  #taskRecord(row: Record<string, SQLOutputValue>): TaskRecord {
+    return {
+      planKey: row.plan_key as string, status: row.status as TaskStatus, stateVersion: row.state_version as number,
+      contextGeneration: row.context_generation as number, assignmentId: row.assignment_id as string,
+      referencedCodeHash: row.referenced_code_hash as string, currentAttemptId: row.current_attempt_id as string | null,
+      requeuePending: row.requeue_pending === 1, cancelRequested: row.cancel_requested as string | null,
+      rebaseInProgress: row.rebase_in_progress === null ? null : decode(row.rebase_in_progress),
+      budgetDeadline: row.budget_deadline as number | null, createdAt: row.created_at as string, updatedAt: row.updated_at as string,
+    };
+  }
+  #attemptRecord(row: Record<string, SQLOutputValue>): AttemptRecord {
+    return {
+      id: row.id as string, kind: row.kind as AttemptKind, phase: row.phase as string, item: row.item as string | null,
+      state: row.state as AttemptState, context: decode<InvocationContext>(row.context), deadline: row.deadline as number,
+      firstReason: row.first_reason as FirstReason | null, stopReason: row.stop_reason as StopReason | null,
+      exitCode: row.exit_code as number | null, signal: row.signal as string | null,
+      result: row.result === null ? null : decode(row.result), diagnostic: row.diagnostic as string | null,
+      diagnosticRef: row.diagnostic_ref as string | null, createdAt: row.created_at as string,
+      startedAt: row.started_at as string | null, settledAt: row.settled_at as string | null,
+    };
+  }
+  /** Every durable change to a task or its attempts increases the state version. */
+  #touch(key: string): void {
+    this.#run('UPDATE tasks SET state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
+  }
+  /** A change an attempt depends on increases both counters in the caller's transaction. */
+  /** Runner writes that change the reviewed context (rebase, ledger owners) wait for a merge and never follow a close. */
+  #assertContextWritable(key: string): void {
+    if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
+  }
+  /** Whether the task is merged or cancelled. False before createPlan has inserted the task row. */
+  #taskClosed(key: string): boolean {
+    const row = this.#get('SELECT status FROM tasks WHERE plan_key=?', key);
+    return !!row && this.#closed(row.status as TaskStatus);
+  }
+  #bumpContext(key: string): void {
+    this.#run('UPDATE tasks SET context_generation=context_generation+1, state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
+  }
+  #contextOf(key: string): InvocationContext {
+    const plan = this.#current(key), task = this.#task(key);
+    return {
+      snapshotId: plan.snapshot_id as string, planId: (JSON.parse(key) as string[])[2]!, planRevision: plan.revision as number,
+      assignmentId: task.assignment_id as string, referencedCodeHash: task.referenced_code_hash as string,
+      stateVersion: task.context_generation as number,
+    };
+  }
+  #closed(status: unknown): boolean { return CLOSED_STATUSES.includes(status as TaskStatus); }
+  #closeTask(key: string, status: 'merged' | 'cancelled', actionId: string, context?: { revision: number; snapshotId: string }): void {
+    // A merge closes the task in the context it merged, even if HEAD was observed to move during the merge.
+    const current = this.#current(key);
+    const plan = context ? { ...current, revision: context.revision, snapshot_id: context.snapshotId } : current;
+    this.#run('UPDATE tasks SET status=?, cancel_requested=NULL WHERE plan_key=?', status, key);
+    this.#run(`INSERT INTO feedback_events (id,plan_key,action_id,plan_revision,snapshot_id,item,kind,text,source_ref,supersedes,created_at)
+      VALUES (?,?,?,?,?,NULL,'task-closed',NULL,?,NULL,?) ON CONFLICT(plan_key,kind,action_id) DO NOTHING`,
+      randomUUID(), key, actionId, plan.revision!, plan.snapshot_id ?? null, key, new Date().toISOString());
+    this.#touch(key);
+  }
+  getTask(identity: PlanIdentity): TaskRecord { return this.#taskRecord(this.#task(identityKey(identity))); }
+  currentContext(identity: PlanIdentity): InvocationContext { return this.#contextOf(identityKey(identity)); }
+  getAttempt(identity: PlanIdentity, id: string): AttemptRecord {
+    const row = this.#get('SELECT * FROM attempts WHERE plan_key=? AND id=?', identityKey(identity), id);
+    if (!row) throw new Error('Unknown attempt.');
+    return this.#attemptRecord(row);
+  }
+  getAttempts(identity: PlanIdentity): AttemptRecord[] {
+    return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));
+  }
+  /** Reassigning work or changing referenced code makes older attempts non-current. */
+  setAssignment(identity: PlanIdentity, expectedStateVersion: number, assignmentId: string, referencedCodeHash: string): void {
+    if (![assignmentId, referencedCodeHash].every(value => typeof value === 'string' && value.length > 0 && value.length <= 200))
+      throw new GuardRefusal('Invalid assignment.');
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const task = this.#task(key);
+      if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal('A closed task never changes.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      this.#run('UPDATE tasks SET assignment_id=?, referenced_code_hash=? WHERE plan_key=?', assignmentId, referencedCodeHash, key);
+      this.#bumpContext(key);
+    });
+  }
+  /** Status changes other than closing and admission. Closing uses cancelTask or a confirmed merge; running comes from admission. */
+  transitionTask(identity: PlanIdentity, expectedStateVersion: number, to: TaskStatus): void {
+    if (!TASK_STATUSES.includes(to) || this.#closed(to) || to === 'running') throw new GuardRefusal('Invalid task status change.');
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const task = this.#task(key);
+      if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status)) throw new GuardRefusal('A closed task never changes.');
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      this.#run('UPDATE tasks SET status=? WHERE plan_key=?', to, key);
+      this.#touch(key);
+    });
+  }
+  /** GitHub may still merge the reviewed head while the latest merge attempt is submitting or queued. */
+  #activeMerge(key: string): boolean {
+    const row = this.#get('SELECT data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', key);
+    return !!row && ['submitting', 'queued'].includes(decode<MergeAttempt>(row.data).state);
+  }
+  #activeAttempt(key: string) {
+    return this.#get("SELECT * FROM attempts WHERE plan_key=? AND state IN ('pending','running')", key);
+  }
+  /** Admission, including retry: status, state version, requeue claim, active attempt and captured context are checked in one transaction. */
+  admitAttempt(identity: PlanIdentity, input: {
+    expectedStateVersion: number; kind: AttemptKind; item?: string | null; expectedContext: InvocationContext;
+    deadline: number; budgetMs?: number; retryOf?: string; now?: number;
+  }): AttemptRecord {
+    const now = input.now ?? Date.now(), budgetMs = input.budgetMs ?? DEFAULT_TASK_BUDGET_MS;
+    if (!(input.kind in ATTEMPT_PHASES)) throw new GuardRefusal('Unknown attempt kind.');
+    if (!Number.isSafeInteger(input.deadline) || input.deadline <= now) throw new GuardRefusal('An attempt needs a finite future deadline.');
+    if (!Number.isSafeInteger(budgetMs) || budgetMs < 1) throw new GuardRefusal('Invalid task budget.');
+    if (input.retryOf !== undefined) assertUuidV4(input.retryOf, 'Retried attempt ID');
+    const key = identityKey(identity);
+    // Re-checked when committed: only a still-open, idle task whose budget has passed moves to needs human.
+    const expire = () => {
+      const task = this.#task(key);
+      if ((task.status !== 'running' && task.status !== 'queued') || task.budget_deadline === null
+        || (task.budget_deadline as number) > now || this.#activeAttempt(key)) return;
+      this.#run("UPDATE tasks SET status='needs human' WHERE plan_key=?", key);
+      this.#touch(key);
+    };
+    try {
+      return this.#transaction((): AttemptRecord => {
+        const task = this.#task(key);
+        if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
+        if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+        if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
+        if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
+        if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
+        if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+        // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
+        if (task.budget_deadline !== null && (task.budget_deadline as number) <= now)
+          throw new RefusalWithEffect('The task time budget has run out; it needs a person.', expire);
+        const current = this.#contextOf(key);
+        if (!sameContext(input.expectedContext, current)) throw new GuardRefusal('The plan, snapshot, assignment or referenced code changed. Reload before starting.');
+        if (input.retryOf !== undefined) {
+          const last = task.current_attempt_id === input.retryOf ? this.#get('SELECT * FROM attempts WHERE plan_key=? AND id=?', key, input.retryOf) : undefined;
+          if (!last || (last.state !== 'failed' && last.state !== 'cancelled')) throw new GuardRefusal('Only the latest failed or cancelled attempt can be retried.');
+          if (!sameContext(decode<InvocationContext>(last.context), current)) throw new GuardRefusal('The retried attempt is out of date. Start a new request on the current code.');
+        }
+        if (input.item !== undefined && input.item !== null && !this.getPlan(identity).items.some(entry => entry.id === input.item))
+          throw new GuardRefusal('Unknown plan item.');
+        const id = randomUUID(), created = new Date(now).toISOString();
+        this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
+          id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
+        this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+        this.#touch(key);
+        return this.getAttempt(identity, id);
+      });
+    } catch (error) {
+      // Inside userAction the effect commits with the saved refusal instead (depth > 0 here).
+      if (error instanceof RefusalWithEffect && this.#depth === 0) this.#transaction(error.effect);
+      throw error;
+    }
+  }
+  /** The "Stopping" transition: sets the first reason once, keeps the state. */
+  recordFirstReason(identity: PlanIdentity, id: string, reason: FirstReason): boolean {
+    if (!FIRST_REASONS.includes(reason)) throw new GuardRefusal('Unknown stop reason.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const changed = this.#run(`UPDATE attempts SET first_reason=? WHERE plan_key=? AND id=? AND state IN ('pending','running') AND first_reason IS NULL`, reason, key, id).changes === 1;
+      if (changed) this.#touch(key);
+      return changed;
+    });
+  }
+  /** pending -> running after D returns a handle. Refused once a first reason is recorded. */
+  markRunning(identity: PlanIdentity, id: string): boolean {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const changed = this.#run(`UPDATE attempts SET state='running', started_at=? WHERE plan_key=? AND id=? AND state='pending' AND first_reason IS NULL
+        AND id=(SELECT current_attempt_id FROM tasks WHERE plan_key=?)`, new Date().toISOString(), key, id, key).changes === 1;
+      if (changed) this.#touch(key);
+      return changed;
+    });
+  }
+  /**
+   * Terminal write. The Store, not the caller, chooses the terminal state from the durable first reason
+   * (or the caller's in-memory one if its write failed), D's result and whether the captured context is still current.
+   */
+  settleAttempt(identity: PlanIdentity, id: string, settlement: Omit<Settlement, 'contextCurrent'> & {
+    signal?: string | null; result?: unknown; diagnosticRef?: string | null;
+  }): Classification {
+    if (settlement.firstReason !== null && !FIRST_REASONS.includes(settlement.firstReason)) throw new GuardRefusal('Unknown stop reason.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key), row = this.#get('SELECT * FROM attempts WHERE plan_key=? AND id=?', key, id);
+      if (!row || task.current_attempt_id !== id || (row.state !== 'pending' && row.state !== 'running')) throw new GuardRefusal('Attempt is not the active attempt.');
+      const firstReason = (row.first_reason as FirstReason | null) ?? settlement.firstReason;
+      const contextCurrent = sameContext(decode<InvocationContext>(row.context), this.#contextOf(key));
+      let outcome = classifySettlement({ ...settlement, firstReason, contextCurrent });
+      if (outcome.state === 'completed' && row.state !== 'running') throw new GuardRefusal('Only a running attempt can complete.');
+      // The task must still be running; a task never leaves running while an attempt is active, so this is a second safeguard.
+      if (outcome.state === 'completed' && (task.status !== 'running' || task.cancel_requested !== null))
+        outcome = { state: 'cancelled', reason: this.#closed(task.status) || task.cancel_requested !== null
+          ? 'The task was closed before the result was saved.' : 'The task left the running state before the result was saved.', timeLimit: false };
+      let result: string | null = null;
+      if (outcome.state === 'completed') {
+        result = encode(settlement.result ?? null);
+        if (Buffer.byteLength(result) > MAX_RESULT_BYTES) outcome = { state: 'failed', reason: 'The result exceeds 1 MiB.', timeLimit: false }, result = null;
+      }
+      this.#run(`UPDATE attempts SET state=?, first_reason=?, stop_reason=?, exit_code=?, signal=?, result=?, diagnostic=?, diagnostic_ref=?, settled_at=? WHERE id=?`,
+        outcome.state, firstReason, settlement.stopReason ?? null, settlement.exitCode, settlement.signal ?? null, result,
+        outcome.reason, settlement.diagnosticRef ?? null, new Date().toISOString(), id);
+      // A pending cancel task wins over everything, including the time limit.
+      if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
+      else {
+        if (outcome.timeLimit && !this.#closed(task.status)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+        this.#touch(key);
+      }
+      return outcome;
+    });
+  }
+  /** Cancel task: closes now, or, with an active attempt, stops it first and closes when it settles. */
+  cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
+    assertUuidV4(actionId, 'Action ID');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key);
+      if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status)) throw new GuardRefusal('The task is already closed.');
+      const merge = this.getMergeAttempt(identity);
+      if (merge && (merge.state === 'submitting' || merge.state === 'queued'))
+        throw new GuardRefusal('A merge is in progress. Cancel the task after it finishes or fails.');
+      const active = this.#activeAttempt(key);
+      if (!active) { this.#closeTask(key, 'cancelled', actionId); return 'closed'; }
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
+      this.#run(`UPDATE attempts SET first_reason='cancelled' WHERE id=? AND first_reason IS NULL`, active.id!);
+      this.#run('UPDATE tasks SET cancel_requested=? WHERE plan_key=?', actionId, key);
+      this.#touch(key);
+      return 'stopping';
+    });
+  }
+  /**
+   * Exact replay for writing user actions. The first definite outcome is recorded, including a guard refusal.
+   * Storage errors are not recorded, so the UI may resend. The response must be JSON.
+   */
+  userAction<T>(identity: PlanIdentity, action: { actionId: string; kind: string; request: unknown }, apply: () => T): { response: T; replayed: boolean } {
+    assertUuidV4(action.actionId, 'Action ID');
+    if (typeof action.kind !== 'string' || !/^[a-z][a-z-]{0,39}$/.test(action.kind)) throw new GuardRefusal('Invalid action kind.');
+    const key = identityKey(identity), hash = requestHash(action.kind, action.request);
+    const saved = () => this.savedAction<T>(identity, action);
+    const record = (outcome: object) => {
+      const response = encode(outcome);
+      if (response.length > 65536) throw new Error('Action response is too large to record.');
+      this.#run('INSERT INTO user_actions VALUES (?,?,?,?,?,?)', key, action.actionId, action.kind, hash, response, new Date().toISOString());
+    };
+    let replaying = false;
+    try {
+      return this.#transaction(() => {
+        const prior = saved(); if (prior) { replaying = true; return prior; }
+        const outer = this.#action;
+        this.#action = { key, actionId: action.actionId };
+        let value: T;
+        try { value = apply(); } finally { this.#action = outer; }
+        record({ ok: true, value });
+        return { response: value, replayed: false };
+      });
+    } catch (error) {
+      const storage = (error as { code?: string }).code === 'ERR_SQLITE_ERROR';
+      if (!replaying && !storage && !(error instanceof ActionIdReused) && this.#depth === 0) {
+        const message = error instanceof Error ? bounded(error.message) : 'Refused.';
+        this.#transaction(() => {
+          if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message });
+          if (error instanceof RefusalWithEffect) error.effect();
+        });
+      }
+      throw error;
+    }
+  }
+  /**
+   * The saved outcome of a user action, or undefined if it has none. Lets a caller replay before slow validation.
+   * Throws ActionIdReused for a different request under the same ID, and the saved refusal for a refused action.
+   */
+  savedAction<T>(identity: PlanIdentity, action: { actionId: string; kind: string; request: unknown }): { response: T; replayed: true } | undefined {
+    assertUuidV4(action.actionId, 'Action ID');
+    const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', identityKey(identity), action.actionId);
+    if (!row) return undefined;
+    if (row.request_hash !== requestHash(action.kind, action.request)) throw new ActionIdReused('Action ID already used for a different request.');
+    const outcome = decode<{ ok: boolean; value?: T; error?: string }>(row.response);
+    if (!outcome.ok) throw new GuardRefusal(outcome.error!);
+    return { response: outcome.value as T, replayed: true };
+  }
+  /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
+  recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null }): FeedbackEvent {
+    assertUuidV4(actionId, 'Action ID');
+    if (this.#depth === 0 || this.#action?.key !== identityKey(identity) || this.#action.actionId !== actionId)
+      throw new Error('Feedback events are written inside their user action, with its action ID.');
+    // task-closed is the last event: J reads a task's feedback once, when it closes.
+    if (this.#taskClosed(identityKey(identity))) throw new GuardRefusal('A closed task never changes.');
+    if (!FEEDBACK_KINDS.includes(event.kind) || event.kind === ('task-closed' as FeedbackKind)) throw new GuardRefusal('Invalid feedback kind.');
+    if (event.text != null && (typeof event.text !== 'string' || event.text.length > 4000)) throw new GuardRefusal('Feedback text is limited to 4000 characters.');
+    if (typeof event.sourceRef !== 'string' || !event.sourceRef || event.sourceRef.length > 200) throw new GuardRefusal('Invalid feedback source.');
+    const key = identityKey(identity), plan = this.#current(key);
+    if (event.supersedes != null && !this.#get('SELECT 1 FROM feedback_events WHERE plan_key=? AND id=? AND source_ref=?', key, event.supersedes, event.sourceRef))
+      throw new GuardRefusal('A superseded event must belong to the same source.');
+    const id = randomUUID(), createdAt = new Date().toISOString();
+    this.#run(`INSERT INTO feedback_events (id,plan_key,action_id,plan_revision,snapshot_id,item,kind,text,source_ref,supersedes,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
+      id, key, actionId, plan.revision!, plan.snapshot_id ?? null, event.item ?? null, event.kind, event.text ?? null, event.sourceRef, event.supersedes ?? null, createdAt);
+    return { id, planKey: key, actionId, planRevision: plan.revision as number, snapshotId: plan.snapshot_id as string | null, item: event.item ?? null,
+      kind: event.kind, text: event.text ?? null, sourceRef: event.sourceRef, supersedes: event.supersedes ?? null, createdAt };
+  }
+  /** Lane J's only read path: available once the task has closed. */
+  feedbackEvents(identity: PlanIdentity): FeedbackEvent[] {
+    const key = identityKey(identity); this.#task(key);
+    if (!this.#get("SELECT 1 FROM feedback_events WHERE plan_key=? AND kind='task-closed'", key)) throw new GuardRefusal('Feedback is available after the task closes.');
+    return this.#db.prepare('SELECT * FROM feedback_events WHERE plan_key=? ORDER BY rowid').all(key).map(row => ({
+      id: row.id as string, planKey: row.plan_key as string, actionId: row.action_id as string, planRevision: row.plan_revision as number,
+      snapshotId: row.snapshot_id as string | null, item: row.item as string | null, kind: row.kind as FeedbackKind, text: row.text as string | null,
+      sourceRef: row.source_ref as string, supersedes: row.supersedes as string | null, createdAt: row.created_at as string,
+    }));
+  }
+
 }

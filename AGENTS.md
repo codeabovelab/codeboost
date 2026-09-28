@@ -81,6 +81,8 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - If the external lifecycle mechanism or mode changes between validation passes, abort before the irreversible command. Create durable lifecycle ownership from the final stable mode, never from an earlier observation.
 - When an irreversible command has an ambiguous timeout, cancellation, transport, or unknown outcome, retain durable in-flight ownership and reconcile external state before enabling retry. Only a confirmed refusal may become retryable failure.
 - Correlate retry observations to the current attempt with an immutable external identity or event boundary, and fail closed when multiple post-boundary action sequences appear. Matching only the resource or commit identity can replay another attempt's terminal event.
+- Make an idempotency key required at the API boundary for every replayable action, and look up its saved outcome before any other guard, including in-flight, validation and coordinator shutdown guards. The one exception is the server's HTTP 503 during shutdown, which applies nothing; the client must keep the key and resend it. Save every definite outcome under the key (refusals before admission too), keep the saved response current with the durable outcome it reports, and replay failures as failures with complete result fields. Only a passing, nothing-applied outcome (shutdown, abort, deadline, storage error) stays resendable.
+- When a refusal must also change durable state (for example, handing an expired task to a person), commit that change outside the refused transaction, together with the saved refusal. Never write it inside the transaction the refusal rolls back.
 
 ## Owned host and Docker resources
 

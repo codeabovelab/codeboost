@@ -1,8 +1,10 @@
+import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
-import { MergeCoordinator } from '../runner/merge.ts';
+import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
-import { Store } from '../runner/store.ts';
+import { Store, mergeActionResponse } from '../runner/store.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 const sha = (digit: string) => digit.repeat(40);
@@ -175,6 +177,451 @@ it('aborts and awaits an active merge command during shutdown', async () => {
   await expect(merging).rejects.toThrow(/shutdown/i);
   expect(commandSettled).toBe(true);
   await expect(coordinator.merge(view.token)).rejects.toThrow(/shutting down/i);
+});
+
+it.each([
+  ['cancelled', (h: ReturnType<typeof queueHarness>) => h.store.cancelTask(h.identity, h.store.getTask(h.identity).stateVersion, randomUUID()), /task is cancelled/],
+  ['changed', (h: ReturnType<typeof queueHarness>) => h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'approved but merge blocked'), /Stale task state/],
+] as const)('does not merge when the task is %s during merge validation', async (_label, change, message) => {
+  const h = queueHarness([]);
+  h.client.queueWatermark = vi.fn(async () => { change(h); return 'CURSOR_before'; });
+  try {
+    await expect(h.coordinator.merge(h.view().token)).rejects.toThrow(message);
+    expect(h.merges).toEqual([]);
+    expect(h.store.getMergeAttempt(h.identity)).toBeNull();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a resent merge click after a lost response instead of submitting again', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    const attempt = h.store.getMergeAttempt(h.identity)!;
+    expect(attempt).toMatchObject({ state: 'queued', actionId });
+    const resent = await h.coordinator.merge(h.view().token, actionId);
+    expect(resent.result).toEqual({ url: 'https://github.example/pr/1' });
+    expect(h.merges).toHaveLength(1);
+    expect(h.store.getMergeAttempt(h.identity)!.id).toBe(attempt.id);
+    await expect(h.coordinator.merge('another-token', actionId)).rejects.toThrow(/already used/);
+    await expect(h.coordinator.merge(h.view().token, 'not-a-uuid')).rejects.toThrow(/UUID v4/);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('joins a resend that arrives while the first merge command is still running, returning its final result', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  let release!: () => void;
+  h.client.merge = vi.fn(async head => { await new Promise<void>(resolve => { release = resolve; }); h.merges.push(head); return { url: 'https://github.example/pr/1' }; });
+  try {
+    const first = h.coordinator.merge(h.view().token, actionId);
+    await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
+    const resend = h.coordinator.merge(h.view().token, actionId);
+    release();
+    const [a, b] = await Promise.all([first, resend]);
+    expect(b).toBe(a);
+    expect(b.result).toEqual({ url: 'https://github.example/pr/1' });
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a refusal made before admission, even after the review becomes mergeable', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  const watermark = h.client.queueWatermark;
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).rejects.toThrow(/Review changed/);
+    h.client.queueWatermark = watermark;
+    h.changeToken(token);
+    await expect(h.coordinator.merge(token, actionId)).rejects.toThrow(/Review changed/);
+    expect(h.merges).toEqual([]);
+    expect(h.store.getMergeAttempt(h.identity)).toBeNull();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('returns a committed merge on replay even when the local review cannot be reloaded', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    vi.mocked(h.service.load).mockImplementation(() => { throw new Error('checkout unreadable'); });
+    const replay = await h.coordinator.merge(h.view().token, actionId);
+    expect(replay.result).toEqual({ url: 'https://github.example/pr/1' });
+    expect(replay.status).toMatchObject({ ready: false, blockers: [{ code: 'refresh' }] });
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('joins a resend that arrives while the first click is still validating, before its action is saved', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  let release!: () => void;
+  const inspect = h.client.inspect;
+  h.client.inspect = vi.fn(async (...args: Parameters<typeof inspect>) => { await new Promise<void>(resolve => { release = resolve; }); h.client.inspect = inspect; return inspect(...args); });
+  try {
+    const first = h.coordinator.merge(h.view().token, actionId);
+    await vi.waitFor(() => expect(release).toBeTypeOf('function'));
+    const resend = h.coordinator.merge(h.view().token, actionId);
+    await expect(h.coordinator.merge('different-token', actionId)).rejects.toThrow(/already used/);
+    await expect(h.coordinator.merge(h.view().token, randomUUID())).rejects.toThrow(/already running/);
+    release();
+    const [a, b] = await Promise.all([first, resend]);
+    expect(b).toBe(a);
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('reports a task that is not in review as a merge blocker, so Merge PR is not ready', async () => {
+  const h = queueHarness([]);
+  try {
+    expect((await h.coordinator.status(h.view())).ready).toBe(true);
+    h.store.transitionTask(h.identity, h.store.getTask(h.identity).stateVersion, 'needs human');
+    const status = await h.coordinator.status(h.view());
+    expect(status.ready).toBe(false);
+    expect(status.blockers).toContainEqual({ code: 'task', message: 'The task is needs human; merge it from review.' });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('leaves a deadline-stopped click unsaved and resendable with the same key', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  const inspect = h.client.inspect;
+  h.client.inspect = vi.fn(async (options: Parameters<typeof inspect>[0]) => new Promise<never>((_, reject) => options?.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true })));
+  const slow = new MergeCoordinator(h.service, h.client, 250);
+  try {
+    const error = await slow.merge(h.view().token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/deadline/i);
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token: h.view().token } })).toBeUndefined();
+    h.client.inspect = vi.fn(async () => remote(h.view(), { mergeQueue: true }));
+    await expect(slow.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    expect(h.merges).toHaveLength(1);
+  } finally { await slow.close(); await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps an attempt aborted during the GitHub command in flight instead of reporting nothing applied', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async (_head, options) => new Promise<never>((_, reject) => options?.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true })));
+  const slow = new MergeCoordinator(h.service, h.client, 250);
+  try {
+    const error = await slow.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).not.toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/deadline/i);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'submitting' });
+  } finally { await slow.close(); await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a click refused while another merge was running, even after a retry would be allowed', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  let refuse!: () => void;
+  h.client.merge = vi.fn(async () => { await new Promise<void>(resolve => { refuse = resolve; }); throw new MergeSubmissionError('Required status check is expected.', 'refused'); });
+  const second = randomUUID();
+  try {
+    const first = h.coordinator.merge(h.view().token, randomUUID()).catch(error => error);
+    await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
+    await expect(h.coordinator.merge(h.view().token, second)).rejects.toThrow(/already running/);
+    refuse();
+    await first;
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed' });
+    await expect(h.coordinator.merge(h.view().token, second)).rejects.toThrow(/already running/);
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers with the in-flight outcome another coordinator saved for the same click during validation', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  h.client.queueWatermark = vi.fn(async () => {
+    // A second coordinator on the same database admits and saves this click first.
+    const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
+    h.store.userAction(h.identity, { actionId, kind: 'merge', request: { token } },
+      () => mergeActionResponse(h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_other', 'queue', actionId)));
+    return 'CURSOR_before';
+  });
+  try {
+    // The other click is still submitting, so its outcome is unknown and the key must be kept.
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers with the in-flight outcome another coordinator saved just before admission', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  const inspect = h.client.inspect;
+  let inspections = 0, armed = false, injected = false;
+  h.client.inspect = vi.fn(async (...args: Parameters<typeof inspect>) => { if (++inspections === 3) armed = true; return inspect(...args); });
+  vi.mocked(h.service.load).mockImplementation(() => {
+    const view = h.view();
+    if (armed) {
+      armed = false; injected = true;
+      const expected = { ...view.expected, reviewVersion: view.expected.reviewVersion! };
+      h.store.userAction(h.identity, { actionId, kind: 'merge', request: { token } },
+        () => mergeActionResponse(h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_other', 'queue', actionId)));
+    }
+    return view;
+  });
+  try {
+    // The other click is still submitting, so its outcome is unknown and the key must be kept.
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(injected).toBe(true);
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('reports a refusal it could not save as resendable, not as a definite 409', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
+  const userAction = h.store.userAction.bind(h.store);
+  h.store.userAction = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  try {
+    const error = await h.coordinator.merge(token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(error.message).toMatch(/could not be saved/);
+    h.store.userAction = userAction;
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })).toBeUndefined();
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps the key-bearing attempt in flight after an unknown outcome, then replays the reconciled URL', async () => {
+  const h = queueHarness([]);
+  let merged = false;
+  h.client.inspect = vi.fn(async () => merged
+    ? { ...remote(h.view()), pullRequestState: 'MERGED' as const, url: 'https://github.example/pr/7' }
+    : remote(h.view()));
+  h.client.merge = vi.fn(async () => { merged = true; throw new MergeSubmissionError('Direct merge response was lost.', 'unknown'); });
+  const actionId = randomUUID();
+  try {
+    const error = await h.coordinator.merge(h.view().token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'submitting', actionId });
+    await h.coordinator.status(h.view());
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'merged', url: 'https://github.example/pr/7' });
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/7' } });
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers resend when the saved merge outcome cannot be read', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    const savedAction = h.store.savedAction.bind(h.store);
+    h.store.savedAction = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+    const error = await h.coordinator.merge(h.view().token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    h.store.savedAction = savedAction;
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers a replay from the outcome its own status refresh reconciled', async () => {
+  const h = queueHarness([]);
+  let merged = false;
+  h.client.inspect = vi.fn(async () => merged
+    ? { ...remote(h.view()), pullRequestState: 'MERGED' as const, url: 'https://github.example/pr/8' }
+    : remote(h.view()));
+  h.client.merge = vi.fn(async () => { merged = true; throw new MergeSubmissionError('Direct merge response was lost.', 'unknown'); });
+  const actionId = randomUUID();
+  try {
+    await expect(h.coordinator.merge(h.view().token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    // No status call in between: the replay's own refresh reconciles the merge and must report its URL.
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/8' } });
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'merged', url: 'https://github.example/pr/8' });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers resend when the attempt cannot be stored at admission', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.store.beginMergeAttempt = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  const actionId = randomUUID(), token = h.view().token;
+  try {
+    const error = await h.coordinator.merge(token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })).toBeUndefined();
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+// Another coordinator on this database saves the click between this coordinator's replay lookup and its save.
+function missEarlyLookups(h: ReturnType<typeof queueHarness>, misses: number) {
+  const savedAction = h.store.savedAction.bind(h.store);
+  let calls = 0;
+  h.store.savedAction = vi.fn((...args: Parameters<typeof savedAction>) => ++calls <= misses ? undefined : savedAction(...args)) as typeof savedAction;
+}
+
+it('answers with the in-flight outcome another coordinator saved while this one was refusing the same click', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
+  h.store.userAction(h.identity, { actionId, kind: 'merge', request: { token } },
+    () => mergeActionResponse(h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_other', 'queue', actionId)));
+  missEarlyLookups(h, 2);
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
+  try {
+    // The other click is still submitting, so its outcome is unknown and the key must be kept.
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers with a refusal another coordinator saved while this one was refusing a second click', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  let release!: () => void;
+  h.client.merge = vi.fn(async head => { await new Promise<void>(resolve => { release = resolve; }); h.merges.push(head); return { url: 'https://github.example/pr/1' }; });
+  const second = randomUUID(), token = h.view().token;
+  try {
+    const first = h.coordinator.merge(token, randomUUID());
+    await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
+    expect(() => h.store.userAction(h.identity, { actionId: second, kind: 'merge', request: { token } },
+      () => { throw new GuardRefusal('Refused by the other coordinator.'); })).toThrow();
+    missEarlyLookups(h, 1);
+    await expect(h.coordinator.merge(token, second)).rejects.toThrow('Refused by the other coordinator.');
+    release();
+    await first;
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers resend when the saved outcome cannot be re-read after the replay refresh', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID(), token = h.view().token;
+  try {
+    await h.coordinator.merge(token, actionId);
+    const savedAction = h.store.savedAction.bind(h.store);
+    let calls = 0;
+    // The replay's first read succeeds; the re-read after its status refresh hits a locked database.
+    h.store.savedAction = vi.fn((...args: Parameters<typeof savedAction>) => {
+      if (++calls === 2) throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' });
+      return savedAction(...args);
+    }) as typeof savedAction;
+    const error = await h.coordinator.merge(token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(calls).toBe(2);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a direct click that is still submitting as an unknown outcome, not as a success', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Direct merge response was lost.', 'unknown'); });
+  const actionId = randomUUID(), token = h.view().token;
+  try {
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'submitting' });
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps a confirmed refusal resendable until its failed state is saved', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Required status check is expected.', 'refused'); });
+  const finish = h.store.finishMergeAttempt.bind(h.store);
+  h.store.finishMergeAttempt = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  try {
+    const error = await h.coordinator.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).toBeInstanceOf(MergeOutcomeUnknown);
+    expect(error.message).toMatch(/Required status check/);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'submitting' });
+    h.store.finishMergeAttempt = finish;
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('saves the queue URL even when a poll observed the queue entry first', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  h.client.merge = vi.fn(async head => {
+    // A concurrent poll sees the queue entry before the enqueue command returns.
+    h.store.observeQueuedMerge(h.identity, h.store.getMergeAttempt(h.identity)!.id, { entryId: 'MQE_1', phase: 'QUEUED', position: 1 });
+    h.merges.push(head); return { url: 'https://github.example/pr/9' };
+  });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/9' } });
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'queued', url: 'https://github.example/pr/9', entryId: 'MQE_1' });
+    expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })?.response).toMatchObject({ state: 'queued', url: 'https://github.example/pr/9' });
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers with the failure a concurrent poll committed, not with the command\'s success', async () => {
+  const h = queueHarness([]);
+  h.client.merge = vi.fn(async head => {
+    // A concurrent poll sees GitHub drop the entry before the enqueue command returns.
+    h.store.finishMergeAttempt(h.identity, h.store.getMergeAttempt(h.identity)!.id, { state: 'removed', reason: 'Removed from the merge queue.' });
+    h.merges.push(head); return { url: 'https://github.example/pr/9' };
+  });
+  try {
+    const error = await h.coordinator.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(error.message).toBe('Removed from the merge queue.');
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('fails closed when a newer attempt started while the old merge command ran', async () => {
+  const h = queueHarness([]);
+  h.client.merge = vi.fn(async head => {
+    // Elsewhere, the attempt is removed and a retry starts a newer attempt before this command returns.
+    const old = h.store.getMergeAttempt(h.identity)!;
+    h.store.finishMergeAttempt(h.identity, old.id, { state: 'removed', reason: 'Removed from the merge queue.' });
+    const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
+    h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_retry', 'queue');
+    h.merges.push(head); return { url: 'https://github.example/pr/9' };
+  });
+  try {
+    const error = await h.coordinator.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).toBeInstanceOf(MergeOutcomeUnknown);
+    expect(error.message).toMatch(/newer merge attempt/);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a refused merge as the same failure, not as a submission', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Required status check is expected.', 'refused'); });
+  const actionId = randomUUID();
+  try {
+    await expect(h.coordinator.merge(h.view().token, actionId)).rejects.toThrow(/Required status check/);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed', actionId });
+    await expect(h.coordinator.merge(h.view().token, actionId)).rejects.toThrow(/Required status check/);
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a saved merge click after shutdown has started', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    await h.coordinator.close();
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    await expect(h.coordinator.merge(h.view().token, randomUUID())).rejects.toThrow(/shutting down/);
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps a direct merge URL for a replayed click', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID();
+  try {
+    await h.coordinator.merge(h.view().token, actionId);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'merged', url: 'https://github.example/pr/1' });
+    await expect(h.coordinator.merge(h.view().token, actionId)).resolves.toMatchObject({ result: { url: 'https://github.example/pr/1' } });
+    expect(h.merges).toHaveLength(1);
+  } finally { await h.coordinator.close(); h.store.close(); }
 });
 
 it('persists enqueue success as queued and waits for a separate confirmed merge', async () => {
