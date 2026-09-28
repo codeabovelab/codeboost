@@ -719,8 +719,41 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), runners = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')] as const;
     const exists = (kind: 'container' | 'volume' | 'network', ref: string) =>
       spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
-    // Each runner leaves what a crash mid-invocation leaves: task storage, a vendor network and an agent container.
-    const leave = async (runnerOwner: string) => {
+    const label = (labels: Record<string, string>) => Object.entries(labels).flatMap(([key, value]) =>
+      ['--label', `${key}=${value}`]);
+    // What a crashed process leaves for the first runner, made with the labels and names D writes, so nothing in this
+    // process owns it: storage with its keeper and a seeder that never finished, storage whose keeper was never
+    // created, and an agent container with its proxy on the vendor network.
+    const crashed = (runnerOwner: string) => {
+      const attemptId = `crashed-${randomUUID()}`, owner = (allocation: string) => ({ 'io.codeboost.runner': runnerOwner,
+        'io.codeboost.attempt': attemptId, 'io.codeboost.allocation': allocation });
+      const storage = (withKeeper: boolean) => {
+        const allocation = randomUUID(), work = `codeboost-work-${randomUUID()}`, metadata = `codeboost-metadata-${randomUUID()}`;
+        docker('volume', 'create', ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'work' }), work);
+        docker('volume', 'create', ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'metadata' }), metadata);
+        const mounts = ['--mount', `type=volume,source=${work},target=/work`, '--mount',
+          `type=volume,source=${metadata},target=/metadata`];
+        const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
+        if (withKeeper) {
+          docker('run', '--detach', '--name', keeper, '--network=none', ...mounts,
+            ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'keeper' }), '--entrypoint', 'sleep', imageId, 'infinity');
+          docker('create', '--name', seeder, '--network=none', ...mounts,
+            ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'seeder' }), '--entrypoint', 'true', imageId);
+        }
+        return { allocation, work, metadata, keeper: withKeeper ? keeper : undefined, seeder: withKeeper ? seeder : undefined };
+      };
+      const full = storage(true), partial = storage(false);
+      const egress = randomUUID(), network = `codeboost-egress-codex-${randomUUID()}`;
+      const proxy = `codeboost-proxy-codex-${randomUUID()}`, agent = `codeboost-agent-${randomUUID()}`;
+      const egressLabels = { ...owner(egress), 'io.codeboost.egress': egress };
+      docker('network', 'create', '--internal', ...label(egressLabels), network);
+      docker('create', '--name', proxy, '--network', network, ...label(egressLabels), '--entrypoint', 'true', imageId);
+      docker('create', '--name', agent, '--network', network, '--mount', `type=volume,source=${full.work},target=/work`,
+        ...label({ ...owner(full.allocation), 'io.codeboost.invocation': randomUUID() }), '--entrypoint', 'true', imageId);
+      return { attemptId, full, partial, network, proxy, agent };
+    };
+    // The second runner is live in this process: task storage, a vendor network and an agent container.
+    const live = async (runnerOwner: string) => {
       const captured = captureInvocation({ runnerOwner, clone: data.clone, phase: 'planning', vendor: 'codex',
         approvedArgv: [], deadline: Date.now() + 60_000, attemptId: `recovery-${randomUUID()}`,
         context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c',
@@ -728,43 +761,53 @@ describe('real Docker agent isolation', () => {
       const storage = prepareTaskFilesystems(data.clone, storageLimits, imageId,
         { runnerOwner, attemptId: captured.attemptId, allocationId: randomUUID() });
       const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId, randomUUID());
-      const live = await createContainerProfile({ invocation: captured, policy, network, filesystems: storage,
+      const profile = await createContainerProfile({ invocation: captured, policy, network, filesystems: storage,
         inputDirectory: data.input, command: createIsolationProbeCommand(policy, 'noop'), imageId,
         codexAuthFile: data.fakeAuth });
-      profiles.push(live);
-      await createValidatedContainer(live);
-      return { storage, network, live };
+      profiles.push(profile);
+      await createValidatedContainer(profile);
+      return { storage, network, profile };
     };
-    const [mine, theirs] = [await leave(runners[0]), await leave(runners[1])];
+    const mine = crashed(runners[0]), theirs = await live(runners[1]);
     // An object from a build before runner labels.
     const legacy = `codeboost-work-legacy-${randomUUID()}`;
     docker('volume', 'create', '--label', `io.codeboost.allocation=${randomUUID()}`, legacy);
+    const leftovers = [['container', mine.agent], ['container', mine.proxy], ['network', mine.network],
+      ['container', mine.full.keeper!], ['container', mine.full.seeder!], ['volume', mine.full.work],
+      ['volume', mine.full.metadata], ['volume', mine.partial.work], ['volume', mine.partial.metadata]] as const;
     try {
-      // After a restart only the runner token is known: the allocator's handles are not used from here on.
+      // A runner with live storage in this process is refused: its agents would be removed under it.
+      await expect(recoverLeftovers(runners[1])).rejects.toThrow('still holds task storage');
       const report = await recoverLeftovers(runners[0]);
       expect(report.removed.map(resource => resource.name).sort())
-        .toEqual([mine.live.name, mine.network.proxyContainer, mine.network.name].sort());
-      for (const [kind, ref] of [['container', mine.live.name], ['container', mine.network.proxyContainer],
-        ['network', mine.network.name]] as const) expect(exists(kind, ref)).toBe(false);
+        .toEqual([mine.agent, mine.proxy, mine.full.seeder, mine.network].sort());
+      for (const ref of [mine.agent, mine.proxy, mine.full.seeder!]) expect(exists('container', ref)).toBe(false);
+      expect(exists('network', mine.network)).toBe(false);
       expect(report.unowned).toContainEqual(expect.objectContaining({ name: legacy, reason: 'no-runner-label' }));
       expect(exists('volume', legacy)).toBe(true);
-      // The storage is kept whole, keeper included, and only the recovery handle releases it.
-      const owner = taskFilesystemOwner(mine.storage);
-      expect(report.storage).toEqual([{ runnerOwner: runners[0], attemptId: owner.attemptId,
-        allocationId: owner.allocationId, workVolume: mine.storage.workVolume,
-        metadataVolume: mine.storage.metadataVolume, keeper: mine.storage.keeper }]);
-      expect(docker('container', 'inspect', '--format', '{{.State.Running}}', mine.storage.keeper)).toBe('true');
-      removeTaskFilesystems(report.storage[0]!);
-      expect(isRecoveredTaskStorage(report.storage[0])).toBe(false);
-      for (const [kind, ref] of [['container', mine.storage.keeper], ['volume', mine.storage.workVolume],
-        ['volume', mine.storage.metadataVolume]] as const) expect(exists(kind, ref)).toBe(false);
+      // Both storage allocations are kept, the keeper running, and only their recovery handles release them.
+      expect([...report.storage].sort((a, b) => a.allocationId.localeCompare(b.allocationId))).toEqual([
+        { runnerOwner: runners[0], attemptId: mine.attemptId, allocationId: mine.full.allocation,
+          workVolume: mine.full.work, metadataVolume: mine.full.metadata, keeper: mine.full.keeper },
+        { runnerOwner: runners[0], attemptId: mine.attemptId, allocationId: mine.partial.allocation,
+          workVolume: mine.partial.work, metadataVolume: mine.partial.metadata },
+      ].sort((a, b) => a.allocationId.localeCompare(b.allocationId)));
+      expect(docker('container', 'inspect', '--format', '{{.State.Running}}', mine.full.keeper!)).toBe('true');
+      for (const handle of report.storage) {
+        removeTaskFilesystems(handle);
+        expect(isRecoveredTaskStorage(handle)).toBe(false);
+      }
+      for (const [kind, ref] of leftovers) expect(exists(kind, ref)).toBe(false);
       // The other runner's objects are untouched.
-      for (const [kind, ref] of [['container', theirs.live.name], ['container', theirs.network.proxyContainer],
+      for (const [kind, ref] of [['container', theirs.profile.name], ['container', theirs.network.proxyContainer],
         ['network', theirs.network.name], ['container', theirs.storage.keeper], ['volume', theirs.storage.workVolume],
         ['volume', theirs.storage.metadataVolume]] as const) expect(exists(kind, ref)).toBe(true);
     } finally {
+      for (const [kind, ref] of leftovers) if (kind !== 'network')
+        spawnSync('docker', kind === 'volume' ? ['volume', 'rm', '--force', ref] : ['rm', '--force', ref], { stdio: 'ignore' });
+      spawnSync('docker', ['network', 'rm', mine.network], { stdio: 'ignore' });
       spawnSync('docker', ['volume', 'rm', '--force', legacy], { stdio: 'ignore' });
-      await disposeValidatedContainer(theirs.live);
+      await disposeValidatedContainer(theirs.profile);
       removeTaskFilesystems(theirs.storage);
     }
   }, 180_000);

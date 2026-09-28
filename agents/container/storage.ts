@@ -6,6 +6,7 @@ import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
+import { runDocker } from '../docker.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, releaseAllocationId, type ResourceOwner } from '../labels.ts';
 
@@ -34,6 +35,12 @@ interface AllocationIdentity {
   readonly limits: Readonly<TaskStorageLimits>;
 }
 const allocations = new WeakMap<TaskFilesystems, AllocationIdentity>();
+// Storage this process allocated and has not removed, as allocation ID to runner token. Recovery never runs for a
+// runner that has any, and never issues a handle for one: a running agent may mount it.
+const liveAllocations = new Map<string, string>();
+/** Whether this process holds task storage of this runner that it allocated and has not removed. */
+export const hasLiveTaskStorage = (runnerOwner: string): boolean =>
+  [...liveAllocations.values()].includes(runnerOwner);
 const dockerEnvironment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const validLimit = (value: number, name: string) => {
   if (!Number.isSafeInteger(value) || value < 1) throw new Error(`${name} must be a positive integer.`);
@@ -281,6 +288,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
     allocations.set(filesystems, Object.freeze({ owner, trustedClone: clone,
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
+    liveAllocations.set(allocationId, owner.runnerOwner);
     releaseAllocationId(allocationId);
     return filesystems;
   } catch (error) {
@@ -314,20 +322,22 @@ const STORAGE_PARTS = Object.freeze([
 
 /**
  * Issue a recovery handle for task storage left by an earlier process. Each named part is inspected now and must be
- * the task-storage object of its kind carrying all three owner labels; otherwise nothing is issued.
+ * the task-storage object of its kind carrying all three owner labels; otherwise nothing is issued. Storage this
+ * process allocated and has not removed is refused, since a running agent may still mount it.
  */
-export function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: TaskStorageParts,
-  timeoutMs = 30_000): RecoveredTaskStorage {
+export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: TaskStorageParts,
+  timeoutMs = 30_000): Promise<RecoveredTaskStorage> {
   owner = assertResourceOwner(owner);
+  if (liveAllocations.has(owner.allocationId))
+    throw new Error('Task storage is still live in this process; only leftovers of an earlier process are recovered.');
   const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
   for (const [field, object, kind, pattern] of STORAGE_PARTS) {
     const name = parts[field];
     if (name === undefined) continue;
     if (typeof name !== 'string' || !pattern.test(name)) throw new Error(`Recovered task ${kind} has an unexpected name.`);
-    const inspect = spawnSync('docker', [object, 'inspect', name], { encoding: 'utf8', timeout: remaining(),
-      killSignal: 'SIGKILL', env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    const inspect = await runDocker([object, 'inspect', name], { timeoutMs: remaining() });
     if (inspect.status !== 0) throw new Error(`Recovered task ${kind} could not be inspected.`);
-    const inspected = JSON.parse(String(inspect.stdout || '[]'))[0] as
+    const inspected = JSON.parse(inspect.stdout || '[]')[0] as
       { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
     const labels = inspected?.Labels ?? inspected?.Config?.Labels;
     if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
@@ -360,6 +370,8 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
   }
   const allocated = filesystems as TaskFilesystems;
   assertTaskFilesystems(allocated);
-  cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], taskFilesystemOwner(allocated));
+  const owner = taskFilesystemOwner(allocated);
+  cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner);
   allocations.delete(allocated);
+  liveAllocations.delete(owner.allocationId);
 }

@@ -136,10 +136,25 @@ describe('recoverLeftovers', () => {
     const error = await recoverLeftovers(A).then(() => undefined, caught => caught);
     expect(error).toBeInstanceOf(RecoveryError);
     expect((error as Error).message).toContain('daemon refused removal');
+    // The error lists what this run did remove, so a caller can log it before running recovery again.
+    const [, , , seeder, , proxy] = mine.objects;
+    expect((error as InstanceType<typeof RecoveryError>).removed.map(resource => resource.name).sort())
+      .toEqual([seeder!.name, proxy!.name].sort());
     expect((error as Error).message.length).toBeLessThan(1_200);
     // The network is not attempted while a container that may still use it remains.
     expect(names()).toContain(network!.name);
     expect(daemon.calls.some(args => args[0] === 'volume' && args[1] === 'inspect' && args.length === 3)).toBe(false);
+  });
+
+  it('inspects objects in bounded batches, however many codeboost objects the daemon holds', async () => {
+    for (let index = 0; index < 450; index++)
+      daemon.objects.push({ kind: 'volume', id: '', name: `codeboost-work-old-${index}`,
+        labels: { 'io.codeboost.allocation': `old-${index}` } });
+    const report = await recoverLeftovers(A);
+    expect(report.unowned).toHaveLength(450);
+    const inspects = daemon.calls.filter(args => args[1] === 'inspect');
+    expect(inspects.length).toBeGreaterThanOrEqual(3);
+    for (const args of inspects) expect(args.length - 2).toBeLessThanOrEqual(200);
   });
 
   it('refuses a malformed runner token before listing anything', async () => {

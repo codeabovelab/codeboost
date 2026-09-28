@@ -1,7 +1,8 @@
 import { DOCKER_ID } from './client-outcome.ts';
 import { runDocker, type DockerOutcome } from './docker.ts';
 import { ALLOCATION_LABEL, ATTEMPT_LABEL, isRunnerOwner, RUNNER_LABEL } from './labels.ts';
-import { adoptRecoveredTaskStorage, type RecoveredTaskStorage, type TaskStorageParts } from './container/storage.ts';
+import { adoptRecoveredTaskStorage, hasLiveTaskStorage, type RecoveredTaskStorage,
+  type TaskStorageParts } from './container/storage.ts';
 
 /** A Docker object recovery found, with the labels it carries. */
 export interface RecoveredResource {
@@ -29,7 +30,14 @@ export interface RecoveryReport {
   readonly unowned: readonly UnownedResource[];
 }
 /** Recovery could not confirm every removal. Nothing was adopted; running it again retries the rest. */
-export class RecoveryError extends AggregateError {}
+export class RecoveryError extends AggregateError {
+  /** The objects this run did confirm removed before it gave up. */
+  readonly removed: readonly RecoveredResource[];
+  constructor(failures: unknown[], message: string, removed: readonly RecoveredResource[]) {
+    super(failures, message);
+    this.removed = Object.freeze([...removed]);
+  }
+}
 
 const INVOCATION_LABEL = 'io.codeboost.invocation';
 const EGRESS_LABEL = 'io.codeboost.egress';
@@ -41,6 +49,8 @@ const KIND_LABELS = {
   network: [EGRESS_LABEL, ALLOCATION_LABEL],
 } as const;
 const DIAGNOSTIC_LIMIT = 1_000;
+// Objects per `docker inspect`, so a daemon with many codeboost objects cannot exceed the argument-size limit.
+const INSPECT_BATCH = 200;
 
 const deadline = (timeoutMs: number) => {
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Recovery deadline must be a positive integer.');
@@ -67,7 +77,12 @@ const list = async (kind: Kind, filter: string, remaining: () => number) => {
   return result.stdout.split('\n').map(line => line.trim()).filter(Boolean);
 };
 const inspect = async (kind: Kind, refs: readonly string[], remaining: () => number): Promise<RecoveredResource[]> => {
-  if (!refs.length) return [];
+  const found: RecoveredResource[] = [];
+  for (let start = 0; start < refs.length; start += INSPECT_BATCH)
+    found.push(...await inspectBatch(kind, refs.slice(start, start + INSPECT_BATCH), remaining));
+  return found;
+};
+const inspectBatch = async (kind: Kind, refs: readonly string[], remaining: () => number) => {
   const result = await runDocker([kind, 'inspect', ...refs], { timeoutMs: remaining() });
   if (result.status !== 0) throw new Error(`Recovery could not inspect ${kind}s; run it again.`);
   const objects = JSON.parse(result.stdout || '[]') as Array<{ Id?: string; Name?: string;
@@ -97,11 +112,15 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
  * older builds without a runner label, and anything it does not recognise, are reported and never touched.
  *
  * Call it only while holding the database's single-runner lock and before admitting work: it removes every agent
- * container of this runner, including one a live invocation of the same runner would still be using. It rejects
+ * container of this runner. It refuses to run while this process holds task storage of the runner, which every agent
+ * mounts, but cannot see other processes; the lock is what excludes them. It rejects
  * with a `RecoveryError` (message bounded to about 1 KB) when any removal is not confirmed, and then adopts nothing.
  */
 export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000): Promise<RecoveryReport> {
   if (!isRunnerOwner(runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
+  // Every agent mounts task storage, so a runner with live storage here may have live agents recovery would remove.
+  if (hasLiveTaskStorage(runnerOwner))
+    throw new Error('This process still holds task storage of this runner; recovery runs only before admitting work.');
   const remaining = deadline(timeoutMs);
   const owned = { container: [] as RecoveredResource[], volume: [] as RecoveredResource[],
     network: [] as RecoveredResource[] };
@@ -145,15 +164,18 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   });
 
   // Containers first: a network cannot be removed while an agent or proxy is still attached to it.
-  const failures: unknown[] = [];
+  const failures: unknown[] = [], confirmed: RecoveredResource[] = [];
   for (const resource of [...remove, ...networks]) {
     if (resource.kind === 'network' && failures.length) break;
-    try { await removeById(resource, remaining); } catch (error) { failures.push(error); }
+    try {
+      await removeById(resource, remaining);
+      confirmed.push(resource);
+    } catch (error) { failures.push(error); }
   }
   if (failures.length) {
     const detail = failures.map(error => (error as Error).message).join('; ');
     throw new RecoveryError(failures, `Recovery could not remove ${failures.length} resource(s): `
-      + (detail.length > DIAGNOSTIC_LIMIT ? `${detail.slice(0, DIAGNOSTIC_LIMIT)}…` : detail));
+      + (detail.length > DIAGNOSTIC_LIMIT ? `${detail.slice(0, DIAGNOSTIC_LIMIT)}…` : detail), confirmed);
   }
 
   const handles: RecoveredTaskStorage[] = [];
@@ -165,8 +187,8 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
     // Adoption re-checks every part's labels, and the owner's format; a group that fails is reported, not adopted.
     const budget = remaining();
     try {
-      handles.push(adoptRecoveredTaskStorage({ runnerOwner, attemptId: group.attemptId, allocationId }, group.parts,
-        budget));
+      handles.push(await adoptRecoveredTaskStorage({ runnerOwner, attemptId: group.attemptId, allocationId },
+        group.parts, budget));
     } catch {
       for (const resource of group.resources) unowned.push(Object.freeze({ ...resource, reason: 'inconsistent-storage' }));
     }

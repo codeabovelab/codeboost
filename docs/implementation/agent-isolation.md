@@ -84,8 +84,10 @@ Use only these entry points to run an agent:
    attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
    a runner label (from older builds), objects of this runner that D does not create, and storage whose parts
-   disagree are listed in `unowned` and never touched. If any removal is not confirmed, it rejects with a
-   `RecoveryError` whose message is about 1 KB at most, and issues no handle; running it again retries.
+   disagree are listed in `unowned` and never touched. It refuses to run while this process still holds task
+   storage of that runner, since every agent mounts storage; the lock is what excludes other processes. If any
+   removal is not confirmed, it rejects with a `RecoveryError` whose message is about 1 KB at most and whose
+   `removed` lists what it did remove, and issues no handle; running it again retries.
 
 The boundary guarantees the following:
 
