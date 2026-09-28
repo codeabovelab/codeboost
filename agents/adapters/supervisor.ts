@@ -3,7 +3,7 @@ import type { InvocationHandle, InvocationInput, InvocationResult, StopReason,
   UnreleasedResource } from '../contract.ts';
 import { assertPhasePolicy } from '../policy.ts';
 import { agentContainerId, agentContainerResources, createValidatedContainer, disposeValidatedContainer,
-  validateContainer } from '../container/run.ts';
+  isContainerProfileRetired, retireContainerProfile, validateContainer } from '../container/run.ts';
 import { assertContainerProfileAuthenticity, containerProfileResources, disposeContainerProfile,
   isContainerProfileAuthentic, type ContainerProfile } from '../container/profile.ts';
 import { removeVendorNetwork, vendorNetworkResources, type VendorNetwork } from '../network/network.ts';
@@ -18,8 +18,6 @@ const CAPTURE_ABORT_GRACE_MS = 1_000;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
 const activeProfiles = new WeakSet<ContainerProfile>();
-// Profiles that settled with cleanup unconfirmed. They stay authentic, so this stops a second launch from reusing one.
-const spentProfiles = new WeakSet<ContainerProfile>();
 const cleanupRecoveries = new Set<InvocationHandle>();
 const hasCleanupRecovery = (attemptId: string) =>
   Array.from(cleanupRecoveries).some(handle => handle.attemptId === attemptId);
@@ -176,7 +174,7 @@ const retainCleanupOwnership = (profile: ContainerProfile, detail: string, regis
   return retainCleanup(invocation, budget => cleanup(profile, budget), detail, () => profileResources(profile),
     register, unreleased => {
       activeProfiles.delete(profile);
-      if (unreleased) spentProfiles.add(profile);
+      if (unreleased) retireContainerProfile(profile);
     });
 };
 
@@ -259,7 +257,8 @@ export function isInvocationActive(attemptId: string): boolean {
 
 export function startProfileInvocation(profile: ContainerProfile, options: SupervisorOptions = {}): InvocationHandle {
   assertContainerProfileAuthenticity(profile);
-  if (spentProfiles.has(profile))
+  // A profile that settled with cleanup unconfirmed is retired for every launch path (run.ts), not only this one.
+  if (isContainerProfileRetired(profile))
     throw new Error('This container profile settled without confirmed cleanup; start a new profile.');
   const invocation = assertPhasePolicy(profile.policy);
   // Rejections before container creation own no container, so they release (and retry) only the profile's own
@@ -591,7 +590,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       if (budget < 1) {
         // The window ended between attempts: report instead of starting one that would run past it.
         unreleased = profileResources(profile);
-        spentProfiles.add(profile);
+        retireContainerProfile(profile);
         failureDetail = `${cleanupWindowDetail()}: ${failureDetail}`;
         wakeCleanup = undefined;
         break;
@@ -607,7 +606,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         if (performance.now() >= giveUpAt) {
           wakeCleanup = undefined;
           unreleased = profileResources(profile);
-          spentProfiles.add(profile);
+          retireContainerProfile(profile);
           failureDetail = `${cleanupWindowDetail()}: ${failureDetail}`;
           break;
         }
