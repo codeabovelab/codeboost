@@ -30,13 +30,12 @@ const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, m
 const notStarted = (message: string): DockerOutcome =>
   ({ status: null, stdout: '', stderr: '', error: Object.assign(new Error(message), { code: NOT_STARTED }) });
 
-// Signal every process in the group; false once the group no longer exists.
+// Signal every process in the group; false once the group no longer exists. Never throws: it runs in timers and
+// listeners, where a throw would crash the runner. Any failure other than ESRCH (such as EPERM, for a member that can
+// no longer be signalled) counts as still alive, so draining gives up at its limit and reports it.
 const signalGroup = (pgid: number, signal: NodeJS.Signals | 0) => {
   try { process.kill(-pgid, signal); return true; }
-  catch (error) {
-    if ((error as NodeJS.ErrnoException).code === 'ESRCH') return false;
-    throw error;
-  }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
 };
 
 // The leader can exit while other members of its group still run (for example a child it forked). A group ID stays
@@ -74,9 +73,13 @@ export function runInProcessGroup(file: string, args: readonly string[],
       child.once('error', error => resolve({ status: null, stdout: '', stderr: '', error }));
       return;
     }
-    options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() }));
+    // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
+    // the call still settles only after the group has exited, with the caller's error.
+    let unrecorded: unknown;
+    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
+    catch (error) { unrecorded = error; }
     const out: Buffer[] = [], err: Buffer[] = [];
-    let outBytes = 0, errBytes = 0, stopped: 'cancelled' | 'timeout' | 'output-limit' | undefined;
+    let outBytes = 0, errBytes = 0, stopped: 'cancelled' | 'timeout' | 'output-limit' | 'unrecorded' | undefined;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
     const stop = (reason: NonNullable<typeof stopped>) => {
       if (stopped) return;
@@ -95,6 +98,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
     options.signal?.addEventListener('abort', onAbort, { once: true });
     let spawnError: Error | undefined;
     child.once('error', error => { spawnError = error; });
+    if (unrecorded !== undefined) { stopped = 'unrecorded'; signalGroup(pgid, 'SIGKILL'); }
     child.once('close', (code, signal) => {
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
@@ -104,6 +108,12 @@ export function runInProcessGroup(file: string, args: readonly string[],
         if (!drained) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
             new Error(`${file} left processes in its group that did not exit after SIGKILL.`), { code: 'EGROUPALIVE' }) });
+          return;
+        }
+        if (stopped === 'unrecorded') {
+          resolve({ status: null, stdout, stderr, error: Object.assign(new Error(
+            `${file} was stopped because its process group could not be recorded.`, { cause: unrecorded }),
+            { code: 'EUNRECORDED' }) });
           return;
         }
         if (stopped === 'cancelled') {

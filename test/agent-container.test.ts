@@ -734,7 +734,9 @@ describe('real Docker agent isolation', () => {
     } finally { clearInterval(waitForStart); }
     expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
     expect(byAllocation(owner.allocationId)).toEqual([]);
-    for (const pgid of pgids) expect(spawnSync('kill', ['-0', `-${pgid}`]).status).not.toBe(0);
+    // process.kill with a negative ID signals the group; the kill utility would read "-<pgid>" as an option.
+    const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
+    for (const pgid of pgids) expect(groupAlive(pgid)).toBe(false);
   }, 90_000);
 
   it('keeps a failed allocation whose cleanup did not settle live, so recovery in this process refuses its runner', async () => {

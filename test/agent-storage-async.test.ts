@@ -28,6 +28,10 @@ const find = ref => objects().find(object => object.name === ref || object.id ==
 const labels = () => Object.fromEntries(args.flatMap((arg, i) => arg === '--label' ? [args[i + 1].split(/=(.*)/s).slice(0, 2)] : []));
 const save = (name, object) => fs.writeFileSync(path.join(state, name + '.json'), JSON.stringify(object));
 const [a, b] = args;
+if ((a === 'ps' || b === 'ls') && fs.existsSync(path.join(state, 'hang-ls'))) {
+  fs.writeFileSync(path.join(state, 'ls-began'), '');
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+}
 if (a === 'ps' || b === 'ls') process.exit(0);
 if (a === 'volume' && b === 'create') { save(args.at(-1), { kind: 'volume', labels: labels() }); console.log(args.at(-1)); process.exit(0); }
 if (a === 'create') {
@@ -116,6 +120,17 @@ describe('asynchronous task storage allocation', () => {
     // The volumes and the keeper it created are gone, and no group it started is still running.
     expect(stored()).toEqual([]);
     for (const group of groups) expect(groupAlive(group.pgid)).toBe(false);
+  }, 30_000);
+
+  it('reports an abort during the allocation ID check as cancelled, having created nothing', async () => {
+    writeFileSync(join(state, 'hang-ls'), '');
+    const controller = new AbortController();
+    const waitForList = setInterval(() => { if (existsSync(join(state, 'ls-began'))) controller.abort(); }, 20);
+    try {
+      await expect(prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(), { signal: controller.signal }))
+        .rejects.toThrow('cancelled');
+    } finally { clearInterval(waitForList); }
+    expect(stored()).toEqual([]);
   }, 30_000);
 
   it('creates nothing when the signal is already aborted', async () => {

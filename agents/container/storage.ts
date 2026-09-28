@@ -268,6 +268,8 @@ function* allocationObjects(allocationId: string, expected: number, remaining: (
   let found = 0;
   for (const command of allocationListCommands(allocationId)) {
     const result = yield* run(command, remaining(), true);
+    // A client that was stopped (an abort or its deadline) or never started says why; a daemon answer does not.
+    if (result.status === null) throw new DockerError(command, result);
     if (result.status !== 0) throw new Error('Could not confirm that allocationId is unused.');
     found += result.stdout.split('\n').filter(line => line.trim()).length;
     if (found > expected) throw new Error(ALLOCATION_IN_USE);

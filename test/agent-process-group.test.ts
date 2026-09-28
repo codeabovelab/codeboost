@@ -55,6 +55,16 @@ describe('runInProcessGroup', () => {
     expect(groupAlive(group!.pgid)).toBe(false);
   });
 
+  it('kills the group and still waits for it when the caller cannot record it', async () => {
+    let group: ProcessGroup | undefined;
+    const outcome = await runInProcessGroup('sh', ['-c', "trap '' TERM; sleep 60 & while :; do sleep 1; done"],
+      { env, timeoutMs: 30_000, onProcessGroup: reported => { group = reported; throw new Error('database is locked'); } });
+    expect(outcome.status).toBeNull();
+    expect((outcome.error as NodeJS.ErrnoException).code).toBe('EUNRECORDED');
+    expect(((outcome.error as Error).cause as Error).message).toBe('database is locked');
+    expect(groupAlive(group!.pgid)).toBe(false);
+  });
+
   it('stops a group whose output exceeds the limit', async () => {
     const outcome = await runInProcessGroup('sh', ['-c', 'while :; do echo xxxxxxxxxxxxxxxx; done'],
       { env, timeoutMs: 30_000, maxBuffer: 1024 });
