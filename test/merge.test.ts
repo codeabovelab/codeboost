@@ -4,6 +4,7 @@ import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
 import { Store, mergeActionResponse } from '../runner/store.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 const sha = (digit: string) => digit.repeat(40);
@@ -446,6 +447,45 @@ it('answers resend when the attempt cannot be stored at admission', async () => 
     expect(error).toBeInstanceOf(MergeNotApplied);
     expect(h.store.savedAction(h.identity, { actionId, kind: 'merge', request: { token } })).toBeUndefined();
     expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+// Another coordinator on this database saves the click between this coordinator's replay lookup and its save.
+function missEarlyLookups(h: ReturnType<typeof queueHarness>, misses: number) {
+  const savedAction = h.store.savedAction.bind(h.store);
+  let calls = 0;
+  h.store.savedAction = vi.fn((...args: Parameters<typeof savedAction>) => ++calls <= misses ? undefined : savedAction(...args)) as typeof savedAction;
+}
+
+it('answers with a success another coordinator saved while this one was refusing the same click', async () => {
+  const h = queueHarness([]);
+  const actionId = randomUUID(), token = h.view().token;
+  const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
+  h.store.userAction(h.identity, { actionId, kind: 'merge', request: { token } },
+    () => mergeActionResponse(h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_other', 'queue', actionId)));
+  missEarlyLookups(h, 2);
+  h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
+  try {
+    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    expect(h.merges).toEqual([]);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('answers with a refusal another coordinator saved while this one was refusing a second click', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  let release!: () => void;
+  h.client.merge = vi.fn(async head => { await new Promise<void>(resolve => { release = resolve; }); h.merges.push(head); return { url: 'https://github.example/pr/1' }; });
+  const second = randomUUID(), token = h.view().token;
+  try {
+    const first = h.coordinator.merge(token, randomUUID());
+    await vi.waitFor(() => expect(h.client.merge).toHaveBeenCalledOnce());
+    expect(() => h.store.userAction(h.identity, { actionId: second, kind: 'merge', request: { token } },
+      () => { throw new GuardRefusal('Refused by the other coordinator.'); })).toThrow();
+    missEarlyLookups(h, 1);
+    await expect(h.coordinator.merge(token, second)).rejects.toThrow('Refused by the other coordinator.');
+    release();
+    await first;
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 

@@ -155,7 +155,8 @@ export class MergeCoordinator {
     if (this.#closing) throw new MergeNotApplied('Merge coordinator is shutting down.');
     if (this.#active) {
       const refusal = new Error('A merge attempt is already running.');
-      if (typeof token === 'string' && typeof actionId === 'string') this.#recordRefusal({ actionId, kind: 'merge', request: { token } }, refusal);
+      const saved = typeof token === 'string' && typeof actionId === 'string' ? this.#recordRefusal(token, actionId, refusal) : undefined;
+      if (saved) return saved;
       throw refusal;
     }
     if (typeof token !== 'string') throw new Error('Stale review state. Refresh before merging.');
@@ -172,16 +173,27 @@ export class MergeCoordinator {
     return attempt;
   }
 
-  /** Save a definite refusal as this click's outcome, so a resend replays it instead of being evaluated again. */
-  #recordRefusal(action: { actionId: string; kind: string; request: unknown } | null, refusal: unknown): void {
-    if (!action || !this.service.store || !this.service.config) return;
-    try { this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; }); }
-    catch (error) {
+  /**
+   * Save a definite refusal as this click's outcome, so a resend replays it instead of being evaluated again.
+   * Returns undefined when this refusal was saved (the caller answers with it). If another coordinator saved the
+   * click first, its outcome is the answer: a saved success comes back as a replay, a saved refusal or a reused key
+   * is thrown.
+   */
+  #recordRefusal(token: string, actionId: string, refusal: unknown): ReturnType<MergeCoordinator['merge']> | undefined {
+    if (!this.service.store || !this.service.config) return undefined;
+    const action = { actionId, kind: 'merge', request: { token } };
+    try {
+      // Returning normally means userAction replayed a success saved concurrently: answer from that record.
+      this.service.store.userAction(this.service.config.identity, action, () => { throw refusal; });
+      return this.#replay(token, actionId);
+    } catch (error) {
       // A storage error, whether it was the refusal itself or the failed save, recorded nothing: resend.
       if (storageError(refusal) || storageError(error)) throw new MergeNotApplied('The merge outcome could not be saved. Try again.', { cause: error });
-      // userAction re-raises the refusal once saved, or a saved outcome's refusal for this key: both are settled.
-      if (error === refusal || error instanceof GuardRefusal) return;
-      // Anything else (a busy or failed database) left the refusal unsaved: nothing was applied, so resend.
+      // userAction re-raised this refusal after saving it.
+      if (error === refusal) return undefined;
+      // A refusal saved concurrently under this key, or the key reused for another request: that is the answer.
+      if (error instanceof GuardRefusal) throw error;
+      // Anything else left the refusal unsaved: nothing was applied, so resend.
       throw new MergeNotApplied('The merge refusal could not be saved. Try again.', { cause: error });
     }
   }
@@ -283,9 +295,8 @@ export class MergeCoordinator {
       // shutdown applied nothing for a passing reason, so the same click may be sent again.
       if (!queueAttempt && !signal.aborted && action) {
         // If another coordinator saved this click meanwhile, its outcome is the answer, not this refusal.
-        const replay = this.#replay(token, action.actionId);
+        const replay = this.#replay(token, action.actionId) ?? this.#recordRefusal(token, action.actionId, error);
         if (replay) return await replay;
-        this.#recordRefusal(action, error);
       }
       // Before admission an abort applied nothing, so the click may be resent (503). After admission the GitHub outcome
       // is unknown: the durable attempt stays in flight and reconciles on refresh, so report the original error.
