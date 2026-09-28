@@ -318,7 +318,11 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     catch (cleanupError) {
       // The claim is kept: a killed create may still land under this allocation ID.
       throw new VendorNetworkCreationCleanupError(error, cleanupError,
-        (budgetMs = 30_000) => cleanupPlannedResources(deadline(budgetMs)),
+        // A retry that settles releases the claim; one that still fails keeps it.
+        async (budgetMs = 30_000) => {
+          await cleanupPlannedResources(deadline(budgetMs));
+          releaseAllocationId(allocationId);
+        },
         () => networkResources(name, proxyContainer, owner, networkId, proxyId)
           .filter(resource => mayExist(resource.kind)));
     }

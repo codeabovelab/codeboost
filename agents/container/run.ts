@@ -129,15 +129,16 @@ const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle =
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Id?: string; Config?: { Labels?: Record<string, string> } } | undefined;
-  // A container found by name (its create's ID never came back) must carry every label this profile wrote.
-  const expected = capturedId ? { 'io.codeboost.invocation': profile.ownershipId }
-    : containerLabels.get(profile) ?? {};
-  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
-    || Object.entries(expected).some(([label, value]) => inspected.Config?.Labels?.[label] !== value))
+  // A captured ID proves the container is the one this profile created (Docker never reuses IDs), so it is removed
+  // even if validation refused its labels. A container found by name (its create's ID never came back) must carry
+  // every label this profile wrote.
+  const expected = containerLabels.get(profile) ?? { 'io.codeboost.invocation': profile.ownershipId };
+  if (!capturedId && (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
+    || Object.entries(expected).some(([label, value]) => inspected?.Config?.Labels?.[label] !== value)))
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
   // Remove and confirm by the ID the daemon just reported for our container, never by the name: a same-named
   // replacement created after this inspect must not be deleted.
-  const id = inspected.Id;
+  const id = inspected?.Id;
   if (!id || !DOCKER_ID.test(id) || (capturedId && id !== capturedId))
     throw new Error('Failed to establish the agent container identity; staged credentials were retained.');
   const result = await runDocker(['rm', '--force', id], { timeoutMs: remaining() });

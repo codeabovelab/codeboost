@@ -658,6 +658,39 @@ describe('real Docker agent isolation', () => {
     } finally { spawnSync('docker', ['rm', '--force', filesystems.keeper], { stdio: 'ignore' }); }
   }, 60_000);
 
+  it('removes an agent container by its captured ID even when validation refused its invocation label', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
+    // The create lands with the wrong invocation label but reports its ID, so the ID alone proves it is ours.
+    const mislabelled = [
+      "const at = args.findIndex(arg => arg.startsWith('io.codeboost.invocation='));",
+      "args[at] = 'io.codeboost.invocation=someone-else';",
+      'result = run(args);',
+    ].join('\n');
+    try {
+      await withDockerShim(['create', '--name'], mislabelled, () =>
+        expect(createValidatedContainer(live)).rejects.toThrow('lockdown'));
+      expect(spawnSync('docker', ['container', 'inspect', live.name]).status).not.toBe(0);
+    } finally { spawnSync('docker', ['rm', '--force', live.name], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('releases a network allocation claim once a failed setup cleanup is retried successfully', async () => {
+    const data = fixture(), allocationId = randomUUID(), marker = join(data.root, 'network-rm-failed');
+    // The proxy create is refused, and the first network removal fails, so setup cleanup does not settle.
+    const failing = [
+      "if (args[0] === 'create' && args[1] === '--name') result = { status: 1, stdout: '', stderr: 'refused' };",
+      `else if (args[0] === 'network' && args[1] === 'rm' && !require('node:fs').existsSync(${JSON.stringify(marker)})) {`,
+      `  require('node:fs').writeFileSync(${JSON.stringify(marker)}, ''); result = { status: 1, stdout: '', stderr: 'busy' }; }`,
+      'else result = run(args);',
+    ].join('\n');
+    const failed = await withDockerShim([], failing, () =>
+      createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId).then(() => undefined, error => error));
+    expect(failed).toBeInstanceOf(VendorNetworkCreationCleanupError);
+    await (failed as VendorNetworkCreationCleanupError).retryCleanup();
+    // Nothing carries the ID any more, and the claim is released, so the ID is usable again.
+    const again = await createVendorNetwork(invocation(data.clone, 'planning'), imageId, allocationId);
+    vendorNetworks.push(again);
+  }, 120_000);
+
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {
     const data = fixture(), filesystems = data.filesystems, owner = taskFilesystemOwner(filesystems);
     taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
