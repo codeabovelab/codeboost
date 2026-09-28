@@ -188,7 +188,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   let networkPlanned = false, proxyPlanned = false;
   // IDs of the objects this call created; cleanup targets these, and names only for a create whose ID never returned.
   let networkId: string | undefined, proxyId: string | undefined, registered: VendorNetwork | undefined;
-  const unsettled = new Set<string>();
+  const unsettled = new Set<string>(), created = new Set<string>();
   const createdId = (value: string, kind: string) => {
     if (!/^[0-9a-f]{64}$/.test(value)) throw new Error(`Docker did not return the created ${kind} ID.`);
     return value;
@@ -196,8 +196,11 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.
   const create = async (object: string, args: readonly string[]) => {
     const timeout = remaining();
-    try { return await docker(args, timeout, signal); }
-    catch (error) {
+    try {
+      const output = await docker(args, timeout, signal);
+      created.add(object);
+      return output;
+    } catch (error) {
       if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
       throw error;
     }
@@ -206,6 +209,11 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   // creates get a settle window, bounded by whatever that budget has left.
   // Objects whose removal (or absence) cleanup has confirmed.
   let proxyGone = false, networkGone = false;
+  // An object may exist only if its create succeeded or its client was killed before the daemon answered; a create
+  // the daemon refused made nothing.
+  const mayExist = (kind: UnreleasedResource['kind']) => kind === 'network'
+    ? networkPlanned && !networkGone && (created.has(name) || unsettled.has(name))
+    : proxyPlanned && !proxyGone && (created.has(proxyContainer) || unsettled.has(proxyContainer));
   const cleanupPlannedResources = async (budget: () => number = deadline(30_000)) => {
     let budgetLeft = 0;
     try { budgetLeft = budget(); } catch { /* the budget is spent */ }
@@ -214,6 +222,9 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     const failures: unknown[] = [];
     // Target the created IDs; names only for a create whose ID never came back, which alone gets a settle window.
     const proxyTarget = proxyId ?? proxyContainer, networkTarget = networkId ?? name;
+    // A create the daemon refused made nothing, so its name (which may belong to someone else) is not touched.
+    if (!mayExist('container')) proxyGone = true;
+    if (!mayExist('network')) networkGone = true;
     if (proxyPlanned && !proxyGone) try {
       await remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
         budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer));
@@ -261,10 +272,6 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     if (registered) identities.delete(registered);
     try { await cleanupPlannedResources(overall); }
     catch (cleanupError) {
-      // An object may exist only if its create returned an ID or its client was killed before the daemon answered.
-      const mayExist = (kind: UnreleasedResource['kind']) => kind === 'network'
-        ? networkPlanned && !networkGone && (networkId !== undefined || unsettled.has(name))
-        : proxyPlanned && !proxyGone && (proxyId !== undefined || unsettled.has(proxyContainer));
       throw new VendorNetworkCreationCleanupError(error, cleanupError,
         (budgetMs = 30_000) => cleanupPlannedResources(deadline(budgetMs)),
         () => networkResources(name, proxyContainer, allocationId, networkId, proxyId)
