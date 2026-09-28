@@ -269,7 +269,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
       '--entrypoint', 'sleep', imageId, 'infinity']);
     if (!DOCKER_ID.test(keeperId)) throw new Error('Docker did not return the created keeper ID.');
     docker(['start', keeperId], remaining());
-    allocate(seeder, ['run', '--rm', '--name', seeder, ...labels,
+    allocate(seeder, ['run', '--rm', '--name', seeder, '--label', 'io.codeboost.task-storage=seeder', ...labels,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
@@ -291,8 +291,75 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   }
 }
 
-export function removeTaskFilesystems(filesystems: TaskFilesystems): void {
-  assertTaskFilesystems(filesystems);
-  cleanup([filesystems.keeper], [filesystems.metadataVolume, filesystems.workVolume], taskFilesystemOwner(filesystems));
-  allocations.delete(filesystems);
+/**
+ * Task storage that `recoverLeftovers` found after a restart, when the `TaskFilesystems` value that allocated it is
+ * gone. A crash during allocation can leave any subset of the parts, so each is optional. D issues a handle only after
+ * checking that every part carries this runner, attempt and allocation, and only a handle D issued is accepted.
+ */
+export interface RecoveredTaskStorage {
+  readonly runnerOwner: string;
+  readonly attemptId: string;
+  readonly allocationId: string;
+  readonly workVolume?: string;
+  readonly metadataVolume?: string;
+  readonly keeper?: string;
+}
+export type TaskStorageParts = Pick<RecoveredTaskStorage, 'workVolume' | 'metadataVolume' | 'keeper'>;
+const recoveredStorage = new WeakMap<RecoveredTaskStorage, ResourceOwner>();
+const STORAGE_PARTS = Object.freeze([
+  ['workVolume', 'volume', 'work', /^codeboost-work-[0-9a-f-]{36}$/],
+  ['metadataVolume', 'volume', 'metadata', /^codeboost-metadata-[0-9a-f-]{36}$/],
+  ['keeper', 'container', 'keeper', /^codeboost-keeper-[0-9a-f-]{36}$/],
+] as const);
+
+/**
+ * Issue a recovery handle for task storage left by an earlier process. Each named part is inspected now and must be
+ * the task-storage object of its kind carrying all three owner labels; otherwise nothing is issued.
+ */
+export function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: TaskStorageParts,
+  timeoutMs = 30_000): RecoveredTaskStorage {
+  owner = assertResourceOwner(owner);
+  const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
+  for (const [field, object, kind, pattern] of STORAGE_PARTS) {
+    const name = parts[field];
+    if (name === undefined) continue;
+    if (typeof name !== 'string' || !pattern.test(name)) throw new Error(`Recovered task ${kind} has an unexpected name.`);
+    const inspect = spawnSync('docker', [object, 'inspect', name], { encoding: 'utf8', timeout: remaining(),
+      killSignal: 'SIGKILL', env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    if (inspect.status !== 0) throw new Error(`Recovered task ${kind} could not be inspected.`);
+    const inspected = JSON.parse(String(inspect.stdout || '[]'))[0] as
+      { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    const labels = inspected?.Labels ?? inspected?.Config?.Labels;
+    if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
+      throw new Error(`Recovered task ${kind} does not carry this owner's task-storage labels.`);
+    found[field] = name;
+  }
+  if (!Object.keys(found).length) throw new Error('Recovered task storage names no parts.');
+  const handle: RecoveredTaskStorage = Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId,
+    allocationId: owner.allocationId, ...found });
+  recoveredStorage.set(handle, owner);
+  return handle;
+}
+
+/** Whether a value is a recovery handle D issued and has not yet released. */
+export const isRecoveredTaskStorage = (value: unknown): value is RecoveredTaskStorage =>
+  typeof value === 'object' && value !== null && recoveredStorage.has(value as RecoveredTaskStorage);
+
+/**
+ * Remove task storage: the value `prepareTaskFilesystems` returned, or a recovery handle from `recoverLeftovers`.
+ * Every part must still carry its owner labels; the handle stays valid until removal is confirmed.
+ */
+export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTaskStorage): void {
+  const recovered = recoveredStorage.get(filesystems as RecoveredTaskStorage);
+  if (recovered) {
+    const handle = filesystems as RecoveredTaskStorage;
+    cleanup(handle.keeper ? [handle.keeper] : [],
+      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered);
+    recoveredStorage.delete(handle);
+    return;
+  }
+  const allocated = filesystems as TaskFilesystems;
+  assertTaskFilesystems(allocated);
+  cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], taskFilesystemOwner(allocated));
+  allocations.delete(allocated);
 }
