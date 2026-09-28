@@ -717,6 +717,10 @@ describe('real Docker agent isolation', () => {
 
   it('recovers only its own runner after a restart, keeping its storage for removal by handle', async () => {
     const data = fixture(), runners = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')] as const;
+    // Every object is registered for cleanup as soon as it exists, so a failure anywhere in setup leaks nothing.
+    // Cleanup runs in reverse: containers go before the networks and volumes they use.
+    const undo: (() => unknown)[] = [];
+    const quietly = (...args: string[]) => () => spawnSync('docker', args, { stdio: 'ignore' });
     const exists = (kind: 'container' | 'volume' | 'network', ref: string) =>
       spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status === 0;
     const label = (labels: Record<string, string>) => Object.entries(labels).flatMap(([key, value]) =>
@@ -727,17 +731,25 @@ describe('real Docker agent isolation', () => {
     const crashed = (runnerOwner: string) => {
       const attemptId = `crashed-${randomUUID()}`, owner = (allocation: string) => ({ 'io.codeboost.runner': runnerOwner,
         'io.codeboost.attempt': attemptId, 'io.codeboost.allocation': allocation });
+      const volume = (name: string, labels: Record<string, string>) => {
+        undo.push(quietly('volume', 'rm', '--force', name));
+        docker('volume', 'create', ...label(labels), name);
+      };
+      const container = (name: string, ...args: string[]) => {
+        undo.push(quietly('rm', '--force', name));
+        docker(...args);
+      };
       const storage = (withKeeper: boolean) => {
         const allocation = randomUUID(), work = `codeboost-work-${randomUUID()}`, metadata = `codeboost-metadata-${randomUUID()}`;
-        docker('volume', 'create', ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'work' }), work);
-        docker('volume', 'create', ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'metadata' }), metadata);
+        volume(work, { ...owner(allocation), 'io.codeboost.task-storage': 'work' });
+        volume(metadata, { ...owner(allocation), 'io.codeboost.task-storage': 'metadata' });
         const mounts = ['--mount', `type=volume,source=${work},target=/work`, '--mount',
           `type=volume,source=${metadata},target=/metadata`];
         const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
         if (withKeeper) {
-          docker('run', '--detach', '--name', keeper, '--network=none', ...mounts,
+          container(keeper, 'run', '--detach', '--name', keeper, '--network=none', ...mounts,
             ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'keeper' }), '--entrypoint', 'sleep', imageId, 'infinity');
-          docker('create', '--name', seeder, '--network=none', ...mounts,
+          container(seeder, 'create', '--name', seeder, '--network=none', ...mounts,
             ...label({ ...owner(allocation), 'io.codeboost.task-storage': 'seeder' }), '--entrypoint', 'true', imageId);
         }
         return { allocation, work, metadata, keeper: withKeeper ? keeper : undefined, seeder: withKeeper ? seeder : undefined };
@@ -746,9 +758,11 @@ describe('real Docker agent isolation', () => {
       const egress = randomUUID(), network = `codeboost-egress-codex-${randomUUID()}`;
       const proxy = `codeboost-proxy-codex-${randomUUID()}`, agent = `codeboost-agent-${randomUUID()}`;
       const egressLabels = { ...owner(egress), 'io.codeboost.egress': egress };
+      undo.push(quietly('network', 'rm', network));
       docker('network', 'create', '--internal', ...label(egressLabels), network);
-      docker('create', '--name', proxy, '--network', network, ...label(egressLabels), '--entrypoint', 'true', imageId);
-      docker('create', '--name', agent, '--network', network, '--mount', `type=volume,source=${full.work},target=/work`,
+      container(proxy, 'create', '--name', proxy, '--network', network, ...label(egressLabels), '--entrypoint', 'true', imageId);
+      container(agent, 'create', '--name', agent, '--network', network, '--mount',
+        `type=volume,source=${full.work},target=/work`,
         ...label({ ...owner(full.allocation), 'io.codeboost.invocation': randomUUID() }), '--entrypoint', 'true', imageId);
       return { attemptId, full, partial, network, proxy, agent };
     };
@@ -760,22 +774,23 @@ describe('real Docker agent isolation', () => {
           stateVersion: 1 } });
       const storage = prepareTaskFilesystems(data.clone, storageLimits, imageId,
         { runnerOwner, attemptId: captured.attemptId, allocationId: randomUUID() });
+      undo.push(() => removeTaskFilesystems(storage));
       const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId, randomUUID());
+      undo.push(() => removeVendorNetwork(network));
       const profile = await createContainerProfile({ invocation: captured, policy, network, filesystems: storage,
         inputDirectory: data.input, command: createIsolationProbeCommand(policy, 'noop'), imageId,
         codexAuthFile: data.fakeAuth });
       profiles.push(profile);
+      undo.push(() => disposeValidatedContainer(profile));
       await createValidatedContainer(profile);
       return { storage, network, profile };
     };
-    const mine = crashed(runners[0]), theirs = await live(runners[1]);
-    // An object from a build before runner labels.
-    const legacy = `codeboost-work-legacy-${randomUUID()}`;
-    docker('volume', 'create', '--label', `io.codeboost.allocation=${randomUUID()}`, legacy);
-    const leftovers = [['container', mine.agent], ['container', mine.proxy], ['network', mine.network],
-      ['container', mine.full.keeper!], ['container', mine.full.seeder!], ['volume', mine.full.work],
-      ['volume', mine.full.metadata], ['volume', mine.partial.work], ['volume', mine.partial.metadata]] as const;
     try {
+      const mine = crashed(runners[0]), theirs = await live(runners[1]);
+      // An object from a build before runner labels.
+      const legacy = `codeboost-work-legacy-${randomUUID()}`;
+      undo.push(quietly('volume', 'rm', '--force', legacy));
+      docker('volume', 'create', '--label', `io.codeboost.allocation=${randomUUID()}`, legacy);
       // A runner with live storage in this process is refused: its agents would be removed under it.
       await expect(recoverLeftovers(runners[1])).rejects.toThrow('still holds task storage');
       const report = await recoverLeftovers(runners[0]);
@@ -797,18 +812,19 @@ describe('real Docker agent isolation', () => {
         removeTaskFilesystems(handle);
         expect(isRecoveredTaskStorage(handle)).toBe(false);
       }
-      for (const [kind, ref] of leftovers) expect(exists(kind, ref)).toBe(false);
+      for (const [kind, ref] of [['container', mine.full.keeper!], ['volume', mine.full.work],
+        ['volume', mine.full.metadata], ['volume', mine.partial.work], ['volume', mine.partial.metadata]] as const)
+        expect(exists(kind, ref)).toBe(false);
       // The other runner's objects are untouched.
       for (const [kind, ref] of [['container', theirs.profile.name], ['container', theirs.network.proxyContainer],
         ['network', theirs.network.name], ['container', theirs.storage.keeper], ['volume', theirs.storage.workVolume],
         ['volume', theirs.storage.metadataVolume]] as const) expect(exists(kind, ref)).toBe(true);
     } finally {
-      for (const [kind, ref] of leftovers) if (kind !== 'network')
-        spawnSync('docker', kind === 'volume' ? ['volume', 'rm', '--force', ref] : ['rm', '--force', ref], { stdio: 'ignore' });
-      spawnSync('docker', ['network', 'rm', mine.network], { stdio: 'ignore' });
-      spawnSync('docker', ['volume', 'rm', '--force', legacy], { stdio: 'ignore' });
-      await disposeValidatedContainer(theirs.profile);
-      removeTaskFilesystems(theirs.storage);
+      const failures: unknown[] = [];
+      for (const step of undo.reverse()) {
+        try { await step(); } catch (error) { failures.push(error); }
+      }
+      if (failures.length) throw new AggregateError(failures, 'Recovery test cleanup failed.');
     }
   }, 180_000);
 

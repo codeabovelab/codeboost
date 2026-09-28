@@ -4,7 +4,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 // A fake Docker daemon behind both CLI entry points recovery uses: execFile (runDocker) and spawnSync (storage).
 interface FakeObject { kind: 'container' | 'volume' | 'network'; id?: string; name: string; labels: Record<string, string> }
 const daemon = vi.hoisted(() => ({ objects: [] as FakeObject[], refuseRemoval: new Set<string>(), calls: [] as string[][],
-  failSingleInspect: new Set<string>() }));
+  failSingleInspect: new Set<string>(), vanishOnInspect: new Set<string>(), brokenInspect: new Set<string>() }));
 const answer = (args: string[]): { status: number; stdout: string; stderr: string } => {
   daemon.calls.push(args);
   const kindOf = (word: string) => word === 'ps' || word === 'container' || word === 'rm' ? 'container' : word;
@@ -19,6 +19,13 @@ const answer = (args: string[]): { status: number; stdout: string; stderr: strin
     return { status: 0, stdout: matches.map(object => kind === 'volume' ? object.name : object.id ?? object.name).join('\n'), stderr: '' };
   }
   if (args[1] === 'inspect') {
+    // Another process removes this object after the scan listed it, just before the inspect reaches the daemon.
+    for (const ref of args.slice(2)) if (daemon.vanishOnInspect.has(ref)) {
+      daemon.vanishOnInspect.delete(ref);
+      daemon.objects = daemon.objects.filter(object => object.id !== ref && object.name !== ref);
+    }
+    if (args.slice(2).some(ref => daemon.brokenInspect.has(ref)))
+      return { status: 1, stdout: '', stderr: 'Error response from daemon: i/o timeout' };
     // Only a one-object inspect (storage adoption) fails, as when the daemon stops answering mid-recovery.
     if (args.length === 3 && daemon.failSingleInspect.has(args[2]!))
       return { status: 1, stdout: '', stderr: 'Cannot connect to the Docker daemon' };
@@ -76,6 +83,7 @@ const names = (kind?: FakeObject['kind']) => daemon.objects.filter(object => !ki
 describe('recoverLeftovers', () => {
   beforeEach(() => {
     daemon.objects = []; daemon.refuseRemoval = new Set(); daemon.calls = []; daemon.failSingleInspect = new Set();
+    daemon.vanishOnInspect = new Set(); daemon.brokenInspect = new Set();
   });
 
   it('removes only its own runtime objects, keeps its storage whole, and never touches another runner', async () => {
@@ -182,6 +190,27 @@ describe('recoverLeftovers', () => {
     daemon.failSingleInspect.add(mine.objects[0]!.name);
     await expect(recoverLeftovers(A)).rejects.toThrow('could not be inspected');
     expect(names('volume')).toHaveLength(2);
+  });
+
+  it('skips another runner\'s object that is removed between the scan and the inspect', async () => {
+    const mine = attempt(A, 'attempt-a'), theirs = attempt(B, 'attempt-b');
+    const legacy: FakeObject = { kind: 'container', id: id(), name: 'codeboost-agent-old',
+      labels: { 'io.codeboost.invocation': 'old' } };
+    daemon.objects.push(legacy);
+    // B's seeder finishes and removes itself while A's recovery is scanning the whole daemon.
+    const [, , , seeder] = theirs.objects;
+    daemon.vanishOnInspect.add(seeder!.id!);
+    const report = await recoverLeftovers(A);
+    expect(report.storage).toHaveLength(1);
+    expect(report.removed).toHaveLength(4);
+    expect(report.unowned).toMatchObject([{ name: legacy.name, reason: 'no-runner-label' }]);
+    expect(names()).not.toContain(mine.objects[4]!.name);
+  });
+
+  it('still fails closed when an inspect fails for a reason other than the object being gone', async () => {
+    const theirs = attempt(B, 'attempt-b');
+    daemon.brokenInspect.add(theirs.objects[3]!.id!);
+    await expect(recoverLeftovers(A)).rejects.toThrow('could not inspect');
   });
 
   it('fails closed on a container the daemon reports without an ID', async () => {

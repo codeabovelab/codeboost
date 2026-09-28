@@ -63,7 +63,7 @@ const deadline = (timeoutMs: number) => {
   };
 };
 const absent = (result: DockerOutcome) => result.status !== 0 && result.status !== null && !result.error
-  && /(?:No such (?:object|container|network)|network .* not found)/i.test(`${result.stdout}\n${result.stderr}`);
+  && /(?:No such (?:object|container|network|volume)|network .* not found)/i.test(`${result.stdout}\n${result.stderr}`);
 
 type Kind = RecoveredResource['kind'];
 const listArgs = (kind: Kind, filter: string): string[] => kind === 'container'
@@ -83,11 +83,23 @@ const inspect = async (kind: Kind, refs: readonly string[], remaining: () => num
     found.push(...await inspectBatch(kind, refs.slice(start, start + INSPECT_BATCH), remaining));
   return found;
 };
+type Inspected = { Id?: string; Name?: string; Labels?: Record<string, string> | null;
+  Config?: { Labels?: Record<string, string> | null } };
+// The daemon-wide scans list other runners' objects too, and those can be removed between the list and the inspect.
+// A batch that fails is inspected one object at a time: an object Docker confirms is gone is skipped, and any other
+// failure still fails closed.
 const inspectBatch = async (kind: Kind, refs: readonly string[], remaining: () => number) => {
   const result = await runDocker([kind, 'inspect', ...refs], { timeoutMs: remaining() });
-  if (result.status !== 0) throw new Error(`Recovery could not inspect ${kind}s; run it again.`);
-  const objects = JSON.parse(result.stdout || '[]') as Array<{ Id?: string; Name?: string;
-    Labels?: Record<string, string> | null; Config?: { Labels?: Record<string, string> | null } }>;
+  let objects: Inspected[];
+  if (result.status === 0) objects = JSON.parse(result.stdout || '[]') as Inspected[];
+  else {
+    objects = [];
+    for (const ref of refs) {
+      const single = await runDocker([kind, 'inspect', ref], { timeoutMs: remaining() });
+      if (single.status === 0) objects.push(...JSON.parse(single.stdout || '[]') as Inspected[]);
+      else if (!absent(single)) throw new Error(`Recovery could not inspect ${kind}s; run it again.`);
+    }
+  }
   return objects.map(object => {
     // Containers and networks are removed by ID, so a missing or short one fails closed.
     const id = kind === 'volume' ? undefined : object.Id;
