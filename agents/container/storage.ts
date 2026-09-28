@@ -525,7 +525,8 @@ export interface ExportOptions extends PreparationOptions {
 // and an untracked nested repository, which Git cannot diff, is named in the output rather than skipped. Output stops at
 // `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
 // Every stage's status is checked: a Git failure fails the export instead of passing off partial output as the diff;
-// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit.
+// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. A worktree with a directory
+// or file the export cannot read is refused, since Git would diff it as absent rather than fail.
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
 // read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
 // diff programs and text conversion are off, and the worktree and attributes file are pinned.
@@ -537,11 +538,17 @@ const EXPORT_SCRIPT = [
   'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
   '  -c core.attributesFile=/dev/null "$@"; }',
   'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
+  '# Git only warns about a directory or file it cannot read, then diffs as if it were absent: untracked files vanish and',
+  '# tracked ones show as deleted. Refuse such a worktree instead of exporting a wrong diff.',
+  'unreadable=$(find . -path ./.git -prune -o \\( -type d ! \\( -readable -executable \\) \\) -print -quit \\',
+  '  -o \\( ! -type d ! -type l ! -readable \\) -print -quit)',
+  'if [ -n "$unreadable" ]; then echo "cannot read $unreadable in the task worktree; the diff cannot be exported" >&2; exit 6; fi',
   'produce() {',
-  '  set -e',
+  '  set -eo pipefail',
   '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" --',
   '  g ls-files -z --others --exclude-standard | while IFS= read -r -d "" path; do',
-  '    if [ -d "$path" ]; then',
+  '    # A symlink to a directory is diffed as the link it is; only a real directory is a nested repository.',
+  '    if [ -d "$path" ] && [ ! -L "$path" ]; then',
   '      printf "codeboost: untracked directory %s is a nested repository; its contents are not exported\\n" "$path"',
   '      continue',
   '    fi',

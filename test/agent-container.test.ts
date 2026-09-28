@@ -750,7 +750,7 @@ describe('real Docker agent isolation', () => {
       'printf "committed\\n" > committed.txt', 'g add committed.txt', 'g commit -qm agent',
       'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
       'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
-      'mkdir nested', '(cd nested && git init -q)', extra].join('\n'));
+      'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link', extra].join('\n'));
   // Every file and directory in both volumes, with its metadata and contents, read without writing.
   const storageSnapshot = (filesystems: ReturnType<typeof prepareTaskFilesystems>) => docker('run', '--rm',
     '--network=none', '--user', '10001:10001',
@@ -770,6 +770,10 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('b/binary.dat');
     expect(text).toContain('GIT binary patch');
     expect(text).toContain('untracked directory nested/ is a nested repository');
+    // A symlink to a directory is diffed as a link, not mistaken for a nested repository.
+    expect(text).toContain('b/dir-link');
+    expect(text).toContain('new file mode 120000');
+    expect(text).not.toContain('dir-link is a nested repository');
     // The agent's own commit, an unstaged edit and an untracked file all appear against the base.
     expect(text).toContain('b/committed.txt');
     expect(text).toContain('+committed');
@@ -781,9 +785,14 @@ describe('real Docker agent isolation', () => {
     expect(cut).toEqual({ diff: exported.diff.subarray(0, 20), truncated: true });
     await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');
     // A Git failure part-way through fails the export; it is never passed off as a complete diff.
-    const failing = fixture();
-    agentChanges(failing.filesystems, 'printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt');
-    await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('git failed');
+    // Anything the export cannot read fails it: Git would otherwise drop untracked files or show tracked ones as deleted.
+    for (const extra of ['printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt',
+      'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden',
+      'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked']) {
+      const failing = fixture();
+      agentChanges(failing.filesystems, extra);
+      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/cannot read|git failed/);
+    }
     // No export container is left, and the storage still validates for the next launch.
     expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
       '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');
