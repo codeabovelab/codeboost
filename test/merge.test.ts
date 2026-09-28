@@ -489,6 +489,25 @@ it('answers with a refusal another coordinator saved while this one was refusing
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('answers resend when the saved outcome cannot be re-read after the replay refresh', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  const actionId = randomUUID(), token = h.view().token;
+  try {
+    await h.coordinator.merge(token, actionId);
+    const savedAction = h.store.savedAction.bind(h.store);
+    let calls = 0;
+    // The replay's first read succeeds; the re-read after its status refresh hits a locked database.
+    h.store.savedAction = vi.fn((...args: Parameters<typeof savedAction>) => {
+      if (++calls === 2) throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' });
+      return savedAction(...args);
+    }) as typeof savedAction;
+    const error = await h.coordinator.merge(token, actionId).catch(value => value);
+    expect(error).toBeInstanceOf(MergeNotApplied);
+    expect(calls).toBe(2);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

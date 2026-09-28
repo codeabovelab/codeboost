@@ -223,8 +223,9 @@ export class MergeCoordinator {
     // The saved outcome is committed; a failing local refresh must not turn it into a blocked merge.
     const unavailable = (error: unknown): MergeUnavailableStatus => ({ available: true, ready: false, action: null, remote: null, queue: null,
       blockers: [{ code: 'refresh', message: `Merge was submitted. Refresh to confirm GitHub state. ${error instanceof Error ? error.message : ''}`.trim() }] });
-    // The status refresh may reconcile the attempt (merged URL, queue failure), so answer from the record re-read after it.
-    const current = () => { try { return read()?.response ?? saved.response; } catch { return saved.response; } };
+    // The status refresh may reconcile the attempt (merged URL, queue failure), so answer from the record re-read after
+    // it. A failed re-read is not answered with the older record: read() turns a storage error into "resend" (503).
+    const current = () => read()?.response ?? saved.response;
     let view: ReviewView;
     try { view = this.service.load(); } catch (error) { return Promise.resolve().then(() => answer(current(), unavailable(error))); }
     return this.displayStatus(view).then(status => answer(current(), status), error => answer(current(), unavailable(error)));
