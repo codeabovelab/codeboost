@@ -167,6 +167,16 @@ export interface AsyncCloneOptions extends CloneOptions {
  * group has exited and the partial clone is removed.
  */
 export async function createTaskCloneAsync(options: AsyncCloneOptions): Promise<TaskClone> {
+  const signal = options.signal;
+  try { return await runCloneSteps(options); }
+  catch (error) {
+    // However the abort surfaced (during a call, at a pause, or as the next call refusing to start), it is a cancel.
+    if (signal?.aborted && (error as Error | undefined)?.name !== 'AbortError')
+      throw Object.assign(new Error('Task clone was cancelled.', { cause: error }), { name: 'AbortError', code: 'ABORT_ERR' });
+    throw error;
+  }
+}
+async function runCloneSteps(options: AsyncCloneOptions): Promise<TaskClone> {
   const env = gitEnvironment(), steps = cloneSteps(options), signal = options.signal;
   const aborted = () => Object.assign(new Error('Task clone was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
   if (signal?.aborted) throw aborted();

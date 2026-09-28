@@ -9,12 +9,17 @@ import type { ProcessGroup } from '../agents/process-group.ts';
 // The asynchronous storage allocation (#51 item 5), against a fake Docker CLI that keeps its objects as files, so the
 // abort path runs without a daemon. The real-Docker suite covers the same path against Docker itself.
 // spawn passes through unless a test makes it throw, as it does synchronously for errors such as ENOMEM.
-const spawnFault = vi.hoisted(() => ({ on: undefined as undefined | ((args: readonly string[]) => boolean) }));
+const spawnFault = vi.hoisted(() => ({ on: undefined as undefined | ((args: readonly string[]) => boolean),
+  afterExit: undefined as undefined | ((args: readonly string[]) => void) }));
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return { ...actual, spawn: ((file: string, args: readonly string[], options: object) => {
     if (spawnFault.on?.(args)) throw Object.assign(new Error('spawn ENOMEM'), { code: 'ENOMEM', syscall: 'spawn' });
-    return actual.spawn(file, args, options);
+    const child = actual.spawn(file, args, options);
+    // One turn after the exit, once the helper has finished with this call and before the next one starts.
+    const afterExit = spawnFault.afterExit;
+    if (afterExit) child.once('exit', () => setImmediate(() => afterExit(args)));
+    return child;
   }) as typeof actual.spawn };
 });
 vi.mock('../agents/container/image.ts', async importOriginal => ({
@@ -95,7 +100,7 @@ beforeEach(() => {
   process.env.PATH = `${bin}:${path}`;
 });
 afterEach(() => {
-  spawnFault.on = undefined;
+  spawnFault.on = undefined; spawnFault.afterExit = undefined;
   process.env.PATH = path;
   rmSync(root, { recursive: true, force: true });
 });
@@ -148,6 +153,17 @@ describe('asynchronous task storage allocation', () => {
     // Both volumes are created; spawning the keeper's `docker create` then fails synchronously.
     spawnFault.on = args => args[0] === 'create';
     await expect(prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner())).rejects.toThrow('ENOMEM');
+    expect(stored()).toEqual([]);
+    expect(hasLiveTaskStorage(RUNNER)).toBe(false);
+  });
+
+  it('reports an abort that lands between two Docker calls as a cancel, and removes what it created', async () => {
+    const controller = new AbortController();
+    // Aborted right after the work volume's create exits: the next call (the reuse check) never starts.
+    spawnFault.afterExit = args => { if (args[0] === 'volume' && args[1] === 'create') controller.abort(); };
+    const error = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(), { signal: controller.signal })
+      .then(() => undefined, caught => caught);
+    expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
     expect(stored()).toEqual([]);
     expect(hasLiveTaskStorage(RUNNER)).toBe(false);
   });

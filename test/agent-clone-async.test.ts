@@ -2,8 +2,19 @@ import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
-import { assertTaskClone, createTaskCloneAsync } from '../git/clone.ts';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+
+// spawn passes through; a test can act one turn after a chosen Git call exits, before the next one starts.
+const spawnHook = vi.hoisted(() => ({ afterExit: undefined as undefined | ((args: readonly string[]) => void) }));
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: ((file: string, args: readonly string[], options: object) => {
+    const child = actual.spawn(file, args, options), afterExit = spawnHook.afterExit;
+    if (afterExit) child.once('exit', () => setImmediate(() => afterExit(args)));
+    return child;
+  }) as typeof actual.spawn };
+});
+const { assertTaskClone, createTaskCloneAsync } = await import('../git/clone.ts');
 import type { ProcessGroup } from '../agents/process-group.ts';
 
 // The asynchronous clone (#51 item 5): every Git call runs in its own process group, and an abort settles only after
@@ -35,7 +46,10 @@ const withStubbornClone = async <T>(root: string, started: string, run: () => Pr
   process.env.PATH = `${shim}:${path}`;
   try { return await run(); } finally { process.env.PATH = path; }
 };
-afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => {
+  spawnHook.afterExit = undefined;
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
 
 describe('asynchronous task clone', () => {
   it('clones like the synchronous helper and reports each Git process group, all gone once it settles', async () => {
@@ -71,6 +85,15 @@ describe('asynchronous task clone', () => {
     for (const group of groups) expect(groupAlive(group.pgid)).toBe(false);
     expect(readdirSync(input.parent)).toEqual([]);
   }, 30_000);
+
+  it('reports an abort that lands between two Git calls as a cancel, and removes the partial clone', async () => {
+    const input = fixture(), controller = new AbortController();
+    // Aborted right after `git clone` exits: the next Git call never starts.
+    spawnHook.afterExit = args => { if (args.includes('clone')) controller.abort(); };
+    const error = await createTaskCloneAsync({ ...input, signal: controller.signal }).then(() => undefined, caught => caught);
+    expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    expect(readdirSync(input.parent)).toEqual([]);
+  });
 
   it('spawns nothing and creates nothing when the signal is already aborted', async () => {
     const input = fixture(), groups: ProcessGroup[] = [];

@@ -102,9 +102,11 @@ export function runInProcessGroup(file: string, args: readonly string[],
     let unrecorded: unknown;
     try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
     catch (error) { unrecorded = error; }
-    // Output past the limit stops a running group; once the leader has exited, the excess is only dropped.
+    // Output past the limit stops a running group; once the leader has exited it only drops the excess. Either way the
+    // output is incomplete, so the call settles as ENOBUFS, never as a success.
+    let truncated = false;
     const collect = (chunks: Buffer[], add: (bytes: number) => number) => (chunk: Buffer) => {
-      if (add(chunk.length) > maxBuffer) stop('output-limit');
+      if (add(chunk.length) > maxBuffer) { truncated = true; stop('output-limit'); }
       else chunks.push(chunk);
     };
     child.stdout!.on('data', collect(out, bytes => (outBytes += bytes)));
@@ -161,6 +163,11 @@ export function runInProcessGroup(file: string, args: readonly string[],
         if (stopped === 'cancelled') {
           resolve({ status: null, stdout, stderr, error: Object.assign(new Error(`${file} ${args[0] ?? ''} was cancelled.`),
             { name: 'AbortError', code: 'ABORT_ERR' }) });
+          return;
+        }
+        if (truncated && !stopped) {
+          resolve({ status: null, stdout, stderr, error: Object.assign(
+            new Error(`${file} ${args[0] ?? ''} exceeded its output limit.`), { code: 'ENOBUFS' }) });
           return;
         }
         if (stopped) {

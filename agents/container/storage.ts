@@ -386,7 +386,15 @@ export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: Task
   owner: ResourceOwner, options: PreparationOptions & { readonly timeoutMs?: number } = {}): Promise<TaskFilesystems> {
   if (options.signal?.aborted)
     throw Object.assign(new Error('Task storage allocation was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
-  return runStepsAsync(allocation(clone, limits, imageId, owner, options.timeoutMs ?? 60_000), options);
+  try { return await runStepsAsync(allocation(clone, limits, imageId, owner, options.timeoutMs ?? 60_000), options); }
+  catch (error) {
+    // However the abort surfaced, it is a cancel. A cleanup that did not settle stays an AggregateError: the caller
+    // must still learn what may be left.
+    if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
+      throw Object.assign(new Error('Task storage allocation was cancelled.', { cause: error }),
+        { name: 'AbortError', code: 'ABORT_ERR' });
+    throw error;
+  }
 }
 
 /**
