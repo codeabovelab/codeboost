@@ -113,6 +113,18 @@ describe('recoverLeftovers', () => {
     expect(() => removeTaskFilesystems(handle!)).toThrow('trusted allocator');
   });
 
+  it('removes a recovered keeper by the ID recovery checked, never a same-named replacement', async () => {
+    const mine = attempt(A, 'attempt-a'), keeper = mine.objects[2]!;
+    const { storage: [handle] } = await recoverLeftovers(A);
+    // The keeper is removed and its name reused, with the same labels, before the handle is released.
+    daemon.objects.splice(daemon.objects.indexOf(keeper), 1);
+    const replacement = { ...keeper, id: id(), labels: { ...keeper.labels } };
+    daemon.objects.push(replacement);
+    removeTaskFilesystems(handle!);
+    expect(names()).toEqual([replacement.name]);
+    expect(daemon.calls.some(args => args[0] === 'rm' && args[2] === replacement.id)).toBe(false);
+  });
+
   it('reports objects without a runner label and never removes them', async () => {
     attempt(A, 'attempt-a');
     const legacy: FakeObject[] = [

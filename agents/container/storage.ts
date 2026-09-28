@@ -313,7 +313,9 @@ export interface RecoveredTaskStorage {
   readonly keeper?: string;
 }
 export type TaskStorageParts = Pick<RecoveredTaskStorage, 'workVolume' | 'metadataVolume' | 'keeper'>;
-const recoveredStorage = new WeakMap<RecoveredTaskStorage, ResourceOwner>();
+// Each issued handle's owner, and the keeper's ID from the inspect that checked it: cleanup removes that keeper by ID,
+// so a same-named replacement created later is never touched.
+const recoveredStorage = new WeakMap<RecoveredTaskStorage, { owner: ResourceOwner; keeperId?: string }>();
 /** The daemon answered, and the storage is not what D creates for this owner; unlike a failed inspect, retrying won't help. */
 export class RecoveredStorageRejected extends Error {}
 const STORAGE_PARTS = Object.freeze([
@@ -334,6 +336,7 @@ export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: Tas
   if (liveAllocations.has(owner.allocationId))
     throw new Error('Task storage is still live in this process; only leftovers of an earlier process are recovered.');
   const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
+  let keeperId: string | undefined;
   for (const [field, object, kind, pattern] of STORAGE_PARTS) {
     const name = parts[field];
     if (name === undefined) continue;
@@ -342,16 +345,21 @@ export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: Tas
     const inspect = await runDocker([object, 'inspect', name], { timeoutMs: remaining() });
     if (inspect.status !== 0) throw new Error(`Recovered task ${kind} could not be inspected.`);
     const inspected = JSON.parse(inspect.stdout || '[]')[0] as
-      { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+      { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
     const labels = inspected?.Labels ?? inspected?.Config?.Labels;
     if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
       throw new RecoveredStorageRejected(`Recovered task ${kind} does not carry this owner's task-storage labels.`);
+    if (object === 'container') {
+      if (!inspected?.Id || !DOCKER_ID.test(inspected.Id))
+        throw new RecoveredStorageRejected(`Recovered task ${kind} has no full ID.`);
+      keeperId = inspected.Id;
+    }
     found[field] = name;
   }
   if (!Object.keys(found).length) throw new RecoveredStorageRejected('Recovered task storage names no parts.');
   const handle: RecoveredTaskStorage = Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId,
     allocationId: owner.allocationId, ...found });
-  recoveredStorage.set(handle, owner);
+  recoveredStorage.set(handle, { owner, keeperId });
   return handle;
 }
 
@@ -367,8 +375,8 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
   const recovered = recoveredStorage.get(filesystems as RecoveredTaskStorage);
   if (recovered) {
     const handle = filesystems as RecoveredTaskStorage;
-    cleanup(handle.keeper ? [handle.keeper] : [],
-      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered);
+    cleanup(recovered.keeperId ? [recovered.keeperId] : [],
+      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner);
     recoveredStorage.delete(handle);
     return;
   }
