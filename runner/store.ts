@@ -416,7 +416,9 @@ export class Store {
   saveReview(identity: PlanIdentity, expected: ReviewState, approvals: readonly Approval[], choices: readonly SegmentChoice[]): void {
     const key = identityKey(identity);
     this.#transaction(() => {
-      this.#expect(key, expected); const plan = this.getPlan(identity);
+      this.#expect(key, expected);
+      if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
+      const plan = this.getPlan(identity);
       for (const approval of approvals) {
         if (!plan.items.some(item => item.id === approval.item) || !approval.fingerprint) throw new Error('Invalid approval.');
         this.#run('INSERT OR REPLACE INTO approvals VALUES (?,?,?)', key, approval.item, encode({ ...approval, ...expected }));
@@ -433,6 +435,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
       if (!this.getPlan(identity).items.some(entry => entry.id === item) || !['question', 'change'].includes(kind) || typeof text !== 'string' || !text.trim() || text.length > 4000) throw new Error('Invalid review note.');
       const note = { id: randomUUID(), item, kind, text: text.trim(), ...(reference ? { reference } : {}), createdAt: new Date().toISOString(), revision: expected.revision, snapshotId: expected.snapshotId };
       this.#run('INSERT INTO review_notes VALUES (?,?,?)', key, note.id, encode(note));

@@ -216,6 +216,8 @@ export class MergeCoordinator {
     // A refused or removed merge replays as the failure the first response reported, never as a submission.
     const answer = (response: ReturnType<typeof mergeActionResponse>, status: MergeStatus | MergeUnavailableStatus) => {
       if (response.state === 'failed' || response.state === 'removed') throw new Error(response.reason ?? 'GitHub did not merge this pull request.');
+      // Still submitting after the refresh: GitHub's outcome is unknown, as the first answer said. Keep the key.
+      if (response.state === 'submitting') throw new MergeOutcomeUnknown(response.reason ?? 'The merge outcome is not confirmed yet. Refresh to check GitHub.');
       return { status, result: { url: response.url ?? '' } };
     };
     if (saved.response.state === 'failed' || saved.response.state === 'removed')
@@ -283,10 +285,12 @@ export class MergeCoordinator {
       }
       return { status: commandStatus, result };
     } catch (error) {
+      // GitHub's refusal is definite only once the attempt's failed state (and the click's saved answer) is durable.
+      let refusalSaved = false;
       if (queueAttempt) try {
         const message = error instanceof Error ? error.message : 'GitHub merge submission outcome is unknown.';
         if (error instanceof MergeSubmissionError && error.outcome === 'refused') {
-          this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, {
+          refusalSaved = this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, {
             state: 'failed', reason: message,
             requiresFreshReview: /head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|stale review/i.test(message),
           });
@@ -302,9 +306,9 @@ export class MergeCoordinator {
       // Before admission an abort applied nothing, so the click may be resent (503). After admission the GitHub outcome
       // is unknown: the durable attempt stays in flight and reconciles on refresh, so report the original error.
       if (signal.aborted && !queueAttempt) throw new MergeNotApplied(signal.reason instanceof Error ? signal.reason.message : 'Merge request stopped.', { cause: signal.reason });
-      // After admission only GitHub's confirmed refusal is definite (the attempt is now failed); anything else leaves
-      // the attempt in flight, and the answer must say so.
-      const refused = error instanceof MergeSubmissionError && error.outcome === 'refused';
+      // After admission only GitHub's confirmed refusal, durably recorded, is definite (the attempt is now failed);
+      // anything else, including a refusal whose failed state could not be saved, leaves the attempt in flight.
+      const refused = error instanceof MergeSubmissionError && error.outcome === 'refused' && refusalSaved;
       const failure = signal.aborted && signal.reason instanceof Error ? signal.reason : error;
       if (queueAttempt && !refused) throw new MergeOutcomeUnknown(failure instanceof Error ? failure.message : 'The merge outcome is unknown.', { cause: failure });
       throw failure;

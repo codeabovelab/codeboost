@@ -332,7 +332,7 @@ it('replays a click refused while another merge was running, even after a retry 
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
-it('returns the saved outcome when another coordinator saves the same click during validation', async () => {
+it('answers with the in-flight outcome another coordinator saved for the same click during validation', async () => {
   const h = queueHarness([]);
   const actionId = randomUUID(), token = h.view().token;
   h.client.queueWatermark = vi.fn(async () => {
@@ -343,12 +343,13 @@ it('returns the saved outcome when another coordinator saves the same click duri
     return 'CURSOR_before';
   });
   try {
-    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    // The other click is still submitting, so its outcome is unknown and the key must be kept.
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
     expect(h.merges).toEqual([]);
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
-it('returns the saved outcome when another coordinator saves the click just before admission', async () => {
+it('answers with the in-flight outcome another coordinator saved just before admission', async () => {
   const h = queueHarness([]);
   const actionId = randomUUID(), token = h.view().token;
   const inspect = h.client.inspect;
@@ -365,7 +366,8 @@ it('returns the saved outcome when another coordinator saves the click just befo
     return view;
   });
   try {
-    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    // The other click is still submitting, so its outcome is unknown and the key must be kept.
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
     expect(injected).toBe(true);
     expect(h.merges).toEqual([]);
   } finally { await h.coordinator.close(); h.store.close(); }
@@ -457,7 +459,7 @@ function missEarlyLookups(h: ReturnType<typeof queueHarness>, misses: number) {
   h.store.savedAction = vi.fn((...args: Parameters<typeof savedAction>) => ++calls <= misses ? undefined : savedAction(...args)) as typeof savedAction;
 }
 
-it('answers with a success another coordinator saved while this one was refusing the same click', async () => {
+it('answers with the in-flight outcome another coordinator saved while this one was refusing the same click', async () => {
   const h = queueHarness([]);
   const actionId = randomUUID(), token = h.view().token;
   const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
@@ -466,7 +468,8 @@ it('answers with a success another coordinator saved while this one was refusing
   missEarlyLookups(h, 2);
   h.client.queueWatermark = vi.fn(async () => { h.changeToken('changed-token'); return 'CURSOR_before'; });
   try {
-    await expect(h.coordinator.merge(token, actionId)).resolves.toMatchObject({ result: { url: '' } });
+    // The other click is still submitting, so its outcome is unknown and the key must be kept.
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
     expect(h.merges).toEqual([]);
   } finally { await h.coordinator.close(); h.store.close(); }
 });
@@ -505,6 +508,34 @@ it('answers resend when the saved outcome cannot be re-read after the replay ref
     const error = await h.coordinator.merge(token, actionId).catch(value => value);
     expect(error).toBeInstanceOf(MergeNotApplied);
     expect(calls).toBe(2);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('replays a direct click that is still submitting as an unknown outcome, not as a success', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Direct merge response was lost.', 'unknown'); });
+  const actionId = randomUUID(), token = h.view().token;
+  try {
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ kind: 'direct', state: 'submitting' });
+    await expect(h.coordinator.merge(token, actionId)).rejects.toBeInstanceOf(MergeOutcomeUnknown);
+    expect(h.client.merge).toHaveBeenCalledOnce();
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
+it('keeps a confirmed refusal resendable until its failed state is saved', async () => {
+  const h = queueHarness([]);
+  h.client.inspect = vi.fn(async () => remote(h.view()));
+  h.client.merge = vi.fn(async () => { throw new MergeSubmissionError('Required status check is expected.', 'refused'); });
+  const finish = h.store.finishMergeAttempt.bind(h.store);
+  h.store.finishMergeAttempt = vi.fn(() => { throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  try {
+    const error = await h.coordinator.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).toBeInstanceOf(MergeOutcomeUnknown);
+    expect(error.message).toMatch(/Required status check/);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'submitting' });
+    h.store.finishMergeAttempt = finish;
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 

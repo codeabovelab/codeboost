@@ -270,6 +270,15 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses review approvals, choices and notes on a closed task', () => {
+    const { store } = fixture();
+    const state = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    const version = store.reviewVersion(identity);
+    expect(() => store.saveReview(identity, state(), [], [])).toThrow(/closed task never changes/);
+    expect(() => store.addReviewNote(identity, state(), 'P1', 'change', 'Too late.')).toThrow(/closed task never changes/);
+    expect(store.reviewVersion(identity)).toBe(version);
+  });
   it('refuses rebase and ledger writes during a merge and after closing, but still observes HEAD', () => {
     const { store } = fixture();
     const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id });
