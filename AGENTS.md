@@ -39,12 +39,17 @@ Before opening or updating a PR for asynchronous behavior, test every applicable
 - An abort error fires, then subprocess close arrives later.
 - Submit starts, then the user edits the composer or switches items, then the response returns.
 - Referenced code is reassigned or the snapshot changes, then retry or rendering occurs.
+- A synchronous caller hook inside a lifecycle (such as a callback that records a spawned process group) throws, blocks past the deadline, or aborts the signal, then the lifecycle continues. Timers and listeners that bound the lifecycle must already be armed when the hook runs, and a signal already aborted when its listener is attached must still take effect.
+- A child process exits, but a descendant outside its process group still holds its output pipes.
 
 Every reproduced race requires a failing-before and passing-after regression. Assert both the visible result and the durable state when they can diverge.
 
 ## Review readiness
 
 - Before requesting or re-requesting an automated Copilot review, self-review the full current diff, fix every issue found, and repeat the self-review and fix cycle until a complete pass finds no new issues. Re-run the relevant validation after fixes; only then request Copilot review.
+- Each self-review pass rereads every changed function in full against the base, not only the lines changed since the previous round. Code unchanged since the first commit of the PR still gets reviewed in every pass.
+- Treat every behavioural claim the change makes, in code comments, the PR body or docs (for example "pauses every 1,000 entries", "settles only after exit", "never throws", "bounded by N seconds"), as something to verify. Trace each claim through every path that can break it, including nested loops, callbacks, error paths and early returns, and give it a test that fails if the claim is false.
+- The author's self-review is not enough for concurrency, process, subprocess, timer or resource-cleanup code. Before requesting Copilot review, also run an independent review that does not share the author's context: `/codex review`, a separate review agent, or `/code-review` at `high` effort or above. Fix its findings like any other.
 - Run final validation against the exact pushed head after the last change.
 - Report current test counts separately from historical milestone counts.
 - Before requesting automated review, report the current head, CI state, mergeability, unresolved threads, and deferred follow-up issues.
