@@ -26,6 +26,9 @@ const DEFAULT_GRACE_MS = 5_000;
 const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 // After the leader exits, how long to keep killing and polling other members of its group before giving up.
 const DRAIN_LIMIT_MS = 10_000;
+// Once the group is gone, how long to wait for stdout and stderr to reach end of file. Only a process outside the group
+// (one that called setsid but kept the inherited pipe) can hold them open after that, and it must not hold this call.
+const STDIO_CLOSE_MS = 1_000;
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const notStarted = (message: string): DockerOutcome =>
   ({ status: null, stdout: '', stderr: '', error: Object.assign(new Error(message), { code: NOT_STARTED }) });
@@ -96,13 +99,23 @@ export function runInProcessGroup(file: string, args: readonly string[],
     const deadline = setTimeout(() => stop('timeout'), options.timeoutMs);
     const onAbort = () => stop('cancelled');
     options.signal?.addEventListener('abort', onAbort, { once: true });
-    let spawnError: Error | undefined;
-    child.once('error', error => { spawnError = error; });
     if (unrecorded !== undefined) { stopped = 'unrecorded'; signalGroup(pgid, 'SIGKILL'); }
-    child.once('close', (code, signal) => {
+    // An abort raised during onProcessGroup came before the listener existed, and an aborted signal never fires again.
+    else if (options.signal?.aborted) stop('cancelled');
+    let spawnError: Error | undefined;
+    const closed = new Promise<void>(resolveClosed => child.once('close', () => resolveClosed()));
+    // Settle from the leader's exit, not from 'close': 'close' also waits for every holder of the pipes, which can
+    // include a process that left the group and so survives the group kill.
+    let finished = false;
+    const finish = (code: number | null, signal: NodeJS.Signals | null) => {
+      if (finished) return;
+      finished = true;
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
-      void drainGroup(pgid).then(drained => {
+      void drainGroup(pgid).then(async drained => {
+        await Promise.race([closed, pause(STDIO_CLOSE_MS)]);
+        child.stdout.destroy();
+        child.stderr.destroy();
         clearTimeout(graceTimer);
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
         if (!drained) {
@@ -134,6 +147,9 @@ export function runInProcessGroup(file: string, args: readonly string[],
         }
         resolve({ status: code, stdout, stderr });
       });
-    });
+    };
+    child.once('exit', finish);
+    // A spawn that fails after the child had a PID emits 'error' and may never emit 'exit'.
+    child.once('error', error => { spawnError = error; finish(null, null); });
   });
 }

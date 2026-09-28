@@ -1,3 +1,6 @@
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import { NOT_STARTED } from '../agents/docker.ts';
@@ -64,6 +67,34 @@ describe('runInProcessGroup', () => {
     expect(((outcome.error as Error).cause as Error).message).toBe('database is locked');
     expect(groupAlive(group!.pgid)).toBe(false);
   });
+
+  it('stops at once when the signal is aborted during onProcessGroup', async () => {
+    const controller = new AbortController();
+    let group: ProcessGroup | undefined;
+    const began = performance.now();
+    const outcome = await runInProcessGroup('sleep', ['60'], { env, timeoutMs: 30_000, signal: controller.signal,
+      onProcessGroup: reported => { group = reported; controller.abort(); } });
+    expect((outcome.error as NodeJS.ErrnoException).code).toBe('ABORT_ERR');
+    expect(performance.now() - began).toBeLessThan(10_000);
+    expect(groupAlive(group!.pgid)).toBe(false);
+  });
+
+  it('settles when a process that left the group still holds its output pipe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'escaped-')), pidFile = join(dir, 'pid');
+    // The leader starts `sleep` in a new session (outside the group) that inherits stdout, then exits.
+    const escape = `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, `
+      + `stdio: ['ignore', 'inherit', 'inherit'] }); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, `
+      + `String(c.pid)); c.unref(); console.log('leader done');`;
+    try {
+      const began = performance.now();
+      const outcome = await runInProcessGroup(process.execPath, ['-e', escape], { env, timeoutMs: 30_000 });
+      expect(outcome).toMatchObject({ status: 0, stdout: 'leader done\n' });
+      expect(performance.now() - began).toBeLessThan(10_000);
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 30_000);
 
   it('stops a group whose output exceeds the limit', async () => {
     const outcome = await runInProcessGroup('sh', ['-c', 'while :; do echo xxxxxxxxxxxxxxxx; done'],
