@@ -46,8 +46,10 @@ export interface UnreleasedResource {
   /** Docker object ID captured at creation; absent when the create's outcome is unknown. */
   readonly id?: string;
   /**
-   * The ownership labels the object carries: `io.codeboost.runner`, `io.codeboost.attempt` and
+   * The ownership labels D wrote on the object: `io.codeboost.runner`, `io.codeboost.attempt` and
    * `io.codeboost.allocation`, plus its kind's own label (`io.codeboost.invocation` or `io.codeboost.egress`).
+   * These are what the object must carry, not what was observed: when `id` is absent, an object found by `name` is
+   * D's only if it carries every one of them, and one that does not is someone else's and must be left alone.
    * Absent for host directories.
    */
   readonly labels?: Readonly<Record<string, string>>;
