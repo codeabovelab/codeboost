@@ -68,8 +68,16 @@ export function runInProcessGroup(file: string, args: readonly string[],
   const graceMs = options.graceMs ?? DEFAULT_GRACE_MS, maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER;
   return new Promise(resolve => {
     // `detached` makes the child the leader of a new process group (setsid), so signals to -pgid reach all it starts.
-    const child = spawn(file, [...args], { cwd: options.cwd, env: options.env, detached: true,
-      stdio: ['ignore', 'pipe', 'pipe'] });
+    // spawn throws, rather than emitting 'error', for invalid arguments and for spawn failures other than ENOENT,
+    // EACCES, EAGAIN, EMFILE and ENFILE (for example ENOMEM or E2BIG). No child exists then; report it, never reject.
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(file, [...args], { cwd: options.cwd, env: options.env, detached: true,
+        stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (error) {
+      resolve({ status: null, stdout: '', stderr: '', error: error as Error });
+      return;
+    }
     const pgid = child.pid;
     if (pgid === undefined) {
       // The spawn itself failed (for example ENOENT); nothing started, and 'error' carries the cause.
@@ -79,8 +87,10 @@ export function runInProcessGroup(file: string, args: readonly string[],
     const out: Buffer[] = [], err: Buffer[] = [];
     let outBytes = 0, errBytes = 0, stopped: 'cancelled' | 'timeout' | 'output-limit' | 'unrecorded' | undefined;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
+    // Set once the leader has exited: from then on the group is drained, not stopped, and its ID may be reused.
+    let exited = false;
     const stop = (reason: NonNullable<typeof stopped>) => {
-      if (stopped) return;
+      if (stopped || exited) return;
       stopped = reason;
       signalGroup(pgid, 'SIGTERM');
       graceTimer = setTimeout(() => signalGroup(pgid, 'SIGKILL'), graceMs);
@@ -92,12 +102,13 @@ export function runInProcessGroup(file: string, args: readonly string[],
     let unrecorded: unknown;
     try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
     catch (error) { unrecorded = error; }
+    // Output past the limit stops a running group; once the leader has exited, the excess is only dropped.
     const collect = (chunks: Buffer[], add: (bytes: number) => number) => (chunk: Buffer) => {
       if (add(chunk.length) > maxBuffer) stop('output-limit');
       else chunks.push(chunk);
     };
-    child.stdout.on('data', collect(out, bytes => (outBytes += bytes)));
-    child.stderr.on('data', collect(err, bytes => (errBytes += bytes)));
+    child.stdout!.on('data', collect(out, bytes => (outBytes += bytes)));
+    child.stderr!.on('data', collect(err, bytes => (errBytes += bytes)));
     const onAbort = () => stop('cancelled');
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (unrecorded !== undefined) { stopped = 'unrecorded'; signalGroup(pgid, 'SIGKILL'); }
@@ -111,6 +122,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
     const finish = (code: number | null, signal: NodeJS.Signals | null) => {
       if (finished) return;
       finished = true;
+      exited = true;
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
       void drainGroup(pgid).then(async drained => {
@@ -120,8 +132,8 @@ export function runInProcessGroup(file: string, args: readonly string[],
         await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
         // Cleared so a finished call never keeps the process alive.
         clearTimeout(stdioTimer);
-        child.stdout.destroy();
-        child.stderr.destroy();
+        child.stdout!.destroy();
+        child.stderr!.destroy();
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
         if (!drained) {
           resolve({ status: null, stdout, stderr, error: Object.assign(

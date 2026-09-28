@@ -8,10 +8,20 @@ import type { ProcessGroup } from '../agents/process-group.ts';
 
 // The asynchronous storage allocation (#51 item 5), against a fake Docker CLI that keeps its objects as files, so the
 // abort path runs without a daemon. The real-Docker suite covers the same path against Docker itself.
+// spawn passes through unless a test makes it throw, as it does synchronously for errors such as ENOMEM.
+const spawnFault = vi.hoisted(() => ({ on: undefined as undefined | ((args: readonly string[]) => boolean) }));
+vi.mock('node:child_process', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: ((file: string, args: readonly string[], options: object) => {
+    if (spawnFault.on?.(args)) throw Object.assign(new Error('spawn ENOMEM'), { code: 'ENOMEM', syscall: 'spawn' });
+    return actual.spawn(file, args, options);
+  }) as typeof actual.spawn };
+});
 vi.mock('../agents/container/image.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../agents/container/image.ts')>(), assertBuiltAgentImage: () => {},
 }));
-const { prepareTaskFilesystemsAsync, removeTaskFilesystems } = await import('../agents/container/storage.ts');
+const { hasLiveTaskStorage, prepareTaskFilesystemsAsync, removeTaskFilesystems } =
+  await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
 
 const RUNNER = '0123456789abcdef0123456789abcdef';
@@ -85,6 +95,7 @@ beforeEach(() => {
   process.env.PATH = `${bin}:${path}`;
 });
 afterEach(() => {
+  spawnFault.on = undefined;
   process.env.PATH = path;
   rmSync(root, { recursive: true, force: true });
 });
@@ -132,6 +143,14 @@ describe('asynchronous task storage allocation', () => {
     } finally { clearInterval(waitForList); }
     expect(stored()).toEqual([]);
   }, 30_000);
+
+  it('removes what it created and releases the allocation when a later Docker call cannot be spawned', async () => {
+    // Both volumes are created; spawning the keeper's `docker create` then fails synchronously.
+    spawnFault.on = args => args[0] === 'create';
+    await expect(prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner())).rejects.toThrow('ENOMEM');
+    expect(stored()).toEqual([]);
+    expect(hasLiveTaskStorage(RUNNER)).toBe(false);
+  });
 
   it('creates nothing when the signal is already aborted', async () => {
     const groups: ProcessGroup[] = [];

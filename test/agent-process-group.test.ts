@@ -112,6 +112,16 @@ describe('runInProcessGroup', () => {
     expect(outcome.stdout.length).toBeLessThanOrEqual(1024);
   });
 
+  it('resolves, never rejects, when spawn itself throws', async () => {
+    let reported = false;
+    // A NUL byte in an argument makes spawn throw synchronously, as ENOMEM or E2BIG from the spawn itself would.
+    const outcome = await runInProcessGroup('sh', ['-c', 'echo a\0b'], { env, timeoutMs: 5_000,
+      onProcessGroup: () => { reported = true; } });
+    expect(outcome.status).toBeNull();
+    expect(outcome.error).toBeInstanceOf(Error);
+    expect(reported).toBe(false);
+  });
+
   it('starts nothing for an aborted signal, an invalid deadline, or a missing program', async () => {
     let reported = false;
     const onProcessGroup = () => { reported = true; };
