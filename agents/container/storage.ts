@@ -218,11 +218,14 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   catch (error) { releaseAllocationId(allocationId); throw error; }
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
-  const createdVolumes: string[] = [], unsettled = new Set<string>();
+  // Names whose create succeeded, or whose client was killed so the object may exist. Cleanup touches only these: a
+  // create the daemon refused made nothing, and its name may belong to someone else.
+  const made = new Set<string>(), unsettled = new Set<string>();
+  const mine = (names: readonly string[]) => names.filter(name => made.has(name) || unsettled.has(name));
   // Run one allocation step; a client killed by its deadline leaves the daemon outcome for `name` unknown.
   const allocate = (name: string, args: readonly string[]) => {
     const timeout = remaining();
-    try { docker(args, timeout); }
+    try { docker(args, timeout); made.add(name); }
     catch (error) {
       if (createOutcomeUnknown(error)) unsettled.add(name);
       throw error;
@@ -231,7 +234,6 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   try {
     for (const [kind, name, bytes, inodes] of [['work', workVolume, limits.workBytes, limits.workInodes],
       ['metadata', metadataVolume, limits.metadataBytes, limits.metadataInodes]] as const) {
-      createdVolumes.push(name);
       allocate(name, ['volume', 'create', '--driver', 'local', '--opt', 'type=tmpfs', '--opt', 'device=tmpfs',
         '--opt', `o=size=${bytes},nr_inodes=${inodes},uid=10001,gid=10001,mode=0755,nosuid,nodev`,
         '--label', `io.codeboost.task-storage=${kind}`, ...labels, name]);
@@ -265,7 +267,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     releaseAllocationId(allocationId);
     return filesystems;
   } catch (error) {
-    try { cleanup([seeder, keeper], createdVolumes.reverse(), owner, unsettled); }
+    try { cleanup(mine([seeder, keeper]), mine([metadataVolume, workVolume]), owner, unsettled); }
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
     releaseAllocationId(allocationId);
     throw error;

@@ -85,9 +85,11 @@ const absent = (result: DockerOutcome) => result.status !== 0 && result.status !
 /** How long a network or proxy whose create client was killed may still materialize in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
 // Cleanup is never cancelled: it runs to its own deadline so nothing is dropped.
-// Remove one owned object. Looks it up by `target` (its ID, or its name for a create whose ID never came back),
-// checks the egress label and all three owner labels, then removes and confirms by the ID the daemon just reported:
-// a same-named replacement created after the lookup is never touched.
+// Remove one owned object. Looks it up by `target` (its ID, or its name for a create whose ID never came back), then
+// removes and confirms by the ID the daemon just reported: a same-named replacement created after the lookup is never
+// touched. A captured ID proves the object is the one this code created (Docker never reuses IDs), so it is removed
+// even if its labels are wrong, as when validation refused it for that. A name proves nothing: an object found by
+// name is removed only if it carries the egress label and all three owner labels.
 const remove = async (object: 'container' | 'network', target: string, remaining: () => number, kind: string,
   owner: ResourceOwner, settleBy = 0) => {
   const inspect = (ref: string) => runDocker([object, 'inspect', ref], { timeoutMs: remaining() });
@@ -103,8 +105,8 @@ const remove = async (object: 'container' | 'network', target: string, remaining
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
-  if (labels?.['io.codeboost.egress'] !== owner.allocationId || !hasOwnerLabels(labels, owner))
-    throw new Error(`Refused to remove unowned ${kind}.`);
+  if (!DOCKER_ID.test(target) && (labels?.['io.codeboost.egress'] !== owner.allocationId
+    || !hasOwnerLabels(labels, owner))) throw new Error(`Refused to remove unowned ${kind}.`);
   const id = inspected?.Id;
   if (!id || !DOCKER_ID.test(id) || (DOCKER_ID.test(target) && id !== target))
     throw new Error(`Failed to establish the identity of ${kind}.`);

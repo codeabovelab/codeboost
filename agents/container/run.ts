@@ -129,7 +129,11 @@ const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle =
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
     { Id?: string; Config?: { Labels?: Record<string, string> } } | undefined;
-  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
+  // A container found by name (its create's ID never came back) must carry every label this profile wrote.
+  const expected = capturedId ? { 'io.codeboost.invocation': profile.ownershipId }
+    : containerLabels.get(profile) ?? {};
+  if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
+    || Object.entries(expected).some(([label, value]) => inspected.Config?.Labels?.[label] !== value))
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
   // Remove and confirm by the ID the daemon just reported for our container, never by the name: a same-named
   // replacement created after this inspect must not be deleted.

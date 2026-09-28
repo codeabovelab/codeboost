@@ -515,16 +515,27 @@ describe('real Docker agent isolation', () => {
     expect(egress()).toBe(before);
   }, 120_000);
 
+  // Storage has no captured IDs, so cleanup refuses an object without every owner label; the test removes its own.
+  const refuseThenRemove = (filesystems: ReturnType<typeof prepareTaskFilesystems>, unlabelled: string[][]) => {
+    taskFilesystems.splice(taskFilesystems.indexOf(filesystems), 1);
+    expect(() => removeTaskFilesystems(filesystems)).toThrow('did not settle');
+    for (const command of unlabelled) docker(...command);
+    removeTaskFilesystems(filesystems);
+  };
+
   it('rejects task volumes without their runner label before the agent starts', async () => {
     const data = await withoutRunnerLabel([['volume', 'create']], () => fixture());
     const live = await profile(data, 'planning', 'must-not-run');
     await expect(createValidatedContainer(live)).rejects.toThrow('bounded tmpfs allocation');
+    refuseThenRemove(data.filesystems, [['volume', 'rm', '--force', data.filesystems.workVolume,
+      data.filesystems.metadataVolume]]);
   }, 60_000);
 
   it('rejects a keeper without its runner label before the agent starts', async () => {
     const data = await withoutRunnerLabel([['run', '--detach', '--name']], () => fixture());
     const live = await profile(data, 'planning', 'must-not-run');
     await expect(createValidatedContainer(live)).rejects.toThrow('trusted keeper');
+    refuseThenRemove(data.filesystems, [['rm', '--force', data.filesystems.keeper]]);
   }, 60_000);
 
   it('rejects an agent container without its runner label before it starts', async () => {
@@ -609,6 +620,23 @@ describe('real Docker agent isolation', () => {
       expect(cleanup.errors.map(error => (error as Error).message)).toEqual(['Refused to remove unowned vendor network.']);
       expect(left).not.toBe('');
     } finally { if (left) spawnSync('docker', ['network', 'rm', ...left.split('\n')], { stdio: 'ignore' }); }
+  }, 60_000);
+
+  it('never removes an agent container found by name after a killed create when a label is missing', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'must-not-run');
+    // The create lands without the runner label, and its client is killed before it reports the ID.
+    const unlabelled = [
+      "const at = args.findIndex(arg => arg.startsWith('io.codeboost.runner='));",
+      'args.splice(at - 1, 2);',
+      'result = run(args);',
+      "process.kill(process.pid, 'SIGKILL');",
+    ].join('\n');
+    try {
+      await withDockerShim(['create', '--name'], unlabelled, () =>
+        expect(createValidatedContainer(live)).rejects.toThrow('cleanup did not settle'));
+      expect(docker('container', 'inspect', '--format', '{{index .Config.Labels "io.codeboost.invocation"}}', live.name))
+        .toBe(live.ownershipId);
+    } finally { spawnSync('docker', ['rm', '--force', live.name], { stdio: 'ignore' }); }
   }, 60_000);
 
   it('never removes a task keeper replaced by another runner, but still removes the owned volumes', () => {

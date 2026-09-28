@@ -35,10 +35,14 @@ export function assertResourceOwner(owner: ResourceOwner): ResourceOwner {
   return Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId, allocationId: owner.allocationId });
 }
 
-// Recovery groups resources by allocation, so one ID must never name two live allocations, whether two task storages
-// or a task storage and a vendor network. Two checks enforce it: this set covers allocations in progress in this
-// process (their objects may not exist yet), and `allocationListCommands` asks the daemon, which covers every earlier
-// process. An entry is released once its allocation finished cleanly, so the set stays bounded.
+// One ID must never name two live allocations, whether two task storages or a task storage and a vendor network.
+// Uniqueness is the caller's duty (a fresh UUID v4 per allocation); D catches mistakes with three checks: this set
+// covers allocations in progress in this process (their objects may not exist yet), `allocationListCommands` before
+// the first create covers every earlier process, and the same list right after the first create catches a concurrent
+// process that passed the first check too (whichever checks second backs out). A rival that backs out but cannot
+// remove its object leaves it labelled with its own attempt, and recovery matches runner, attempt and allocation
+// together, so it is reported as unowned rather than merged. An entry is released once its allocation finished
+// cleanly, so the set stays bounded.
 const claimedAllocations = new Set<string>();
 /** Claim an allocation ID for an allocation that is starting. Refuses an ID another allocation here holds. */
 export function claimAllocationId(allocationId: string): string {
