@@ -715,6 +715,27 @@ describe('real Docker agent isolation', () => {
     expect(byAllocation(owner.allocationId)).toEqual([]);
   }, 60_000);
 
+  it('keeps a failed allocation whose cleanup did not settle live, so recovery in this process refuses its runner', async () => {
+    const data = fixture(), runnerOwner = randomBytes(16).toString('hex');
+    const owner = { runnerOwner, attemptId: 'unsettled-allocation', allocationId: randomUUID() };
+    // The seeder is refused, and every volume removal fails, so the allocation's cleanup does not settle.
+    const failing = [
+      "if (args[0] === 'run' && args[1] === '--rm') result = { status: 1, stdout: '', stderr: 'refused' };",
+      "else if (args[0] === 'volume' && args[1] === 'rm') result = { status: 1, stdout: '', stderr: 'volume is in use' };",
+      'else result = run(args);',
+    ].join('\n');
+    try {
+      await withDockerShim([], failing, () => expect(() => prepareTaskFilesystems(data.clone, storageLimits, imageId,
+        owner)).toThrow('cleanup did not settle'));
+      await expect(recoverLeftovers(runnerOwner)).rejects.toThrow('still holds task storage');
+    } finally {
+      for (const name of docker('ps', '--all', '--quiet', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`)
+        .split('\n').filter(Boolean)) spawnSync('docker', ['rm', '--force', name], { stdio: 'ignore' });
+      for (const name of docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`)
+        .split('\n').filter(Boolean)) spawnSync('docker', ['volume', 'rm', '--force', name], { stdio: 'ignore' });
+    }
+  }, 60_000);
+
   it('recovers only its own runner after a restart, keeping its storage for removal by handle', async () => {
     const data = fixture(), runners = [randomBytes(16).toString('hex'), randomBytes(16).toString('hex')] as const;
     // Every object is registered for cleanup as soon as it exists, so a failure anywhere in setup leaks nothing.

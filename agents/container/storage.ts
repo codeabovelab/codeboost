@@ -35,7 +35,8 @@ interface AllocationIdentity {
   readonly limits: Readonly<TaskStorageLimits>;
 }
 const allocations = new WeakMap<TaskFilesystems, AllocationIdentity>();
-// Storage this process allocated and has not removed, as allocation ID to runner token. Recovery never runs for a
+// Storage this process is allocating or has allocated, and has not confirmed removed (including a failed allocation
+// whose cleanup did not settle), as allocation ID to runner token. Recovery never runs for a
 // runner that has any, and never issues a handle for one: a running agent may mount it.
 const liveAllocations = new Map<string, string>();
 /** Whether this process holds task storage of this runner that it allocated and has not removed. */
@@ -231,6 +232,8 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
   // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
   try { assertAllocationObjects(allocationId, 0, remaining); }
   catch (error) { releaseAllocationId(allocationId); throw error; }
+  // Live from before the first create: a failed allocation whose cleanup does not settle still owns what it made.
+  liveAllocations.set(allocationId, owner.runnerOwner);
   const workVolume = `codeboost-work-${randomUUID()}`, metadataVolume = `codeboost-metadata-${randomUUID()}`;
   const keeper = `codeboost-keeper-${randomUUID()}`, seeder = `codeboost-seeder-${randomUUID()}`;
   // Names whose create succeeded, or whose client was killed so the object may exist. Cleanup touches only these: a
@@ -288,12 +291,13 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
     const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
     allocations.set(filesystems, Object.freeze({ owner, trustedClone: clone,
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
-    liveAllocations.set(allocationId, owner.runnerOwner);
     releaseAllocationId(allocationId);
     return filesystems;
   } catch (error) {
     try { cleanup(mine([seeder, keeper]), mine([metadataVolume, workVolume]), owner, unsettled); }
+    // Still live: this process owns whatever cleanup could not remove, and reports it through the error.
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Task allocation failed and cleanup did not settle.'); }
+    liveAllocations.delete(allocationId);
     releaseAllocationId(allocationId);
     throw error;
   }
