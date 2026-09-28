@@ -58,7 +58,8 @@ metadata, read-only isolation and capacity probes had this defect.
 Use only these entry points to run an agent:
 
 1. `createTaskClone` creates a committed, standalone staging clone.
-2. `prepareTaskFilesystems` copies that clone into bounded task storage. Call
+2. `prepareTaskFilesystems` copies that clone into bounded task storage, labelled with the owner you pass: your
+   runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Call
    `removeTaskFilesystems` when the task ends. It refuses a repository that has a
    symbolic link with an absolute target or a target outside the checkout, before it
    creates any storage. Report this to the user as a repository the agent cannot run
@@ -69,7 +70,8 @@ Use only these entry points to run an agent:
    the Docker setup and the agent inside it. It throws only when it allocated nothing
    (invalid input, an expired budget, or an attempt ID that is still owned); every
    later failure settles the handle. `cancel()` during setup kills the in-flight Docker
-   call. Pass the vendor credential only as the function argument.
+   call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
+   credential only as the function argument.
 
 The boundary guarantees the following:
 
@@ -160,8 +162,8 @@ Ask keeps the contract's identity and cleanup rules:
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
   resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
   restart, Ask stays off while any container, volume or network labelled `io.codeboost.allocation`,
-  `io.codeboost.invocation` or `io.codeboost.egress` exists. Caller-provided
-  allocation IDs (#51 item 3) would let Ask name these resources instead.
+  `io.codeboost.invocation` or `io.codeboost.egress` exists. Resources now carry caller-provided allocation IDs
+  and runner labels (#51 item 3), but Ask does not yet use them to name its resources.
 - One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on a lock file keyed by
   the database file's identity (device and inode), in a private directory (`<tmp>/codeboost-asklocks-<uid>`, mode
   0700, checked to be owned by you). A lock path that is a symlink is refused, never followed. It is an OS file lock that the operating
@@ -170,11 +172,11 @@ Ask keeps the contract's identity and cleanup rules:
   and any startup scan still in flight have finished. Only the holder scans, starts a worker or writes the
   record. The record itself is kept next to the database's canonical path (`realpath`), so relative,
 absolute and symlinked spellings share them. A database with other hard links is refused. Separating different
-  reviews that share one Docker daemon needs runner identity labels (#51 item 3), and the general single-runner
-  lock is F1d (#59).
+  reviews that share one Docker daemon needs a per-database runner token: resources now carry runner labels
+  (#51 item 3), but Ask labels them with a random per-session owner until F1d's token exists (#59).
 - The first question of each process runs that scan even without a record, because a process killed before it
-  could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
-  process running Ask at the same moment also keeps this one off.
+  could write one leaves no record. Until Ask labels resources with a per-database runner token and filters its
+  scan by it, another codeboost process running Ask at the same moment also keeps this one off.
 - Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off (it counts as untracked leftovers) until a restart finds no labelled resources. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
   the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It

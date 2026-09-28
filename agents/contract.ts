@@ -1,3 +1,5 @@
+import { isRunnerOwner } from './labels.ts';
+
 /** Lane D/F boundary. Only the runner may construct requests after admission. */
 export interface TaskClone {
   readonly id: string;
@@ -23,6 +25,11 @@ export interface InvocationInput {
   readonly approvedArgv: readonly (readonly string[])[];
   readonly deadline: number;
   readonly attemptId: string;
+  /**
+   * The runner token of the database this attempt belongs to: 32 lowercase hex characters, created once per database.
+   * Every Docker object D creates for the invocation carries it as `io.codeboost.runner` (#51 item 3).
+   */
+  readonly runnerOwner: string;
   readonly context: InvocationContext;
 }
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
@@ -94,6 +101,7 @@ export function captureInvocation(input: InvocationInput, now = Date.now()): Inv
   if (!input || !input.clone || !input.context) throw new Error('Missing invocation context.');
   if (!['planning', 'questions', 'review', 'execute', 'fix'].includes(input.phase)
     || !['claude', 'codex'].includes(input.vendor)) throw new Error('Unsupported invocation profile.');
+  if (!isRunnerOwner(input.runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
   if (!nonempty(input.attemptId) || !nonempty(input.clone.id) || !nonempty(input.clone.taskId)
     || !nonempty(input.clone.directory) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.clone.head))
     throw new Error('Invalid task clone or attempt identity.');

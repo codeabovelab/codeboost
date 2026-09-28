@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
+import { assertResourceOwner, hasOwnerLabels, ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 
@@ -15,7 +16,7 @@ export interface VendorNetwork {
   readonly proxyUrl: string;
   readonly vendor: InvocationInput['vendor'];
 }
-interface NetworkIdentity { readonly allocationId: string; readonly imageId: string; readonly invocation: InvocationInput;
+interface NetworkIdentity { readonly allocationId: string; readonly owner: ResourceOwner; readonly imageId: string; readonly invocation: InvocationInput;
   readonly subnet: string; readonly proxyIp: string;
   /** Daemon object IDs captured at creation; a same-named replacement has a different ID. */
   readonly networkId: string; readonly proxyId: string }
@@ -138,6 +139,7 @@ const validateVendorNetwork = async (network: VendorNetwork, invocation: Invocat
     || inspectedNetwork.Name !== network.name || !Object.keys(inspectedNetwork.Containers ?? {}).includes(identity.proxyId)
     || !inspect?.State?.Running || inspect.Config?.Image !== identity.imageId || inspect.Config?.User !== '10001:10001'
     || inspect.Config?.Labels?.['io.codeboost.egress'] !== identity.allocationId || !inspect.HostConfig?.ReadonlyRootfs
+    || !hasOwnerLabels(inspect.Config?.Labels, identity.owner)
     || inspect.HostConfig.Privileged || !inspect.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (inspect.HostConfig.CapAdd?.length ?? 0) || inspect.HostConfig.SecurityOpt?.length !== 2
     || !inspect.HostConfig.SecurityOpt.some(option => ['no-new-privileges', 'no-new-privileges:true'].includes(option))
@@ -162,6 +164,7 @@ const validateVendorNetwork = async (network: VendorNetwork, invocation: Invocat
     || inspect.NetworkSettings?.Networks?.[network.name]?.IPAddress !== identity.proxyIp
     || !inspectedNetwork?.Internal || inspectedNetwork.Driver !== 'bridge'
     || inspectedNetwork.Labels?.['io.codeboost.egress'] !== identity.allocationId
+    || !hasOwnerLabels(inspectedNetwork.Labels, identity.owner)
     || inspectedNetwork.IPAM?.Config?.length !== 1 || inspectedNetwork.IPAM.Config[0]?.Subnet !== identity.subnet
     || !endpoints.includes(network.proxyContainer) || endpoints.some(name => !name || !allowedEndpoints.includes(name)))
     throw new Error('Vendor network or proxy changed after allocation.');
@@ -178,10 +181,14 @@ export async function assertVendorNetwork(network: VendorNetwork, invocation?: I
  * Create the vendor-only network and its egress proxy. `signal` cancels setup: the in-flight Docker call is killed,
  * and everything created so far is removed (cleanup itself is not cancelled) before the promise rejects.
  */
-export async function createVendorNetwork(invocation: InvocationInput, imageId: string,
+export async function createVendorNetwork(invocation: InvocationInput, imageId: string, allocationId: string,
   timeoutMs = 60_000, signal?: AbortSignal): Promise<VendorNetwork> {
   assertCapturedInvocation(invocation);
   assertBuiltAgentImage(imageId);
+  // The network and proxy carry the invocation's runner and attempt and this caller-chosen allocation ID.
+  const owner = assertResourceOwner({ runnerOwner: invocation.runnerOwner, attemptId: invocation.attemptId,
+    allocationId });
+  const labels = ownerLabelArgs(owner);
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
   // No allocation may outlive the invocation it serves.
@@ -189,7 +196,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   timeoutMs = Math.min(timeoutMs, invocationLeft);
   const overall = deadline(timeoutMs), cleanupReserve = Math.min(10_000, Math.floor(timeoutMs / 3));
-  const remaining = deadline(Math.max(1, timeoutMs - cleanupReserve)), allocationId = randomUUID();
+  const remaining = deadline(Math.max(1, timeoutMs - cleanupReserve));
   const name = `codeboost-egress-${vendor}-${randomUUID()}`;
   const proxyContainer = `codeboost-proxy-${vendor}-${randomUUID()}`;
   const subnetSeed = randomUUID().replaceAll('-', '');
@@ -251,13 +258,14 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     networkPlanned = true;
     signal?.throwIfAborted();
     networkId = createdId(await create(name, ['network', 'create', '--internal', '--driver', 'bridge', '--subnet', subnet,
-      '--label', `io.codeboost.egress=${allocationId}`, name]), 'network');
+      '--label', `io.codeboost.egress=${allocationId}`, ...labels, name]), 'network');
     proxyPlanned = true;
     // Create and start separately: a refused create made nothing, while a failed start leaves a container we own by ID.
     proxyId = createdId(await create(proxyContainer, ['create', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
-      '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
+      '--label', `io.codeboost.egress=${allocationId}`, ...labels,
+      '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
       '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']), 'proxy');
     await docker(['start', proxyId], remaining(), signal);
     await docker(['network', 'connect', 'bridge', proxyId], remaining(), signal);
@@ -273,7 +281,8 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     if (!proxyIp || !/^10\.254\.\d{1,3}\.\d{1,3}$/.test(proxyIp))
       throw new Error('Vendor proxy did not receive its expected internal address.');
     const network = Object.freeze({ name, proxyContainer, proxyUrl: `http://${proxyIp}:3128`, vendor });
-    identities.set(network, Object.freeze({ allocationId, imageId, invocation, subnet, proxyIp, networkId, proxyId }));
+    identities.set(network, Object.freeze({ allocationId, owner, imageId, invocation, subnet, proxyIp, networkId,
+      proxyId }));
     registered = network;
     await validateVendorNetwork(network, invocation, undefined, remaining, signal);
     remaining();

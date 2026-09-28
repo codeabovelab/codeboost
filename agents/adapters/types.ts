@@ -8,6 +8,11 @@ export interface AgentAdapterRequest {
   readonly inputDirectory: string;
   readonly imageId: string;
   readonly prompt: string;
+  /**
+   * The caller-chosen allocation ID (a lowercase UUID v4) for the vendor network and proxy, recorded before the start
+   * call so recovery can match them to the attempt (#51 item 3).
+   */
+  readonly networkAllocationId: string;
 }
 export interface AgentAdapterOptions {
   readonly timeoutMs?: number;

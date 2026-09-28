@@ -1,12 +1,13 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CLEANUP_RETRY_WINDOW_MS, isInvocationActive, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationResult } from '../agents/contract.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 // Retained cleanup must settle even when Docker never answers (#51 item 1). These run without Docker.
 describe('bounded cleanup settlement', () => {
   const resources = Object.freeze([Object.freeze({ kind: 'container' as const, name: 'codeboost-proxy-codex-x' }),
     Object.freeze({ kind: 'network' as const, name: 'codeboost-egress-codex-x' })]);
-  const captured = (attemptId: string) => captureInvocation({
+  const captured = (attemptId: string) => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
     clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
     phase: 'planning', vendor: 'codex', approvedArgv: [], deadline: Date.now() + 60_000, attemptId,
     context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },

@@ -11,9 +11,13 @@ import { assertContainerProfile, createContainerProfile, disposeContainerProfile
 import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
+import { hasOwnerLabels } from '../agents/labels.ts';
+import { taskFilesystemOwner } from '../agents/container/storage.ts';
 import { createVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../agents/network/network.ts';
 import { createClaudeCommand, createCodexCommand, createIsolationProbeCommand, createPhasePolicy,
-  type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
+  assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
 
 const roots: string[] = [];
 const taskFilesystems: ReturnType<typeof prepareTaskFilesystems>[] = [];
@@ -46,7 +50,7 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
   const clone = createTaskClone({ source, parent: staging, taskId: 'task-1', head: git(source, 'rev-parse', 'HEAD') });
   const filesystems = prepareTaskFilesystems(clone, options.limits ?? {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
-  }, imageId);
+  }, imageId, testOwner());
   taskFilesystems.push(filesystems);
   const fakeAuth = join(root, 'auth.json'); writeFileSync(fakeAuth, '{}', { mode: 0o600 });
   return { root, source, input, clone, filesystems, fakeAuth };
@@ -54,13 +58,13 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
 
 function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, vendor: 'codex' | 'claude' = 'codex',
   deadlineMs = 60_000): InvocationInput {
-  return captureInvocation({ clone, phase, vendor, approvedArgv: phase === 'planning' || phase === 'questions' ? [] : [['git', 'status']],
+  return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone, phase, vendor, approvedArgv: phase === 'planning' || phase === 'questions' ? [] : [['git', 'status']],
     deadline: Date.now() + deadlineMs, attemptId: `${vendor}-${phase}-${Math.random().toString(16).slice(2)}`,
     context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
       referencedCodeHash: 'code-1', stateVersion: 1 } });
 }
 const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop') => {
-  const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId);
+  const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId, randomUUID());
   vendorNetworks.push(network);
   return { invocation: captured, policy, network, command: createIsolationProbeCommand(policy, probe) };
 };
@@ -71,7 +75,7 @@ async function profile(data: ReturnType<typeof fixture>, phase: Phase,
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
-  const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId);
+  const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId, randomUUID());
   vendorNetworks.push(network);
   const trustedCommand = typeof command === 'string' ? createIsolationProbeCommand(policy, command) : command(policy);
   const base = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
@@ -196,7 +200,7 @@ describe('real Docker agent isolation', () => {
     const before = new Set(owned());
     expect(() => prepareTaskFilesystems(clone, {
       workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
-    }, imageId)).toThrow('Git metadata contains a link');
+    }, imageId, testOwner())).toThrow('Git metadata contains a link');
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
@@ -457,6 +461,40 @@ describe('real Docker agent isolation', () => {
     expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
   }, 60_000);
 
+  it('labels every Docker object with its runner, attempt and allocation', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'noop');
+    await createValidatedContainer(live); containers.add(live.name);
+    const labelsOf = (kind: 'container' | 'volume' | 'network', name: string) =>
+      JSON.parse(docker(kind, 'inspect', '--format', kind === 'container' ? '{{json .Config.Labels}}' : '{{json .Labels}}',
+        name)) as Record<string, string>;
+    const storage = taskFilesystemOwner(data.filesystems), invocation = assertPhasePolicy(live.policy);
+    expect(storage.runnerOwner).toBe(TEST_RUNNER_OWNER);
+    // Task storage: both volumes and the keeper carry the caller's allocation.
+    for (const [kind, name] of [['volume', data.filesystems.workVolume], ['volume', data.filesystems.metadataVolume],
+      ['container', data.filesystems.keeper]] as const) expect(hasOwnerLabels(labelsOf(kind, name), storage)).toBe(true);
+    // The agent container: its own attempt, and the allocation it mounts.
+    expect(hasOwnerLabels(labelsOf('container', live.name), { runnerOwner: TEST_RUNNER_OWNER,
+      attemptId: invocation.attemptId, allocationId: storage.allocationId })).toBe(true);
+    // The network and proxy: the invocation's runner and attempt, and the network's own caller-chosen allocation.
+    for (const [kind, name] of [['network', live.network.name], ['container', live.network.proxyContainer]] as const) {
+      const labels = labelsOf(kind, name);
+      expect(labels['io.codeboost.runner']).toBe(TEST_RUNNER_OWNER);
+      expect(labels['io.codeboost.attempt']).toBe(invocation.attemptId);
+      expect(labels['io.codeboost.allocation']).toMatch(/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+      expect(labels['io.codeboost.allocation']).toBe(labels['io.codeboost.egress']);
+    }
+  }, 60_000);
+
+  it('refuses task storage that belongs to another runner', async () => {
+    const data = fixture();
+    const foreign = prepareTaskFilesystems(data.clone, { workBytes: 16 * 1024 * 1024, workInodes: 512,
+      metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 }, imageId,
+    { runnerOwner: 'f'.repeat(32), attemptId: 'other-runner', allocationId: randomUUID() });
+    taskFilesystems.push(foreign);
+    await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'planning')), filesystems: foreign,
+      inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('another runner');
+  }, 60_000);
+
   it('refuses to seed a clone whose staging directory was replaced after creation', async () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-2',
@@ -465,7 +503,7 @@ describe('real Docker agent isolation', () => {
     mkdirSync(clone.directory); git(clone.directory, 'init');
     expect(() => prepareTaskFilesystems(clone, {
       workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
-    }, imageId)).toThrow('replaced after it was created');
+    }, imageId, testOwner())).toThrow('replaced after it was created');
   }, 60_000);
 
   it('rejects a container that relies on the daemon default seccomp profile', async () => {
@@ -502,7 +540,7 @@ describe('real Docker agent isolation', () => {
       expect(() => prepareTaskFilesystems(clone, {
         workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
       // A budget that tolerates a loaded daemon; the keeper still lands after its client is killed at ~8 s.
-      }, imageId, 8_000)).toThrow();
+      }, imageId, testOwner(), 8_000)).toThrow();
     } finally { process.env.PATH = path; }
     execFileSync('sleep', ['3']);
     const orphans = [...keepers()].filter(id => !before.has(id));
@@ -675,13 +713,13 @@ describe('real Docker agent isolation', () => {
     expect(() => assertBuiltAgentImage(untrustedDigest)).toThrow('trusted validated builder');
     expect(() => prepareTaskFilesystems(data.clone, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
-    }, untrustedDigest)).toThrow('trusted validated builder');
+    }, untrustedDigest, testOwner())).toThrow('trusted validated builder');
     expect(() => prepareTaskFilesystems(data.clone, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
-    }, AGENT_IMAGE)).toThrow('immutable built image ID');
+    }, AGENT_IMAGE, testOwner())).toThrow('immutable built image ID');
     expect(() => prepareTaskFilesystems({ ...data.clone }, {
       workBytes: 1024, workInodes: 16, metadataBytes: 1024, metadataInodes: 16,
-    }, imageId)).toThrow('trusted clone builder');
+    }, imageId, testOwner())).toThrow('trusted clone builder');
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {

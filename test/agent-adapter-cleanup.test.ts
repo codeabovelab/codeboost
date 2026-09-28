@@ -1,5 +1,7 @@
+import { randomUUID } from 'node:crypto';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { InvocationResult } from '../agents/contract.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 // When profile creation and its cleanup both fail, the adapter keeps retrying that one cleanup inside the bounded
 // window. It must not add a second network removal with a fresh deadline on every retry (#51 item 1).
@@ -40,7 +42,7 @@ describe('adapter profile-creation cleanup', () => {
   afterEach(() => { vi.useRealTimers(); });
 
   it('retries only the profile cleanup, within the window, and never removes the network separately', async () => {
-    const invocation = captureInvocation({
+    const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
       phase: 'planning', vendor: 'codex', approvedArgv: [], deadline: Date.now() + 10 * 60_000,
       attemptId: 'adapter-profile-cleanup',
@@ -48,7 +50,7 @@ describe('adapter profile-creation cleanup', () => {
     });
     const started = performance.now();
     const handle = startCodexInvocation({ invocation, filesystems: {} as never, inputDirectory: '/unused',
-      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused' }, '/unused/auth.json');
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() }, '/unused/auth.json');
     const box: { result?: InvocationResult } = {};
     void handle.settled.then(result => { box.result = result; });
     await vi.advanceTimersByTimeAsync(CLEANUP_RETRY_WINDOW_MS + 5_000);
@@ -60,14 +62,14 @@ describe('adapter profile-creation cleanup', () => {
 
   it('releases a created profile when the handoff to the supervisor throws', async () => {
     state.profileFails = false;
-    const invocation = captureInvocation({
+    const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
       clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
       phase: 'planning', vendor: 'codex', approvedArgv: [], deadline: Date.now() + 10 * 60_000,
       attemptId: 'adapter-handoff-throws',
       context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
     });
     const handle = startCodexInvocation({ invocation, filesystems: {} as never, inputDirectory: '/unused',
-      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused' }, '/unused/auth.json');
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() }, '/unused/auth.json');
     const box: { result?: InvocationResult } = {};
     void handle.settled.then(result => { box.result = result; });
     await vi.advanceTimersByTimeAsync(0);

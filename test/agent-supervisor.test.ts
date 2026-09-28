@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -16,6 +17,8 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
 import { createVendorNetwork } from '../agents/network/network.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
 import { createTaskClone } from '../git/clone.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
+const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
 
 const roots: string[] = [], profiles: ContainerProfile[] = [];
 const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
@@ -33,13 +36,13 @@ function fixture() {
   const clone = createTaskClone({ source, parent: staging, taskId: 'supervisor', head: git(source, 'rev-parse', 'HEAD') });
   const filesystems = prepareTaskFilesystems(clone, {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
-  }, imageId); allocations.push(filesystems);
+  }, imageId, testOwner()); allocations.push(filesystems);
   const auth = join(root, 'auth.json'); writeFileSync(auth, '{}', { mode: 0o600 });
   return { root, input, clone, filesystems, auth };
 }
 function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlineMs = 2 * 60_000,
   vendor: 'codex' | 'claude' = 'codex'): InvocationInput {
-  return captureInvocation({ clone: data.clone, phase: 'planning', vendor, approvedArgv: [],
+  return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone: data.clone, phase: 'planning', vendor, approvedArgv: [],
     deadline: Date.now() + deadlineMs, attemptId,
     context: { snapshotId: 'snapshot', planId: 'plan', planRevision: 1, assignmentId: 'assignment',
       referencedCodeHash: 'code', stateVersion: 1 } });
@@ -49,7 +52,7 @@ async function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
   // An attempt can be captured once, so a duplicate-attempt profile reuses the captured invocation.
   const captured = typeof attempt === 'string' ? invocation(data, attempt, deadlineMs) : attempt;
   const policy = createPhasePolicy(captured);
-  const network = await createVendorNetwork(captured, imageId);
+  const network = await createVendorNetwork(captured, imageId, randomUUID());
   const value = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
     inputDirectory: data.input, command: createIsolationProbeCommand(policy, probe), imageId, codexAuthFile: data.auth,
     deferredOutput });
@@ -264,7 +267,7 @@ describe('container invocation supervisor', () => {
     const result = await withEnvironment('PATH', hangingDocker('network\\ create*'), async () => {
       const started = performance.now();
       const handle = startCodexInvocation({ invocation: captured, filesystems: data.filesystems,
-        inputDirectory: data.input, imageId, prompt: 'unused' }, data.auth, { timeoutMs: 2 * 60_000 });
+        inputDirectory: data.input, imageId, prompt: 'unused', networkAllocationId: randomUUID() }, data.auth, { timeoutMs: 2 * 60_000 });
       expect(performance.now() - started).toBeLessThan(250);
       expect(isInvocationActive('adapter-setup-cancel')).toBe(true);
       await new Promise(resolve => setTimeout(resolve, 1_000));
@@ -544,7 +547,7 @@ describe('container invocation supervisor', () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
       const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000),
-        filesystems: data.filesystems, inputDirectory: data.input, imageId,
+        filesystems: data.filesystems, inputDirectory: data.input, imageId, networkAllocationId: randomUUID(),
         prompt: schemaPrompt }, authFile).settled;
       expect(result.stopReason, result.stderr).toBeUndefined();
       expect(result.exitCode).toBe(0);
@@ -556,7 +559,7 @@ describe('container invocation supervisor', () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
       const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude', 6 * 60_000, 'claude'),
-        filesystems: data.filesystems, inputDirectory: data.input, imageId,
+        filesystems: data.filesystems, inputDirectory: data.input, imageId, networkAllocationId: randomUUID(),
         prompt: schemaPrompt }, token).settled;
       expect(result.stopReason, result.stderr).toBeUndefined();
       expect(result.exitCode).toBe(0);

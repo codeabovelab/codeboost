@@ -3,6 +3,7 @@ import { beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type Phase } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 // The gate is only meaningful if its probes fail when isolation breaks. Each case runs the exact production probe
 // script in a container deliberately built without one protection, bypassing the profile and its validator, and
@@ -11,7 +12,7 @@ import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } f
 
 let imageId = '', attempt = 0;
 const probeScript = (phase: Phase, probe: IsolationProbe) => {
-  const policy = createPhasePolicy(captureInvocation({
+  const policy = createPhasePolicy(captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
     clone: { id: 'gate-clone', taskId: 'gate-task', directory: '/tmp/gate', head: 'a'.repeat(40) },
     vendor: 'codex', phase, approvedArgv: ['planning', 'questions'].includes(phase) ? [] : [['git', 'status']],
     deadline: Date.now() + 60_000, attemptId: `gate-${phase}-${probe}-${++attempt}`,

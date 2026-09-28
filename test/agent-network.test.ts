@@ -9,6 +9,7 @@ import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_H
   VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
+const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 let imageId = '', network: VendorNetwork, invocation: InvocationInput;
 const docker = (...args: string[]) => execFileSync('docker', args, {
@@ -22,12 +23,12 @@ const curl = (url: string, direct = false) => spawnSync('docker', ['run', '--rm'
 beforeAll(async () => {
   imageId = buildAgentImage();
   // Capture after the image build, so a cold build cannot spend the invocation's deadline before allocation.
-  invocation = captureInvocation({
+  invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
     clone: { id: 'clone-network', taskId: 'task-network', directory: '/tmp/network', head: 'a'.repeat(40) },
     vendor: 'claude', phase: 'planning', approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId: 'network-probe',
     context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
   });
-  network = await createVendorNetwork(invocation, imageId);
+  network = await createVendorNetwork(invocation, imageId, randomUUID());
 }, 10 * 60_000);
 // If setup failed there is no network, and a teardown error would hide the setup failure.
 afterAll(async () => { if (network) await removeVendorNetwork(network); }, 60_000);
@@ -41,7 +42,7 @@ describe('vendor-only egress', () => {
       `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
     const path = process.env.PATH, started = performance.now();
     process.env.PATH = `${shim}:${path}`;
-    try { await expect(createVendorNetwork(invocation, imageId, 3_000)).rejects.toThrow(); }
+    try { await expect(createVendorNetwork(invocation, imageId, randomUUID(), 3_000)).rejects.toThrow(); }
     finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     expect(performance.now() - started).toBeLessThan(6_000);
   }, 60_000);
@@ -61,7 +62,7 @@ describe('vendor-only egress', () => {
     process.env.PATH = `${shim}:${path}`;
     let name = '';
     try {
-      await expect(createVendorNetwork(lateInvocation, imageId, 9_000)).rejects.toThrow();
+      await expect(createVendorNetwork(lateInvocation, imageId, randomUUID(), 9_000)).rejects.toThrow();
       name = readFileSync(requested, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     execFileSync('sleep', ['3']);
@@ -86,7 +87,7 @@ describe('vendor-only egress', () => {
     process.env.PATH = `${shim}:${path}`;
     let foreign = '', error: unknown;
     try {
-      try { await createVendorNetwork(refused, imageId); } catch (caught) { error = caught; }
+      try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
       foreign = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     const survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
@@ -112,7 +113,7 @@ describe('vendor-only egress', () => {
     process.env.PATH = `${shim}:${path}`;
     let proxyId = '';
     try {
-      await expect(createVendorNetwork(failing, imageId)).rejects.toThrow('failed to start');
+      await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow('failed to start');
       proxyId = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     const leaked = spawnSync('docker', ['container', 'inspect', proxyId], { stdio: 'ignore' }).status === 0;
@@ -135,7 +136,7 @@ describe('vendor-only egress', () => {
     process.env.PATH = `${shim}:${path}`;
     let foreign = '', error: unknown;
     try {
-      try { await createVendorNetwork(refused, imageId); } catch (caught) { error = caught; }
+      try { await createVendorNetwork(refused, imageId, randomUUID()); } catch (caught) { error = caught; }
       foreign = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     const survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
@@ -156,7 +157,7 @@ describe('vendor-only egress', () => {
     const path = process.env.PATH, started = performance.now();
     process.env.PATH = shim;
     let error: unknown;
-    try { try { await createVendorNetwork(blocked, imageId); } catch (caught) { error = caught; } }
+    try { try { await createVendorNetwork(blocked, imageId, randomUUID()); } catch (caught) { error = caught; } }
     finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     expect(error).toBeInstanceOf(Error);
     expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
@@ -180,7 +181,7 @@ describe('vendor-only egress', () => {
     process.env.PATH = `${shim}:${path}`;
     let impostor = '';
     try {
-      await expect(createVendorNetwork(failing, imageId)).rejects.toThrow();
+      await expect(createVendorNetwork(failing, imageId, randomUUID())).rejects.toThrow();
       impostor = readFileSync(recorded, 'utf8');
     } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
     const survived = spawnSync('docker', ['container', 'inspect', impostor], { stdio: 'ignore' }).status === 0;
@@ -192,7 +193,7 @@ describe('vendor-only egress', () => {
   it('reports only the part of a network whose removal is still unconfirmed', async () => {
     const partial = captureInvocation({ ...invocation, attemptId: `partial-removal-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
-    const created = await createVendorNetwork(partial, imageId), blocker = `codeboost-blocker-${randomUUID()}`;
+    const created = await createVendorNetwork(partial, imageId, randomUUID()), blocker = `codeboost-blocker-${randomUUID()}`;
     const [proxy, net] = vendorNetworkResources(created);
     expect(proxy).toMatchObject({ kind: 'container', name: created.proxyContainer });
     expect(net).toMatchObject({ kind: 'network', name: created.name });
@@ -239,7 +240,7 @@ describe('vendor-only egress', () => {
   }, 30_000);
 
   it('rejects a copied network capability', async () => {
-    await expect(createVendorNetwork(invocation, imageId, 0)).rejects.toThrow('positive integer');
+    await expect(createVendorNetwork(invocation, imageId, randomUUID(), 0)).rejects.toThrow('positive integer');
     await expect(assertVendorNetwork(network, invocation, undefined, 0)).rejects.toThrow('positive integer');
     await expect(removeVendorNetwork({ ...network })).rejects.toThrow('trusted network builder');
     const otherInvocation = captureInvocation({ ...invocation, attemptId: 'other-network-probe',
@@ -250,7 +251,7 @@ describe('vendor-only egress', () => {
   it('keeps concurrent invocations on separate internal networks', async () => {
     const otherInvocation = captureInvocation({ ...invocation, attemptId: 'concurrent-network-probe',
       deadline: Date.now() + 60_000 });
-    const other = await createVendorNetwork(otherInvocation, imageId), peer = `codeboost-peer-${randomUUID()}`;
+    const other = await createVendorNetwork(otherInvocation, imageId, randomUUID()), peer = `codeboost-peer-${randomUUID()}`;
     try {
       docker('run', '--detach', '--name', peer, `--network=${network.name}`, '--network-alias', 'codeboost-peer',
         '--entrypoint', 'node', imageId, '-e', "require('node:net').createServer(()=>{}).listen(4567,'0.0.0.0');setInterval(()=>{},1000)");
@@ -280,7 +281,7 @@ describe('vendor-only egress', () => {
   ] as const)('rejects a proxy replaced with %s before launch', async (_label, extra) => {
     const replacementInvocation = captureInvocation({ ...invocation, attemptId: `mutated-proxy-probe-${randomUUID()}`,
       deadline: Date.now() + 60_000 });
-    const replacement = await createVendorNetwork(replacementInvocation, imageId);
+    const replacement = await createVendorNetwork(replacementInvocation, imageId, randomUUID());
     const inspected = JSON.parse(docker('container', 'inspect', replacement.proxyContainer))[0] as
       { Config: { Labels: Record<string, string> }; NetworkSettings: { Networks: Record<string, { IPAddress: string }> } };
     const allocation = inspected.Config.Labels['io.codeboost.egress'];

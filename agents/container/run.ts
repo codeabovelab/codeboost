@@ -2,11 +2,13 @@ import { realpathSync } from 'node:fs';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import type { UnreleasedResource } from '../contract.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
-import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
+import { agentContainerOwner, assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
   isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
-import { taskFilesystemAllocationId } from './storage.ts';
+import { taskFilesystemAllocationId, taskFilesystemOwner } from './storage.ts';
+import { hasOwnerLabels } from '../labels.ts';
+import { assertPhasePolicy } from '../policy.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
 export type { TaskFilesystems, TaskStorageLimits } from './storage.ts';
 
@@ -201,6 +203,7 @@ export async function validateContainer(container: string, profile: ContainerPro
     || JSON.stringify(inspect.Config.Entrypoint) !== JSON.stringify(['/usr/local/bin/codeboost-container-probe'])
     || JSON.stringify(inspect.Config.Cmd) !== JSON.stringify(profile.command)
     || inspect.Config.Labels?.['io.codeboost.invocation'] !== profile.ownershipId
+    || !hasOwnerLabels(inspect.Config.Labels, agentContainerOwner(assertPhasePolicy(profile.policy), profile.filesystems))
     || !host.ReadonlyRootfs || host.Privileged
     || !host.CapDrop?.map(value => value.toUpperCase()).includes('ALL') || (host.CapAdd?.length ?? 0) !== 0
     || !exactSecurityOptions(host.SecurityOpt)
@@ -272,6 +275,7 @@ export async function validateContainer(container: string, profile: ContainerPro
     if (!expected || volume.Driver !== 'local' || options.type !== 'tmpfs' || options.device !== 'tmpfs'
       || volume.Labels?.['io.codeboost.task-storage'] !== expected[0]
       || volume.Labels?.['io.codeboost.allocation'] !== allocationId
+      || !hasOwnerLabels(volume.Labels, taskFilesystemOwner(profile.filesystems))
       || !hasExactOptions(optionString, [`size=${expected[1]}`, `nr_inodes=${expected[2]}`,
         'uid=10001', 'gid=10001', 'mode=0755', 'nosuid', 'nodev']))
       throw new Error('Task volume does not match its bounded tmpfs allocation.');
@@ -287,6 +291,7 @@ export async function validateContainer(container: string, profile: ContainerPro
   if (!keeper?.State?.Running || keeper.Config?.Image !== profile.expectedImage || keeper.Config?.User !== '10001:10001'
     || keeper.Config?.Labels?.['io.codeboost.task-storage'] !== 'keeper'
     || keeper.Config?.Labels?.['io.codeboost.allocation'] !== allocationId || !keeper.HostConfig?.ReadonlyRootfs
+    || !hasOwnerLabels(keeper.Config?.Labels, taskFilesystemOwner(profile.filesystems))
     || keeper.HostConfig.Privileged || keeper.HostConfig.NetworkMode !== 'none'
     || !keeper.HostConfig.CapDrop?.map(value => value.toUpperCase()).includes('ALL')
     || (keeper.HostConfig.CapAdd?.length ?? 0) !== 0
