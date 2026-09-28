@@ -53,9 +53,14 @@ export function claimAllocationId(allocationId: string): string {
  */
 export function releaseAllocationId(allocationId: string): void { claimedAllocations.delete(allocationId); }
 /** Docker commands that list any container, volume or network still labelled with this allocation ID. */
-export const allocationListCommands = (allocationId: string): readonly (readonly string[])[] =>
-  (['ps --all', 'volume ls', 'network ls'] as const).map(command => Object.freeze([...command.split(' '), '--quiet',
-    '--filter', `label=${ALLOCATION_LABEL}=${allocationId}`]));
+export const allocationListCommands = (allocationId: string): readonly (readonly string[])[] => {
+  const filter = ['--quiet', '--filter', `label=${ALLOCATION_LABEL}=${allocationId}`];
+  return Object.freeze([
+    Object.freeze(['ps', '--all', ...filter]),
+    Object.freeze(['volume', 'ls', ...filter]),
+    Object.freeze(['network', 'ls', ...filter]),
+  ]);
+};
 export const ALLOCATION_IN_USE = 'allocationId still labels a Docker object; every allocation needs a new allocation ID.';
 
 /** `docker create`/`run`/`volume create`/`network create` arguments that apply the owner labels. */

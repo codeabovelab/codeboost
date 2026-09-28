@@ -47,12 +47,13 @@ const networkResources = (name: string, proxyContainer: string, owner: ResourceO
   ]);
 };
 // Fails closed: an unanswered list cannot prove the ID is unused.
+// The three lists are independent, so they run in parallel.
 const assertAllocationUnused = async (allocationId: string, remaining: () => number, signal?: AbortSignal) => {
-  for (const command of allocationListCommands(allocationId)) {
-    const result = await runDocker(command, { timeoutMs: remaining(), signal });
-    if (result.status !== 0) throw new Error('Could not confirm that allocationId is unused.');
-    if (result.stdout.trim()) throw new Error(ALLOCATION_IN_USE);
-  }
+  const timeoutMs = remaining();
+  const results = await Promise.all(allocationListCommands(allocationId)
+    .map(command => runDocker(command, { timeoutMs, signal })));
+  if (results.some(result => result.status !== 0)) throw new Error('Could not confirm that allocationId is unused.');
+  if (results.some(result => result.stdout.trim())) throw new Error(ALLOCATION_IN_USE);
 };
 const identities = new WeakMap<VendorNetwork, NetworkIdentity>();
 // Parts of a network whose removal is already confirmed, while the other part is still being retried.

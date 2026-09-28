@@ -207,6 +207,20 @@ describe('vendor-only egress', () => {
     expect(vendorNetworkResources(created)).toEqual([]);
   }, 60_000);
 
+  it('refuses an allocation ID that a live network still carries', async () => {
+    const reused = randomUUID();
+    const first = await createVendorNetwork(captureInvocation({ ...invocation, attemptId: `reuse-a-${randomUUID()}`,
+      deadline: Date.now() + 60_000 }), imageId, reused);
+    const networks = () => docker('network', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused}`);
+    try {
+      const before = networks();
+      await expect(createVendorNetwork(captureInvocation({ ...invocation, attemptId: `reuse-b-${randomUUID()}`,
+        deadline: Date.now() + 60_000 }), imageId, reused)).rejects.toThrow('still labels a Docker object');
+      // Refused before creating anything: still only the first network carries the ID.
+      expect(networks()).toBe(before);
+    } finally { await removeVendorNetwork(first); }
+  }, 60_000);
+
   it('pins the host list with each vendor profile', async () => {
     expect(VENDOR_HOSTS).toEqual({ claude: ['api.anthropic.com'], codex: ['api.openai.com', 'chatgpt.com'] });
     expect(Object.isFrozen(VENDOR_HOSTS.claude)).toBe(true);
