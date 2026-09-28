@@ -65,8 +65,11 @@ Use only these entry points to run an agent:
    on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
-4. `startCodexInvocation` or `startClaudeInvocation` runs the agent and returns a
-   handle. Pass the vendor credential only as the function argument.
+4. `startCodexInvocation` or `startClaudeInvocation` returns a handle at once and runs
+   the Docker setup and the agent inside it. It throws only when it allocated nothing
+   (invalid input, an expired budget, or an attempt ID that is still owned); every
+   later failure settles the handle. `cancel()` during setup kills the in-flight Docker
+   call. Pass the vendor credential only as the function argument.
 
 The boundary guarantees the following:
 
@@ -86,12 +89,11 @@ The caller must do the following:
   the window, and each cleanup subprocess is killed at its deadline. That result has a `stopReason` and lists
   the resources it could not confirm removed in `unreleased`; the container may still be running. Worst case,
   settlement ends about 90 seconds after cleanup starts: up to 30 seconds for the first, failed attempt, then
-  the 60-second window. Cleanup retries are still synchronous Docker calls of up to 30 seconds each, so a cancel
-  or shutdown waits behind a retry that is already running. The window bounds the total wait, not how quickly
-  the process responds; asynchronous D helpers (#51 item 2) address that.
-- If profile creation fails and its own cleanup fails too, the Claude and Codex start calls return a handle that
-  keeps retrying that cleanup and settles with `capture-failure` (plus `unreleased` if the window ends). They no
-  longer retry once and re-throw the startup error, so callers must not rely on a throw for this case.
+  the 60-second window. Cleanup retries are asynchronous Docker calls (#51 item 2), so the event loop stays free
+  and a cancel or shutdown is handled while a retry runs; the window bounds the total wait.
+- Every Docker setup failure settles the start call's handle rather than throwing (#51 item 2). If profile creation
+  fails and its own cleanup fails too, that handle keeps retrying the cleanup and settles with `capture-failure`
+  (plus `unreleased` if the window ends), so callers must not rely on a throw for this case.
 - When `unreleased` is present, record those resources durably and keep them owned until their removal is
   confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
   if both still match. An object is listed only if this invocation created it or may have (its create succeeded,
@@ -108,8 +110,9 @@ The caller must do the following:
 
 Ask (`runner/question-container.ts`) is the first production caller. It follows the four entry points above in the
 "questions" phase with no approved commands, clones the reviewed snapshot head, and writes a fixed answer schema as the
-only input file. Because every entry point above is synchronous, a worker thread (`runner/question-worker.ts`) owns the
-image, clones and allocations, so the review server keeps serving while Docker and Git run. The worker settles a
+only input file. Because the image build, the clone and storage allocation are still synchronous (#51 item 5), a worker thread
+(`runner/question-worker.ts`) owns the image, clones and allocations, so the review server keeps serving while Docker
+and Git run. The adapters' start calls are asynchronous (#51 item 2). The worker settles a
 question only after the invocation settles and its storage is removed.
 
 Ask keeps the contract's identity and cleanup rules:

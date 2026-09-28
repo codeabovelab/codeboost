@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
 import { createOutcomeUnknown } from '../agents/client-outcome.ts';
+import { docker } from '../agents/docker.ts';
 
 // A failed create leaves its object possibly present only if the request may have reached the daemon (#51 item 1).
 describe('create outcome classification', () => {
@@ -29,5 +30,23 @@ describe('create outcome classification', () => {
     expect(createOutcomeUnknown({ status: null, cause: { code: 'ENOENT' } })).toBe(false);
     expect(createOutcomeUnknown({ status: null, cause: { code: 'ETIMEDOUT' } })).toBe(true);
     expect(createOutcomeUnknown({ status: null })).toBe(true);
+  });
+
+  it('treats a call cancelled before its client started as having created nothing, and a killed one as unknown', async () => {
+    // Cancel lands between two setup steps: the next create is refused before any client runs.
+    const cancelled = new AbortController(); cancelled.abort();
+    const before = await docker(['network', 'create', 'unused'], { timeoutMs: 1_000, signal: cancelled.signal })
+      .then(() => undefined, (error: unknown) => error);
+    expect(createOutcomeUnknown(before)).toBe(false);
+    // A cancel that kills a client already in flight leaves the outcome unknown.
+    writeFileSync(join(dir, 'docker'), '#!/bin/sh\nexec sleep 5\n', { mode: 0o755 });
+    const path = process.env.PATH; process.env.PATH = `${dir}:${path}`;
+    try {
+      const inflight = new AbortController();
+      const pending = docker(['network', 'create', 'unused'], { timeoutMs: 10_000, signal: inflight.signal })
+        .then(() => undefined, (error: unknown) => error);
+      setTimeout(() => inflight.abort(), 100);
+      expect(createOutcomeUnknown(await pending)).toBe(true);
+    } finally { process.env.PATH = path; }
   });
 });

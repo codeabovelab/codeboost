@@ -1,9 +1,8 @@
 import type { InvocationHandle } from '../contract.ts';
-import { createContainerProfile, ProfileCreationCleanupError } from '../container/profile.ts';
-import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
-  type VendorNetwork } from '../network/network.ts';
 import { createClaudeCommand, createPhasePolicy } from '../policy.ts';
-import { retainNetworkCleanup, retainSetupCleanup, startProfileInvocation } from './supervisor.ts';
+import { launchInvocation } from './supervisor.ts';
+import { setUpProfile } from './setup.ts';
+import { assertBuiltAgentImage } from '../container/image.ts';
 import { createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export function parseClaudeOutput(raw: Buffer): { text: string; providerFailed: boolean } {
@@ -19,29 +18,11 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   if (!oauthToken || oauthToken.includes('\0')) throw new Error('Claude OAuth token is malformed.');
   const policy = createPhasePolicy(request.invocation);
   const remaining = createAdapterInvocationBudget(request.invocation, options.timeoutMs);
-  let network: VendorNetwork;
-  try { network = createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining())); }
-  catch (error) {
-    if (error instanceof VendorNetworkCreationCleanupError)
-      return retainSetupCleanup(request.invocation, budget => error.retryCleanup(budget), error.startupError, error,
-        'network creation cleanup', () => error.resources);
-    throw error;
-  }
-  try {
-    const profile = createContainerProfile({ ...request, policy, network,
-      command: createClaudeCommand(policy, request.prompt), claudeToken: oauthToken,
-      timeoutMs: Math.min(60_000, remaining()) });
-    return startProfileInvocation(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
-      invocationBudget: remaining,
-      decode: (_profile, raw) => parseClaudeOutput(raw) });
-  } catch (error) {
-    // Profile creation already tried its cleanup, which removes this network too, and failed. Retry that one cleanup
-    // with the window's budget; removing the network again here would start a second full deadline per retry.
-    if (error instanceof ProfileCreationCleanupError)
-      return retainSetupCleanup(request.invocation, budget => error.retryCleanup(budget), error.startupError, error,
-        'profile and network cleanup', () => error.resources);
-    try { removeVendorNetwork(network, Math.min(30_000, remaining())); }
-    catch (cleanupError) { return retainNetworkCleanup(request.invocation, network, error, cleanupError); }
-    throw error;
-  }
+  // Invalid input throws here, before anything is allocated; only Docker setup runs inside the handle.
+  assertBuiltAgentImage(request.imageId);
+  return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
+    network => ({ ...request, policy, network, command: createClaudeCommand(policy, request.prompt),
+      claudeToken: oauthToken }),
+    profile => start(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
+      invocationBudget: remaining, decode: (_profile, raw) => parseClaudeOutput(raw) })));
 }
