@@ -26,6 +26,19 @@ export interface InvocationInput {
   readonly context: InvocationContext;
 }
 export type StopReason = 'cancelled' | 'timeout' | 'shutdown' | 'output-limit' | 'capture-failure';
+/**
+ * A resource D created for an attempt and could not confirm removed. A name alone does not prove ownership: remove a
+ * Docker object only if its `id` (when present) and its `owner` label both still match.
+ */
+export interface UnreleasedResource {
+  readonly kind: 'container' | 'network' | 'directory';
+  /** Docker name, or the absolute host path of a staging directory. */
+  readonly name: string;
+  /** Docker object ID captured at creation; absent when the create's outcome is unknown. */
+  readonly id?: string;
+  /** The label that marks D's ownership of a Docker object; absent for host directories. */
+  readonly owner?: { readonly label: string; readonly value: string };
+}
 export interface InvocationResult {
   readonly attemptId: string;
   readonly context: InvocationContext;
@@ -34,11 +47,21 @@ export interface InvocationResult {
   readonly stopReason?: StopReason;
   readonly stdout: string;
   readonly stderr: string;
+  /**
+   * Present only when cleanup was still failing when D's bounded retry window ended (`CLEANUP_RETRY_WINDOW_MS`,
+   * 60 s after the first failure). Retries after the first are limited to what is left of the window, and every
+   * cleanup subprocess is killed at its deadline, so settlement ends within about 90 s of cleanup starting: at most
+   * 30 s for the first, failed attempt, then the 60 s window, which no retry outlasts. These resources
+   * may still exist, and the agent container may still be running. `stopReason` is always set. The caller must
+   * record them durably and keep them owned until their removal is confirmed.
+   */
+  readonly unreleased?: readonly UnreleasedResource[];
 }
 /**
  * F owns persisted pending/stale and admission; D owns running invocations.
  * cancel() records the first reason and requests termination, never settlement.
- * settled resolves only after the container AND capture processes terminate.
+ * settled resolves only after the container AND capture processes terminate, or, when cleanup keeps failing, once
+ * D's bounded cleanup retries end with `unreleased` set.
  * completed/failed/cancelled records are published by F using attemptId + context
  * CAS; discarded stale output still must settle before releasing D's slot.
  * Closing rejects admission before draining requests, cancelling, and awaiting

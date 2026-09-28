@@ -2,7 +2,7 @@ import { execFileSync } from 'node:child_process';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
@@ -221,6 +221,35 @@ it.skipIf(process.getuid?.() === 0)('keeps a host copy of the code it could not 
     if (saved === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = saved;
     chmodSync(parent, 0o700); rmSync(parent, { recursive: true, force: true });
   }
+});
+
+it('turns Ask off when D settles with resources it could not confirm removed', async () => {
+  const retained = new RetainedStorage();
+  const leaked = fakeDeps({ stopReason: 'capture-failure', exitCode: null,
+    unreleased: [{ kind: 'container', name: 'codeboost-proxy-claude-x' }, { kind: 'directory', name: '/tmp/codeboost-auth-x' }] });
+  const answer = askInContainer(question(), leaked.deps, new AbortController().signal, {}, retained);
+  await vi.waitFor(() => expect(leaked.captured).toHaveLength(1));
+  leaked.settle({ stopReason: 'capture-failure', unreleased: [{ kind: 'network', name: 'codeboost-egress-claude-x' }] });
+  await expect(answer).rejects.toThrow();
+  expect(retained.untracked).toBe(1);
+  // No second invocation starts while those resources are unaccounted for.
+  const next = fakeDeps();
+  await expect(askInContainer(question(), next.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cannot tell which Docker resources');
+  expect(next.events).toEqual([]);
+  // An empty list still means D stopped retrying before cleanup was confirmed.
+  const empty = new RetainedStorage(), unnamed = fakeDeps({ stopReason: 'capture-failure' });
+  const unnamedAnswer = askInContainer(question(), unnamed.deps, new AbortController().signal, {}, empty);
+  await vi.waitFor(() => expect(unnamed.captured).toHaveLength(1));
+  unnamed.settle({ stopReason: 'capture-failure', unreleased: [] });
+  await expect(unnamedAnswer).rejects.toThrow();
+  expect(empty.untracked).toBe(1);
+  // A stop whose cleanup D confirmed leaves Ask on.
+  const clean = new RetainedStorage(), stopped = fakeDeps({ stopReason: 'cancelled' });
+  const stoppedAnswer = askInContainer(question(), stopped.deps, new AbortController().signal, {}, clean);
+  await vi.waitFor(() => expect(stopped.captured).toHaveLength(1));
+  stopped.settle({ stopReason: 'cancelled' });
+  await expect(stoppedAnswer).rejects.toThrow();
+  expect(clean.untracked).toBe(0);
 });
 
 it('turns Ask off when a failed setup leaves storage D cannot hand back', async () => {

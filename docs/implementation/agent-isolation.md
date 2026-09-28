@@ -80,8 +80,26 @@ The boundary guarantees the following:
 
 The caller must do the following:
 
-- Keep ownership until `settled` resolves. It resolves only after the container has
-  stopped and its cleanup has finished. The supervisor retries cleanup until then.
+- Keep ownership until `settled` resolves. It resolves after the container has
+  stopped and its cleanup has finished. If cleanup keeps failing, the supervisor retries it every second for
+  60 seconds after the first failure, then settles anyway. Retries after the first get only what is left of
+  the window, and each cleanup subprocess is killed at its deadline. That result has a `stopReason` and lists
+  the resources it could not confirm removed in `unreleased`; the container may still be running. Worst case,
+  settlement ends about 90 seconds after cleanup starts: up to 30 seconds for the first, failed attempt, then
+  the 60-second window. Cleanup retries are still synchronous Docker calls of up to 30 seconds each, so a cancel
+  or shutdown waits behind a retry that is already running. The window bounds the total wait, not how quickly
+  the process responds; asynchronous D helpers (#51 item 2) address that.
+- If profile creation fails and its own cleanup fails too, the Claude and Codex start calls return a handle that
+  keeps retrying that cleanup and settles with `capture-failure` (plus `unreleased` if the window ends). They no
+  longer retry once and re-throw the startup error, so callers must not rely on a throw for this case.
+- When `unreleased` is present, record those resources durably and keep them owned until their removal is
+  confirmed. Each Docker entry has its creation-time ID (when known) and its ownership label; remove one only
+  if both still match. An object is listed only if this invocation created it or may have (its create succeeded,
+  or its client was killed before the daemon answered). A create the daemon refused, for example because another
+  invocation holds the name, made nothing, so that name is never reported or touched. The egress proxy is created
+  and started as two steps for this reason. Directory entries are host paths under the caller's `TMPDIR`.
+- A profile that settled with `unreleased` is retired: every launch path (`startProfileInvocation`,
+  `createValidatedContainer`, `startValidatedContainer`, `runContainer`) refuses it, while its cleanup still runs.
 - Call `cancel` to stop an invocation. The first stop reason is kept.
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
@@ -154,7 +172,7 @@ absolute and symlinked spellings share them. A database with other hard links is
 - The first question of each process runs that scan even without a record, because a process killed before it
   could write one leaves no record. Until resources carry the runner's identity (#51 item 3), another codeboost
   process running Ask at the same moment also keeps this one off.
-- Lane D's settlement can retry cleanup without limit (#51 item 1). Abandonment happens once: a crash, a watchdog and shutdown all wait on
+- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off (it counts as untracked leftovers) until a restart finds no labelled resources. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
   the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
   records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call

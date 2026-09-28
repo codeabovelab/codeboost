@@ -357,9 +357,11 @@ describe('real Docker agent isolation', () => {
       inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId });
     profiles.push(first, duplicate);
     docker(...first.args); containers.add(first.name);
-    expect(() => createValidatedContainer(duplicate)).toThrow('Container creation failed and cleanup did not settle.');
-    expect(existsSync(duplicate.codexAuthFile!)).toBe(true);
-    expect(isContainerProfileAuthentic(duplicate)).toBe(true);
+    // The refused create made no container, so the duplicate releases its own staging without touching the name.
+    expect(() => createValidatedContainer(duplicate)).toThrow(/already in use|Conflict/);
+    expect(existsSync(duplicate.codexAuthFile!)).toBe(false);
+    expect(isContainerProfileAuthentic(duplicate)).toBe(false);
+    expect(spawnSync('docker', ['network', 'inspect', duplicate.network.name], { stdio: 'ignore' }).status).not.toBe(0);
     const state = JSON.parse(docker('container', 'inspect', first.name))[0] as { State: { Status: string } };
     expect(state.State.Status).toBe('created');
     docker('rm', '--force', first.name); containers.delete(first.name);
@@ -404,6 +406,55 @@ describe('real Docker agent isolation', () => {
     } finally { process.env.PATH = path; }
     expect(isContainerProfileAuthentic(unsettled)).toBe(true);
     expect(existsSync(unsettled.codexAuthFile!)).toBe(true);
+  }, 60_000);
+
+  it('removes the agent container by its ID, never a same-named replacement', () => {
+    const data = fixture(), live = profile(data, 'planning', 'noop');
+    createValidatedContainer(live);
+    const originalId = docker('container', 'inspect', '--format', '{{.Id}}', live.name);
+    const moved = `${live.name}-moved`, replacement = live.name;
+    // Someone renames our container and puts a same-named, same-labelled container in its place.
+    docker('rename', live.name, moved); containers.add(moved);
+    docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
+      '--entrypoint', 'true', imageId); containers.add(replacement);
+    const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
+    disposeValidatedContainer(live);
+    expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
+    expect(docker('container', 'inspect', '--format', '{{.Id}}', replacement)).toBe(replacementId);
+    expect(isContainerProfileAuthentic(live)).toBe(false);
+  }, 60_000);
+
+  it('never looks the name up again when only the profile cleanup is retried', () => {
+    const data = fixture(), live = profile(data, 'planning', 'noop');
+    createValidatedContainer(live);
+    const blocker = `codeboost-blocker-${randomUUID()}`, replacement = live.name;
+    // Our container goes, but a foreign endpoint keeps the network busy, so the profile cleanup fails and is retried.
+    docker('run', '--detach', '--name', blocker, '--network', live.network.name, '--entrypoint', 'sleep', imageId, '300');
+    containers.add(blocker);
+    expect(() => disposeValidatedContainer(live)).toThrow('did not settle');
+    expect(isContainerProfileAuthentic(live)).toBe(true);
+    // A same-named, same-labelled container appears before the retry.
+    docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
+      '--entrypoint', 'true', imageId); containers.add(replacement);
+    const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
+    docker('rm', '--force', blocker); containers.delete(blocker);
+    disposeValidatedContainer(live);
+    expect(isContainerProfileAuthentic(live)).toBe(false);
+    expect(docker('container', 'inspect', '--format', '{{.Id}}', replacement)).toBe(replacementId);
+  }, 60_000);
+
+  it('starts the agent container by its ID, never a same-named replacement', () => {
+    const data = fixture(), live = profile(data, 'planning', 'finite-output');
+    createValidatedContainer(live);
+    const originalId = docker('container', 'inspect', '--format', '{{.Id}}', live.name);
+    const moved = `${live.name}-moved`, replacement = live.name;
+    docker('rename', live.name, moved); containers.add(moved);
+    docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
+      '--entrypoint', 'true', imageId); containers.add(replacement);
+    expect(startValidatedContainer(live)).toBe('stdout-marker');
+    // The replacement was never started, and cleanup removed only ours.
+    expect(docker('container', 'inspect', '--format', '{{.State.StartedAt}}', replacement)).toBe('0001-01-01T00:00:00Z');
+    expect(spawnSync('docker', ['container', 'inspect', originalId], { stdio: 'ignore' }).status).not.toBe(0);
   }, 60_000);
 
   it('refuses to seed a clone whose staging directory was replaced after creation', () => {

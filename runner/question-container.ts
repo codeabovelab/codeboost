@@ -55,7 +55,7 @@ export class RetainedStorage {
       try { remove(filesystems); this.#retained.delete(filesystems); } catch { /* still owned; retried next time */ }
     }
     if (this.#paths.size) throw new Error(`A copy of reviewed code from an earlier question could not be deleted (${[...this.#paths].join(', ')}). Ask stays off until it is deleted.`);
-    if (this.#untracked) throw new Error(`Agent storage setup failed and its cleanup was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no containers, volumes or networks labelled \`io.codeboost.allocation\`, \`io.codeboost.invocation\` or \`io.codeboost.egress\` remain.`);
+    if (this.#untracked) throw new Error(`An agent's setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no containers, volumes or networks labelled \`io.codeboost.allocation\`, \`io.codeboost.invocation\` or \`io.codeboost.egress\` remain.`);
     if (this.#retained.size) throw new Error(`Agent storage from an earlier question could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
   }
 }
@@ -217,8 +217,17 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     const handle = question.provider === 'claude' ? deps.startClaude(request, credential) : deps.startCodex(request, credential);
     const cancel = () => handle.cancel(stopOf(signal.reason));
     if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
-    try { return answerFromResult(question.provider, await handle.settled, invocation); }
+    let result: InvocationResult;
+    try { result = await handle.settled; }
     finally { signal.removeEventListener('abort', cancel); }
+    // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so the
+    // worker reports them at release and no new question starts until a restart finds none left.
+    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed. Docker
+    // leftovers are found again by their labels. Host leftovers (D's input and auth staging directories) are covered by
+    // the Ask root: the worker's TMPDIR is that root, D stages under tmpdir(), and the root is recorded durably before
+    // setup and deleted at startup before Ask is enabled again.
+    if (result.unreleased !== undefined) retained.markUntracked();
+    return answerFromResult(question.provider, result, invocation);
   } finally {
     const failures: unknown[] = [];
     if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.retain(filesystems); failures.push(error); }

@@ -1,5 +1,6 @@
 import type { InvocationHandle } from '../contract.ts';
-import { createContainerProfile, ProfileCreationCleanupError } from '../container/profile.ts';
+import { createContainerProfile, ProfileCreationCleanupError, type ContainerProfile } from '../container/profile.ts';
+import { agentContainerId } from '../container/run.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../network/network.ts';
 import { createCodexCommand, createPhasePolicy } from '../policy.ts';
@@ -8,6 +9,12 @@ import { readBoundedContainerFile, retainNetworkCleanup, retainSetupCleanup,
 import { createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
+// Read the output from the container this invocation created, by ID; a same-named replacement must not answer.
+const codexContainer = (profile: ContainerProfile) => {
+  const id = agentContainerId(profile);
+  if (!id) throw new Error('The Codex container ID is unknown.');
+  return id;
+};
 
 export async function readCodexOutput(container: string, maximumBytes: number, timeoutMs = 30_000,
   signal?: AbortSignal) {
@@ -25,8 +32,8 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   try { network = createVendorNetwork(request.invocation, request.imageId, Math.min(60_000, remaining())); }
   catch (error) {
     if (error instanceof VendorNetworkCreationCleanupError)
-      return retainSetupCleanup(request.invocation, error.retryCleanup, error.startupError, error,
-        'network creation cleanup');
+      return retainSetupCleanup(request.invocation, budget => error.retryCleanup(budget), error.startupError, error,
+        'network creation cleanup', () => error.resources);
     throw error;
   }
   try {
@@ -36,20 +43,13 @@ export function startCodexInvocation(request: AgentAdapterRequest,
     return startProfileInvocation(profile, { ...options,
       invocationBudget: remaining,
       decode: (current, _raw, maximum, timeoutMs, signal) =>
-        readCodexOutput(current.name, maximum, timeoutMs, signal) });
+        readCodexOutput(codexContainer(current), maximum, timeoutMs, signal) });
   } catch (error) {
-    if (error instanceof ProfileCreationCleanupError) {
-      const retryCleanup = (networkTimeoutMs = 30_000) => {
-        const failures: unknown[] = [];
-        try { error.retryCleanup(); } catch (cleanupError) { failures.push(cleanupError); }
-        try { removeVendorNetwork(network, networkTimeoutMs); } catch (cleanupError) { failures.push(cleanupError); }
-        if (failures.length) throw new AggregateError(failures, 'Adapter setup cleanup did not settle.');
-      };
-      try { retryCleanup(Math.min(30_000, remaining())); }
-      catch (cleanupError) { return retainSetupCleanup(request.invocation, () => retryCleanup(),
-        error.startupError, cleanupError, 'profile and network cleanup'); }
-      throw error.startupError;
-    }
+    // Profile creation already tried its cleanup, which removes this network too, and failed. Retry that one cleanup
+    // with the window's budget; removing the network again here would start a second full deadline per retry.
+    if (error instanceof ProfileCreationCleanupError)
+      return retainSetupCleanup(request.invocation, budget => error.retryCleanup(budget), error.startupError, error,
+        'profile and network cleanup', () => error.resources);
     try { removeVendorNetwork(network, Math.min(30_000, remaining())); }
     catch (cleanupError) { return retainNetworkCleanup(request.invocation, network, error, cleanupError); }
     throw error;

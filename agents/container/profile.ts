@@ -3,10 +3,11 @@ import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, ope
   readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { assertCapturedInvocation, type InvocationInput, type Phase } from '../contract.ts';
+import { assertCapturedInvocation, type InvocationInput, type Phase, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, type TaskFilesystems } from './storage.ts';
-import { assertVendorNetwork, removeVendorNetwork, type VendorNetwork } from '../network/network.ts';
+import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
+  type VendorNetwork } from '../network/network.ts';
 import { assertAgentCommand, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
 export interface ContainerProfile {
   readonly name: string;
@@ -40,13 +41,19 @@ export interface ProfileOptions {
 
 export class ProfileCreationCleanupError extends AggregateError {
   readonly startupError: unknown;
-  readonly retryCleanup: () => void;
+  /** Retry the cleanup; `budgetMs` (default 30 s) bounds the network removal. */
+  readonly retryCleanup: (budgetMs?: number) => void;
+  readonly #resources: () => readonly UnreleasedResource[];
 
-  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: () => void) {
+  constructor(startupError: unknown, cleanupError: unknown, retryCleanup: (budgetMs?: number) => void,
+    resources: () => readonly UnreleasedResource[] = () => []) {
     super([startupError, cleanupError], 'Profile creation and cleanup both failed.');
     this.startupError = startupError;
     this.retryCleanup = retryCleanup;
+    this.#resources = resources;
   }
+  /** The staging directories and network this creation may still have left behind, as of now. */
+  get resources(): readonly UnreleasedResource[] { return this.#resources(); }
 }
 
 interface FileIdentity {
@@ -162,13 +169,28 @@ export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now
   return Math.min(timeoutMs, left);
 }
 
+// Never throws: this runs while a handle settles. A directory whose state cannot be read is still reported.
+const directoryResources = (directories: readonly string[]) => directories.filter(directory => {
+  try { return lstatSync(directory, { throwIfNoEntry: false }) !== undefined; } catch { return true; }
+}).map(name => Object.freeze({ kind: 'directory' as const, name }));
+
+/**
+ * The staging directories and network a profile still owns, for reporting when their removal is not confirmed. The
+ * agent container is reported separately (`agentContainerResources`), because only a create makes it this profile's.
+ */
+export function containerProfileResources(profile: ContainerProfile): readonly UnreleasedResource[] {
+  const identity = identities.get(profile);
+  if (!identity) return Object.freeze([]);
+  return Object.freeze([...vendorNetworkResources(identity.network), ...directoryResources(identity.cleanupDirectories)]);
+}
+
 /** Remove runner-owned credential staging after this one-shot profile settles. */
-export function disposeContainerProfile(profile: ContainerProfile): void {
+export function disposeContainerProfile(profile: ContainerProfile, networkTimeoutMs = 30_000): void {
   const identity = identities.get(profile);
   if (!identity) return;
   const failures: unknown[] = [];
   try { removeOwnedDirectories(identity.cleanupDirectories); } catch (error) { failures.push(error); }
-  try { removeVendorNetwork(identity.network); } catch (error) { failures.push(error); }
+  try { removeVendorNetwork(identity.network, networkTimeoutMs); } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
   identities.delete(profile);
 }
@@ -273,14 +295,17 @@ export function createContainerProfile(options: ProfileOptions): ContainerProfil
       deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
-    const cleanupProfileResources = () => {
+    const cleanupProfileResources = (budgetMs = 30_000) => {
       const failures: unknown[] = [];
       try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
-      try { removeVendorNetwork(options.network); } catch (cleanupError) { failures.push(cleanupError); }
+      try { removeVendorNetwork(options.network, budgetMs); } catch (cleanupError) { failures.push(cleanupError); }
       if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
     };
     try { cleanupProfileResources(); }
-    catch (cleanupError) { throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources); }
+    catch (cleanupError) {
+      throw new ProfileCreationCleanupError(error, cleanupError, cleanupProfileResources, () => Object.freeze([
+        ...vendorNetworkResources(options.network), ...directoryResources(cleanupDirectories)]));
+    }
     throw error;
   }
 }

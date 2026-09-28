@@ -5,7 +5,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
-import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS,
+import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS, vendorNetworkResources,
+  VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 
@@ -70,6 +71,99 @@ describe('vendor-only egress', () => {
     expect(orphaned).toBe(false);
   }, 60_000);
 
+  it('leaves a same-named network alone when the daemon refuses the create', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The name is taken by someone else's network just before our create, so the daemon refuses it.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
+        + `'${realDocker}' network create "$last" >/dev/null; printf %s "$last" > '${recorded}'; `
+        + `echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const refused = captureInvocation({ ...invocation, attemptId: `refused-network-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let foreign = '', error: unknown;
+    try {
+      try { createVendorNetwork(refused, imageId); } catch (caught) { error = caught; }
+      foreign = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+    spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
+    // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
+    expect(String(error)).toMatch(/already exists/);
+    expect(survived).toBe(true);
+  }, 60_000);
+
+  it('removes a proxy that was created even though its start failed', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'proxy');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The proxy container is created, then its start fails: a container this allocation owns by ID.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = start ] && [ "$2" != --attach ]; then printf %s "$2" > '${recorded}'; `
+        + `echo 'Error response from daemon: failed to start' >&2; exit 1; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const failing = captureInvocation({ ...invocation, attemptId: `proxy-start-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let proxyId = '';
+    try {
+      expect(() => createVendorNetwork(failing, imageId)).toThrow('failed to start');
+      proxyId = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const leaked = spawnSync('docker', ['container', 'inspect', proxyId], { stdio: 'ignore' }).status === 0;
+    if (leaked) spawnSync('docker', ['rm', '--force', proxyId], { stdio: 'ignore' });
+    expect(proxyId).toMatch(/^[0-9a-f]{64}$/);
+    expect(leaked).toBe(false);
+  }, 60_000);
+
+  it('neither reports nor removes a same-named proxy when the daemon refuses the create', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // Someone else's container takes the proxy name just before our create, so the daemon refuses it.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = create ] && [ "$2" = --name ] && case "$3" in codeboost-proxy-*) true;; *) false;; esac; then `
+        + `'${realDocker}' create --name "$3" --entrypoint true ${imageId} >/dev/null; printf %s "$3" > '${recorded}'; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const refused = captureInvocation({ ...invocation, attemptId: `refused-proxy-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let foreign = '', error: unknown;
+    try {
+      try { createVendorNetwork(refused, imageId); } catch (caught) { error = caught; }
+      foreign = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const survived = spawnSync('docker', ['container', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+    spawnSync('docker', ['rm', '--force', foreign], { stdio: 'ignore' });
+    // The refused create is reported as itself: our network was removed, nothing is left to retry or report.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
+    expect(String(error)).toMatch(/already in use|Conflict/);
+    expect(survived).toBe(true);
+  }, 60_000);
+
+  it('reports a Docker client that could not start as a plain failure, with nothing to clean up', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-'));
+    // A `docker` that cannot be executed: the create never reached the daemon, so nothing can exist.
+    writeFileSync(join(shim, 'docker'), '#!/bin/sh\n', { mode: 0o644 });
+    const blocked = captureInvocation({ ...invocation, attemptId: `unstartable-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH, started = performance.now();
+    process.env.PATH = shim;
+    let error: unknown;
+    try { try { createVendorNetwork(blocked, imageId); } catch (caught) { error = caught; } }
+    finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
+    // No settle window was waited out for a create that never happened.
+    expect(performance.now() - started).toBeLessThan(5_000);
+  }, 60_000);
+
   it('does not delete a same-named stand-in when setup fails after the proxy exists', () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -93,6 +187,23 @@ describe('vendor-only egress', () => {
     spawnSync('docker', ['rm', '--force', impostor], { stdio: 'ignore' });
     expect(impostor).toMatch(/^codeboost-proxy-/);
     expect(survived).toBe(true);
+  }, 60_000);
+
+  it('reports only the part of a network whose removal is still unconfirmed', () => {
+    const partial = captureInvocation({ ...invocation, attemptId: `partial-removal-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const created = createVendorNetwork(partial, imageId), blocker = `codeboost-blocker-${randomUUID()}`;
+    const [proxy, net] = vendorNetworkResources(created);
+    expect(proxy).toMatchObject({ kind: 'container', name: created.proxyContainer });
+    expect(net).toMatchObject({ kind: 'network', name: created.name });
+    // A foreign endpoint keeps the network busy, so the proxy is removed but `network rm` fails.
+    docker('run', '--detach', '--name', blocker, '--network', created.name, '--entrypoint', 'sleep', imageId, '300');
+    try {
+      expect(() => removeVendorNetwork(created, 10_000)).toThrow('did not settle');
+      expect(vendorNetworkResources(created)).toEqual([net]);
+    } finally { spawnSync('docker', ['rm', '--force', blocker], { stdio: 'ignore' }); }
+    removeVendorNetwork(created);
+    expect(vendorNetworkResources(created)).toEqual([]);
   }, 60_000);
 
   it('pins the host list with each vendor profile', () => {

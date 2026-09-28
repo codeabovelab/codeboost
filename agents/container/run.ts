@@ -1,5 +1,7 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { realpathSync } from 'node:fs';
+import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
+import type { UnreleasedResource } from '../contract.ts';
 import { assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
   isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
@@ -51,16 +53,64 @@ const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 // When a killed `docker create` for a profile stops counting as possibly in flight (performance.now() timestamp).
 const unsettledCreates = new WeakMap<ContainerProfile, number>();
-const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false) => {
+// Profiles whose `docker create` succeeded (with the returned ID) or whose client was killed (ID unknown). Only these
+// may own a container named `profile.name`; before that the name can belong to another invocation. An entry is
+// removed only once the container's removal (or absence) is confirmed, so any later retry of the profile's own
+// network or staging cleanup is profile-only and never looks the name up again.
+const createdContainers = new WeakMap<ContainerProfile, string | undefined>();
+
+/**
+ * The immutable ID of the agent container this profile created, when `docker create` returned one. Every operation
+ * after the create should use it: the name can be taken over by a replacement container.
+ */
+export function agentContainerId(profile: ContainerProfile): string | undefined {
+  return createdContainers.get(profile);
+}
+
+const requireContainerId = (profile: ContainerProfile) => {
+  const id = createdContainers.get(profile);
+  if (!id) throw new Error('Docker did not return the created agent container ID.');
+  return id;
+};
+
+// Profiles that settled with cleanup unconfirmed. They stay authentic so their cleanup can still run and be recovered,
+// but no launch path may create or start a container for one again.
+const retiredProfiles = new WeakSet<ContainerProfile>();
+/** Mark a profile whose invocation settled with `unreleased` resources: it can be cleaned up, never launched. */
+export function retireContainerProfile(profile: ContainerProfile): void { retiredProfiles.add(profile); }
+export function isContainerProfileRetired(profile: ContainerProfile): boolean { return retiredProfiles.has(profile); }
+// Checked before any launch work, so a refusal owns nothing and triggers no cleanup.
+const assertLaunchable = (profile: ContainerProfile) => {
+  if (retiredProfiles.has(profile))
+    throw new Error('This container profile settled without confirmed cleanup; start a new profile.');
+};
+
+/** The agent container this profile may have created, for reporting when its removal is not confirmed. */
+export function agentContainerResources(profile: ContainerProfile): readonly UnreleasedResource[] {
+  if (!createdContainers.has(profile)) return Object.freeze([]);
+  const id = createdContainers.get(profile);
+  return Object.freeze([Object.freeze({ kind: 'container' as const, name: profile.name, ...(id ? { id } : {}),
+    owner: Object.freeze({ label: 'io.codeboost.invocation', value: profile.ownershipId }) })]);
+}
+const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false, timeoutMs = 30_000) => {
   // Destructive cleanup acts only for the builder-registered profile; a copy's name and label are not a capability.
   if (!isContainerProfileAuthentic(profile))
     throw new Error('Container profile was not created by the trusted profile builder.');
+  // A profile whose `docker create` never ran, or was refused by the daemon, owns no container: the name may belong
+  // to another invocation, which must neither be inspected as ours nor block this profile's own cleanup.
+  if (!createdContainers.has(profile)) {
+    disposeContainerProfile(profile, timeoutMs);
+    return;
+  }
   const settleUntil = unsettledCreates.get(profile) ?? 0;
-  const remaining = createDeadline(30_000 + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
+  const remaining = createDeadline(timeoutMs + (waitForSettle ? Math.max(0, Math.ceil(settleUntil - performance.now())) : 0));
+  // Look up by the captured ID; the name only for a create whose ID never came back.
+  const capturedId = createdContainers.get(profile), target = capturedId ?? profile.name;
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
-    before = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+    before = spawnSync('docker', ['container', 'inspect', target], {
+      encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (before.status === 0) break;
     const missing = !before.error && /No such (?:object|container)/i.test(`${before.stdout ?? ''}\n${before.stderr ?? ''}`);
@@ -70,34 +120,47 @@ const removeContainerOrThrow = (profile: ContainerProfile, waitForSettle = false
     // inside the window and retries later.
     if (performance.now() >= settleUntil) {
       unsettledCreates.delete(profile);
-      disposeContainerProfile(profile);
+      createdContainers.delete(profile);
+      disposeContainerProfile(profile, remaining());
       return;
     }
     if (!waitForSettle) throw new Error('Agent container creation did not settle; staged credentials were retained.');
     sleep(250);
   }
-  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as { Config?: { Labels?: Record<string, string> } } | undefined;
+  const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
+    { Id?: string; Config?: { Labels?: Record<string, string> } } | undefined;
   if (inspected?.Config?.Labels?.['io.codeboost.invocation'] !== profile.ownershipId)
     throw new Error('Agent container name is held by another invocation; staged credentials were retained.');
-  const result = spawnSync('docker', ['rm', '--force', profile.name], {
-    encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+  // Remove and confirm by the ID the daemon just reported for our container, never by the name: a same-named
+  // replacement created after this inspect must not be deleted.
+  const id = inspected.Id;
+  if (!id || !DOCKER_ID.test(id) || (capturedId && id !== capturedId))
+    throw new Error('Failed to establish the agent container identity; staged credentials were retained.');
+  const result = spawnSync('docker', ['rm', '--force', id], {
+    encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
+    stdio: ['ignore', 'pipe', 'pipe'],
   });
   if (result.status !== 0) {
-    const inspect = spawnSync('docker', ['container', 'inspect', profile.name], {
-      encoding: 'utf8', timeout: remaining(), env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
+    const inspect = spawnSync('docker', ['container', 'inspect', id], {
+      encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: dockerEnvironment(),
+      stdio: ['ignore', 'pipe', 'pipe'],
     });
     const absent = inspect.status !== 0 && !inspect.error
       && /No such (?:object|container)/i.test(`${inspect.stdout ?? ''}\n${inspect.stderr ?? ''}`);
     if (!absent) throw new Error('Failed to confirm removal of the agent container; staged credentials were retained.');
   }
   unsettledCreates.delete(profile);
-  disposeContainerProfile(profile);
+  createdContainers.delete(profile);
+  disposeContainerProfile(profile, remaining());
 };
 
-/** Remove a validated invocation container, then its profile-owned staging and network resources. */
-export function disposeValidatedContainer(profile: ContainerProfile): void {
+/**
+ * Remove a validated invocation container, then its profile-owned staging and network resources. `timeoutMs` bounds
+ * the whole removal: the container step and the network step share one deadline.
+ */
+export function disposeValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000): void {
   assertContainerProfileAuthenticity(profile);
-  removeContainerOrThrow(profile);
+  removeContainerOrThrow(profile, false, timeoutMs);
 }
 
 type Inspect = {
@@ -285,6 +348,7 @@ export function validateContainer(container: string, profile: ContainerProfile, 
 
 export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 30_000,
   secrets: Readonly<Record<string, string>> = {}): string {
+  assertLaunchable(profile);
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let createUnsettled = false;
   try {
@@ -292,14 +356,19 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
     assertContainerProfile(profile, remaining());
     const createTimeout = remaining();
     createUnsettled = true;
-    try { docker(profile.args, { timeoutMs: createTimeout, secrets }); }
+    try {
+      const id = docker(profile.args, { timeoutMs: createTimeout, secrets });
+      // An unexpected create output leaves the ID unknown, so cleanup falls back to a verified name lookup.
+      createdContainers.set(profile, DOCKER_ID.test(id) ? id : undefined);
+    }
     catch (error) {
       // A nonzero exit means the daemon answered; a killed client leaves the request in flight.
-      createUnsettled = typeof (error as { status?: unknown }).status !== 'number';
+      createUnsettled = createOutcomeUnknown(error);
+      if (createUnsettled) createdContainers.set(profile, undefined);
       throw error;
     }
     createUnsettled = false;
-    validateContainer(profile.name, profile, remaining());
+    validateContainer(requireContainerId(profile), profile, remaining());
     assertContainerProfile(profile, remaining());
     remaining();
     return profile.name;
@@ -313,12 +382,15 @@ export function createValidatedContainer(profile: ContainerProfile, timeoutMs = 
 
 export function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
   secrets: Readonly<Record<string, string>> = {}): string {
+  assertLaunchable(profile);
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let failure: unknown;
   try {
     validateSecrets(profile, secrets);
-    validateContainer(profile.name, profile, remaining());
-    const output = docker(['start', '--attach', profile.name], { timeoutMs: remaining(), secrets });
+    // Validate and start the container this profile created, by ID: a same-named replacement must never run.
+    const id = requireContainerId(profile);
+    validateContainer(id, profile, remaining());
+    const output = docker(['start', '--attach', id], { timeoutMs: remaining(), secrets });
     remaining();
     return output;
   }
