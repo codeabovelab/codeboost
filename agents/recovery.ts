@@ -44,11 +44,8 @@ const INVOCATION_LABEL = 'io.codeboost.invocation';
 const EGRESS_LABEL = 'io.codeboost.egress';
 const STORAGE_LABEL = 'io.codeboost.task-storage';
 // Every label a codeboost object of any build carries at least one of; used to find objects without a runner label.
-const KIND_LABELS = {
-  container: [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL, ALLOCATION_LABEL],
-  volume: [STORAGE_LABEL, ALLOCATION_LABEL],
-  network: [EGRESS_LABEL, ALLOCATION_LABEL],
-} as const;
+// Each Docker type is scanned for all of them, so an object with a label D never puts on its type is still found.
+const KIND_LABELS = [INVOCATION_LABEL, EGRESS_LABEL, STORAGE_LABEL, ALLOCATION_LABEL] as const;
 const DIAGNOSTIC_LIMIT = 1_000;
 // Objects per `docker inspect`, so a daemon with many codeboost objects cannot exceed the argument-size limit.
 const INSPECT_BATCH = 200;
@@ -143,7 +140,7 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   for (const kind of ['container', 'volume', 'network'] as const) {
     owned[kind] = await inspect(kind, await list(kind, `${RUNNER_LABEL}=${runnerOwner}`, remaining), remaining);
     // Docker cannot filter on a missing label, so list every codeboost object of this kind and keep those without one.
-    const candidates = unique((await Promise.all(KIND_LABELS[kind].map(label => list(kind, label, remaining)))).flat());
+    const candidates = unique((await Promise.all(KIND_LABELS.map(label => list(kind, label, remaining)))).flat());
     for (const resource of await inspect(kind, candidates, remaining))
       if (!(RUNNER_LABEL in resource.labels)) unowned.push(Object.freeze({ ...resource, reason: 'no-runner-label' }));
   }

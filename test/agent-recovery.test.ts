@@ -156,6 +156,9 @@ describe('recoverLeftovers', () => {
     attempt(A, 'attempt-a');
     const legacy: FakeObject[] = [
       { kind: 'container', id: id(), name: 'codeboost-agent-old', labels: { 'io.codeboost.invocation': 'old' } },
+      // Labels D never puts on these types: still codeboost objects, so still found.
+      { kind: 'volume', name: 'codeboost-volume-with-invocation', labels: { 'io.codeboost.invocation': 'old' } },
+      { kind: 'network', id: id(), name: 'codeboost-network-with-storage', labels: { 'io.codeboost.task-storage': 'work' } },
       { kind: 'network', id: id(), name: 'codeboost-egress-old', labels: { 'io.codeboost.egress': 'old' } },
       { kind: 'volume', id: '', name: 'codeboost-work-old', labels: { 'io.codeboost.allocation': 'old', 'io.codeboost.task-storage': 'work' } },
     ];
