@@ -553,9 +553,9 @@ describe('real Docker agent isolation', () => {
     expect(docker('volume', 'ls', '--quiet', '--filter', `label=io.codeboost.allocation=${reused.allocationId}`)).toBe(before);
   }, 60_000);
 
-  // A docker wrapper that runs `after` (a script body with `args`, `run` and `result` in scope) once the real command
-  // matching `prefix` has finished, to act as a concurrent process or a killed client.
-  const withDockerShim = async <T>(prefix: string[], after: string, run: () => Promise<T> | T): Promise<T> => {
+  // A docker wrapper that hands a command matching `prefix` to `script`: a script body with `args` and `run` in scope
+  // that must set `result` (it may edit `args` first, run it, act as a concurrent process, or kill the client).
+  const withDockerShim = async <T>(prefix: string[], script: string, run: () => Promise<T> | T): Promise<T> => {
     const shim = mkdtempSync(join(tmpdir(), 'codeboost-shim-docker-')); roots.push(shim);
     mkdirSync(join(shim, 'input')); // afterAll resets this path's mode
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
@@ -565,8 +565,8 @@ describe('real Docker agent isolation', () => {
       `const run = rest => spawnSync(${JSON.stringify(realDocker)}, rest, { encoding: 'utf8' });`,
       `if (!${JSON.stringify(prefix)}.every((word, i) => args[i] === word)) {`,
       `  process.exit(spawnSync(${JSON.stringify(realDocker)}, args, { stdio: 'inherit' }).status ?? 1); }`,
-      'let result = run(args);',
-      after,
+      'let result;',
+      script,
       'process.stdout.write(result.stdout); process.stderr.write(result.stderr); process.exit(result.status ?? 1);',
     ].join('\n'), { mode: 0o755 });
     const path = process.env.PATH;
@@ -575,6 +575,7 @@ describe('real Docker agent isolation', () => {
   };
   // After our create, another process creates a volume carrying the same allocation ID: both passed the check first.
   const racer = (name: string) => [
+    'result = run(args);',
     "const allocation = args.find(arg => arg.startsWith('io.codeboost.allocation='));",
     `run(['volume', 'create', '--label', 'io.codeboost.runner=${'f'.repeat(32)}', '--label', allocation, '${name}']);`,
   ].join('\n');
