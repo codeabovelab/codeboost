@@ -86,8 +86,8 @@ const absent = (result: DockerOutcome) => result.status !== 0 && result.status !
 const CREATE_SETTLE_MS = 10_000;
 // Cleanup is never cancelled: it runs to its own deadline so nothing is dropped.
 // Remove one owned object. Looks it up by `target` (its ID, or its name for a create whose ID never came back),
-// checks the egress label and all three owner labels, then removes and confirms by the ID the daemon just reported: a same-named replacement
-// created after the lookup is never touched.
+// checks the egress label and all three owner labels, then removes and confirms by the ID the daemon just reported:
+// a same-named replacement created after the lookup is never touched.
 const remove = async (object: 'container' | 'network', target: string, remaining: () => number, kind: string,
   owner: ResourceOwner, settleBy = 0) => {
   const inspect = (ref: string) => runDocker([object, 'inspect', ref], { timeoutMs: remaining() });
