@@ -7,7 +7,7 @@ import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { DockerError, pause, runDocker, type DockerOutcome } from '../docker.ts';
-import { runInProcessGroup, type ProcessGroup } from '../process-group.ts';
+import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../process-group.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
 
@@ -49,6 +49,8 @@ const validLimit = (value: number, name: string) => {
 };
 const createDeadline = (timeoutMs: number) => {
   validLimit(timeoutMs, 'timeoutMs');
+  // Both variants share these steps, and the asynchronous one arms Node timers, which cannot wait longer than this.
+  if (timeoutMs > MAXIMUM_TIMER_MS) throw new Error(`timeoutMs must be at most ${MAXIMUM_TIMER_MS}.`);
   const deadline = performance.now() + timeoutMs;
   return () => {
     const value = Math.ceil(deadline - performance.now());

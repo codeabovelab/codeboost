@@ -4,15 +4,16 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-// spawn passes through; a test can act one turn after a chosen Git call exits, before the next one starts.
-const spawnHook = vi.hoisted(() => ({ afterExit: undefined as undefined | ((args: readonly string[]) => void) }));
-vi.mock('node:child_process', async importOriginal => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
-  return { ...actual, spawn: ((file: string, args: readonly string[], options: object) => {
-    const child = actual.spawn(file, args, options), afterExit = spawnHook.afterExit;
-    if (afterExit) child.once('exit', () => setImmediate(() => afterExit(args)));
-    return child;
-  }) as typeof actual.spawn };
+// Every Git call passes through; a test can act after one call settles and before the next is requested.
+const calls = vi.hoisted(() => ({ made: [] as string[][], afterCall: undefined as undefined | ((args: readonly string[]) => void) }));
+vi.mock('../agents/process-group.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../agents/process-group.ts')>();
+  return { ...actual, runInProcessGroup: async (...call: Parameters<typeof actual.runInProcessGroup>) => {
+    calls.made.push([...call[1]]);
+    const outcome = await actual.runInProcessGroup(...call);
+    calls.afterCall?.(call[1]);
+    return outcome;
+  } };
 });
 const { assertTaskClone, createTaskCloneAsync } = await import('../git/clone.ts');
 import type { ProcessGroup } from '../agents/process-group.ts';
@@ -47,7 +48,7 @@ const withStubbornClone = async <T>(root: string, started: string, run: () => Pr
   try { return await run(); } finally { process.env.PATH = path; }
 };
 afterEach(() => {
-  spawnHook.afterExit = undefined;
+  calls.afterCall = undefined; calls.made = [];
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
@@ -87,11 +88,13 @@ describe('asynchronous task clone', () => {
   }, 30_000);
 
   it('reports an abort that lands between two Git calls as a cancel, and removes the partial clone', async () => {
-    const input = fixture(), controller = new AbortController();
-    // Aborted right after `git clone` exits: the next Git call never starts.
-    spawnHook.afterExit = args => { if (args.includes('clone')) controller.abort(); };
-    const error = await createTaskCloneAsync({ ...input, signal: controller.signal }).then(() => undefined, caught => caught);
+    const input = fixture(), controller = new AbortController(), groups: ProcessGroup[] = [];
+    // Aborted after `git clone` settles and before the next Git call is requested: that call never starts.
+    calls.afterCall = args => { if (args.includes('clone')) controller.abort(); };
+    const error = await createTaskCloneAsync({ ...input, signal: controller.signal,
+      onProcessGroup: group => { groups.push(group); } }).then(() => undefined, caught => caught);
     expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    expect(calls.made.length - groups.length).toBe(1);
     expect(readdirSync(input.parent)).toEqual([]);
   });
 

@@ -9,17 +9,23 @@ import type { ProcessGroup } from '../agents/process-group.ts';
 // The asynchronous storage allocation (#51 item 5), against a fake Docker CLI that keeps its objects as files, so the
 // abort path runs without a daemon. The real-Docker suite covers the same path against Docker itself.
 // spawn passes through unless a test makes it throw, as it does synchronously for errors such as ENOMEM.
-const spawnFault = vi.hoisted(() => ({ on: undefined as undefined | ((args: readonly string[]) => boolean),
-  afterExit: undefined as undefined | ((args: readonly string[]) => void) }));
+const spawnFault = vi.hoisted(() => ({ on: undefined as undefined | ((args: readonly string[]) => boolean) }));
+// Every Docker call passes through; a test can act after one call settles and before the next is requested.
+const calls = vi.hoisted(() => ({ made: [] as string[][], afterCall: undefined as undefined | ((args: readonly string[]) => void) }));
+vi.mock('../agents/process-group.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../agents/process-group.ts')>();
+  return { ...actual, runInProcessGroup: async (...call: Parameters<typeof actual.runInProcessGroup>) => {
+    calls.made.push([...call[1]]);
+    const outcome = await actual.runInProcessGroup(...call);
+    calls.afterCall?.(call[1]);
+    return outcome;
+  } };
+});
 vi.mock('node:child_process', async importOriginal => {
   const actual = await importOriginal<typeof import('node:child_process')>();
   return { ...actual, spawn: ((file: string, args: readonly string[], options: object) => {
     if (spawnFault.on?.(args)) throw Object.assign(new Error('spawn ENOMEM'), { code: 'ENOMEM', syscall: 'spawn' });
-    const child = actual.spawn(file, args, options);
-    // One turn after the exit, once the helper has finished with this call and before the next one starts.
-    const afterExit = spawnFault.afterExit;
-    if (afterExit) child.once('exit', () => setImmediate(() => afterExit(args)));
-    return child;
+    return actual.spawn(file, args, options);
   }) as typeof actual.spawn };
 });
 vi.mock('../agents/container/image.ts', async importOriginal => ({
@@ -100,7 +106,7 @@ beforeEach(() => {
   process.env.PATH = `${bin}:${path}`;
 });
 afterEach(() => {
-  spawnFault.on = undefined; spawnFault.afterExit = undefined;
+  spawnFault.on = undefined; calls.afterCall = undefined; calls.made = [];
   process.env.PATH = path;
   rmSync(root, { recursive: true, force: true });
 });
@@ -158,14 +164,23 @@ describe('asynchronous task storage allocation', () => {
   });
 
   it('reports an abort that lands between two Docker calls as a cancel, and removes what it created', async () => {
-    const controller = new AbortController();
-    // Aborted right after the work volume's create exits: the next call (the reuse check) never starts.
-    spawnFault.afterExit = args => { if (args[0] === 'volume' && args[1] === 'create') controller.abort(); };
-    const error = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(), { signal: controller.signal })
-      .then(() => undefined, caught => caught);
+    const controller = new AbortController(), groups: ProcessGroup[] = [];
+    // Aborted after the work volume's create settles and before the next call (the reuse check) is requested.
+    calls.afterCall = args => { if (args[0] === 'volume' && args[1] === 'create') controller.abort(); };
+    const error = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(),
+      { signal: controller.signal, onProcessGroup: group => { groups.push(group); } }).then(() => undefined, caught => caught);
     expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    // Exactly one call was refused before it started (the reuse check); every other call ran and reported its group.
+    expect(calls.made.length - groups.length).toBe(1);
     expect(stored()).toEqual([]);
     expect(hasLiveTaskStorage(RUNNER)).toBe(false);
+  });
+
+  it('refuses a deadline longer than a Node timer can wait, before any Docker call', async () => {
+    await expect(prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(), { timeoutMs: 2 ** 31 }))
+      .rejects.toThrow('at most');
+    expect(calls.made).toEqual([]);
+    expect(stored()).toEqual([]);
   });
 
   it('creates nothing when the signal is already aborted', async () => {

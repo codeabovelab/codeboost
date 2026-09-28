@@ -130,6 +130,8 @@ describe('runInProcessGroup', () => {
     for (const outcome of [
       await runInProcessGroup('sleep', ['1'], { env, timeoutMs: 5_000, signal: AbortSignal.abort(), onProcessGroup }),
       await runInProcessGroup('sleep', ['1'], { env, timeoutMs: 0, onProcessGroup }),
+      // Longer than a Node timer can wait: accepting it would time the call out after 1 ms.
+      await runInProcessGroup('sleep', ['1'], { env, timeoutMs: 2 ** 31, onProcessGroup }),
     ]) {
       expect((outcome.error as NodeJS.ErrnoException).code).toBe(NOT_STARTED);
       expect(createOutcomeUnknown({ status: outcome.status, cause: outcome.error })).toBe(false);

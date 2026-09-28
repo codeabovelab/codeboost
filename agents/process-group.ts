@@ -23,6 +23,8 @@ export interface ProcessGroupOptions {
 }
 
 const DEFAULT_GRACE_MS = 5_000;
+/** The longest delay a Node timer honours; `setTimeout` treats anything longer as 1 ms. */
+export const MAXIMUM_TIMER_MS = 2 ** 31 - 1;
 const DEFAULT_MAX_BUFFER = 16 * 1024 * 1024;
 // After the leader exits, how long to keep killing and polling other members of its group before giving up.
 const DRAIN_LIMIT_MS = 10_000;
@@ -62,8 +64,8 @@ const drainGroup = async (pgid: number) => {
  */
 export function runInProcessGroup(file: string, args: readonly string[],
   options: ProcessGroupOptions): Promise<DockerOutcome> {
-  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1)
-    return Promise.resolve(notStarted('Process deadline must be a positive integer.'));
+  if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1 || options.timeoutMs > MAXIMUM_TIMER_MS)
+    return Promise.resolve(notStarted(`Process deadline must be a positive integer of at most ${MAXIMUM_TIMER_MS} ms.`));
   if (options.signal?.aborted) return Promise.resolve(notStarted(`${file} was cancelled before it started.`));
   const graceMs = options.graceMs ?? DEFAULT_GRACE_MS, maxBuffer = options.maxBuffer ?? DEFAULT_MAX_BUFFER;
   return new Promise(resolve => {
