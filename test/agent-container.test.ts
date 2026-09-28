@@ -424,6 +424,25 @@ describe('real Docker agent isolation', () => {
     expect(isContainerProfileAuthentic(live)).toBe(false);
   }, 60_000);
 
+  it('never looks the name up again when only the profile cleanup is retried', async () => {
+    const data = fixture(), live = await profile(data, 'planning', 'noop');
+    await createValidatedContainer(live);
+    const blocker = `codeboost-blocker-${randomUUID()}`, replacement = live.name;
+    // Our container goes, but a foreign endpoint keeps the network busy, so the profile cleanup fails and is retried.
+    docker('run', '--detach', '--name', blocker, '--network', live.network.name, '--entrypoint', 'sleep', imageId, '300');
+    containers.add(blocker);
+    await expect(disposeValidatedContainer(live)).rejects.toThrow('did not settle');
+    expect(isContainerProfileAuthentic(live)).toBe(true);
+    // A same-named, same-labelled container appears before the retry.
+    docker('create', '--name', replacement, '--label', `io.codeboost.invocation=${live.ownershipId}`,
+      '--entrypoint', 'true', imageId); containers.add(replacement);
+    const replacementId = docker('container', 'inspect', '--format', '{{.Id}}', replacement);
+    docker('rm', '--force', blocker); containers.delete(blocker);
+    await disposeValidatedContainer(live);
+    expect(isContainerProfileAuthentic(live)).toBe(false);
+    expect(docker('container', 'inspect', '--format', '{{.Id}}', replacement)).toBe(replacementId);
+  }, 60_000);
+
   it('starts the agent container by its ID, never a same-named replacement', async () => {
     const data = fixture(), live = await profile(data, 'planning', 'finite-output');
     await createValidatedContainer(live);

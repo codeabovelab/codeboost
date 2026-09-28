@@ -49,7 +49,9 @@ const CREATE_SETTLE_MS = 10_000;
 // When a killed `docker create` for a profile stops counting as possibly in flight (performance.now() timestamp).
 const unsettledCreates = new WeakMap<ContainerProfile, number>();
 // Profiles whose `docker create` succeeded (with the returned ID) or whose client was killed (ID unknown). Only these
-// may own a container named `profile.name`; before that the name can belong to another invocation.
+// may own a container named `profile.name`; before that the name can belong to another invocation. An entry is
+// removed only once the container's removal (or absence) is confirmed, so any later retry of the profile's own
+// network or staging cleanup is profile-only and never looks the name up again.
 const createdContainers = new WeakMap<ContainerProfile, string | undefined>();
 
 const CONTAINER_ID = /^[0-9a-f]{64}$/;
