@@ -419,6 +419,8 @@ export class Store {
     this.#transaction(() => {
       this.#expect(key, expected);
       if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
+      // Approvals and choices must not change the reviewed state while GitHub may still merge it.
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
       const plan = this.getPlan(identity);
       for (const approval of approvals) {
         if (!plan.items.some(item => item.id === approval.item) || !approval.fingerprint) throw new Error('Invalid approval.');

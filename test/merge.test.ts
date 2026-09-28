@@ -569,6 +569,23 @@ it('answers with the failure a concurrent poll committed, not with the command\'
   } finally { await h.coordinator.close(); h.store.close(); }
 });
 
+it('fails closed when a newer attempt started while the old merge command ran', async () => {
+  const h = queueHarness([]);
+  h.client.merge = vi.fn(async head => {
+    // Elsewhere, the attempt is removed and a retry starts a newer attempt before this command returns.
+    const old = h.store.getMergeAttempt(h.identity)!;
+    h.store.finishMergeAttempt(h.identity, old.id, { state: 'removed', reason: 'Removed from the merge queue.' });
+    const expected = { ...h.view().expected, reviewVersion: h.view().expected.reviewVersion! };
+    h.store.beginMergeAttempt(h.identity, expected, sha('b'), 'CURSOR_retry', 'queue');
+    h.merges.push(head); return { url: 'https://github.example/pr/9' };
+  });
+  try {
+    const error = await h.coordinator.merge(h.view().token, randomUUID()).catch(value => value);
+    expect(error).toBeInstanceOf(MergeOutcomeUnknown);
+    expect(error.message).toMatch(/newer merge attempt/);
+  } finally { await h.coordinator.close(); h.store.close(); }
+});
+
 it('replays a refused merge as the same failure, not as a submission', async () => {
   const h = queueHarness([]);
   h.client.inspect = vi.fn(async () => remote(h.view()));

@@ -291,6 +291,10 @@ export class MergeCoordinator {
           const current = this.service.store.getMergeAttempt(this.service.config.identity);
           if (current?.id === queueAttempt.id && (current.state === 'failed' || current.state === 'removed'))
             throw new CommittedFailure(current.reason ?? 'GitHub did not merge this pull request.');
+          // A newer attempt started while this command ran (only possible across processes before the single-runner
+          // lock): this command's result cannot be tied to either attempt, so fail closed rather than report success.
+          if (current?.id !== queueAttempt.id)
+            throw new MergeOutcomeUnknown('A newer merge attempt started while this merge ran. Refresh to confirm GitHub state.');
         }
       }
       return { status: commandStatus, result };

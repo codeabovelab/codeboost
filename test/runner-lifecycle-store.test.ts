@@ -270,6 +270,15 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses approvals and choices during a merge, but still takes notes', () => {
+    const { store } = fixture();
+    const state = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    store.beginMergeAttempt(identity, state(), oid(2), null, 'direct');
+    expect(() => store.saveReview(identity, state(), [], [])).toThrow(/merge is in progress/);
+    // Notes (questions and change requests) change no reviewed code; a queued merge may take a while.
+    expect(store.addReviewNote(identity, state(), 'P1', 'question', 'Why this?').kind).toBe('question');
+    expect(store.addReviewNote(identity, state(), 'P1', 'change', 'Change it.').kind).toBe('change');
+  });
   it('refuses a feedback event after the task has closed', () => {
     const { store } = fixture();
     store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
