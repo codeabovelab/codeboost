@@ -66,10 +66,58 @@ dedicated read-only gateway with these boundaries:
 
 H1-H3 own dedicated issue retrieval, normalization and ranking modules plus
 their tests and this document. They do not edit the Store, runner, shared web
-shell, package files or CI. H4 waits for G4 to release shared web files and will
-record explicit trust decisions through the then-current storage owner.
+shell, package files or CI.
+
+**Schedule change (2026-09-25, approved by the product owner).** H4 was planned
+to wait for G4 to release the shared web files. G cannot start until E4 merges,
+and E4 waits for D5, so the web files had no active owner. H4 therefore takes
+them now, split in two:
+
+- **H4a (this change): the Issues screen.** It owns `web/server.ts`,
+  `web/public/*`, a new `web/issues.ts`, the demo fixture
+  `scripts/demo-issues.ts` and their tests. It does not edit `runner/store.ts`.
+  It hands the web files to G when G1 starts.
+- **H4b: the "trust this issue" action.** It records trust decisions through
+  the storage owner (F) after F1's Store changes land, so the two lanes do not
+  both bump the schema version.
 
 H1 is complete when this policy and access inspection are committed. H2/H3 are
 complete when dedicated tests prove normalized retrieval, deterministic reasons,
 stable tie-breaking, trust classification, bounded failure, and stale versus
 unavailable states, and `npm run typecheck` passes.
+
+## H4a: Issues screen
+
+**What you see.** "Issues" in the app bar opens a ranked table: rank, issue
+number and title (a link to GitHub), labels, one line of reasons, score, trust
+and the date it was opened. Trust shows "✓ Collaborator" or "! Needs trust".
+The status line says one of:
+
+- "✓ Current": the list was retrieved at the time shown;
+- "! Stale": the last good list is shown, with the time and error of the
+  failed refresh;
+- "✕ Unavailable": no list has been retrieved yet, with the error;
+- "– Not configured": the review configuration has no `github.repository`.
+
+A note says that trusting issues and queueing are not available yet. Demo mode
+shows fixture issues and never contacts GitHub.
+
+**State holders.**
+
+| Holder | Owner | Lifecycle |
+| --- | --- | --- |
+| Retrieval (`gh` subprocesses) | `IssueBoard` in `web/issues.ts` | One refresh at a time, under an abort controller owned by the server. Concurrent requests join it. The gateway timeout is 12 seconds, below the 15-second request timeout. |
+| Last good list | `IssuePrioritizer` (H3) | Kept in memory only. After a restart, the first failure is "unavailable", not "stale". |
+| HTTP requests | `web/server.ts` | `GET /api/issues` reads the current view without fetching. `POST /api/issues` with `{"action":"refresh"}` starts or joins a refresh. A request that is aborted stops waiting but does not cancel the shared refresh. |
+| Rendered screen | `web/public/app.js` | A generation number discards a response that a newer refresh has replaced. Switching screens hides and shows views without re-rendering, so review drafts, selections and focus stay. |
+
+**Shutdown.** The server rejects new requests, drains admitted requests within
+the grace period, then aborts the refresh and awaits the gateway's settlement
+before closing storage.
+
+**Evidence.** `test/issue-board.test.ts` covers joining, a departing request,
+stale after success, shutdown abort-and-await, endpoint validation and the
+unconfigured state. `test/browser/issues.spec.ts` covers ranked order, reasons,
+trust marks, `aria-current` navigation, review input kept across navigation,
+review shortcuts ignored on the Issues screen, the unavailable → current → stale
+sequence, a late refresh after leaving the screen, and the 1280px layout.

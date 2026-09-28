@@ -1,39 +1,228 @@
-import { spawn } from 'node:child_process';
-import { mkdtemp, rm } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { randomBytes, randomUUID } from 'node:crypto';
+import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
-export type Provider = 'claude' | 'codex';
-export function agentArguments(provider: Provider): string[] {
-  if(provider==='claude') return ['--print','--output-format','json','--tools','','--safe-mode','--strict-mcp-config','--no-session-persistence','--disable-slash-commands'];
-  return ['exec','--ignore-user-config','--ignore-rules','--sandbox','read-only','--skip-git-repo-check','--ephemeral','--json',
-    '-c','approval_policy="never"','-c','web_search="disabled"','-c','project_doc_max_bytes=0',
-    ...['shell_tool','apps','plugins','hooks','memories','multi_agent','multi_agent_v2','skill_search','skill_mcp_dependency_install'].flatMap(key=>['-c',`features.${key}=false`]),'-'];
-}
-export function cliQuestionAgent(provider: Provider): QuestionAgent {
-  return async(prompt,signal)=>{
-    const cwd=await mkdtemp(join(tmpdir(),'codeboost-question-'));
+import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, type Provider } from './question-container.ts';
+import type { ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
+import { createAskRoot, removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
+export type { Provider } from './question-container.ts';
+
+// Leave the worker time to cancel the container and release storage before the review's own timeout fires.
+const SETTLE_MARGIN_MS = 5_000;
+// Bounds the final storage removal at shutdown; whatever remains is recorded instead of waited for.
+const RELEASE_TIMEOUT_MS = 30_000;
+// Lane D's settlement can retry cleanup without limit (#51 item 1). A question not settled this long after its
+// deadline is abandoned: its resources are recorded as unknown and the worker is stopped.
+const ABANDON_AFTER_DEADLINE_MS = 30_000;
+// Bounds the wait for an abandoned worker thread to stop (a synchronous Docker or Git call finishes first).
+const DEFAULT_TERMINATE_WAIT_MS = 15_000;
+
+/** One worker owns every Ask container, so lane D's trusted image and allocations stay in one registry. */
+export class QuestionWorker {
+  private worker?: Worker;
+  // The worker's TMPDIR. Recorded before the worker starts, deleted after it stops.
+  private root?: string;
+  private pending = new Map<string, { attemptId: string; resolve: (text: string) => void; reject: (error: Error) => void;
+    watchdog: ReturnType<typeof setTimeout> }>();
+  private scanned = false;
+  // Written as `io.codeboost.runner` on every Docker object Ask creates (#51 item 3). Interim: one random owner per
+  // session. The runner's per-database token (F1d) replaces it; Ask's own leftovers ledger does not depend on it.
+  private readonly runnerOwner = randomBytes(16).toString('hex');
+  // Set when the worker dies. Its containers and storage may still exist, and nothing in this process can reclaim
+  // them until lane D's scoped recovery exists (#51), so Ask stays off rather than starting a replacement worker.
+  private crashed?: Error;
+  private releases = new Map<string, (reply: Omit<ReleaseReply, 'id'> | null) => void>();
+  private url: URL;
+  private ledger?: LeftoverLedger;
+  /** With a ledger, storage left at shutdown is recorded, and Ask stays off while recorded storage still exists. */
+  private abandonAfterMs: number;
+  private terminateWaitMs: number;
+  private releaseTimeoutMs: number;
+  private closed = false;
+  private env: Readonly<Record<string, string | undefined>>;
+  constructor(url = new URL('./question-worker.ts', import.meta.url), ledger?: LeftoverLedger,
+    options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; releaseTimeoutMs?: number; env?: Readonly<Record<string, string | undefined>> } = {}) {
+    this.url = url; this.ledger = ledger; this.abandonAfterMs = options.abandonAfterDeadlineMs ?? ABANDON_AFTER_DEADLINE_MS;
+    this.terminateWaitMs = options.terminateWaitMs ?? DEFAULT_TERMINATE_WAIT_MS;
+    this.releaseTimeoutMs = options.releaseTimeoutMs ?? RELEASE_TIMEOUT_MS;
+    this.env = options.env ?? process.env;
+  }
+  private start(): Worker {
+    if (this.crashed) throw this.crashed;
+    if (this.worker) return this.worker;
+    // Stamped with this review's lock, so a later process can find it even if the record is renamed away or lost.
+    const root = createAskRoot(this.ledger?.lockPath ?? '');
+    // Durable before any setup: a process killed from here on still leaves a record of this root.
+    try { this.ledger?.record([], 0, [root]); } catch (error) { removeAskRoot(root); throw error; }
+    let worker: Worker;
     try {
+      worker = new Worker(this.url, { env: workerEnvironment(process.env, root),
+        workerData: { credentials: credentialEnvironment(this.env) } });
+    } catch (error) {
+      // Nothing ran in the root yet: delete it and drop the record, so close() can release the lock.
+      removeAskRoot(root); this.ledger?.forget(root);
+      throw error;
+    }
+    this.root = root;
+    worker.on('message', (reply: WorkerReply | ReleaseReply) => {
+      if ('remaining' in reply) { this.releases.get(reply.id)?.(reply); this.releases.delete(reply.id); return; }
+      const job = this.pending.get(reply.id);
+      if (!job) return;
+      this.pending.delete(reply.id);
+      clearTimeout(job.watchdog);
+      if (reply.attemptId !== job.attemptId) job.reject(new Error('The agent returned a result for a different question attempt.'));
+      else if (reply.ok) job.resolve(reply.text); else job.reject(new Error(reply.error));
+    });
+    const fail = (error: Error) => { if (this.worker === worker) void this.#abandon(`stopped (${error.message})`); };
+    worker.on('error', fail);
+    worker.on('exit', code => fail(new Error(`exit code ${code}`)));
+    this.worker = worker;
+    return worker;
+  }
+  /**
+   * Give up on the worker: record its allocations as unknown, reject everything waiting on it, and stop it.
+   * Used after a crash and when lane D does not settle in time. Ask stays off until codeboost restarts, and after
+   * the restart until no labelled resources remain.
+   */
+  #abandoning?: Promise<void>;
+  /** Every caller (crash, watchdog, shutdown) waits on the same bounded termination and handoff. */
+  #abandon(why: string): Promise<void> {
+    this.#abandoning ??= this.#abandonOnce(why);
+    return this.#abandoning;
+  }
+  async #abandonOnce(why: string) {
+    const worker = this.worker;
+    this.worker = undefined;
+    this.crashed ??= new Error(`The agent container worker ${why}. Its containers and storage may still exist, so Ask is off until codeboost restarts. Check \`docker ps -a\` and \`docker volume ls\` before restarting.`);
+    // Durable before anything else, so a later kill of this process cannot lose it.
+    this.#recordUnknown();
+    for (const release of this.releases.values()) release(null);
+    this.releases.clear();
+    // Keep the questions (and their slots) pending until the thread has stopped: a synchronous Docker or Git call
+    // in progress finishes first. Asynchronous children it leaves are covered by the unknown-leftover record.
+    if (worker) {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      // A rejected terminate() proves nothing about the thread: only a settled termination counts as stopped.
+      const termination = worker.terminate().then(() => true, () => false);
+      const stopped = await Promise.race([termination,
+        new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), this.terminateWaitMs); })]);
+      clearTimeout(timer);
+      // Only a stopped thread can no longer write into its root. If it is still inside a synchronous Docker or Git
+      // call, its ownership is already durable (unknown leftovers and the recorded root), and the crashed state
+      // admits no new question, so the waiters can be released; the root is deleted once the thread does stop.
+      const root = this.root;
+      if (stopped) this.#removeRoot();
+      else void termination.then(ended => { if (ended && this.root === root) this.#removeRoot(); });
+    }
+    for (const job of this.pending.values()) { clearTimeout(job.watchdog); job.reject(this.crashed); }
+    this.pending.clear();
+  }
+  /** Delete the worker's root and drop it from the record; if deletion fails it stays recorded for the next check. */
+  #removeRoot() {
+    const root = this.root;
+    if (!root) return;
+    this.root = undefined;
+    try {
+      removeAskRoot(root); this.ledger?.forget(root);
+      // A thread that stopped after close() has no more files to write; the lock still stays if it was abandoned.
+      if (this.closed && !this.#abandoning) this.ledger?.release();
+    }
+    catch (error) { console.error(`codeboost: could not delete ${root}: ${error instanceof Error ? error.message : error}`); }
+  }
+  #recordUnknown() {
+    try { this.ledger?.record([], 1); }
+    catch (error) { console.error(`codeboost: could not record possible leftover agent storage: ${error instanceof Error ? error.message : error}`); }
+  }
+  agent(provider: Provider): QuestionAgent {
+    return async (prompt, signal, scope, timeoutMs) => {
+      if (this.crashed) throw this.crashed;
+      // Missing sign-in is reported before any Docker work, including the leftover scan.
+      questionCredential(provider, this.env);
+      // Held until close, so no other process can scan, start a worker or write the record for this review.
+      this.ledger?.acquire();
+      // The first question of a process also scans for labelled leftovers when there is no record. The scan is
+      // single-flight: concurrent first questions share it, so none can see another's new resources as leftovers.
+      if (!this.scanned) await this.#startupScan(signal);
+      else await this.ledger?.assertClear(signal, { active: this.root });
       signal.throwIfAborted();
-      const stdout=await new Promise<string>((resolve,reject)=>{
-        const env={...process.env};delete env.CLAUDECODE;delete env.NODE_OPTIONS;
-        const child=spawn(provider,agentArguments(provider),{cwd,env,stdio:['pipe','pipe','pipe'],signal,killSignal:'SIGKILL'});
-        const chunks:Buffer[]=[];let bytes=0,diagnostic='';let failure:Error|undefined;
-        child.stdout.on('data',(chunk:Buffer)=>{bytes+=chunk.length;if(bytes>1024*1024){failure ??= new Error('Agent output exceeded its limit.');child.kill('SIGKILL');}else chunks.push(chunk);});
-        child.stderr.on('data',(chunk:Buffer)=>{diagnostic=(diagnostic+chunk.toString()).slice(-2000);});
-        child.on('error',error=>{failure = signal.aborted && signal.reason instanceof Error ? signal.reason : new Error(signal.aborted?'Agent cancelled.':`Could not start ${provider}. Check that its CLI is installed and signed in. (${error.name})`);});
-        child.on('close',code=>failure?reject(failure):code===0?resolve(Buffer.concat(chunks).toString('utf8')):reject(new Error(`${provider} exited with status ${code}. Check its login and usage limits.${/auth|login|sign.in/i.test(diagnostic)?' Authentication may be required.':''}`)));
-        child.stdin.on('error',()=>{});child.stdin.end(prompt);
-      });
-      if(provider==='claude') {
-        const result=JSON.parse(stdout);
-        if(result.is_error || typeof result.result!=='string') throw new Error('Claude could not answer. Check its login and usage limits.');
-        return result.result;
-      }
-      const events=stdout.split('\n').filter(Boolean).map(line=>JSON.parse(line));
-      const failure=events.find(event=>event.type==='turn.failed'||event.type==='error');
-      if(failure) throw new Error('Codex could not answer. Check its login and usage limits.');
-      return events.filter(event=>event.type==='item.completed'&&event.item?.type==='agent_message').map(event=>event.item.text).join('\n\n');
-    } finally {await rm(cwd,{recursive:true,force:true});}
-  };
+      return this.#ask(provider, prompt, signal, scope, timeoutMs);
+    };
+  }
+  #scanning?: Promise<void>;
+  /** One startup scan for all concurrent first questions. Each caller may stop waiting; a failed scan is retried. */
+  async #startupScan(signal: AbortSignal) {
+    this.#scanning ??= (async () => {
+      try { await this.ledger?.assertClear(undefined, { startup: true, active: this.root }); this.scanned = true; }
+      finally { this.#scanning = undefined; }
+    })();
+    const scan = this.#scanning;
+    let release!: () => void;
+    const aborted = new Promise<never>((_, reject) => { release = () => reject(signal.reason); signal.addEventListener('abort', release, { once: true }); });
+    try { await Promise.race([scan, aborted]); }
+    finally { signal.removeEventListener('abort', release); }
+  }
+  #ask(provider: Provider, ...[prompt, signal, scope, timeoutMs]: Parameters<QuestionAgent>) {
+    return new Promise<string>((resolve, reject) => {
+      if (!scope) { reject(new Error('Ask needs the reviewed repository and head.')); return; }
+      let worker: Worker;
+      try { worker = this.start(); } catch (error) { reject(error as Error); return; }
+      const id = randomUUID();
+      const question = { ...scope, provider, prompt, runnerOwner: this.runnerOwner,
+        deadline: Date.now() + Math.max(1_000, (timeoutMs ?? 120_000) - SETTLE_MARGIN_MS) };
+      const watchdog = setTimeout(() => { if (this.pending.has(id)) void this.#abandon('did not settle a question after its deadline'); },
+        question.deadline - Date.now() + this.abandonAfterMs);
+      watchdog.unref?.();
+      this.pending.set(id, { attemptId: scope.attemptId, resolve, reject, watchdog });
+      worker.postMessage({ type: 'ask', id, question } satisfies WorkerRequest);
+      // The promise settles only when the worker reports that the container and its storage are gone.
+      const cancel = () => worker.postMessage({ type: 'cancel', id, stop: stopOf(signal.reason),
+        reason: signal.reason instanceof Error ? signal.reason.message : 'Agent cancelled.' } satisfies WorkerRequest);
+      if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
+    });
+  }
+  /**
+   * Call only after every agent promise has settled. Asks the worker for a final storage removal and records
+   * anything it could not remove before terminating it, because terminating drops the worker's allocation handles.
+   */
+  async close() {
+    this.closed = true;
+    try { await this.#close(); }
+    finally {
+      // A shared startup scan may still be running and could write the record; it must finish under the lock.
+      await this.#scanning?.catch(() => undefined);
+      // Keep the lock while an abandoned thread may still write into its recorded root. After any abandonment, keep it
+      // until this process exits: Docker CLI children the thread started can outlive it, and nothing here can see or
+      // await them (that needs lane D's process groups, #51 item 5). The OS releases the lock when the process ends.
+      if (!this.root && !this.#abandoning) this.ledger?.release();
+    }
+  }
+  async #close() {
+    const worker = this.worker;
+    // An abandonment already in progress (crash or watchdog) owns the worker: wait for its bounded settlement.
+    if (!worker) { await this.#abandoning; return; }
+    // Questions still waiting mean lane D has not settled; do not wait on it at shutdown.
+    if (this.pending.size) { await this.#abandon('was stopped at shutdown with questions still settling'); return; }
+    const id = randomUUID();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const released = await new Promise<Omit<ReleaseReply, 'id'> | null>(resolve => {
+      this.releases.set(id, resolve);
+      timer = setTimeout(() => { this.releases.delete(id); resolve(null); }, this.releaseTimeoutMs);
+      worker.postMessage({ type: 'release', id } satisfies WorkerRequest);
+    });
+    clearTimeout(timer);
+    // No report means the worker may still be inside a synchronous Docker call: use the bounded abandon path,
+    // which records unknown leftovers and keeps the root recorded until the thread has stopped.
+    if (released === null) { await this.#abandon('did not report its storage before shutdown'); return; }
+    this.worker = undefined;
+    let recorded = false;
+    try { this.ledger?.record(released.remaining, released.untracked); recorded = true; }
+    finally {
+      await worker.terminate();
+      // The root is the durable evidence of this worker: delete it only once the release report is saved. Otherwise
+      // it stays recorded (from start()), and Docker leftovers are still caught by the startup label scan.
+      if (recorded) this.#removeRoot();
+      // The thread has stopped, so nothing writes into the root any more: it stays on disk and in the record for the
+      // next check, and this process lets go of it so close() can release the lock.
+      else this.root = undefined;
+    }
+  }
 }

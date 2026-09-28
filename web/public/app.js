@@ -11,7 +11,7 @@ const credential =
   location.hash.slice(1) || sessionStorage.getItem("codeboost-token") || "";
 if (location.hash) {
   sessionStorage.setItem("codeboost-token", credential);
-  history.replaceState(null, "", location.pathname);
+  history.replaceState(null, "", location.pathname + location.search);
 }
 let data,
   selected,
@@ -20,9 +20,18 @@ let data,
   since = false,
   busy = false;
 let reviewGeneration = 0;
+let view = "review";
+let mergeGeneration = 0,
+  mergePollTimer = null,
+  mergePollState = null,
+  mergePollDelay = 2000;
+const mergePollMaximumDelay = 30000;
 const drafts = new Map();
 const attachments = new Map();
 let snippetSelection = null;
+// Kept until the server answers, so a resend after a lost response replays the same click instead of merging twice.
+// The key travels with the exact request it was made for: a later Refresh changes data.token, not this request.
+let mergeAction = null;
 const statusClass = (text) =>
   text.startsWith("✓")
     ? "good"
@@ -41,13 +50,18 @@ async function api(path, body) {
     body: body ? JSON.stringify(body) : undefined,
   });
   const value = await response.json();
-  if (!response.ok) throw new Error(value.error || "Request failed.");
+  if (!response.ok) throw Object.assign(new Error(value.error || "Request failed."), { status: response.status, outcomeUnknown: value.outcomeUnknown === true });
   return value;
 }
 function rememberDraft() {
   if (selected) drafts.set(`${selected}:${mode}`, $("message").value);
 }
 function showFailure(message) {
+  mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
+  mergePollState = null;
+  mergePollDelay = 2000;
   data = null;
   snippetSelection = null;
   $("selection-actions").hidden = true;
@@ -79,6 +93,9 @@ async function refresh() {
   if (busy) return;
   busy = true;
   reviewGeneration++;
+  mergeGeneration++;
+  mergePollState = null;
+  mergePollDelay = 2000;
   renderAttachment();
   $("banner").textContent = "Linking changes to plan items…";
   try {
@@ -100,10 +117,81 @@ async function refresh() {
     renderAttachment();
   }
 }
+function renderMerge() {
+  const merge = data?.merge;
+  $("merge").hidden = !merge?.available;
+  $("merge-details").hidden = !merge?.available || (!merge.blockers.length && !merge.queue);
+  if (!merge?.available) return;
+  // Once the attempt this retained key started has ended, a retry is a new action and needs a new key.
+  if (mergeAction && merge.queue?.actionId === mergeAction.actionId && ["merged", "removed", "failed"].includes(merge.queue.state)) mergeAction = null;
+  $("merge").disabled = !merge.ready;
+  $("merge").textContent = merge.action === "retry"
+    ? "Retry merge"
+    : merge.queue?.state === "submitting"
+      ? "Submitting…"
+      : merge.queue?.state === "queued"
+        ? "Merge queued"
+        : merge.queue?.state === "merged"
+          ? "Merged"
+          : merge.ready
+            ? "Merge PR"
+            : `${merge.blockers.length} blocker${merge.blockers.length === 1 ? "" : "s"}`;
+  $("merge-details").textContent = merge.queue ? "Merge status" : "Review blockers";
+  scheduleMergePoll();
+}
+function scheduleMergePoll() {
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
+  const queue = data?.merge?.queue;
+  const state = queue?.state;
+  if (queue?.kind === "queue" && ["submitting", "queued"].includes(state)) {
+    if (state !== mergePollState) {
+      mergePollState = state;
+      mergePollDelay = 2000;
+    }
+    const generation = mergeGeneration;
+    mergePollTimer = setTimeout(() => pollMergeQueue(generation), mergePollDelay);
+  } else {
+    mergePollState = null;
+    mergePollDelay = 2000;
+  }
+}
+function backOffMergePoll() {
+  mergePollDelay = Math.min(mergePollDelay * 2, mergePollMaximumDelay);
+}
+async function pollMergeQueue(generation) {
+  try {
+    const update = await api("/api/merge");
+    if (generation !== mergeGeneration || !data?.merge?.available) return;
+    data = { ...data, merge: { ...data.merge, queue: update.queue } };
+    const queue = update.queue;
+    if (queue?.state === "merged") {
+      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." }] };
+      $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
+    } else if (queue?.state === "removed" || queue?.state === "failed") {
+      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` }] };
+      $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
+    } else if (queue?.observationError) {
+      $("banner").textContent = `${queue.state === "submitting" ? "Merge submission status is unknown" : "Merge remains queued"}. ${queue.observationError}`;
+    } else if (queue?.state === "queued") {
+      $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
+    }
+    if (queue?.state === mergePollState) backOffMergePoll();
+    renderMerge();
+  } catch (error) {
+    if (generation !== mergeGeneration || !data?.merge?.available) return;
+    $("banner").textContent = `Could not refresh merge-queue status. ${error.message}`;
+    backOffMergePoll();
+    scheduleMergePoll();
+  }
+}
 async function act(command) {
   if (busy || !data) return false;
   busy = true;
   reviewGeneration++;
+  mergeGeneration++;
+  mergePollState = null;
+  mergePollDelay = 2000;
   renderAttachment();
   try {
     rememberDraft();
@@ -145,16 +233,7 @@ function render() {
     `#${data.plan.issue} ${data.plan.summary} · r${data.plan.revision}`;
   $("progress").textContent =
     `${data.approved} of ${data.items.length} approved`;
-  const merge = data.merge;
-  $("merge").hidden = !merge?.available;
-  $("merge-details").hidden = !merge?.available || merge.ready;
-  if (merge?.available) {
-    $("merge").disabled = !merge.ready;
-    $("merge").textContent = merge.ready
-      ? "Merge PR"
-      : `${merge.blockers.length} blocker${merge.blockers.length === 1 ? "" : "s"}`;
-    $("merge-details").textContent = "Review blockers";
-  }
+  renderMerge();
   $("banner").textContent = data.demo
     ? "Demo repository · real Git changes and local SQLite storage. No tests or AI review have been run for this demo."
     : "";
@@ -379,23 +458,34 @@ $("approve").onclick = () => {
 $("reload").onclick = refresh;
 $("merge-details").onclick = () => {
   if (!data?.merge?.available) return;
+  const queue = data.merge.queue;
   showDialog(
-    `<h2>Merge blockers</h2><ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
+    `<h2>${queue ? "Merge status" : "Merge blockers"}</h2>${queue ? `<p><strong>${esc(queue.state)}</strong> · reviewed head <code>${esc(queue.reviewedHead.slice(0, 12))}</code></p>${queue.phase ? `<p>GitHub phase: ${esc(queue.phase)}${queue.position === null ? "" : ` · position ${queue.position}`}</p>` : ""}${queue.reason ? `<p>${esc(queue.reason)}</p>` : ""}${queue.observationError ? `<p>${esc(queue.observationError)}</p>` : ""}` : ""}<ul>${data.merge.blockers.map((blocker) => `<li>${esc(blocker.message)}</li>`).join("")}</ul>`,
   );
 };
 $("merge").onclick = async () => {
-  if (busy || !data?.merge?.ready || !window.confirm("Merge this reviewed pull request?")) return;
+  if (busy || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
   busy = true;
+  mergeGeneration++;
+  mergePollState = null;
+  mergePollDelay = 2000;
   $("merge").disabled = true;
   try {
-    const updated = await api("/api/action", { action: "merge", token: data.token });
-    const blocker = { code: "merge-submitted", message: "Merge was submitted. Refresh to confirm GitHub state." };
+    rememberDraft();
+    mergeAction ??= { actionId: crypto.randomUUID(), token: data.token };
+    const updated = await api("/api/action", { action: "merge", token: mergeAction.token, actionId: mergeAction.actionId });
+    mergeAction = null;
+    const queued = updated.mergeQueue?.state === "queued" || updated.mergeQueue?.state === "submitting";
+    const blocker = { code: queued ? "queue-active" : "merge-submitted", message: queued ? "The reviewed head is queued. Waiting for GitHub to confirm the outcome." : "Merge was submitted. Refresh to confirm GitHub state." };
     data = updated.mergeRefreshRequired
-      ? { ...data, merge: { ...data.merge, ready: false, blockers: [blocker] } }
-      : { ...updated, merge: { ...updated.merge, ready: false, blockers: [blocker] } };
+      ? { ...data, merge: { ...data.merge, ready: false, action: null, queue: updated.mergeQueue ?? null, blockers: [blocker] } }
+      : { ...updated, merge: { ...updated.merge, ready: false, action: null, blockers: [blocker] } };
     render();
-    $("banner").textContent = `Merge submitted. ${updated.mergeResult.url}`;
+    $("banner").textContent = `${queued ? "Merge queued" : "Merge submitted"}. ${updated.mergeResult.url}`;
   } catch (error) {
+    // Only a parsed, definite server answer resolves this click. No response, an unreadable body, 503 (nothing
+    // applied) or an admitted attempt with an unknown outcome keeps the key until that attempt ends.
+    if (typeof error.status === "number" && error.status !== 503 && !error.outcomeUnknown) mergeAction = null;
     data = { ...data, merge: { ...data.merge, ready: false, blockers: [{ code: "stale-merge", message: `${error.message} Refresh before trying again.` }] } };
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
@@ -405,7 +495,8 @@ $("merge").onclick = async () => {
 };
 $("review-link").onclick = (event) => {
   event.preventDefault();
-  refresh();
+  if (view === "review") refresh();
+  else showView("review");
 };
 $("next").onclick = () => moveChange(1);
 $("previous").onclick = () => moveChange(-1);
@@ -482,6 +573,7 @@ document.addEventListener("keydown", (event) => {
     ["TEXTAREA", "INPUT", "SELECT"].includes(
       document.activeElement?.tagName,
     ) ||
+    view !== "review" ||
     !data
   )
     return;
@@ -662,7 +754,7 @@ $("settings").onclick=async()=>{
   showDialog('<h2>Settings</h2><p>Loading…</p>');
   try {
     const settings=await api("/api/settings");
-    $("dialog-body").innerHTML=`<h2>Settings</h2><label for="question-provider">Question agent</label><select id="question-provider"><option value="">Not configured</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><p>Ask sends the question, selected code, plan item, and conversation to this provider using your local CLI login. Answers cannot edit source files. This choice is saved for this review database.</p><button id="save-settings">Save settings</button><p id="settings-status" role="status"></p>`;
+    $("dialog-body").innerHTML=`<h2>Settings</h2><label for="question-provider">Question agent</label><select id="question-provider"><option value="">Not configured</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><p>Ask runs this agent in a locked-down Docker container. It gets a read-only copy of the reviewed code, cannot run commands, and can reach only its vendor. Claude Code needs <code>CLAUDE_CODE_OAUTH_TOKEN</code> (create it with <code>claude setup-token</code>); Codex needs its <code>auth.json</code>. Set these before starting codeboost. This choice is saved for this review database.</p><button id="save-settings">Save settings</button><p id="settings-status" role="status"></p>`;
     $("question-provider").value=settings.questionProvider||"";
     $("save-settings").onclick=async()=>{try{await api("/api/settings",{questionProvider:$("question-provider").value||null});$("settings-status").textContent="Settings saved.";}catch(error){$("settings-status").textContent=error.message;}};
   } catch(error){$("dialog-body").textContent=error.message;}
@@ -706,5 +798,98 @@ new ResizeObserver(() => {
   const width = conversationPane.getBoundingClientRect().width;
   if (width) conversationResize.setAttribute("aria-valuenow", String(Math.round(width)));
 }).observe(conversationPane);
+
+let issuesGeneration = 0,
+  issuesView = null,
+  issuesRequested = false,
+  issuesLoading = false;
+function showView(next) {
+  view = next;
+  $("review-view").hidden = next !== "review";
+  $("issues-view").hidden = next !== "issues";
+  for (const [id, name] of [["review-link", "review"], ["issues-link", "issues"]]) {
+    if (name === next) $(id).setAttribute("aria-current", "page");
+    else $(id).removeAttribute("aria-current");
+  }
+  document.title = `${next === "issues" ? "Issues" : "Review"} · codeboost`;
+  history.replaceState(null, "", next === "issues" ? "/?view=issues" : "/");
+  if (next === "issues" && !issuesRequested) loadIssues();
+}
+const issueTime = (value) => esc(new Date(value).toLocaleString());
+function issueStatus() {
+  if (!issuesView) return ["neutral", "Loading issues…"];
+  if (!issuesView.configured) return ["neutral", `– Not configured. ${esc(issuesView.reason)}`];
+  const state = issuesView.state;
+  if (!state) return ["neutral", issuesView.refreshing ? "Loading issues…" : "– Not loaded yet"];
+  if (state.state === "fresh")
+    return ["good", `✓ Current · retrieved ${issueTime(state.retrievedAt)} · ${state.issues.length} open issue${state.issues.length === 1 ? "" : "s"}`];
+  if (state.state === "stale")
+    return ["warn", `! Stale · showing issues retrieved ${issueTime(state.retrievedAt)}. Refresh failed at ${issueTime(state.failedAt)}: ${esc(state.error)}`];
+  return ["bad", `✕ Unavailable · ${esc(state.error)}`];
+}
+function trustMark(issue) {
+  return issue.trust === "trusted"
+    ? '<span class="good" aria-label="Trust: author is a repository collaborator">✓ Collaborator</span>'
+    : '<span class="warn" aria-label="Trust: needs your trust before queueing, author is not a repository collaborator">! Needs trust</span>';
+}
+function renderIssues() {
+  const [tone, text] = issueStatus();
+  $("issues-status").className = tone;
+  $("issues-status").innerHTML = text;
+  $("issues-repository").textContent = issuesView?.configured ? issuesView.repository : "";
+  const state = issuesView?.configured ? issuesView.state : null;
+  if (!state) {
+    $("issues-list").innerHTML = "";
+    return;
+  }
+  if (!state.issues.length) {
+    $("issues-list").innerHTML =
+      state.state === "unavailable"
+        ? '<div class="empty"><h2>Issues could not load</h2><p>Resolve the error above, then refresh.</p></div>'
+        : '<div class="empty"><h2>No open issues</h2><p>This repository has no open issues to rank.</p></div>';
+    return;
+  }
+  $("issues-list").innerHTML = `<table class="issues-table"><thead><tr><th scope="col">Rank</th><th scope="col">Issue and reasons</th><th scope="col" class="numeric">Score</th><th scope="col">Trust</th><th scope="col">Opened</th></tr></thead><tbody>${state.issues
+    .map(
+      (issue, index) =>
+        `<tr data-issue="${issue.number}"><td class="mono">${index + 1}</td><td><div class="issue-title"><span class="mono muted">#${issue.number}</span> ${/^https:\/\/github\.com\//.test(issue.url) ? `<a href="${esc(issue.url)}" target="_blank" rel="noopener noreferrer">${esc(issue.title)}</a>` : esc(issue.title)}${issue.labels.length ? ` <span class="issue-labels mono">${issue.labels.map(esc).join(" · ")}</span>` : ""}</div><ul class="issue-reasons" aria-label="Why #${issue.number} ranks here">${issue.reasons.map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul></td><td class="mono numeric">${issue.score}</td><td>${trustMark(issue)}</td><td class="mono">${esc(issue.createdAt.slice(0, 10))}</td></tr>`,
+    )
+    .join("")}</tbody></table>`;
+}
+async function loadIssues() {
+  if (issuesLoading) return;
+  const generation = ++issuesGeneration;
+  issuesRequested = true;
+  issuesLoading = true;
+  // aria-disabled, not disabled: disabling the focused button would drop keyboard focus to the page.
+  $("issues-refresh").setAttribute("aria-disabled", "true");
+  $("issues-refresh").textContent = "Refreshing…";
+  if (issuesView?.configured) issuesView = { ...issuesView, refreshing: true };
+  renderIssues();
+  try {
+    const updated = await api("/api/issues", { action: "refresh" });
+    if (generation !== issuesGeneration) return;
+    issuesView = updated;
+    renderIssues();
+  } catch (error) {
+    if (generation !== issuesGeneration) return;
+    if (issuesView?.configured) issuesView = { ...issuesView, refreshing: false };
+    renderIssues();
+    $("issues-status").className = "bad";
+    $("issues-status").textContent = `✕ Could not refresh issues. ${error.message}`;
+  } finally {
+    if (generation === issuesGeneration) {
+      issuesLoading = false;
+      $("issues-refresh").removeAttribute("aria-disabled");
+      $("issues-refresh").textContent = "Refresh issues";
+    }
+  }
+}
+$("issues-link").onclick = (event) => {
+  event.preventDefault();
+  showView("issues");
+};
+$("issues-refresh").onclick = () => loadIssues();
+showView(new URLSearchParams(location.search).get("view") === "issues" ? "issues" : "review");
 
 await refresh();

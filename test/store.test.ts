@@ -74,11 +74,37 @@ it('retains cancellation reasons across restart and never revives cancelled work
   expect(recovered.getSuggestions(identity, id)).toMatchObject({ state: 'cancelled', reason: 'Runner shut down.', snapshotId: expected.snapshotId });
   expect(() => recovered.completeSuggestions(identity, id, reply())).toThrow(/stale|cancelled|complete/);
 });
+it('persists the merge-queue lifecycle and terminal reason across restart', () => {
+  const { store, path } = fixture();
+  const expected = { ...state(store), reviewVersion: store.reviewVersion(identity) };
+  const attempt = store.beginMergeAttempt(identity, expected, oid(2), 'MQEV_before');
+  expect(store.recordMergeAttemptDiagnostic(identity, attempt.id, 'Submission timed out after GitHub may have accepted it.')).toBe(true);
+  expect(store.getMergeAttempt(identity)).toMatchObject({ state: 'submitting', reason: 'Submission timed out after GitHub may have accepted it.' });
+  expect(store.queueMergeAttempt(identity, attempt.id, 'https://github.example/pr/1')).toBe(true);
+  expect(store.getMergeAttempt(identity)).toMatchObject({ state: 'queued', reason: null });
+  expect(store.observeQueuedMerge(identity, attempt.id, { entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2 })).toBe(true);
+  expect(store.finishMergeAttempt(identity, attempt.id, { state: 'removed', reason: 'Checks failed.', occurredAt: '2026-09-24T08:05:00Z' })).toBe(true);
+  close(store);
+  expect(open(path).getMergeAttempt(identity)).toMatchObject({
+    id: attempt.id, state: 'removed', reviewedHead: oid(2), queueWatermark: 'MQEV_before', reason: 'Checks failed.', entryId: 'MQE_1', phase: 'AWAITING_CHECKS', position: 2,
+  });
+});
+it('prevents a stale queue observation from overwriting a retry attempt', () => {
+  const { store } = fixture();
+  const expected = { ...state(store), reviewVersion: store.reviewVersion(identity) };
+  const first = store.beginMergeAttempt(identity, expected, oid(2));
+  store.queueMergeAttempt(identity, first.id, 'https://github.example/pr/1');
+  store.finishMergeAttempt(identity, first.id, { state: 'failed', reason: 'Queue failed.' });
+  const retry = store.beginMergeAttempt(identity, expected, oid(2));
+  store.queueMergeAttempt(identity, retry.id, 'https://github.example/pr/1');
+  expect(store.finishMergeAttempt(identity, first.id, { state: 'merged', occurredAt: '2026-09-24T08:10:00Z' })).toBe(false);
+  expect(store.getMergeAttempt(identity)).toMatchObject({ id: retry.id, state: 'queued', reviewedHead: oid(2) });
+});
 it('migrates unbound active requests to terminal history instead of reviving them', () => {
   const { store, path } = fixture(); const id = ready(store);
   close(store);
   const legacy = new DatabaseSync(path);
-  legacy.exec('ALTER TABLE requests DROP COLUMN reason; ALTER TABLE requests DROP COLUMN snapshot_id; PRAGMA user_version=3;');
+  legacy.exec('DROP TABLE merge_attempts; ALTER TABLE requests DROP COLUMN reason; ALTER TABLE requests DROP COLUMN snapshot_id; PRAGMA user_version=3;');
   legacy.close();
   const recovered = open(path);
   expect(recovered.getSuggestions(identity, id)).toEqual({ state: 'invalidated', revision: 1, snapshotId: null, reply: reply(), reason: 'Request predates snapshot binding.' });

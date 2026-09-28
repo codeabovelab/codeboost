@@ -6,9 +6,8 @@ import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { Questions } from '../runner/questions.ts';
 import { choiceKeys } from '../core/approvals.ts';
-import { agentArguments } from '../runner/question-agent.ts';
-// Real-Git context reads match the existing review integration suite budget.
-vi.setConfig({testTimeout:15000});
+// Real-Git context reads can overlap the Docker-backed isolation suite in a full run.
+vi.setConfig({testTimeout:30000});
 const roots:string[]=[], services:ReviewService[]=[], managers:Questions[]=[];
 afterEach(async()=>{for(const manager of managers.splice(0))await manager.close();services.splice(0).forEach(s=>s.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));vi.restoreAllMocks();});
 function waitForAbort(_prompt:string,signal:AbortSignal):Promise<string>{return new Promise((_,reject)=>signal.addEventListener('abort',()=>reject(signal.reason),{once:true}));}
@@ -21,6 +20,12 @@ it('persists answers with plan, code, selected snippet and prior conversation co
  expect(prompt).toContain('Why cap the retry delay?');expect(prompt).toContain('Math.min');expect(prompt).toContain('Keep the signature.');
  const after=service.load();expect(after.plan.revision).toBe(asked.plan.revision);expect(after.token).toBe(asked.token);expect(after.approved).toBe(0);
  const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.load().notes.at(-1)?.answer?.text).toContain('bounds retry latency');
+},30_000);
+it('asks about the configured repository at the reviewed snapshot head',async()=>{
+ const service=fixture(),asked=question(service);let received:unknown;
+ const manager=new Questions(service,async(_prompt,_signal,scope)=>{received=scope;return 'Answer';});managers.push(manager);manager.start(asked.createdNoteId!,asked);
+ await vi.waitFor(()=>expect(received).toBeDefined());
+ expect(received).toEqual({repository:service.config.repository,head:asked.snapshot.head,snapshotId:asked.snapshot.id,planId:service.config.identity.planId,planRevision:asked.plan.revision,noteId:asked.createdNoteId,attemptId:service.store.getReviewNotes(service.config.identity)[0]!.answer!.attempt,contextId:asked.notes.find(note=>note.id===asked.createdNoteId)!.contextId});
 });
 it('fails visibly and retries without duplicating the question or accepting stale completions',async()=>{
  const service=fixture(),asked=question(service);let calls=0;
@@ -36,10 +41,8 @@ it('prevents duplicate invocations and records interruption when the server stop
  expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow(/already answering/);await manager.close();
  expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/Server stopped/);
 });
-it('persists provider selection and restricts commands to fixed provider launch arguments',()=>{
+it('persists provider selection and rejects anything but a known provider',()=>{
  const service=fixture();expect(service.store.questionProvider()).toBeNull();service.store.setQuestionProvider('codex');const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.store.questionProvider()).toBe('codex');expect(()=>service.store.setQuestionProvider('sh -c anything')).toThrow(/Choose/);
- const claude=agentArguments('claude');expect(claude[claude.indexOf('--tools')+1]).toBe('');expect(claude).toContain('--safe-mode');
- const codex=agentArguments('codex');expect(codex).toContain('read-only');expect(codex).toContain('features.shell_tool=false');expect(codex).toContain('features.plugins=false');
 });
 it('times out an unresponsive agent and allows expired pending attempts to be recovered',async()=>{
  const service=fixture(),asked=question(service);const manager=new Questions(service,waitForAbort);managers.push(manager);
@@ -105,4 +108,13 @@ it('marks an item-level attempt historical and rejects retry when assigned code 
  const changed=service.load(),note=changed.notes.find(note=>note.id===asked.createdNoteId)!;
  expect(changed.snapshot.id).toBe(asked.snapshot.id);expect(note.answerOutdated).toBe(true);
  expect(()=>manager.start(note.id,changed)).toThrow(/older review/);expect(agent).toHaveBeenCalledTimes(1);
+});
+it('refuses new questions once admission has stopped, before close() runs',()=>{
+ const service=fixture(),asked=question(service);const manager=new Questions(service,async()=>'Answer');managers.push(manager);
+ manager.stopAdmission();
+ expect(()=>manager.start(asked.createdNoteId!,asked)).toThrow('Server is stopping');
+ expect(manager.isRunning(asked.createdNoteId!)).toBe(false);
+ expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toBeUndefined();
+ manager.markStopped(asked.createdNoteId!,service.load());
+ expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toMatchObject({status:'failed',error:'Server stopped. Retry the question.'});
 });
