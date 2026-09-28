@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { assertVendorNetwork, createVendorNetwork, removeVendorNetwork, VENDOR_HOSTS, vendorNetworkResources,
+  VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { captureInvocation, type InvocationInput } from '../agents/contract.ts';
 
@@ -68,6 +69,33 @@ describe('vendor-only egress', () => {
     if (orphaned) docker('network', 'rm', name);
     expect(name).toMatch(/^codeboost-egress-/);
     expect(orphaned).toBe(false);
+  }, 60_000);
+
+  it('leaves a same-named network alone when the daemon refuses the create', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'foreign');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // The name is taken by someone else's network just before our create, so the daemon refuses it.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = network ] && [ "$2" = create ]; then for arg; do last="$arg"; done; `
+        + `'${realDocker}' network create "$last" >/dev/null; printf %s "$last" > '${recorded}'; `
+        + `echo "Error response from daemon: network with name $last already exists" >&2; exit 1; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const refused = captureInvocation({ ...invocation, attemptId: `refused-network-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let foreign = '', error: unknown;
+    try {
+      try { createVendorNetwork(refused, imageId); } catch (caught) { error = caught; }
+      foreign = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const survived = spawnSync('docker', ['network', 'inspect', foreign], { stdio: 'ignore' }).status === 0;
+    spawnSync('docker', ['network', 'rm', foreign], { stdio: 'ignore' });
+    // The refused create is reported as itself, with no cleanup left to retry, and the foreign network survives.
+    expect(error).toBeInstanceOf(Error);
+    expect(error).not.toBeInstanceOf(VendorNetworkCreationCleanupError);
+    expect(String(error)).toMatch(/already exists/);
+    expect(survived).toBe(true);
   }, 60_000);
 
   it('does not delete a same-named stand-in when setup fails after the proxy exists', () => {
