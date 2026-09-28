@@ -68,6 +68,12 @@ if (a === 'start') process.exit(0);
 if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
   const name = args[args.indexOf('--name') + 1];
   save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
+  if (fs.existsSync(path.join(state, 'fail-export'))) {
+    // Like --rm after the export script failed: the container is gone and the client reports the script's status.
+    fs.rmSync(path.join(state, name + '.json'));
+    console.error('git failed while exporting the diff (status 128)');
+    process.exit(4);
+  }
   if (fs.existsSync(path.join(state, 'hang-export'))) {
     fs.writeFileSync(path.join(state, 'export-began'), '');
     process.on('SIGTERM', () => {});
@@ -258,6 +264,16 @@ describe('task diff export', () => {
     rmSync(join(state, 'hang-export'));
     removeTaskFilesystems(filesystems);
   }, 60_000);
+
+  it('fails when the export container fails, reporting why, and leaves no container behind', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'export-diff'), 'partial');
+    writeFileSync(join(state, 'fail-export'), '');
+    await expect(exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE })).rejects.toThrow('git failed');
+    expect(exports()).toEqual([]);
+    rmSync(join(state, 'fail-export'));
+    removeTaskFilesystems(filesystems);
+  });
 
   it('rejects an invalid base, limit or image before any Docker call', async () => {
     const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());

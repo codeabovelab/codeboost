@@ -739,22 +739,37 @@ describe('real Docker agent isolation', () => {
     for (const pgid of pgids) expect(groupAlive(pgid)).toBe(false);
   }, 90_000);
 
-  // What an agent leaves in task storage: a commit of its own, an edit to a tracked file, and a new untracked file.
-  const agentChanges = (filesystems: ReturnType<typeof prepareTaskFilesystems>) => docker('run', '--rm', '--network=none',
+  // What an agent leaves in task storage: a commit of its own, an edit to a tracked file, a staged-only file, a binary
+  // file, a new untracked file and an untracked nested repository. `extra` runs last, as the same user.
+  const agentChanges = (filesystems: ReturnType<typeof prepareTaskFilesystems>, extra = 'true') => docker('run', '--rm', '--network=none',
     '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
     '--mount', `type=volume,source=${filesystems.workVolume},target=/work`,
     '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'bash', imageId, '-c', [
       'set -e', 'cd /work',
       'g() { git -c user.name=agent -c user.email=agent@example.com -c core.hooksPath=/dev/null "$@"; }',
       'printf "committed\\n" > committed.txt', 'g add committed.txt', 'g commit -qm agent',
-      'printf "changed\\n" > file.txt', 'printf "brand new\\n" > untracked.txt'].join('\n'));
+      'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
+      'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
+      'mkdir nested', '(cd nested && git init -q)', extra].join('\n'));
+  // Every file and directory in both volumes, with its metadata and contents, read without writing.
+  const storageSnapshot = (filesystems: ReturnType<typeof prepareTaskFilesystems>) => docker('run', '--rm',
+    '--network=none', '--user', '10001:10001',
+    '--mount', `type=volume,source=${filesystems.workVolume},target=/work,readonly`,
+    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git,readonly`, '--entrypoint', 'bash',
+    imageId, '-c', 'cd /work && find . -printf "%p %m %s %T@\\n" | sort && find . -type f -readable -print0 | sort -z | xargs -0 sha256sum');
 
   it('exports the diff against the last codeboost commit, bounded and without writing to the storage', async () => {
     const data = fixture(), filesystems = data.filesystems;
     agentChanges(filesystems);
+    const before = storageSnapshot(filesystems);
     const exported = await exportTaskDiff(filesystems, { base: data.clone.head, imageId });
+    expect(storageSnapshot(filesystems)).toBe(before);
     const text = exported.diff.toString('utf8');
     expect(exported.truncated).toBe(false);
+    expect(text).toContain('+staged only');
+    expect(text).toContain('b/binary.dat');
+    expect(text).toContain('GIT binary patch');
+    expect(text).toContain('untracked directory nested/ is a nested repository');
     // The agent's own commit, an unstaged edit and an untracked file all appear against the base.
     expect(text).toContain('b/committed.txt');
     expect(text).toContain('+committed');
@@ -765,6 +780,10 @@ describe('real Docker agent isolation', () => {
     const cut = await exportTaskDiff(filesystems, { base: data.clone.head, imageId, maxBytes: 20 });
     expect(cut).toEqual({ diff: exported.diff.subarray(0, 20), truncated: true });
     await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');
+    // A Git failure part-way through fails the export; it is never passed off as a complete diff.
+    const failing = fixture();
+    agentChanges(failing.filesystems, 'printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt');
+    await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('git failed');
     // No export container is left, and the storage still validates for the next launch.
     expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
       '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');

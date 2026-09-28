@@ -519,23 +519,44 @@ export interface ExportOptions extends PreparationOptions {
   /** Overall deadline for the Docker work, cleanup excluded. Default 60 s. */
   readonly timeoutMs?: number;
 }
-// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff` compares
-// `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every commit) and
-// never refreshes the index (GIT_OPTIONAL_LOCKS=0); new untracked files are diffed against /dev/null. Output stops at
+// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff --binary`
+// compares `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every
+// commit) and never refreshes the index (GIT_OPTIONAL_LOCKS=0); each new untracked file is diffed against /dev/null,
+// and an untracked nested repository, which Git cannot diff, is named in the output rather than skipped. Output stops at
 // `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
+// Every stage's status is checked: a Git failure fails the export instead of passing off partial output as the diff;
+// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit.
+// Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
+// read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
+// diff programs and text conversion are off, and the worktree and attributes file are pinned.
 const EXPORT_SCRIPT = [
   'set -eu',
   'base=$1 limit=$2',
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
   'cd /work',
-  'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false "$@"; }',
+  'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
+  '  -c core.attributesFile=/dev/null "$@"; }',
   'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
-  '{',
-  '  g diff --no-color --no-ext-diff --no-textconv "$base" --',
+  'produce() {',
+  '  set -e',
+  '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" --',
   '  g ls-files -z --others --exclude-standard | while IFS= read -r -d "" path; do',
-  '    g diff --no-color --no-ext-diff --no-textconv --no-index -- /dev/null "$path" || [ $? -eq 1 ]',
+  '    if [ -d "$path" ]; then',
+  '      printf "codeboost: untracked directory %s is a nested repository; its contents are not exported\\n" "$path"',
+  '      continue',
+  '    fi',
+  '    status=0',
+  '    g diff --binary --no-color --no-ext-diff --no-textconv --no-index -- /dev/null "$path" || status=$?',
+  '    # 0: no difference, 1: difference shown; anything else is a failure.',
+  '    [ "$status" -le 1 ] || exit "$status"',
   '  done',
-  '} | head -c "$limit" | base64 -w0',
+  '}',
+  'set +e',
+  'produce | head -c "$limit" | base64 -w0',
+  'statuses=("${PIPESTATUS[@]}")',
+  'set -e',
+  'if [ "${statuses[0]}" -ne 0 ] && [ "${statuses[0]}" -ne 141 ]; then echo "git failed while exporting the diff (status ${statuses[0]})" >&2; exit 4; fi',
+  'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');
 
 function* exportSteps(workVolume: string, metadataVolume: string, owner: ResourceOwner, options: ExportOptions,
