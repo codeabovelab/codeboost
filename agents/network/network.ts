@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { assertCapturedInvocation, type InvocationInput, type UnreleasedResource } from '../contract.ts';
+import { createOutcomeUnknown } from '../client-outcome.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 
@@ -209,7 +210,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
       created.add(object);
       return output;
     } catch (error) {
-      if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
+      if (createOutcomeUnknown(error)) unsettled.add(object);
       throw error;
     }
   };
