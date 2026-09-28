@@ -4,6 +4,7 @@ import { agentContainerId } from '../container/run.ts';
 import { createCodexCommand, createPhasePolicy } from '../policy.ts';
 import { launchInvocation, readBoundedContainerFile } from './supervisor.ts';
 import { setUpProfile } from './setup.ts';
+import { assertBuiltAgentImage } from '../container/image.ts';
 import { createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 export const CODEX_OUTPUT_FILE = '/run/codeboost-output/final.txt';
@@ -26,6 +27,8 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   if (!authFile || authFile.includes('\0')) throw new Error('Codex auth path is malformed.');
   const policy = createPhasePolicy(request.invocation);
   const remaining = createAdapterInvocationBudget(request.invocation, options.timeoutMs);
+  // Invalid input throws here, before anything is allocated; only Docker setup runs inside the handle.
+  assertBuiltAgentImage(request.imageId);
   return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
     network => ({ ...request, policy, network, command: createCodexCommand(policy, request.prompt),
       codexAuthFile: authFile, deferredOutput: true }),

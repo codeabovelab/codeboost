@@ -2,6 +2,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AdapterSetupCleanupError, CLEANUP_RETRY_WINDOW_MS, isInvocationActive,
   launchInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationHandle, type InvocationResult } from '../agents/contract.ts';
+import { startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { startCodexInvocation } from '../agents/adapters/codex.ts';
 
 // The start call returns its handle at once and runs setup inside it (#51 item 2). These run without Docker.
 describe('asynchronous launch', () => {
@@ -113,5 +115,16 @@ describe('asynchronous launch', () => {
     const box = watch(handle.settled);
     await vi.advanceTimersByTimeAsync(after);
     expect(box.result?.stopReason).toBe(reason);
+  });
+
+  it.each(['codex', 'claude'] as const)('refuses an untrusted %s image synchronously, allocating nothing', vendor => {
+    const invocation = captured(`untrusted-image-${vendor}`);
+    const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused' };
+    const start = () => vendor === 'codex'
+      ? startCodexInvocation(request, '/unused/auth.json')
+      : startClaudeInvocation(request, 'token');
+    expect(start).toThrow('trusted validated builder');
+    expect(isInvocationActive(invocation.attemptId)).toBe(false);
   });
 });
