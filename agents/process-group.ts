@@ -76,11 +76,6 @@ export function runInProcessGroup(file: string, args: readonly string[],
       child.once('error', error => resolve({ status: null, stdout: '', stderr: '', error }));
       return;
     }
-    // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
-    // the call still settles only after the group has exited, with the caller's error.
-    let unrecorded: unknown;
-    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
-    catch (error) { unrecorded = error; }
     const out: Buffer[] = [], err: Buffer[] = [];
     let outBytes = 0, errBytes = 0, stopped: 'cancelled' | 'timeout' | 'output-limit' | 'unrecorded' | undefined;
     let graceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -90,13 +85,19 @@ export function runInProcessGroup(file: string, args: readonly string[],
       signalGroup(pgid, 'SIGTERM');
       graceTimer = setTimeout(() => signalGroup(pgid, 'SIGKILL'), graceMs);
     };
+    // Armed at the spawn, before the caller records the group: time spent recording counts against the deadline.
+    const deadline = setTimeout(() => stop('timeout'), options.timeoutMs);
+    // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
+    // the call still settles only after the group has exited, with the caller's error.
+    let unrecorded: unknown;
+    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
+    catch (error) { unrecorded = error; }
     const collect = (chunks: Buffer[], add: (bytes: number) => number) => (chunk: Buffer) => {
       if (add(chunk.length) > maxBuffer) stop('output-limit');
       else chunks.push(chunk);
     };
     child.stdout.on('data', collect(out, bytes => (outBytes += bytes)));
     child.stderr.on('data', collect(err, bytes => (errBytes += bytes)));
-    const deadline = setTimeout(() => stop('timeout'), options.timeoutMs);
     const onAbort = () => stop('cancelled');
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (unrecorded !== undefined) { stopped = 'unrecorded'; signalGroup(pgid, 'SIGKILL'); }

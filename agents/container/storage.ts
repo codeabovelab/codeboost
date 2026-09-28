@@ -236,11 +236,12 @@ const linkStaysInside = (staging: string, link: string) => {
  */
 function* containedLinks(staging: string, remaining: () => number): Steps<void> {
   const metadata = join(staging, '.git'), pending = [staging];
-  let count = 0;
+  // `walked` counts every entry touched, including each one read from a directory, so one huge directory pauses too.
+  let count = 0, walked = 0;
   while (pending.length) {
     remaining();
     count++;
-    if (count % PAUSE_EVERY === 0) yield PAUSE;
+    if (++walked % PAUSE_EVERY === 0) yield PAUSE;
     const path = pending.pop()!, stat = lstatSync(path);
     if (stat.isSymbolicLink()) {
       const name = JSON.stringify(relative(staging, path));
@@ -258,6 +259,7 @@ function* containedLinks(staging: string, remaining: () => number): Steps<void> 
         if (count + pending.length >= LINK_INSPECTION_LIMIT)
           throw new Error('Repository checkout exceeds the link inspection limit.');
         pending.push(join(path, entry.name));
+        if (++walked % PAUSE_EVERY === 0) yield PAUSE;
       }
     } finally { directory.closeSync(); }
   }

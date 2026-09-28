@@ -78,11 +78,12 @@ function* cloneSteps(options: CloneOptions): Generator<CloneStep, TaskClone, Git
       if (lstatSync(join(metadata, name), { throwIfNoEntry: false })) throw new Error(`Unsupported Git storage: ${name}`);
     }
     const pending = [join(metadata, 'objects')];
-    let count = 0;
+    // `walked` counts every entry touched, including each one read from a directory, so one huge directory pauses too.
+    let count = 0, walked = 0;
     while (pending.length) {
       remaining();
       if (++count > 100_000) throw new Error('Object storage exceeds inspection limit.');
-      if (count % PAUSE_EVERY === 0) yield PAUSE;
+      if (++walked % PAUSE_EVERY === 0) yield PAUSE;
       const path = pending.pop()!, stat = lstatSync(path);
       if (stat.isSymbolicLink() || (!stat.isDirectory() && !stat.isFile())) throw new Error('Unsupported object entry.');
       if (independent && stat.isFile() && stat.nlink !== 1) throw new Error('Task objects must not be hard-linked.');
@@ -93,6 +94,7 @@ function* cloneSteps(options: CloneOptions): Generator<CloneStep, TaskClone, Git
             remaining();
             if (count + pending.length >= 100_000) throw new Error('Object storage exceeds inspection limit.');
             pending.push(join(path, entry.name));
+            if (++walked % PAUSE_EVERY === 0) yield PAUSE;
           }
         } finally { directory.closeSync(); }
       }

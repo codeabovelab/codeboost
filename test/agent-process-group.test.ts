@@ -96,6 +96,15 @@ describe('runInProcessGroup', () => {
     }
   }, 30_000);
 
+  it('counts time spent recording the group against the deadline', async () => {
+    const began = performance.now();
+    const outcome = await runInProcessGroup('sleep', ['60'], { env, timeoutMs: 1_000, graceMs: 100,
+      // A slow durable write: the deadline must already be running while it blocks.
+      onProcessGroup: () => { const until = performance.now() + 1_000; while (performance.now() < until); } });
+    expect((outcome.error as NodeJS.ErrnoException).code).toBe('ETIMEDOUT');
+    expect(performance.now() - began).toBeLessThan(1_700);
+  });
+
   it('stops a group whose output exceeds the limit', async () => {
     const outcome = await runInProcessGroup('sh', ['-c', 'while :; do echo xxxxxxxxxxxxxxxx; done'],
       { env, timeoutMs: 30_000, maxBuffer: 1024 });
