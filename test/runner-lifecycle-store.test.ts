@@ -270,6 +270,14 @@ describe('task closure', () => {
 });
 
 describe('user actions', () => {
+  it('refuses a feedback event after the task has closed', () => {
+    const { store } = fixture();
+    store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    const actionId = randomUUID();
+    expect(() => store.userAction(identity, { actionId, kind: 'assign', request: { item: 'P1' } },
+      () => store.recordFeedback(identity, actionId, { kind: 'segment-assign', item: 'P1', sourceRef: 'choice-late' }))).toThrow(/closed task never changes/);
+    expect(store.feedbackEvents(identity).map(event => event.kind)).toEqual(['task-closed']);
+  });
   it('refuses review approvals, choices and notes on a closed task', () => {
     const { store } = fixture();
     const state = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });

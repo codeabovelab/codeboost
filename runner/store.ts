@@ -842,6 +842,8 @@ export class Store {
     assertUuidV4(actionId, 'Action ID');
     if (this.#depth === 0 || this.#action?.key !== identityKey(identity) || this.#action.actionId !== actionId)
       throw new Error('Feedback events are written inside their user action, with its action ID.');
+    // task-closed is the last event: J reads a task's feedback once, when it closes.
+    if (this.#taskClosed(identityKey(identity))) throw new GuardRefusal('A closed task never changes.');
     if (!FEEDBACK_KINDS.includes(event.kind) || event.kind === ('task-closed' as FeedbackKind)) throw new GuardRefusal('Invalid feedback kind.');
     if (event.text != null && (typeof event.text !== 'string' || event.text.length > 4000)) throw new GuardRefusal('Feedback text is limited to 4000 characters.');
     if (typeof event.sourceRef !== 'string' || !event.sourceRef || event.sourceRef.length > 200) throw new GuardRefusal('Invalid feedback source.');
