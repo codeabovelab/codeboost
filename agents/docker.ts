@@ -41,7 +41,9 @@ export function runDocker(args: readonly string[], options: DockerOptions): Prom
       const out = String(stdout ?? ''), err = String(stderr ?? '');
       if (!error) { resolve({ status: 0, stdout: out, stderr: err }); return; }
       const exitCode = (error as { code?: unknown }).code;
-      const aborted = options.signal?.aborted === true || error.name === 'AbortError';
+      // Only Node's own abort error means this client was killed by the signal. A numeric exit code is the daemon's
+      // answer even if the signal was aborted after the process exited but before this callback ran.
+      const aborted = error.name === 'AbortError' || (error as { code?: unknown }).code === 'ABORT_ERR';
       const killed = aborted || (error as { killed?: boolean }).killed === true;
       // A numeric code means the client ran and the daemon answered; anything else leaves the outcome unknown.
       if (typeof exitCode === 'number' && !killed) { resolve({ status: exitCode, stdout: out, stderr: err }); return; }
