@@ -21,13 +21,18 @@ export interface DockerOutcome {
 }
 
 const MAX_BUFFER = 16 * 1024 * 1024;
+/** Error code for a call refused before any client process started (already cancelled, or an invalid deadline). */
+export const NOT_STARTED = 'ENOTSTARTED';
 
 /** Run one Docker CLI call without blocking the event loop. Never rejects. */
 export function runDocker(args: readonly string[], options: DockerOptions): Promise<DockerOutcome> {
+  // Refused before any client starts: nothing reached the daemon, which `NOT_STARTED` tells callers.
   if (!Number.isSafeInteger(options.timeoutMs) || options.timeoutMs < 1)
-    return Promise.resolve({ status: null, stdout: '', stderr: '', error: new Error('Docker deadline must be a positive integer.') });
+    return Promise.resolve({ status: null, stdout: '', stderr: '', error: Object.assign(
+      new Error('Docker deadline must be a positive integer.'), { code: NOT_STARTED }) });
   if (options.signal?.aborted)
-    return Promise.resolve({ status: null, stdout: '', stderr: '', error: new Error('Docker call was cancelled.') });
+    return Promise.resolve({ status: null, stdout: '', stderr: '', error: Object.assign(
+      new Error(`docker ${args[0] ?? ''} was cancelled before it started.`), { code: NOT_STARTED }) });
   return new Promise(resolve => {
     execFile('docker', [...args], {
       encoding: 'utf8', timeout: options.timeoutMs, killSignal: 'SIGKILL', maxBuffer: MAX_BUFFER,

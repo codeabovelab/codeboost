@@ -1,5 +1,7 @@
 /** Spawn errors: the Docker client process never started, so it cannot have sent any request to the daemon. */
-const NOT_STARTED = new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'EMFILE', 'ENFILE', 'ENOMEM', 'E2BIG', 'ENOEXEC']);
+// `ENOTSTARTED` is agents/docker.ts's code for a call it refused before spawning (already cancelled, bad deadline).
+const NOT_STARTED = new Set(['ENOENT', 'EACCES', 'EPERM', 'EAGAIN', 'EMFILE', 'ENFILE', 'ENOMEM', 'E2BIG', 'ENOEXEC',
+  'ENOTSTARTED']);
 
 /**
  * Whether a failed Docker create may still have reached the daemon, so the object may exist. A numeric exit status
