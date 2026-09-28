@@ -82,7 +82,7 @@ const removeContainerOrThrow = async (profile: ContainerProfile, waitForSettle =
   // A profile whose `docker create` never ran, or was refused by the daemon, owns no container: the name may belong
   // to another invocation, which must neither be inspected as ours nor block this profile's own cleanup.
   if (!createdContainers.has(profile)) {
-    disposeContainerProfile(profile, timeoutMs);
+    await disposeContainerProfile(profile, timeoutMs);
     return;
   }
   const settleUntil = unsettledCreates.get(profile) ?? 0;
