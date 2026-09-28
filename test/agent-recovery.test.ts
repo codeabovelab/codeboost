@@ -142,6 +142,16 @@ describe('recoverLeftovers', () => {
     expect(names()).toContain(replacement.name);
   });
 
+  it('refuses storage whose name is not one D generates, even with matching labels', async () => {
+    const allocation = randomUUID(), name = `codeboost-work-${'0'.repeat(36)}`;
+    daemon.objects.push({ kind: 'volume', name,
+      labels: { ...owner(A, 'attempt-a', allocation), 'io.codeboost.task-storage': 'work' } });
+    const report = await recoverLeftovers(A);
+    expect(report.storage).toEqual([]);
+    expect(report.unowned).toMatchObject([{ name, reason: 'inconsistent-storage' }]);
+    expect(names()).toEqual([name]);
+  });
+
   it('reports objects without a runner label and never removes them', async () => {
     attempt(A, 'attempt-a');
     const legacy: FakeObject[] = [

@@ -8,7 +8,7 @@ import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { runDocker } from '../docker.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
-  ownerLabelArgs, releaseAllocationId, type ResourceOwner } from '../labels.ts';
+  ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
 
 export interface TaskFilesystems {
   readonly keeper: string;
@@ -323,9 +323,10 @@ const recoveredStorage = new WeakMap<RecoveredTaskStorage, { owner: ResourceOwne
 /** The daemon answered, and the storage is not what D creates for this owner; unlike a failed inspect, retrying won't help. */
 export class RecoveredStorageRejected extends Error {}
 const STORAGE_PARTS = Object.freeze([
-  ['workVolume', 'volume', 'work', /^codeboost-work-[0-9a-f-]{36}$/],
-  ['metadataVolume', 'volume', 'metadata', /^codeboost-metadata-[0-9a-f-]{36}$/],
-  ['keeper', 'container', 'keeper', /^codeboost-keeper-[0-9a-f-]{36}$/],
+  // Exactly the names `prepareTaskFilesystems` generates: a fixed prefix and a UUID v4.
+  ['workVolume', 'volume', 'work', new RegExp(`^codeboost-work-${UUID_V4}$`)],
+  ['metadataVolume', 'volume', 'metadata', new RegExp(`^codeboost-metadata-${UUID_V4}$`)],
+  ['keeper', 'container', 'keeper', new RegExp(`^codeboost-keeper-${UUID_V4}$`)],
 ] as const);
 
 /**

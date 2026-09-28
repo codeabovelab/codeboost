@@ -17,7 +17,9 @@ export interface ResourceOwner {
 }
 
 const RUNNER_OWNER = /^[0-9a-f]{32}$/;
-const ALLOCATION_ID = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+/** A lowercase UUID v4, as `crypto.randomUUID()` writes it; unanchored, for building patterns. */
+export const UUID_V4 = '[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}';
+const ALLOCATION_ID = new RegExp(`^${UUID_V4}$`);
 // Attempt IDs are UUIDs in the runner; any short printable value is accepted so other callers keep their own IDs.
 const ATTEMPT_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,199}$/;
 
