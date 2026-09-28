@@ -1,6 +1,6 @@
 import type { InvocationHandle } from '../contract.ts';
-import { createContainerProfile, ProfileCreationCleanupError, type ContainerProfile,
-  type ProfileOptions } from '../container/profile.ts';
+import { containerProfileResources, createContainerProfile, disposeContainerProfile, ProfileCreationCleanupError,
+  type ContainerProfile, type ProfileOptions } from '../container/profile.ts';
 import { createVendorNetwork, removeVendorNetwork, vendorNetworkResources,
   type VendorNetwork } from '../network/network.ts';
 import { AdapterSetupCleanupError } from './supervisor.ts';
@@ -34,5 +34,15 @@ export async function setUpProfile(request: AgentAdapterRequest, remaining: () =
     }
     throw error;
   }
-  return start(profile);
+  // The profile owns the network and staging now. If the handoff itself throws, nothing else will release them:
+  // the launcher treats a failure without a handle as "nothing allocated", so release (or retain) them here.
+  try { return start(profile); }
+  catch (error) {
+    try { await disposeContainerProfile(profile, CLEANUP_TIMEOUT_MS); }
+    catch (cleanupError) {
+      throw new AdapterSetupCleanupError(error, cleanupError,
+        (budgetMs = CLEANUP_TIMEOUT_MS) => disposeContainerProfile(profile, budgetMs), () => containerProfileResources(profile));
+    }
+    throw error;
+  }
 }

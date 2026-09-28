@@ -379,8 +379,12 @@ export async function createValidatedContainer(profile: ContainerProfile, timeou
   }
 }
 
+/**
+ * Validate and start the created container, then remove it. `signal` stops the run: the in-flight Docker call is
+ * killed, and the container is still removed (cleanup is never cancelled) before the promise rejects.
+ */
 export async function startValidatedContainer(profile: ContainerProfile, timeoutMs = 60_000,
-  secrets: Readonly<Record<string, string>> = {}): Promise<string> {
+  secrets: Readonly<Record<string, string>> = {}, signal?: AbortSignal): Promise<string> {
   assertLaunchable(profile);
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
   let failure: unknown;
@@ -388,8 +392,8 @@ export async function startValidatedContainer(profile: ContainerProfile, timeout
     validateSecrets(profile, secrets);
     // Validate and start the container this profile created, by ID: a same-named replacement must never run.
     const id = requireContainerId(profile);
-    await validateContainer(id, profile, remaining());
-    const output = await docker(['start', '--attach', id], { timeoutMs: remaining(), secrets });
+    await validateContainer(id, profile, remaining(), signal);
+    const output = await docker(['start', '--attach', id], { timeoutMs: remaining(), secrets, signal });
     remaining();
     return output;
   }
@@ -403,10 +407,11 @@ export async function startValidatedContainer(profile: ContainerProfile, timeout
   }
 }
 
+/** Create, validate, start and remove the container. `signal` cancels at any step; cleanup still runs. */
 export async function runContainer(profile: ContainerProfile, timeoutMs = 60_000,
-  secrets: Readonly<Record<string, string>> = {}): Promise<string> {
+  secrets: Readonly<Record<string, string>> = {}, signal?: AbortSignal): Promise<string> {
   const remaining = createDeadline(profileTimeout(profile, timeoutMs));
-  await createValidatedContainer(profile, remaining(), secrets);
+  await createValidatedContainer(profile, remaining(), secrets, signal);
   let startBudget: number;
   try { startBudget = remaining(); }
   catch (error) {
@@ -414,5 +419,5 @@ export async function runContainer(profile: ContainerProfile, timeoutMs = 60_000
     catch (cleanupError) { throw new AggregateError([error, cleanupError], 'Agent deadline and cleanup both failed.'); }
     throw error;
   }
-  return startValidatedContainer(profile, startBudget, secrets);
+  return startValidatedContainer(profile, startBudget, secrets, signal);
 }
