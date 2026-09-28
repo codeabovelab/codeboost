@@ -150,12 +150,14 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
 
   const remove: RecoveredResource[] = [];
   const storage = new Map<string, { attemptId?: string; parts: Record<string, string>; resources: RecoveredResource[];
-    consistent: boolean }>();
+    consistent: boolean; keeperId?: string }>();
   const keep = (resource: RecoveredResource, part: keyof TaskStorageParts) => {
     const allocationId = resource.labels[ALLOCATION_LABEL] ?? '', attemptId = resource.labels[ATTEMPT_LABEL];
     const group = storage.get(allocationId) ?? { attemptId, parts: {}, resources: [], consistent: true };
     if (group.attemptId !== attemptId || part in group.parts) group.consistent = false;
     group.parts[part] = resource.name;
+    // The keeper's ID from this scan: adoption checks that same object, not whatever holds the name by then.
+    if (part === 'keeper') group.keeperId = resource.id;
     group.resources.push(resource);
     storage.set(allocationId, group);
   };
@@ -218,7 +220,7 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
     const budget = remaining();
     try {
       handles.push(await adoptRecoveredTaskStorage({ runnerOwner, attemptId: group.attemptId, allocationId },
-        group.parts, budget));
+        group.parts, budget, group.keeperId));
     } catch (error) {
       if (!(error instanceof RecoveredStorageRejected)) throw error;
       for (const resource of group.resources) unowned.push(Object.freeze({ ...resource, reason: 'inconsistent-storage' }));

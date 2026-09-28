@@ -330,28 +330,37 @@ const STORAGE_PARTS = Object.freeze([
  * process allocated and has not removed is refused, since a running agent may still mount it.
  */
 export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: TaskStorageParts,
-  timeoutMs = 30_000): Promise<RecoveredTaskStorage> {
+  timeoutMs = 30_000, keeperId?: string): Promise<RecoveredTaskStorage> {
   try { owner = assertResourceOwner(owner); }
   catch (error) { throw new RecoveredStorageRejected((error as Error).message); }
   if (liveAllocations.has(owner.allocationId))
     throw new Error('Task storage is still live in this process; only leftovers of an earlier process are recovered.');
+  if (keeperId !== undefined && !DOCKER_ID.test(keeperId)) throw new RecoveredStorageRejected('Keeper ID is not a full ID.');
   const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
-  let keeperId: string | undefined;
   for (const [field, object, kind, pattern] of STORAGE_PARTS) {
     const name = parts[field];
     if (name === undefined) continue;
     if (typeof name !== 'string' || !pattern.test(name))
       throw new RecoveredStorageRejected(`Recovered task ${kind} has an unexpected name.`);
-    const inspect = await runDocker([object, 'inspect', name], { timeoutMs: remaining() });
-    if (inspect.status !== 0) throw new Error(`Recovered task ${kind} could not be inspected.`);
-    const inspected = JSON.parse(inspect.stdout || '[]')[0] as
-      { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    // A keeper the caller already identified is looked up by that ID, never by its reusable name: a keeper removed and
+    // recreated under the same name since then is a different object, and is refused.
+    const target = object === 'container' && keeperId ? keeperId : name;
+    const inspect = await runDocker([object, 'inspect', target], { timeoutMs: remaining() });
+    if (inspect.status !== 0) {
+      if (absent(inspect as unknown as ReturnType<typeof spawnSync>))
+        throw new RecoveredStorageRejected(`Recovered task ${kind} is gone.`);
+      throw new Error(`Recovered task ${kind} could not be inspected.`);
+    }
+    const inspected = JSON.parse(inspect.stdout || '[]')[0] as { Id?: string; Name?: string;
+      Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    if (object === 'container' && inspected?.Name?.replace(/^\//, '') !== name)
+      throw new RecoveredStorageRejected(`Recovered task ${kind} no longer has its name.`);
     const labels = inspected?.Labels ?? inspected?.Config?.Labels;
     if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
       throw new RecoveredStorageRejected(`Recovered task ${kind} does not carry this owner's task-storage labels.`);
     if (object === 'container') {
-      if (!inspected?.Id || !DOCKER_ID.test(inspected.Id))
-        throw new RecoveredStorageRejected(`Recovered task ${kind} has no full ID.`);
+      if (!inspected?.Id || !DOCKER_ID.test(inspected.Id) || (keeperId && inspected.Id !== keeperId))
+        throw new RecoveredStorageRejected(`Recovered task ${kind} has no full ID, or changed.`);
       keeperId = inspected.Id;
     }
     found[field] = name;
