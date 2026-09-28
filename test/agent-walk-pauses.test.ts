@@ -55,7 +55,9 @@ describe('pauses while walking one large directory', () => {
     // One object-storage directory with far more entries than one pause interval.
     const info = join(input.source, '.git', 'objects', 'info');
     for (let index = 0; index < ENTRIES; index++) writeFileSync(join(info, `entry-${index}`), '');
-    await createTaskCloneAsync(input);
+    // Each Git call is awaited, which yields the event loop too; the object checks before and after the clone call are
+    // separate walks, so a run only counts entries read without any yield in between.
+    await createTaskCloneAsync({ ...input, onProcessGroup: () => { trace.run = 0; } });
     expect(trace.total).toBeGreaterThanOrEqual(ENTRIES);
     expect(trace.longest).toBeLessThanOrEqual(1_000);
   }, 60_000);
