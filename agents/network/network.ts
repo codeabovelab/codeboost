@@ -73,12 +73,16 @@ const absent = (result: ReturnType<typeof spawnSync>) => result.status !== 0 && 
 /** How long a network or proxy whose create client was killed may still materialize in the daemon. */
 const CREATE_SETTLE_MS = 10_000;
 const sleep = (ms: number) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-const remove = (args: readonly string[], inspect: readonly string[], remaining: () => number, kind: string,
+// Remove one owned object. Looks it up by `target` (its ID, or its name for a create whose ID never came back),
+// checks the ownership label, then removes and confirms by the ID the daemon just reported: a same-named replacement
+// created after the lookup is never touched.
+const remove = (object: 'container' | 'network', target: string, remaining: () => number, kind: string,
   allocationId: string, settleBy = 0) => {
+  const inspect = (ref: string) => spawnSync('docker', [object, 'inspect', ref], { encoding: 'utf8',
+    timeout: remaining(), killSignal: 'SIGKILL', env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
   let before: ReturnType<typeof spawnSync>;
   for (;;) {
-    before = spawnSync('docker', [...inspect], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-      env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
+    before = inspect(target);
     if (before.status === 0) break;
     if (!absent(before)) throw new Error(`Failed to establish ownership of ${kind}.`);
     // A killed create may still land; only absence after the settle window counts.
@@ -86,15 +90,16 @@ const remove = (args: readonly string[], inspect: readonly string[], remaining: 
     sleep(250);
   }
   const inspected = JSON.parse(String(before.stdout || '[]'))[0] as
-    { Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
+    { Id?: string; Labels?: Record<string, string>; Config?: { Labels?: Record<string, string> } } | undefined;
   const labels = inspected?.Labels ?? inspected?.Config?.Labels;
   if (labels?.['io.codeboost.egress'] !== allocationId) throw new Error(`Refused to remove unowned ${kind}.`);
-  const result = spawnSync('docker', [...args], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-    env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
+  const id = inspected?.Id;
+  if (!id || !/^[0-9a-f]{64}$/.test(id) || (/^[0-9a-f]{64}$/.test(target) && id !== target))
+    throw new Error(`Failed to establish the identity of ${kind}.`);
+  const result = spawnSync('docker', object === 'container' ? ['rm', '--force', id] : ['network', 'rm', id],
+    { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL', env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
   if (result.status === 0) return;
-  const check = spawnSync('docker', [...inspect], { encoding: 'utf8', timeout: remaining(), killSignal: 'SIGKILL',
-    env: environment(), stdio: ['ignore', 'pipe', 'pipe'] });
-  if (!absent(check)) throw new Error(`Failed to confirm removal of ${kind}.`);
+  if (!absent(inspect(id))) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
 
 const validateVendorNetwork = (network: VendorNetwork, invocation: InvocationInput | undefined,
@@ -195,7 +200,9 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     return value;
   };
   // Run one create step; a client killed by its deadline leaves the daemon outcome for `object` unknown.
-  const create = (object: string, args: readonly string[]) => {
+  // `answeredFailureMayCreate`: a command such as `docker run --detach` that can create the object and then exit
+  // nonzero (the start failed), so even a daemon-answered failure leaves the object possibly present.
+  const create = (object: string, args: readonly string[], answeredFailureMayCreate = false) => {
     const timeout = remaining();
     try {
       const output = docker(args, timeout);
@@ -203,6 +210,7 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       return output;
     } catch (error) {
       if (typeof (error as { status?: unknown }).status !== 'number') unsettled.add(object);
+      else if (answeredFailureMayCreate) created.add(object);
       throw error;
     }
   };
@@ -227,12 +235,12 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
     if (!mayExist('container')) proxyGone = true;
     if (!mayExist('network')) networkGone = true;
     if (proxyPlanned && !proxyGone) try {
-      remove(['rm', '--force', proxyTarget], ['container', 'inspect', proxyTarget],
+      remove('container', proxyTarget,
         budget, 'vendor proxy', allocationId, proxyId ? 0 : settleBy(proxyContainer));
       proxyGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
     if (networkPlanned && !networkGone) try {
-      remove(['network', 'rm', networkTarget], ['network', 'inspect', networkTarget],
+      remove('network', networkTarget,
         budget, 'vendor network', allocationId, networkId ? 0 : settleBy(name));
       networkGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
@@ -247,7 +255,7 @@ export function createVendorNetwork(invocation: InvocationInput, imageId: string
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=64m', '--memory-swap=64m',
       '--cpus=.25', '--network', name, '--network-alias', 'codeboost-proxy',
       '--label', `io.codeboost.egress=${allocationId}`, '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
-      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']), 'proxy');
+      '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs'], true), 'proxy');
     docker(['network', 'connect', 'bridge', proxyId], remaining());
     docker(['exec', proxyId, 'node', '-e', [
       "const net=require('node:net');let attempts=0;",
@@ -290,12 +298,12 @@ export function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30_000):
   const removed = removedParts.get(network) ?? new Set<UnreleasedResource['kind']>();
   removedParts.set(network, removed);
   if (!removed.has('container')) try {
-    remove(['rm', '--force', identity.proxyId], ['container', 'inspect', identity.proxyId],
+    remove('container', identity.proxyId,
       remaining, 'vendor proxy', allocationId);
     removed.add('container');
   } catch (error) { failures.push(error); }
   if (!removed.has('network')) try {
-    remove(['network', 'rm', identity.networkId], ['network', 'inspect', identity.networkId],
+    remove('network', identity.networkId,
       remaining, 'vendor network', allocationId);
     removed.add('network');
   } catch (error) { failures.push(error); }

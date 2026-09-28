@@ -98,6 +98,29 @@ describe('vendor-only egress', () => {
     expect(survived).toBe(true);
   }, 60_000);
 
+  it('removes a proxy that was created even though its start failed', () => {
+    const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'proxy');
+    const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
+    // `docker run --detach` creates the proxy, then the start fails: the client exits nonzero with a daemon answer.
+    writeFileSync(join(shim, 'docker'), ['#!/bin/sh',
+      `if [ "$1" = run ] && [ "$2" = --detach ]; then shift 2; printf %s "$2" > '${recorded}'; `
+        + `'${realDocker}' create "$@" >/dev/null; echo 'Error response from daemon: failed to start' >&2; exit 125; fi`,
+      `exec '${realDocker}' "$@"`].join('\n'), { mode: 0o755 });
+    const failing = captureInvocation({ ...invocation, attemptId: `proxy-start-${randomUUID()}`,
+      deadline: Date.now() + 60_000 });
+    const path = process.env.PATH;
+    process.env.PATH = `${shim}:${path}`;
+    let proxy = '';
+    try {
+      expect(() => createVendorNetwork(failing, imageId)).toThrow('failed to start');
+      proxy = readFileSync(recorded, 'utf8');
+    } finally { process.env.PATH = path; rmSync(shim, { recursive: true, force: true }); }
+    const leaked = spawnSync('docker', ['container', 'inspect', proxy], { stdio: 'ignore' }).status === 0;
+    if (leaked) spawnSync('docker', ['rm', '--force', proxy], { stdio: 'ignore' });
+    expect(proxy).toMatch(/^codeboost-proxy-/);
+    expect(leaked).toBe(false);
+  }, 60_000);
+
   it('does not delete a same-named stand-in when setup fails after the proxy exists', () => {
     const shim = mkdtempSync(join(tmpdir(), 'docker-shim-')), recorded = join(shim, 'impostor');
     const realDocker = execFileSync('sh', ['-c', 'command -v docker'], { encoding: 'utf8' }).trim();
