@@ -125,8 +125,12 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
  *
  * Call it only while holding the database's single-runner lock and before admitting work: it removes every agent
  * container of this runner. It refuses to run while this process holds task storage of the runner, which every agent
- * mounts, but cannot see other processes; the lock is what excludes them. It rejects
- * with a `RecoveryError` (message bounded to about 1 KB) when any removal is not confirmed, and then adopts nothing.
+ * mounts, but cannot see other processes; the lock is what excludes them.
+ *
+ * Treat any rejection as "recovery did not finish": do not admit work, and run it again. It rejects with a
+ * `RecoveryError` (message bounded to about 1 KB, plus `removed`) when a removal is not confirmed, and with a plain
+ * `Error` when it refuses to run (a malformed token, or live storage of this runner here), when a list or inspect
+ * fails, when a storage check cannot reach Docker, or when the deadline runs out. A rejection returns no handles.
  */
 export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000): Promise<RecoveryReport> {
   if (!isRunnerOwner(runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
