@@ -57,7 +57,8 @@ vi.mock('node:child_process', async importOriginal => ({
   spawnSync: vi.fn((_file: string, args: string[]) => ({ ...answer(args), error: undefined })),
 }));
 const { recoverLeftovers, RecoveryError } = await import('../agents/recovery.ts');
-const { isRecoveredTaskStorage, removeTaskFilesystems } = await import('../agents/container/storage.ts');
+const { adoptRecoveredTaskStorage, isRecoveredTaskStorage, removeTaskFilesystems } =
+  await import('../agents/container/storage.ts');
 
 const A = 'a'.repeat(32), B = 'b'.repeat(32);
 const id = () => randomUUID().replaceAll('-', '').repeat(2);
@@ -150,6 +151,14 @@ describe('recoverLeftovers', () => {
     expect(report.storage).toEqual([]);
     expect(report.unowned).toMatchObject([{ name, reason: 'inconsistent-storage' }]);
     expect(names()).toEqual([name]);
+  });
+
+  it('refuses a keeper ID without the keeper it names, so storage cleanup cannot reach another container', async () => {
+    const mine = attempt(A, 'attempt-a'), [work, , , , agent] = mine.objects;
+    const owner = { runnerOwner: A, attemptId: 'attempt-a', allocationId: mine.storage };
+    await expect(adoptRecoveredTaskStorage(owner, { workVolume: work!.name }, 30_000, agent!.id))
+      .rejects.toThrow('keeper ID needs the keeper');
+    expect(names()).toContain(agent!.name);
   });
 
   it('reports objects without a runner label and never removes them', async () => {

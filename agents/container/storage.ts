@@ -340,8 +340,11 @@ export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: Tas
   catch (error) { throw new RecoveredStorageRejected((error as Error).message); }
   if (liveAllocations.has(owner.allocationId))
     throw new Error('Task storage is still live in this process; only leftovers of an earlier process are recovered.');
-  if (keeperId !== undefined && !DOCKER_ID.test(keeperId)) throw new RecoveredStorageRejected('Keeper ID is not a full ID.');
+  if (keeperId !== undefined && (!DOCKER_ID.test(keeperId) || parts.keeper === undefined))
+    throw new RecoveredStorageRejected('A keeper ID needs the keeper it names, as a full ID.');
   const remaining = createDeadline(timeoutMs), found: Record<string, string> = {};
+  // Only an ID the keeper inspection below confirms is kept for cleanup.
+  let confirmedKeeperId: string | undefined;
   for (const [field, object, kind, pattern] of STORAGE_PARTS) {
     const name = parts[field];
     if (name === undefined) continue;
@@ -366,14 +369,14 @@ export async function adoptRecoveredTaskStorage(owner: ResourceOwner, parts: Tas
     if (object === 'container') {
       if (!inspected?.Id || !DOCKER_ID.test(inspected.Id) || (keeperId && inspected.Id !== keeperId))
         throw new RecoveredStorageRejected(`Recovered task ${kind} has no full ID, or changed.`);
-      keeperId = inspected.Id;
+      confirmedKeeperId = inspected.Id;
     }
     found[field] = name;
   }
   if (!Object.keys(found).length) throw new RecoveredStorageRejected('Recovered task storage names no parts.');
   const handle: RecoveredTaskStorage = Object.freeze({ runnerOwner: owner.runnerOwner, attemptId: owner.attemptId,
     allocationId: owner.allocationId, ...found });
-  recoveredStorage.set(handle, { owner, keeperId });
+  recoveredStorage.set(handle, { owner, keeperId: confirmedKeeperId });
   return handle;
 }
 
