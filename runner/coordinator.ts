@@ -45,8 +45,11 @@ type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
   firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean; staleCause?: string;
-  /** The terminal write is done; only host-side cleanup remains, so a stop has nothing left to change. */
-  ended?: boolean;
+  /**
+   * The outcome is fixed: before launch once the job starts ending (cleanup, then the terminal write), after launch once
+   * the terminal write is done. A later stop has nothing left to change.
+   */
+  decided?: boolean;
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: 'result-not-saved' | 'start-not-saved' }
@@ -121,9 +124,20 @@ export class RunnerCoordinator {
   }
   /** Cancel task: the Store records the reason and the pending close; the coordinator stops the running work. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
-    const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
     const job = this.#jobs.get(identityKey(identity));
-    if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason && !job.ended) {
+    // The Store writes `cancelled` wherever the row has no reason yet, so save an earlier unsaved reason first. That write
+    // bumps the state version, so it is made only when the caller's version is current, and the cancel then uses the new one.
+    if (job?.firstReason && !job.reasonSaved) {
+      try {
+        if (this.#store.getTask(identity).stateVersion === expectedStateVersion
+          && this.#store.recordFirstReason(job.identity, job.attemptId, job.firstReason)) {
+          job.reasonSaved = true;
+          expectedStateVersion = this.#store.getTask(identity).stateVersion;
+        }
+      } catch { /* still unsaved; the Store's own write below is likely to fail the same way */ }
+    }
+    const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
+    if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason) {
       // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout);
       // keep the job's reason in step with it so status shows the stop.
       job.firstReason = 'cancelled'; job.reasonSaved = true;
@@ -154,7 +168,7 @@ export class RunnerCoordinator {
 
   #requestStop(job: Job, reason: FirstReason): boolean {
     // The attempt deadline passed before launch: it ends `failed` with no first reason, so a later stop cannot claim it.
-    if (job.ended || (job.preparationTimedOut && !job.firstReason)) return false;
+    if (job.decided || (job.preparationTimedOut && !job.firstReason)) return false;
     if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
     job.firstReason = reason;
     try {
@@ -197,7 +211,11 @@ export class RunnerCoordinator {
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
       if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
       // A context change comes before both time checks, as in the settlement order and startup recovery.
-      if (!sameContext(row.context, this.#store.currentContext(job.identity))) return await this.#endBeforeLaunch(job, attempt, {});
+      if (!sameContext(row.context, this.#store.currentContext(job.identity))) {
+        // Recorded like any stale stop, so the row keeps it even if a cancel task lands during cleanup.
+        this.#requestStop(job, 'stale');
+        return await this.#endBeforeLaunch(job, attempt, {});
+      }
       if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}); }
       if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }); }
       // Fail closed: once D reported resources it could not remove, no new invocation starts, even one already admitted.
@@ -237,7 +255,7 @@ export class RunnerCoordinator {
       // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
       if (job.firstReason === 'stale') detail = job.staleCause;
       const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
-      job.ended = true;
+      job.decided = true;
       // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
       if (saved) await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
     } finally {
@@ -258,6 +276,8 @@ export class RunnerCoordinator {
   }
   /** Ending without a handle: host-side cleanup, then the terminal write from the first reason. */
   async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }): Promise<void> {
+    // Stops that land while preparation finishes are taken into account; once the job is ending, the outcome is fixed.
+    job.decided = true;
     await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
     this.#settle(job, { exitCode: null, signal: null, valid: false, detail: job.firstReason === 'stale' ? job.staleCause : s.detail });
   }

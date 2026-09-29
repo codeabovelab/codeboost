@@ -325,7 +325,7 @@ describe('review regressions', () => {
     preparations[0]!.resolve();
     await runner.settled(A);
     expect(launches).toHaveLength(0);
-    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: null });
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
     expect(store.getTask(A).status).not.toBe('needs human');
   });
   it('shows the cancel task stop after a preparation timeout, and closes the task', async () => {
@@ -338,6 +338,50 @@ describe('review regressions', () => {
     preparations[0]!.resolve();
     await runner.settled(A);
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+    expect(store.getTask(A).status).toBe('cancelled');
+  });
+  it('keeps stale when shutdown lands during cleanup after the launch check saw a context change', async () => {
+    const { store, runner, launches, preparations, deps } = setup();
+    let finish!: () => void, cleanupStarted = false;
+    deps.cleanupPreparation = () => { cleanupStarted = true; return new Promise<void>(resolve => { finish = resolve; }); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    store.setAssignment(A, store.getTask(A).stateVersion, 'reassigned', 'hash');
+    preparations[0]!.resolve();
+    await until(() => cleanupStarted, 'cleanup');
+    const closing = runner.close();
+    finish();
+    await closing;
+    expect(launches).toHaveLength(0);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
+  });
+  it('keeps the launch failure when shutdown lands during cleanup', async () => {
+    const { store, runner, preparations, deps, failStart } = setup();
+    let finish!: () => void, cleanupStarted = false;
+    deps.cleanupPreparation = () => { cleanupStarted = true; return new Promise<void>(resolve => { finish = resolve; }); };
+    failStart(new Error('untrusted image'));
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => cleanupStarted, 'cleanup');
+    const closing = runner.close();
+    expect(runner.status(A).stopRequested).toBeNull();
+    finish();
+    await closing;
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Launch failed: untrusted image' });
+  });
+  it('saves an earlier unsaved reason before cancel task, so the Store does not replace it', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    vi.spyOn(store, 'recordFirstReason').mockImplementationOnce(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    runner.stop(A, attempt.id, 'stale', 'plan revision 2 replaced 1');
+    expect(runner.status(A).stopRequested).toMatchObject({ reason: 'stale', saved: false });
+    expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+    expect(runner.status(A).stopRequested).toMatchObject({ reason: 'stale', saved: true });
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale', diagnostic: 'plan revision 2 replaced 1' });
     expect(store.getTask(A).status).toBe('cancelled');
   });
   it('refuses a stop once the terminal write is done and only cleanup remains', async () => {
