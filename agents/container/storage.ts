@@ -334,7 +334,15 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
       'find /run/codeboost-staging -mindepth 1 -maxdepth 1 ! -name .git'
         + ' -exec cp -a --no-preserve=ownership,timestamps -t /work/ {} +',
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
-      'chown -R 10001:10001 /work /metadata'].join('; ');
+      'chown -R 10001:10001 /work /metadata',
+      // The copy gave every file new timestamps and inodes, so the copied index sees every tracked file as changed.
+      // Refresh it once, after the chown (which changes ctimes) and a second after the copy, so no entry is racily
+      // clean. The volumes stay mounted behind the keeper, so these stat values hold for later containers.
+      'sleep 1',
+      'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --git-dir=/metadata --work-tree=/work -c safe.directory=*'
+        + ' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.bigFileThreshold=8m update-index -q --refresh'
+        + ' >/dev/null',
+      'chown 10001:10001 /metadata/index'].join('; ');
     // Create and start separately: once the create returns, the keeper is ours by ID even if its start fails.
     const keeperId = yield* allocate(keeper, ['create', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m', '--cpus=.25',
@@ -499,4 +507,283 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
   runSteps(cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner));
   allocations.delete(allocated);
   liveAllocations.delete(owner.allocationId);
+}
+
+/** At most this much diff is returned; the caller saves it as a stopped attempt's partial output. */
+export const MAXIMUM_EXPORT_BYTES = 1024 * 1024;
+export interface TaskDiff {
+  /** The diff's raw bytes, at most `maxBytes`. It is not necessarily valid UTF-8. */
+  readonly diff: Buffer;
+  /** Whether the diff was longer than `maxBytes` and was cut. */
+  readonly truncated: boolean;
+}
+export interface ExportOptions extends PreparationOptions {
+  /** The last commit codeboost made in this storage (or the clone's head): a full commit ID. */
+  readonly base: string;
+  /** The immutable ID of the built agent image, whose Git runs the export. */
+  readonly imageId: string;
+  /** Default and maximum `MAXIMUM_EXPORT_BYTES`. */
+  readonly maxBytes?: number;
+  /** Overall deadline for the Docker work, cleanup excluded. Default 60 s. */
+  readonly timeoutMs?: number;
+}
+// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff --binary`
+// compares `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every
+// commit) without refreshing the real index (GIT_OPTIONAL_LOCKS=0), and new untracked files are diffed through a
+// separate intent-to-add index in /tmp. An untracked nested repository, which Git cannot diff, is named in a
+// notice line instead, quoted so an agent-chosen name cannot forge diff lines. Output stops at
+// `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
+// Every stage's status is checked: a Git failure fails the export instead of passing off partial output as the diff;
+// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. A Git warning that it could
+// not read a directory or path also fails it, since Git then diffs that path as absent; other warnings do not.
+// Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
+// read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
+// diff programs and text conversion are off, and the worktree and attributes file are pinned. A populated submodule's
+// own config is the agent's, so Git never looks inside one: every diff passes --ignore-submodules on the command line,
+// which, unlike the config default, overrides the worktree's .gitmodules and applies to plumbing diff-index too. A
+// submodule's pointer change is still exported, but no `git status` runs inside it, and so none of its filters. core.safecrlf is off
+// so ordinary line-ending attributes (`text=auto`, `eol=crlf`) do not warn on stderr and fail a correct export.
+const EXPORT_SCRIPT = [
+  'set -eu',
+  'base=$1 limit=$2',
+  'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
+  'cd /work',
+  'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
+  '  -c core.attributesFile=/dev/null -c core.safecrlf=false -c core.bigFileThreshold=8m -c core.ignorecase=false "$@"; }',
+  'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
+  'produce() {',
+  '  set -eo pipefail',
+  '  # A tracked file inside a directory Git cannot search looks deleted, and Git says nothing when that directory is',
+  '  # ignored. For every tracked file that looks deleted, a directory above it that exists but cannot be read or',
+  '  # searched means the file was not read, not deleted. One perl pass reads the list at C speed and tests each',
+  '  # directory once, from the top down: at a symlink or a missing directory it stops, since what is behind is not part',
+  '  # of the worktree and Git correctly reports it as deleted (lstat follows a symlink in the middle of a path, so',
+  '  # testing from the bottom up would reach behind one). Its message takes the form of Git\'s own read failures, the',
+  '  # path escaped onto one line, so the stderr filter keeps it. Git\'s own lstat errors here go through that filter.',
+  '  g ls-files -z --deleted | perl -0 -ne \'chomp; my @parts = split m{/}; pop @parts; my $p = "";',
+  '    for my $part (@parts) { $p = $p eq "" ? $part : "$p/$part";',
+  '      my $s = $state{$p} //= (-l $p ? "link" : !-d _ ? "gone" : (!-r _ || !-x _) ? "unreadable" : "ok");',
+  '      last if $s eq "link" || $s eq "gone";',
+  '      if ($s eq "unreadable") { (my $q = $p) =~ s/([^\\w.\\/ -])/sprintf("\\\\x%02x", ord $1)/ge;',
+  '        print STDERR "warning: could not open directory \\x27$q\\x27: Permission denied\\n"; exit 6 } }\'',
+  '  # Git reads, and for --binary compresses, a whole file before it writes any of its diff, so the output limit does',
+  '  # not bound a large file: it can exhaust memory or the deadline. A changed file whose base or worktree version is',
+  '  # over 8 MiB, far past the 1 MiB the export returns, is named in a notice instead and excluded from the diff. Its',
+  '  # base size comes from one ls-tree pass, its worktree size from lstat; a symlink is never followed. The candidates',
+  '  # come from plumbing diff-index, which lists a file whose stat changed without reading it to compare (porcelain',
+  '  # git diff would read both versions of a touched, same-size file in full), so the list may include a large file',
+  '  # that did not really change.',
+  '  g diff-index --ignore-submodules=all --name-only -z --no-renames "$base" -- > /tmp/export-changed',
+  '  : > /tmp/export-large',
+  '  g ls-tree -r -l -z "$base" | perl -0 -e \'open(my $c, "<", "/tmp/export-changed") or die; my %base;',
+  '    my @changed = map { chomp; $_ } <$c>; my %wanted = map { $_ => 1 } @changed;',
+  '    while (<STDIN>) { chomp; my ($meta, $path) = split /\\t/, $_, 2;',
+  '      my $size = (split / +/, $meta)[3]; $base{$path} = $size if $wanted{$path} && $size =~ /^\\d+$/ }',
+  '    open(my $large, ">", "/tmp/export-large") or die;',
+  '    for my $path (@changed) { my $here = (!-l $path && -f _) ? -s _ : 0;',
+  '      print $large "$path\\0" if ($base{$path} // 0) > 8388608 || $here > 8388608 }',
+  '    close($large) or die\'',
+  '  # Tracked changes: the real index, read only, without the large files.',
+  '  excluded=()',
+  '  while IFS= read -r -d "" path; do excluded+=(":(exclude,literal)$path"); done < /tmp/export-large',
+  '  if [ "${#excluded[@]}" -gt 1000 ]; then exit 7; fi',
+  '  g diff --ignore-submodules=dirty --binary --no-color --no-ext-diff --no-textconv "$base" -- . \\',
+  '    ${excluded[@]+"${excluded[@]}"}',
+  '  # One perl pass splits the untracked list at C speed, reading all of it so Git never writes to a closed pipe:',
+  '  # nested repositories (the only entries ending in /) and the first 20,000 other paths. Each of those adds at least',
+  '  # about 60 bytes of diff, so past the cap the output already exceeds 1 MiB and is marked truncated.',
+  '  g ls-files -z --others --exclude-standard | perl -0 -ne \'BEGIN { open(N, ">", "/tmp/export-nested") or die;',
+  '    open(A, ">", "/tmp/export-new") or die; open(L, ">>", "/tmp/export-large") or die;',
+  '    open(R, ">", "/tmp/export-reserved") or die }',
+  '    if (m{/\\0\\z}) { print N $_ } else { (my $path = $_) =~ s/\\0\\z//;',
+  '      my @part = split m{/}, $path;',
+  '      if ((grep { lc eq ".git" } @part) || (-l $path && lc $part[-1] eq ".gitmodules")) { print R $_ }',
+  '      elsif (!-l $path && -f _ && -s _ > 8388608) { print L $_ } elsif ($n++ < 20000) { print A $_ } }',
+  '    END { close(N) or die; close(A) or die; close(L) or die; close(R) or die }\'',
+  '  # Git refuses to index a path with a part named .git, or a symlink named .gitmodules, in any case; such a path is',
+  '  # named in a notice.',
+  '  while IFS= read -r -d "" path; do',
+  '    printf "codeboost: untracked %q is a name Git will not add; it is not exported\\n" "$path"',
+  '  done < /tmp/export-reserved',
+  '  # Git silently skips more than the nested repositories above. It never lists an entry named .git anywhere, or',
+  '  # anything inside one, and it never looks for new files in a directory that holds a repository, even a tracked',
+  '  # directory. It skips fifos and sockets. And it skips ignored paths, under ignore files the agent controls. So one',
+  '  # find pass (bounded by the work volume\'s inode limit) names every .git entry, fifo and socket, except inside an',
+  '  # ignored path, an untracked nested repository or a submodule, each of which is named or exported as a whole.',
+  '  # Ignored untracked paths come from Git; a directory that ignores itself is listed with its contents, so an entry',
+  '  # under another listed directory is dropped. find\'s own errors are about unreadable directories: one Git searches',
+  '  # fails the export through Git\'s warnings, and one it does not search is inside a path already named.',
+  '  g ls-files -z --others --ignored --exclude-standard --directory | perl -0 -ne \'chomp; push @all, $_;',
+  '    END { my %dir = map { $_ => 1 } grep { m{/\\z} } @all; open(my $out, ">", "/tmp/export-ignored") or die;',
+  '      PATH: for my $path (@all) { my @part = split m{/}, $path; pop @part; my $p = "";',
+  '        for my $part (@part) { $p .= "$part/"; next PATH if $dir{$p} } print $out "$path\\0" }',
+  '      close($out) or die }\'',
+  '  g ls-files -z --stage > /tmp/export-stage',
+  '  { find . -path ./.git -prune -o -name .git -print0 -prune -o \\( -type p -o -type s \\) -print0 2>/dev/null || true; } \\',
+  '    | perl -0 -e \'my %skip; for my $f ("/tmp/export-ignored", "/tmp/export-nested") { open(my $h, "<", $f) or die;',
+  '      while (<$h>) { chomp; $skip{$_} = 1 } }',
+  '      open(my $h, "<", "/tmp/export-stage") or die; while (<$h>) { chomp; $skip{"$1/"} = 1 if /^160000 \\S+ \\d+\\t(.*)\\z/s }',
+  '      open(my $out, ">", "/tmp/export-special") or die;',
+  '      PATH: while (<STDIN>) { chomp; s{^\\./}{}; my $p = "";',
+  '        for my $part (split m{/}) { $p .= $part; next PATH if $skip{$p} || $skip{"$p/"}; $p .= "/" }',
+  '        print $out "$_\\0" } close($out) or die\'',
+  '  while IFS= read -r -d "" path; do',
+  '    if [ "${path##*/}" = .git ]; then',
+  '      printf "codeboost: %q is a .git entry, which Git skips; nothing in it, and if it holds a repository no new file beside it, is exported\\n" "$path"',
+  '    else printf "codeboost: %q is a fifo or socket; it is not exported\\n" "$path"; fi',
+  '  done < /tmp/export-special',
+  '  ignored=0',
+  '  while IFS= read -r -d "" path; do',
+  '    ignored=$((ignored + 1))',
+  '    if [ "$ignored" -le 100 ]; then printf "codeboost: untracked %q is ignored; it is not exported\\n" "$path"; fi',
+  '  done < /tmp/export-ignored',
+  '  if [ "$ignored" -gt 100 ]; then printf "codeboost: %d more ignored untracked paths are not exported\\n" "$((ignored - 100))"; fi',
+  '  # A large file, tracked or new, is named with its notice; %q keeps its agent-chosen name on one line.',
+  '  while IFS= read -r -d "" path; do',
+  '    printf "codeboost: %q is over 8 MiB; if it changed, its content is not exported\\n" "$path"',
+  '  done < /tmp/export-large',
+  '  # An untracked nested repository cannot be diffed and is named in a notice; %q keeps its name on one line.',
+  '  while IFS= read -r -d "" path; do',
+  '    printf "codeboost: untracked directory %q is a nested repository; its contents are not exported\\n" "$path"',
+  '  done < /tmp/export-nested',
+  '  # New files go, as intent-to-add entries, into a separate index in /tmp that starts empty, and a second diff compares',
+  '  # the worktree with it: one Git process however many there are, and an index that grows with them, not with the',
+  '  # repository. Paths are literal pathspecs, so "-" or "*" is just a name; anything Git writes goes to /tmp.',
+  '  if [ -s /tmp/export-new ]; then',
+  '    mkdir -p /tmp/export-objects',
+  '    export GIT_INDEX_FILE=/tmp/export-index GIT_OBJECT_DIRECTORY=/tmp/export-objects',
+  '    export GIT_ALTERNATE_OBJECT_DIRECTORIES=/work/.git/objects GIT_LITERAL_PATHSPECS=1',
+  '    # This index is never checked out, so the Windows-only name checks guard nothing here and would refuse names',
+  '    # such as GIT~1 that are ordinary files on Linux.',
+  '    g -c core.protectNTFS=false add --intent-to-add --pathspec-from-file=/tmp/export-new --pathspec-file-nul',
+  '    g diff --ignore-submodules=dirty --binary --no-color --no-ext-diff --no-textconv --',
+  '  fi',
+  '}',
+  'set +e',
+  '# Git only warns about a directory or path it cannot read, then diffs it as absent: untracked files vanish and tracked',
+  '# ones show as deleted. Those warnings fail the export; they are matched by their whole form, anchored, never by',
+  '# words a path could contain. Other messages about the agent\'s own .gitattributes or',
+  '# .gitignore (a negated pattern, an encoding it cannot apply) do not: Git still reads everything. A Git error that',
+  '# stops it is caught by its exit status.',
+  '# stderr is filtered as it arrives, keeping at most 101 such lines, so no amount of other warnings can fill /tmp and',
+  '# push a read failure out; the filter reads everything, so Git never writes to a closed stderr. Only produce\'s',
+  '# stderr goes through the pipe (its stdout goes on through fd 3), and the pipeline waits for the filter to finish.',
+  'filtered() {',
+  '  { produce 2>&1 1>&3 3>&- | awk \'(/^warning: could not open directory \\047/ || /^error: open\\(".*"\\): / \\',
+  '      || /^warning: unable to access \\047.*\\047: (Permission denied|Input\\/output error)$/ \\',
+  '      || /^(error|fatal): .*Input\\/output error$/) && n < 101 { print; n++; next }',
+  '    /^(error|fatal): / { before = last; last = $0 }',
+  '    END { if (before != "") print before > "/tmp/export-errors"; if (last != "") print last > "/tmp/export-errors" }\' \\',
+  '    > /tmp/export-failure 3>&-; return "${PIPESTATUS[0]}"; } 3>&1',
+  '}',
+  ': > /tmp/export-errors',
+  'filtered | head -c "$limit" | base64 -w0',
+  'statuses=("${PIPESTATUS[@]}")',
+  'set -e',
+  '# Git also looks up attribute and ignore files through a symlink that replaced a tracked directory. What is behind it',
+  '# is not part of the worktree (the diff shows the directory becoming a link), so a failure there is not one. Past 100',
+  '# lines the rest were not kept, so that fails too.',
+  'failure=""',
+  'if [ "$(wc -l < /tmp/export-failure)" -gt 100 ]; then failure="more than 100 paths could not be read"; fi',
+  'while [ -z "$failure" ] && IFS= read -r line; do',
+  '  if [[ $line =~ ^warning:\\ unable\\ to\\ access\\ \\\'(.*)\\\':\\ (Permission\\ denied|Input/output\\ error)$ ]]; then',
+  '    path=${BASH_REMATCH[1]} through_link=""',
+  '    while [[ $path == */* ]]; do path=${path%/*}; if [ -L "$path" ]; then through_link=1; break; fi; done',
+  '    [ -n "$through_link" ] && continue',
+  '  fi',
+  '  failure=$line',
+  'done < /tmp/export-failure',
+  'if [ -n "$failure" ]; then',
+  '  echo "git could not read part of the task worktree: $(printf %s "$failure" | head -c 300 | tr -d "\\000-\\010\\013-\\037")" >&2',
+  '  exit 6',
+  'fi',
+  'if [ "${statuses[0]}" -eq 7 ]; then echo "more than 1,000 changed files are over 8 MiB; the diff cannot be exported" >&2; exit 7; fi',
+  'if [ "${statuses[0]}" -ne 0 ] && [ "${statuses[0]}" -ne 141 ]; then',
+  '  # Git\'s last two errors say why it stopped (earlier ones can be about paths behind a symlink, which do not fail it).',
+  '  # They can quote agent-chosen names, so they are cut short and kept to printable text.',
+  '  detail=$(awk \'NR > 1 { printf "; " } { printf "%s", $0 }\' /tmp/export-errors | head -c 400 | tr -d "\\000-\\010\\013-\\037")',
+  '  echo "git failed while exporting the diff (status ${statuses[0]})${detail:+: $detail}" >&2; exit 4',
+  'fi',
+  'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
+].join('\n');
+
+function* exportSteps(workVolume: string, metadataVolume: string, owner: ResourceOwner, options: ExportOptions,
+  maxBytes: number): Steps<TaskDiff> {
+  const remaining = createDeadline(options.timeoutMs ?? 60_000);
+  // Mount nothing that is not this storage: each volume must still carry its kind and all three owner labels.
+  for (const [name, kind] of [[workVolume, 'work'], [metadataVolume, 'metadata']] as const) {
+    const inspect = yield* run(['volume', 'inspect', name], remaining(), true);
+    if (inspect.status === null) throw new DockerError(['volume', 'inspect', name], inspect);
+    if (inspect.status !== 0) throw new Error(`Task ${kind} volume is missing; the diff cannot be exported.`);
+    const labels = (JSON.parse(inspect.stdout || '[]')[0] as { Labels?: Record<string, string> } | undefined)?.Labels;
+    if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
+      throw new Error(`Task ${kind} volume does not carry this storage's labels.`);
+  }
+  const name = `codeboost-export-${randomUUID()}`;
+  let unsettled = false;
+  try {
+    const args = ['run', '--rm', '--name', name, '--label', 'io.codeboost.task-storage=export', ...ownerLabelArgs(owner),
+      '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
+      '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=256m', '--cpus=.5',
+      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
+      '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
+      '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
+      '--entrypoint', 'bash', options.imageId, '-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1)];
+    const outcome = yield* run(args, remaining(), true);
+    if (outcome.status !== 0) {
+      const error = new DockerError(args, outcome);
+      // A client stopped before the daemon answered may still have started the container.
+      unsettled = createOutcomeUnknown(error);
+      throw error;
+    }
+    const bytes = Buffer.from(outcome.stdout.trim(), 'base64');
+    return Object.freeze({ diff: bytes.subarray(0, maxBytes), truncated: bytes.length > maxBytes });
+  } catch (error) {
+    // `--rm` removes a container that ran to completion; one whose client was killed is still running, so remove it
+    // by name once its labels are confirmed, uncancelled, before the export settles.
+    try { yield* cleanup([name], [], owner, unsettled ? new Set([name]) : new Set()); }
+    catch (cleanupError) {
+      throw new AggregateError([error, cleanupError], 'Task diff export failed and its container cleanup did not settle.');
+    }
+    throw error;
+  }
+}
+
+/**
+ * Export the diff of task storage against `base`, the last commit codeboost made there, for a stopped attempt's partial
+ * output (#51 item 6). It accepts the value `prepareTaskFilesystems` returned or a recovery handle, runs Git in a
+ * read-only container that has no network, and returns at most `maxBytes` (1 MiB at most) with `truncated` set when
+ * the diff was longer. `maxBytes` bounds the returned data; `timeoutMs` and `signal` bound the Docker work. On abort or
+ * at the deadline the `docker run` client is stopped and the export container, which outlives a killed client, is
+ * removed; the promise settles only after both. An abort rejects with an `AbortError`, unless that container's
+ * cleanup did not settle, which rejects with an `AggregateError`.
+ */
+export async function exportTaskDiff(storage: TaskFilesystems | RecoveredTaskStorage,
+  options: ExportOptions): Promise<TaskDiff> {
+  const maxBytes = options.maxBytes ?? MAXIMUM_EXPORT_BYTES;
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAXIMUM_EXPORT_BYTES)
+    throw new Error(`maxBytes must be a positive integer of at most ${MAXIMUM_EXPORT_BYTES}.`);
+  if (typeof options.base !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.base))
+    throw new Error('base must be a full commit ID.');
+  if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId)) throw new Error('Export requires the immutable built image ID.');
+  assertBuiltAgentImage(options.imageId);
+  let owner: ResourceOwner, workVolume: string | undefined, metadataVolume: string | undefined;
+  const recovered = recoveredStorage.get(storage as RecoveredTaskStorage);
+  if (recovered) {
+    owner = recovered.owner;
+    ({ workVolume, metadataVolume } = storage as RecoveredTaskStorage);
+  } else {
+    const allocated = storage as TaskFilesystems;
+    owner = taskFilesystemOwner(allocated);
+    ({ workVolume, metadataVolume } = allocated);
+  }
+  if (!workVolume || !metadataVolume) throw new Error('Task storage has no work or metadata volume; nothing to export.');
+  if (options.signal?.aborted)
+    throw Object.assign(new Error('Task diff export was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
+  try { return await runStepsAsync(exportSteps(workVolume, metadataVolume, owner, options, maxBytes), options); }
+  catch (error) {
+    if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
+      throw Object.assign(new Error('Task diff export was cancelled.', { cause: error }), { name: 'AbortError', code: 'ABORT_ERR' });
+    throw error;
+  }
 }

@@ -12,7 +12,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner } from '../agents/container/storage.ts';
+import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -738,6 +738,222 @@ describe('real Docker agent isolation', () => {
     const groupAlive = (pgid: number) => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
     for (const pgid of pgids) expect(groupAlive(pgid)).toBe(false);
   }, 90_000);
+
+  // What an agent leaves in task storage: a commit of its own, an edit to a tracked file, a staged-only file, a binary
+  // file, a new untracked file and an untracked nested repository. `extra` runs last, as the same user.
+  const agentChanges = (filesystems: ReturnType<typeof prepareTaskFilesystems>, extra = 'true') => docker('run', '--rm', '--network=none',
+    '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
+    '--mount', `type=volume,source=${filesystems.workVolume},target=/work`,
+    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'bash', imageId, '-c', [
+      'set -e', 'cd /work',
+      'g() { git -c user.name=agent -c user.email=agent@example.com -c core.hooksPath=/dev/null "$@"; }',
+      'printf "committed\\n" > committed.txt', 'g add committed.txt', 'g commit -qm agent',
+      'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
+      'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
+      'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link',
+      // A tracked directory replaced by a link to /etc/ssl, whose private/ this user cannot read. What is behind the
+      // link is not the task's: its files are deleted, and Git's warnings about /etc/ssl/private must not fail the export.
+      'mkdir -p ssl/private', 'printf "cert\\n" > ssl/cert.pem', 'printf "key\\n" > ssl/private/key.pem',
+      'g add ssl', 'g commit -qm ssl', 'rm -rf ssl', 'ln -s /etc/ssl ssl',
+      // Ordinary line-ending attributes make Git warn about these files; a warning must not fail the export.
+      'printf "* text=auto\\n*.bat text eol=crlf\\n" > .gitattributes', 'printf "a\\r\\nb\\r\\n" > crlf.txt',
+      'printf "x\\n" > unix.bat',
+      // Warnings about the agent's own attribute and ignore files must not fail the export either.
+      'printf "!ignored text\\n" >> .gitattributes', 'mkdir -p tools', 'printf "*.log\\n" > tools/gitignore',
+      'ln -s tools/gitignore .gitignore',
+      'printf "enc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes', 'printf "plain\\n" > enc.txt',
+      'printf "dash content\\n" > ./-', 'printf "after dash\\n" > z-after.txt',
+      // Names Git refuses or guards on Windows: one it will never add, and two ordinary on Linux.
+      'mkdir .GIT', 'printf "reserved\\n" > .GIT/f', 'printf "short\\n" > GIT~1', 'mkdir x', 'printf "spaced\\n" > "x/.git "',
+      'ln -s target x/.GitModules',
+      // Folders whose names contain words from Git's read-failure messages, with attribute lines Git warns about.
+      'mkdir "could not open" "x Permission denied"', 'printf "* -bad!name\\n" > "could not open/.gitattributes"',
+      'printf "* -bad!name\\n" > "x Permission denied/.gitattributes"', 'printf "kept\\n" > "could not open/f"',
+      // A nested repository whose name tries to forge a hunk for another file.
+      'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
+      extra].join('\n'));
+  // Every file and directory in both volumes, with its metadata and contents, read without writing.
+  const storageSnapshot = (filesystems: ReturnType<typeof prepareTaskFilesystems>) => docker('run', '--rm',
+    '--network=none', '--user', '10001:10001',
+    '--mount', `type=volume,source=${filesystems.workVolume},target=/work,readonly`,
+    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git,readonly`, '--entrypoint', 'bash',
+    imageId, '-c', 'cd /work && find . -printf "%p %m %s %T@\\n" | sort && find . -type f -readable -print0 | sort -z | xargs -0 sha256sum');
+
+  it('exports the diff against the last codeboost commit, bounded and without writing to the storage', async () => {
+    const data = fixture(), filesystems = data.filesystems;
+    agentChanges(filesystems);
+    const before = storageSnapshot(filesystems);
+    const exported = await exportTaskDiff(filesystems, { base: data.clone.head, imageId });
+    expect(storageSnapshot(filesystems)).toBe(before);
+    const text = exported.diff.toString('utf8');
+    expect(exported.truncated).toBe(false);
+    expect(text).toContain('+staged only');
+    expect(text).toContain('b/binary.dat');
+    expect(text).toContain('GIT binary patch');
+    expect(text).toContain('untracked directory nested/ is a nested repository');
+    // A symlink is diffed as the link it is, not followed or mistaken for a nested repository.
+    expect(text).toContain('b/dir-link');
+    expect(text).toContain('new file mode 120000');
+    expect(text).not.toContain('dir-link is a nested repository');
+    // A file named "-" is a name, not standard input, and the files after it are still exported.
+    expect(text).toContain('+dash content');
+    expect(text).toContain('+after dash');
+    expect(text).toContain('b/could not open/f');
+    expect(text).toContain('codeboost: untracked .GIT/f is a name Git will not add');
+    expect(text).toContain('codeboost: untracked x/.GitModules is a name Git will not add');
+    expect(text).toContain('+short');
+    expect(text).toContain('+spaced');
+    // The hostile name stays on one quoted line: no forged hunk line appears.
+    expect(text).not.toMatch(/^\+forged$/m);
+    expect(text).toMatch(/untracked directory \$'evil\\n.*is a nested repository/);
+    // The agent's own commit, an unstaged edit and an untracked file all appear against the base.
+    expect(text).toContain('b/committed.txt');
+    expect(text).toContain('+committed');
+    expect(text).toContain('-trusted');
+    expect(text).toContain('+changed');
+    expect(text).toContain('b/untracked.txt');
+    expect(text).toContain('+brand new');
+    expect(text).toContain('b/ssl');
+    expect(text).toContain('b/crlf.txt');
+    expect(text).toContain('b/unix.bat');
+    expect(text).toContain('b/enc.txt');
+    const cut = await exportTaskDiff(filesystems, { base: data.clone.head, imageId, maxBytes: 20 });
+    expect(cut).toEqual({ diff: exported.diff.subarray(0, 20), truncated: true });
+    await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');
+    // A Git failure part-way through fails the export; it is never passed off as a complete diff.
+    // Anything the export cannot read fails it: Git would otherwise drop untracked files or show tracked ones as deleted.
+    for (const extra of ['printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt',
+      'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden',
+      'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked',
+      // An ignored directory: the untracked scan never enters it, so Git would report its tracked file as deleted.
+      'mkdir -p .git/info && printf "gone/\\n" >> .git/info/exclude && mkdir gone && printf "a\\n" > gone/f && g add -f gone/f && g commit -qm gone && chmod 000 gone']) {
+      const failing = fixture();
+      agentChanges(failing.filesystems, extra);
+      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('could not read part of the task worktree');
+    }
+    // No export container is left, and the storage still validates for the next launch.
+    expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
+      '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');
+  }, 120_000);
+
+  it('exports freshly seeded storage without treating every tracked file as changed', async () => {
+    // A large tracked file the agent never touches, and an edit made without Git, as an agent that never commits
+    // leaves it: nothing refreshes the index after seeding except the seeder itself.
+    const data = fixture({ limits: { workBytes: 48 * 1024 * 1024, workInodes: 512, metadataBytes: 48 * 1024 * 1024,
+      metadataInodes: 512 }, hostile: source => writeFileSync(join(source, 'untouched-big.bin'), randomBytes(9 * 1024 * 1024)) });
+    docker('run', '--rm', '--network=none', '--user', '10001:10001',
+      '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`, '--entrypoint', 'sh', imageId, '-c',
+      'printf "edited\\n" > /work/file.txt');
+    const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
+    expect(text).toContain('+edited');
+    expect(text).not.toContain('untouched-big.bin');
+  }, 180_000);
+
+  it('names every entry Git would skip without a word, instead of dropping what is inside', async () => {
+    const data = fixture();
+    agentChanges(data.filesystems, [
+      // A tracked directory that becomes a repository: Git no longer looks for new files in it.
+      'mkdir src && printf "a\\n" > src/a.txt && g add src && g commit -qm src',
+      '(cd src && git init -q) && printf "new\\n" > src/new.txt',
+      // Something named .git that is not a repository: Git never lists it or anything inside.
+      'mkdir -p out/.git && printf "payload\\n" > out/.git/payload',
+      'mkfifo pipe',
+      // A directory that ignores itself: Git lists it and its contents, and it is named once.
+      'mkdir gen && printf "*\\n" > gen/.gitignore && printf "important\\n" > gen/code.py',
+      // A clone made on a case-insensitive host (macOS) records core.ignorecase=true; the work volume is case-sensitive,
+      // and with it Git would take .GIT for .git and FILE.txt for the tracked file.txt, and drop both.
+      'g config core.ignorecase true && printf "upper\\n" > FILE.txt'].join(' && '));
+    const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
+    expect(text).toContain('codeboost: src/.git is a .git entry, which Git skips');
+    expect(text).toContain('codeboost: out/.git is a .git entry, which Git skips');
+    expect(text).toContain('codeboost: pipe is a fifo or socket; it is not exported');
+    expect(text).toMatch(/^codeboost: untracked gen\/ is ignored; it is not exported$/m);
+    expect(text).not.toContain('gen/code.py');
+    expect(text).toContain('codeboost: untracked .GIT/f is a name Git will not add');
+    expect(text).toContain('+upper');
+    // Covered as a whole already: the untracked nested repository's own .git is not named again.
+    expect(text).toContain('untracked directory nested/ is a nested repository');
+    expect(text).not.toContain('nested/.git');
+  }, 120_000);
+
+  it('says what Git reported when it fails', async () => {
+    const data = fixture();
+    // agentChanges also replaces a tracked directory with a link to /etc/ssl, so Git first prints an error about a file
+    // behind it that does not stop it; the reason must still be the one Git stopped on.
+    agentChanges(data.filesystems, 'rm file.txt && mkfifo file.txt');
+    await expect(exportTaskDiff(data.filesystems, { base: data.clone.head, imageId }))
+      .rejects.toThrow(/git failed while exporting the diff \(status \d+\): error: file\.txt: unsupported file type; fatal: /);
+  }, 120_000);
+
+  it('names files over 8 MiB instead of diffing them, so one large file cannot exhaust memory or the deadline', async () => {
+    const data = fixture({ limits: { workBytes: 96 * 1024 * 1024, workInodes: 512, metadataBytes: 64 * 1024 * 1024,
+      metadataInodes: 512 } });
+    agentChanges(data.filesystems, ['head -c 9437184 /dev/urandom > tracked-big.bin',
+      'head -c 9437184 /dev/urandom > touched-big.bin', 'g add tracked-big.bin touched-big.bin', 'g commit -qm big',
+      'head -c 1000 /dev/urandom >> tracked-big.bin',
+      // Same size, new timestamp: porcelain git diff would read both versions in full to compare them.
+      'touch -d "@$(( $(date +%s) + 60 ))" touched-big.bin',
+      'head -c 20971520 /dev/urandom > new-big.bin', 'printf "small\\n" > small.txt'].join(' && '));
+    const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+    const text = exported.diff.toString('utf8');
+    expect(text).toContain('codeboost: tracked-big.bin is over 8 MiB; if it changed, its content is not exported');
+    expect(text).toContain('codeboost: touched-big.bin is over 8 MiB; if it changed, its content is not exported');
+    expect(text).toContain('codeboost: new-big.bin is over 8 MiB; if it changed, its content is not exported');
+    expect(text).not.toContain('diff --git a/tracked-big.bin');
+    expect(text).not.toContain('diff --git a/new-big.bin');
+    expect(text).toContain('+small');
+  }, 180_000);
+
+  it.each(['', 'printf "[submodule \\"sub\\"]\\n\\tpath = sub\\n\\tignore = none\\n" > .gitmodules'])(
+    'never runs a populated submodule\'s own filters (worktree .gitmodules: %s)', async gitmodules => {
+      const data = fixture();
+      // The submodule's config is the agent's: if Git ran git status inside it, this filter would print a read
+      // failure and fail the export. Its commit stays the recorded one, so only a look inside would notice it.
+      agentChanges(data.filesystems, [
+        'git init -q sub', '(cd sub && printf "f\\n" > f && g add f && g commit -qm one)', 'g add sub',
+        'g commit -qm submodule',
+        '(cd sub && printf "f filter=evil\\n" > .gitattributes && g config filter.evil.clean \'echo "warning: could not open directory \\x27x\\x27: Permission denied" >&2; cat\')',
+        'touch -d "@$(( $(date +%s) + 60 ))" sub/f', gitmodules || 'true'].join(' && '));
+      const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+      expect(exported.diff.toString('utf8')).toContain('Subproject commit');
+    }, 120_000);
+
+  it('marks the export truncated when there are more untracked files than it adds', async () => {
+    // Enough inodes for 21,000 files; the default test storage allows 512.
+    const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 25_000, metadataBytes: 16 * 1024 * 1024,
+      metadataInodes: 512 } });
+    // Past 20,000 untracked files the export stops adding them; their diffs alone already pass the 1 MiB limit.
+    agentChanges(data.filesystems, 'mkdir many && cd many && for i in $(seq 1 21000); do : > "e$i"; done');
+    const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+    expect(exported.truncated).toBe(true);
+    expect(exported.diff.length).toBe(1024 * 1024);
+  }, 180_000);
+
+  it('on abort, removes a running export container whose client ignores SIGTERM', async () => {
+    const data = fixture(), filesystems = data.filesystems, marker = join(data.root, 'export-started');
+    const allocationId = taskFilesystemOwner(filesystems).allocationId;
+    // The export container really starts (a long sleep in place of the diff), then the client ignores SIGTERM.
+    const stubborn = [
+      "if (args.includes('io.codeboost.task-storage=export')) {",
+      "  const at = args.indexOf('-c'); args.splice(at, 2, '-c', 'sleep 300'); args.splice(1, 0, '--detach');",
+      '  result = run(args);',
+      `  require('node:fs').writeFileSync(${JSON.stringify(marker)}, '');`,
+      "  process.on('SIGTERM', () => {});",
+      '  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);',
+      '} else result = run(args);',
+    ].join('\n');
+    const controller = new AbortController();
+    const waitForStart = setInterval(() => { if (existsSync(marker)) controller.abort(); }, 20);
+    const began = performance.now();
+    try {
+      const error = await withDockerShim(['run', '--rm'], stubborn, () => exportTaskDiff(filesystems,
+        { base: data.clone.head, imageId, signal: controller.signal }).then(() => undefined, caught => caught));
+      expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    } finally { clearInterval(waitForStart); }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
+    expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
+      '--filter', `label=io.codeboost.allocation=${allocationId}`)).toBe('');
+  }, 120_000);
 
   it('keeps a failed allocation whose cleanup did not settle live, so recovery in this process refuses its runner', async () => {
     const data = fixture(), runnerOwner = randomBytes(16).toString('hex');
