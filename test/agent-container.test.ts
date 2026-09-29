@@ -750,7 +750,10 @@ describe('real Docker agent isolation', () => {
       'printf "committed\\n" > committed.txt', 'g add committed.txt', 'g commit -qm agent',
       'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
       'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
-      'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link', extra].join('\n'));
+      'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link',
+      // A nested repository whose name tries to forge a hunk for another file.
+      'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
+      extra].join('\n'));
   // Every file and directory in both volumes, with its metadata and contents, read without writing.
   const storageSnapshot = (filesystems: ReturnType<typeof prepareTaskFilesystems>) => docker('run', '--rm',
     '--network=none', '--user', '10001:10001',
@@ -770,10 +773,12 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('b/binary.dat');
     expect(text).toContain('GIT binary patch');
     expect(text).toContain('untracked directory nested/ is a nested repository');
-    // A symlink to a directory is diffed as a link, not mistaken for a nested repository.
-    expect(text).toContain('b/dir-link');
-    expect(text).toContain('new file mode 120000');
+    // A symlink is named with its target, not followed or mistaken for a nested repository.
+    expect(text).toContain('codeboost: untracked symlink dir-link -> linked-dir');
     expect(text).not.toContain('dir-link is a nested repository');
+    // The hostile name stays on one quoted line: no forged hunk line appears.
+    expect(text).not.toMatch(/^\+forged$/m);
+    expect(text).toMatch(/untracked directory \$'evil\\n.*is a nested repository/);
     // The agent's own commit, an unstaged edit and an untracked file all appear against the base.
     expect(text).toContain('b/committed.txt');
     expect(text).toContain('+committed');
@@ -791,7 +796,7 @@ describe('real Docker agent isolation', () => {
       'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked']) {
       const failing = fixture();
       agentChanges(failing.filesystems, extra);
-      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/cannot read|git failed/);
+      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/git reported a problem|git failed/);
     }
     // No export container is left, and the storage still validates for the next launch.
     expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',

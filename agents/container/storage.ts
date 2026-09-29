@@ -521,12 +521,13 @@ export interface ExportOptions extends PreparationOptions {
 }
 // Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff --binary`
 // compares `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every
-// commit) and never refreshes the index (GIT_OPTIONAL_LOCKS=0); each new untracked file is diffed against /dev/null,
-// and an untracked nested repository, which Git cannot diff, is named in the output rather than skipped. Output stops at
+// commit) and never refreshes the index (GIT_OPTIONAL_LOCKS=0); each new untracked file is diffed against /dev/null.
+// An untracked symlink or nested repository, which that cannot represent, is named in a notice line instead, quoted so
+// an agent-chosen name cannot forge diff lines. Output stops at
 // `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
 // Every stage's status is checked: a Git failure fails the export instead of passing off partial output as the diff;
-// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. A worktree with a directory
-// or file the export cannot read is refused, since Git would diff it as absent rather than fail.
+// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. Anything Git writes to
+// stderr also fails it: for a directory or path it cannot read, Git only warns and diffs it as absent.
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
 // read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
 // diff programs and text conversion are off, and the worktree and attributes file are pinned.
@@ -538,18 +539,18 @@ const EXPORT_SCRIPT = [
   'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
   '  -c core.attributesFile=/dev/null "$@"; }',
   'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
-  '# Git only warns about a directory or file it cannot read, then diffs as if it were absent: untracked files vanish and',
-  '# tracked ones show as deleted. Refuse such a worktree instead of exporting a wrong diff.',
-  'unreadable=$(find . -path ./.git -prune -o \\( -type d ! \\( -readable -executable \\) \\) -print -quit \\',
-  '  -o \\( ! -type d ! -type l ! -readable \\) -print -quit)',
-  'if [ -n "$unreadable" ]; then echo "cannot read $unreadable in the task worktree; the diff cannot be exported" >&2; exit 6; fi',
   'produce() {',
   '  set -eo pipefail',
   '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" --',
   '  g ls-files -z --others --exclude-standard | while IFS= read -r -d "" path; do',
-  '    # A symlink to a directory is diffed as the link it is; only a real directory is a nested repository.',
-  '    if [ -d "$path" ] && [ ! -L "$path" ]; then',
-  '      printf "codeboost: untracked directory %s is a nested repository; its contents are not exported\\n" "$path"',
+  '    # git diff --no-index follows a symlink (into a directory it cannot diff, or to another file\'s content), so a',
+  '    # symlink is named with its target instead. %q keeps agent-chosen names on one line.',
+  '    if [ -L "$path" ]; then',
+  '      printf "codeboost: untracked symlink %q -> %q\\n" "$path" "$(readlink -- "$path")"',
+  '      continue',
+  '    fi',
+  '    if [ -d "$path" ]; then',
+  '      printf "codeboost: untracked directory %q is a nested repository; its contents are not exported\\n" "$path"',
   '      continue',
   '    fi',
   '    status=0',
@@ -559,9 +560,15 @@ const EXPORT_SCRIPT = [
   '  done',
   '}',
   'set +e',
-  'produce | head -c "$limit" | base64 -w0',
+  '# Git only warns about a directory or path it cannot read, then diffs it as absent: untracked files vanish and tracked',
+  '# ones show as deleted. Anything Git reports on stderr therefore fails the export.',
+  'produce 2>/tmp/export-errors | head -c "$limit" | base64 -w0',
   'statuses=("${PIPESTATUS[@]}")',
   'set -e',
+  'if [ -s /tmp/export-errors ]; then',
+  '  echo "git reported a problem while exporting the diff: $(head -c 300 /tmp/export-errors | tr -d "\\000-\\010\\013-\\037")" >&2',
+  '  exit 6',
+  'fi',
   'if [ "${statuses[0]}" -ne 0 ] && [ "${statuses[0]}" -ne 141 ]; then echo "git failed while exporting the diff (status ${statuses[0]})" >&2; exit 4; fi',
   'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');
