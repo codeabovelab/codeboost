@@ -763,6 +763,8 @@ describe('real Docker agent isolation', () => {
       'ln -s tools/gitignore .gitignore',
       'printf "enc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes', 'printf "plain\\n" > enc.txt',
       'printf "dash content\\n" > ./-', 'printf "after dash\\n" > z-after.txt',
+      // Names Git refuses or guards on Windows: one it will never add, and two ordinary on Linux.
+      'mkdir .GIT', 'printf "reserved\\n" > .GIT/f', 'printf "short\\n" > GIT~1', 'mkdir x', 'printf "spaced\\n" > "x/.git "',
       // Folders whose names contain words from Git's read-failure messages, with attribute lines Git warns about.
       'mkdir "could not open" "x Permission denied"', 'printf "* -bad!name\\n" > "could not open/.gitattributes"',
       'printf "* -bad!name\\n" > "x Permission denied/.gitattributes"', 'printf "kept\\n" > "could not open/f"',
@@ -796,6 +798,9 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('+dash content');
     expect(text).toContain('+after dash');
     expect(text).toContain('b/could not open/f');
+    expect(text).toContain('codeboost: untracked .GIT/f has a part named .git');
+    expect(text).toContain('+short');
+    expect(text).toContain('+spaced');
     // The hostile name stays on one quoted line: no forged hunk line appears.
     expect(text).not.toMatch(/^\+forged$/m);
     expect(text).toMatch(/untracked directory \$'evil\\n.*is a nested repository/);
