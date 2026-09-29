@@ -50,9 +50,10 @@ dedicated read-only gateway with these boundaries:
 
 - Codeboost invokes `gh` with literal arguments; issue text is parsed only as
   data and is never interpolated into a shell command or prompt.
-- Each `gh` process gets only the allowlisted environment in
-  `github/gh-env.ts`. Other variables from the server, such as unrelated
-  credentials, are not passed on.
+- Each `gh` process gets only the allowlisted variables in
+  `github/gh-env.ts`, plus fixed settings that turn off prompts, the pager,
+  colour and update checks. Other variables from the server, such as
+  unrelated credentials, are not passed on.
 - The gateway fetches open issues and the repository's current collaborators,
   excludes pull requests, follows bounded pagination for both collections, and
   validates every field used for normalization, trust, or ranking. If the
