@@ -17,7 +17,8 @@ let data,
   selected,
   change = 0,
   mode = "question",
-  since = false,
+  // The reviewer's explicit view choice, held only for the item and stale state it was made on; otherwise a stale item opens the comparison.
+  sinceChoice = null,
   busy = false;
 let reviewGeneration = 0;
 let view = "review";
@@ -105,7 +106,6 @@ async function refresh() {
     data = updated;
     snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
-    since = data.items.find((item) => item.id === selected)?.state === "stale";
     render();
   } catch (error) {
     rememberDraft();
@@ -209,12 +209,21 @@ async function act(command) {
     renderAttachment();
   }
 }
+const staleState = (item) =>
+  JSON.stringify([
+    item.reasons,
+    data.segments.filter((s) => s.row === item.id).map((s) => [s.path, s.operation, s.content]),
+    data.plan.items.find((p) => p.id === item.id),
+  ]);
+const showSince = (item) =>
+  item?.state === "stale" &&
+  (sinceChoice?.item === item.id && sinceChoice.state === staleState(item) ? sinceChoice.value : true);
 function select(id) {
   rememberDraft();
   selected = id;
   snippetSelection = null;
   change = 0;
-  since = data.items.find((item) => item.id === id)?.state === "stale";
+  sinceChoice = null;
   render();
 }
 function render() {
@@ -285,11 +294,11 @@ function render() {
   $("approve").disabled = item?.state === "approved";
   $("view-toggle").innerHTML =
     item?.state === "stale"
-      ? `<button data-since="true" aria-pressed="${since}">Since approval</button><button data-since="false" aria-pressed="${!since}">Full change</button>`
+      ? `<button data-since="true" aria-pressed="${showSince(item)}">Since approval</button><button data-since="false" aria-pressed="${!showSince(item)}">Full change</button>`
       : "";
   document.querySelectorAll("[data-since]").forEach((button) =>
     button.addEventListener("click", () => {
-      since = button.dataset.since === "true";
+      sinceChoice = { item: item.id, state: staleState(item), value: button.dataset.since === "true" };
       renderCode();
     }),
   );
@@ -332,7 +341,7 @@ function renderCode() {
   $("previous").disabled = !segments.length || change === 0;
   $("next").disabled = !segments.length || change === segments.length - 1;
   let comparison = "";
-  if (since && item?.state === "stale" && item.before) {
+  if (showSince(item) && item.before) {
     const prior = item.before.segments
       .map((s) => `${s.path} ${s.operation || ""}\n${s.content}`)
       .join("\n");
@@ -415,7 +424,7 @@ function renderCode() {
     .forEach((button) =>
       button.setAttribute(
         "aria-pressed",
-        String((button.dataset.since === "true") === since),
+        String((button.dataset.since === "true") === showSince(item)),
       ),
     );
 }
