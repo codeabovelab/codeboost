@@ -30,6 +30,8 @@ export interface TaskPullRequest {
   state: 'opening' | 'opened' | 'abandoned'; number: number | null; url: string | null; createdAt: string;
   /** The task state version this opening owns; only a response for that exact version may change the task status. */
   ownerVersion: number;
+  /** An update of this open PR that started and has not been confirmed; the PR may already show it. */
+  refresh: { head: string; draft: boolean; stateVersion: number } | null;
 }
 export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
@@ -891,6 +893,7 @@ export class Store {
         opening_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), repository TEXT NOT NULL, base TEXT NOT NULL,
         head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL, owner_version INTEGER NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('opening','opened','abandoned')), number INTEGER, url TEXT,
+        refresh_head TEXT, refresh_draft INTEGER, refresh_version INTEGER,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         CHECK ((state = 'opened') = (number IS NOT NULL AND url IS NOT NULL)));
       CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_number ON task_pull_requests (lower(repository), number) WHERE number IS NOT NULL;
@@ -903,6 +906,7 @@ export class Store {
       headSha: row.head_sha as string, draft: row.draft === 1, state: row.state as TaskPullRequest['state'],
       number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
       ownerVersion: row.owner_version as number,
+      refresh: row.refresh_head === null ? null : { head: row.refresh_head as string, draft: row.refresh_draft === 1, stateVersion: row.refresh_version as number },
     };
   }
   /** Every PR codeboost opened or started to open for the task, oldest first. */
@@ -958,16 +962,34 @@ export class Store {
       return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
     });
   }
+  /** Nothing changed since a clear check of this head. Called right before each external write (push, open, refresh). */
+  assertCheckCurrent(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
+    this.#transaction(() => this.#assertCheckedHead(identity, input));
+  }
   /**
-   * The same guard for reusing the task's open PR: nothing changed since a clear check of this head. Returns the state
-   * version the refresh owns.
+   * Records an update of the task's open PR before it starts, under the same guard as an opening. The PATCH and the
+   * draft change may land even if their confirmation is lost; the record keeps that visible until the update is
+   * confirmed or abandoned. Returns the state version the update owns.
    */
-  assertReadyToRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): number {
+  beginRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): number {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#assertCheckedHead(identity, input);
       if (!this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened'", key, input.openingId)) throw new GuardRefusal('Unknown pull request.');
-      return this.#task(key).state_version as number;
+      this.#touch(key);
+      const version = this.#task(key).state_version as number;
+      this.#run('UPDATE task_pull_requests SET refresh_head=?, refresh_draft=?, refresh_version=?, updated_at=? WHERE opening_id=?',
+        input.headSha, input.draft ? 1 : 0, version, new Date().toISOString(), input.openingId);
+      return version;
+    });
+  }
+  /** An unconfirmed update is dropped; the next publish checks again and repeats it (the update is idempotent). */
+  abandonRefresh(identity: PlanIdentity, openingId: string): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      if (this.#run("UPDATE task_pull_requests SET refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, updated_at=? WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL",
+        new Date().toISOString(), key, openingId).changes !== 1) throw new GuardRefusal('No update of this pull request is in flight.');
+      this.#touch(key);
     });
   }
   #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
@@ -991,10 +1013,11 @@ export class Store {
       // Opening completes an `opening` row; a refresh updates the task's existing PR to the head it was checked at.
       const row = refreshedHead === undefined
         ? this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opening'", key, openingId)
-        : this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened' AND number=?", key, openingId, pr.number);
+        : this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened' AND number=? AND refresh_head=? AND refresh_version=?",
+          key, openingId, pr.number, refreshed!.head, refreshed!.stateVersion);
       if (!row) throw new GuardRefusal('No pull request is being opened with this ID.');
       const expectedHead = refreshedHead ?? row.head_sha as string;
-      this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, updated_at=? WHERE opening_id=?",
+      this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, updated_at=? WHERE opening_id=?",
         pr.number, pr.url, pr.draft ? 1 : 0, expectedHead, new Date().toISOString(), openingId);
       const task = this.#task(key), owned = refreshed?.stateVersion ?? row.owner_version as number;
       // Every status change and every admission increases the state version, so an unchanged version means the task is

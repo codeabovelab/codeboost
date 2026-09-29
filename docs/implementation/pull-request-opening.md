@@ -30,7 +30,7 @@ The check matches when any of these is true:
 | Signal | Source | Not a match |
 |---|---|---|
 | Something other than this task closed the issue. | The issue state and its latest close event (GraphQL). | Closed by an own PR or an own commit. A reopened issue. |
-| Another open or merged PR links to the issue. | Cross-reference and "connected" timeline events. | Own PRs, matched by repository and number. Closed, unmerged PRs. |
+| Another open or merged PR links to the issue. | Cross-reference events, and manual links: "connected" and "disconnected" events replayed in order. | Own PRs, matched by repository and number. Closed, unmerged PRs. A manual link whose latest event is a disconnect. |
 | A new commit on the base branch mentions the issue. | The commits from the task's base to the current base branch head. | Own commits. `#123` when the issue is `#12`. `other/repo#12`. |
 
 A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue URL. A PR in another repository that links the issue counts as a match. It is not excluded by number, because its number belongs to another repository.
@@ -41,7 +41,8 @@ A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue U
 - a task base that is not an ancestor of the base branch;
 - a closed issue with no close event;
 - a linked item that is missing, of an unknown type, or in a malformed response;
-- a GitHub error or invalid JSON.
+- a GitHub error or invalid JSON;
+- the whole check running past its single deadline (45 seconds by default). Reaching the deadline stops the running `gh` call.
 
 A cancelled check throws. It does not return `unknown`.
 
@@ -53,9 +54,9 @@ Publish runs these steps in order:
 2. **Status and no changes.** Refuse unless the task is running (or in needs human, for a draft). If the task head is its base, open nothing. A running task moves to needs human.
 3. **Check.** Run the check. Record the result, and any status change, in one transaction. That transaction refuses if the task changed during the check.
 4. **Find the earlier PR.** If the task has an opened PR on the same branch, ask GitHub whether it is still open.
-5. **Push.** Push the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
+5. **Push.** Re-read the task as in step 6, then push the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
 6. **Re-read.** Right before the GitHub call, the Store confirms that the latest check is clear and that the task is unchanged since that check: same state version, same snapshot, same head.
-7. **Open or reuse.** Open a new PR, or update the open earlier PR and mark it ready. Record the result.
+7. **Open or reuse.** Open a new PR, or update the open earlier PR and mark it ready (or a draft). An update is recorded before it starts. If its confirmation is lost, the next publish drops the record in step 1 and repeats the update after a new check; the update is idempotent. Record the result.
 
 Each opening or refresh owns the task state version at the moment it passed step 6. The PR is always recorded. The status changes only when the task still has that version. Every status change, admission and context change increases the version. So a response that arrives after the task changed never moves it.
 

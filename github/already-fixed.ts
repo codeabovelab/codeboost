@@ -33,6 +33,8 @@ export interface AlreadyFixedGateway { check(input: AlreadyFixedInput, signal?: 
 
 export const MAX_TIMELINE_ITEMS = 100;
 export const MAX_BASE_COMMITS = 250;
+/** One deadline for the whole check, below the default serving request budget. Each `gh` call no longer gets its own. */
+export const DEFAULT_CHECK_DEADLINE_MS = 45_000;
 const PAGE = 100;
 
 const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
@@ -40,7 +42,7 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
     nameWithOwner
     issue(number: $number) {
       state
-      timelineItems(first: ${MAX_TIMELINE_ITEMS}, itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT, CONNECTED_EVENT]) {
+      timelineItems(first: ${MAX_TIMELINE_ITEMS}, itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT, CONNECTED_EVENT, DISCONNECTED_EVENT]) {
         totalCount
         pageInfo { hasNextPage }
         nodes {
@@ -48,6 +50,7 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
           ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } } }
           ... on CrossReferencedEvent { source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
           ... on ConnectedEvent { subject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
+          ... on DisconnectedEvent { subject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
         }
       }
     }
@@ -83,15 +86,18 @@ export function mentionsIssue(message: string, repository: string, issue: number
     || new RegExp(`(?<![\\w.-])(?:https?://)?(?:www\\.)?github\\.com/${repo}/issues/${n}(?![\\w])`, 'i').test(message);
 }
 
-export interface GhAlreadyFixedConfig { repository: string }
+export interface GhAlreadyFixedConfig { repository: string; deadlineMs?: number }
 
 /** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
   readonly repository: string;
   readonly run: RunGh;
+  readonly deadlineMs: number;
   constructor(config: GhAlreadyFixedConfig, run?: RunGh) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository)) throw new Error('A GitHub repository is required for the already-fixed check.');
+    if (config.deadlineMs !== undefined && (!Number.isSafeInteger(config.deadlineMs) || config.deadlineMs < 1)) throw new Error('Invalid check deadline.');
     this.repository = config.repository;
+    this.deadlineMs = config.deadlineMs ?? DEFAULT_CHECK_DEADLINE_MS;
     this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() })).stdout);
   }
 
@@ -106,9 +112,11 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     if (!SHA.test(input.taskBase)) throw new Error('Invalid task base commit.');
     if (!/^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/.test(input.baseBranch)) throw new Error('Invalid base branch name.');
     if (input.ownPullRequests.some(number => !Number.isSafeInteger(number) || number < 1)) throw new Error('Invalid pull request number.');
+    // Every stage shares one deadline; reaching it aborts the running `gh` call and makes the check unknown.
+    const deadline = AbortSignal.timeout(this.deadlineMs), stages = signal ? AbortSignal.any([signal, deadline]) : deadline;
     try {
-      const matches = await this.#timeline(input, signal);
-      const { baseHead, commits } = await this.#baseCommits(input, signal);
+      const matches = await this.#timeline(input, stages);
+      const { baseHead, commits } = await this.#baseCommits(input, stages);
       for (const commit of commits) {
         if (input.ownCommits.has(commit.sha) || !mentionsIssue(commit.message, this.repository, input.issue)) continue;
         matches.push({ kind: 'commit', sha: commit.sha, subject: commit.message.split('\n', 1)[0]!.slice(0, 200) });
@@ -116,6 +124,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       return matches.length ? { outcome: 'found', baseHead, matches } : { outcome: 'clear', baseHead };
     } catch (error) {
       if (signal?.aborted) throw error;
+      if (deadline.aborted) return { outcome: 'unknown', reason: `The check did not finish within ${Math.ceil(this.deadlineMs / 1000)} s.` };
       return { outcome: 'unknown', reason: error instanceof Unknown ? error.message : 'GitHub could not be read.' };
     }
   }
@@ -136,7 +145,9 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       throw new Unknown(`The issue has more than ${MAX_TIMELINE_ITEMS} linking events; the check cannot read them all.`);
     const own = new Set(input.ownPullRequests);
     const isOwn = (repo: string, number: number) => repo.toLowerCase() === self && own.has(number);
-    const matches: AlreadyFixedMatch[] = [], seen = new Set<string>();
+    // Cross-references are permanent. A manual connection counts only while its latest event is a connect, so the
+    // events are replayed in timeline order and a later disconnect removes the link.
+    const referenced = new Map<string, AlreadyFixedMatch>(), connected = new Map<string, AlreadyFixedMatch | null>();
     let lastCloser: string | null | undefined;
     for (const raw of nodes) {
       const node = object(raw, 'timeline event');
@@ -152,19 +163,22 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
         } else throw new Unknown('GitHub returned an unknown closer.');
         continue;
       }
-      const field = node.__typename === 'CrossReferencedEvent' ? 'source' : node.__typename === 'ConnectedEvent' ? 'subject' : null;
+      const field = node.__typename === 'CrossReferencedEvent' ? 'source' : node.__typename === 'ConnectedEvent' || node.__typename === 'DisconnectedEvent' ? 'subject' : null;
       if (!field) throw new Unknown('GitHub returned an unexpected timeline event.');
       const source = object(node[field], 'linked item');
       if (source.__typename === 'Issue') continue;
       if (source.__typename !== 'PullRequest') throw new Unknown('GitHub returned an unknown linked item.');
       const repo = repositoryName(source.repository), number = positive(source.number, 'pull request number');
       if (!['OPEN', 'CLOSED', 'MERGED'].includes(source.state as string) || typeof source.isDraft !== 'boolean') throw new Unknown('GitHub returned an invalid pull request state.');
-      if (isOwn(repo, number) || source.state === 'CLOSED') continue;
+      if (isOwn(repo, number)) continue;
       const key = `${repo.toLowerCase()}#${number}`;
-      if (seen.has(key)) continue;
-      seen.add(key);
-      matches.push({ kind: 'pull request', repository: repo, number, state: source.state as 'OPEN' | 'MERGED', draft: source.isDraft });
+      const match: AlreadyFixedMatch | null = source.state === 'CLOSED' ? null : { kind: 'pull request', repository: repo, number, state: source.state as 'OPEN' | 'MERGED', draft: source.isDraft };
+      if (node.__typename === 'DisconnectedEvent') connected.set(key, null);
+      else if (node.__typename === 'ConnectedEvent') connected.set(key, match);
+      else if (match && !referenced.has(key)) referenced.set(key, match);
     }
+    const matches: AlreadyFixedMatch[] = [...referenced.values()];
+    for (const [key, match] of connected) if (match && !referenced.has(key)) matches.push(match);
     if (issue.state === 'CLOSED') {
       if (lastCloser === undefined) throw new Unknown('The issue is closed, but GitHub did not say what closed it.');
       if (lastCloser !== null) matches.unshift({ kind: 'closed', by: lastCloser });

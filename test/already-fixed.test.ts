@@ -7,6 +7,7 @@ const pr = (number: number, state = 'OPEN', extra: Record<string, unknown> = {})
   ({ __typename: 'PullRequest', number, state, isDraft: false, repository: { nameWithOwner: repo }, ...extra });
 const cross = (source: unknown) => ({ __typename: 'CrossReferencedEvent', source });
 const connected = (subject: unknown) => ({ __typename: 'ConnectedEvent', subject });
+const disconnected = (subject: unknown) => ({ __typename: 'DisconnectedEvent', subject });
 const closed = (closer: unknown) => ({ __typename: 'ClosedEvent', closer });
 
 interface Fake { state?: string; nodes?: unknown[]; totalCount?: number; hasNextPage?: boolean; errors?: unknown; nameWithOwner?: string;
@@ -54,6 +55,11 @@ describe('the pre-PR already-fixed check', () => {
     expect(await gh.check(input())).toMatchObject({ outcome: 'found', matches: [
       { kind: 'pull request', repository: repo, number: 401, state: 'OPEN' }, { kind: 'pull request', number: 402, state: 'MERGED' }] });
   });
+  it('replays manual links: a later disconnect removes a connected PR, a later connect restores it, a cross-reference stays', async () => {
+    expect(await gateway({ nodes: [connected(pr(401)), disconnected(pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
+    expect(await gateway({ nodes: [connected(pr(401)), disconnected(pr(401)), connected(pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ number: 401 }] });
+    expect(await gateway({ nodes: [cross(pr(401)), connected(pr(401)), disconnected(pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ number: 401 }] });
+  });
   it("ignores the task's own PR and earlier drafts by repository and number", async () => {
     const { gh } = gateway({ nodes: [cross(pr(7)), cross(pr(8, 'OPEN', { isDraft: true }))] });
     expect(await gh.check(input({ ownPullRequests: [7, 8] }))).toMatchObject({ outcome: 'clear' });
@@ -93,6 +99,14 @@ describe('the pre-PR already-fixed check', () => {
       { fail: /graphql/ }, { fail: /compare/ },
     ];
     for (const fake of cases) expect(await gateway(fake).gh.check(input()), JSON.stringify(fake)).toMatchObject({ outcome: 'unknown' });
+  });
+  it('gives the whole check one deadline and aborts the running call when it passes', async () => {
+    let aborted = false;
+    const gh = new GhAlreadyFixedGateway({ repository: repo, deadlineMs: 50 }, (_args, options) => new Promise((_, reject) => {
+      options?.signal?.addEventListener('abort', () => { aborted = true; reject(new Error('killed')); });
+    }));
+    expect(await gh.check(input())).toEqual({ outcome: 'unknown', reason: 'The check did not finish within 1 s.' });
+    expect(aborted).toBe(true);
   });
   it('passes cancellation through instead of reporting it as unknown', async () => {
     const controller = new AbortController();

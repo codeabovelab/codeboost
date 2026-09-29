@@ -32,7 +32,8 @@ function runningTask(options: { head?: string } = {}) {
 
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
-  push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean } = {}) {
+  push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
+  onFind?: () => void; refreshFails?: boolean } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 };
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ?? [{ outcome: 'clear', baseHead: oid(9) }];
@@ -44,9 +45,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       const pr = { number: counter.value++, url: 'https://github.com/owner/repo/pull/1', headSha: store.getSnapshot(identity).head, draft: input.draft };
       live.set(input.marker, pr); return pr;
     },
-    async findOpened(input) { log.push(`find ${input.marker}`); return options.found !== undefined ? options.found : live.get(input.marker) ?? null; },
+    async findOpened(input) { log.push(`find ${input.marker}`); options.onFind?.(); return options.found !== undefined ? options.found : live.get(input.marker) ?? null; },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
+      if (options.refreshFails) throw new Error('timeout reading the PR back');
       const pr = { ...live.get(input.marker)!, draft: options.draftAfterRefresh ?? input.draft, headSha: store.getSnapshot(identity).head };
       live.set(input.marker, pr); return pr;
     },
@@ -249,6 +251,37 @@ describe('recovering a lost opening', () => {
     rerun(store);
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     expect(await harness(store, { live, next, draftAfterRefresh: false }).publisher.publish(identity, { problems: ['x'] })).toMatchObject({ draft: false, status: 'needs human' });
+  });
+  it('does not push when the task changed while the earlier PR was looked up', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    const again = harness(store, { live, next, onFind: () => store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code') });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/Stale task state/);
+    expect(again.log.some(line => line.startsWith('push'))).toBe(false);
+  });
+  it('records an update of the open PR before it starts, and repeats it after its confirmation was lost', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: { head: oid(3), draft: false } }]);
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
+    expect(again.log.at(-1)).toBe('refresh 100 ready');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(3) }]);
+  });
+  it('drops an unconfirmed update when the next check matches, so no stale update stays pending', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    const again = harness(store, { live, next, results: [{ outcome: 'unknown', reason: 'GitHub could not be read.' }] });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
   });
   it('opens a new PR when the earlier draft was closed, and still excludes the old draft from the check', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };

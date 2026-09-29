@@ -67,6 +67,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Align subprocess output limits with every payload the schema accepts, or tighten the upstream page and field bounds; valid bounded input must not fail only because the transport budget is smaller.
 - Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
 - Preserve repository identity with pull request numbers in cross-reference scans. Never resolve or exclude a repository-qualified reference by number alone.
+- When a relation can be added and removed (a manually linked PR, a label, an assignment), replay its add and remove events in order and count only its latest state. An add event alone does not prove the relation still holds.
 - After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
 - Check an operation's source-state preconditions before any shortcut or early return that writes state or reports success, not only on the main path.
 - Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.

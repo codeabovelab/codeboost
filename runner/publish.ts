@@ -78,11 +78,13 @@ export class PullRequestPublisher {
       && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).at(-1);
     const live = earlier ? await this.#pulls.findOpened({ base: earlier.base, headBranch: branch, marker: marker(earlier.openingId) }, signal) : null;
     signal?.throwIfAborted();
+    // The push changes GitHub too: re-read the task after the last await before it, as before open and refresh.
+    this.#store.assertCheckCurrent(identity, { checkId: check.id, headSha: snapshot.head, draft });
     await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
     signal?.throwIfAborted();
     if (earlier && live) {
       if (live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
-      const stateVersion = this.#store.assertReadyToRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
+      const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
       const pr = await this.#pulls.refresh(live.number, {
         base: earlier.base, headBranch: branch, draft, ready: !draft, marker: marker(earlier.openingId),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
@@ -108,6 +110,9 @@ export class PullRequestPublisher {
    * the settle time has passed; only then is it abandoned. The caller retries after OpeningUnsettled.
    */
   async #recover(identity: PlanIdentity, signal?: AbortSignal): Promise<PublishOutcome | null> {
+    // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed.
+    const refreshing = this.#store.taskPullRequests(identity).find(pr => pr.refresh !== null);
+    if (refreshing) this.#store.abandonRefresh(identity, refreshing.openingId);
     const lost = this.#store.taskPullRequests(identity).find((pr: TaskPullRequest) => pr.state === 'opening');
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
