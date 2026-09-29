@@ -462,6 +462,13 @@ describe('running gh with a request body on stdin', () => {
     await expect(started).rejects.toThrow('stop');
     expect(Date.now() - aborted).toBeGreaterThanOrEqual(100);
   });
+  it('kills a process that ignores SIGTERM after the grace period, and still settles', async () => {
+    const controller = new AbortController();
+    const started = runWithInput(process.execPath, ['-e', 'process.on("SIGTERM",()=>{});setInterval(()=>{},1000)'], { signal: controller.signal, killGraceMs: 100 });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    controller.abort(new Error('stop'));
+    await expect(started).rejects.toThrow('stop');
+  });
   it('reports a failing exit with its stderr', async () => {
     await expect(runWithInput(process.execPath, ['-e', 'console.error("HTTP 422");process.exit(1)'], {})).rejects.toThrow(/exit 1\): HTTP 422/);
   });

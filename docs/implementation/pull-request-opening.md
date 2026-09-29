@@ -69,7 +69,7 @@ Each opening or refresh owns the task state version at the moment it passed step
 
 The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.
 
-**Transport.** The PR title and description go to `gh api --input -` as a JSON body on stdin (`github/run-with-input.ts`), never as arguments: Linux limits one argument to 128 KiB, and a 60,000-character description of multibyte text is larger. The runner settles only after `gh` has exited, including on a timeout or abort. The already-fixed check also waits for both of its reads to settle before it returns.
+**Transport.** The PR title and description go to `gh api --input -` as a JSON body on stdin (`github/run-with-input.ts`), never as arguments: Linux limits one argument to 128 KiB, and a 60,000-character description of multibyte text is larger. The runner settles only after `gh` has exited, including on a timeout or abort: it sends SIGTERM, then SIGKILL after 5 seconds if `gh` is still running. The already-fixed check also waits for both of its reads to settle before it returns.
 
 **Environment.** Each `gh` process gets only an allowlist of variables: the path, home and locale; GitHub tokens, host and configuration directories; the D-Bus session bus that Linux keyring sign-in uses; and proxy and CA settings (`github/gh-env.ts`). Prompts, the pager and update checks are turned off.
 
