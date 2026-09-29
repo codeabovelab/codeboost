@@ -754,6 +754,9 @@ describe('real Docker agent isolation', () => {
       // Ordinary line-ending attributes make Git warn about these files; a warning must not fail the export.
       'printf "* text=auto\\n*.bat text eol=crlf\\n" > .gitattributes', 'printf "a\\r\\nb\\r\\n" > crlf.txt',
       'printf "x\\n" > unix.bat',
+      // Warnings about the agent's own attribute and ignore files must not fail the export either.
+      'printf "!ignored text\\n" >> .gitattributes', 'mkdir -p tools', 'printf "*.log\\n" > tools/gitignore',
+      'ln -s tools/gitignore .gitignore',
       // A nested repository whose name tries to forge a hunk for another file.
       'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
       extra].join('\n'));
@@ -801,7 +804,7 @@ describe('real Docker agent isolation', () => {
       'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked']) {
       const failing = fixture();
       agentChanges(failing.filesystems, extra);
-      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/git reported a problem|git failed/);
+      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/could not read part of the task worktree|git failed/);
     }
     // No export container is left, and the storage still validates for the next launch.
     expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',

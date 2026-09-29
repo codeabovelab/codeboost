@@ -526,8 +526,8 @@ export interface ExportOptions extends PreparationOptions {
 // an agent-chosen name cannot forge diff lines. Output stops at
 // `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
 // Every stage's status is checked: a Git failure fails the export instead of passing off partial output as the diff;
-// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. Anything Git writes to
-// stderr also fails it: for a directory or path it cannot read, Git only warns and diffs it as absent.
+// only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. A Git warning that it could
+// not read a directory or path also fails it, since Git then diffs that path as absent; other warnings do not.
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
 // read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
 // diff programs and text conversion are off, and the worktree and attributes file are pinned. core.safecrlf is off
@@ -562,12 +562,14 @@ const EXPORT_SCRIPT = [
   '}',
   'set +e',
   '# Git only warns about a directory or path it cannot read, then diffs it as absent: untracked files vanish and tracked',
-  '# ones show as deleted. Anything Git reports on stderr therefore fails the export.',
+  '# ones show as deleted. Those warnings, and any Git error, fail the export. Other warnings (about the agent\'s own',
+  '# .gitattributes or .gitignore, for example) do not: they never make Git read less than it should.',
   'produce 2>/tmp/export-errors | head -c "$limit" | base64 -w0',
   'statuses=("${PIPESTATUS[@]}")',
   'set -e',
-  'if [ -s /tmp/export-errors ]; then',
-  '  echo "git reported a problem while exporting the diff: $(head -c 300 /tmp/export-errors | tr -d "\\000-\\010\\013-\\037")" >&2',
+  'failure=$(grep -m 1 -E "Permission denied|could not open|Input/output error|^(error|fatal):" /tmp/export-errors || true)',
+  'if [ -n "$failure" ]; then',
+  '  echo "git could not read part of the task worktree: $(printf %s "$failure" | head -c 300 | tr -d "\\000-\\010\\013-\\037")" >&2',
   '  exit 6',
   'fi',
   'if [ "${statuses[0]}" -ne 0 ] && [ "${statuses[0]}" -ne 141 ]; then echo "git failed while exporting the diff (status ${statuses[0]})" >&2; exit 4; fi',
