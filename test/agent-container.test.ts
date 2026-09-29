@@ -757,6 +757,7 @@ describe('real Docker agent isolation', () => {
       // Warnings about the agent's own attribute and ignore files must not fail the export either.
       'printf "!ignored text\\n" >> .gitattributes', 'mkdir -p tools', 'printf "*.log\\n" > tools/gitignore',
       'ln -s tools/gitignore .gitignore',
+      'printf "enc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes', 'printf "plain\\n" > enc.txt',
       // A nested repository whose name tries to forge a hunk for another file.
       'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
       extra].join('\n'));
@@ -794,6 +795,7 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('+brand new');
     expect(text).toContain('b/crlf.txt');
     expect(text).toContain('b/unix.bat');
+    expect(text).toContain('b/enc.txt');
     const cut = await exportTaskDiff(filesystems, { base: data.clone.head, imageId, maxBytes: 20 });
     expect(cut).toEqual({ diff: exported.diff.subarray(0, 20), truncated: true });
     await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');
