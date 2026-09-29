@@ -504,6 +504,67 @@ describe('review regressions', () => {
   });
 });
 
+describe('copilot review', () => {
+  it.each([
+    ['another attempt', (input: InvocationInput) => ({ attemptId: randomUUID() })],
+    ['another context', (input: InvocationInput) => ({ context: { ...input.context, stateVersion: input.context.stateVersion + 1 } })],
+  ] as const)('never validates or saves a result for %s', async (_label, foreign) => {
+    const { store, runner, launches, preparations, deps } = setup();
+    const validate = vi.spyOn(deps, 'validate');
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle(foreign(launches[0]!.input));
+    await runner.settled(A);
+    expect(validate).not.toHaveBeenCalled();
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', result: null,
+      diagnostic: 'The agent returned a result for a different attempt; it was not saved.' });
+    expect(() => runner.start(B, request(store, B))).not.toThrow();
+  });
+  it('holds the slot when preparation files cannot be removed after D settles', async () => {
+    const { store, runner, launches, preparations, deps } = setup();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    deps.cleanupPreparation = async () => { throw new Error('EBUSY'); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id).state).toBe('completed');
+    expect(runner.status(A)).toMatchObject({ active: false, unresolved: { attemptId: attempt.id, reason: 'preparation-not-removed' } });
+    expect(() => runner.start(A, request(store, A))).toThrow(/preparation files could not be removed/);
+    expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
+  });
+  it('holds the slot when preparation files cannot be removed before launch', async () => {
+    const { store, runner, launches, preparations, deps } = setup();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    deps.cleanupPreparation = async () => { throw new Error('EBUSY'); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    preparations[0]!.reject(new Error('clone failed'));
+    await runner.settled(A);
+    expect(launches).toHaveLength(0);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: clone failed' });
+    expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'preparation-not-removed' });
+    expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
+  });
+  it('keeps the result-not-saved marker when both the terminal write and the removal fail', async () => {
+    const { store, runner, launches, preparations, deps } = setup();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let cleanups = 0;
+    deps.cleanupPreparation = async () => { cleanups++; throw new Error('EBUSY'); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    vi.spyOn(store, 'settleAttempt').mockImplementation(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    launches[0]!.settle();
+    await runner.settled(A);
+    // A failed terminal write leaves the files for startup recovery, so there is nothing to remove yet.
+    expect(cleanups).toBe(0);
+    expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'result-not-saved' });
+  });
+});
+
 describe('cancel task, limits and shutdown', () => {
   it('stops the running attempt on cancel task and closes the task when it settles, even with a valid result', async () => {
     const { store, runner, launches, preparations } = setup();

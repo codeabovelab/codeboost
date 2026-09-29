@@ -39,8 +39,13 @@ export interface StartRequest {
 export interface RunnerStatus {
   active: boolean;
   stopRequested: { attemptId: string; reason: FirstReason; saved: boolean } | null;
-  unresolved: { attemptId: string; reason: 'result-not-saved' | 'start-not-saved' } | null;
+  unresolved: { attemptId: string; reason: UnresolvedReason } | null;
 }
+/**
+ * Why a task's slot stays held until restart: the terminal write failed, pending -> running failed, or the host-side
+ * preparation files could not be removed.
+ */
+export type UnresolvedReason = 'result-not-saved' | 'start-not-saved' | 'preparation-not-removed';
 type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
@@ -54,12 +59,18 @@ interface Job {
   cancelShown?: boolean;
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
-interface Marker { group: Group; attemptId: string; reason: 'result-not-saved' | 'start-not-saved' }
+interface Marker { group: Group; attemptId: string; reason: UnresolvedReason }
 
 const D_REASON: Record<FirstReason, StopReason> = { cancelled: 'cancelled', stale: 'cancelled', shutdown: 'shutdown', 'time-limit': 'timeout' };
 /** setTimeout accepts at most 2^31-1 ms; longer waits are re-armed. */
 const MAX_TIMER = 2_147_483_647;
 const PREPARATION_TIMEOUT = 'Timed out while preparing.';
+const NEEDS_RESTART: Record<UnresolvedReason, string> = {
+  'result-not-saved': 'Needs restart: the last result could not be saved.',
+  'start-not-saved': 'Needs restart: the start of the last attempt could not be saved.',
+  'preparation-not-removed': 'Needs restart: the last attempt\'s preparation files could not be removed.',
+};
+const FOREIGN_RESULT = 'The agent returned a result for a different attempt; it was not saved.';
 const NOT_STARTED_UNRELEASED = 'Not started: an earlier agent\'s cleanup could not be confirmed. Restart codeboost to run it again.';
 
 /**
@@ -96,7 +107,7 @@ export class RunnerCoordinator {
     const key = identityKey(identity);
     if (this.#jobs.has(key)) throw new GuardRefusal('An attempt is already active for this task.');
     const marker = this.#markers.get(key);
-    if (marker) throw new GuardRefusal('Needs restart: the last result could not be saved.');
+    if (marker) throw new GuardRefusal(NEEDS_RESTART[marker.reason]);
     if (!(request.kind in ATTEMPT_PHASES)) throw new GuardRefusal('Unknown attempt kind.');
     const group: Group = WRITABLE_KINDS.includes(request.kind) ? 'writable' : 'readOnly';
     if (this.#used(group) >= this.#limits[group]) throw new GuardRefusal('No free runner slot. Try again when the current attempt finishes.');
@@ -272,6 +283,14 @@ export class RunnerCoordinator {
       } else if (job.firstReason) handle.cancel(D_REASON[job.firstReason]);
       const result = await handle.settled;
       this.#noteUnreleased(result);
+      // Accept only the result of this exact invocation, as the question path does. Anything else is never validated
+      // or saved: the attempt fails closed.
+      if (result.attemptId !== attempt.id || !result.context || !sameContext(result.context, attempt.context)) {
+        this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false,
+          detail: job.firstReason === 'stale' ? job.staleCause : FOREIGN_RESULT });
+        job.decided = true;
+        return;
+      }
       let valid = false, value: unknown, detail = result.stderr ? bounded(result.stderr) : undefined;
       if (!job.firstReason && result.exitCode === 0 && !result.stopReason) {
         try { value = this.#deps.validate(attempt, result); valid = true; }
@@ -282,7 +301,7 @@ export class RunnerCoordinator {
       const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
       job.decided = true;
       // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
-      if (saved) await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
+      if (saved && !(await this.#removePreparation(job, attempt))) this.#holdForPreparation(job);
     } catch (error) {
       // Set the marker before the job goes, so the slot is never free in between.
       this.#unexpected(job, error);
@@ -306,8 +325,24 @@ export class RunnerCoordinator {
   async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }): Promise<void> {
     // Stops that land while preparation finishes are taken into account; once the job is ending, the outcome is fixed.
     job.decided = true;
-    await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
+    const removed = await this.#removePreparation(job, attempt);
     this.#settle(job, { exitCode: null, signal: null, valid: false, detail: job.firstReason === 'stale' ? job.staleCause : s.detail });
+    if (!removed) this.#holdForPreparation(job);
+  }
+  /**
+   * Remove host-side preparation files. If that fails, they still hold a clone of the task, so the caller keeps the slot
+   * held under a marker until startup recovery removes the attempt directory.
+   */
+  async #removePreparation(job: Job, attempt: AttemptRecord): Promise<boolean> {
+    try { await this.#deps.cleanupPreparation(attempt); return true; }
+    catch (error) {
+      console.error(`Runner job ${job.attemptId} could not remove its preparation files: ${message(error)}`);
+      return false;
+    }
+  }
+  /** Set in the same turn the job goes, so the slot is never free in between. A failed terminal write's marker stays. */
+  #holdForPreparation(job: Job): void {
+    if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'preparation-not-removed' });
   }
   #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string }): Classification | undefined {
     try {
