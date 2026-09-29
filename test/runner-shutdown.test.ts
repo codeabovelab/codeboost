@@ -1,7 +1,6 @@
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { request as httpRequest } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -12,6 +11,7 @@ import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import { ShuttingDownError } from '../runner/lifecycle.ts';
 import type { RunnerDeps } from '../runner/coordinator.ts';
+import { fixtureGit } from './fixtures/git.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { MergeGateway, MergeQueueGateway, RemoteMergeState } from '../github/merge.ts';
 
@@ -166,8 +166,8 @@ describe('server shutdown', { timeout: 15_000 }, () => {
   it('answers 503, not 409, when a review load hits the write gate', async () => {
     const { app, config } = await serve();
     writeFileSync(join(config.repository, 'moved.txt'), 'x');
-    execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'add', '-A'], { cwd: config.repository });
-    execFileSync('git', ['-c', 'core.hooksPath=/dev/null', '-c', 'user.name=t', '-c', 'user.email=t@t', 'commit', '-qm', 'move head'], { cwd: config.repository });
+    fixtureGit(config.repository, 'add', '-A');
+    fixtureGit(config.repository, 'commit', '-qm', 'move head');
     app.service.store.closeWrites();
     const response = await api(app, 'GET', '/api/review');
     expect(response).toEqual({ status: 503, body: { error: 'The review server is shutting down.' } });
