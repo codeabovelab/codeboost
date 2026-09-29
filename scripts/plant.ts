@@ -1,4 +1,4 @@
-import { isolatedGitEnvironment } from './git-environment.ts';
+import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from './git-environment.ts';
 import { execFileSync } from 'node:child_process';
 import { existsSync, mkdirSync, writeFileSync, appendFileSync, lstatSync, readFileSync, realpathSync } from 'node:fs';
 import { resolve, join, dirname, basename, relative, isAbsolute } from 'node:path';
@@ -42,8 +42,8 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
   const declared=candidates[randomInt(candidates.length)]!;
   const owned=history.commits.map((commit,index)=>({index,owner:owners.get(commit.sha)})).filter(entry=>entry.owner&&plan!.items.some(item=>item.id===entry.owner));
   const outside=owned[randomInt(owned.length)]!;
-  const env=isolatedGitEnvironment();
-  const gitRaw=(cwd:string,...args:string[])=>execFileSync('git',['-c','core.hooksPath=/dev/null','-c','commit.gpgsign=false',...args],{cwd,env,encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:30000,maxBuffer:32*1024*1024});
+  const env=hardenedGitEnvironment();
+  const gitRaw=(cwd:string,...args:string[])=>execFileSync('git',[...HARDENED_GIT_OPTIONS,'-c','commit.gpgsign=false',...args],{cwd,env,encoding:'utf8',stdio:['ignore','pipe','pipe'],timeout:30000,maxBuffer:32*1024*1024});
   const git=(cwd:string,...args:string[])=>gitRaw(cwd,...args).trim();
   // Refuse existing paths, symlink targets, and unsupported declared-file transitions before creating output.
   for(const sha of [snapshot.base,...history.commits.map(commit=>commit.sha)]){
@@ -54,7 +54,7 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
     if(!/^100(?:644|755) blob /.test(git(config.repository,'ls-tree',commit.sha,'--',declared.path)))throw new Error('Declared plant needs a regular file retained through the remaining history.');
   }
   mkdirSync(root,{recursive:true});const repository=join(root,'repository');
-  git(root,'clone','--no-local','--no-checkout',resolve(config.repository),repository);
+  git(root,'-c','protocol.file.allow=always','clone','--no-local','--no-checkout',resolve(config.repository),repository);
   git(repository,'config','user.name','Codeboost Experiment');git(repository,'config','user.email','experiment@example.invalid');
   git(repository,'checkout','-b','review-experiment',snapshot.base);
   const baseEntries:BaseEntry[]=git(repository,'ls-tree','-rz',snapshot.base).split('\0').filter(Boolean).map(record=>{

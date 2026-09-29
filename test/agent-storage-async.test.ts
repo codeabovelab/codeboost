@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -128,8 +128,7 @@ if (a === 'rm' || (a === 'volume' && b === 'rm')) {
 console.error('fake docker: unsupported ' + args.join(' ')); process.exit(2);
 `;
 
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 const clone = () => {
   const source = join(root, `source-${randomUUID()}`), parent = join(root, `staging-${randomUUID()}`);
   mkdirSync(source); mkdirSync(parent);

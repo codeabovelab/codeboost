@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { execFileSync, spawnSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -23,8 +24,7 @@ const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, 
 const roots: string[] = [], profiles: ContainerProfile[] = [];
 const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
 let imageId = '';
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'agent-supervisor-')); roots.push(root);

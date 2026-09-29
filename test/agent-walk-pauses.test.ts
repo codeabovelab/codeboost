@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -30,8 +30,7 @@ const { prepareTaskFilesystemsAsync } = await import('../agents/container/storag
 const ENTRIES = 2_500;
 let root = '';
 const realSetImmediate = globalThis.setImmediate;
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 const repository = () => {
   const source = join(root, 'source'), parent = join(root, 'staging');
   mkdirSync(source); mkdirSync(parent);
