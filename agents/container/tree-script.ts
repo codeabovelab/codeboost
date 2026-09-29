@@ -128,6 +128,20 @@ sub exit_reason { my $status = shift; return $status == -1 ? "could not start" :
 # commit would, so the answer still holds. Nor do the two complaints Git prints without a prefix about an attribute line
 # it skips ("<name> is not a valid attribute name: <file>:<line>", "<macro> not allowed: <file>:<line>"). Any other line
 # fails it.
+# The first line of Git's stderr that means it did less than asked, or undef. A warning can run over several lines; a
+# line that follows one without a prefix of its own belongs to it.
+sub stderr_failure {
+  my $errors = shift; my ($first, $in_warning);
+  for my $line (split /\n/, $errors) {
+    if ($line =~ /^warning: /) { $in_warning = 1; next }
+    if ($line =~ /^(?:error|fatal): /) { $first = $line; last }
+    # The path can hold a colon, so everything after the fixed phrase is taken as the file.
+    if ($line =~ /(?: is not a valid attribute name| not allowed): (?:.+\/)?\.gitattributes:\d+\z/) { $in_warning = 0; next }
+    # Only the lines right after a warning continue it.
+    if (!$in_warning) { $first = $line; last }
+  }
+  return $first;
+}
 my $stderr_file = "/tmp/git-stderr";
 sub git_in {
   my ($input, $strict, @args) = @_;
@@ -140,16 +154,7 @@ sub git_in {
   local $/; my $output = <$out> // ""; close $out;
   my $errors = "";
   if ($strict && open(my $captured, "<", $stderr_file)) { $errors = <$captured> // ""; close $captured }
-  # A warning can run over several lines; a line that follows one without a prefix of its own belongs to it.
-  my ($first, $in_warning);
-  for my $line (split /\n/, $errors) {
-    if ($line =~ /^warning: /) { $in_warning = 1; next }
-    if ($line =~ /^(?:error|fatal): /) { $first = $line; last }
-    # The path can hold a colon, so everything after the fixed phrase is taken as the file.
-    if ($line =~ /(?: is not a valid attribute name| not allowed): (?:.+\/)?\.gitattributes:\d+\z/) { $in_warning = 0; next }
-    # Only the lines right after a warning continue it.
-    if (!$in_warning) { $first = $line; last }
-  }
+  my $first = $strict ? stderr_failure($errors) : undef;
   # Name the Git command itself, past any "-c name=value" pairs in front of it.
   my @rest = @args; splice @rest, 0, 2 while @rest && $rest[0] eq "-c";
   # Git's line can quote an agent-chosen name: it stays one line of printable ASCII.
@@ -159,6 +164,26 @@ sub git_in {
   return $output;
 }
 sub git { return git_in(undef, 0, @_) }
+# Git in the mirror of base's attribute files (/tmp/attributes), strict like git_in: it reads base's rules, never the
+# work tree's.
+sub git_in_mirror {
+  my ($input, @args) = @_;
+  my $pid = open(my $out, "-|"); fail(4, "could not run git: $!") unless defined $pid;
+  if (!$pid) {
+    chdir "/tmp/attributes" or die "could not enter the attribute mirror: $!";
+    $ENV{GIT_DIR} = "/work/.git";
+    if (defined $input) { open(STDIN, "<", $input) or die "could not open git input: $!" }
+    open(STDERR, ">", $stderr_file) or die "could not capture git errors: $!";
+    exec(@GIT, "--work-tree=/tmp/attributes", @args) or die "could not run git: $!";
+  }
+  local $/; my $output = <$out> // ""; close $out;
+  my $errors = ""; if (open(my $captured, "<", $stderr_file)) { $errors = <$captured> // ""; close $captured }
+  my $first = stderr_failure($errors);
+  (my $line = substr($first // "", 0, 300)) =~ s/([^\x20-\x7e])/sprintf("\\x%02x", ord $1)/ge;
+  fail(4, "git $args[0] " . ($? ? "failed (" . exit_reason($?) . ")" : "reported an error") . ($line ne "" ? ": $line" : ""))
+    if $? || defined $first;
+  return $output;
+}
 
 my $format = git("rev-parse", "--show-object-format"); chomp $format;
 my $algorithm = $format eq "sha256" ? 256 : 1;
@@ -309,6 +334,7 @@ my @links = splice @ARGV, 0, $link_count; my @targets = @ARGV;
 # rules that count, with the repository's info/exclude: the agent's own edits to them do not decide what is listed.
 my (%base, %base_directory);
 mkdir "/tmp/ignore" or fail(4, "could not create the ignore tree: $!");
+mkdir "/tmp/attributes" or fail(4, "could not create the attribute mirror: $!");
 for my $record (split /\0/, git("ls-tree", "-r", "-z", "--full-tree", $base)) {
   my ($meta, $path) = split /\t/, $record, 2; my ($git_mode, $kind, $oid) = split / /, $meta;
   text($path, "path");
@@ -316,6 +342,12 @@ for my $record (split /\0/, git("ls-tree", "-r", "-z", "--full-tree", $base)) {
     type => $git_mode eq "160000" ? "gitlink" : $git_mode eq "120000" ? "symlink" : "file" };
   my @parts = split m{/}, $path; my $name = pop @parts;
   $base_directory{join "/", @parts[0 .. $_]} = 1 for 0 .. $#parts;
+  # Base's attribute files too: the checkout comparison below reads base's rules, as the clone's checkout did.
+  if ($name eq ".gitattributes" && $git_mode =~ /^100/) {
+    my $dir = "/tmp/attributes"; for my $part (@parts) { $dir .= "/$part"; mkdir $dir unless -d $dir }
+    open(my $file, ">", "$dir/.gitattributes") or fail(4, "could not write the attribute mirror: $!");
+    binmode $file; print $file git("cat-file", "blob", $oid); close $file or fail(4, "could not write the attribute mirror: $!");
+  }
   if ($name eq ".gitignore" && $git_mode =~ /^100/) {
     my $dir = "/tmp/ignore"; for my $part (@parts) { $dir .= "/$part"; mkdir $dir unless -d $dir }
     open(my $file, ">", "$dir/.gitignore") or fail(4, "could not write the ignore tree: $!");
@@ -435,9 +467,10 @@ $work{$_}{oid} = file_id($_) for grep { $work{$_}{type} eq "file" && under_git_p
 
 # A tracked file whose bytes are exactly what checking out base's blob writes is untouched, whatever re-hashing it would
 # give: base can store a file Git would now store differently (committed with CRLF before a text rule, or an expanded
-# $Id$ before an ident rule). Only a file whose checkout converts can differ that way, so base's attributes (check-attr
-# --cached reads the real index, which holds base's) and the repository's line-ending config pick the candidates, and
-# cat-file --filters writes base's blob for each as checkout does, with the same attributes the clone's checkout used.
+# $Id$ before an ident rule). Both steps read base's attribute files, mirrored in /tmp/attributes, never the work
+# tree's: check-attr picks the files whose checkout converts (with the repository's line-ending config), and
+# cat-file --filters writes base's blob for each as the clone's checkout did. One process per such file, so past the
+# change limit the run refuses before it starts them.
 my %as_checked_out;
 {
   my @differ = grep { $work{$_} && $work{$_}{type} eq "file" && $base{$_}{type} eq "file" && $work{$_}{oid} ne $base{$_}{oid} }
@@ -446,17 +479,19 @@ my %as_checked_out;
   if (@differ) {
     open(my $list, ">", "/tmp/attr-paths") or fail(4, "could not write the paths to check: $!");
     print $list map { "$_\0" } @differ; close $list or fail(4, "could not write the paths to check: $!");
-    my @fields = split /\0/, git_in("/tmp/attr-paths", 1, "check-attr", "--cached", "-z", "--stdin",
+    my @fields = split /\0/, git_in_mirror("/tmp/attr-paths", "check-attr", "-z", "--stdin",
       "text", "eol", "crlf", "ident", "working-tree-encoding", "filter");
     while (@fields) { my ($path, $attr, $value) = splice @fields, 0, 3; $converts{$path} = 1 if $value ne "unspecified" }
     # Repository config can convert line endings for every file, with no attribute at all.
     my $pid = open(my $out, "-|", @GIT, "config", "--get-regexp", "^core\\.(autocrlf|eol)\$") or fail(4, "could not run git: $!");
     local $/; my $config = <$out> // ""; close $out;
     fail(4, "git config failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127) || ($? >> 8) > 1;
-    %converts = map { $_ => 1 } @differ if $config =~ /^core\.(?:autocrlf (?!false\b)|eol )/m;
+    %converts = map { $_ => 1 } @differ if $config =~ /^core\.(?:autocrlf(?! false\b)|eol )/m;
   }
-  for my $path (grep { $converts{$_} } @differ) {
-    my $bytes = git_in(undef, 1, "cat-file", "--filters", "--path=$path", $base{$path}{oid});
+  my @compare = grep { $converts{$_} } @differ;
+  fail(9, "more than $MAXIMUM_CHANGES changes; the change set is too large to inspect") if @compare > $MAXIMUM_CHANGES;
+  for my $path (@compare) {
+    my $bytes = git_in_mirror(undef, "cat-file", "--filters", "--path=$path", $base{$path}{oid});
     $as_checked_out{$path} = 1 if blob_id($bytes) eq file_id($path);
   }
 }

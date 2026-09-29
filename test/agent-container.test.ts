@@ -1251,6 +1251,22 @@ describe('real Docker agent isolation', () => {
       expect((await inspect()).changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'a.txt' })]);
     }, 180_000);
 
+    it('compares with checkout under base\'s attributes, not the ones the agent left', async () => {
+      const data = fixture({ hostile: source => {
+        // u.txt is stored with CRLF though base's rule would normalize it: committed before the rule existed.
+        writeFileSync(join(source, 'u.txt'), 'x\r\n'); writeFileSync(join(source, 'b.txt'), 'x\n');
+        git(source, 'add', 'u.txt', 'b.txt'); git(source, 'commit', '-m', 'files');
+        writeFileSync(join(source, '.gitattributes'), '*.txt eol=crlf\nu.txt text\n');
+        git(source, 'update-index', '--assume-unchanged', 'u.txt', 'b.txt');
+      } });
+      // b.txt stays as checkout wrote it (CRLF under base's eol=crlf); u.txt is re-encoded under a rule the agent adds.
+      asAgent(data.filesystems, 'printf "u.txt text working-tree-encoding=UTF-16LE\\n" > .gitattributes && printf "x\\r\\n" | iconv -t UTF-16LE > u.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      const paths = manifest.changes.map(change => change.path);
+      expect(paths).not.toContain('b.txt');
+      expect(paths).toContain('u.txt');
+    }, 180_000);
+
     it('hashes with the attributes the work tree has: a deleted .gitattributes no longer applies', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '*.txt text\n') });
       asAgent(data.filesystems, 'rm .gitattributes && printf "trusted\\r\\n" > file.txt');
