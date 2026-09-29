@@ -531,8 +531,9 @@ export interface ExportOptions extends PreparationOptions {
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
 // read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
 // diff programs and text conversion are off, and the worktree and attributes file are pinned. A populated submodule's
-// own config is the agent's, so Git never looks inside one (diff.ignoreSubmodules=dirty): its pointer change is still
-// exported, but no `git status` runs there, and so none of its filters. core.safecrlf is off
+// own config is the agent's, so Git never looks inside one: every diff passes --ignore-submodules on the command line,
+// which, unlike the config default, overrides the worktree's .gitmodules and applies to plumbing diff-index too. A
+// submodule's pointer change is still exported, but no `git status` runs inside it, and so none of its filters. core.safecrlf is off
 // so ordinary line-ending attributes (`text=auto`, `eol=crlf`) do not warn on stderr and fail a correct export.
 const EXPORT_SCRIPT = [
   'set -eu',
@@ -540,8 +541,7 @@ const EXPORT_SCRIPT = [
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
   'cd /work',
   'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
-  '  -c core.attributesFile=/dev/null -c core.safecrlf=false -c core.bigFileThreshold=8m -c diff.ignoreSubmodules=dirty \\',
-  '  "$@"; }',
+  '  -c core.attributesFile=/dev/null -c core.safecrlf=false -c core.bigFileThreshold=8m "$@"; }',
   'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
   'produce() {',
   '  set -eo pipefail',
@@ -565,7 +565,7 @@ const EXPORT_SCRIPT = [
   '  # come from plumbing diff-index, which lists a file whose stat changed without reading it to compare (porcelain',
   '  # git diff would read both versions of a touched, same-size file in full), so the list may include a large file',
   '  # that did not really change.',
-  '  g diff-index --name-only -z --no-renames "$base" -- > /tmp/export-changed',
+  '  g diff-index --ignore-submodules=all --name-only -z --no-renames "$base" -- > /tmp/export-changed',
   '  : > /tmp/export-large',
   '  g ls-tree -r -l -z "$base" | perl -0 -e \'open(my $c, "<", "/tmp/export-changed") or die; my %base;',
   '    my @changed = map { chomp; $_ } <$c>; my %wanted = map { $_ => 1 } @changed;',
@@ -579,7 +579,8 @@ const EXPORT_SCRIPT = [
   '  excluded=()',
   '  while IFS= read -r -d "" path; do excluded+=(":(exclude,literal)$path"); done < /tmp/export-large',
   '  if [ "${#excluded[@]}" -gt 1000 ]; then echo "more than 1,000 changed files are over 8 MiB" >&2; exit 7; fi',
-  '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" -- . ${excluded[@]+"${excluded[@]}"}',
+  '  g diff --ignore-submodules=dirty --binary --no-color --no-ext-diff --no-textconv "$base" -- . \\',
+  '    ${excluded[@]+"${excluded[@]}"}',
   '  # One perl pass splits the untracked list at C speed, reading all of it so Git never writes to a closed pipe:',
   '  # nested repositories (the only entries ending in /) and the first 20,000 other paths. Each of those adds at least',
   '  # about 60 bytes of diff, so past the cap the output already exceeds 1 MiB and is marked truncated.',
@@ -604,7 +605,7 @@ const EXPORT_SCRIPT = [
   '    export GIT_INDEX_FILE=/tmp/export-index GIT_OBJECT_DIRECTORY=/tmp/export-objects',
   '    export GIT_ALTERNATE_OBJECT_DIRECTORIES=/work/.git/objects GIT_LITERAL_PATHSPECS=1',
   '    g add --intent-to-add --pathspec-from-file=/tmp/export-new --pathspec-file-nul',
-  '    g diff --binary --no-color --no-ext-diff --no-textconv --',
+  '    g diff --ignore-submodules=dirty --binary --no-color --no-ext-diff --no-textconv --',
   '  fi',
   '}',
   'set +e',

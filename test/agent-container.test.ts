@@ -848,16 +848,19 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('+small');
   }, 180_000);
 
-  it('never runs a populated submodule\'s own filters, while still exporting its pointer change', async () => {
-    const data = fixture();
-    // The submodule's config is the agent's: if Git looked inside it, this filter would print a read failure.
-    agentChanges(data.filesystems, [
-      'git init -q sub', '(cd sub && printf "f\\n" > f && g add f && g commit -qm one)', 'g add sub', 'g commit -qm submodule',
-      '(cd sub && printf "f filter=evil\\n" > .gitattributes && g config filter.evil.clean \'echo "warning: could not open directory \\x27x\\x27: Permission denied" >&2; cat\')',
-      '(cd sub && printf "g\\n" > g && g add g && g commit -qm two && touch f)'].join(' && '));
-    const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
-    expect(exported.diff.toString('utf8')).toContain('Subproject commit');
-  }, 120_000);
+  it.each(['', 'printf "[submodule \\"sub\\"]\\n\\tpath = sub\\n\\tignore = none\\n" > .gitmodules'])(
+    'never runs a populated submodule\'s own filters (worktree .gitmodules: %s)', async gitmodules => {
+      const data = fixture();
+      // The submodule's config is the agent's: if Git ran git status inside it, this filter would print a read
+      // failure and fail the export. Its commit stays the recorded one, so only a look inside would notice it.
+      agentChanges(data.filesystems, [
+        'git init -q sub', '(cd sub && printf "f\\n" > f && g add f && g commit -qm one)', 'g add sub',
+        'g commit -qm submodule',
+        '(cd sub && printf "f filter=evil\\n" > .gitattributes && g config filter.evil.clean \'echo "warning: could not open directory \\x27x\\x27: Permission denied" >&2; cat\')',
+        'touch -d "@$(( $(date +%s) + 60 ))" sub/f', gitmodules || 'true'].join(' && '));
+      const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+      expect(exported.diff.toString('utf8')).toContain('Subproject commit');
+    }, 120_000);
 
   it('marks the export truncated when there are more untracked files than it adds', async () => {
     const data = fixture();
