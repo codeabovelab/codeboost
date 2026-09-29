@@ -1235,6 +1235,22 @@ describe('real Docker agent isolation', () => {
       expect(manifest.changes.map(change => change.path)).toEqual(['file.txt']);
     }, 180_000);
 
+    it('reports nothing for an untouched file base stores unnormalized, and an edit to it as a change', async () => {
+      const data = fixture({ hostile: source => {
+        // Committed with CRLF, and with an expanded $Id$, before text and ident rules were added: re-hashing either
+        // would store it differently, though nobody touched it.
+        writeFileSync(join(source, 'a.txt'), 'a\r\n'); writeFileSync(join(source, 'id.c'), '$Id: old $\n');
+        git(source, 'add', 'a.txt', 'id.c'); git(source, 'commit', '-m', 'unnormalized');
+        writeFileSync(join(source, '.gitattributes'), '*.txt text\nid.c ident\n');
+        // Or the fixture's own add would re-hash them under the new rules and commit them normalized.
+        git(source, 'update-index', '--assume-unchanged', 'a.txt', 'id.c');
+      } });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      expect((await inspect()).changes).toEqual([]);
+      asAgent(data.filesystems, 'printf "b\\r\\n" > a.txt');
+      expect((await inspect()).changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'a.txt' })]);
+    }, 180_000);
+
     it('hashes with the attributes the work tree has: a deleted .gitattributes no longer applies', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '*.txt text\n') });
       asAgent(data.filesystems, 'rm .gitattributes && printf "trusted\\r\\n" > file.txt');

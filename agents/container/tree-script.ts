@@ -433,6 +433,33 @@ if (@commitable) {
 # A file under a .git part can never be committed; its ID is its bytes, for the record.
 $work{$_}{oid} = file_id($_) for grep { $work{$_}{type} eq "file" && under_git_path($_) } keys %work;
 
+# A tracked file whose bytes are exactly what checking out base's blob writes is untouched, whatever re-hashing it would
+# give: base can store a file Git would now store differently (committed with CRLF before a text rule, or an expanded
+# $Id$ before an ident rule). Only a file whose checkout converts can differ that way, so base's attributes (check-attr
+# --cached reads the real index, which holds base's) and the repository's line-ending config pick the candidates, and
+# cat-file --filters writes base's blob for each as checkout does, with the same attributes the clone's checkout used.
+my %as_checked_out;
+{
+  my @differ = grep { $work{$_} && $work{$_}{type} eq "file" && $base{$_}{type} eq "file" && $work{$_}{oid} ne $base{$_}{oid} }
+    sort keys %base;
+  my %converts;
+  if (@differ) {
+    open(my $list, ">", "/tmp/attr-paths") or fail(4, "could not write the paths to check: $!");
+    print $list map { "$_\0" } @differ; close $list or fail(4, "could not write the paths to check: $!");
+    my @fields = split /\0/, git_in("/tmp/attr-paths", 1, "check-attr", "--cached", "-z", "--stdin",
+      "text", "eol", "crlf", "ident", "working-tree-encoding", "filter");
+    while (@fields) { my ($path, $attr, $value) = splice @fields, 0, 3; $converts{$path} = 1 if $value ne "unspecified" }
+    # Repository config can convert line endings for every file, with no attribute at all.
+    my $pid = open(my $out, "-|", @GIT, "config", "--get-regexp", "^core\\.(autocrlf|eol)\$") or fail(4, "could not run git: $!");
+    local $/; my $config = <$out> // ""; close $out;
+    fail(4, "git config failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127) || ($? >> 8) > 1;
+    %converts = map { $_ => 1 } @differ if $config =~ /^core\.(?:autocrlf (?!false\b)|eol )/m;
+  }
+  for my $path (grep { $converts{$_} } @differ) {
+    my $bytes = git_in(undef, 1, "cat-file", "--filters", "--path=$path", $base{$path}{oid});
+    $as_checked_out{$path} = 1 if blob_id($bytes) eq file_id($path);
+  }
+}
 sub under_git { return under_git_path(shift) ? JSON::PP::true : JSON::PP::false }
 my (@changes, @deleted, @added);
 sub change {
@@ -448,7 +475,9 @@ for my $path (sort keys %base) {
   if (!$new) { push @deleted, change("delete", $path, $old); next }
   if ($old->{type} eq "gitlink") { push @changes, change("modify", $path, $old, $new) if $new->{type} ne "directory"; next }
   if ($new->{type} ne $old->{type}) { push @changes, change("modify", $path, $old, $new); next }
-  my ($content, $mode) = ($new->{oid} ne $old->{oid}, $new->{gitMode} ne $old->{gitMode});
+  my $content = $new->{oid} ne $old->{oid} && !$as_checked_out{$path};
+  my $mode = $new->{gitMode} ne $old->{gitMode};
+  $new->{oid} = $old->{oid} unless $content;
   push @changes, change($content ? "modify" : "mode", $path, $old, $new) if $content || $mode;
 }
 for my $path (sort keys %work) {
