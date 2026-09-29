@@ -247,11 +247,14 @@ sub anchored {
 sub resolve {
   my ($link, $walk) = @_; my %record = (link => text($link, "declared path"));
   my @parents = split m{/}, $link; pop @parents; my $prefix = "";
+  # A declared path that is not there, or not a link, is not-a-link whether or not its directory exists: adding or
+  # deleting a declared file must not look like a change to a link. A directory on the way that is a link still makes
+  # it through-link, since anything written there lands elsewhere.
   for my $part (@parents) {
-    my $parent = $prefix; $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
-    return { %record, %{ anchored("absent", $parent) } } unless @stat;
+    $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
+    return { %record, status => "not-a-link" } unless @stat;
     return { %record, %{ anchored("through-link", $prefix) } } if -l _;
-    return { %record, %{ anchored("absent", $prefix) } } unless -d _;
+    return { %record, status => "not-a-link" } unless -d _;
   }
   my @stat = lstat $link;
   return { %record, status => "not-a-link" } unless @stat && -l _;

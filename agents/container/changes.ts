@@ -113,7 +113,8 @@ export interface LinkTargetChange {
    * `content`, `mode` and `type` as named; `created` and `deleted` for an entry that appeared or went; `identity` for
    * the same content under a new inode or ctime (a rewrite, a chmod back, a hard link); `status` for a change between
    * present, absent and through a link; `retargeted` when the link now resolves somewhere else (its own text changed,
-   * or a directory on the way did).
+   * or a directory on the way did). A `retargeted` link the item itself edits is that edit, judged by the plan's link
+   * rules; every other kind is a change to what the link points at.
    */
   readonly change: 'content' | 'mode' | 'type' | 'created' | 'deleted' | 'identity' | 'status' | 'retargeted';
 }

@@ -990,6 +990,16 @@ describe('real Docker agent isolation', () => {
       expect(after.linkTargetChanges.filter(change => change.link === 'pl')).toHaveLength(1);
     }, 180_000);
 
+    it('reports no link change when a declared plain file is added or deleted, wherever its directory is', async () => {
+      const data = fixture({ hostile: source => { mkdirSync(join(source, 'old')); writeFileSync(join(source, 'old', 'only.go'), 'o\n'); } });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['new/x.go', 'a2.go', 'old/only.go'], { imageId });
+      expect(linkSnapshot.links.map(link => link.status)).toEqual(['not-a-link', 'not-a-link', 'not-a-link']);
+      asAgent(data.filesystems, 'mkdir new && printf "x\\n" > new/x.go && printf "y\\n" > a2.go && rm -rf old');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest.linkTargetChanges).toEqual([]);
+      expect(manifest.changes.map(change => change.path).sort()).toEqual(['a2.go', 'new/x.go', 'old/only.go']);
+    }, 180_000);
+
     it('keeps to the work tree when the agent reshapes the path to a declared link\'s target', async () => {
       const data = fixture({ hostile: source => {
         mkdirSync(join(source, 'd', 'lib'), { recursive: true }); writeFileSync(join(source, 'd', 'lib', 'x'), 'x\n');
