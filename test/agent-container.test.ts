@@ -1275,8 +1275,11 @@ describe('real Docker agent isolation', () => {
       // An invisible right-to-left mark: "x" and "x\u200f" would show as one name.
       asAgent(data.filesystems, `rm -f s*; printf "x\\n" > "$(printf "x\\342\\200\\217")"`);
       await expect(inspect()).rejects.toThrow(/x\\xe2\\x80\\x8f is not printable UTF-8/);
+      // A format character from Unicode 15 (U+13439), newer than the image's Perl knows: refused, not let through.
+      asAgent(data.filesystems, `rm -f x*; printf "x\\n" > "$(printf "a.txt\\360\\223\\220\\271")"`);
+      await expect(inspect()).rejects.toThrow(/a\.txt\\xf0\\x93\\x90\\xb9 is not printable UTF-8/);
       // A C1 control character (U+009B, which some terminals read as the start of an escape sequence).
-      asAgent(data.filesystems, `rm -f x*; printf "x\\n" > "$(printf "c\\302\\233")"`);
+      asAgent(data.filesystems, `rm -f a.txt*; printf "x\\n" > "$(printf "c\\302\\233")"`);
       await expect(inspect()).rejects.toThrow(/c\\xc2\\x9b is not printable UTF-8/);
       // A name longer than the manifest carries.
       asAgent(data.filesystems, `rm -f c*; mkdir -p "$(printf 'd%.0s' $(seq 1 200))" && cd "$(printf 'd%.0s' $(seq 1 200))" && for i in 1 2 3 4 5 6; do mkdir "$(printf 'e%.0s' $(seq 1 200))" && cd "$(printf 'e%.0s' $(seq 1 200))"; done && : > f`);

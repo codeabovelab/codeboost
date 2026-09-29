@@ -53,13 +53,14 @@ sub fail { my ($code, $message) = @_; print STDERR "$message\n"; exit $code }
 # decoder would pass and Node would turn into U+FFFD, so two different names could show as one. Control and format
 # characters and line and paragraph separators (Unicode Cc, Cf, Zl, Zp: C0, DEL, C1, bidirectional marks and overrides,
 # zero-width characters, the byte order mark) can make a name display as another, so they are refused too, as is a
-# name longer than the manifest carries.
+# name longer than the manifest carries. So is a code point this Perl's Unicode does not assign (Cn): a format
+# character added in a later Unicode version is one this check cannot recognise.
 sub text {
   my ($bytes, $what) = @_;
   fail(8, "$what " . shown(substr($bytes, 0, 64)) . "... is longer than $MAXIMUM_NAME_BYTES bytes") if length $bytes > $MAXIMUM_NAME_BYTES;
   my $text = eval { Encode::decode("UTF-8", $bytes, Encode::FB_CROAK | Encode::LEAVE_SRC) };
   fail(8, "$what " . shown($bytes) . " is not printable UTF-8")
-    if !defined $text || $text =~ /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/;
+    if !defined $text || $text =~ /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/;
   return $text;
 }
 sub children {

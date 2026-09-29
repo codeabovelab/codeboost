@@ -144,7 +144,7 @@ const DIGEST = /^[0-9a-f]{64}$/;
 // A declared path names one entry of the work tree by its Git path: relative, no empty, `.` or `..` part, and not the
 // metadata. It must be a name the manifest can carry: no control or format characters or separators, and not too long.
 const assertDeclaredPath = (path: unknown) => {
-  if (typeof path !== 'string' || path === '' || path.startsWith('/') || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path)
+  if (typeof path !== 'string' || path === '' || path.startsWith('/') || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(path)
     || Buffer.byteLength(path) > MAXIMUM_NAME_BYTES
     || path.split('/').some(part => part === '' || part === '.' || part === '..') || path.split('/')[0] === '.git')
     throw new Error(`Declared path ${JSON.stringify(path)} is not a path in the work tree.`);
