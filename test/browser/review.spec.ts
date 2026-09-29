@@ -120,6 +120,19 @@ test('opens an item selected while an assignment is in flight in the view its an
  let view=app.service.load();view=app.service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned'&&segment.path==='retry.ts')!.key,item:'P1',token:view.token});expect(view.items.find(item=>item.id==='P1')!.state).toBe('stale');
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
 });
+test('ends an explicit view choice when any field the approval fingerprint covers changes',async({page})=>{
+ let view=app.service.load();view=app.service.act({action:'approve',item:'P1',confirmNoChange:false,token:view.token});
+ view=app.service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});expect(view.items.find(item=>item.id==='P1')!.state).toBe('stale');
+ // Each step changes one fingerprint field of P1's segments in the answer and leaves the path, content and reasons as they were.
+ const edits:Array<(segment:Record<string,any>)=>void>=[segment=>{segment.context=`${segment.context} moved`;},segment=>{segment.owners=[...segment.owners,'P2'];},segment=>{segment.oldPath=`${segment.oldPath ?? segment.path}.old`;}];let applied=0;
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();for(const segment of body.segments)if(segment.row==='P1')for(const edit of edits.slice(0,applied))edit(segment);await route.fulfill({response,json:body});});
+ await page.goto(app.url);await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
+ for(const _ of edits){
+  await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+  applied++;await page.getByRole('button',{name:'Refresh',exact:true}).click();
+  await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
+ }
+});
 test('shows file metadata and no-change confirmation, supports narrow desktop and keyboard',async({page})=>{
   await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await expect(page.getByText('File mode changed',{exact:false})).toBeVisible();await expect(page.getByText('✕ Out of scope',{exact:true})).toBeVisible();
   await page.getByRole('button',{name:/P3 Confirm API compatibility/}).click();await page.getByRole('button',{name:'Confirm no change needed',exact:true}).click();await expect(page.getByText('1 of 3 approved')).toBeVisible();

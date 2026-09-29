@@ -212,7 +212,10 @@ async function act(command) {
 const staleState = (item) =>
   JSON.stringify([
     item.reasons,
-    data.segments.filter((s) => s.row === item.id).map((s) => [s.path, s.operation, s.content]),
+    // The same segment fields as the approval fingerprint in core/approvals.ts, so every change that can make an item stale is a new state.
+    data.segments
+      .filter((s) => s.row === item.id)
+      .map((s) => [s.path, s.oldPath, s.kind, s.operation, s.content, s.context, [...s.owners].sort()]),
     data.plan.items.find((p) => p.id === item.id),
   ]);
 const showSince = (item) =>
