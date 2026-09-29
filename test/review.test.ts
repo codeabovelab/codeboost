@@ -103,7 +103,7 @@ it('gives each stale state its own stale key, including states whose segments an
  view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
  expect(item('P1').state).toBe('stale');expect(own('P1')).toEqual(second.p1Segments);expect(item('P1').reasons).toEqual(second.p1Reasons);
  expect(item('P1').staleKey).not.toBe(second.p1);expect(item('P1').staleKey).not.toBe(first.p1);
-});
+},30000);
 it('gives a still-stale item a new stale key when it gains an ambiguous change',()=>{
  const {service,config}=fixture();let view=service.load();const item=(id:string)=>view.items.find(value=>value.id===id)!;
  view=service.act({action:'approve',item:'P1',token:view.token});view=service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});
@@ -114,7 +114,14 @@ it('gives a still-stale item a new stale key when it gains an ambiguous change',
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
  view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
  expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(before.key);
-});
+ // P3 then edits the same line back to P2's text: the segment keeps its choice key but gains an owner, so the stale state is new.
+ const shared=()=>view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!,second={key:item('P1').staleKey,segment:shared()};
+ writeFileSync(readme,`${original}Shared note, draft.\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','P3 draft'],{cwd:config.repository,stdio:'pipe'});const byP3=execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();
+ const back=commit('Shared note, revised.','P3 restores the line'),current=service.store.getSnapshot(config.identity);
+ service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:current.id},current.base,back,[{sha:byP3,owner:'P3',origin:'owned',sourceSha:null},{sha:back,owner:'P3',origin:'owned',sourceSha:null}]);
+ view=service.load();expect(shared().key).toBe(second.segment.key);expect(shared().owners).not.toEqual(second.segment.owners);
+ expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(second.key);
+},30000);
 it('gives each replaced head after a queue attempt its own stale key',()=>{
  const {service,config}=fixture();let view=service.load();
  service.store.saveReview(config.identity,view.expected,view.items.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();

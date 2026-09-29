@@ -33,11 +33,13 @@ export function applyChoices(plan: Plan, segments: readonly Segment[], choices: 
   });
 }
 export interface Approval { item: string; fingerprint: string }
+/** Every segment field an approval covers. */
+export const reviewedSegment = (s: Segment) => ({
+  path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
+  content: s.content, context: s.context, owners: [...s.owners].sort(),
+});
 export function fingerprint(item: PlanItem, segments: readonly Segment[], identity: PlanIdentity): string {
-  return stable({ identity: identityKey(identity), item, segments: segments.filter(s => s.row === item.id).map(s => ({
-    path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
-    content: s.content, context: s.context, owners: [...s.owners].sort(),
-  })) });
+  return stable({ identity: identityKey(identity), item, segments: segments.filter(s => s.row === item.id).map(reviewedSegment) });
 }
 export function approveItem(plan: Plan, segments: readonly Segment[], itemId: string, identity: PlanIdentity, confirmNoChange = false): Approval {
   const item = plan.items.find(item => item.id === itemId);

@@ -5,7 +5,7 @@ import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
-import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint } from '../core/approvals.ts';
+import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 
@@ -73,7 +73,8 @@ export class ReviewService {
       const key = createHash('sha256').update(JSON.stringify({
         approval: saved.approvals.find(value => value.item === item.id) ?? null,
         current: fingerprint(item, segments, identity),
-        ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(segment => segment.key),
+        // A choice key leaves out context and owners, so the ambiguous segments carry every field an approval covers.
+        ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(segment => [segment.key, reviewedSegment(segment)]),
         dependencies: item.depends_on.map(id => { const dependency = plan.items.find(value => value.id === id); return dependency ? staleKey(dependency) : null; }),
         replacement: replacementReview ? { snapshotId: snapshot.id, revision: plan.revision, requiresFreshReview: mergeAttempt.requiresFreshReview, reviewVersion: mergeAttempt.reviewVersion } : null,
       })).digest('hex');
