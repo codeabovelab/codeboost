@@ -546,7 +546,8 @@ export interface ExportOptions extends PreparationOptions {
 // which, unlike the config default, overrides the worktree's .gitmodules and applies to plumbing diff-index too. A
 // submodule's pointer change is still exported, but no `git status` runs inside it, and so none of its filters. core.safecrlf is off
 // so ordinary line-ending attributes (`text=auto`, `eol=crlf`) do not warn on stderr and fail a correct export.
-const EXPORT_SCRIPT = [
+// Exported only so tests can run it with failing stand-ins for the tools it uses; `exportTaskDiff` is the entry point.
+export const EXPORT_SCRIPT = [
   'set -eu',
   'base=$1 limit=$2',
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
