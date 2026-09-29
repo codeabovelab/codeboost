@@ -18,6 +18,23 @@ export function fenced(text: string): string {
   return `${fence}text\n${text.replace(/\r\n?/g, '\n')}\n${fence}`;
 }
 
+/**
+ * GitHub also reads closing keywords ("Fixes #7") in commit messages on the default branch, fenced or not, and a squash
+ * or merge commit can carry the PR title and description. So every issue reference in plan text and problems is
+ * neutralised: `#7` becomes `＃7`, `GH-7` becomes `GH‑7` (non-breaking hyphen), and `/issues/7` or `/pull/7` in a URL gets a
+ * division slash. The text stays readable, and no merge method can close another issue through it.
+ */
+export function neutralizeReferences(text: string): string {
+  return text.replace(/#(?=\d)/g, '＃').replace(/\b(GH)-(?=\d)/gi, '$1‑').replace(/\/(issues|pull)\/(?=\d)/gi, '/$1∕');
+}
+/** Cut to at most `max` UTF-16 units (the unit every length bound here counts), never inside a surrogate pair. */
+function cut(text: string, max: number): string {
+  if (text.length <= max) return text;
+  let end = max - 1;
+  if (/[\ud800-\udbff]/.test(text[end - 1] ?? '')) end--;
+  return `${text.slice(0, end)}…`;
+}
+
 function planText(plan: Plan, full: boolean): string {
   return plan.items.map(item => {
     const lines = [`${item.id}: ${item.title}`];
@@ -30,12 +47,13 @@ function planText(plan: Plan, full: boolean): string {
     return lines.join('\n');
   }).join('\n\n');
 }
+const planTextSafe = (plan: Plan, full: boolean) => neutralizeReferences(planText(plan, full));
 
-/** Single line, no control characters, bounded. */
+/** Single line, no control characters, no issue references except its own, bounded in code points. */
 export function pullRequestTitle(plan: Plan): string {
-  const summary = plan.summary.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  const summary = neutralizeReferences(plan.summary.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()) || 'codeboost plan';
   const suffix = ` (#${plan.issue})`;
-  return (summary.length + suffix.length > MAX_TITLE ? `${summary.slice(0, MAX_TITLE - suffix.length - 1)}…` : summary) + suffix;
+  return cut(summary, MAX_TITLE - suffix.length) + suffix;
 }
 
 /**
@@ -45,7 +63,7 @@ export function pullRequestTitle(plan: Plan): string {
 export function pullRequestBody(input: { plan: Plan; marker: string; problems?: readonly string[] }): string {
   const { plan, marker } = input;
   // The full problems stay in codeboost; the description shows a bounded summary of them.
-  const all = input.problems ?? [], shown = all.slice(0, MAX_PROBLEMS).map(problem => problem.length > MAX_PROBLEM ? `${problem.slice(0, MAX_PROBLEM)}…` : problem);
+  const all = input.problems ?? [], shown = all.slice(0, MAX_PROBLEMS).map(problem => neutralizeReferences(cut(problem, MAX_PROBLEM + 1)));
   const problems = all.length > shown.length ? [...shown, `(${all.length - shown.length} more in codeboost)`] : shown;
   const build = (full: boolean) => [
     marker,
@@ -56,7 +74,7 @@ export function pullRequestBody(input: { plan: Plan; marker: string; problems?: 
     '',
     full ? '**Plan**' : '**Plan** (items only; the full plan is too long for this description)',
     '',
-    fenced(planText(plan, full)),
+    fenced(planTextSafe(plan, full)),
   ].join('\n');
   const body = build(true);
   if (body.length <= MAX_BODY) return body;

@@ -78,6 +78,20 @@ describe('the pre-PR already-fixed check', () => {
     // A reopened issue does not count as closed.
     expect(await gateway({ state: 'OPEN', nodes: [closed(null)] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
   });
+  it('treats an issue closed by a Projects workflow as closed by someone else, not as unreadable', async () => {
+    expect(await gateway({ state: 'CLOSED', nodes: [closed({ __typename: 'ProjectV2', number: 3 })] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: 'a project workflow' }] });
+  });
+  it('runs the timeline and base-commit reads together, and a failure in one stops the other', async () => {
+    let timelineAborted = false;
+    const gh = new GhAlreadyFixedGateway({ repository: repo, deadlineMs: 10_000 }, async (args, options) => {
+      if (args[1] === 'graphql') return new Promise((_, reject) => options?.signal?.addEventListener('abort', () => { timelineAborted = true; reject(new Error('killed')); }));
+      throw new Error('HTTP 502');
+    });
+    const started = Date.now();
+    expect(await gh.check(input())).toMatchObject({ outcome: 'unknown', reason: 'GitHub could not be read.' });
+    expect(timelineAborted).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5_000);
+  });
   it('finds new base-branch commits that mention the issue, except its own commits', async () => {
     const commits = [{ sha: sha(5), message: 'Fix crash (#12)\n\nlong body' }, { sha: sha(6), message: 'P1: own change, refs #12' }, { sha: sha(7), message: 'Fix #123' }];
     expect(await gateway({ commits }).gh.check(input({ ownCommits: new Set([sha(6)]) }))).toMatchObject({ outcome: 'found', matches: [{ kind: 'commit', sha: sha(5), subject: 'Fix crash (#12)' }] });

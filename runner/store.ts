@@ -964,20 +964,21 @@ export class Store {
       return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
     });
   }
-  /** Nothing changed since a clear check of this head. Called right before each external write (push, open, refresh). */
-  assertCheckCurrent(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
-    this.#transaction(() => this.#assertCheckedHead(identity, input));
-  }
   /**
    * Records an update of the task's open PR before it starts, under the same guard as an opening. The PATCH and the
    * draft change may land even if their confirmation is lost; the record keeps that visible until the update is
    * confirmed or abandoned. Returns the state version the update owns.
    */
-  beginRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): number {
+  beginRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean; adopt?: { number: number; url: string } }): number {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#assertCheckedHead(identity, input);
-      if (!this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened'", key, input.openingId)) throw new GuardRefusal('Unknown pull request.');
+      const row = this.#get('SELECT state FROM task_pull_requests WHERE plan_key=? AND opening_id=?', key, input.openingId);
+      // An abandoned opening whose PR became visible later is adopted here, under the same guard as the update.
+      if (row?.state === 'abandoned' && input.adopt) {
+        if (!Number.isSafeInteger(input.adopt.number) || input.adopt.number < 1 || typeof input.adopt.url !== 'string') throw new Error('Invalid pull request.');
+        this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=? WHERE opening_id=?", input.adopt.number, input.adopt.url, input.openingId);
+      } else if (row?.state !== 'opened') throw new GuardRefusal('Unknown pull request.');
       this.#touch(key);
       const version = this.#task(key).state_version as number;
       this.#run('UPDATE task_pull_requests SET refresh_head=?, refresh_draft=?, refresh_version=?, updated_at=? WHERE opening_id=?',

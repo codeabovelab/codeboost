@@ -79,28 +79,32 @@ export class PullRequestPublisher {
       if (!draft) this.#store.transitionTask(identity, task.stateVersion, 'needs human');
       return { kind: 'no changes' };
     }
-    const prs = this.#store.taskPullRequests(identity);
+    const prs = this.#store.taskPullRequests(identity), branch = this.branch(identity);
+    // The task's earlier PR (a needs-human draft, or an abandoned opening's PR that became visible later) is reused while
+    // it is still open: GitHub allows one open PR per branch. It is looked up before the check, because an abandoned
+    // opening's PR links the issue too and has no recorded number; the marker proves it is the task's own.
+    const candidates = this.#branchRows(prs, branch, this.#config.baseBranch).filter(pr => pr.state !== 'opening');
+    const live = candidates.length ? await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal) : null;
+    signal?.throwIfAborted();
+    const earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
+    const own = new Set(prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!));
+    if (live) own.add(live.number);
     const result = await this.#checks.check({
       issue: plan.issue, taskBase: snapshot.base, baseBranch: this.#config.baseBranch,
-      ownPullRequests: prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!),
+      ownPullRequests: [...own],
       ownCommits: new Set(this.#store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha)),
     }, signal);
     signal?.throwIfAborted();
     const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
     if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
-    const branch = this.branch(identity);
-    // The task's earlier PR (a needs-human draft) is reused while it is still open: GitHub allows one open PR per branch.
-    const earlier = prs.filter(pr => pr.state === 'opened' && pr.headBranch === branch && pr.base === this.#config.baseBranch
-      && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).at(-1);
-    const live = earlier ? await this.#pulls.findOpened({ base: earlier.base, headBranch: branch, marker: marker(earlier.openingId) }, signal) : null;
-    signal?.throwIfAborted();
-    // The push changes GitHub too: re-read the task after the last await before it, as before open and refresh.
-    this.#store.assertCheckCurrent(identity, { checkId: check.id, headSha: snapshot.head, draft });
+    // Checked before the push: a refused publish must not move the branch.
+    if (earlier && live && earlier.state === 'opened' && live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
+    // No await since recordAlreadyFixed, whose transaction re-read the task: the push follows it directly.
     await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
     signal?.throwIfAborted();
     if (earlier && live) {
-      if (live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
-      const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
+      const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft,
+        ...(earlier.state === 'abandoned' ? { adopt: { number: live.number, url: live.url } } : {}) });
       const pr = await this.#pulls.refresh(live.number, {
         base: earlier.base, headBranch: branch, draft, ready: !draft, marker: marker(earlier.openingId),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
@@ -120,6 +124,11 @@ export class PullRequestPublisher {
     return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
   }
 
+  /** The task's PR records for one branch into one base, in the configured repository. */
+  #branchRows(prs: readonly TaskPullRequest[], branch: string, base: string): TaskPullRequest[] {
+    return prs.filter(pr => pr.headBranch === branch && pr.base === base && pr.repository.toLowerCase() === this.#config.repository.toLowerCase());
+  }
+
   /**
    * An opening whose GitHub outcome was lost (a crash or a timeout): adopt the PR if GitHub has it. An empty lookup
    * does not prove the request was refused while GitHub may still apply or show it, so the opening stays owned until
@@ -132,8 +141,15 @@ export class PullRequestPublisher {
     const lost = this.#store.taskPullRequests(identity).find((pr: TaskPullRequest) => pr.state === 'opening');
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
-    const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal);
+    const rows = this.#branchRows(this.#store.taskPullRequests(identity), lost.headBranch, lost.base);
+    const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
+    if (pr && pr.marker !== marker(lost.openingId)) {
+      // The branch's open PR belongs to another of the task's openings, so this opening's request created nothing
+      // (GitHub allows one open PR per branch). Drop it; the main path reuses, or adopts, the PR that is there.
+      this.#store.abandonPullRequestOpening(identity, lost.openingId);
+      return null;
+    }
     if (!pr) {
       const age = (this.#config.now ?? Date.now)() - Date.parse(lost.createdAt);
       if (!(age >= (this.#config.settleMs ?? DEFAULT_SETTLE_MS))) throw new OpeningUnsettled('An earlier pull request opening has not settled yet. Try again later.');

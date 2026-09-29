@@ -17,8 +17,11 @@ export interface OpenPullRequestInput {
 export interface OpenedPullRequest { number: number; url: string; headSha: string; draft: boolean }
 export interface PullRequestGateway {
   open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest>;
-  /** The open PR from `headBranch` into `base` whose description carries `marker`, or null when there is none. */
-  findOpened(input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest | null>;
+  /**
+   * The open PR from `headBranch` into `base`, with the one of `markers` its description carries, or null when there is
+   * no open PR. An open PR that carries none of them was not opened by codeboost, and is refused.
+   */
+  findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
   refresh(number: number, input: OpenPullRequestInput & { ready: boolean }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
@@ -55,9 +58,10 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return { number: pr.number as number, url: pr.html_url, headSha: pr.head.sha, draft: pr.draft, body: pr.body ?? '' };
   }
 
-  #validate(input: { base: string; headBranch: string; marker: string }): void {
+  #validate(input: { base: string; headBranch: string; marker?: string; markers?: readonly string[] }): void {
     if (!BRANCH.test(input.base) || !BRANCH.test(input.headBranch)) throw new Error('Invalid branch name.');
-    if (!/^<!-- codeboost:[a-z-]+=[0-9a-f-]{36} -->$/.test(input.marker)) throw new Error('Invalid pull request marker.');
+    const markers = input.markers ?? [input.marker];
+    if (!markers.length || markers.some(marker => typeof marker !== 'string' || !/^<!-- codeboost:[a-z-]+=[0-9a-f-]{36} -->$/.test(marker))) throw new Error('Invalid pull request marker.');
   }
 
   async open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest> {
@@ -70,7 +74,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return pr;
   }
 
-  async findOpened(input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest | null> {
+  async findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {
     this.#validate(input);
     const owner = this.repository.split('/')[0]!;
     const query = new URLSearchParams({ state: 'open', head: `${owner}:${input.headBranch}`, base: input.base, per_page: '100' });
@@ -79,8 +83,9 @@ export class GhPullRequestGateway implements PullRequestGateway {
     if (!Array.isArray(response) || response.length > 1) throw new Error('GitHub returned an invalid pull request list.');
     if (!response.length) return null;
     const { body, ...pr } = this.#pull(response[0], input);
-    if (!body.includes(input.marker)) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
-    return pr;
+    const found = input.markers.filter(marker => body.includes(marker));
+    if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
+    return { ...pr, marker: found[0]! };
   }
 
   async refresh(number: number, input: OpenPullRequestInput & { ready: boolean }, signal?: AbortSignal): Promise<OpenedPullRequest> {

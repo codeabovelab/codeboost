@@ -29,7 +29,7 @@ The check matches when any of these is true:
 
 | Signal | Source | Not a match |
 |---|---|---|
-| Something other than this task closed the issue. | The issue state and its latest close event (GraphQL). | Closed by an own PR or an own commit. A reopened issue. |
+| Something other than this task closed the issue. | The issue state and its latest close event (GraphQL). The closer is a PR, a commit, or a Projects workflow (closed by the project, so a match). | Closed by an own PR or an own commit. A reopened issue. |
 | Another open or merged PR links to the issue. | Cross-reference events, and manual links: "connected" and "disconnected" events replayed in order. | Own PRs, matched by repository and number. Closed, unmerged PRs. A manual link whose latest event is a disconnect. |
 | A new commit on the base branch mentions the issue. | The commits from the task's base to the current base branch head. | Own commits. `#123` when the issue is `#12`. `other/repo#12`. |
 
@@ -50,13 +50,13 @@ A cancelled check throws. It does not return `unknown`.
 
 Only one publish runs per task at a time; a second one is refused. A publish whose signal is already aborted changes nothing. Publish runs these steps in order:
 
-1. **Recover.** If an opening is still `opening`, look for an open PR from the task branch whose description has its marker. If one exists, record it as opened. If none exists, the request may still be in flight or not yet visible. So publish stops with `OpeningUnsettled` until the opening is 10 minutes old (`settleMs`). After that, it marks the opening `abandoned` and continues.
+1. **Recover.** If an opening is still `opening`, look for the open PR from the task branch, with the markers of all the task's openings for that branch. If it has this opening's marker, record it as opened. If it has another opening's marker, this opening created nothing (one open PR per branch): mark it `abandoned` and continue. If none exists, the request may still be in flight or not yet visible. So publish stops with `OpeningUnsettled` until the opening is 10 minutes old (`settleMs`). After that, it marks the opening `abandoned` and continues.
 2. **Status and no changes.** Refuse unless the task is running (or in needs human, for a draft). If the task head is its base, open nothing. A running task moves to needs human.
-3. **Check.** Run the check. Record the result, and any status change, in one transaction. That transaction refuses if the task changed during the check.
-4. **Find the earlier PR.** If the task has an opened PR on the same branch, ask GitHub whether it is still open.
-5. **Push.** Re-read the task as in step 6, then push the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
+3. **Find the earlier PR.** If the task has an opened or abandoned opening on the same branch, ask GitHub for the branch's open PR and which opening's marker it carries. A PR with an opened record's marker but another number is refused here, before the push. This comes before the check: an abandoned opening's PR links the issue and has no recorded number, so only its marker shows it is the task's own, and its number is added to the own PRs for the check.
+4. **Check.** Run the check. Record the result, and any status change, in one transaction. That transaction refuses if the task changed during the check.
+5. **Push.** Push, straight after the check's transaction with no await in between, the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
 6. **Re-read.** Right before the GitHub call, the Store confirms that the latest check is clear and that nothing changed since that check: same task state version, same review version (approvals, choices and notes), same snapshot, same head.
-7. **Open or reuse.** Open a new PR, or update the open earlier PR and mark it ready (or a draft). An update is recorded before it starts. If its confirmation is lost, the next publish drops the record in step 1 and repeats the update after a new check; the update is idempotent. Record the result.
+7. **Open or reuse.** Open a new PR, or update the open earlier PR (found in step 3 with the markers of every earlier opening, abandoned ones included; an abandoned opening's PR is adopted in the same transaction that records the update) and mark it ready (or a draft). An update is recorded before it starts. If its confirmation is lost, the next publish drops the record in step 1 and repeats the update after a new check; the update is idempotent. Record the result.
 
 Each opening or refresh owns the task state version at the moment it passed step 6. The PR is always recorded. The status changes only when the task still has that version. Every status change, admission and context change increases the version. So a response that arrives after the task changed never moves it.
 
@@ -75,7 +75,11 @@ The adapter refuses any answer for a PR that is not open. A PR closed between th
 
 The description starts with the marker and `Fixes #<issue>`. The plan follows, inside a fenced code block. A draft also lists its open problems inside a fenced code block.
 
-GitHub ignores closing keywords and @-mentions inside code. So plan text or agent output cannot close other issues or notify people. The fence is longer than any run of backticks in the text, so the text cannot end the block.
+GitHub ignores closing keywords and @-mentions inside code. So plan text or agent output cannot notify people from the description, and cannot end the block: the fence is longer than any run of backticks in the text.
+
+Fences do not protect commit messages. A squash or merge commit can carry the PR title and description, and GitHub acts on closing keywords in default-branch commit messages. So every issue reference in the title's summary, the plan and the problems is neutralised: `#7` becomes `＃7`, `GH-7` gets a non-breaking hyphen, and `/issues/7` or `/pull/7` gets a division slash. Only the task's own `Fixes #<issue>` line and the title's `(#<issue>)` remain real references.
+
+Titles and problems are cut by code point, never inside a surrogate pair. An empty summary becomes `codeboost plan`.
 
 The description stays under 60,000 characters. If the full plan is too long, only item IDs and titles are listed. At most 20 open problems are shown, each cut to 2,000 characters.
 

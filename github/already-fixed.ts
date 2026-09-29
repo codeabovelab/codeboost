@@ -47,7 +47,7 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
         pageInfo { hasNextPage }
         nodes {
           __typename
-          ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } } }
+          ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } ... on ProjectV2 { number } } }
           ... on CrossReferencedEvent { source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
           ... on ConnectedEvent { subject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
           ... on DisconnectedEvent { subject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
@@ -113,10 +113,12 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     if (!/^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/.test(input.baseBranch)) throw new Error('Invalid base branch name.');
     if (input.ownPullRequests.some(number => !Number.isSafeInteger(number) || number < 1)) throw new Error('Invalid pull request number.');
     // Every stage shares one deadline; reaching it aborts the running `gh` call and makes the check unknown.
-    const deadline = AbortSignal.timeout(this.deadlineMs), stages = signal ? AbortSignal.any([signal, deadline]) : deadline;
+    // The two stages are independent and run together; the first failure stops the other.
+    const deadline = AbortSignal.timeout(this.deadlineMs), failed = new AbortController();
+    const stages = AbortSignal.any([...(signal ? [signal] : []), deadline, failed.signal]);
+    const stop = (error: unknown) => { failed.abort(); throw error; };
     try {
-      const matches = await this.#timeline(input, stages);
-      const { baseHead, commits } = await this.#baseCommits(input, stages);
+      const [matches, { baseHead, commits }] = await Promise.all([this.#timeline(input, stages).catch(stop), this.#baseCommits(input, stages).catch(stop)]);
       for (const commit of commits) {
         if (input.ownCommits.has(commit.sha) || !mentionsIssue(commit.message, this.repository, input.issue)) continue;
         matches.push({ kind: 'commit', sha: commit.sha, subject: commit.message.split('\n', 1)[0]!.slice(0, 200) });
@@ -160,7 +162,8 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
         } else if (closer.__typename === 'Commit') {
           if (typeof closer.oid !== 'string' || !SHA.test(closer.oid)) throw new Unknown('GitHub returned an invalid closing commit.');
           lastCloser = input.ownCommits.has(closer.oid) ? null : `commit ${closer.oid}`;
-        } else throw new Unknown('GitHub returned an unknown closer.');
+        } else if (closer.__typename === 'ProjectV2') lastCloser = 'a project workflow';
+        else throw new Unknown('GitHub returned an unknown closer.');
         continue;
       }
       const field = node.__typename === 'CrossReferencedEvent' ? 'source' : node.__typename === 'ConnectedEvent' || node.__typename === 'DisconnectedEvent' ? 'subject' : null;
