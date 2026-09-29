@@ -205,8 +205,19 @@ describe('/api/runner', () => {
     const first = await api(app, 'POST', '/api/runner', cancel);
     expect(first).toMatchObject({ status: 200, body: { result: { outcome: 'closed' }, runner: { task: { status: 'cancelled' } } } });
     expect((await api(app, 'POST', '/api/runner', cancel)).body.result).toEqual(first.body.result);
-    expect((await api(app, 'POST', '/api/runner', { ...cancel, action: 'retry' })).status).toBe(409);
+    expect((await api(app, 'POST', '/api/runner', { ...cancel, action: 'retry', attemptId: randomUUID() }))).toMatchObject({ status: 409, body: { error: /different request/ } });
     expect((await api(app, 'POST', '/api/runner', { ...cancel, actionId: 'not-a-uuid' })).status).toBe(400);
+  });
+  it('answers 400 for a malformed runner request and records nothing under its action ID', async () => {
+    const { app } = await serve();
+    const version = (await api(app, 'GET', '/api/runner')).body.stateVersion, actionId = randomUUID();
+    expect(await api(app, 'POST', '/api/runner', { action: 'bogus', expectedStateVersion: version, actionId })).toMatchObject({ status: 400 });
+    expect(await api(app, 'POST', '/api/runner', { action: 'retry', expectedStateVersion: 'x', actionId })).toMatchObject({ status: 400 });
+    expect(await api(app, 'POST', '/api/runner', { action: 'cancel-attempt', attemptId: 'x', expectedStateVersion: version, actionId })).toMatchObject({ status: 400 });
+    expect(await api(app, 'POST', '/api/runner', { action: 'retry', expectedStateVersion: version, actionId })).toMatchObject({ status: 400 });
+    // Nothing was saved under the key, so the corrected request is evaluated, not answered with ActionIdReused.
+    const fixed = await api(app, 'POST', '/api/runner', { action: 'cancel-task', expectedStateVersion: version, actionId });
+    expect(fixed).toMatchObject({ status: 200, body: { result: { outcome: 'closed' } } });
   });
   it('cancels a running attempt, then retries it, and shutdown waits for the running retry', async () => {
     const { deps, settles } = fakeRunner();

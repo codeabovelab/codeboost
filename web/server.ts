@@ -7,7 +7,7 @@ import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
-import { BadRequest, GuardRefusal, ShuttingDownError, isUuidV4, sameContext } from '../runner/lifecycle.ts';
+import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
@@ -47,19 +47,20 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   };
   const runnerAction = (input: Record<string, unknown>) => {
     const { action, attemptId, expectedStateVersion, actionId } = input;
-    if (!['cancel-attempt', 'retry', 'cancel-task'].includes(action as string)) throw new GuardRefusal('Unsupported runner action.');
-    if (!Number.isSafeInteger(expectedStateVersion)) throw new GuardRefusal('expectedStateVersion is required.');
+    // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
+    if (!['cancel-attempt', 'retry', 'cancel-task'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
+    if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
+    if (action !== 'cancel-task') assertUuidV4(attemptId, 'Attempt ID');
     return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal('The runner is not available yet.');
-      if (typeof attemptId !== 'string') throw new GuardRefusal('attemptId is required.');
       if (action === 'cancel-attempt') {
-        if (!runner.stop(identity, attemptId, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
+        if (!runner.stop(identity, attemptId as string, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
         return { outcome: 'stopping' };
       }
-      const last = service.store.getAttempt(identity, attemptId);
-      const retry = runner.retry(identity, attemptId, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
+      const last = service.store.getAttempt(identity, attemptId as string);
+      const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
       return { outcome: 'started', attemptId: retry.id };
     }).response;
