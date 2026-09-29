@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -21,8 +22,7 @@ import type { ProcessGroup } from '../agents/process-group.ts';
 // The asynchronous clone (#51 item 5): every Git call runs in its own process group, and an abort settles only after
 // that group has exited and the partial clone is gone.
 const roots: string[] = [];
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'clone-async-')); roots.push(root);
   const source = join(root, 'source'), parent = join(root, 'tasks');

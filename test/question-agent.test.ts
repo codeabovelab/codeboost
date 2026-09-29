@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -329,7 +329,7 @@ it.each([
 
 it('measures the checkout at the reviewed head and the object store with Git', () => {
   const repo = mkdtempSync(join(tmpdir(), 'measure-')); roots.push(repo);
-  const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repo, encoding: 'utf8' }).trim();
+  const git = (...args: string[]) => fixtureGit(repo, ...args);
   git('init', '-q'); git('config', 'user.name', 'T'); git('config', 'user.email', 't@example.com');
   mkdirSync(join(repo, 'dir')); writeFileSync(join(repo, 'dir', 'a.txt'), 'x'.repeat(1000)); writeFileSync(join(repo, 'b.txt'), 'y'.repeat(24));
   git('add', '.'); git('commit', '-qm', 'base');

@@ -1,7 +1,7 @@
 import { mkdtempSync, readdirSync, mkdirSync, writeFileSync, existsSync, rmSync, chmodSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { afterEach, expect, it, vi } from 'vitest';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
@@ -17,7 +17,7 @@ const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture(initial: Record<string, string> = { 'a.txt': 'one\ntwo\nthree\n' }) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-history-')); dirs.push(dir);
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = (...args: string[]) => fixtureGit(dir, ...args);
   git('init', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid'); git('config', 'commit.gpgsign', 'false');
   const write = (path: string, text: string | Buffer) => { mkdirSync(dirname(join(dir, path)), { recursive: true }); writeFileSync(join(dir, path), text); };
   const ledger = new Map<string, string>();

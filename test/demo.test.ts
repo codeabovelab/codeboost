@@ -1,9 +1,10 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, renameSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, renameSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { isolatedGitEnvironment } from '../scripts/git-environment.ts';
+import { hardenedGitEnvironment } from '../scripts/git-environment.ts';
 import { createDemo } from '../scripts/demo.ts';
+import { fixtureGit } from './fixtures/git.ts';
 const roots: string[] = [];
 afterEach(() => { vi.unstubAllEnvs(); roots.splice(0).forEach(root => rmSync(root, { recursive: true, force: true })); });
 function root() { const path = mkdtempSync(join(tmpdir(), 'codeboost-demo-')); roots.push(path); return path; }
@@ -27,7 +28,7 @@ it('rejects symlinked demo roots, configs, repositories and databases', () => {
     rmSync(path); renameSync(backup, path);
   }
 });
-it('scrubs inherited Git repository and config environment in demo commands', () => {
+it('ignores inherited Git repository and config environment in demo commands', () => {
   const base = root();
   vi.stubEnv('GIT_DIR', join(base, 'outside.git'));
   vi.stubEnv('GIT_WORK_TREE', join(base, 'outside'));
@@ -38,11 +39,16 @@ it('scrubs inherited Git repository and config environment in demo commands', ()
   expect(readFileSync(join(config.repository, 'retry.ts'), 'utf8')).toContain('Math.min');
 });
 
-it('scrubs Git environment names case-insensitively for Windows', () => {
-  vi.stubEnv('git_dir', '/outside'); vi.stubEnv('Git_Work_Tree', '/outside');
-  const env = isolatedGitEnvironment();
-  expect(env).not.toHaveProperty('git_dir'); expect(env).not.toHaveProperty('Git_Work_Tree');
-  expect(env.GIT_CONFIG_NOSYSTEM).toBe('1');
+it('passes only allowlisted variables to demo Git, whatever the inherited names', () => {
+  vi.stubEnv('git_dir', '/outside'); vi.stubEnv('Git_Work_Tree', '/outside'); vi.stubEnv('HOME', '/outside'); vi.stubEnv('XDG_CONFIG_HOME', '/outside');
+  expect(Object.keys(hardenedGitEnvironment()).sort()).toEqual(['GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'GIT_NO_LAZY_FETCH', 'GIT_TERMINAL_PROMPT', 'PATH']);
+});
+it('ignores inherited user Git ignore files outside the GIT_ namespace in demo commands', () => {
+  const base = root(), home = join(base, 'home'); mkdirSync(join(home, 'git'), { recursive: true });
+  writeFileSync(join(home, 'git', 'ignore'), '*.ts\n*.log\n');
+  vi.stubEnv('XDG_CONFIG_HOME', home); vi.stubEnv('HOME', base);
+  const config = createDemo(join(base, 'demo'));
+  expect(fixtureGit(config.repository, 'ls-tree', '--name-only', 'HEAD').split('\n')).toEqual(expect.arrayContaining(['retry.ts', 'debug.log']));
 });
 it('rejects symlinked ancestors before creating a demo', () => {
   const base = root(); symlinkSync(base, join(base, 'alias'));

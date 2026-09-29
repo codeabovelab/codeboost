@@ -2,7 +2,6 @@ import { test, expect } from '@playwright/test';
 import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { request as httpRequest, type IncomingMessage } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { createDemo } from '../../scripts/demo.ts';
@@ -19,7 +18,7 @@ function requestAdmitted(server: typeof app.server) {
  const admitted=new Promise<void>(resolve=>{const onRequest=(req:IncomingMessage)=>{if(req.headers['x-codeboost-test-request']!==id)return;server.off('request',onRequest);resolve();};server.on('request',onRequest);});
  return {admitted,marker};
 }
-function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Restore declared scope'],{cwd:config.repository,stdio:'pipe'}); }
+function removeDemoOutOfScope(config: typeof app.service.config) { chmodSync(join(config.repository,'run.sh'),0o644);fixtureGit(config.repository,'commit','-am','Restore declared scope'); }
 test.beforeEach(async () => { root=mkdtempSync(join(tmpdir(),'codeboost-browser-'));app=await startServer(createDemo(join(root,'demo')),0); });
 test.afterEach(async () => { await app.close();rmSync(root,{recursive:true,force:true}); });
 test('resends the same merge key after a 503, a lost response, an unreadable body or an unknown outcome, and a new key after a definite answer',async({page})=>{
@@ -147,7 +146,7 @@ test('shows file metadata and no-change confirmation, supports narrow desktop an
 test('refresh makes changed code stale and stale browser actions cannot approve it',async({page,context})=>{
   await page.goto(app.url);await page.getByRole('button',{name:'Approve P1',exact:true}).click();await expect(page.getByText('1 of 3 approved')).toBeVisible();
   const other=await context.newPage();await other.goto(app.url);await expect(other.getByText('1 of 3 approved')).toBeVisible();
-  const repository=app.service.config.repository;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return 42;\n}\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','External change'],{cwd:repository,stdio:'pipe'});
+  const repository=app.service.config.repository;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return 42;\n}\n');fixtureGit(repository,'commit','-am','External change');
   await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();
   await other.getByRole('button',{name:/P3 Confirm API compatibility/}).click();await other.getByRole('button',{name:'Confirm no change needed',exact:true}).click();await expect(other.getByRole('status').filter({hasText:'Stale review state'})).toBeVisible();
 });
@@ -244,36 +243,36 @@ test('never enables merging for a demo even with an injected gateway',async({pag
 });
 test('shows an honest history error and keeps markup in notes as text',async({page})=>{
  await page.goto(app.url);await page.getByLabel('Question about this item').fill('<img src=x onerror=alert(1)>');await page.getByRole('button',{name:'Ask agent'}).click();await expect(page.getByText('<img src=x onerror=alert(1)>',{exact:true})).toBeVisible();await expect(page.locator('#notes img')).toHaveCount(0);
- const repository=app.service.config.repository;execFileSync('git',['checkout','--orphan','unrelated'],{cwd:repository,stdio:'pipe'});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Unrelated history'],{cwd:repository,stdio:'pipe'});
+ const repository=app.service.config.repository;fixtureGit(repository,'checkout','--orphan','unrelated');fixtureGit(repository,'commit','-m','Unrelated history');
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('Could not read this branch’s history.',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Approve P1',exact:true})).not.toBeVisible();
 });
 test('can assign a large foreign change without sending its content back in the command',async({request})=>{
- const repository=app.service.config.repository;writeFileSync(join(repository,'debug.log'),'x'.repeat(20000)+'\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Large foreign change'],{cwd:repository,stdio:'pipe'});
+ const repository=app.service.config.repository;writeFileSync(join(repository,'debug.log'),'x'.repeat(20000)+'\n');fixtureGit(repository,'commit','-am','Large foreign change');
  const base=app.url.split('#')[0]!,headers={'x-codeboost-token':app.token};const view=await(await request.get(base+'api/review',{headers})).json();const segment=view.segments.find((s:{content:string;row:string})=>s.row==='Unplanned'&&s.content.length>19000);
  const response=await request.post(base+'api/action',{headers:{...headers,'Content-Type':'application/json'},data:{action:'assign',item:'P1',key:segment.key,token:view.token}});
  expect(response.status()).toBe(200);
 });
 test('shows bounded raster previews and byte sizes for file-change cards',async({page})=>{
- const repository=app.service.config.repository;writeFileSync(join(repository,'pixel.png'),Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRHsAAAAASUVORK5CYII=','base64'));execFileSync('git',['add','pixel.png'],{cwd:repository});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Add image'],{cwd:repository,stdio:'pipe'});
+ const repository=app.service.config.repository;writeFileSync(join(repository,'pixel.png'),Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aRHsAAAAASUVORK5CYII=','base64'));fixtureGit(repository,'add','pixel.png');fixtureGit(repository,'commit','-m','Add image');
  await page.goto(app.url);await page.getByRole('button',{name:/Unplanned changes/}).click();await expect(page.getByRole('img',{name:'Current image in pixel.png'})).toBeVisible();await expect(page.getByRole('img',{name:'Current image in pixel.png'})).toHaveJSProperty('naturalWidth',1);await expect(page.getByText('Size: N/A → 68 bytes',{exact:true})).toBeVisible();
 });
 test('rejects malformed non-ASCII credentials consistently',async({request})=>{
  const response=await request.get(app.url.split('#')[0]+'api/review',{headers:{'x-codeboost-token':'é'.repeat(64)}});expect(response.status()).toBe(403);
 });
 test('keeps stale item controls unavailable after a failed refresh',async({page})=>{
- await page.goto(app.url);const repository=app.service.config.repository;execFileSync('git',['checkout','--orphan','unrelated'],{cwd:repository,stdio:'pipe'});execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Other history'],{cwd:repository,stdio:'pipe'});
+ await page.goto(app.url);const repository=app.service.config.repository;fixtureGit(repository,'checkout','--orphan','unrelated');fixtureGit(repository,'commit','-m','Other history');
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('Could not read this branch’s history.',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:/P3 Confirm API compatibility/})).toHaveCount(0);
 });
 test('accepts a foreign segment and keeps that choice across reload',async({page})=>{
  await page.goto(app.url);await page.getByRole('button',{name:/Unplanned changes/}).click();await page.getByRole('button',{name:'Accept as is',exact:true}).first().click();await page.getByRole('button',{name:/Accepted 1/}).click();await expect(page.getByRole('article').first()).toBeVisible();await expect(page.getByText('Accepted outside plan',{exact:true})).toBeVisible();await page.reload();await page.getByRole('button',{name:/Accepted 1/}).click();await expect(page.getByRole('article').first()).toBeVisible();
 });
 test('shows the whole-plan empty state without claiming checks passed',async({page})=>{
- const {repository,identity}=app.service.config;const base=app.service.store.getSnapshot(identity).base;execFileSync('git',['reset','--hard',base],{cwd:repository,stdio:'pipe'});
+ const {repository,identity}=app.service.config;const base=app.service.store.getSnapshot(identity).base;fixtureGit(repository,'reset','--hard',base);
  await page.goto(app.url);await expect(page.getByRole('heading',{name:'No code changes yet'})).toBeVisible();await expect(page.getByRole('button',{name:'Confirm no change needed',exact:true})).toBeVisible();await expect(page.getByRole('button',{name:'AI review: – Not run',exact:true})).toBeVisible();
 });
 test('routes mixed owned and ambiguous items to attribution resolution',async({page})=>{
- const {repository,identity}=app.service.config;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','P2 changes retry'],{cwd:repository,stdio:'pipe'});
- const head=execFileSync('git',['rev-parse','HEAD'],{cwd:repository,encoding:'utf8'}).trim(),snapshot=app.service.store.getSnapshot(identity);app.service.store.recordHistory(identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
+ const {repository,identity}=app.service.config;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');fixtureGit(repository,'commit','-am','P2 changes retry');
+ const head=fixtureGit(repository,'rev-parse','HEAD'),snapshot=app.service.store.getSnapshot(identity);app.service.store.recordHistory(identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
  await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await page.getByRole('button',{name:'Resolve ambiguous changes',exact:true}).click();await expect(page.getByRole('heading',{name:'Ambiguous',exact:true})).toBeVisible();
 });
 test('keeps review shortcuts active while a toolbar button has focus',async({page})=>{
@@ -286,13 +285,13 @@ test('attaches clicked lines to a question, persists and navigates the reference
  await expect(page.locator('#attachment')).toContainText('retry.ts');
  await page.getByLabel('Question about this item').fill('Why this exact line?');await page.getByRole('button',{name:'Ask agent',exact:true}).click();
  await page.reload();await page.locator('.note-reference').click();await expect(page.locator('.selected-line').first()).toBeVisible();
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','another revision'],{cwd:app.service.config.repository,stdio:'pipe'});
+ fixtureGit(app.service.config.repository,'commit','--allow-empty','-m','another revision');
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.locator('.note-reference')).toContainText('Outdated');await page.locator('.note-reference').click();await expect(page.getByRole('heading',{name:'! Outdated code reference'})).toBeVisible();await expect(page.locator('#dialog-body pre')).toContainText('Math.min');
 });
 test('supports shift ranges, highlighted lines, and independent snippet drafts',async({page})=>{
  const repository=app.service.config.repository;
  writeFileSync(join(repository,'retry.ts'),'export const cap = 5000;\nexport const base = 100;\nexport const delay = (n: number) => Math.min(cap, base * 2 ** n);\n');
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','rewrite retry'],{cwd:repository,stdio:'pipe'});
+ fixtureGit(repository,'commit','-am','rewrite retry');
  let view=app.service.load();
  for(const key of view.segments.filter(s=>s.path==='retry.ts'&&['Unplanned','Ambiguous'].includes(s.row)).map(s=>s.key)) view=app.service.act({action:'assign',key,item:'P1',token:view.token});
  await page.goto(app.url);
@@ -383,7 +382,7 @@ test('resizes Conversation using its divider and keyboard',async({page})=>{
 test('places selection actions beside code deep in a scrolled diff',async({page})=>{
  const repository=app.service.config.repository;
  writeFileSync(join(repository,'retry.ts'),Array.from({length:90},(_,i)=>`export const value${i} = ${i};`).join('\n')+'\n');
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','Long diff'],{cwd:repository,stdio:'pipe'});
+ fixtureGit(repository,'commit','-am','Long diff');
  let view=app.service.load();
  for(const key of view.segments.filter(s=>s.path==='retry.ts'&&['Unplanned','Ambiguous'].includes(s.row)).map(s=>s.key)) view=app.service.act({action:'assign',key,item:'P1',token:view.token});
  await page.goto(app.url);
@@ -444,7 +443,7 @@ test('polls persisted answer status without rebuilding the review',async({page})
 test('outdated questions explain how to continue without offering a broken retry',async({page})=>{
  const service=app.service;
  service.act({action:'note',item:'P1',kind:'question',text:'Old question',token:service.load().token});
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','New snapshot'],{cwd:service.config.repository,stdio:'pipe'});
+ fixtureGit(service.config.repository,'commit','--allow-empty','-m','New snapshot');
  await page.goto(app.url);
  await expect(page.getByText('Old question',{exact:true})).toBeVisible();
  await expect(page.getByRole('button',{name:'Retry answer',exact:true})).toHaveCount(0);
@@ -480,7 +479,7 @@ for(const scenario of ['navigation','snapshot','removed item','failure']) test(`
   await page.getByRole('button',{name:/P2 Document retry behavior/}).click();
   await page.getByRole('button',{name:'Request change',exact:true}).click();await page.locator('#message').fill('Latest change request');
  }
- if(scenario==='snapshot')execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','New snapshot'],{cwd:app.service.config.repository,stdio:'pipe'});
+ if(scenario==='snapshot')fixtureGit(app.service.config.repository,'commit','--allow-empty','-m','New snapshot');
  if(scenario==='removed item'){
   const service=app.service,identity=service.config.identity,plan=service.store.getPlan(identity);
   service.store.importRevision(JSON.stringify({...plan,items:plan.items.filter(item=>item.id!=='P1').map(item=>({...item,depends_on:[]}))}),'json',{identity,issue:plan.issue,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},plan.revision);
@@ -499,7 +498,7 @@ for(const scenario of ['navigation','snapshot','removed item','failure']) test(`
  await expect(page.locator('#message')).toHaveValue('Latest question');
  if(scenario==='snapshot'){
   await expect(page.locator('#attachment')).toContainText('Outdated');await expect(page.locator('#save-note')).toBeDisabled();
-  expect(app.service.load().snapshot.head).toBe(execFileSync('git',['rev-parse','HEAD'],{cwd:app.service.config.repository,encoding:'utf8'}).trim());
+  expect(app.service.load().snapshot.head).toBe(fixtureGit(app.service.config.repository,'rev-parse','HEAD'));
  }
  if(scenario==='removed item'){
   await expect(page.locator('#item-details')).toContainText('no longer in the plan');await expect(page.locator('#save-note')).toBeDisabled();

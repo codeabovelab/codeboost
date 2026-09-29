@@ -1,4 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -27,8 +28,7 @@ const containers = new Set<string>();
 const profiles: Awaited<ReturnType<typeof createContainerProfile>>[] = [];
 let imageId = '';
 const vendorNetworks: VendorNetwork[] = [];
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 const docker = (...args: string[]) => execFileSync('docker', args, {
   encoding: 'utf8', timeout: 60_000, stdio: ['ignore', 'pipe', 'pipe'],
 }).trim();

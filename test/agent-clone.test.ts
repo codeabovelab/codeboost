@@ -1,4 +1,5 @@
 import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, lstatSync, symlinkSync, writeFileSync, renameSync, opendirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -15,8 +16,7 @@ vi.mock('node:child_process', async importOriginal => {
 });
 
 const roots: string[] = [];
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), 'clone-test-')); roots.push(root);
   const source = join(root, 'source'), parent = join(root, 'tasks');
