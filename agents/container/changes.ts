@@ -116,7 +116,10 @@ export interface TaskChangeManifest {
   readonly linkTargetChanges: readonly LinkTargetChange[];
   /** Gitlink paths with anything in them, or that cannot be read. */
   readonly nestedGitlinkContent: readonly string[];
-  /** SHA-256 of the manifest without this field, as canonical JSON. `commitTaskChanges` recomputes and compares it. */
+  /**
+   * SHA-256 of the manifest without this field, as canonical JSON (`manifestDigest`). The commit step (#66 part 2) is
+   * to recompute it and refuse a work tree that no longer matches.
+   */
   readonly digest: string;
 }
 
@@ -246,8 +249,10 @@ interface InspectOutput {
  * skip are listed too: new ignored files, fifos, anything under a `.git` part, and anything in a gitlink directory
  * (reported in `nestedGitlinkContent`); a new directory that base's rules ignore is one entry. Each declared link is
  * resolved again and each target the snapshot recorded is compared with what is there now. Runs in a read-only
- * container over the storage with no network. It fails, rather than returns part of the answer, on more than
- * `MAXIMUM_CHANGES` changes, on a name or link target that is not strict printable UTF-8, and on anything it cannot read.
+ * container over the storage with no network. It fails, rather than returns part of the answer, on: more than
+ * `MAXIMUM_CHANGES` changes; a name or link target longer than `MAXIMUM_NAME_BYTES` or not strict printable UTF-8; more
+ * than `MAXIMUM_TARGET_ENTRIES` entries beneath the recorded targets; anything it cannot read; a `base` that is not a
+ * commit there; and any Git failure. F treats every refusal as needs human.
  */
 export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
   options: InspectOptions): Promise<TaskChangeManifest> {

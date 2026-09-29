@@ -98,14 +98,16 @@ Use only these entry points to run an agent:
    - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
      change manifest: every difference between the work tree and `base`, read without following links, with content
      IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
-     directory that `base`'s own ignore rules ignore is one entry (`ignored: true`). It also returns `agentCommits`,
+     directory that `base`'s own ignore rules ignore, with no tracked entry beneath it, is one entry (`ignored: true`). It also returns `agentCommits`,
      `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`.
    - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
      failed. Route it to needs human, as for link target changes and nested gitlink content.
    - **Refusals.** It refuses, and never returns part of the answer, when:
      - there are more than 10,000 changes;
-     - a name or link target is not printable UTF-8;
-     - it cannot read something.
+     - a name or link target is longer than 1,024 bytes, or is not strict UTF-8 free of control and format characters;
+     - the recorded targets hold more than 20,000 entries;
+     - it cannot read something;
+     - `base` is not a commit in the storage, or Git fails.
 
      Treat a refusal as needs human.
    - **Both calls** run in a read-only container with no network, take `signal`, `onProcessGroup` and `timeoutMs`

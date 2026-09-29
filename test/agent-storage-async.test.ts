@@ -97,6 +97,7 @@ if (a === 'run' && args.includes('io.codeboost.task-storage=seeder')) {
 // Like the change inspection: prints the canned result, then --rm removes the container.
 if (a === 'run' && args.includes('io.codeboost.task-storage=inspect')) {
   const name = args[args.indexOf('--name') + 1];
+  fs.writeFileSync(path.join(state, 'inspect-args.json'), JSON.stringify(args.filter(arg => arg.length < 200)));
   save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
   if (fs.existsSync(path.join(state, 'hang-inspect'))) {
     fs.writeFileSync(path.join(state, 'inspect-began'), '');
@@ -338,6 +339,21 @@ describe('task change inspection', () => {
     expect(changed.metadataChanged).toBe(true);
     expect(changed.digest).not.toBe(quiet.digest);
     expect(inspections()).toEqual([]);
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('runs with the memory and output room the limits need: 1 GB, and a result far past 16 MiB', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    // 10,000 new links with long names and targets: within every limit, about 17 MB of JSON.
+    const changes = Array.from({ length: 10_000 }, (_, index) => ({ kind: 'add', path: `${index}`.padEnd(800, 'p'),
+      newType: 'symlink', newMode: '120000', newOid: 'd'.repeat(40), newLinkTarget: 't'.repeat(900), underGit: false,
+      ignored: false }));
+    const big = JSON.stringify({ metadataDigest: BASELINE, head: BASE, agentCommits: [], nestedGitlinkContent: [], changes,
+      links: [], targets: {} });
+    expect(big.length).toBeGreaterThan(16 * 1024 * 1024);
+    writeFileSync(join(state, 'inspect-output'), big);
+    expect((await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks })).changes).toHaveLength(10_000);
+    expect(JSON.parse(readFileSync(join(state, 'inspect-args.json'), 'utf8'))).toContain('--memory=1g');
     removeTaskFilesystems(filesystems);
   });
 

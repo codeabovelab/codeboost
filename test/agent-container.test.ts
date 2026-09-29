@@ -1057,6 +1057,20 @@ describe('real Docker agent isolation', () => {
       expect(byPath.get('build/.gitignore')).toMatchObject({ kind: 'delete' });
     }, 180_000);
 
+    it('keeps base\'s ignore rules when the agent puts a directory where a .gitignore was', async () => {
+      const data = fixture({ hostile: source => {
+        writeFileSync(join(source, '.gitignore'), 'out/\n');
+        mkdirSync(join(source, 'sub')); writeFileSync(join(source, 'sub', '.gitignore'), '!out/\n'); writeFileSync(join(source, 'sub', 'a'), 'a\n');
+      } });
+      asAgent(data.filesystems, ['rm sub/.gitignore', 'mkdir sub/.gitignore', 'printf "f\\n" > sub/.gitignore/f',
+        'mkdir -p sub/out', 'printf "p\\n" > sub/out/payload.sh'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const byPath = new Map(manifest.changes.map(change => [change.path, change]));
+      // base's sub/.gitignore re-includes sub/out, so what is inside is listed.
+      expect(byPath.get('sub/out/payload.sh')).toMatchObject({ kind: 'add', ignored: false });
+      expect(byPath.get('sub/.gitignore')).toMatchObject({ kind: 'modify', oldType: 'file', newType: 'directory' });
+    }, 180_000);
+
     it('reports what a commit would store: nothing for an honest CRLF checkout, the stored blob under ident', async () => {
       const data = fixture({ hostile: source => {
         writeFileSync(join(source, '.gitattributes'), '*.txt eol=crlf\nid.c ident\n');
@@ -1150,7 +1164,10 @@ describe('real Docker agent isolation', () => {
       // A name longer than the manifest carries.
       asAgent(data.filesystems, `rm -f c*; mkdir -p "$(printf 'd%.0s' $(seq 1 200))" && cd "$(printf 'd%.0s' $(seq 1 200))" && for i in 1 2 3 4 5 6; do mkdir "$(printf 'e%.0s' $(seq 1 200))" && cd "$(printf 'e%.0s' $(seq 1 200))"; done && : > f`);
       await expect(inspect()).rejects.toThrow(`longer than ${MAXIMUM_NAME_BYTES} bytes`);
-      asAgent(data.filesystems, `rm -rf dd*; mkdir many; cd many; for i in $(seq 1 ${MAXIMUM_CHANGES + 1}); do : > "$i"; done`);
+      // A file it cannot read is refused by name, not passed to Git.
+      asAgent(data.filesystems, 'rm -rf dd* && chmod 000 file.txt');
+      await expect(inspect()).rejects.toThrow(/exit 6\): could not read file\.txt/);
+      asAgent(data.filesystems, `chmod 644 file.txt; mkdir many; cd many; for i in $(seq 1 ${MAXIMUM_CHANGES + 1}); do : > "$i"; done`);
       await expect(inspect()).rejects.toThrow(`more than ${MAXIMUM_CHANGES} new entries`);
     }, 240_000);
 

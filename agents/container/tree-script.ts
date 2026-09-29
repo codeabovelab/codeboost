@@ -143,7 +143,8 @@ sub entry {
 sub walk_entry {
   my $path = shift; my @stat = lstat $path; return undef unless @stat;
   if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => text($target, "the link target of " . shown($path)) } }
-  return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } if -f _;
+  # Every file is hashed below; one that cannot be read fails the run here, with its name, rather than inside Git.
+  if (-f _) { fail(6, "could not read " . shown($path) . ": permission denied") unless -r _; return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } }
   return { type => -d _ ? "directory" : "other" };
 }
 # A target entry also carries the file's raw content ID: the snapshot compares identity, not what Git would store.
@@ -284,15 +285,20 @@ sub move_aside {
 sub is_ignored {
   my ($path, $directory) = @_; my $mirror = "/tmp/ignore";
   my @parts = split m{/}, $path; my $name = pop @parts;
-  # Every parent is a directory in the work tree (the walk is inside it), so it is one in the mirror too: even where base
-  # tracked a file, or a .gitignore stands in the way.
+  # Every parent is a directory in the work tree (the walk is inside it), so it is made one in the mirror too. The mirror
+  # holds only directories and base's .gitignore files, and a rule file is never moved: where one stands in the way (the
+  # agent made a directory named .gitignore), nothing deeper is mirrored. Git then sees no directory there, so a
+  # directory-only pattern does not match below it: that can only list more, never hide anything.
   for my $part (@parts, $directory ? ($name) : ()) {
     $mirror .= "/$part";
-    next if -d $mirror && !-l $mirror;
-    move_aside($mirror) if -e $mirror || -l $mirror;
+    last if -e $mirror && !-d $mirror;
+    next if -d $mirror;
     mkdir $mirror or fail(4, "could not mirror a directory: $!");
   }
-  if (!$directory) { $mirror .= "/$name"; move_aside($mirror) if -d $mirror }
+  # A directory in the way of a file (base tracked build/.gitignore, the agent made build a file) would let a
+  # directory-only pattern match the file, so it goes. The rule files inside it only govern paths under it, and there
+  # are none now.
+  if (!$directory) { my $at = "/tmp/ignore/$path"; move_aside($at) if -d $at }
   print $ignore_in "./$path\0"; $ignore_in->flush;
   local $/ = "\0"; my @fields;
   for (1 .. 4) { my $field = <$ignore_out>; fail(4, "git check-ignore stopped answering") unless defined $field; chomp $field; push @fields, $field }
