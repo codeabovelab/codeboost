@@ -96,6 +96,11 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Treat paths read from a durable record or discovered on disk as untrusted. Before deleting, opening or probing one, validate its exact location and name, not only its basename, and never follow a link to it. Keep files that other local users must not plant or swap, such as lock files, in a directory only the current user can write. Write durable records through a unique temporary file opened exclusively, and delete it if the write fails.
 - Exclude other processes with an OS-level lock held for the owner's lifetime, keyed by the resource's stable identity rather than a path spelling. A PID liveness check never authorizes taking over a lock. Run shared one-time startup work single-flight under that lock, and keep the lock until the work has finished.
 
+## Agent-controlled content
+
+- When a subprocess reports a problem only as a warning and carries on, decide pass or fail by what each message means for the result, not by whether anything was printed: fail on messages that mean it did less than it should (for example could not read a path), and let through messages about harmless input the agent controls. Test both a benign case and a failing case, and filter the output as it arrives so that no volume of benign messages can push a failure out of a bounded buffer.
+- Quote or escape agent-controlled text (file names, paths, branch names) wherever it lands in output that people or tools parse, such as diffs, notices, logs or reports, so it cannot forge that output's structure.
+
 ## Blinded experiments
 
 - Keep experimental PRs as drafts with automated review disabled until the assigned human decision is recorded. An automated review invalidates reviewer blindness; replace the affected package rather than reusing it.
