@@ -67,9 +67,13 @@ Each opening or refresh owns the task state version at the moment it passed step
 | Unchanged, needs human | Draft opened, or the earlier PR updated and turned back into a draft | needs human |
 | Changed (cancelled, reassigned, new attempt, new head) | Opened | Unchanged; the PR is recorded so it can be reused or closed later |
 
+After an update, the read-back polls up to 5 times, half a second apart, until GitHub shows the pushed head, because GitHub updates a PR's head a moment after a push.
+
+When the check matches (or is unknown) and the task's earlier PR is open and ready for review, publish turns it back into a draft. A task that is not being published as ready never leaves its PR ready for review.
+
 The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.
 
-**Transport.** The PR title and description go to `gh api --input -` as a JSON body on stdin (`github/run-with-input.ts`), never as arguments: Linux limits one argument to 128 KiB, and a 60,000-character description of multibyte text is larger. The runner settles only after `gh` has exited, including on a timeout or abort: it sends SIGTERM, then SIGKILL after 5 seconds if `gh` is still running. The already-fixed check also waits for both of its reads to settle before it returns.
+**Transport.** The PR title and description go to `gh api --input -` as a JSON body on stdin (`github/run-with-input.ts`), never as arguments: Linux limits one argument to 128 KiB, and a 60,000-character description of multibyte text is larger. The runner settles only after `gh` has exited, including on a timeout or abort: it sends SIGTERM, then SIGKILL after 5 seconds if `gh` is still running, and if a process `gh` started keeps the output pipes open after `gh` exits, it closes them after 1 second. The already-fixed check uses the same runner, so its 12-second deadline always holds. The already-fixed check also waits for both of its reads to settle before it returns.
 
 **Environment.** Each `gh` process gets only an allowlist of variables: the path, home and locale; GitHub tokens, host and configuration directories; the D-Bus session bus that Linux keyring sign-in uses; and proxy and CA settings (`github/gh-env.ts`). Prompts, the pager and update checks are turned off.
 

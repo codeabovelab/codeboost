@@ -96,7 +96,15 @@ export class PullRequestPublisher {
     }, signal);
     signal?.throwIfAborted();
     const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
-    if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
+    if (result.outcome !== 'clear') {
+      // A task that is not published as ready never leaves its PR ready for review: its earlier ready PR becomes a draft.
+      // No await since recordAlreadyFixed, which re-read the task; the change only lowers what the PR offers.
+      if (earlier && live && !live.draft) {
+        const pr = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
+        if (earlier.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier.openingId, pr.number, pr.draft);
+      }
+      return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
+    }
     // Checked before the push: a refused publish must not move the branch.
     if (earlier && live && earlier.state === 'opened' && live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
     // No await since recordAlreadyFixed, whose transaction re-read the task: the push follows it directly.
@@ -106,7 +114,7 @@ export class PullRequestPublisher {
       const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft,
         ...(earlier.state === 'abandoned' ? { adopt: { number: live.number, url: live.url } } : {}) });
       const pr = await this.#pulls.refresh(live.number, {
-        base: earlier.base, headBranch: branch, draft, ready: !draft, marker: marker(earlier.openingId),
+        base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
       const status = this.#store.recordPullRequestOpened(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
@@ -138,10 +146,12 @@ export class PullRequestPublisher {
     // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed.
     const refreshing = this.#store.taskPullRequests(identity).find(pr => pr.refresh !== null);
     if (refreshing) this.#store.abandonRefresh(identity, refreshing.openingId);
-    const lost = this.#store.taskPullRequests(identity).find((pr: TaskPullRequest) => pr.state === 'opening');
+    // Read once: abandonRefresh above is the only write before this point.
+    const prs = this.#store.taskPullRequests(identity);
+    const lost = prs.find((pr: TaskPullRequest) => pr.state === 'opening');
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
-    const rows = this.#branchRows(this.#store.taskPullRequests(identity), lost.headBranch, lost.base);
+    const rows = this.#branchRows(prs, lost.headBranch, lost.base);
     const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
     if (pr && pr.marker !== marker(lost.openingId)) {

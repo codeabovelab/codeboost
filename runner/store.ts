@@ -1034,6 +1034,15 @@ export class Store {
       return this.#task(key).status as TaskStatus;
     });
   }
+  /** Records that the task's open PR is now a draft (after a check matched). The task status does not change. */
+  recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      if (this.#run("UPDATE task_pull_requests SET draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='opened' AND number=?",
+        draft ? 1 : 0, new Date().toISOString(), key, openingId, number).changes !== 1) throw new GuardRefusal('Unknown pull request.');
+      this.#touch(key);
+    });
+  }
   /** Recovery found no PR for an opening whose outcome was lost; a new check and opening follow. */
   abandonPullRequestOpening(identity: PlanIdentity, openingId: string): void {
     const key = identityKey(identity);

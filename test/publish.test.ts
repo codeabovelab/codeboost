@@ -66,6 +66,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
       return { ...open[1], marker: open[0] };
     },
+    async markDraft(number, input) {
+      log.push(`draft ${number}`);
+      const pr = { ...live.get(input.marker)!, draft: true }; live.set(input.marker, pr); return pr;
+    },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
       if (options.refreshFails) throw new Error('timeout reading the PR back');
@@ -155,7 +159,7 @@ describe('opening the task PR', () => {
     } };
     const opened: string[] = [];
     const publisher = new PullRequestPublisher(store, { checks: gate, pusher: { async push() {} },
-      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async refresh() { throw new Error('unreachable'); } } }, config);
+      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); } } }, config);
     await expect(publisher.publish(identity)).rejects.toThrow(GuardRefusal);
     expect(opened).toEqual([]);
   });
@@ -256,6 +260,8 @@ describe('recovering a lost opening', () => {
     const [draft] = store.taskPullRequests(identity);
     expect(again.log).toEqual([`find <!-- codeboost:opening=${draft!.openingId} -->`, 'check', 'push codeboost/issue-12-task-42 003', 'refresh 100 ready']);
     expect(again.opened[0]!.body).not.toContain('Needs human');
+    // The refresh waits for GitHub to show the pushed head.
+    expect(again.opened[0]).toMatchObject({ headSha: oid(3) });
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false, headSha: oid(3), state: 'opened' }]);
   });
   it('keeps a needs-human task in needs human when it reuses its earlier ready PR, and turns that PR back into a draft', async () => {
@@ -337,6 +343,17 @@ describe('recovering a lost opening', () => {
     await expect(publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
     expect(log).toEqual([]);
     expect(store.getTask(identity).status).toBe('running');
+  });
+  it('turns the earlier ready PR back into a draft when the check matches, so it is never left ready for review', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    expect(store.getTask(identity).status).toBe('in review');
+    rerun(store);
+    const again = harness(store, { live, next, results: [{ outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] }] });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
+    expect(again.log).toEqual([expect.stringMatching(/^find /), 'check', 'draft 100']);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+    expect(store.getTask(identity).status).toBe('possibly already fixed');
   });
   it('opens a new PR when the earlier draft was closed, and still excludes the old draft from the check', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
@@ -469,6 +486,12 @@ describe('running gh with a request body on stdin', () => {
     controller.abort(new Error('stop'));
     await expect(started).rejects.toThrow('stop');
   });
+  it('settles after the process exits even when a child it started keeps the pipes open', async () => {
+    const started = Date.now();
+    const script = 'require("child_process").spawn(process.execPath,["-e","setTimeout(()=>{},3000)"],{stdio:["ignore","inherit","inherit"]}).unref();process.exit(0)';
+    await expect(runWithInput(process.execPath, ['-e', script], { pipeGraceMs: 100 })).resolves.toBe('');
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
   it('reports a failing exit with its stderr', async () => {
     await expect(runWithInput(process.execPath, ['-e', 'console.error("HTTP 422");process.exit(1)'], {})).rejects.toThrow(/exit 1\): HTTP 422/);
   });
@@ -524,6 +547,27 @@ describe('GitHub PR adapter', () => {
     // Closed between the lookup and the refresh: refused, so the task never moves to in review without an open PR.
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ state: 'closed' }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/not open/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ state: 'closed' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/not open/);
+  });
+  it('waits for GitHub to show the pushed head before returning a refresh', async () => {
+    let gets = 0;
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
+      if (args[0] === 'pr') return '';
+      if (args.includes('GET') || !args.includes('-X')) { gets++; return JSON.stringify(response({ draft: false, head: { sha: gets < 3 ? oid(2) : oid(3), ref: 'codeboost/issue-12-task', repo: { full_name: 'owner/repo' } } })); }
+      return JSON.stringify(response({ draft: false }));
+    });
+    expect(await gh.refresh(7, { ...input, draft: false, ready: true, headSha: oid(3) })).toMatchObject({ headSha: oid(3) });
+    expect(gets).toBe(3);
+  });
+  it('marks an open ready PR as a draft, and leaves a draft alone', async () => {
+    const calls: string[][] = [];
+    let draft = false;
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
+      calls.push([...args]); if (args[0] === 'pr') { draft = true; return ''; } return JSON.stringify(response({ draft }));
+    });
+    expect(await gh.markDraft(7, input)).toMatchObject({ draft: true });
+    expect(calls.filter(call => call[0] === 'pr')).toEqual([['pr', 'ready', '7', '--undo', '--repo', 'owner/repo']]);
+    await gh.markDraft(7, input);
+    expect(calls.filter(call => call[0] === 'pr')).toHaveLength(1);
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];

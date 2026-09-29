@@ -22,8 +22,12 @@ export interface PullRequestGateway {
    */
   findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
-  refresh(number: number, input: OpenPullRequestInput & { ready: boolean }, signal?: AbortSignal): Promise<OpenedPullRequest>;
+  refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
+  /** Turns an open PR codeboost opened back into a draft; a no-op for a draft. */
+  markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
+/** GitHub updates a PR's head a moment after a push; the read-back waits up to this many polls for the pushed head. */
+export const HEAD_POLLS = 5, HEAD_POLL_MS = 500;
 
 const SHA = /^[a-f0-9]{40}$/;
 const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/;
@@ -90,7 +94,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return { ...pr, marker: found[0]! };
   }
 
-  async refresh(number: number, input: OpenPullRequestInput & { ready: boolean }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+  async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
     if (!input.body.includes(input.marker)) throw new Error('The pull request description must carry its marker.');
@@ -100,8 +104,27 @@ export class GhPullRequestGateway implements PullRequestGateway {
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
     else if (input.draft && !patched.draft) await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
-    const { body, ...pr } = this.#pull(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal), input);
-    if (pr.number !== number || !body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
-    return pr;
+    return this.#readBack(number, input, input.headSha, signal);
+  }
+
+  async markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+    this.#validate(input);
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
+    const current = await this.#readBack(number, input, undefined, signal);
+    if (!current.draft) await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
+    return current.draft ? current : this.#readBack(number, input, undefined, signal);
+  }
+
+  /** Reads the PR back; when `headSha` is given, polls briefly until GitHub shows it, then returns the last answer. */
+  async #readBack(number: number, input: { base: string; headBranch: string; marker: string }, headSha: string | undefined, signal?: AbortSignal): Promise<OpenedPullRequest> {
+    for (let poll = 1; ; poll++) {
+      const { body, ...pr } = this.#pull(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal), input);
+      if (pr.number !== number || !body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
+      if (headSha === undefined || pr.headSha === headSha || poll >= HEAD_POLLS) return pr;
+      await new Promise((resolve, reject) => {
+        const timer = setTimeout(resolve, HEAD_POLL_MS);
+        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+      });
+    }
   }
 }

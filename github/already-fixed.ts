@@ -1,9 +1,6 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import type { RunGh } from './merge.ts';
 import { ghEnvironment } from './gh-env.ts';
-
-const runFile = promisify(execFile);
+import { runWithInput } from './run-with-input.ts';
 
 /**
  * The pre-PR "already fixed" check (design, "Checking whether the issue is already fixed"). It reports a match when
@@ -98,7 +95,8 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     if (config.deadlineMs !== undefined && (!Number.isSafeInteger(config.deadlineMs) || config.deadlineMs < 1)) throw new Error('Invalid check deadline.');
     this.repository = config.repository;
     this.deadlineMs = config.deadlineMs ?? DEFAULT_CHECK_DEADLINE_MS;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() })).stdout);
+    // runWithInput escalates to SIGKILL, so an aborted stage always settles and the check's single deadline holds.
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
