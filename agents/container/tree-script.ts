@@ -6,8 +6,8 @@
  *   metadata and any work-tree link that can lead out of the work tree, resolved as the container's kernel would.
  *
  * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime,
- *   link target and a regular file's content. Content is hashed rather than trusted to the times, which a write does
- *   not always move; loose objects and packs, which are named by their content and most of the volume, are not.
+ *   link target and every regular file's content. Content is hashed rather than trusted to the times, which a write
+ *   does not always move.
  * - `snapshot <baseline> <link>...` (in /work) resolves each declared link as the kernel would in an agent container,
  *   one part at a time, and records the state of its target and everything beneath it.
  * - `inspect <baseline> <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of
@@ -94,9 +94,9 @@ sub metadata_digest {
     my $path = shift @pending; my $full = $path eq "." ? $root : "$root/$path";
     my @stat = lstat $full; fail(6, "could not stat metadata " . shown($path) . ": $!") unless @stat;
     my ($link, $directory, $file) = (-l _, -d _, -f _);
-    # Loose objects and packs are named by their content and make up most of the volume; hashing them would slow every
-    # allocation. Every other file (pack indexes, info/alternates, refs, the index) is hashed.
-    my $content = $link ? readlink $full : $file && $path !~ m{^objects/(?:[0-9a-f]{2}/[0-9a-f]+|pack/pack-[0-9a-f]+\.pack)\z} ? file_digest($full) : "";
+    # Every file's content, objects and packs included: a name that says what the content is proves nothing if the
+    # bytes can change without moving the times.
+    my $content = $link ? readlink $full : $file ? file_digest($full) : "";
     $sha->add(join("\0", $path, @stat[1, 2, 4, 5, 7, 10, 9], $content), "\0");
     unshift @pending, map { join_path($path, $_) } children($full) if $directory;
   }

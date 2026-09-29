@@ -22,7 +22,7 @@ export interface TaskFilesystems {
   readonly metadataInodes: number;
   /**
    * SHA-256 over every entry of the metadata volume (path, inode, mode, owner, size, ctime, mtime, link target, and a
-   * file's content except loose objects and packs), taken by the seeder as its last step. F records it: `inspectTaskChanges` compares it to report any change under `.git`,
+   * file's content), taken by the seeder as its last step. F records it: `inspectTaskChanges` compares it to report any change under `.git`,
    * and needs it back for a recovery handle.
    */
   readonly metadataBaseline: string;
