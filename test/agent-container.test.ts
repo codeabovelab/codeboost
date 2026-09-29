@@ -974,6 +974,37 @@ describe('real Docker agent isolation', () => {
       expect(after.linkTargetChanges.filter(change => change.link === 'pl')).toHaveLength(1);
     }, 180_000);
 
+    it('keeps to the work tree when the agent reshapes the path to a declared link\'s target', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'd', 'lib'), { recursive: true }); writeFileSync(join(source, 'd', 'lib', 'x'), 'x\n');
+        symlinkSync('d/lib', join(source, 'L'));
+        // Through a missing directory and back up: where that leads depends on what m becomes, so nothing is watched.
+        mkdirSync(join(source, 'real')); writeFileSync(join(source, 'real', 'f'), 'f\n'); symlinkSync('real', join(source, 'via'));
+        writeFileSync(join(source, 'plain'), 'p\n');
+        symlinkSync('m/../via/f', join(source, 'M')); symlinkSync('m/../plain', join(source, 'P'));
+        // A tracked file the agent turns into a directory.
+        writeFileSync(join(source, 'docs'), 'docs\n');
+      } });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['L', 'M', 'P'], { imageId });
+      expect(linkSnapshot.links[0]).toMatchObject({ link: 'L', status: 'present', target: 'd/lib' });
+      for (const record of linkSnapshot.links.slice(1)) {
+        expect(record).toMatchObject({ status: 'absent', anchor: { path: '.' } });
+        expect(record.target).toBeUndefined();
+      }
+      // Untouched: nothing to report for any of them.
+      expect((await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId })).linkTargetChanges)
+        .toEqual([]);
+      asAgent(data.filesystems, 'rm -rf d && ln -s /usr d && rm docs && mkdir -p docs/api && printf "a\\n" > docs/api/x');
+      // The inspection must not walk /usr through the new link: it reports the change and finishes.
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest.linkTargetChanges).toEqual(expect.arrayContaining([
+        { link: 'L', target: 'd/lib', path: 'L', change: 'retargeted' },
+        { link: 'L', target: 'd/lib', path: 'd/lib', change: 'status' }]));
+      const byPath = new Map(manifest.changes.map(change => [change.path, change]));
+      expect(byPath.get('docs')).toMatchObject({ kind: 'modify', oldType: 'file', newType: 'directory' });
+      expect(byPath.get('docs/api/x')).toMatchObject({ kind: 'add' });
+    }, 180_000);
+
     it('reports what Git would skip: ignored files and directories under base\'s rules, fifos and .git parts', async () => {
       const data = fixture({ hostile: source => {
         writeFileSync(join(source, '.gitignore'), '*.log\n/build/\n');
@@ -1097,8 +1128,11 @@ describe('real Docker agent isolation', () => {
       // A surrogate code point: a lax decoder accepts it, and Node would show it as U+FFFD, like another real name.
       asAgent(data.filesystems, `rm -f bad*; printf "x\\n" > "$(printf "s\\355\\240\\200")"`);
       await expect(inspect()).rejects.toThrow(/s\\xed\\xa0\\x80 is not printable UTF-8/);
+      // An invisible right-to-left mark: "x" and "x\u200f" would show as one name.
+      asAgent(data.filesystems, `rm -f s*; printf "x\\n" > "$(printf "x\\342\\200\\217")"`);
+      await expect(inspect()).rejects.toThrow(/x\\xe2\\x80\\x8f is not printable UTF-8/);
       // A C1 control character (U+009B, which some terminals read as the start of an escape sequence).
-      asAgent(data.filesystems, `rm -f s*; printf "x\\n" > "$(printf "c\\302\\233")"`);
+      asAgent(data.filesystems, `rm -f x*; printf "x\\n" > "$(printf "c\\302\\233")"`);
       await expect(inspect()).rejects.toThrow(/c\\xc2\\x9b is not printable UTF-8/);
       // A name longer than the manifest carries.
       asAgent(data.filesystems, `rm -f c*; mkdir -p "$(printf 'd%.0s' $(seq 1 200))" && cd "$(printf 'd%.0s' $(seq 1 200))" && for i in 1 2 3 4 5 6; do mkdir "$(printf 'e%.0s' $(seq 1 200))" && cd "$(printf 'e%.0s' $(seq 1 200))"; done && : > f`);

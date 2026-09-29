@@ -75,8 +75,9 @@ export interface DeclaredLink extends Omit<Partial<TargetState>, 'status'> {
   /** The target's path in the work tree, when it resolves inside it through real directories. */
   readonly target?: string;
   /**
-   * Besides the target states: `not-a-link` (the declared path is not a symlink), `outside` (the target is absolute
-   * or climbs out of the work tree) and `metadata` (it points into `.git`). None of those has a target to watch.
+   * Besides the target states: `not-a-link` (the declared path is not a symlink), `outside` (the target is outside the
+   * work tree, is the work tree itself, or passes through anything outside it on the way, which D cannot check from the
+   * storage) and `metadata` (it points into `.git`). None of those has a target to watch.
    */
   readonly status: TargetState['status'] | 'not-a-link' | 'outside' | 'metadata';
 }
@@ -125,15 +126,17 @@ const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const OUTPUT_SLACK = 1024 * 1024;
 const DIGEST = /^[0-9a-f]{64}$/;
 // A declared path names one entry of the work tree by its Git path: relative, no empty, `.` or `..` part, and not the
-// metadata. Control characters cannot appear in a manifest.
+// metadata. It must be a name the manifest can carry: no control or format characters or separators, and not too long.
 const assertDeclaredPath = (path: unknown) => {
-  if (typeof path !== 'string' || path === '' || path.startsWith('/') || /[\x00-\x1f\x7f-\x9f]/.test(path)
+  if (typeof path !== 'string' || path === '' || path.startsWith('/') || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/u.test(path)
     || Buffer.byteLength(path) > MAXIMUM_NAME_BYTES
     || path.split('/').some(part => part === '' || part === '.' || part === '..') || path.split('/')[0] === '.git')
     throw new Error(`Declared path ${JSON.stringify(path)} is not a path in the work tree.`);
 };
-// Every argument, and the whole list, must fit what the kernel lets one exec carry, with room for the script.
-const MAXIMUM_ARGUMENT_BYTES = 64 * 1024;
+// Every argument, and the whole list, must fit what the kernel lets one exec carry, with room for the script. It holds
+// the most a snapshot can pass on to its inspection: every declared link and every distinct target, each at the name
+// limit, so a snapshot that was accepted can always be inspected.
+const MAXIMUM_ARGUMENT_BYTES = 2 * MAXIMUM_DECLARED_LINKS * (MAXIMUM_NAME_BYTES + 1);
 const assertArguments = (values: readonly string[]) => {
   if (values.reduce((total, value) => total + Buffer.byteLength(value) + 1, 0) > MAXIMUM_ARGUMENT_BYTES)
     throw new Error('Too many declared paths to pass to the storage container at once.');

@@ -34,7 +34,8 @@ vi.mock('../agents/container/image.ts', async importOriginal => ({
 const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTaskFilesystemsAsync,
   removeTaskFilesystems } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
-const { inspectTaskChanges, manifestDigest } = await import('../agents/container/changes.ts');
+const { inspectTaskChanges, manifestDigest, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES } =
+  await import('../agents/container/changes.ts');
 
 // Every fake Docker call starts a Node process, so a loaded machine needs more than the default 5 s per test.
 vi.setConfig({ testTimeout: 60_000 });
@@ -103,8 +104,9 @@ if (a === 'run' && args.includes('io.codeboost.task-storage=inspect')) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
   }
   fs.rmSync(path.join(state, name + '.json'));
-  process.stdout.write(fs.readFileSync(path.join(state, 'inspect-output')));
-  process.exit(0);
+  // Exit only once the write is done: exiting at once cuts a pipe write past 64 KiB.
+  process.stdout.write(fs.readFileSync(path.join(state, 'inspect-output')), () => process.exit(0));
+  return;
 }
 if (a === 'run') process.exit(0);
 if (b === 'inspect') {
@@ -375,6 +377,22 @@ describe('task change inspection', () => {
     rmSync(join(state, 'hang-inspect'));
     removeTaskFilesystems(filesystems);
   }, 60_000);
+
+  it('always accepts, at inspection, the largest set of declared links a snapshot accepts', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    const long = (prefix: string, index: number) => `${prefix}${index}`.padEnd(MAXIMUM_NAME_BYTES, 'x');
+    const links = Array.from({ length: MAXIMUM_DECLARED_LINKS },
+      (_, index) => ({ link: long('link', index), status: 'absent' as const, target: long('target', index),
+        anchor: { path: '.', type: 'directory' as const, mode: '40755', size: 0, ino: 1, ctime: '0', mtime: '0' } }));
+    writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: BASELINE, head: BASE, agentCommits: [],
+      nestedGitlinkContent: [], changes: [], links, targets: Object.fromEntries(links.map(link => [link.target,
+        { status: 'absent', anchor: link.anchor }])) }));
+    const manifest = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: { links } });
+    expect(manifest.linkTargetChanges).toEqual([]);
+    await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE,
+      linkSnapshot: { links: [...links, { link: 'one-more', status: 'not-a-link' }] } })).rejects.toThrow('linkSnapshot');
+    removeTaskFilesystems(filesystems);
+  });
 
   it('rejects an invalid base or a declared target outside the work tree before any Docker call', async () => {
     const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());

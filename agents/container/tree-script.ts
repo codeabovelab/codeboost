@@ -21,7 +21,7 @@ export const MAXIMUM_CHANGES = 10_000;
 /** Entries recorded beneath all declared links' targets together, in one snapshot or inspection. */
 export const MAXIMUM_TARGET_ENTRIES = 20_000;
 /** Declared links in one snapshot or inspection. */
-export const MAXIMUM_DECLARED_LINKS = 1_000;
+export const MAXIMUM_DECLARED_LINKS = 200;
 /** Bytes in one path or link target the manifest carries; a longer one fails the run (exit 8). */
 export const MAXIMUM_NAME_BYTES = 1_024;
 // JSON at most doubles a name (a quote or backslash is escaped; control characters are refused). A change carries at
@@ -47,15 +47,16 @@ $SIG{__DIE__} = sub { return if $^S; print STDERR "tree script failed: @_"; exit
 sub shown { my $p = shift; $p =~ s/([^\w.\/ -])/sprintf("\\x%02x", ord $1)/ge; return $p }
 sub fail { my ($code, $message) = @_; print STDERR "$message\n"; exit $code }
 # The manifest carries names as JSON text. Strict UTF-8 refuses surrogates and code points past U+10FFFF, which a lax
-# decoder would pass and Node would turn into U+FFFD, so two different names could show as one. Control characters (C0,
-# DEL, C1) and the line and bidirectional controls that can make a name display as another are refused too, as is a
+# decoder would pass and Node would turn into U+FFFD, so two different names could show as one. Control and format
+# characters and line and paragraph separators (Unicode Cc, Cf, Zl, Zp: C0, DEL, C1, bidirectional marks and overrides,
+# zero-width characters, the byte order mark) can make a name display as another, so they are refused too, as is a
 # name longer than the manifest carries.
 sub text {
   my ($bytes, $what) = @_;
   fail(8, "$what " . shown(substr($bytes, 0, 64)) . "... is longer than $MAXIMUM_NAME_BYTES bytes") if length $bytes > $MAXIMUM_NAME_BYTES;
   my $text = eval { Encode::decode("UTF-8", $bytes, Encode::FB_CROAK | Encode::LEAVE_SRC) };
   fail(8, "$what " . shown($bytes) . " is not printable UTF-8")
-    if !defined $text || $text =~ /[\x00-\x1f\x7f-\x9f\x{2028}\x{2029}\x{202a}-\x{202e}\x{2066}-\x{2069}]/;
+    if !defined $text || $text =~ /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/;
   return $text;
 }
 sub children {
@@ -148,11 +149,17 @@ sub target_entry { my $path = shift; my $entry = entry($path); $entry->{oid} = f
 # existing entry. Only a target reached through real directories is watched. The path is tracked from the filesystem
 # root, so "/work/x" and "../work/x" are inside; anywhere else outside /work is outside.
 my $target_entries = 0;
-# The anchor is the nearest entry that exists, walking up from the given path: the work tree itself at the least.
+# The anchor is the deepest entry on the way to the given path reached through real directories only: walking down one
+# part at a time, it stops at the first part that is missing, a link or not a directory. It never reads through a link.
 sub anchored {
-  my ($status, $path) = @_;
-  while ($path ne "" && !lstat $path) { my @parts = split m{/}, $path; pop @parts; $path = join "/", @parts }
-  return { status => $status, anchor => target_entry($path eq "" ? "." : $path) };
+  my ($status, $path) = @_; my $anchor = ""; my $prefix = "";
+  for my $part (split m{/}, $path) {
+    $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
+    last unless @stat;
+    $anchor = $prefix;
+    last if -l _ || !-d _;
+  }
+  return { status => $status, anchor => target_entry($anchor eq "" ? "." : $anchor) };
 }
 sub resolve {
   my ($link, $walk) = @_; my %record = (link => text($link, "declared path"));
@@ -170,10 +177,15 @@ sub resolve {
   my @at = $raw =~ m{^/} ? () : ("work", @parents);
   my @parts = grep { $_ ne "" && $_ ne "." } split m{/}, $raw;
   # Once a directory on the way is missing, the rest is followed by name: that is where the link leads if the missing
-  # directories are created, so the target stays the same whether they exist or not.
+  # directories are created as directories, so the target stays the same whether they exist or not. A ".." after a
+  # missing part cannot be followed by name (what it climbs back into is not known), so that link is absent with no
+  # target.
   my $missing = 0;
   for my $i (0 .. $#parts) {
-    if ($parts[$i] eq "..") { pop @at; next }
+    if ($parts[$i] eq "..") {
+      return { %record, %{ anchored("absent", join "/", @at[1 .. $#at]) } } if $missing;
+      pop @at; next;
+    }
     push @at, $parts[$i];
     return { %record, status => "outside" } if $at[0] ne "work";
     return { %record, status => "metadata" } if @at > 1 && $at[1] eq ".git";
@@ -190,12 +202,19 @@ sub resolve {
   my @final = lstat $target;
   return { %record, target => text($target, "path"), %{ $walk ? target_state($target) : { status => @final ? "present" : "absent" } } };
 }
-# The state of a target whose parents are real directories: absent (anchored on its parent), present with every entry
-# beneath it walked without following links, or through-link when a link inside a directory target leads elsewhere.
+# The state of a target: absent, present with every entry beneath it walked without following links, or through-link
+# when a part on the way is a link (the agent may have made one since the snapshot) or a link inside a directory target
+# leads elsewhere. Its parents are checked one part at a time, so nothing outside the work tree is ever read.
 sub target_state {
-  my $target = shift; my @parents = split m{/}, $target; pop @parents;
+  my $target = shift; my @parents = split m{/}, $target; pop @parents; my $prefix = "";
+  for my $part (@parents) {
+    $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
+    return anchored("absent", $target) unless @stat;
+    return anchored("through-link", $target) if -l _;
+    return anchored("absent", $target) unless -d _;
+  }
   my @stat = lstat $target;
-  return anchored("absent", join "/", @parents) unless @stat;
+  return anchored("absent", $target) unless @stat;
   my @entries; my @pending = ($target);
   while (@pending) {
     my $path = shift @pending;
@@ -252,10 +271,22 @@ my $ignore_pid = do {
 # a file (one where base tracked a .gitignore) is moved aside. A path goes in without a trailing slash: with one, a
 # pattern such as "build/*" would match the directory itself and hide what a negation re-includes.
 my $aside = 0;
+sub move_aside {
+  my $path = shift; mkdir "/tmp/aside" unless -d "/tmp/aside";
+  rename $path, "/tmp/aside/" . $aside++ or fail(4, "could not move a mirrored entry aside: $!");
+}
 sub is_ignored {
-  my ($path, $directory) = @_; my $mirror = "/tmp/ignore/$path";
-  if ($directory) { mkdir $mirror or fail(4, "could not mirror a directory: $!") unless -d $mirror }
-  elsif (-d $mirror) { mkdir "/tmp/aside" unless -d "/tmp/aside"; rename $mirror, "/tmp/aside/" . $aside++ or fail(4, "could not move a directory aside: $!") }
+  my ($path, $directory) = @_; my $mirror = "/tmp/ignore";
+  my @parts = split m{/}, $path; my $name = pop @parts;
+  # Every parent is a directory in the work tree (the walk is inside it), so it is one in the mirror too: even where base
+  # tracked a file, or a .gitignore stands in the way.
+  for my $part (@parts, $directory ? ($name) : ()) {
+    $mirror .= "/$part";
+    next if -d $mirror && !-l $mirror;
+    move_aside($mirror) if -e $mirror || -l $mirror;
+    mkdir $mirror or fail(4, "could not mirror a directory: $!");
+  }
+  if (!$directory) { $mirror .= "/$name"; move_aside($mirror) if -d $mirror }
   print $ignore_in "./$path\0"; $ignore_in->flush;
   local $/ = "\0"; my @fields;
   for (1 .. 4) { my $field = <$ignore_out>; fail(4, "git check-ignore stopped answering") unless defined $field; chomp $field; push @fields, $field }
