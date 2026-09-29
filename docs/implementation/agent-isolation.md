@@ -83,8 +83,9 @@ Use only these entry points to run an agent:
    `removeTaskFilesystems`. `base` is the full ID of the last commit codeboost made in that storage. It returns at
    most 1 MiB of diff (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
    A changed file over 8 MiB, an untracked nested repository, a path Git will not add, an entry named `.git`, a fifo
-   or socket, and an ignored untracked path each appear as a `codeboost:` notice line, not a diff. When Git fails, the
-   error carries Git's first error line.
+   or socket, an ignored untracked path, a submodule directory with content, and a changed file whose `ident` or
+   `working-tree-encoding` attribute changes what the diff shows each appear as a `codeboost:` notice line. When Git
+   fails, the error carries Git's last two error lines.
 6. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
    token. It removes agent containers, egress proxies, seeders, export containers and networks, and resolves once they are gone. It keeps

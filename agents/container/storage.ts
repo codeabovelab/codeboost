@@ -537,13 +537,17 @@ export interface ExportOptions extends PreparationOptions {
 // only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. A Git warning that it could
 // not read a directory or path also fails it, since Git then diffs that path as absent; other warnings do not.
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
-// read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
-// diff programs and text conversion are off, and the worktree and attributes file are pinned. A populated submodule's
+// read-only. Worktree attributes are the agent's. A filter or diff driver needs config to run anything; external diff
+// programs and text conversion are off, and the worktree and attributes file are pinned. Two built-in attributes still
+// change what the diff shows without config (`ident` collapses `$Id: ... $`, `working-tree-encoding` re-encodes), so a
+// changed or new file with either set is named in a notice. Line-ending attributes change only line endings, and
+// overriding them would make every file a repository checks out with CRLF look changed, so they are left alone. A populated submodule's
 // own config is the agent's, so Git never looks inside one: every diff passes --ignore-submodules on the command line,
 // which, unlike the config default, overrides the worktree's .gitmodules and applies to plumbing diff-index too. A
 // submodule's pointer change is still exported, but no `git status` runs inside it, and so none of its filters. core.safecrlf is off
 // so ordinary line-ending attributes (`text=auto`, `eol=crlf`) do not warn on stderr and fail a correct export.
-const EXPORT_SCRIPT = [
+// Exported only so tests can run it with failing stand-ins for the tools it uses; `exportTaskDiff` is the entry point.
+export const EXPORT_SCRIPT = [
   'set -eu',
   'base=$1 limit=$2',
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
@@ -619,6 +623,12 @@ const EXPORT_SCRIPT = [
   '        for my $part (@part) { $p .= "$part/"; next PATH if $dir{$p} } print $out "$path\\0" }',
   '      close($out) or die }\'',
   '  g ls-files -z --stage > /tmp/export-stage',
+  '  # The task clone is not recursive, so a submodule is an empty directory. Git never lists files under it, and',
+  '  # --ignore-submodules keeps it from looking inside, so anything the agent put there (files, or a repository with',
+  '  # commits) would vanish. A submodule directory that is not empty, or cannot be read, is named in a notice.',
+  '  perl -0 -ne \'chomp; next unless /^160000 \\S+ \\d+\\t(.*)\\z/s; my $p = $1; next if -l $p || !-d _;',
+  '    my $d; my $full = !opendir($d, $p) || grep { $_ ne "." && $_ ne ".." } readdir $d;',
+  '    print "$p\\0" if $full\' /tmp/export-stage > /tmp/export-gitlink',
   '  { find . -path ./.git -prune -o -name .git -print0 -prune -o \\( -type p -o -type s \\) -print0 2>/dev/null || true; } \\',
   '    | perl -0 -e \'my %skip; for my $f ("/tmp/export-ignored", "/tmp/export-nested") { open(my $h, "<", $f) or die;',
   '      while (<$h>) { chomp; $skip{$_} = 1 } }',
@@ -642,6 +652,16 @@ const EXPORT_SCRIPT = [
   '  while IFS= read -r -d "" path; do',
   '    printf "codeboost: %q is over 8 MiB; if it changed, its content is not exported\\n" "$path"',
   '  done < /tmp/export-large',
+  '  while IFS= read -r -d "" path; do',
+  '    printf "codeboost: submodule directory %q has content in the task worktree; it is not exported\\n" "$path"',
+  '  done < /tmp/export-gitlink',
+  '  # A changed or new file whose attributes make Git show something other than its bytes (see above).',
+  '  cat /tmp/export-changed /tmp/export-new | g check-attr -z --stdin ident working-tree-encoding \\',
+  '    | perl -0 -ne \'chomp; push @f, $_; if (@f == 3) { my ($path, $attr, $value) = @f; @f = ();',
+  '      print "$path\\0$attr\\0" if $value ne "unspecified" && $value ne "unset" && !$seen{$path}++ }\' > /tmp/export-attrs',
+  '  while IFS= read -r -d "" path && IFS= read -r -d "" attr; do',
+  '    printf "codeboost: %q has the %s attribute, so its diff may not show its real bytes\\n" "$path" "$attr"',
+  '  done < /tmp/export-attrs',
   '  # An untracked nested repository cannot be diffed and is named in a notice; %q keeps its name on one line.',
   '  while IFS= read -r -d "" path; do',
   '    printf "codeboost: untracked directory %q is a nested repository; its contents are not exported\\n" "$path"',
@@ -674,12 +694,16 @@ const EXPORT_SCRIPT = [
   '      || /^(error|fatal): .*Input\\/output error$/) && n < 101 { print; n++; next }',
   '    /^(error|fatal): / { before = last; last = $0 }',
   '    END { if (before != "") print before > "/tmp/export-errors"; if (last != "") print last > "/tmp/export-errors" }\' \\',
-  '    > /tmp/export-failure 3>&-; return "${PIPESTATUS[0]}"; } 3>&1',
+  '    > /tmp/export-failure 3>&-',
+  '    # The filter writes its file when it exits; if it failed (for example /tmp full), a read failure may be missing.',
+  '    local s=("${PIPESTATUS[@]}"); if [ "${s[1]}" -ne 0 ]; then return 98; fi; return "${s[0]}"; } 3>&1',
   '}',
   ': > /tmp/export-errors',
-  'filtered | head -c "$limit" | base64 -w0',
+  '# tee keeps what head passed on, so SIGPIPE can be accepted only when head really stopped at the limit.',
+  'filtered | head -c "$limit" | tee /tmp/export-out | base64 -w0',
   'statuses=("${PIPESTATUS[@]}")',
   'set -e',
+  'if [ "${statuses[0]}" -eq 98 ]; then echo "the export could not check Git\'s warnings" >&2; exit 5; fi',
   '# Git also looks up attribute and ignore files through a symlink that replaced a tracked directory. What is behind it',
   '# is not part of the worktree (the diff shows the directory becoming a link), so a failure there is not one. Past 100',
   '# lines the rest were not kept, so that fails too.',
@@ -698,13 +722,16 @@ const EXPORT_SCRIPT = [
   '  exit 6',
   'fi',
   'if [ "${statuses[0]}" -eq 7 ]; then echo "more than 1,000 changed files are over 8 MiB; the diff cannot be exported" >&2; exit 7; fi',
+  'if [ "${statuses[0]}" -eq 141 ] && [ "$(stat -c %s /tmp/export-out)" -ne "$limit" ]; then',
+  '  echo "git stopped on SIGPIPE before the output reached its limit" >&2; exit 5',
+  'fi',
   'if [ "${statuses[0]}" -ne 0 ] && [ "${statuses[0]}" -ne 141 ]; then',
   '  # Git\'s last two errors say why it stopped (earlier ones can be about paths behind a symlink, which do not fail it).',
   '  # They can quote agent-chosen names, so they are cut short and kept to printable text.',
   '  detail=$(awk \'NR > 1 { printf "; " } { printf "%s", $0 }\' /tmp/export-errors | head -c 400 | tr -d "\\000-\\010\\013-\\037")',
   '  echo "git failed while exporting the diff (status ${statuses[0]})${detail:+: $detail}" >&2; exit 4',
   'fi',
-  'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
+  'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ] || [ "${statuses[3]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');
 
 function* exportSteps(workVolume: string, metadataVolume: string, owner: ResourceOwner, options: ExportOptions,
