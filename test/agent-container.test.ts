@@ -236,9 +236,12 @@ describe('real Docker agent isolation', () => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
-    expect(() => prepareTaskFilesystems(clone, {
-      workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
-    }, imageId, testOwner())).toThrow('Git metadata contains a link');
+    const refused = (() => {
+      try { prepareTaskFilesystems(clone, { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024,
+        metadataInodes: 512 }, imageId, testOwner()); } catch (error) { return error; }
+    })();
+    expect(refused).toBeInstanceOf(UnusableRepositoryError);
+    expect((refused as Error).message).toMatch(/^Repository Git metadata contains a link: /);
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 

@@ -32,12 +32,16 @@ export interface TaskFilesystems {
  * seeder finds it; nothing was kept. Report it to the user and do not retry.
  */
 export class UnusableRepositoryError extends Error {}
-// The seeder's refusal (exit 11) as an UnusableRepositoryError with its whole reason; any other failure as it came.
+// The seeder's refusal (exit 11) as an UnusableRepositoryError with its reason; any other failure as it came.
 function* refusedRepository<T>(steps: Steps<T>): Steps<T> {
   try { return yield* steps; }
   catch (error) {
-    if (error instanceof DockerError && error.status === 11)
-      throw new UnusableRepositoryError(error.stderr.trim().slice(0, 2048), { cause: error });
+    // Docker can print its own warnings on stderr first (a host without swap accounting, say): the reason is the
+    // script's line, which starts "Repository".
+    if (error instanceof DockerError && error.status === 11) {
+      const reason = error.stderr.split('\n').find(line => line.startsWith('Repository ')) ?? error.stderr.trim();
+      throw new UnusableRepositoryError(reason.slice(0, 2048), { cause: error });
+    }
     throw error;
   }
 }
