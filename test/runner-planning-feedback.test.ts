@@ -9,6 +9,8 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer, type PlanningDeps } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
+import { ReviewService } from '../runner/review.ts';
+import { fixtureGit } from './fixtures/git.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
 import type { EditReply } from '../core/plan.ts';
 
@@ -92,6 +94,22 @@ describe('feedback from review actions', () => {
     const first = await api(app, 'POST', '/api/action', stale);
     expect(first.status).toBe(409);
     expect(await api(app, 'POST', '/api/action', stale)).toEqual(first);
+  });
+});
+
+describe('trusted plan context', () => {
+  it('reads the base tree itself, not a replacement object for it', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-f1e-')); roots.push(root);
+    const config = createDemo(join(root, 'demo')), service = new ReviewService(config);
+    try {
+      const snapshot = service.store.getSnapshot(config.identity);
+      const paths = () => service.planContext().baseEntries.map(entry => entry.path).sort();
+      const expected = paths();
+      expect(expected).not.toContain('debug.log');
+      // A replace ref makes plain Git read the head commit (which adds debug.log) wherever the base is named.
+      fixtureGit(config.repository, 'replace', snapshot.base, snapshot.head);
+      expect(paths()).toEqual(expected);
+    } finally { service.close(); }
   });
 });
 

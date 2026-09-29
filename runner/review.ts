@@ -5,7 +5,7 @@ import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { execFileSync } from 'node:child_process';
-import { isolatedGitEnvironment } from '../scripts/git-environment.ts';
+import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
 import type { BaseEntry, PlanContext } from '../core/plan.ts';
 import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
@@ -122,11 +122,13 @@ export class ReviewService {
       const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
       return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
     };
-    const listing = execFileSync('git', ['-c', 'core.hooksPath=/dev/null', 'ls-tree', '-rz', snapshot.base], { cwd: repository, env: isolatedGitEnvironment(), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
+    // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
+    const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], { cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer, stdio: ['ignore', 'pipe', 'pipe'] });
+    const listing = git(['ls-tree', '-rz', snapshot.base], 64 * 1024 * 1024);
     const baseEntries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
       const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
       if (mode === '160000') return { path, kind: 'gitlink' };
-      if (mode === '120000') return { path, kind: 'symlink', target: execFileSync('git', ['cat-file', 'blob', oid!], { cwd: repository, env: isolatedGitEnvironment(), encoding: 'utf8' }) };
+      if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!]) };
       return { path, kind: 'file' };
     });
     return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
