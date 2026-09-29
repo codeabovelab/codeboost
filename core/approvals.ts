@@ -3,7 +3,7 @@ import type { Plan, PlanItem } from './plan.ts';
 import type { Segment } from './linking.ts';
 
 /** Stable representation ignores object-key order and normalizes CRLF, not whitespace. */
-function stable(value: unknown): string {
+export function stable(value: unknown): string {
   if (typeof value === 'string') return JSON.stringify(value.replace(/\r\n/g, '\n'));
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (value !== null && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, val]) => `${JSON.stringify(key)}:${stable(val)}`).join(',')}}`;
@@ -33,11 +33,13 @@ export function applyChoices(plan: Plan, segments: readonly Segment[], choices: 
   });
 }
 export interface Approval { item: string; fingerprint: string }
-function fingerprint(item: PlanItem, segments: readonly Segment[], identity: PlanIdentity): string {
-  return stable({ identity: identityKey(identity), item, segments: segments.filter(s => s.row === item.id).map(s => ({
-    path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
-    content: s.content, context: s.context, owners: [...s.owners].sort(),
-  })) });
+/** Every segment field an approval covers. */
+export const reviewedSegment = (s: Segment) => ({
+  path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
+  content: s.content, context: s.context, owners: [...s.owners].sort(),
+});
+export function fingerprint(item: PlanItem, segments: readonly Segment[], identity: PlanIdentity): string {
+  return stable({ identity: identityKey(identity), item, segments: segments.filter(s => s.row === item.id).map(reviewedSegment) });
 }
 export function approveItem(plan: Plan, segments: readonly Segment[], itemId: string, identity: PlanIdentity, confirmNoChange = false): Approval {
   const item = plan.items.find(item => item.id === itemId);

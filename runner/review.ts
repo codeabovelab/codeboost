@@ -5,7 +5,8 @@ import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
-import { applyChoices, approvalStates, approveItem, choiceKeys } from '../core/approvals.ts';
+import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
+import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 
 export interface ReviewConfig { database: string; repository: string; identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
@@ -63,6 +64,29 @@ export class ReviewService {
     const contextIds = new Map(plan.items.map(item => [item.id,createHash('sha256').update(JSON.stringify(segments.filter(segment=>segment.row===item.id).map(segment=>segment.key))).digest('hex')]));
     const notes = this.store.getReviewNotes(identity).map(note => {const contextId=contextIds.get(note.item)!;return { ...note, contextId, answerOutdated: note.snapshotId!==snapshot.id || note.revision!==plan.revision || (!!note.answer?.contextId && note.answer.contextId!==contextId), outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) };});
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
+    // Names each stale item's stale state from every input that decides it, so the page keeps a reviewer's view choice only while that state is unchanged.
+    const staleKeys = new Map<string, string | null>();
+    // Every field an approval covers, in the approval fingerprint's canonical form, hashed once per segment so a segment shared by many stale items is not serialized once per owner.
+    const reviewedDigests = new Map<string, string>();
+    const reviewedDigest = (segment: typeof segments[number]) => {
+      let digest = reviewedDigests.get(segment.key);
+      if (digest === undefined) reviewedDigests.set(segment.key, digest = createHash('sha256').update(stable(reviewedSegment(segment))).digest('hex'));
+      return digest;
+    };
+    const staleKey = (item: PlanItem): string | null => {
+      if (staleKeys.has(item.id)) return staleKeys.get(item.id) ?? null;
+      staleKeys.set(item.id, null);
+      if (states[item.id] !== 'stale') return null;
+      const key = createHash('sha256').update(JSON.stringify({
+        approval: saved.approvals.find(value => value.item === item.id) ?? null,
+        current: fingerprint(item, segments, identity),
+        ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(reviewedDigest),
+        dependencies: item.depends_on.map(id => { const dependency = plan.items.find(value => value.id === id); return dependency ? staleKey(dependency) : null; }),
+        replacement: replacementReview ? { snapshotId: snapshot.id, revision: plan.revision, requiresFreshReview: mergeAttempt.requiresFreshReview, reviewVersion: mergeAttempt.reviewVersion } : null,
+      })).digest('hex');
+      staleKeys.set(item.id, key);
+      return key;
+    };
     const items = plan.items.map(item => {
       const owned = segments.filter(segment => segment.row === item.id);
       const ambiguous = segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).length;
@@ -80,7 +104,7 @@ export class ReviewService {
         for (const dep of item.depends_on) if (states[dep] === 'stale') reasons.push(`Depends on ${dep}, which changed`);
         if (!reasons.length) reasons.push('Code or plan definition changed');
       }
-      return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before,
+      return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before, staleKey: staleKey(item),
         checks: { attributed: ambiguous ? `! ${ambiguous} ambiguous` : owned.length ? '✓ Attributed' : '– No changes', scope: outside.length ? `✕ ${new Set(outside).size} out of scope` : owned.length ? '✓ In scope' : '– No changes', tests: item.acceptance.some(check => check.type === 'cmd') ? '– Not run' : '– No tests defined', ai: '– Not run' }, outside: [...new Set(outside)],
       };
     });

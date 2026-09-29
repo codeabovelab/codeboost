@@ -10,6 +10,7 @@ import { choiceKeys } from '../../core/approvals.ts';
 import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
 import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
+import { fixtureGit } from '../fixtures/git.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
 // Resolves once the server has parsed the headers of the request that carries `marker` and is reading its body, so that partial request is provably admitted before shutdown starts.
 // Matching the marker matters: any other client on the port (a polling tab, a reused ephemeral port) also emits 'request' and would start shutdown too early.
@@ -97,6 +98,43 @@ test('reviews real changes, persists approval and conversation, and assigns fore
   await page.getByRole('button',{name:/Unplanned changes/}).click();await page.getByLabel('Assign change 1 to').selectOption('P1');await page.getByRole('button',{name:'Assign',exact:true}).first().click();
   await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
   await page.screenshot({path:'test-results/review-desktop.png',fullPage:true});expect(errors).toEqual([]);
+});
+test('opens an item selected while an assignment is in flight in the view its answered state calls for',async({page})=>{
+ await page.goto(app.url);await page.getByRole('button',{name:'Approve P1',exact:true}).click();await expect(page.getByText('1 of 3 approved')).toBeVisible();
+ let release!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;}),assignArrived=new Promise<void>(resolve=>{arrived=resolve;});
+ await page.route('**/api/action',async route=>{if(route.request().postDataJSON().action==='assign'){arrived();await held;}await route.continue();});
+ await page.getByRole('button',{name:/Unplanned changes/}).click();await page.getByLabel('Assign change 1 to').selectOption('P1');await page.getByRole('button',{name:'Assign',exact:true}).first().click();await assignArrived;
+ // P1 is still approved in the page when it is selected; the held answer makes it stale.
+ await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await expect(page.getByRole('heading',{name:'Bound exponential retries'})).toBeVisible();await expect(page.getByText('! Stale:',{exact:false})).toHaveCount(0);
+ release();await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();
+ await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
+ expect(app.service.load().items.find(item=>item.id==='P1')!.state).toBe('stale');
+ // An explicit choice survives the next answer.
+ await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ // Every check below already holds before the Refresh answer, so wait until that answer is rendered.
+ const answered=page.waitForResponse('**/api/review');await page.getByRole('button',{name:'Refresh',exact:true}).click();await answered;await expect(page.locator('#banner')).not.toContainText('Linking changes');
+ await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Full change',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ // A code change on the still-stale item is a new state, so the choice made on the old one no longer holds.
+ const repository=app.service.config.repository;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return 42;\n}\n');fixtureGit(repository,'commit','-am','External change');
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
+ // After approval, a new stale state opens the comparison again.
+ await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ await page.getByRole('button',{name:'Approve P1',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false})).toHaveCount(0);
+ let view=app.service.load();view=app.service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned'&&segment.path==='retry.ts')!.key,item:'P1',token:view.token});expect(view.items.find(item=>item.id==='P1')!.state).toBe('stale');
+ await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
+});
+test('keeps an explicit view choice only while the server names the same stale state',async({page})=>{
+ let view=app.service.load();view=app.service.act({action:'approve',item:'P1',confirmNoChange:false,token:view.token});
+ view=app.service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});expect(view.items.find(item=>item.id==='P1')!.state).toBe('stale');
+ // The answer is the server's own, except that P1's staleKey can be replaced; nothing else about P1 changes.
+ let staleKey:string|null=null;
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();if(staleKey)body.items.find((item:{id:string})=>item.id==='P1').staleKey=staleKey;await route.fulfill({response,json:body});});
+ const refresh=async()=>{const answered=page.waitForResponse('**/api/review');await page.getByRole('button',{name:'Refresh',exact:true}).click();await answered;await expect(page.locator('#banner')).not.toContainText('Linking changes');};
+ await page.goto(app.url);await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
+ await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ await refresh();await expect(page.getByRole('button',{name:'Full change',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ staleKey='0'.repeat(64);await refresh();
+ await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
 });
 test('shows file metadata and no-change confirmation, supports narrow desktop and keyboard',async({page})=>{
   await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await expect(page.getByText('File mode changed',{exact:false})).toBeVisible();await expect(page.getByText('✕ Out of scope',{exact:true})).toBeVisible();
