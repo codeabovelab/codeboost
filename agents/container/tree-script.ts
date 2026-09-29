@@ -1,6 +1,9 @@
 /**
- * The Perl program D runs inside task storage to read it without following links (#66). One program serves three modes,
- * so the seeder's metadata baseline and a later inspection compute the metadata digest the same way:
+ * The Perl program D runs inside task storage to read it without following links (#66). One program serves four modes,
+ * so the seeder's checks and a later inspection read storage the same way:
+ *
+ * - `links <work> <metadata>` (run by the seeder, as root, over what it copied) refuses, with exit 11, any link in the
+ *   metadata and any work-tree link that can lead out of the work tree, resolved as the container's kernel would.
  *
  * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime,
  *   link target and a regular file's content. Content is hashed rather than trusted to the times, which a write does
@@ -135,13 +138,13 @@ if ($mode eq "links") {
   while (@pending) {
     my $path = shift @pending; my $full = $path eq "." ? $metadata : "$metadata/$path";
     my @stat = lstat $full; fail(6, "could not stat metadata " . shown($path) . ": $!") unless @stat;
-    fail(11, "Repository Git metadata contains a link " . shown($path) . ".") if -l _;
+    fail(11, "Repository Git metadata contains a link: " . shown($path)) if -l _;
     unshift @pending, map { join_path($path, $_) } children($full) if -d _;
   }
   @pending = grep { $_ ne ".git" } children($work);
   while (@pending) {
     my $path = shift @pending; my @stat = lstat "$work/$path"; fail(6, "could not stat " . shown($path) . ": $!") unless @stat;
-    if (-l _) { fail(11, "Repository link " . shown($path) . " leaves the checkout.") if link_escapes($work, $path); next }
+    if (-l _) { fail(11, "Repository link leaves the checkout: " . shown($path)) if link_escapes($work, $path); next }
     unshift @pending, map { "$path/$_" } children("$work/$path") if -d _;
   }
   exit 0;

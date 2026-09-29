@@ -27,6 +27,20 @@ export interface TaskFilesystems {
    */
   readonly metadataBaseline: string;
 }
+/**
+ * A repository the agent cannot run on: a link that can lead out of the checkout, or any link in its Git metadata. The
+ * seeder finds it; nothing was kept. Report it to the user and do not retry.
+ */
+export class UnusableRepositoryError extends Error {}
+// The seeder's refusal (exit 11) as an UnusableRepositoryError with its whole reason; any other failure as it came.
+function* refusedRepository<T>(steps: Steps<T>): Steps<T> {
+  try { return yield* steps; }
+  catch (error) {
+    if (error instanceof DockerError && error.status === 11)
+      throw new UnusableRepositoryError(error.stderr.trim().slice(0, 2048), { cause: error });
+    throw error;
+  }
+}
 export interface TaskStorageLimits {
   readonly workBytes: number;
   readonly workInodes: number;
@@ -315,12 +329,12 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
       '--entrypoint', 'sleep', imageId, 'infinity']);
     if (!DOCKER_ID.test(keeperId)) throw new Error('Docker did not return the created keeper ID.');
     yield* must(['start', keeperId], remaining());
-    const seeded = yield* allocate(seeder, ['run', '--rm', '--name', seeder, '--label', 'io.codeboost.task-storage=seeder', ...labels,
+    const seeded = yield* refusedRepository(allocate(seeder, ['run', '--rm', '--name', seeder, '--label', 'io.codeboost.task-storage=seeder', ...labels,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
-      '--entrypoint', 'sh', imageId, '-c', seed, 'seed', TREE_SCRIPT]);
+      '--entrypoint', 'sh', imageId, '-c', seed, 'seed', TREE_SCRIPT]));
     // Reject a staging directory swapped while the seeder was reading it.
     assertTaskClone(clone);
     remaining();

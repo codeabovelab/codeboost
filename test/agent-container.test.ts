@@ -12,7 +12,8 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT } from '../agents/container/storage.ts';
+import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
+  UnusableRepositoryError } from '../agents/container/storage.ts';
 import { inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks } from '../agents/container/changes.ts';
 import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
@@ -182,7 +183,7 @@ describe('real Docker agent isolation', () => {
       symlinkSync('deep/er/top/..', join(source, 'chained'));
     }],
     ['a chain that leaves through a target this host lacks', (source: string) => {
-      // On the host the final path is missing, but in the container /work/.. is / and the credential mount exists.
+      // The final path is a container mount, not in the checkout: /work/.. is / there.
       mkdirSync(join(source, 'deep')); mkdirSync(join(source, 'deep', 'er'));
       symlinkSync('../..', join(source, 'deep', 'er', 'top'));
       symlinkSync('deep/er/top/../run/codeboost-auth/codex/auth.json', join(source, 'chained'));
@@ -210,7 +211,10 @@ describe('real Docker agent isolation', () => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
-    expect(() => fixture({ hostile })).toThrow('leaves the checkout');
+    const refused = (() => { try { fixture({ hostile }); } catch (error) { return error; } })();
+    // Its own error type, so a caller can tell an unusable repository from a Docker failure, with the reason first.
+    expect(refused).toBeInstanceOf(UnusableRepositoryError);
+    expect((refused as Error).message).toMatch(/^Repository link leaves the checkout: /);
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 

@@ -70,8 +70,8 @@ Use only these entry points to run an agent:
    `removeTaskFilesystems` when the task ends. It refuses a repository that has a
    symbolic link with an absolute target or one that can lead outside the checkout (resolved in the container as its
    kernel would, even once the agent creates a missing directory on the way), or any link in its Git metadata; the
-   seeder checks this and the allocation removes what it made. Report this to the user as a repository the agent
-   cannot run on; do not retry it.
+   seeder checks this and the allocation removes what it made, then throws an `UnusableRepositoryError`. Report
+   this to the user as a repository the agent cannot run on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
 4. `startCodexInvocation` or `startClaudeInvocation` returns a handle at once and runs
