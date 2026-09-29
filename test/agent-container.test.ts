@@ -13,7 +13,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT } from '../agents/container/storage.ts';
-import { inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, snapshotDeclaredLinks } from '../agents/container/changes.ts';
+import { inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks } from '../agents/container/changes.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -946,8 +946,12 @@ describe('real Docker agent isolation', () => {
         // A chain: the target is itself a link. And a directory target with a link inside it.
         symlinkSync('link2', join(source, 'chain')); symlinkSync('secret', join(source, 'link2'));
         mkdirSync(join(source, 'box')); symlinkSync('../secret', join(source, 'box', 'inner')); symlinkSync('box', join(source, 'boxlink'));
+        writeFileSync(join(source, 'box', 'app.yml'), 'app\n');
+        // A declared link whose target's parent the agent will remove, and one named like an option.
+        mkdirSync(join(source, 'p')); writeFileSync(join(source, 'p', 'f'), 'f\n'); symlinkSync('p/f', join(source, 'pl'));
+        symlinkSync('secret', join(source, '--'));
       } });
-      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['x', 'y', 'chain', 'boxlink'], { imageId });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['x', 'y', 'chain', 'boxlink', 'pl', '--'], { imageId });
       // x goes through the link a (to d/e), so it reaches d/secret, not the top-level secret its text suggests.
       expect(linkSnapshot.links[0]).toMatchObject({ link: 'x', status: 'through-link', anchor: { path: 'a', type: 'symlink' } });
       expect(linkSnapshot.links[0]!.target).toBeUndefined();
@@ -957,9 +961,17 @@ describe('real Docker agent isolation', () => {
       expect(linkSnapshot.links[2]).toMatchObject({ link: 'chain', status: 'through-link', anchor: { path: 'link2' } });
       expect(linkSnapshot.links[3]).toMatchObject({ link: 'boxlink', status: 'through-link', target: 'box',
         anchor: { path: 'box/inner', type: 'symlink' } });
+      expect(linkSnapshot.links[5]).toMatchObject({ link: '--', status: 'present', target: 'secret' });
       // Unchanged after the run: nothing to report, though inspection resolves the links without walking the targets.
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
       expect(manifest.linkTargetChanges).toEqual([]);
+      // A write elsewhere in a through-link directory target is still a change to it; a removed parent is reported.
+      asAgent(data.filesystems, 'printf "EVIL\\n" > box/app.yml && rm -rf p');
+      const after = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(after.linkTargetChanges).toEqual(expect.arrayContaining([
+        { link: 'boxlink', target: 'box', path: 'box/app.yml', change: 'content' },
+        { link: 'pl', target: 'p/f', path: 'p/f', change: 'status' }]));
+      expect(after.linkTargetChanges.filter(change => change.link === 'pl')).toHaveLength(1);
     }, 180_000);
 
     it('reports what Git would skip: ignored files and directories under base\'s rules, fifos and .git parts', async () => {
@@ -993,6 +1005,25 @@ describe('real Docker agent isolation', () => {
       expect(byPath.get('hidden.secret')).toMatchObject({ kind: 'add', ignored: false });
       expect(byPath.get(':/build/evil.js')).toMatchObject({ kind: 'add', newType: 'file', ignored: false });
       expect(byPath.get(':(glob)x')).toMatchObject({ kind: 'add', ignored: false });
+    }, 180_000);
+
+    it('decides ignored paths as Git would: a negation inside an ignored directory, and directory-only patterns', async () => {
+      const data = fixture({ hostile: source => {
+        writeFileSync(join(source, '.gitignore'), 'node_modules/*\n!node_modules/local-pkg/\nbuild/\n');
+        mkdirSync(join(source, 'build')); writeFileSync(join(source, 'build', '.gitignore'), '*.o\n');
+        git(source, 'add', '-f', 'build/.gitignore');
+      } });
+      asAgent(data.filesystems, [
+        'mkdir -p node_modules/local-pkg node_modules/other', 'printf "l\\n" > node_modules/local-pkg/index.js',
+        'printf "o\\n" > node_modules/other/x.js',
+        // A file where base had a directory: "build/" matches directories only.
+        'rm -rf build && printf "b\\n" > build'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const byPath = new Map(manifest.changes.map(change => [change.path, change]));
+      expect(byPath.get('node_modules/local-pkg/index.js')).toMatchObject({ kind: 'add', ignored: false });
+      expect(byPath.get('node_modules/other')).toMatchObject({ kind: 'add', newType: 'directory', ignored: true });
+      expect(byPath.get('build')).toMatchObject({ kind: 'add', newType: 'file', ignored: false });
+      expect(byPath.get('build/.gitignore')).toMatchObject({ kind: 'delete' });
     }, 180_000);
 
     it('reports what a commit would store: nothing for an honest CRLF checkout, the stored blob under ident', async () => {
@@ -1066,7 +1097,13 @@ describe('real Docker agent isolation', () => {
       // A surrogate code point: a lax decoder accepts it, and Node would show it as U+FFFD, like another real name.
       asAgent(data.filesystems, `rm -f bad*; printf "x\\n" > "$(printf "s\\355\\240\\200")"`);
       await expect(inspect()).rejects.toThrow(/s\\xed\\xa0\\x80 is not printable UTF-8/);
-      asAgent(data.filesystems, `rm -f s*; mkdir many; cd many; for i in $(seq 1 ${MAXIMUM_CHANGES + 1}); do : > "$i"; done`);
+      // A C1 control character (U+009B, which some terminals read as the start of an escape sequence).
+      asAgent(data.filesystems, `rm -f s*; printf "x\\n" > "$(printf "c\\302\\233")"`);
+      await expect(inspect()).rejects.toThrow(/c\\xc2\\x9b is not printable UTF-8/);
+      // A name longer than the manifest carries.
+      asAgent(data.filesystems, `rm -f c*; mkdir -p "$(printf 'd%.0s' $(seq 1 200))" && cd "$(printf 'd%.0s' $(seq 1 200))" && for i in 1 2 3 4 5 6; do mkdir "$(printf 'e%.0s' $(seq 1 200))" && cd "$(printf 'e%.0s' $(seq 1 200))"; done && : > f`);
+      await expect(inspect()).rejects.toThrow(`longer than ${MAXIMUM_NAME_BYTES} bytes`);
+      asAgent(data.filesystems, `rm -rf dd*; mkdir many; cd many; for i in $(seq 1 ${MAXIMUM_CHANGES + 1}); do : > "$i"; done`);
       await expect(inspect()).rejects.toThrow(`more than ${MAXIMUM_CHANGES} new entries`);
     }, 240_000);
 

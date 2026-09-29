@@ -93,7 +93,8 @@ Use only these entry points to run an agent:
    - **Before launch**, call `snapshotDeclaredLinks(storage, paths, { imageId })` with the item's declared paths.
      For each declared symlink it records where it resolves, one part at a time as the kernel would, and the state of
      the target and everything beneath it. A link on the way, a target that is a link, or a link inside a directory
-     target shows as `through-link`. Keep the result.
+     target shows as `through-link`. Do not launch an item with a `through-link` declared link: a write through it
+     lands somewhere its target does not cover. Keep the result.
    - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
      change manifest: every difference between the work tree and `base`, read without following links, with content
      IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new

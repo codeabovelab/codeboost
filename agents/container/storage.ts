@@ -766,6 +766,8 @@ interface StorageScript {
   readonly args: readonly string[];
   /** Bytes of standard output kept; more fails the run (ENOBUFS). Default 16 MiB. */
   readonly maxOutputBytes?: number;
+  /** The container's memory limit. Default 256m. */
+  readonly memory?: '256m' | '1g';
 }
 export interface StorageScriptOptions extends PreparationOptions {
   /** The immutable ID of the built agent image, whose tools run the script. */
@@ -791,7 +793,7 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
   try {
     const args = ['run', '--rm', '--name', name, '--label', `io.codeboost.task-storage=${script.kind}`, ...ownerLabelArgs(owner),
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
-      '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=256m', '--cpus=.5',
+      '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', `--memory=${script.memory ?? '256m'}`, '--cpus=.5',
       '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
       '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,

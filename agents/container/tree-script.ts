@@ -20,8 +20,17 @@
 export const MAXIMUM_CHANGES = 10_000;
 /** Entries recorded beneath all declared links' targets together, in one snapshot or inspection. */
 export const MAXIMUM_TARGET_ENTRIES = 20_000;
-/** The script refuses to print more than this; the storage runner keeps a little more, so the refusal is the script's. */
-export const MAXIMUM_TREE_OUTPUT = 64 * 1024 * 1024;
+/** Declared links in one snapshot or inspection. */
+export const MAXIMUM_DECLARED_LINKS = 1_000;
+/** Bytes in one path or link target the manifest carries; a longer one fails the run (exit 8). */
+export const MAXIMUM_NAME_BYTES = 1_024;
+// JSON at most doubles a name (a quote or backslash is escaped; control characters are refused). A change carries at
+// most three names, a target entry or a link record at most five, each with under 1 KiB of other fields.
+const KIB = 1024;
+/** The largest output the limits above allow; the script also refuses to print more. */
+export const MAXIMUM_TREE_OUTPUT = MAXIMUM_CHANGES * (3 * 2 * MAXIMUM_NAME_BYTES + KIB)
+  + MAXIMUM_TARGET_ENTRIES * (5 * 2 * MAXIMUM_NAME_BYTES + KIB) + 2 * MAXIMUM_DECLARED_LINKS * (5 * 2 * MAXIMUM_NAME_BYTES + KIB)
+  + 64 * KIB;
 
 export const TREE_SCRIPT = String.raw`
 use strict; use warnings;
@@ -29,17 +38,24 @@ use Time::HiRes qw(lstat); use Digest::SHA; use JSON::PP; use Encode (); use Fcn
 use IPC::Open2 qw(open2);
 $SIG{__WARN__} = sub { die @_ };
 my $mode = shift @ARGV // "";
-my ($MAXIMUM_CHANGES, $MAXIMUM_TARGET_ENTRIES, $MAXIMUM_OUTPUT) = (${MAXIMUM_CHANGES}, ${MAXIMUM_TARGET_ENTRIES}, ${MAXIMUM_TREE_OUTPUT});
+my ($MAXIMUM_CHANGES, $MAXIMUM_TARGET_ENTRIES, $MAXIMUM_NAME_BYTES, $MAXIMUM_OUTPUT) =
+  (${MAXIMUM_CHANGES}, ${MAXIMUM_TARGET_ENTRIES}, ${MAXIMUM_NAME_BYTES}, ${MAXIMUM_TREE_OUTPUT});
+# An unexpected failure (a warning made fatal, or a die outside an eval) is its own exit status, never a quiet 2 or 255.
+$SIG{__DIE__} = sub { return if $^S; print STDERR "tree script failed: @_"; exit 5 };
 
 # An agent-chosen name goes into an error message escaped onto one printable line.
 sub shown { my $p = shift; $p =~ s/([^\w.\/ -])/sprintf("\\x%02x", ord $1)/ge; return $p }
 sub fail { my ($code, $message) = @_; print STDERR "$message\n"; exit $code }
 # The manifest carries names as JSON text. Strict UTF-8 refuses surrogates and code points past U+10FFFF, which a lax
-# decoder would pass and Node would turn into U+FFFD, so two different names could show as one.
+# decoder would pass and Node would turn into U+FFFD, so two different names could show as one. Control characters (C0,
+# DEL, C1) and the line and bidirectional controls that can make a name display as another are refused too, as is a
+# name longer than the manifest carries.
 sub text {
   my ($bytes, $what) = @_;
+  fail(8, "$what " . shown(substr($bytes, 0, 64)) . "... is longer than $MAXIMUM_NAME_BYTES bytes") if length $bytes > $MAXIMUM_NAME_BYTES;
   my $text = eval { Encode::decode("UTF-8", $bytes, Encode::FB_CROAK | Encode::LEAVE_SRC) };
-  fail(8, "$what " . shown($bytes) . " is not printable UTF-8") if !defined $text || $text =~ /[\x00-\x1f\x7f]/;
+  fail(8, "$what " . shown($bytes) . " is not printable UTF-8")
+    if !defined $text || $text =~ /[\x00-\x1f\x7f-\x9f\x{2028}\x{2029}\x{202a}-\x{202e}\x{2066}-\x{2069}]/;
   return $text;
 }
 sub children {
@@ -116,6 +132,13 @@ sub entry {
   else { $entry{type} = "other" }
   return \%entry;
 }
+# What the walk keeps of each entry: its type and Git mode, and a link's content. A large checkout holds many.
+sub walk_entry {
+  my $path = shift; my @stat = lstat $path; return undef unless @stat;
+  if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => text($target, "the link target of " . shown($path)) } }
+  return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } if -f _;
+  return { type => -d _ ? "directory" : "other" };
+}
 # A target entry also carries the file's raw content ID: the snapshot compares identity, not what Git would store.
 sub target_entry { my $path = shift; my $entry = entry($path); $entry->{oid} = file_id($path) if $entry->{type} eq "file"; return { path => text($path, "path"), %$entry } }
 
@@ -125,7 +148,12 @@ sub target_entry { my $path = shift; my $entry = entry($path); $entry->{oid} = f
 # existing entry. Only a target reached through real directories is watched. The path is tracked from the filesystem
 # root, so "/work/x" and "../work/x" are inside; anywhere else outside /work is outside.
 my $target_entries = 0;
-sub anchored { my ($status, $path) = @_; return { status => $status, anchor => target_entry($path eq "" ? "." : $path) } }
+# The anchor is the nearest entry that exists, walking up from the given path: the work tree itself at the least.
+sub anchored {
+  my ($status, $path) = @_;
+  while ($path ne "" && !lstat $path) { my @parts = split m{/}, $path; pop @parts; $path = join "/", @parts }
+  return { status => $status, anchor => target_entry($path eq "" ? "." : $path) };
+}
 sub resolve {
   my ($link, $walk) = @_; my %record = (link => text($link, "declared path"));
   my @parents = split m{/}, $link; pop @parents; my $prefix = "";
@@ -141,20 +169,24 @@ sub resolve {
   # From the filesystem root: ("work", ...) is inside the work tree.
   my @at = $raw =~ m{^/} ? () : ("work", @parents);
   my @parts = grep { $_ ne "" && $_ ne "." } split m{/}, $raw;
+  # Once a directory on the way is missing, the rest is followed by name: that is where the link leads if the missing
+  # directories are created, so the target stays the same whether they exist or not.
+  my $missing = 0;
   for my $i (0 .. $#parts) {
     if ($parts[$i] eq "..") { pop @at; next }
     push @at, $parts[$i];
     return { %record, status => "outside" } if $at[0] ne "work";
     return { %record, status => "metadata" } if @at > 1 && $at[1] eq ".git";
-    next if @at == 1;
+    next if @at == 1 || $missing;
     my $path = join "/", @at[1 .. $#at]; my @here = lstat $path;
-    # A missing last part is a dangling target, watched like any other: creating it is a change to it.
-    if (!@here) { last if $i == $#parts; return { %record, %{ anchored("absent", join "/", @at[1 .. $#at - 1]) } } }
+    if (!@here) { $missing = 1; next }
     return { %record, %{ anchored("through-link", $path) } } if -l _;
     return { %record, %{ anchored("absent", $path) } } if $i < $#parts && !-d _;
   }
   return { %record, status => "outside" } if @at < 2;
   my $target = join "/", @at[1 .. $#at];
+  # A dangling target, watched like any other: creating it, or what leads to it, is a change to it.
+  return { %record, target => text($target, "path"), %{ anchored("absent", $target) } } if $missing;
   my @final = lstat $target;
   return { %record, target => text($target, "path"), %{ $walk ? target_state($target) : { status => @final ? "present" : "absent" } } };
 }
@@ -169,10 +201,11 @@ sub target_state {
     my $path = shift @pending;
     fail(9, "declared link targets hold more than $MAXIMUM_TARGET_ENTRIES entries") if ++$target_entries > $MAXIMUM_TARGET_ENTRIES;
     my $entry = target_entry($path); push @entries, $entry;
-    return { status => "through-link", anchor => $entry } if $entry->{type} eq "symlink";
     unshift @pending, map { "$path/$_" } children($path) if $entry->{type} eq "directory";
   }
-  return { status => "present", entries => \@entries };
+  # Every entry is recorded and compared either way; a link inside means a write can land outside the target.
+  my ($link) = grep { $_->{type} eq "symlink" } @entries;
+  return $link ? { status => "through-link", anchor => $link, entries => \@entries } : { status => "present", entries => \@entries };
 }
 
 if ($mode eq "snapshot") { emit({ links => [map { resolve($_, 1) } @ARGV] }) }
@@ -182,8 +215,9 @@ my $base = shift @ARGV;
 fail(3, "base is not a full commit ID") unless $base =~ /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 fail(3, "base $base is not a commit in this task storage")
   unless system(@GIT, "cat-file", "-e", "$base^{commit}") == 0;
-my (@links, @targets); my $list = \@links;
-for my $argument (@ARGV) { if ($argument eq "--") { $list = \@targets } else { push @$list, $argument } }
+my $link_count = shift @ARGV;
+fail(2, "bad link count") unless defined $link_count && $link_count =~ /^\d+$/ && $link_count <= @ARGV;
+my @links = splice @ARGV, 0, $link_count; my @targets = @ARGV;
 
 # The tree of base: every blob and gitlink, and every directory above one. Its .gitignore files are the only ignore
 # rules that count, with the repository's info/exclude: the agent's own edits to them do not decide what is listed.
@@ -213,9 +247,16 @@ my $ignore_pid = do {
   eval { open2($ignore_out, $ignore_in, @GIT, "-C", "/tmp/ignore", "--work-tree=/tmp/ignore", "check-ignore", "--no-index",
     "--stdin", "-z", "--non-matching", "--verbose") } // fail(4, "could not run git check-ignore: $@");
 };
+# check-ignore decides whether a directory-only pattern (such as "build/") applies by looking at the path in /tmp/ignore,
+# so that tree mirrors what each checked path is: a new directory is created there first, and a directory in the way of
+# a file (one where base tracked a .gitignore) is moved aside. A path goes in without a trailing slash: with one, a
+# pattern such as "build/*" would match the directory itself and hide what a negation re-includes.
+my $aside = 0;
 sub is_ignored {
-  my ($path, $directory) = @_;
-  print $ignore_in "./", ($directory ? "$path/" : $path), "\0"; $ignore_in->flush;
+  my ($path, $directory) = @_; my $mirror = "/tmp/ignore/$path";
+  if ($directory) { mkdir $mirror or fail(4, "could not mirror a directory: $!") unless -d $mirror }
+  elsif (-d $mirror) { mkdir "/tmp/aside" unless -d "/tmp/aside"; rename $mirror, "/tmp/aside/" . $aside++ or fail(4, "could not move a directory aside: $!") }
+  print $ignore_in "./$path\0"; $ignore_in->flush;
   local $/ = "\0"; my @fields;
   for (1 .. 4) { my $field = <$ignore_out>; fail(4, "git check-ignore stopped answering") unless defined $field; chomp $field; push @fields, $field }
   return $fields[2] ne "" && $fields[2] !~ /^!/;
@@ -230,7 +271,7 @@ my $new_entries = 0;
 my @pending = grep { $_ ne ".git" } children(".");
 while (@pending) {
   my $path = shift @pending; text($path, "path");
-  my $entry = entry($path) // fail(6, "could not stat " . shown($path) . ": $!");
+  my $entry = walk_entry($path) // fail(6, "could not stat " . shown($path) . ": $!");
   $work{$path} = $entry;
   my @parts = split m{/}, $path; pop @parts; $has_child{join "/", @parts} = 1 if @parts;
   my $directory = $entry->{type} eq "directory";

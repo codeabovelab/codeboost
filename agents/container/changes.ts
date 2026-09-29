@@ -1,9 +1,12 @@
 import { createHash } from 'node:crypto';
 import { runStorageScript, taskMetadataBaseline, type RecoveredTaskStorage, type StorageScriptOptions,
   type TaskFilesystems } from './storage.ts';
-import { MAXIMUM_CHANGES, MAXIMUM_TARGET_ENTRIES, MAXIMUM_TREE_OUTPUT, TREE_SCRIPT } from './tree-script.ts';
+import { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES, MAXIMUM_TREE_OUTPUT,
+  TREE_SCRIPT } from './tree-script.ts';
 
-export { MAXIMUM_CHANGES, MAXIMUM_TARGET_ENTRIES };
+export { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES };
+// Walking a large checkout holds every path in memory: more than an export needs.
+const INSPECTION_MEMORY = '1g';
 
 /** What an entry is, as the change manifest reports it. `other` is a fifo, socket or device. */
 export type EntryType = 'file' | 'symlink' | 'gitlink' | 'directory' | 'other';
@@ -77,7 +80,11 @@ export interface DeclaredLink extends Omit<Partial<TargetState>, 'status'> {
    */
   readonly status: TargetState['status'] | 'not-a-link' | 'outside' | 'metadata';
 }
-/** Taken before launch and kept by F; `inspectTaskChanges` compares every recorded target with what is there after. */
+/**
+ * Taken before launch and kept by F; `inspectTaskChanges` compares every recorded target with what is there after. F
+ * must not launch an item with a declared link whose status is `through-link`: a write through it would land somewhere
+ * the snapshot does not watch as the link's target (plan-format.md: a target never goes through another link).
+ */
 export interface DeclaredLinkSnapshot {
   readonly links: readonly DeclaredLink[];
 }
@@ -120,7 +127,8 @@ const DIGEST = /^[0-9a-f]{64}$/;
 // A declared path names one entry of the work tree by its Git path: relative, no empty, `.` or `..` part, and not the
 // metadata. Control characters cannot appear in a manifest.
 const assertDeclaredPath = (path: unknown) => {
-  if (typeof path !== 'string' || path === '' || path.startsWith('/') || /[\x00-\x1f\x7f]/.test(path)
+  if (typeof path !== 'string' || path === '' || path.startsWith('/') || /[\x00-\x1f\x7f-\x9f]/.test(path)
+    || Buffer.byteLength(path) > MAXIMUM_NAME_BYTES
     || path.split('/').some(part => part === '' || part === '.' || part === '..') || path.split('/')[0] === '.git')
     throw new Error(`Declared path ${JSON.stringify(path)} is not a path in the work tree.`);
 };
@@ -161,11 +169,13 @@ const deepFreeze = <T>(value: T): T => {
 export async function snapshotDeclaredLinks(storage: TaskFilesystems | RecoveredTaskStorage, paths: readonly string[],
   options: StorageScriptOptions): Promise<DeclaredLinkSnapshot> {
   if (!Array.isArray(paths)) throw new Error('Declared paths must be a list.');
+  if (paths.length > MAXIMUM_DECLARED_LINKS) throw new Error(`At most ${MAXIMUM_DECLARED_LINKS} declared paths are recorded.`);
   for (const path of paths) assertDeclaredPath(path);
   assertArguments(paths);
   if (paths.length === 0) return deepFreeze({ links: [] });
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Declared link snapshot',
     consequence: 'declared links cannot be recorded', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
+    memory: INSPECTION_MEMORY,
     args: ['-e', TREE_SCRIPT, 'snapshot', ...paths] }, { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const snapshot = JSON.parse(stdout) as DeclaredLinkSnapshot;
   if (!Array.isArray(snapshot.links) || snapshot.links.length !== paths.length)
@@ -193,7 +203,9 @@ const sameAnchor = (a: TargetEntry | undefined, b: TargetEntry | undefined) => a
 function compareTarget(link: string, target: string, before: TargetState, after: TargetState): LinkTargetChange[] {
   const change = (path: string, kind: LinkTargetChange['change']) => ({ link, target, path, change: kind });
   if (before.status !== after.status) return [change(target, 'status')];
-  if (before.status !== 'present') {
+  // A directory target that holds a link is through-link but still carries every entry, and all of them are compared
+  // below. Without entries (absent, or stopped at a link), the anchor is what can change.
+  if (before.entries === undefined) {
     // Creating the target itself shows as a status change; a sibling created beside it is not a write through the link.
     return sameAnchor(before.anchor, after.anchor) ? [] : [change(before.anchor?.path ?? target, 'identity')];
   }
@@ -245,14 +257,16 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
   const baseline = known ?? options.metadataBaseline;
   if (!baseline) throw new Error('A recovered storage handle needs the metadataBaseline F recorded at allocation.');
   const links = options.linkSnapshot?.links;
-  if (!Array.isArray(links)) throw new Error('linkSnapshot must be what snapshotDeclaredLinks returned.');
+  if (!Array.isArray(links) || links.length > MAXIMUM_DECLARED_LINKS)
+    throw new Error('linkSnapshot must be what snapshotDeclaredLinks returned.');
   for (const link of links) assertDeclaredPath(link?.link);
   const targets = [...new Set(links.flatMap(link => link.target === undefined ? [] : [link.target]))];
   for (const target of targets) assertDeclaredPath(target);
   assertArguments([...links.map(link => link.link), ...targets]);
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Task change inspection',
     consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
-    args: ['-e', TREE_SCRIPT, 'inspect', options.base, ...links.map(link => link.link), '--', ...targets] },
+    memory: INSPECTION_MEMORY,
+    args: ['-e', TREE_SCRIPT, 'inspect', options.base, String(links.length), ...links.map(link => link.link), ...targets] },
   { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const output = JSON.parse(stdout) as InspectOutput;
   if (!DIGEST.test(output.metadataDigest) || !Array.isArray(output.changes) || !Array.isArray(output.agentCommits)
