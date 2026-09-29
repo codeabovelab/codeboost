@@ -398,9 +398,9 @@ fail(4, "git check-ignore failed (status " . ($? >> 8) . ")") if ($? >> 8) > 1 |
 # read: a file's times do not always move when its content does (not every way of writing to tmpfs updates them), so an
 # unchanged stat proves nothing. They are hashed into a scratch index built from base, as the seeded index is, with
 # --info-only so no object is written: Git applies the work tree's attributes as git add does, including leaving a
-# text=auto file's CRLF alone when base already stores it that way. The scratch index only computes these IDs; the
-# commit step must store files the same way (the same removals first, then update-index), so what it stores is what
-# was audited, and apply links and deletions as the manifest lists them.
+# text=auto file's CRLF alone when base already stores it that way. The scratch index only computes these IDs. The
+# commit step builds its tree from base plus the manifest's changes, storing each file as hashed here; what the
+# manifest does not list (an unchanged submodule, a symlinked .gitattributes) stays as base has it.
 my @commitable = grep { $work{$_}{type} eq "file" && !under_git_path($_) } sort keys %work;
 if (@commitable) {
   local $ENV{GIT_INDEX_FILE} = "/tmp/scratch-index";
@@ -408,14 +408,10 @@ if (@commitable) {
   # What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
   # the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
   # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
-  # A submodule is checked out as a directory (the task clone is not recursive): that is its unchanged state, so it
-  # stays. The commit step, which removes the same entries, would otherwise drop every submodule.
-  # Every regular .gitattributes leaves it too: where Git will not read the work tree's own (a symlink, one over 100 MB)
-  # it falls back to the index, which must not hold base's rules. So only attribute files the work tree has, and Git
-  # reads, decide; a regular one is added back below like any file. A tracked symlink stays as it is: its content is a
-  # link target, never rules, and the commit step keeps it.
-  my @gone = grep { !$work{$_} || ($base{$_}{type} eq "file" && m{(?:\A|/)\.gitattributes\z}) || ($work{$_}{type} ne $base{$_}{type}
-    && !($base{$_}{type} eq "gitlink" && $work{$_}{type} eq "directory")) } sort keys %base;
+  # Every .gitattributes leaves it too, a symlink included: where Git will not read the work tree's own (a symlink, one
+  # over 100 MB) it falls back to the index and parses what is there as rules, even a symlink's target text. So only
+  # attribute files the work tree has, and Git reads, decide; a regular one is added back below like any file.
+  my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} || m{(?:\A|/)\.gitattributes\z} } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
     print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");

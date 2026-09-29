@@ -1218,6 +1218,16 @@ describe('real Docker agent isolation', () => {
         newOid: createHash('sha1').update('blob 9\0trusted\r\n').digest('hex') }));
     }, 240_000);
 
+    it('reads no rules from a symlinked .gitattributes, not even its target text', async () => {
+      // Git will not open a symlinked .gitattributes, and would fall back to the index, where it would parse the link's
+      // target text as rules. Here that text is a rule.
+      const data = fixture({ hostile: source => symlinkSync('*.txt text', join(source, '.gitattributes')) });
+      asAgent(data.filesystems, 'printf "trusted\\r\\n" > file.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      expect(manifest.changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'file.txt',
+        newOid: createHash('sha1').update('blob 9\0trusted\r\n').digest('hex') })]);
+    }, 180_000);
+
     it('lets through a warning that runs over two lines', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '!foo text\n') });
       asAgent(data.filesystems, 'printf "edited\\n" > file.txt');
