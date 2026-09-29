@@ -1,5 +1,5 @@
 import { createHash } from 'node:crypto';
-import { runStorageScript, taskMetadataBaseline, type RecoveredTaskStorage, type StorageScriptOptions,
+import { resolveMetadataBaseline, runStorageScript, type RecoveredTaskStorage, type StorageScriptOptions,
   type TaskFilesystems } from './storage.ts';
 import { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES, MAXIMUM_TREE_OUTPUT,
   TREE_SCRIPT } from './tree-script.ts';
@@ -17,8 +17,8 @@ export type EntryType = 'file' | 'symlink' | 'gitlink' | 'directory' | 'other';
  * One difference between the work tree and the tree of `base`, read without following links (#66). Every file is read
  * and hashed as the blob Git would store, with the work tree's attributes (only those: a deleted `.gitattributes` no
  * longer applies); a tracked file counts as changed when that blob or its mode differs from `base`. A file whose stored
- * blob would not change (an honest CRLF checkout, say) is not a change. The commit step (#66 part 2) must store exactly
- * these blobs, built the same way, so what the audit approves is what is committed. A link target is compared as it is.
+ * blob would not change (an honest CRLF checkout, say) is not a change. The commit step (#66 part 2) must store files
+ * the same way, so what the audit approves is what is committed. A link target is compared as it is.
  */
 export interface TaskChange {
   readonly path: string;
@@ -169,18 +169,6 @@ const deepFreeze = <T>(value: T): T => {
   return value;
 };
 
-// The baseline the seeder recorded: D's own for storage this process allocated (a given one must match it), or the one F
-// recorded, which a recovery handle needs.
-function metadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage, given: string | undefined): string {
-  const known = taskMetadataBaseline(storage);
-  if (given !== undefined && !DIGEST.test(given)) throw new Error('metadataBaseline must be the SHA-256 the storage value carried.');
-  if (known && given !== undefined && given !== known)
-    throw new Error('metadataBaseline does not match the one recorded when this storage was seeded.');
-  const baseline = known ?? given;
-  if (!baseline) throw new Error('A recovered storage handle needs the metadataBaseline F recorded at allocation.');
-  return baseline;
-}
-
 /**
  * Record, before launch, where each declared link resolves (one part at a time, as the kernel would in an agent
  * container) and the state of its target and everything beneath it, or the nearest existing entry for a dangling one.
@@ -191,12 +179,12 @@ function metadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage, given
  */
 export async function snapshotDeclaredLinks(storage: TaskFilesystems | RecoveredTaskStorage, paths: readonly string[],
   options: StorageScriptOptions & { readonly metadataBaseline?: string }): Promise<DeclaredLinkSnapshot> {
-  const baseline = metadataBaseline(storage, options.metadataBaseline);
+  const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
   if (!Array.isArray(paths)) throw new Error('Declared paths must be a list.');
   if (paths.length > MAXIMUM_DECLARED_LINKS) throw new Error(`At most ${MAXIMUM_DECLARED_LINKS} declared paths are recorded.`);
   for (const path of paths) assertDeclaredPath(path);
   assertArguments(paths);
-  if (paths.length === 0) return deepFreeze({ links: [] });
+  // Run even with nothing declared: the metadata check before launch is part of the answer.
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Declared link snapshot',
     consequence: 'declared links cannot be recorded', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
     memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
@@ -275,7 +263,7 @@ interface InspectOutput {
 export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
   options: InspectOptions): Promise<TaskChangeManifest> {
   if (typeof options.base !== 'string' || !COMMIT_ID.test(options.base)) throw new Error('base must be a full commit ID.');
-  const baseline = metadataBaseline(storage, options.metadataBaseline);
+  const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
   const links = options.linkSnapshot?.links;
   if (!Array.isArray(links) || links.length > MAXIMUM_DECLARED_LINKS)
     throw new Error('linkSnapshot must be what snapshotDeclaredLinks returned.');

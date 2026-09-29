@@ -84,7 +84,8 @@ if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
   }
   // Like the export script: the diff, cut to the limit it is given, base64-encoded; then --rm removes the container.
-  const diff = fs.readFileSync(path.join(state, 'export-diff')).subarray(0, Number(args.at(-1)));
+  // The script's arguments follow "-c": the script, $0, base, the limit, the baseline and the digest program.
+  const diff = fs.readFileSync(path.join(state, 'export-diff')).subarray(0, Number(args[args.indexOf('-c') + 4]));
   fs.rmSync(path.join(state, name + '.json'));
   process.stdout.write(diff.toString('base64'));
   process.exit(0);
@@ -267,7 +268,12 @@ describe('task diff export', () => {
     writeFileSync(join(state, `${metadata}.json`), JSON.stringify({ kind: 'volume', labels: labels('metadata') }));
     writeFileSync(join(state, 'export-diff'), 'partial output\n');
     const handle = await adoptRecoveredTaskStorage(owned, { workVolume: work, metadataVolume: metadata });
-    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE })).diff.toString()).toBe('partial output\n');
+    // D keeps no baseline across a restart: F passes the one it recorded, and without it nothing runs.
+    calls.made = [];
+    await expect(exportTaskDiff(handle, { base: BASE, imageId: IMAGE })).rejects.toThrow('needs the metadataBaseline');
+    expect(calls.made).toEqual([]);
+    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE, metadataBaseline: 'b'.repeat(64) })).diff.toString())
+      .toBe('partial output\n');
   });
 
   it('refuses a volume that no longer carries the storage labels, before running anything', async () => {
@@ -354,6 +360,18 @@ describe('task change inspection', () => {
     writeFileSync(join(state, 'inspect-output'), big);
     expect((await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks })).changes).toHaveLength(10_000);
     expect(JSON.parse(readFileSync(join(state, 'inspect-args.json'), 'utf8'))).toContain('--memory=1g');
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('reports only metadataChanged when the script found the metadata changed, and refuses a result that says otherwise', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: 'e'.repeat(64), metadataOnly: true }));
+    expect(await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks })).toMatchObject({
+      metadataChanged: true, changes: [], agentCommits: [], linkTargetChanges: [], nestedGitlinkContent: [] });
+    // A metadata-only result whose digest matches the baseline contradicts itself.
+    writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: BASELINE, metadataOnly: true }));
+    await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks }))
+      .rejects.toThrow('unexpected result');
     removeTaskFilesystems(filesystems);
   });
 

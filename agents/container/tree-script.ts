@@ -385,8 +385,9 @@ fail(4, "git check-ignore failed (status " . ($? >> 8) . ")") if ($? >> 8) > 1 |
 # read: a file's times do not always move when its content does (not every way of writing to tmpfs updates them), so an
 # unchanged stat proves nothing. They are hashed into a scratch index built from base, as the seeded index is, with
 # --info-only so no object is written: Git applies the work tree's attributes as git add does, including leaving a
-# text=auto file's CRLF alone when base already stores it that way. The commit step must build from this same scratch
-# index procedure, so what it stores is what was audited.
+# text=auto file's CRLF alone when base already stores it that way. The scratch index only computes these IDs; the
+# commit step must store files the same way (the same removals first, then update-index), so what it stores is what
+# was audited, and apply links and deletions as the manifest lists them.
 my @commitable = grep { $work{$_}{type} eq "file" && !under_git_path($_) } sort keys %work;
 if (@commitable) {
   local $ENV{GIT_INDEX_FILE} = "/tmp/scratch-index";
@@ -394,9 +395,7 @@ if (@commitable) {
   # What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
   # the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
   # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
-  # A submodule checked out as a directory is unchanged: it stays, or a commit built from this index would drop it.
-  my @gone = grep { !$work{$_} || ($work{$_}{type} ne $base{$_}{type}
-    && !($base{$_}{type} eq "gitlink" && $work{$_}{type} eq "directory")) } sort keys %base;
+  my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
     print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");

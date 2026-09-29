@@ -14,6 +14,7 @@ import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT } from '../agents/container/storage.ts';
 import { inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks } from '../agents/container/changes.ts';
+import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -35,7 +36,7 @@ const docker = (...args: string[]) => execFileSync('docker', args, {
 }).trim();
 
 function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number;
-  hostile?: (source: string, root: string) => void } = {}) {
+  hostile?: (source: string, root: string) => void; beforeSeed?: (clone: string) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'agent-container-')); roots.push(root);
   const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
@@ -51,6 +52,8 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
   writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-schema-marker"}\n');
   chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
   const clone = createTaskClone({ source, parent: staging, taskId: 'task-1', head: git(source, 'rev-parse', 'HEAD') });
+  // Repository state codeboost itself would hold, set before seeding: agents can never write the metadata.
+  options.beforeSeed?.(clone.directory);
   const filesystems = prepareTaskFilesystems(clone, options.limits ?? {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
   }, imageId, testOwner());
@@ -740,22 +743,27 @@ describe('real Docker agent isolation', () => {
     for (const pgid of pgids) expect(groupAlive(pgid)).toBe(false);
   }, 90_000);
 
-  // What an agent leaves in task storage: a commit of its own, an edit to a tracked file, a staged-only file, a binary
+  // Base-side state for agentChanges: a tracked directory the agent will replace with a link to /etc/ssl.
+  const agentBase = (source: string) => {
+    mkdirSync(join(source, 'ssl', 'private'), { recursive: true });
+    writeFileSync(join(source, 'ssl', 'cert.pem'), 'cert\n'); writeFileSync(join(source, 'ssl', 'private', 'key.pem'), 'key\n');
+  };
+  // What an agent leaves in task storage: new files (it cannot commit or stage), an edit to a tracked file, a binary
   // file, a new untracked file and an untracked nested repository. `extra` runs last, as the same user.
   const agentChanges = (filesystems: ReturnType<typeof prepareTaskFilesystems>, extra = 'true') => docker('run', '--rm', '--network=none',
     '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
     '--mount', `type=volume,source=${filesystems.workVolume},target=/work`,
-    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'bash', imageId, '-c', [
+    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git,readonly`, '--entrypoint', 'bash', imageId, '-c', [
       'set -e', 'cd /work',
       'g() { git -c user.name=agent -c user.email=agent@example.com -c core.hooksPath=/dev/null "$@"; }',
-      'printf "committed\\n" > committed.txt', 'g add committed.txt', 'g commit -qm agent',
-      'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
+      'printf "committed\\n" > committed.txt',
+      'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt',
       'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
       'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link',
-      // A tracked directory replaced by a link to /etc/ssl, whose private/ this user cannot read. What is behind the
-      // link is not the task's: its files are deleted, and Git's warnings about /etc/ssl/private must not fail the export.
-      'mkdir -p ssl/private', 'printf "cert\\n" > ssl/cert.pem', 'printf "key\\n" > ssl/private/key.pem',
-      'g add ssl', 'g commit -qm ssl', 'rm -rf ssl', 'ln -s /etc/ssl ssl',
+      // A tracked directory (from agentBase) replaced by a link to /etc/ssl, whose private/ this user cannot read. What
+      // is behind the link is not the task's: its files are deleted, and Git's warnings about /etc/ssl/private must not
+      // fail the export.
+      'rm -rf ssl', 'ln -s /etc/ssl ssl',
       // Ordinary line-ending attributes make Git warn about these files; a warning must not fail the export.
       'printf "* text=auto\\n*.bat text eol=crlf\\n" > .gitattributes', 'printf "a\\r\\nb\\r\\n" > crlf.txt',
       'printf "x\\n" > unix.bat',
@@ -781,7 +789,7 @@ describe('real Docker agent isolation', () => {
     imageId, '-c', 'cd /work && find . -printf "%p %m %s %T@\\n" | sort && find . -type f -readable -print0 | sort -z | xargs -0 sha256sum');
 
   it('exports the diff against the last codeboost commit, bounded and without writing to the storage', async () => {
-    const data = fixture(), filesystems = data.filesystems;
+    const data = fixture({ hostile: agentBase }), filesystems = data.filesystems;
     agentChanges(filesystems);
     const before = storageSnapshot(filesystems);
     const exported = await exportTaskDiff(filesystems, { base: data.clone.head, imageId });
@@ -807,7 +815,7 @@ describe('real Docker agent isolation', () => {
     // The hostile name stays on one quoted line: no forged hunk line appears.
     expect(text).not.toMatch(/^\+forged$/m);
     expect(text).toMatch(/untracked directory \$'evil\\n.*is a nested repository/);
-    // The agent's own commit, an unstaged edit and an untracked file all appear against the base.
+    // An edit and new files all appear against the base.
     expect(text).toContain('b/committed.txt');
     expect(text).toContain('+committed');
     expect(text).toContain('-trusted');
@@ -823,12 +831,16 @@ describe('real Docker agent isolation', () => {
     await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');
     // A Git failure part-way through fails the export; it is never passed off as a complete diff.
     // Anything the export cannot read fails it: Git would otherwise drop untracked files or show tracked ones as deleted.
-    for (const extra of ['printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt',
-      'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden',
-      'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked',
+    const tracked = (name: string) => (source: string) => { agentBase(source); mkdirSync(join(source, name)); writeFileSync(join(source, name, 'f'), 'a\n'); };
+    for (const { extra, hostile, beforeSeed } of [
+      { extra: 'printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt' },
+      { extra: 'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden' },
+      { hostile: tracked('tracked'), extra: 'printf "b\\n" > tracked/f && chmod 000 tracked' },
       // An ignored directory: the untracked scan never enters it, so Git would report its tracked file as deleted.
-      'mkdir -p .git/info && printf "gone/\\n" >> .git/info/exclude && mkdir gone && printf "a\\n" > gone/f && g add -f gone/f && g commit -qm gone && chmod 000 gone']) {
-      const failing = fixture();
+      { hostile: tracked('gone'), beforeSeed: (clone: string) => {
+        mkdirSync(join(clone, '.git', 'info'), { recursive: true }); writeFileSync(join(clone, '.git', 'info', 'exclude'), 'gone/\n');
+      }, extra: 'chmod 000 gone' }]) {
+      const failing = fixture({ hostile: hostile ?? agentBase, beforeSeed });
       agentChanges(failing.filesystems, extra);
       await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('could not read part of the task worktree');
     }
@@ -851,19 +863,20 @@ describe('real Docker agent isolation', () => {
   }, 180_000);
 
   it('names every entry Git would skip without a word, instead of dropping what is inside', async () => {
-    const data = fixture();
+    const data = fixture({ hostile: source => {
+      agentBase(source); mkdirSync(join(source, 'src')); writeFileSync(join(source, 'src', 'a.txt'), 'a\n');
+    // A clone made on a case-insensitive host (macOS) records core.ignorecase=true; the work volume is case-sensitive,
+    // and with it Git would take .GIT for .git and FILE.txt for the tracked file.txt, and drop both.
+    }, beforeSeed: clone => git(clone, 'config', 'core.ignorecase', 'true') });
     agentChanges(data.filesystems, [
       // A tracked directory that becomes a repository: Git no longer looks for new files in it.
-      'mkdir src && printf "a\\n" > src/a.txt && g add src && g commit -qm src',
       '(cd src && git init -q) && printf "new\\n" > src/new.txt',
       // Something named .git that is not a repository: Git never lists it or anything inside.
       'mkdir -p out/.git && printf "payload\\n" > out/.git/payload',
       'mkfifo pipe',
       // A directory that ignores itself: Git lists it and its contents, and it is named once.
       'mkdir gen && printf "*\\n" > gen/.gitignore && printf "important\\n" > gen/code.py',
-      // A clone made on a case-insensitive host (macOS) records core.ignorecase=true; the work volume is case-sensitive,
-      // and with it Git would take .GIT for .git and FILE.txt for the tracked file.txt, and drop both.
-      'g config core.ignorecase true && printf "upper\\n" > FILE.txt'].join(' && '));
+      'printf "upper\\n" > FILE.txt'].join(' && '));
     const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
     expect(text).toContain('codeboost: src/.git is a .git entry, which Git skips');
     expect(text).toContain('codeboost: out/.git is a .git entry, which Git skips');
@@ -1139,6 +1152,9 @@ describe('real Docker agent isolation', () => {
       expect(await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } }))
         .toMatchObject({ metadataChanged: true, changes: [] });
       await expect(snapshotDeclaredLinks(data.filesystems, ['file.txt'], { imageId })).rejects.toThrow('metadata changed');
+      await expect(snapshotDeclaredLinks(data.filesystems, [], { imageId })).rejects.toThrow('metadata changed');
+      // The export does not run Git on it either.
+      await expect(exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).rejects.toThrow('metadata changed');
     }, 180_000);
 
     it('hashes as git add does: CRLF that base stores under text=auto stays CRLF', async () => {
@@ -1274,7 +1290,8 @@ describe('real Docker agent isolation', () => {
       '--mount', `type=bind,source=${dir},target=/shims,readonly`,
       '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work,readonly`,
       '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git,readonly`,
-      '--entrypoint', 'bash', imageId, '-c', EXPORT_SCRIPT, 'export', data.clone.head, String(1024 * 1024 + 1)],
+      '--entrypoint', 'bash', imageId, '-c', EXPORT_SCRIPT, 'export', data.clone.head, String(1024 * 1024 + 1),
+      data.filesystems.metadataBaseline, TREE_SCRIPT],
     { encoding: 'utf8' });
   };
 
@@ -1297,7 +1314,7 @@ describe('real Docker agent isolation', () => {
   }, 120_000);
 
   it('says what Git reported when it fails', async () => {
-    const data = fixture();
+    const data = fixture({ hostile: agentBase });
     // agentChanges also replaces a tracked directory with a link to /etc/ssl, so Git first prints an error about a file
     // behind it that does not stop it; the reason must still be the one Git stopped on.
     agentChanges(data.filesystems, 'rm file.txt && mkfifo file.txt');
@@ -1307,10 +1324,12 @@ describe('real Docker agent isolation', () => {
 
   it('names files over 8 MiB instead of diffing them, so one large file cannot exhaust memory or the deadline', async () => {
     const data = fixture({ limits: { workBytes: 96 * 1024 * 1024, workInodes: 512, metadataBytes: 64 * 1024 * 1024,
-      metadataInodes: 512 } });
-    agentChanges(data.filesystems, ['head -c 9437184 /dev/urandom > tracked-big.bin',
-      'head -c 9437184 /dev/urandom > touched-big.bin', 'g add tracked-big.bin touched-big.bin', 'g commit -qm big',
-      'head -c 1000 /dev/urandom >> tracked-big.bin',
+      metadataInodes: 512 }, hostile: source => {
+      agentBase(source);
+      writeFileSync(join(source, 'tracked-big.bin'), randomBytes(9 * 1024 * 1024));
+      writeFileSync(join(source, 'touched-big.bin'), randomBytes(9 * 1024 * 1024));
+    } });
+    agentChanges(data.filesystems, ['head -c 1000 /dev/urandom >> tracked-big.bin',
       // Same size, new timestamp: porcelain git diff would read both versions in full to compare them.
       'touch -d "@$(( $(date +%s) + 60 ))" touched-big.bin',
       'head -c 20971520 /dev/urandom > new-big.bin', 'printf "small\\n" > small.txt'].join(' && '));
@@ -1326,12 +1345,17 @@ describe('real Docker agent isolation', () => {
 
   it.each(['', 'printf "[submodule \\"sub\\"]\\n\\tpath = sub\\n\\tignore = none\\n" > .gitmodules'])(
     'never runs a populated submodule\'s own filters (worktree .gitmodules: %s)', async gitmodules => {
-      const data = fixture();
+      // Base records a submodule; the task clone leaves it an empty directory, which the agent populates.
+      const data = fixture({ hostile: source => {
+        agentBase(source);
+        const sub = join(source, 'sub'); mkdirSync(sub);
+        git(sub, 'init'); git(sub, 'config', 'user.name', 'Test'); git(sub, 'config', 'user.email', 'test@example.com');
+        writeFileSync(join(sub, 'f'), 'base\n'); git(sub, 'add', 'f'); git(sub, 'commit', '-m', 'recorded');
+      } });
       // The submodule's config is the agent's: if Git ran git status inside it, this filter would print a read
-      // failure and fail the export. Its commit stays the recorded one, so only a look inside would notice it.
+      // failure and fail the export.
       agentChanges(data.filesystems, [
-        'git init -q sub', '(cd sub && printf "f\\n" > f && g add f && g commit -qm one)', 'g add sub',
-        'g commit -qm submodule',
+        'git init -q sub', '(cd sub && printf "f\\n" > f && g add f && g commit -qm one)',
         '(cd sub && printf "f filter=evil\\n" > .gitattributes && g config filter.evil.clean \'echo "warning: could not open directory \\x27x\\x27: Permission denied" >&2; cat\')',
         'touch -d "@$(( $(date +%s) + 60 ))" sub/f', gitmodules || 'true'].join(' && '));
       const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });

@@ -205,6 +205,20 @@ export function taskMetadataBaseline(storage: TaskFilesystems | RecoveredTaskSto
   assertTaskFilesystems(storage as TaskFilesystems);
   return (storage as TaskFilesystems).metadataBaseline;
 }
+/**
+ * The baseline to check the metadata against: D's own for storage this process allocated (a given one must match it),
+ * or the one F recorded, which a recovery handle needs. Only a runner commit (#66 part 2) may change the metadata after
+ * seeding; it is the last step on a storage, and is to return the new baseline.
+ */
+export function resolveMetadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage, given: string | undefined): string {
+  const known = taskMetadataBaseline(storage);
+  if (given !== undefined && !/^[0-9a-f]{64}$/.test(given)) throw new Error('metadataBaseline must be the SHA-256 the storage value carried.');
+  if (known && given !== undefined && given !== known)
+    throw new Error('metadataBaseline does not match the one recorded when this storage was seeded.');
+  const baseline = known ?? given;
+  if (!baseline) throw new Error('A recovered storage handle needs the metadataBaseline F recorded at allocation.');
+  return baseline;
+}
 
 /** The owner labels this task storage carries. */
 export function taskFilesystemOwner(filesystems: TaskFilesystems): ResourceOwner {
@@ -547,6 +561,8 @@ export interface ExportOptions extends PreparationOptions {
   readonly maxBytes?: number;
   /** Overall deadline for the Docker work, cleanup excluded. Default 60 s. */
   readonly timeoutMs?: number;
+  /** The storage's `metadataBaseline`, which F recorded at allocation. Required for a recovery handle. */
+  readonly metadataBaseline?: string;
 }
 // Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff --binary`
 // compares `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every
@@ -570,7 +586,11 @@ export interface ExportOptions extends PreparationOptions {
 // Exported only so tests can run it with failing stand-ins for the tools it uses; `exportTaskDiff` is the entry point.
 export const EXPORT_SCRIPT = [
   'set -eu',
-  'base=$1 limit=$2',
+  'base=$1 limit=$2 baseline=$3 tree=$4',
+  '# Before any Git command, the metadata must be as the seeder left it: Git reads its config, and config the agent',
+  '# could have changed must never run.',
+  'digest=$(perl -e "$tree" digest /work/.git)',
+  'if [ "$digest" != "$baseline" ]; then echo "the metadata changed since the storage was seeded; the diff was not exported" >&2; exit 10; fi',
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
   'cd /work',
   'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
@@ -871,9 +891,10 @@ export async function exportTaskDiff(storage: TaskFilesystems | RecoveredTaskSto
     throw new Error(`maxBytes must be a positive integer of at most ${MAXIMUM_EXPORT_BYTES}.`);
   if (typeof options.base !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.base))
     throw new Error('base must be a full commit ID.');
+  const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
   const stdout = await runStorageScript(storage, { kind: 'export', operation: 'Task diff export',
     consequence: 'the diff cannot be exported', entrypoint: 'bash',
-    args: ['-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1)] }, options);
+    args: ['-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1), baseline, TREE_SCRIPT] }, options);
   const bytes = Buffer.from(stdout.trim(), 'base64');
   return Object.freeze({ diff: bytes.subarray(0, maxBytes), truncated: bytes.length > maxBytes });
 }

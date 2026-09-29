@@ -88,8 +88,9 @@ Use only these entry points to run an agent:
    fails, the error carries Git's last two error lines.
 6. To audit what a writable attempt changed (#66, `agents/container/changes.ts`):
    - **Record the baseline.** The storage value carries `metadataBaseline`, a digest of the metadata volume that the
-     seeder takes as its last step. Record it with the allocation. `inspectTaskChanges` needs it back for a recovery
-     handle.
+     seeder takes as its last step. Record it with the allocation. `snapshotDeclaredLinks`, `inspectTaskChanges` and
+     `exportTaskDiff` each check the metadata against it before running any Git command, and need it back
+     (`metadataBaseline`) for a recovery handle.
    - **Before launch**, call `snapshotDeclaredLinks(storage, paths, { imageId })` with the item's declared paths.
      For each declared symlink it records where it resolves, one part at a time as the kernel would, and the state of
      the target and everything beneath it. A link on the way, a target that is a link, or a link inside a directory
@@ -99,7 +100,8 @@ Use only these entry points to run an agent:
      change manifest: every difference between the work tree and `base`, read without following links, with content
      IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
      directory that `base`'s own ignore rules ignore, with no tracked entry beneath it, is one entry (`ignored: true`). It also returns `agentCommits`,
-     `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`.
+     `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`. If the metadata changed, no Git
+     command runs: the manifest has `metadataChanged: true` and every other list empty.
    - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
      failed. Route it to needs human, as for link target changes and nested gitlink content.
    - **Refusals.** It refuses, and never returns part of the answer, when:
@@ -107,7 +109,8 @@ Use only these entry points to run an agent:
      - a name or link target is longer than 1,024 bytes, or is not strict UTF-8 free of control and format characters;
      - the recorded targets hold more than 20,000 entries;
      - it cannot read something;
-     - `base` is not a commit in the storage, or Git fails.
+     - `base` is not a commit in the storage, or Git fails;
+     - for a snapshot, the metadata changed since seeding (an export refuses then too).
 
      Treat a refusal as needs human.
    - **Both calls** run in a read-only container with no network, take `signal`, `onProcessGroup` and `timeoutMs`
