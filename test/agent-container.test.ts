@@ -803,7 +803,9 @@ describe('real Docker agent isolation', () => {
     // Anything the export cannot read fails it: Git would otherwise drop untracked files or show tracked ones as deleted.
     for (const extra of ['printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt',
       'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden',
-      'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked']) {
+      'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked',
+      // An ignored directory: the untracked scan never enters it, so Git would report its tracked file as deleted.
+      'printf "gone/\\n" >> .git/info/exclude && mkdir gone && printf "a\\n" > gone/f && g add -f gone/f && g commit -qm gone && chmod 000 gone']) {
       const failing = fixture();
       agentChanges(failing.filesystems, extra);
       await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/could not read part of the task worktree|git failed/);
