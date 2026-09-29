@@ -7,7 +7,9 @@ import { DatabaseSync } from 'node:sqlite';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { startServer } from '../web/server.ts';
-import { approveItem } from '../core/approvals.ts';
+import { approveItem, reviewedSegment } from '../core/approvals.ts';
+// A passthrough, so the stale-key test can count how often load() serializes a segment.
+vi.mock('../core/approvals.ts', async original => { const actual = await original<typeof import('../core/approvals.ts')>(); return { ...actual, reviewedSegment: vi.fn(actual.reviewedSegment) }; });
 // Each integration case performs several bounded real-Git reads.
 vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
@@ -106,7 +108,7 @@ it('gives each stale state its own stale key, including states whose segments an
 },30000);
 it('gives a still-stale item a new stale key when it gains an ambiguous change',()=>{
  const {service,config}=fixture();let view=service.load();const item=(id:string)=>view.items.find(value=>value.id===id)!;
- view=service.act({action:'approve',item:'P1',token:view.token});view=service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});
+ for(const id of ['P1','P2','P3'])view=service.act({action:'approve',item:id,confirmNoChange:item(id).count===0,token:view.token});view=service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});
  const before={key:item('P1').staleKey,reasons:item('P1').reasons,own:view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)};expect(item('P1').state).toBe('stale');
  const readme=join(config.repository,'README.md'),original=readFileSync(readme,'utf8');
  const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am',message],{cwd:config.repository,stdio:'pipe'});return execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();};
@@ -121,6 +123,10 @@ it('gives a still-stale item a new stale key when it gains an ambiguous change',
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:current.id},current.base,back,[{sha:byP3,owner:'P3',origin:'owned',sourceSha:null},{sha:back,owner:'P3',origin:'owned',sourceSha:null}]);
  view=service.load();expect(shared().key).toBe(second.segment.key);expect(shared().owners).not.toEqual(second.segment.owners);
  expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(second.key);
+ // The shared segment belongs to three stale items, yet one load serializes it once.
+ vi.mocked(reviewedSegment).mockClear();view=service.load();
+ expect(shared().owners.filter(owner=>owner!==null&&item(owner).state==='stale').length).toBeGreaterThanOrEqual(3);
+ expect(vi.mocked(reviewedSegment).mock.calls.filter(([segment])=>(segment as {key?:string}).key===shared().key)).toHaveLength(1);
 },30000);
 it('gives each replaced head after a queue attempt its own stale key',()=>{
  const {service,config}=fixture();let view=service.load();

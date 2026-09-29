@@ -66,6 +66,13 @@ export class ReviewService {
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
     // Names each stale item's stale state from every input that decides it, so the page keeps a reviewer's view choice only while that state is unchanged.
     const staleKeys = new Map<string, string | null>();
+    // Every field an approval covers, hashed once per segment, so a segment shared by many stale items is not serialized once per owner.
+    const reviewedDigests = new Map<string, string>();
+    const reviewedDigest = (segment: typeof segments[number]) => {
+      let digest = reviewedDigests.get(segment.key);
+      if (digest === undefined) reviewedDigests.set(segment.key, digest = createHash('sha256').update(JSON.stringify(reviewedSegment(segment))).digest('hex'));
+      return digest;
+    };
     const staleKey = (item: PlanItem): string | null => {
       if (staleKeys.has(item.id)) return staleKeys.get(item.id) ?? null;
       staleKeys.set(item.id, null);
@@ -73,8 +80,7 @@ export class ReviewService {
       const key = createHash('sha256').update(JSON.stringify({
         approval: saved.approvals.find(value => value.item === item.id) ?? null,
         current: fingerprint(item, segments, identity),
-        // A choice key leaves out context and owners, so the ambiguous segments carry every field an approval covers.
-        ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(segment => [segment.key, reviewedSegment(segment)]),
+        ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(reviewedDigest),
         dependencies: item.depends_on.map(id => { const dependency = plan.items.find(value => value.id === id); return dependency ? staleKey(dependency) : null; }),
         replacement: replacementReview ? { snapshotId: snapshot.id, revision: plan.revision, requiresFreshReview: mergeAttempt.requiresFreshReview, reviewVersion: mergeAttempt.reviewVersion } : null,
       })).digest('hex');
