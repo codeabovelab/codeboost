@@ -1,0 +1,362 @@
+import { identityKey, type PlanIdentity } from '../core/identity.ts';
+import { captureInvocation, type InvocationHandle, type InvocationInput, type InvocationResult, type StopReason, type TaskClone, type UnreleasedResource } from '../agents/contract.ts';
+import type { AttemptRecord, Store } from './store.ts';
+import { ATTEMPT_PHASES, GuardRefusal, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason } from './lifecycle.ts';
+
+/** What F's host-side preparation hands to D's start call. */
+export interface PreparedAttempt {
+  readonly clone: TaskClone;
+  readonly vendor: 'claude' | 'codex';
+  readonly approvedArgv: readonly (readonly string[])[];
+}
+export interface RunnerDeps {
+  /**
+   * The runner token D labels every resource with (32 lowercase hex characters). `prepare` must allocate task storage
+   * under the same token, because D refuses storage owned by another runner.
+   */
+  readonly runnerOwner: string;
+  /**
+   * Host-side preparation (clone, prompt). On abort it must stop and await every subprocess it started, then reject.
+   * It never leaves work running after it settles.
+   */
+  prepare(attempt: AttemptRecord, signal: AbortSignal): Promise<PreparedAttempt>;
+  /**
+   * Remove host-side preparation files only: before the terminal write when D never ran, after it once D settled.
+   * Task storage waits for the terminal write.
+   */
+  cleanupPreparation(attempt: AttemptRecord): Promise<void>;
+  /** D's start call: returns a handle at once, or throws with nothing left running. */
+  start(input: InvocationInput, prepared: PreparedAttempt): InvocationHandle;
+  /** Validate a clean result; throw with an actionable reason if it is invalid. Returns the value to persist. */
+  validate(attempt: AttemptRecord, result: InvocationResult): unknown;
+  now?(): number;
+}
+export interface SlotLimits { readonly writable: number; readonly readOnly: number }
+export interface StartRequest {
+  expectedStateVersion: number; kind: AttemptKind; item?: string | null; deadline: number; budgetMs?: number; retryOf?: string;
+  expectedContext: AttemptRecord['context'];
+}
+export interface RunnerStatus {
+  active: boolean;
+  stopRequested: { attemptId: string; reason: FirstReason; saved: boolean } | null;
+  unresolved: { attemptId: string; reason: UnresolvedReason } | null;
+}
+/**
+ * Why a task's slot stays held until restart: the terminal write failed, pending -> running failed, or the host-side
+ * preparation files could not be removed.
+ */
+export type UnresolvedReason = 'result-not-saved' | 'start-not-saved' | 'preparation-not-removed';
+type Group = 'writable' | 'readOnly';
+interface Job {
+  identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
+  firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean; staleCause?: string;
+  /**
+   * The outcome is fixed: before launch once the job starts ending (cleanup, then the terminal write), after launch once
+   * the terminal write is done. A later stop has nothing left to change.
+   */
+  decided?: boolean;
+  /** A cancel task the Store recorded on a job that no longer takes stops; shown in status only. */
+  cancelShown?: boolean;
+  controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
+}
+interface Marker { group: Group; attemptId: string; reason: UnresolvedReason }
+
+const D_REASON: Record<FirstReason, StopReason> = { cancelled: 'cancelled', stale: 'cancelled', shutdown: 'shutdown', 'time-limit': 'timeout' };
+/** setTimeout accepts at most 2^31-1 ms; longer waits are re-armed. */
+const MAX_TIMER = 2_147_483_647;
+const PREPARATION_TIMEOUT = 'Timed out while preparing.';
+const NEEDS_RESTART: Record<UnresolvedReason, string> = {
+  'result-not-saved': 'Needs restart: the last result could not be saved.',
+  'start-not-saved': 'Needs restart: the start of the last attempt could not be saved.',
+  'preparation-not-removed': 'Needs restart: the last attempt\'s preparation files could not be removed.',
+};
+const FOREIGN_RESULT = 'The agent returned a result for a different attempt; it was not saved.';
+const NOT_STARTED_UNRELEASED = 'Not started: an earlier agent\'s cleanup could not be confirmed. Restart codeboost to run it again.';
+
+/**
+ * One runner coordinator per process and Store. Owns in-memory jobs, slots and unresolved markers.
+ * See docs/implementation/runner-lifecycle.md ("Slots and concurrency", "Launch", "Rules for the running state").
+ */
+export class RunnerCoordinator {
+  #store: Store; #deps: RunnerDeps; #limits: SlotLimits;
+  #jobs = new Map<string, Job>(); #markers = new Map<string, Marker>();
+  #closing = false;
+  /** Set once D settles with `unreleased`: no new work until a restart's recovery confirms their removal. */
+  #unreleased: UnreleasedResource[] | null = null;
+  constructor(store: Store, deps: RunnerDeps, limits: SlotLimits = { writable: 1, readOnly: 1 }) {
+    if (![limits.writable, limits.readOnly].every(n => Number.isSafeInteger(n) && n >= 1)) throw new Error('Slot limits must be positive integers.');
+    this.#store = store; this.#deps = deps; this.#limits = limits;
+  }
+  get closing(): boolean { return this.#closing; }
+  /** Resources D could not confirm removed; non-null keeps the runner closed to new work until restart. */
+  get unreleased(): readonly UnreleasedResource[] | null { return this.#unreleased; }
+  #now(): number { return this.#deps.now?.() ?? Date.now(); }
+  #used(group: Group): number {
+    let used = 0;
+    for (const job of this.#jobs.values()) if (job.group === group) used++;
+    for (const marker of this.#markers.values()) if (marker.group === group) used++;
+    return used;
+  }
+  /**
+   * Admission. In-memory checks and the slot reservation happen in one synchronous turn before the Store transaction;
+   * a refused transaction releases the reservation in the same turn.
+   */
+  start(identity: PlanIdentity, request: StartRequest): AttemptRecord {
+    if (this.#closing) throw new GuardRefusal('The runner is shutting down.');
+    if (this.#unreleased) throw new GuardRefusal('Needs restart: an agent\'s cleanup could not be confirmed, so its containers or files may remain.');
+    const key = identityKey(identity);
+    if (this.#jobs.has(key)) throw new GuardRefusal('An attempt is already active for this task.');
+    const marker = this.#markers.get(key);
+    if (marker) throw new GuardRefusal(NEEDS_RESTART[marker.reason]);
+    if (!(request.kind in ATTEMPT_PHASES)) throw new GuardRefusal('Unknown attempt kind.');
+    const group: Group = WRITABLE_KINDS.includes(request.kind) ? 'writable' : 'readOnly';
+    if (this.#used(group) >= this.#limits[group]) throw new GuardRefusal('No free runner slot. Try again when the current attempt finishes.');
+    const job: Job = { identity: { ...identity }, key, group, attemptId: '', firstReason: null, reasonSaved: true, preparationTimedOut: false, controller: new AbortController(), timers: [] };
+    this.#jobs.set(key, job);
+    let attempt: AttemptRecord;
+    try { attempt = this.#store.admitAttempt(identity, { ...request, now: this.#now() }); }
+    catch (error) { this.#jobs.delete(key); throw error; }
+    job.attemptId = attempt.id; job.attempt = attempt;
+    job.done = this.#run(job, attempt);
+    return attempt;
+  }
+  /** Retry is a new attempt bound to the latest failed or cancelled one. */
+  retry(identity: PlanIdentity, attemptId: string, request: Omit<StartRequest, 'retryOf'>): AttemptRecord {
+    return this.start(identity, { ...request, retryOf: attemptId });
+  }
+  /**
+   * User stop or detected staleness. The first reason wins; nothing is freed until settlement.
+   * `cause` says what made the attempt stale (for example "plan revision 4 replaced 3") and is kept only if `stale` wins.
+   */
+  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale', cause?: string): boolean {
+    const job = this.#jobs.get(identityKey(identity));
+    if (!job || job.attemptId !== attemptId) return false;
+    const won = this.#requestStop(job, reason);
+    if (won && reason === 'stale' && cause !== undefined) job.staleCause = bounded(cause);
+    return won;
+  }
+  /** Cancel task: the Store records the reason and the pending close; the coordinator stops the running work. */
+  cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
+    const job = this.#jobs.get(identityKey(identity));
+    // The Store writes `cancelled` wherever the row has no reason yet, so save an earlier unsaved reason first. That write
+    // bumps the state version, so it is made only when the caller's version is current, and the cancel then uses the new one.
+    if (job?.firstReason && !job.reasonSaved) {
+      try {
+        if (this.#store.getTask(identity).stateVersion === expectedStateVersion
+          && this.#store.recordFirstReason(job.identity, job.attemptId, job.firstReason)) {
+          job.reasonSaved = true; this.#confirmSaved(job);
+          expectedStateVersion = this.#store.getTask(identity).stateVersion;
+        }
+      } catch { /* still unsaved; the Store's own write below is likely to fail the same way */ }
+    }
+    const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
+    if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason) {
+      // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout).
+      // Status shows it, but it never becomes the job's reason: the write may roll back with the caller's transaction,
+      // and the terminal write reads the row's own reason anyway.
+      job.cancelShown = true;
+      queueMicrotask(() => {
+        try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== 'cancelled') job.cancelShown = false; }
+        catch { /* unreadable: keep showing what the Store reported */ }
+      });
+    }
+    return outcome;
+  }
+  isActive(identity: PlanIdentity): boolean { return this.#jobs.has(identityKey(identity)); }
+  status(identity: PlanIdentity): RunnerStatus {
+    const key = identityKey(identity), job = this.#jobs.get(key), marker = this.#markers.get(key);
+    return {
+      active: !!job,
+      stopRequested: job?.firstReason ? { attemptId: job.attemptId, reason: job.firstReason, saved: job.reasonSaved }
+        : job?.cancelShown ? { attemptId: job.attemptId, reason: 'cancelled', saved: true } : null,
+      unresolved: marker ? { attemptId: marker.attemptId, reason: marker.reason } : null,
+    };
+  }
+  /** Resolves when the task's current job has settled (or immediately if there is none). */
+  async settled(identity: PlanIdentity): Promise<void> { await this.#jobs.get(identityKey(identity))?.done; }
+  /**
+   * Shutdown step 4: reject admission, record `shutdown` only where no reason is set, stop everything and await settlement.
+   * No timer abandons a job (decision 4); the Store stays open for the caller to close afterwards.
+   */
+  async close(): Promise<void> {
+    this.#closing = true;
+    const jobs = [...this.#jobs.values()];
+    for (const job of jobs) this.#requestStop(job, 'shutdown');
+    await Promise.all(jobs.map(job => job.done));
+  }
+
+  #requestStop(job: Job, reason: FirstReason): boolean {
+    // The attempt deadline passed before launch: it ends `failed` with no first reason, so a later stop cannot claim it.
+    if (job.decided || (job.preparationTimedOut && !job.firstReason)) return false;
+    if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
+    job.firstReason = reason;
+    try {
+      if (job.attemptId && !this.#store.recordFirstReason(job.identity, job.attemptId, reason)) {
+        // Another writer (for example cancel task) recorded a reason first; adopt the durable one.
+        const durable = this.#store.getAttempt(job.identity, job.attemptId).firstReason;
+        if (durable) job.firstReason = durable;
+      }
+      job.reasonSaved = true; this.#confirmSaved(job);
+    } catch { job.reasonSaved = false; }
+    job.controller.abort(new Error(`Stopped: ${job.firstReason}`));
+    job.handle?.cancel(D_REASON[job.firstReason]);
+    return true;
+  }
+  /**
+   * A reason write may be part of the caller's transaction (userAction) and roll back with it. Once that transaction
+   * has ended, check the row, so an undone write shows as unsaved and the next cancel task saves it again.
+   */
+  #confirmSaved(job: Job): void {
+    queueMicrotask(() => {
+      if (!job.firstReason || !job.reasonSaved) return;
+      try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== job.firstReason) job.reasonSaved = false; }
+      catch { /* unreadable: keep what the write reported */ }
+    });
+  }
+  /** Task budget and, before launch, the attempt deadline. D enforces the deadline once it runs. */
+  #arm(job: Job, attempt: AttemptRecord): void {
+    const at = (when: number, fire: () => void) => {
+      const wait = () => {
+        const remaining = when - this.#now();
+        if (remaining <= 0) return fire();
+        job.timers.push(setTimeout(wait, Math.min(remaining, MAX_TIMER)));
+      };
+      wait();
+    };
+    const budget = this.#store.getTask(job.identity).budgetDeadline;
+    if (budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
+    at(attempt.deadline, () => { if (!job.handle && !job.firstReason) { job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT)); } });
+  }
+  async #run(job: Job, attempt: AttemptRecord): Promise<void> {
+    try {
+      // Admission may be part of the caller's transaction (userAction). Start nothing until that transaction has ended:
+      // if it rolled back, the row is gone and the job only gives back its reservation.
+      await null;
+      if (!this.#store.getAttempts(job.identity).some(row => row.id === attempt.id)) return;
+      // A failed read ends the attempt before preparation.
+      try { this.#arm(job, attempt); }
+      catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Could not arm the task time limit: ${message(error)}` }); }
+      // A stop can land before this point; do not start preparation for it.
+      if (job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
+      let prepared: PreparedAttempt;
+      try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
+      catch (error) { return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error)); }
+      if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job));
+      // Launch check: one synchronous turn, no await between the checks and D's start call.
+      const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
+      if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
+      if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
+      // A context change comes before both time checks, as in the settlement order and startup recovery.
+      if (!sameContext(row.context, this.#store.currentContext(job.identity))) {
+        // Recorded like any stale stop, so the row keeps it even if a cancel task lands during cleanup.
+        this.#requestStop(job, 'stale');
+        return await this.#endBeforeLaunch(job, attempt, {});
+      }
+      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}); }
+      if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }); }
+      // Fail closed: once D reported resources it could not remove, no new invocation starts, even one already admitted.
+      if (this.#unreleased) return await this.#endBeforeLaunch(job, attempt, { detail: NOT_STARTED_UNRELEASED });
+      let handle: InvocationHandle;
+      try {
+        const input = captureInvocation({ clone: prepared.clone, phase: ATTEMPT_PHASES[attempt.kind], vendor: prepared.vendor,
+          approvedArgv: prepared.approvedArgv, deadline: attempt.deadline, attemptId: attempt.id, runnerOwner: this.#deps.runnerOwner, context: attempt.context }, now);
+        handle = this.#deps.start(input, prepared);
+      } catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Launch failed: ${message(error)}` }); }
+      job.handle = handle;
+      let running: boolean | undefined;
+      try { running = this.#store.markRunning(job.identity, attempt.id); } catch { running = undefined; }
+      if (running === undefined) {
+        // A storage error, not a stop: keep ownership until D settles, then hold the slot under a marker.
+        handle.cancel('capture-failure');
+        const result = await handle.settled.catch(() => undefined);
+        if (result) this.#noteUnreleased(result);
+        this.#markers.set(job.key, { group: job.group, attemptId: attempt.id, reason: 'start-not-saved' });
+        return;
+      }
+      if (!running) {
+        // Refused because a first reason is now recorded: a normal stop.
+        // A read failure must not strand the live handle: fall back to the in-memory reason and still await D.
+        let durable: FirstReason | null = null;
+        try { durable = this.#store.getAttempt(job.identity, attempt.id).firstReason; } catch { /* keep the in-memory reason */ }
+        if (durable && !job.firstReason) job.firstReason = durable;
+        handle.cancel(D_REASON[job.firstReason ?? 'cancelled']);
+      } else if (job.firstReason) handle.cancel(D_REASON[job.firstReason]);
+      const result = await handle.settled;
+      this.#noteUnreleased(result);
+      // Accept only the result of this exact invocation, as the question path does. Anything else is never validated
+      // or saved: the attempt fails closed.
+      if (result.attemptId !== attempt.id || !result.context || !sameContext(result.context, attempt.context)) {
+        this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false,
+          detail: job.firstReason === 'stale' ? job.staleCause : FOREIGN_RESULT });
+        job.decided = true;
+        return;
+      }
+      let valid = false, value: unknown, detail = result.stderr ? bounded(result.stderr) : undefined;
+      if (!job.firstReason && result.exitCode === 0 && !result.stopReason) {
+        try { value = this.#deps.validate(attempt, result); valid = true; }
+        catch (error) { detail = `Invalid output: ${message(error)}`; }
+      }
+      // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
+      if (job.firstReason === 'stale') detail = job.staleCause;
+      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
+      job.decided = true;
+      // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
+      if (saved && !(await this.#removePreparation(job, attempt))) this.#holdForPreparation(job);
+    } catch (error) {
+      // Set the marker before the job goes, so the slot is never free in between.
+      this.#unexpected(job, error);
+    } finally {
+      for (const timer of job.timers) clearTimeout(timer);
+      if (this.#jobs.get(job.key) === job) this.#jobs.delete(job.key);
+    }
+  }
+  /** D gave up on cleanup (presence, not length, is the signal): fail closed until restart, as Ask does. */
+  #noteUnreleased(result: InvocationResult): void {
+    if (result.unreleased === undefined) return;
+    this.#unreleased = [...(this.#unreleased ?? []), ...result.unreleased];
+    console.error(`Runner job ${result.attemptId} left resources whose removal was not confirmed; new work is refused until restart.`);
+  }
+  #preparationDetail(job: Job, error?: unknown): { detail?: string } {
+    // D never ran, so there is no D stop reason; without one the Store keeps this text instead of "Timed out.".
+    if (job.preparationTimedOut && !job.firstReason) return { detail: PREPARATION_TIMEOUT };
+    return error === undefined || job.firstReason ? {} : { detail: `Preparation failed: ${message(error)}` };
+  }
+  /** Ending without a handle: host-side cleanup, then the terminal write from the first reason. */
+  async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }): Promise<void> {
+    // Stops that land while preparation finishes are taken into account; once the job is ending, the outcome is fixed.
+    job.decided = true;
+    const removed = await this.#removePreparation(job, attempt);
+    this.#settle(job, { exitCode: null, signal: null, valid: false, detail: job.firstReason === 'stale' ? job.staleCause : s.detail });
+    if (!removed) this.#holdForPreparation(job);
+  }
+  /**
+   * Remove host-side preparation files. If that fails, they still hold a clone of the task, so the caller keeps the slot
+   * held under a marker until startup recovery removes the attempt directory.
+   */
+  async #removePreparation(job: Job, attempt: AttemptRecord): Promise<boolean> {
+    try { await this.#deps.cleanupPreparation(attempt); return true; }
+    catch (error) {
+      console.error(`Runner job ${job.attemptId} could not remove its preparation files: ${message(error)}`);
+      return false;
+    }
+  }
+  /** Set in the same turn the job goes, so the slot is never free in between. A failed terminal write's marker stays. */
+  #holdForPreparation(job: Job): void {
+    if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'preparation-not-removed' });
+  }
+  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string }): Classification | undefined {
+    try {
+      return this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason });
+    } catch {
+      // The row's outcome is unknown: hold the slot until startup recovery reconciles it.
+      this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });
+      return undefined;
+    }
+  }
+  #unexpected(job: Job, error: unknown): void {
+    // Fail closed: an unexpected error keeps the slot held until restart.
+    this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });
+    console.error(`Runner job ${job.attemptId} failed unexpectedly: ${message(error)}`);
+  }
+}
+const message = (error: unknown) => bounded(error instanceof Error ? error.message : String(error));

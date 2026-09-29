@@ -7,7 +7,7 @@ import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
-import { isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
+import { ACKNOWLEDGEMENT_SCRIPT, isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
   startProfileInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationInput, type InvocationResult } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
@@ -541,6 +541,38 @@ describe('container invocation supervisor', () => {
     expect(result.stopReason, result.stderr).toBeUndefined();
     expect(result.stdout).toBe('captured');
     expect(result.stderr).toContain('trailing-diagnostic');
+  }, 60_000);
+
+  it('writes the deferred output acknowledgement idempotently, repairing a partial one', () => {
+    const token = randomUUID(), file = `/run/codeboost-control/collected-${token}`;
+    const name = `codeboost-ack-script-${randomUUID()}`;
+    execFileSync('docker', ['run', '-d', '--rm', '--name', name, '--network', 'none', '--cap-drop=ALL',
+      '--security-opt=no-new-privileges', '--user', '10001:10001', '--entrypoint', 'sleep',
+      '--tmpfs', '/run/codeboost-control:rw,nosuid,nodev,noexec,size=65536,nr_inodes=16,uid=0,gid=0,mode=0711',
+      imageId, '120'], { stdio: 'ignore' });
+    try {
+      const acknowledge = () => spawnSync('docker', ['exec', '--user', '0', name, 'node', '-e', ACKNOWLEDGEMENT_SCRIPT,
+        token], { encoding: 'utf8' });
+      const content = () => execFileSync('docker', ['exec', name, 'cat', file], { encoding: 'utf8' });
+      const root = (script: string) => execFileSync('docker', ['exec', '--user', '0', name, 'sh', '-c', script]);
+      expect(acknowledge().status).toBe(0);
+      expect(content()).toBe(token);
+      // A retry after an attempt that completed.
+      expect(acknowledge().status).toBe(0);
+      expect(content()).toBe(token);
+      // A retry after an attempt that died once it had created the file.
+      for (const partial of ['', token.slice(0, 8)]) {
+        root(`rm ${file} && printf '${partial}' > ${file} && chmod 444 ${file}`);
+        expect(acknowledge().status).toBe(0);
+        expect(content()).toBe(token);
+      }
+      expect(execFileSync('docker', ['exec', name, 'stat', '-c', '%a %u %h', file], { encoding: 'utf8' }).trim())
+        .toBe('444 0 1');
+      root(`rm ${file} && ln -s /etc/passwd ${file}`);
+      expect(acknowledge().status).not.toBe(0);
+    } finally {
+      spawnSync('docker', ['rm', '--force', name], { stdio: 'ignore' });
+    }
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {

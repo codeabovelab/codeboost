@@ -1,6 +1,6 @@
 import { fixtureGit } from './fixtures/git.ts';
 import { randomUUID } from 'node:crypto';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -31,10 +31,12 @@ vi.mock('node:child_process', async importOriginal => {
 vi.mock('../agents/container/image.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../agents/container/image.ts')>(), assertBuiltAgentImage: () => {},
 }));
-const { hasLiveTaskStorage, prepareTaskFilesystemsAsync, removeTaskFilesystems } =
-  await import('../agents/container/storage.ts');
+const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTaskFilesystemsAsync,
+  removeTaskFilesystems } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
 
+// Every fake Docker call starts a Node process, so a loaded machine needs more than the default 5 s per test.
+vi.setConfig({ testTimeout: 60_000 });
 const RUNNER = '0123456789abcdef0123456789abcdef';
 const IMAGE = `sha256:${'a'.repeat(64)}`;
 const LIMITS = { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 };
@@ -65,6 +67,26 @@ if (a === 'start' && fs.existsSync(path.join(state, 'hang-start'))) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 }
 if (a === 'start') process.exit(0);
+if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
+  const name = args[args.indexOf('--name') + 1];
+  save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
+  if (fs.existsSync(path.join(state, 'fail-export'))) {
+    // Like --rm after the export script failed: the container is gone and the client reports the script's status.
+    fs.rmSync(path.join(state, name + '.json'));
+    console.error('git failed while exporting the diff (status 128)');
+    process.exit(4);
+  }
+  if (fs.existsSync(path.join(state, 'hang-export'))) {
+    fs.writeFileSync(path.join(state, 'export-began'), '');
+    process.on('SIGTERM', () => {});
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+  }
+  // Like the export script: the diff, cut to the limit it is given, base64-encoded; then --rm removes the container.
+  const diff = fs.readFileSync(path.join(state, 'export-diff')).subarray(0, Number(args.at(-1)));
+  fs.rmSync(path.join(state, name + '.json'));
+  process.stdout.write(diff.toString('base64'));
+  process.exit(0);
+}
 if (a === 'run') process.exit(0);
 if (b === 'inspect') {
   const object = find(args[2]);
@@ -188,5 +210,80 @@ describe('asynchronous task storage allocation', () => {
       { signal: AbortSignal.abort(), onProcessGroup: group => { groups.push(group); } })).rejects.toThrow('cancelled');
     expect(groups).toEqual([]);
     expect(stored()).toEqual([]);
+  });
+});
+
+describe('task diff export', () => {
+  const BASE = 'b'.repeat(40);
+  const exports = () => stored().filter(file => file.startsWith('codeboost-export-'));
+
+  it('returns the diff bytes, and cuts a longer diff at maxBytes', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    const diff = Buffer.concat([Buffer.from('diff --git a/file.txt b/file.txt\n'), Buffer.from([0xff, 0x00, 0xfe])]);
+    writeFileSync(join(state, 'export-diff'), diff);
+    expect(await exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE })).toEqual({ diff, truncated: false });
+    expect(await exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE, maxBytes: 10 }))
+      .toEqual({ diff: diff.subarray(0, 10), truncated: true });
+    // The export container is transient: none is left behind.
+    expect(exports()).toEqual([]);
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('exports through a recovery handle, after a restart lost the allocator value', async () => {
+    const owned = owner(), labels = (kind: string) => ({ 'io.codeboost.runner': owned.runnerOwner,
+      'io.codeboost.attempt': owned.attemptId, 'io.codeboost.allocation': owned.allocationId, 'io.codeboost.task-storage': kind });
+    const work = `codeboost-work-${randomUUID()}`, metadata = `codeboost-metadata-${randomUUID()}`;
+    writeFileSync(join(state, `${work}.json`), JSON.stringify({ kind: 'volume', labels: labels('work') }));
+    writeFileSync(join(state, `${metadata}.json`), JSON.stringify({ kind: 'volume', labels: labels('metadata') }));
+    writeFileSync(join(state, 'export-diff'), 'partial output\n');
+    const handle = await adoptRecoveredTaskStorage(owned, { workVolume: work, metadataVolume: metadata });
+    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE })).diff.toString()).toBe('partial output\n');
+  });
+
+  it('refuses a volume that no longer carries the storage labels, before running anything', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    const file = join(state, `${filesystems.workVolume}.json`), object = JSON.parse(readFileSync(file, 'utf8'));
+    writeFileSync(file, JSON.stringify({ ...object, labels: { ...object.labels, 'io.codeboost.runner': 'f'.repeat(32) } }));
+    writeFileSync(join(state, 'export-diff'), 'x');
+    await expect(exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE })).rejects.toThrow("storage's labels");
+    expect(exports()).toEqual([]);
+  });
+
+  it('on abort, kills a docker run that ignores SIGTERM and removes the export container before settling', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'hang-export'), '');
+    const controller = new AbortController();
+    const waitForRun = setInterval(() => { if (existsSync(join(state, 'export-began'))) controller.abort(); }, 20);
+    const began = performance.now();
+    try {
+      const error = await exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE, signal: controller.signal })
+        .then(() => undefined, caught => caught);
+      expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    } finally { clearInterval(waitForRun); }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
+    expect(exports()).toEqual([]);
+    rmSync(join(state, 'hang-export'));
+    removeTaskFilesystems(filesystems);
+  }, 60_000);
+
+  it('fails when the export container fails, reporting why, and leaves no container behind', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'export-diff'), 'partial');
+    writeFileSync(join(state, 'fail-export'), '');
+    await expect(exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE })).rejects.toThrow('git failed');
+    expect(exports()).toEqual([]);
+    rmSync(join(state, 'fail-export'));
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('rejects an invalid base, limit or image before any Docker call', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    calls.made = [];
+    await expect(exportTaskDiff(filesystems, { base: 'HEAD', imageId: IMAGE })).rejects.toThrow('full commit ID');
+    await expect(exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE, maxBytes: 1024 * 1024 + 1 }))
+      .rejects.toThrow('at most');
+    await expect(exportTaskDiff(filesystems, { base: BASE, imageId: 'latest' })).rejects.toThrow('immutable');
+    expect(calls.made).toEqual([]);
+    removeTaskFilesystems(filesystems);
   });
 });

@@ -3,7 +3,7 @@ import type { Plan, PlanItem } from './plan.ts';
 import type { Segment } from './linking.ts';
 
 /** Stable representation ignores object-key order and normalizes CRLF, not whitespace. */
-function stable(value: unknown): string {
+export function stable(value: unknown): string {
   if (typeof value === 'string') return JSON.stringify(value.replace(/\r\n/g, '\n'));
   if (Array.isArray(value)) return `[${value.map(stable).join(',')}]`;
   if (value !== null && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, val]) => `${JSON.stringify(key)}:${stable(val)}`).join(',')}}`;
