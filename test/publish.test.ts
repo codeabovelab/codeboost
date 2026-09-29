@@ -34,7 +34,7 @@ function runningTask(options: { head?: string } = {}) {
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ? [...options.results] : [];
@@ -68,6 +68,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
+      if (options.draftFails) throw new Error('timeout marking the PR a draft');
       const pr = { ...live.get(input.marker)!, draft: true }; live.set(input.marker, pr); return pr;
     },
     async refresh(number, input) {
@@ -355,6 +356,27 @@ describe('recovering a lost opening', () => {
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
     expect(store.getTask(identity).status).toBe('possibly already fixed');
   });
+  it('keeps the task running when marking the earlier PR a draft fails, so a retry repeats it', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    rerun(store);
+    const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+    await expect(harness(store, { live, next, results: [found], draftFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    expect(store.getTask(identity).status).toBe('running');
+    const retry = harness(store, { live, next, results: [found] });
+    expect(await retry.publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
+    expect(retry.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
+  it('refuses a PR-number mismatch before drafting anything', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    for (const [m, pr] of live) live.set(m, { ...pr, number: 999 });
+    rerun(store);
+    const again = harness(store, { live, next, results: [{ outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] }] });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/different pull request/);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+  });
   it('opens a new PR when the earlier draft was closed, and still excludes the old draft from the check', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
@@ -555,8 +577,15 @@ describe('GitHub PR adapter', () => {
       if (args.includes('GET') || !args.includes('-X')) { gets++; return JSON.stringify(response({ draft: false, head: { sha: gets < 3 ? oid(2) : oid(3), ref: 'codeboost/issue-12-task', repo: { full_name: 'owner/repo' } } })); }
       return JSON.stringify(response({ draft: false }));
     });
-    expect(await gh.refresh(7, { ...input, draft: false, ready: true, headSha: oid(3) })).toMatchObject({ headSha: oid(3) });
+    const controller = new AbortController();
+    let listeners = 0;
+    const add = controller.signal.addEventListener.bind(controller.signal), remove = controller.signal.removeEventListener.bind(controller.signal);
+    controller.signal.addEventListener = ((...a: Parameters<typeof add>) => { if (a[0] === 'abort') listeners++; return add(...a); }) as typeof add;
+    controller.signal.removeEventListener = ((...a: Parameters<typeof remove>) => { if (a[0] === 'abort') listeners--; return remove(...a); }) as typeof remove;
+    expect(await gh.refresh(7, { ...input, draft: false, ready: true, headSha: oid(3) }, controller.signal)).toMatchObject({ headSha: oid(3) });
     expect(gets).toBe(3);
+    // Each wait removes its abort listener, so a long-lived signal does not collect them.
+    expect(listeners).toBe(0);
   });
   it('marks an open ready PR as a draft, and leaves a draft alone', async () => {
     const calls: string[][] = [];

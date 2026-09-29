@@ -95,18 +95,17 @@ export class PullRequestPublisher {
       ownCommits: new Set(this.#store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha)),
     }, signal);
     signal?.throwIfAborted();
-    const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
-    if (result.outcome !== 'clear') {
-      // A task that is not published as ready never leaves its PR ready for review: its earlier ready PR becomes a draft.
-      // No await since recordAlreadyFixed, which re-read the task; the change only lowers what the PR offers.
-      if (earlier && live && !live.draft) {
-        const pr = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
-        if (earlier.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier.openingId, pr.number, pr.draft);
-      }
-      return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
-    }
-    // Checked before the push: a refused publish must not move the branch.
+    // Checked before any GitHub change: a refused publish must neither draft the PR nor move the branch.
     if (earlier && live && earlier.state === 'opened' && live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
+    // A task that is not published as ready never leaves its PR ready for review: on a match its earlier ready PR becomes
+    // a draft. This comes before the result is recorded, so if it fails the task is still running and a retry repeats it.
+    // Making a PR a draft only lowers what it offers, so it needs no re-read of the task first.
+    const drafted = result.outcome !== 'clear' && earlier && live && !live.draft
+      ? await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal) : null;
+    signal?.throwIfAborted();
+    const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
+    if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft);
+    if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
     // No await since recordAlreadyFixed, whose transaction re-read the task: the push follows it directly.
     await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
     signal?.throwIfAborted();

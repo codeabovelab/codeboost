@@ -121,9 +121,11 @@ export class GhPullRequestGateway implements PullRequestGateway {
       const { body, ...pr } = this.#pull(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal), input);
       if (pr.number !== number || !body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
       if (headSha === undefined || pr.headSha === headSha || poll >= HEAD_POLLS) return pr;
-      await new Promise((resolve, reject) => {
-        const timer = setTimeout(resolve, HEAD_POLL_MS);
-        signal?.addEventListener('abort', () => { clearTimeout(timer); reject(signal.reason); }, { once: true });
+      await new Promise<void>((resolve, reject) => {
+        signal?.throwIfAborted();
+        const onAbort = () => { clearTimeout(timer); reject(signal!.reason); };
+        const timer = setTimeout(() => { signal?.removeEventListener('abort', onAbort); resolve(); }, HEAD_POLL_MS);
+        signal?.addEventListener('abort', onAbort, { once: true });
       });
     }
   }

@@ -69,7 +69,7 @@ Each opening or refresh owns the task state version at the moment it passed step
 
 After an update, the read-back polls up to 5 times, half a second apart, until GitHub shows the pushed head, because GitHub updates a PR's head a moment after a push.
 
-When the check matches (or is unknown) and the task's earlier PR is open and ready for review, publish turns it back into a draft. A task that is not being published as ready never leaves its PR ready for review.
+When the check matches (or is unknown) and the task's earlier PR is open and ready for review, publish turns it back into a draft. A task that is not being published as ready never leaves its PR ready for review. This happens before the check result is recorded: if it fails, the task is still running, and a retry checks again and repeats it. A PR-number mismatch is refused before any GitHub change.
 
 The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.
 
