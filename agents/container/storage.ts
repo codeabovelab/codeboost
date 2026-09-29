@@ -530,7 +530,9 @@ export interface ExportOptions extends PreparationOptions {
 // not read a directory or path also fails it, since Git then diffs that path as absent; other warnings do not.
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
 // read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
-// diff programs and text conversion are off, and the worktree and attributes file are pinned. core.safecrlf is off
+// diff programs and text conversion are off, and the worktree and attributes file are pinned. A populated submodule's
+// own config is the agent's, so Git never looks inside one (diff.ignoreSubmodules=dirty): its pointer change is still
+// exported, but no `git status` runs there, and so none of its filters. core.safecrlf is off
 // so ordinary line-ending attributes (`text=auto`, `eol=crlf`) do not warn on stderr and fail a correct export.
 const EXPORT_SCRIPT = [
   'set -eu',
@@ -538,7 +540,8 @@ const EXPORT_SCRIPT = [
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
   'cd /work',
   'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
-  '  -c core.attributesFile=/dev/null -c core.safecrlf=false -c core.bigFileThreshold=8m "$@"; }',
+  '  -c core.attributesFile=/dev/null -c core.safecrlf=false -c core.bigFileThreshold=8m -c diff.ignoreSubmodules=dirty \\',
+  '  "$@"; }',
   'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
   'produce() {',
   '  set -eo pipefail',
@@ -576,7 +579,7 @@ const EXPORT_SCRIPT = [
   '  excluded=()',
   '  while IFS= read -r -d "" path; do excluded+=(":(exclude,literal)$path"); done < /tmp/export-large',
   '  if [ "${#excluded[@]}" -gt 1000 ]; then echo "more than 1,000 changed files are over 8 MiB" >&2; exit 7; fi',
-  '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" -- . "${excluded[@]}"',
+  '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" -- . ${excluded[@]+"${excluded[@]}"}',
   '  # One perl pass splits the untracked list at C speed, reading all of it so Git never writes to a closed pipe:',
   '  # nested repositories (the only entries ending in /) and the first 20,000 other paths. Each of those adds at least',
   '  # about 60 bytes of diff, so past the cap the output already exceeds 1 MiB and is marked truncated.',
