@@ -168,6 +168,15 @@ it('Git built-ins cannot be overridden by repository shell aliases', () => {
   expect(f.segments().length).toBeGreaterThan(0);
   expect(existsSync(join(f.dir, 'alias-executed'))).toBe(false);
 });
+it('ignores inherited user Git attributes outside the GIT_ namespace', () => {
+  const f = fixture(); f.write('a.txt', 'ONE\ntwo\nthree\n'); f.commit('P1');
+  const read = () => readHistory(f.dir, f.base).final.map(file => file.contexts);
+  const expected = read(); expect(expected.flat()).not.toHaveLength(0);
+  const home = mkdtempSync(join(tmpdir(), 'codeboost-history-home-')); dirs.push(home);
+  mkdirSync(join(home, 'git')); writeFileSync(join(home, 'git', 'attributes'), '* -diff\n');
+  vi.stubEnv('XDG_CONFIG_HOME', home); vi.stubEnv('HOME', home);
+  try { expect(read()).toEqual(expected); } finally { vi.unstubAllEnvs(); }
+});
 it('isolates repository selection from inherited Git environment variables', () => {
   const expected = fixture(); expected.write('a.txt', 'expected repo\n'); expected.commit('P1');
   const foreign = fixture(); foreign.write('a.txt', 'foreign repo\n'); foreign.commit();
