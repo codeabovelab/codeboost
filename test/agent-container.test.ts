@@ -943,18 +943,28 @@ describe('real Docker agent isolation', () => {
         writeFileSync(join(source, 'd', 'e', 'keep'), '');
         symlinkSync('d/e', join(source, 'a')); symlinkSync('a/../secret', join(source, 'x'));
         symlinkSync('d/e/../secret', join(source, 'y'));
+        // A chain: the target is itself a link. And a directory target with a link inside it.
+        symlinkSync('link2', join(source, 'chain')); symlinkSync('secret', join(source, 'link2'));
+        mkdirSync(join(source, 'box')); symlinkSync('../secret', join(source, 'box', 'inner')); symlinkSync('box', join(source, 'boxlink'));
       } });
-      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['x', 'y'], { imageId });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['x', 'y', 'chain', 'boxlink'], { imageId });
       // x goes through the link a (to d/e), so it reaches d/secret, not the top-level secret its text suggests.
       expect(linkSnapshot.links[0]).toMatchObject({ link: 'x', status: 'through-link', anchor: { path: 'a', type: 'symlink' } });
       expect(linkSnapshot.links[0]!.target).toBeUndefined();
       // Through real directories only, y resolves by name.
       expect(linkSnapshot.links[1]).toMatchObject({ link: 'y', status: 'present', target: 'd/secret' });
+      // A write through either would land on secret, which neither target is: both stop at the link.
+      expect(linkSnapshot.links[2]).toMatchObject({ link: 'chain', status: 'through-link', anchor: { path: 'link2' } });
+      expect(linkSnapshot.links[3]).toMatchObject({ link: 'boxlink', status: 'through-link', target: 'box',
+        anchor: { path: 'box/inner', type: 'symlink' } });
+      // Unchanged after the run: nothing to report, though inspection resolves the links without walking the targets.
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest.linkTargetChanges).toEqual([]);
     }, 180_000);
 
     it('reports what Git would skip: ignored files and directories under base\'s rules, fifos and .git parts', async () => {
       const data = fixture({ hostile: source => {
-        writeFileSync(join(source, '.gitignore'), '*.log\nbuild/\n');
+        writeFileSync(join(source, '.gitignore'), '*.log\n/build/\n');
         mkdirSync(join(source, 'kept')); writeFileSync(join(source, 'kept', 'tracked.log'), 'tracked\n');
         git(source, 'add', '-f', 'kept/tracked.log');
       } });
@@ -965,7 +975,12 @@ describe('real Docker agent isolation', () => {
         // A directory holding a tracked file is never collapsed, even under an ignore rule.
         'printf "changed\\n" > kept/tracked.log && printf "n\\n" > kept/new.log',
         // The agent's own ignore rules do not count: this file is still listed as not ignored.
-        'printf "*.secret\\n" >> .gitignore && printf "s\\n" > hidden.secret'].join(' && '));
+        'printf "*.secret\\n" >> .gitignore && printf "s\\n" > hidden.secret',
+        // Names are literal, never pathspec magic: ":/build" is a directory named ":" holding "build", not the top-level
+        // build that "/build/" ignores.
+        'mkdir -p ":/build" && printf "e\\n" > ":/build/evil.js" && printf "g\\n" > ":(glob)x"',
+        // An ignored directory is never entered, so what cannot be read inside it cannot fail the inspection.
+        'mkdir -p build/locked && chmod 000 build/locked'].join(' && '));
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('x.log')).toMatchObject({ kind: 'add', newType: 'file', ignored: true });
@@ -976,6 +991,8 @@ describe('real Docker agent isolation', () => {
       expect(byPath.get('kept/tracked.log')).toMatchObject({ kind: 'modify' });
       expect(byPath.get('kept/new.log')).toMatchObject({ kind: 'add', ignored: true });
       expect(byPath.get('hidden.secret')).toMatchObject({ kind: 'add', ignored: false });
+      expect(byPath.get(':/build/evil.js')).toMatchObject({ kind: 'add', newType: 'file', ignored: false });
+      expect(byPath.get(':(glob)x')).toMatchObject({ kind: 'add', ignored: false });
     }, 180_000);
 
     it('reports what a commit would store: nothing for an honest CRLF checkout, the stored blob under ident', async () => {
@@ -1050,8 +1067,21 @@ describe('real Docker agent isolation', () => {
       asAgent(data.filesystems, `rm -f bad*; printf "x\\n" > "$(printf "s\\355\\240\\200")"`);
       await expect(inspect()).rejects.toThrow(/s\\xed\\xa0\\x80 is not printable UTF-8/);
       asAgent(data.filesystems, `rm -f s*; mkdir many; cd many; for i in $(seq 1 ${MAXIMUM_CHANGES + 1}); do : > "$i"; done`);
-      await expect(inspect()).rejects.toThrow(`more than ${MAXIMUM_CHANGES} changes`);
+      await expect(inspect()).rejects.toThrow(`more than ${MAXIMUM_CHANGES} new entries`);
     }, 240_000);
+
+    it('counts each declared target once, so a target the snapshot accepted is inspected too', async () => {
+      const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 14_000, metadataBytes: 16 * 1024 * 1024,
+        metadataInodes: 512 }, hostile: source => {
+        mkdirSync(join(source, 'big')); for (let i = 0; i < 12_000; i += 1) writeFileSync(join(source, 'big', String(i)), '');
+        symlinkSync('big', join(source, 'biglink'));
+      } });
+      // More than half the limit: counted twice, the inspection would refuse what the snapshot accepted.
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['biglink'], { imageId });
+      expect(linkSnapshot.links[0]!.entries).toHaveLength(12_001);
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest.linkTargetChanges).toEqual([]);
+    }, 300_000);
   });
 
   it('names what the diff cannot show: a submodule directory with content, and attributes that rewrite bytes', async () => {

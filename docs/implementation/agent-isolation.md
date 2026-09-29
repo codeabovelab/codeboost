@@ -91,12 +91,14 @@ Use only these entry points to run an agent:
      seeder takes as its last step. Record it with the allocation. `inspectTaskChanges` needs it back for a recovery
      handle.
    - **Before launch**, call `snapshotDeclaredLinks(storage, paths, { imageId })` with the item's declared paths.
-     For each declared symlink it records where the target resolves (by name, never through a link) and the state of
-     the target and everything beneath it. Keep the result.
+     For each declared symlink it records where it resolves, one part at a time as the kernel would, and the state of
+     the target and everything beneath it. A link on the way, a target that is a link, or a link inside a directory
+     target shows as `through-link`. Keep the result.
    - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
-     change manifest: every difference between the work tree and `base`, read without following links and hashed as
-     raw bytes, so ignored files, fifos, entries under a `.git` part and attribute tricks are all visible. It also
-     returns `agentCommits`, `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`.
+     change manifest: every difference between the work tree and `base`, read without following links, with content
+     IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
+     directory that `base`'s own ignore rules ignore is one entry (`ignored: true`). It also returns `agentCommits`,
+     `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`.
    - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
      failed. Route it to needs human, as for link target changes and nested gitlink content.
    - **Refusals.** It refuses, and never returns part of the answer, when:

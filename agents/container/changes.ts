@@ -58,9 +58,9 @@ export interface TargetState {
   /**
    * `present`: `entries` is the target and everything beneath it. `absent`: nothing is there (or a part on the way is
    * missing or not a directory), and `anchor` is the nearest existing entry; its inode shows whether it was replaced
-   * (its times also change when a sibling is created, so they are not compared). `through-link`: a part on the way is
-   * a link, which `anchor` names. The link is resolved one part at a time, as the kernel does, so `a/..` goes through
-   * `a`.
+   * (its times also change when a sibling is created, so they are not compared). `through-link`: a part on the way, the
+   * target itself, or an entry inside a directory target is a link, which `anchor` names; a write would go on to
+   * wherever it points. The link is resolved one part at a time, as the kernel does, so `a/..` goes through `a`.
    */
   readonly status: 'present' | 'absent' | 'through-link';
   readonly entries?: readonly TargetEntry[];
@@ -113,6 +113,9 @@ export interface TaskChangeManifest {
 }
 
 const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
+// The script refuses output past MAXIMUM_TREE_OUTPUT itself; the runner keeps a little more so that refusal, with its
+// reason, is what reaches the caller.
+const OUTPUT_SLACK = 1024 * 1024;
 const DIGEST = /^[0-9a-f]{64}$/;
 // A declared path names one entry of the work tree by its Git path: relative, no empty, `.` or `..` part, and not the
 // metadata. Control characters cannot appear in a manifest.
@@ -148,10 +151,12 @@ const deepFreeze = <T>(value: T): T => {
 };
 
 /**
- * Record, before launch, where each declared link's target resolves (by name, never through the filesystem) and the
- * state of that target and everything beneath it, including the nearest existing directory above a dangling target.
+ * Record, before launch, where each declared link resolves (one part at a time, as the kernel would in an agent
+ * container) and the state of its target and everything beneath it, or the nearest existing entry for a dangling one.
+ * A link on the way, a target that is itself a link, or a link inside a directory target makes it `through-link`.
  * Runs in a read-only container over the storage with no network. F keeps the result and passes it to
- * `inspectTaskChanges`. More than `MAXIMUM_TARGET_ENTRIES` entries beneath one target fails rather than truncates.
+ * `inspectTaskChanges`. More than `MAXIMUM_TARGET_ENTRIES` entries beneath all targets together fails rather than
+ * truncates.
  */
 export async function snapshotDeclaredLinks(storage: TaskFilesystems | RecoveredTaskStorage, paths: readonly string[],
   options: StorageScriptOptions): Promise<DeclaredLinkSnapshot> {
@@ -160,7 +165,7 @@ export async function snapshotDeclaredLinks(storage: TaskFilesystems | Recovered
   assertArguments(paths);
   if (paths.length === 0) return deepFreeze({ links: [] });
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Declared link snapshot',
-    consequence: 'declared links cannot be recorded', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT,
+    consequence: 'declared links cannot be recorded', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
     args: ['-e', TREE_SCRIPT, 'snapshot', ...paths] }, { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const snapshot = JSON.parse(stdout) as DeclaredLinkSnapshot;
   if (!Array.isArray(snapshot.links) || snapshot.links.length !== paths.length)
@@ -181,14 +186,16 @@ export interface InspectOptions extends StorageScriptOptions {
 }
 
 const sameIdentity = (a: TargetEntry, b: TargetEntry) => a.ino === b.ino && a.ctime === b.ctime && a.mtime === b.mtime;
+// An anchor is compared by what shows it was replaced or repointed: its inode, and for a link, where it points. Its
+// times are not compared: they change whenever a sibling is created beside a dangling target.
+const sameAnchor = (a: TargetEntry | undefined, b: TargetEntry | undefined) => a?.path === b?.path && a?.type === b?.type
+  && a?.ino === b?.ino && a?.linkTarget === b?.linkTarget;
 function compareTarget(link: string, target: string, before: TargetState, after: TargetState): LinkTargetChange[] {
   const change = (path: string, kind: LinkTargetChange['change']) => ({ link, target, path, change: kind });
   if (before.status !== after.status) return [change(target, 'status')];
   if (before.status !== 'present') {
-    const [a, b] = [before.anchor!, after.anchor!];
-    if (a.path !== b.path || a.type !== b.type) return [change(a.path, 'status')];
     // Creating the target itself shows as a status change; a sibling created beside it is not a write through the link.
-    return a.ino === b.ino ? [] : [change(a.path, 'identity')];
+    return sameAnchor(before.anchor, after.anchor) ? [] : [change(before.anchor?.path ?? target, 'identity')];
   }
   const now = new Map((after.entries ?? []).map(entry => [entry.path, entry]));
   const changes: LinkTargetChange[] = [];
@@ -220,11 +227,12 @@ interface InspectOutput {
 
 /**
  * Compare the work tree with the tree of `base` after an invocation settled, without following links, and return the
- * change manifest F2a audits (#66). Every regular file is hashed as raw bytes, so no Git attribute can hide an edit,
- * and every entry is seen: ignored files, fifos, anything under a `.git` part, and anything in a gitlink directory
- * (reported in `nestedGitlinkContent`). Runs in a read-only container over the storage with no network. It fails,
- * rather than returns part of the answer, on more than `MAXIMUM_CHANGES` changes, on a name or link target that is not
- * printable UTF-8, and on anything it cannot read.
+ * change manifest F2a audits (#66). Content IDs are what a commit would store (see `TaskChange`). Entries Git would
+ * skip are listed too: new ignored files, fifos, anything under a `.git` part, and anything in a gitlink directory
+ * (reported in `nestedGitlinkContent`); a new directory that base's rules ignore is one entry. Each declared link is
+ * resolved again and each target the snapshot recorded is compared with what is there now. Runs in a read-only
+ * container over the storage with no network. It fails, rather than returns part of the answer, on more than
+ * `MAXIMUM_CHANGES` changes, on a name or link target that is not strict printable UTF-8, and on anything it cannot read.
  */
 export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
   options: InspectOptions): Promise<TaskChangeManifest> {
@@ -243,7 +251,7 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
   for (const target of targets) assertDeclaredPath(target);
   assertArguments([...links.map(link => link.link), ...targets]);
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Task change inspection',
-    consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT,
+    consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
     args: ['-e', TREE_SCRIPT, 'inspect', options.base, ...links.map(link => link.link), '--', ...targets] },
   { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const output = JSON.parse(stdout) as InspectOutput;
@@ -258,11 +266,12 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
     const found: LinkTargetChange[] = [];
     // Where it resolves now: its text, or a directory on the way, may have changed.
     if (after.linkTarget !== before.linkTarget || after.target !== before.target) found.push(change(before.link, 'retargeted'));
-    else if (after.status !== before.status) found.push(change(before.link, 'status'));
-    else if (before.target === undefined && before.anchor
-      && (after.anchor?.path !== before.anchor.path || after.anchor?.type !== before.anchor.type
-        || after.anchor?.ino !== before.anchor.ino))
-      found.push(change(before.anchor.path, 'identity'));
+    // A link that stopped before a target (not a link, outside, through a link or missing on the way) is compared here;
+    // a target's own state is compared below, from a full walk.
+    else if (before.target === undefined) {
+      if (after.status !== before.status) found.push(change(before.link, 'status'));
+      else if (!sameAnchor(before.anchor, after.anchor)) found.push(change(before.anchor?.path ?? before.link, 'identity'));
+    }
     // What the target recorded before launch holds now, even if the link was pointed elsewhere.
     if (before.target !== undefined) {
       const now = output.targets[before.target];
