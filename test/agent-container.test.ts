@@ -1128,9 +1128,17 @@ describe('real Docker agent isolation', () => {
         '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'git', imageId,
         '-C', '/work', '-c', 'user.name=agent', '-c', 'user.email=agent@example.com', 'commit', '-q', '--allow-empty', '-m', 'agent');
       const committed = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
-      expect(committed.agentCommits.length).toBeGreaterThan(0);
-      expect(committed.metadataChanged).toBe(true);
+      // Changed metadata is never read with Git: nothing else is reported, and that alone is needs human.
+      expect(committed).toMatchObject({ metadataChanged: true, changes: [], agentCommits: [] });
       expect(committed.digest).not.toBe(quiet.digest);
+      // Config the agent could have written never runs: a filter that fails would fail the inspection if Git ran.
+      docker('run', '--rm', '--network=none', '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
+        '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`,
+        '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'sh', imageId,
+        '-c', 'cd /work && git config filter.x.clean false && git config filter.x.required true && printf "* filter=x\\n" > .gitattributes');
+      expect(await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } }))
+        .toMatchObject({ metadataChanged: true, changes: [] });
+      await expect(snapshotDeclaredLinks(data.filesystems, ['file.txt'], { imageId })).rejects.toThrow('metadata changed');
     }, 180_000);
 
     it('hashes as git add does: CRLF that base stores under text=auto stays CRLF', async () => {
@@ -1179,6 +1187,7 @@ describe('real Docker agent isolation', () => {
         // and a symlinked .gitattributes: Git ignores each, as it does on commit. The root file has no warning of its
         // own, so nothing else excuses the unprefixed lines.
         writeFileSync(join(source, '.gitattributes'), '* -=x\n');
+        mkdirSync(join(source, 'a:b')); writeFileSync(join(source, 'a:b', '.gitattributes'), '* -=y\n');
         mkdirSync(join(source, 'v')); writeFileSync(join(source, 'v', '.gitattributes'), '[attr]mybin -diff -text\n');
         writeFileSync(join(source, 'v', 'a.txt'), 'a\n');
         mkdirSync(join(source, 'c')); writeFileSync(join(source, 'c', 'attrs'), '*.txt text\n');
@@ -1188,19 +1197,6 @@ describe('real Docker agent isolation', () => {
       asAgent(data.filesystems, 'printf "edited\\n" > v/a.txt && printf "edited\\n" > w/b.txt');
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
       expect(manifest.changes.map(change => change.path)).toEqual(['v/a.txt', 'w/b.txt']);
-    }, 180_000);
-
-    it('reads every file: an edit the index vouches for is still a change', async () => {
-      const data = fixture();
-      // Edit file.txt, then mark it assume-unchanged, so Git's own check skips it, as it skips a file whose times did
-      // not move with its content. Nothing may rely on Git's view of the index.
-      asAgent(data.filesystems, 'printf "hidden edit\\n" > file.txt');
-      docker('run', '--rm', '--network=none', '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
-        '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`,
-        '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'git', imageId,
-        '-C', '/work', 'update-index', '--assume-unchanged', 'file.txt');
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
-      expect(manifest.changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'file.txt' })]);
     }, 180_000);
 
     it('fails, never truncates, on too many changes and on a name that is not UTF-8', async () => {

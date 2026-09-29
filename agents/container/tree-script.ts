@@ -95,6 +95,16 @@ sub metadata_digest {
 if ($mode eq "digest") { print metadata_digest(shift @ARGV), "\n"; exit 0 }
 
 chdir "/work" or fail(6, "could not enter the work tree: $!");
+# Before any Git command, the metadata must be as the seeder left it: Git reads its config, and config the agent could
+# have changed must never run (a filter driver, say). If it changed, no Git runs at all: a snapshot refuses, and an
+# inspection reports only that.
+my $baseline = shift @ARGV // "";
+fail(2, "bad metadata baseline") unless $baseline =~ /^[0-9a-f]{64}\z/;
+my $metadata_digest = metadata_digest("/work/.git");
+if ($metadata_digest ne $baseline) {
+  fail(10, "the metadata changed since the storage was seeded; no Git command was run") if $mode eq "snapshot";
+  emit({ metadataDigest => $metadata_digest, metadataOnly => JSON::PP::true });
+}
 my %keep = map { $_ => 1 } qw(GIT_CONFIG_NOSYSTEM GIT_CONFIG_GLOBAL GIT_OPTIONAL_LOCKS GIT_TERMINAL_PROMPT GIT_NO_LAZY_FETCH
   GIT_LITERAL_PATHSPECS);
 delete $ENV{$_} for grep { /^GIT_/ && !$keep{$_} } keys %ENV;
@@ -131,7 +141,9 @@ sub git_in {
   for my $line (split /\n/, $errors) {
     if ($line =~ /^warning: /) { $in_warning = 1; next }
     if ($line =~ /^(?:error|fatal): /) { $first = $line; last }
-    next if $line =~ /(?: is not a valid attribute name| not allowed): [^:]*\.gitattributes:\d+\z/;
+    # The path can hold a colon, so everything after the fixed phrase is taken as the file.
+    if ($line =~ /(?: is not a valid attribute name| not allowed): (?:.+\/)?\.gitattributes:\d+\z/) { $in_warning = 0; next }
+    # Only the lines right after a warning continue it.
     if (!$in_warning) { $first = $line; last }
   }
   # Name the Git command itself, past any "-c name=value" pairs in front of it.
@@ -382,7 +394,9 @@ if (@commitable) {
   # What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
   # the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
   # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
-  my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} } sort keys %base;
+  # A submodule checked out as a directory is unchanged: it stays, or a commit built from this index would drop it.
+  my @gone = grep { !$work{$_} || ($work{$_}{type} ne $base{$_}{type}
+    && !($base{$_}{type} eq "gitlink" && $work{$_}{type} eq "directory")) } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
     print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");
@@ -456,6 +470,6 @@ if ($head ne $base) {
 }
 my @fresh = map { resolve($_, 0) } @links;
 my %targets = map { (text($_, "target") => target_state($_)) } @targets;
-emit({ metadataDigest => metadata_digest("/work/.git"), head => $head, agentCommits => \@agent_commits,
+emit({ metadataDigest => $metadata_digest, head => $head, agentCommits => \@agent_commits,
   changes => \@changes, nestedGitlinkContent => [map { text($_, "path") } sort @nested], links => \@fresh, targets => \%targets });
 `;

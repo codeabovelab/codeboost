@@ -113,7 +113,10 @@ export interface TaskChangeManifest {
   readonly changes: readonly TaskChange[];
   /** Commits on top of `base`. The metadata volume is read-only to agents, so any entry here means needs human. */
   readonly agentCommits: readonly string[];
-  /** Whether anything under `.git` differs from the baseline the seeder recorded. `true` means needs human. */
+  /**
+   * Whether anything under `.git` differs from the baseline the seeder recorded. `true` means needs human. Git reads
+   * that config, so when it changed no Git command runs and nothing else is read: every other list is then empty.
+   */
   readonly metadataChanged: boolean;
   readonly linkTargetChanges: readonly LinkTargetChange[];
   /** Gitlink paths with anything in them, or that cannot be read. */
@@ -166,6 +169,18 @@ const deepFreeze = <T>(value: T): T => {
   return value;
 };
 
+// The baseline the seeder recorded: D's own for storage this process allocated (a given one must match it), or the one F
+// recorded, which a recovery handle needs.
+function metadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage, given: string | undefined): string {
+  const known = taskMetadataBaseline(storage);
+  if (given !== undefined && !DIGEST.test(given)) throw new Error('metadataBaseline must be the SHA-256 the storage value carried.');
+  if (known && given !== undefined && given !== known)
+    throw new Error('metadataBaseline does not match the one recorded when this storage was seeded.');
+  const baseline = known ?? given;
+  if (!baseline) throw new Error('A recovered storage handle needs the metadataBaseline F recorded at allocation.');
+  return baseline;
+}
+
 /**
  * Record, before launch, where each declared link resolves (one part at a time, as the kernel would in an agent
  * container) and the state of its target and everything beneath it, or the nearest existing entry for a dangling one.
@@ -175,7 +190,8 @@ const deepFreeze = <T>(value: T): T => {
  * truncates.
  */
 export async function snapshotDeclaredLinks(storage: TaskFilesystems | RecoveredTaskStorage, paths: readonly string[],
-  options: StorageScriptOptions): Promise<DeclaredLinkSnapshot> {
+  options: StorageScriptOptions & { readonly metadataBaseline?: string }): Promise<DeclaredLinkSnapshot> {
+  const baseline = metadataBaseline(storage, options.metadataBaseline);
   if (!Array.isArray(paths)) throw new Error('Declared paths must be a list.');
   if (paths.length > MAXIMUM_DECLARED_LINKS) throw new Error(`At most ${MAXIMUM_DECLARED_LINKS} declared paths are recorded.`);
   for (const path of paths) assertDeclaredPath(path);
@@ -184,7 +200,7 @@ export async function snapshotDeclaredLinks(storage: TaskFilesystems | Recovered
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Declared link snapshot',
     consequence: 'declared links cannot be recorded', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
     memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
-    args: ['-e', TREE_SCRIPT, 'snapshot', ...paths] }, { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
+    args: ['-e', TREE_SCRIPT, 'snapshot', baseline, ...paths] }, { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const snapshot = JSON.parse(stdout) as DeclaredLinkSnapshot;
   if (!Array.isArray(snapshot.links) || snapshot.links.length !== paths.length)
     throw new Error('The declared link snapshot did not cover every declared path.');
@@ -259,13 +275,7 @@ interface InspectOutput {
 export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
   options: InspectOptions): Promise<TaskChangeManifest> {
   if (typeof options.base !== 'string' || !COMMIT_ID.test(options.base)) throw new Error('base must be a full commit ID.');
-  const known = taskMetadataBaseline(storage);
-  if (options.metadataBaseline !== undefined && !DIGEST.test(options.metadataBaseline))
-    throw new Error('metadataBaseline must be the SHA-256 the storage value carried.');
-  if (known && options.metadataBaseline !== undefined && options.metadataBaseline !== known)
-    throw new Error('metadataBaseline does not match the one recorded when this storage was seeded.');
-  const baseline = known ?? options.metadataBaseline;
-  if (!baseline) throw new Error('A recovered storage handle needs the metadataBaseline F recorded at allocation.');
+  const baseline = metadataBaseline(storage, options.metadataBaseline);
   const links = options.linkSnapshot?.links;
   if (!Array.isArray(links) || links.length > MAXIMUM_DECLARED_LINKS)
     throw new Error('linkSnapshot must be what snapshotDeclaredLinks returned.');
@@ -276,9 +286,17 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Task change inspection',
     consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
     memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
-    args: ['-e', TREE_SCRIPT, 'inspect', options.base, String(links.length), ...links.map(link => link.link), ...targets] },
+    args: ['-e', TREE_SCRIPT, 'inspect', baseline, options.base, String(links.length), ...links.map(link => link.link), ...targets] },
   { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
-  const output = JSON.parse(stdout) as InspectOutput;
+  const output = JSON.parse(stdout) as InspectOutput & { readonly metadataOnly?: boolean };
+  // The metadata changed: no Git command ran, so nothing else was read. That alone sends the task to needs human.
+  if (output.metadataOnly === true) {
+    if (!DIGEST.test(output.metadataDigest) || output.metadataDigest === baseline)
+      throw new Error('The change inspection returned an unexpected result.');
+    const manifest = { base: options.base, changes: [], agentCommits: [], metadataChanged: true, linkTargetChanges: [],
+      nestedGitlinkContent: [] };
+    return deepFreeze({ ...manifest, digest: manifestDigest(manifest) });
+  }
   if (!DIGEST.test(output.metadataDigest) || !Array.isArray(output.changes) || !Array.isArray(output.agentCommits)
     || !Array.isArray(output.nestedGitlinkContent) || !Array.isArray(output.links) || output.links.length !== links.length
     || typeof output.targets !== 'object' || output.targets === null)
