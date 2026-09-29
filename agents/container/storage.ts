@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, opendirSync, readdirSync, readlinkSync } from 'node:fs';
-import { basename, dirname, isAbsolute, join, relative } from 'node:path';
+import { lstatSync } from 'node:fs';
+import { join } from 'node:path';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
@@ -71,8 +71,6 @@ type StorageStep = { readonly args: readonly string[]; readonly timeoutMs: numbe
   | { readonly sleepMs: number } | typeof PAUSE;
 type Steps<T> = Generator<StorageStep, T, DockerOutcome | undefined>;
 const PAUSE = Symbol('pause');
-// Entries walked between pauses, so the asynchronous variant never holds the event loop for a whole checkout.
-const PAUSE_EVERY = 1_000;
 /** Ask the driver to run one Docker call. Allocation calls are cancellable; cleanup calls never are. */
 function* run(args: readonly string[], timeoutMs: number, cancellable: boolean,
   maxBuffer?: number): Steps<DockerOutcome> {
@@ -226,89 +224,6 @@ export function taskFilesystemOwner(filesystems: TaskFilesystems): ResourceOwner
   return allocations.get(filesystems)!.owner;
 }
 
-const within = (base: string, path: string) => {
-  const rel = relative(base, path);
-  return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
-};
-const LINK_INSPECTION_LIMIT = 200_000;
-// The Linux kernel gives up after 40 link hops (ELOOP); a cycle never resolves, so it cannot reach anything.
-const MAXIMUM_LINK_HOPS = 40;
-/**
- * Resolve a link as the container kernel will, with the checkout standing for /work. Each existing link along the way
- * is followed, `..` is applied to the resolved path, and the path must stay inside the checkout after every step.
- * Components that do not exist here (missing, or under a file) are applied textually, as the kernel would resolve them
- * once the agent made them directories, and every part after them that does exist is still checked: a `..` can climb
- * back to a real link. An absolute target is refused, so a target the host lacks cannot hide an escape.
- */
-// Whether the directory holding `path` has an entry named exactly as `path` spells it, byte for byte.
-const exactName = (path: string) => {
-  try { return readdirSync(dirname(path), { encoding: 'buffer' }).some(name => name.equals(Buffer.from(basename(path)))); }
-  catch { return false; }
-};
-const linkStaysInside = (staging: string, link: string) => {
-  let current = dirname(link), hops = 0;
-  const components = readlinkSync(link).split('/');
-  if (components[0] === '') return false;
-  while (components.length) {
-    const component = components.shift()!;
-    if (component === '' || component === '.') continue;
-    current = component === '..' ? dirname(current) : join(current, component);
-    if (!within(staging, current)) return false;
-    if (component === '..') continue;
-    // Every part that exists is checked, even past one that is missing or under a file (ENOTDIR): the agent can
-    // create the missing directory, and a ".." can climb back to a real link, which is followed here as the kernel
-    // would follow it then.
-    let stat: ReturnType<typeof lstatSync> | undefined;
-    try { stat = lstatSync(current, { throwIfNoEntry: false }); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOTDIR') throw error; }
-    // A host file system that ignores case or Unicode normalization (macOS) finds "D" where only "d" exists; the
-    // container's does not, so a part counts only when its directory holds exactly that name.
-    if (stat && !exactName(current)) stat = undefined;
-    if (!stat?.isSymbolicLink()) continue;
-    if (++hops > MAXIMUM_LINK_HOPS) return true;
-    const target = readlinkSync(current);
-    if (target.startsWith('/')) return false;
-    components.unshift(...target.split('/'));
-    current = dirname(current);
-  }
-  return true;
-};
-/**
- * Refuse a checkout whose symbolic links leave it, or whose Git metadata contains any link. The seeder copies links as
- * links, so an absolute or escaping link would let a path-restricted agent tool read container files outside the
- * checkout (for example process environments that hold vendor credentials). Worktree links that stay inside, including
- * loops and not-yet-existing targets, are allowed.
- */
-function* containedLinks(staging: string, remaining: () => number): Steps<void> {
-  const metadata = join(staging, '.git'), pending = [staging];
-  // `walked` counts every entry touched, including each one read from a directory, so one huge directory pauses too.
-  let count = 0, walked = 0;
-  while (pending.length) {
-    remaining();
-    count++;
-    if (++walked % PAUSE_EVERY === 0) yield PAUSE;
-    const path = pending.pop()!, stat = lstatSync(path);
-    if (stat.isSymbolicLink()) {
-      const name = JSON.stringify(relative(staging, path));
-      // Git never needs links in its own metadata, which is mounted at /work/.git; refuse any, wherever it points.
-      if (within(metadata, path)) throw new Error(`Repository Git metadata contains a link ${name}.`);
-      if (!linkStaysInside(staging, path)) throw new Error(`Repository link ${name} leaves the checkout.`);
-      continue;
-    }
-    if (!stat.isDirectory()) continue;
-    const directory = opendirSync(path, { bufferSize: 1 });
-    try {
-      for (let entry = directory.readSync(); entry; entry = directory.readSync()) {
-        // Bound time and memory per entry, so one huge directory cannot defer the deadline or the entry limit.
-        remaining();
-        if (count + pending.length >= LINK_INSPECTION_LIMIT)
-          throw new Error('Repository checkout exceeds the link inspection limit.');
-        pending.push(join(path, entry.name));
-        if (++walked % PAUSE_EVERY === 0) yield PAUSE;
-      }
-    } finally { directory.closeSync(); }
-  }
-}
 
 // Fails closed: an unanswered list cannot prove the ID is unused. Throws when more than `expected` objects carry it.
 function* allocationObjects(allocationId: string, expected: number, remaining: () => number): Steps<void> {
@@ -334,7 +249,6 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
   const staging = assertTaskClone(clone), remaining = createDeadline(timeoutMs);
   if (/[\n,]/.test(staging)) throw new Error('Staging path cannot be represented as a Docker mount.');
   if (!lstatSync(`${staging}/.git`).isDirectory()) throw new Error('Staging clone must contain standalone Git metadata.');
-  yield* containedLinks(staging, remaining);
   const allocationId = claimAllocationId(owner.allocationId);
   // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
   try { yield* allocationObjects(allocationId, 0, remaining); }
@@ -378,6 +292,10 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
         + ' -exec cp -a --no-preserve=ownership,timestamps -t /work/ {} +',
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
       'chown -R 10001:10001 /work /metadata',
+      // Refuse, before anything uses it, a repository with a link that can lead out of the checkout (or any link in its
+      // metadata). Checked here, in the container, as its kernel resolves links: exact names and raw bytes, as a host
+      // that folds case or decodes names would not see them.
+      'perl -e "$1" links /work /metadata',
       // The copy gave every file new timestamps and inodes, so the copied index sees every tracked file as changed.
       // Refresh it once, after the chown (which changes ctimes) and a second after the copy, so no entry is racily
       // clean. The volumes stay mounted behind the keeper, so these stat values hold for later containers.

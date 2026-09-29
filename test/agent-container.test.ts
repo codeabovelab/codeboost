@@ -193,6 +193,11 @@ describe('real Docker agent isolation', () => {
       mkdirSync(join(source, 'x', 'y'), { recursive: true }); writeFileSync(join(source, 'x', 'y', 'k'), '');
       symlinkSync('x/y', join(source, 'd')); symlinkSync('D/../../etc/hostname', join(source, 'a'));
     }],
+    // A wrong-case directory earlier on the way: D does not exist in the container, so D/x cannot reach the link d/x.
+    ['a link through a wrong-case directory that the kernel would not find', (source: string) => {
+      mkdirSync(join(source, 'd', 'a', 'b'), { recursive: true }); writeFileSync(join(source, 'd', 'a', 'b', 'k'), '');
+      symlinkSync('a/b', join(source, 'd', 'x')); symlinkSync('D/x/../../../etc/hostname', join(source, 'L'));
+    }],
     // Behind a part that is missing, or under a file: once the agent makes it a directory, the ".." climbs back to
     // d/esc, which leads to the checkout's parent.
     ...(['m/../d/esc/../etc/hostname', 'f/x/../../d/esc/../etc/hostname'] as const).map(target => [
@@ -201,7 +206,7 @@ describe('real Docker agent isolation', () => {
         mkdirSync(join(source, 'd')); symlinkSync('..', join(source, 'd', 'esc')); writeFileSync(join(source, 'f'), 'f\n');
         symlinkSync(target, join(source, 'L'));
       }] as const),
-  ] as const)('refuses to seed a repository with %s, before any storage exists', async (_label, hostile) => {
+  ] as const)('refuses to seed a repository with %s, and leaves no storage behind', async (_label, hostile) => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
     const before = new Set(owned());
@@ -209,7 +214,16 @@ describe('real Docker agent isolation', () => {
     expect(owned().filter(id => !before.has(id))).toEqual([]);
   }, 60_000);
 
-  it('refuses to seed a clone whose Git metadata contains a link, before any storage exists', async () => {
+  // Names are bytes: a link whose name is not UTF-8, beside a file named what a decoder turns it into. Linux only: a
+  // macOS file system refuses such a name.
+  it.skipIf(process.platform !== 'linux')('refuses a link whose name is not UTF-8, however a host would decode it', async () => {
+    expect(() => fixture({ hostile: source => {
+      symlinkSync('/etc', Buffer.concat([Buffer.from(source + '/'), Buffer.from([0xff])]));
+      writeFileSync(join(source, '\ufffd'), '');
+    } })).toThrow('leaves the checkout');
+  }, 60_000);
+
+  it('refuses to seed a clone whose Git metadata contains a link, and leaves no storage behind', async () => {
     const data = fixture();
     const clone = createTaskClone({ source: data.source, parent: join(data.root, 'staging'), taskId: 'task-git-link',
       head: git(data.source, 'rev-parse', 'HEAD') });

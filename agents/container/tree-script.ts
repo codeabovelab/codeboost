@@ -101,6 +101,52 @@ sub metadata_digest {
 }
 if ($mode eq "digest") { print metadata_digest(shift @ARGV), "\n"; exit 0 }
 
+# Whether a link in the work tree can lead out of it, resolved as the kernel does in an agent container, where the work
+# tree is /work: by bytes, with exact names, following every link on the way. A part that is missing, or is a file
+# with more after it, is taken as a directory the agent may create: what follows is resolved by name until a ".."
+# climbs back above it, where real parts are checked again. An absolute target counts as leaving; a cycle the kernel
+# gives up on (40 links) reaches nothing.
+sub link_escapes {
+  my ($root, $link) = @_;
+  my @at = split m{/}, $link; pop @at;
+  my $text = readlink "$root/$link"; return 1 if $text =~ m{^/};
+  my @todo = split m{/}, $text; my ($hops, $virtual) = (0, 0);
+  while (@todo) {
+    my $part = shift @todo; next if $part eq "" || $part eq ".";
+    if ($part eq "..") { return 1 unless @at; pop @at; $virtual-- if $virtual; next }
+    push @at, $part;
+    if ($virtual) { $virtual++; next }
+    my $path = "$root/" . join("/", @at); my @stat = lstat $path;
+    if (!@stat) { $virtual = 1; next }
+    if (-l _) {
+      return 0 if ++$hops > 40;
+      my $target = readlink $path; return 1 if $target =~ m{^/};
+      pop @at; unshift @todo, split m{/}, $target; next;
+    }
+    $virtual = 1 if !-d _ && @todo;
+  }
+  return 0;
+}
+# Run by the seeder over what it copied, before anything else can use it: no link in the metadata at all (Git never
+# needs one, and it is mounted at /work/.git), and none in the work tree that can lead out of it.
+if ($mode eq "links") {
+  my ($work, $metadata) = @ARGV;
+  my @pending = (".");
+  while (@pending) {
+    my $path = shift @pending; my $full = $path eq "." ? $metadata : "$metadata/$path";
+    my @stat = lstat $full; fail(6, "could not stat metadata " . shown($path) . ": $!") unless @stat;
+    fail(11, "Repository Git metadata contains a link " . shown($path) . ".") if -l _;
+    unshift @pending, map { join_path($path, $_) } children($full) if -d _;
+  }
+  @pending = grep { $_ ne ".git" } children($work);
+  while (@pending) {
+    my $path = shift @pending; my @stat = lstat "$work/$path"; fail(6, "could not stat " . shown($path) . ": $!") unless @stat;
+    if (-l _) { fail(11, "Repository link " . shown($path) . " leaves the checkout.") if link_escapes($work, $path); next }
+    unshift @pending, map { "$path/$_" } children("$work/$path") if -d _;
+  }
+  exit 0;
+}
+
 chdir "/work" or fail(6, "could not enter the work tree: $!");
 # Before any Git command, the metadata must be as the seeder left it: Git reads its config, and config the agent could
 # have changed must never run (a filter driver, say). If it changed, no Git runs at all: a snapshot refuses, and an
