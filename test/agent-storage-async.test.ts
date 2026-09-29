@@ -334,7 +334,7 @@ describe('task change inspection', () => {
   const output = (digest: string) => JSON.stringify({ metadataDigest: digest, head: BASE, agentCommits: [], nestedGitlinkContent: [],
     changes: [{ kind: 'add', path: 'new.txt', newType: 'file', newMode: '100644', newOid: 'd'.repeat(40), underGit: false,
       ignored: false }], links: [], targets: {} });
-  const noLinks = { links: [] };
+  const noLinks = { links: [], targets: {} };
 
   it('builds the manifest from the container, comparing the metadata with the seeder baseline', async () => {
     const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
@@ -419,16 +419,16 @@ describe('task change inspection', () => {
   it('always accepts, at inspection, the largest set of declared links a snapshot accepts', async () => {
     const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
     const long = (prefix: string, index: number) => `${prefix}${index}`.padEnd(MAXIMUM_NAME_BYTES, 'x');
+    const anchor = { path: '.', type: 'directory' as const, mode: '40755', size: 0, ino: 1, ctime: '0', mtime: '0' };
     const links = Array.from({ length: MAXIMUM_DECLARED_LINKS },
-      (_, index) => ({ link: long('link', index), status: 'absent' as const, target: long('target', index),
-        anchor: { path: '.', type: 'directory' as const, mode: '40755', size: 0, ino: 1, ctime: '0', mtime: '0' } }));
+      (_, index) => ({ link: long('link', index), status: 'absent' as const, target: long('target', index) }));
+    const targets = Object.fromEntries(links.map(link => [link.target, { status: 'absent' as const, anchor }]));
     writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: BASELINE, head: BASE, agentCommits: [],
-      nestedGitlinkContent: [], changes: [], links, targets: Object.fromEntries(links.map(link => [link.target,
-        { status: 'absent', anchor: link.anchor }])) }));
-    const manifest = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: { links } });
+      nestedGitlinkContent: [], changes: [], links, targets }));
+    const manifest = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: { links, targets } });
     expect(manifest.linkTargetChanges).toEqual([]);
     await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE,
-      linkSnapshot: { links: [...links, { link: 'one-more', status: 'not-a-link' }] } })).rejects.toThrow('linkSnapshot');
+      linkSnapshot: { links: [...links, { link: 'one-more', status: 'not-a-link' }], targets } })).rejects.toThrow('linkSnapshot');
     removeTaskFilesystems(filesystems);
   });
 
@@ -439,7 +439,8 @@ describe('task change inspection', () => {
       .rejects.toThrow('full commit ID');
     for (const target of ['../etc', '/etc', '.git/config', 'a//b', 'a\nb'])
       await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE,
-        linkSnapshot: { links: [{ link: 'l', status: 'present', target, entries: [] }] } })).rejects.toThrow('not a path');
+        linkSnapshot: { links: [{ link: 'l', status: 'present', target }], targets: { [target]: { status: 'present', entries: [] } } } }))
+        .rejects.toThrow('not a path');
     expect(calls.made).toEqual([]);
     removeTaskFilesystems(filesystems);
   });

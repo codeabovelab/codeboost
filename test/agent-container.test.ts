@@ -975,8 +975,8 @@ describe('real Docker agent isolation', () => {
       expect(linkSnapshot.links[1]).toMatchObject({ link: 'y', status: 'present', target: 'd/secret' });
       // A write through either would land on secret, which neither target is: both stop at the link.
       expect(linkSnapshot.links[2]).toMatchObject({ link: 'chain', status: 'through-link', anchor: { path: 'link2' } });
-      expect(linkSnapshot.links[3]).toMatchObject({ link: 'boxlink', status: 'through-link', target: 'box',
-        anchor: { path: 'box/inner', type: 'symlink' } });
+      expect(linkSnapshot.links[3]).toMatchObject({ link: 'boxlink', status: 'through-link', target: 'box' });
+      expect(linkSnapshot.targets.box).toMatchObject({ status: 'through-link', anchor: { path: 'box/inner', type: 'symlink' } });
       expect(linkSnapshot.links[5]).toMatchObject({ link: '--', status: 'present', target: 'secret' });
       // Unchanged after the run: nothing to report, though inspection resolves the links without walking the targets.
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
@@ -1040,7 +1040,7 @@ describe('real Docker agent isolation', () => {
         'mkdir -p ":/build" && printf "e\\n" > ":/build/evil.js" && printf "g\\n" > ":(glob)x"',
         // An ignored directory is never entered, so what cannot be read inside it cannot fail the inspection.
         'mkdir -p build/locked && chmod 000 build/locked'].join(' && '));
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('x.log')).toMatchObject({ kind: 'add', newType: 'file', ignored: true });
       expect(byPath.get('pipe')).toEqual({ kind: 'add', path: 'pipe', newType: 'other', underGit: false, ignored: false });
@@ -1065,7 +1065,7 @@ describe('real Docker agent isolation', () => {
         'printf "o\\n" > node_modules/other/x.js',
         // A file where base had a directory: "build/" matches directories only.
         'rm -rf build && printf "b\\n" > build'].join(' && '));
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('node_modules/local-pkg/index.js')).toMatchObject({ kind: 'add', ignored: false });
       expect(byPath.get('node_modules/other')).toMatchObject({ kind: 'add', newType: 'directory', ignored: true });
@@ -1080,7 +1080,7 @@ describe('real Docker agent isolation', () => {
       } });
       asAgent(data.filesystems, ['rm sub/.gitignore', 'mkdir sub/.gitignore', 'printf "f\\n" > sub/.gitignore/f',
         'mkdir -p sub/out', 'printf "p\\n" > sub/out/payload.sh'].join(' && '));
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       // base's sub/.gitignore re-includes sub/out, so what is inside is listed.
       expect(byPath.get('sub/out/payload.sh')).toMatchObject({ kind: 'add', ignored: false });
@@ -1095,7 +1095,7 @@ describe('real Docker agent isolation', () => {
       } });
       asAgent(data.filesystems, ['rm sub/.gitignore', 'mkdir -p sub/.gitignore/newdir other/newdir',
         'printf "c\\n" > sub/.gitignore/newdir/x.c', 'printf "c\\n" > other/newdir/x.c'].join(' && '));
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const paths = manifest.changes.map(change => change.path);
       expect(paths).toContain('other/newdir/x.c');
       expect(paths).toContain('sub/.gitignore/newdir/x.c');
@@ -1104,7 +1104,7 @@ describe('real Docker agent isolation', () => {
     it('keeps a deletion a deletion when the file reappears only under a .git part', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, 'secret.txt'), 'secret\n') });
       asAgent(data.filesystems, 'mkdir -p x/.git && mv secret.txt x/.git/');
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('secret.txt')).toMatchObject({ kind: 'delete' });
       expect(byPath.get('x/.git/secret.txt')).toMatchObject({ kind: 'add', underGit: true });
@@ -1115,11 +1115,11 @@ describe('real Docker agent isolation', () => {
         writeFileSync(join(source, '.gitattributes'), '*.txt eol=crlf\nid.c ident\n');
         writeFileSync(join(source, 'a.txt'), 'one\ntwo\n'); writeFileSync(join(source, 'id.c'), '$Id$\n');
       } });
-      const untouched = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const untouched = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       // The checkout wrote CRLF and an expanded $Id$; Git would store what base has, so neither is a change.
       expect(untouched.changes).toEqual([]);
       asAgent(data.filesystems, 'printf "one\\r\\nTWO\\r\\n" > a.txt && printf "\\$Id: anything \\$\\n" > id.c');
-      const edited = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const edited = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       // The CRLF edit is one line; the $Id$ keyword is stored collapsed, so what a commit would store did not change.
       expect(edited.changes.map(change => change.path)).toEqual(['a.txt']);
       // Stored with LF, as eol=crlf converts it: the blob of "one\ntwo" with the edit, not of the CRLF bytes on disk.
@@ -1136,7 +1136,7 @@ describe('real Docker agent isolation', () => {
         'rm Q', 'mv Z ./-Q',
         // Git unquotes a hashed path that starts with a double quote: this one must still be hashed as itself.
         `printf "quoted\\n" > '"x"'`, 'printf "other\\n" > x'].join(' && '));
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('bar')).toMatchObject({ kind: 'rename', oldPath: 'foo' });
       expect(byPath.get('-foo')).toMatchObject({ kind: 'add' });
@@ -1151,7 +1151,7 @@ describe('real Docker agent isolation', () => {
         git(source, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},sm`);
       } });
       asAgent(data.filesystems, 'printf "work\\n" > sm/work.c');
-      const quiet = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const quiet = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       expect(quiet.nestedGitlinkContent).toEqual(['sm']);
       expect(quiet.changes.map(change => change.path)).not.toContain('sm/work.c');
       expect(quiet).toMatchObject({ agentCommits: [], metadataChanged: false });
@@ -1159,14 +1159,14 @@ describe('real Docker agent isolation', () => {
       docker('run', '--rm', '--network=none', '--user', '10001:10001',
         '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'chmod', imageId,
         '600', '/work/.git/config');
-      const chmodded = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const chmodded = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       expect(chmodded).toMatchObject({ agentCommits: [], metadataChanged: true });
       // Agents mount the metadata read-only, so they cannot commit; this stands in for that protection failing.
       docker('run', '--rm', '--network=none', '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
         '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`,
         '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'git', imageId,
         '-C', '/work', '-c', 'user.name=agent', '-c', 'user.email=agent@example.com', 'commit', '-q', '--allow-empty', '-m', 'agent');
-      const committed = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const committed = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       // Changed metadata is never read with Git: nothing else is reported, and that alone is needs human.
       expect(committed).toMatchObject({ metadataChanged: true, changes: [], agentCommits: [] });
       expect(committed.digest).not.toBe(quiet.digest);
@@ -1175,7 +1175,7 @@ describe('real Docker agent isolation', () => {
         '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`,
         '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'sh', imageId,
         '-c', 'cd /work && git config filter.x.clean false && git config filter.x.required true && printf "* filter=x\\n" > .gitattributes');
-      expect(await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } }))
+      expect(await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } }))
         .toMatchObject({ metadataChanged: true, changes: [] });
       await expect(snapshotDeclaredLinks(data.filesystems, ['file.txt'], { imageId })).rejects.toThrow('metadata changed');
       await expect(snapshotDeclaredLinks(data.filesystems, [], { imageId })).rejects.toThrow('metadata changed');
@@ -1189,7 +1189,7 @@ describe('real Docker agent isolation', () => {
         writeFileSync(join(source, 'crlf.txt'), 'a\r\n'); git(source, 'add', 'crlf.txt'); git(source, 'commit', '-m', 'crlf');
         writeFileSync(join(source, '.gitattributes'), '* text=auto\n');
       } });
-      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       expect((await inspect()).changes).toEqual([]);
       asAgent(data.filesystems, 'printf "b\\r\\n" > crlf.txt');
       expect((await inspect()).changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'crlf.txt',
@@ -1198,7 +1198,7 @@ describe('real Docker agent isolation', () => {
 
     it('fails with Git\'s reason when it cannot hash as a commit would, and names a .gitattributes it could not open', async () => {
       const data = fixture();
-      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       asAgent(data.filesystems, 'printf "file.txt working-tree-encoding=NOPE-ENC\\n" > .gitattributes');
       await expect(inspect()).rejects.toThrow(/git update-index reported an error: error: failed to encode/);
       // A fifo where Git reads attributes would block it until the deadline.
@@ -1213,7 +1213,7 @@ describe('real Docker agent isolation', () => {
       // "*.txt text" in the index. The file stays a regular file, so only the rule that every .gitattributes leaves
       // the scratch index prevents that.
       asAgent(data.filesystems, '{ printf "*.txt -text\\n"; head -c 105000000 /dev/zero | tr "\\0" "#"; } > .gitattributes && printf "trusted\\r\\n" > file.txt');
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       expect(manifest.changes).toContainEqual(expect.objectContaining({ kind: 'modify', path: 'file.txt',
         newOid: createHash('sha1').update('blob 9\0trusted\r\n').digest('hex') }));
     }, 240_000);
@@ -1221,14 +1221,14 @@ describe('real Docker agent isolation', () => {
     it('lets through a warning that runs over two lines', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '!foo text\n') });
       asAgent(data.filesystems, 'printf "edited\\n" > file.txt');
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       expect(manifest.changes.map(change => change.path)).toEqual(['file.txt']);
     }, 180_000);
 
     it('hashes with the attributes the work tree has: a deleted .gitattributes no longer applies', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '*.txt text\n') });
       asAgent(data.filesystems, 'rm .gitattributes && printf "trusted\\r\\n" > file.txt');
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       // Without the text attribute, git add stores the CRLF.
       expect(manifest.changes).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'delete', path: '.gitattributes' }),
         expect.objectContaining({ kind: 'modify', path: 'file.txt',
@@ -1249,14 +1249,14 @@ describe('real Docker agent isolation', () => {
         writeFileSync(join(source, 'w', 'b.txt'), 'b\n');
       } });
       asAgent(data.filesystems, 'printf "edited\\n" > v/a.txt && printf "edited\\n" > w/b.txt');
-      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       expect(manifest.changes.map(change => change.path)).toEqual(['v/a.txt', 'w/b.txt']);
     }, 180_000);
 
     it('fails, never truncates, on too many changes and on a name that is not UTF-8', async () => {
       const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 12_000, metadataBytes: 16 * 1024 * 1024,
         metadataInodes: 512 } });
-      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       asAgent(data.filesystems, `printf "x\\n" > "$(printf "bad\\377")"`);
       await expect(inspect()).rejects.toThrow(/bad\\xff is not printable UTF-8/);
       // A surrogate code point: a lax decoder accepts it, and Node would show it as U+FFFD, like another real name.
@@ -1286,7 +1286,9 @@ describe('real Docker agent isolation', () => {
       } });
       // More than half the limit, reached by two links: counted twice, either run would refuse.
       const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['biglink', 'biglink2'], { imageId });
-      expect(linkSnapshot.links[0]!.entries).toHaveLength(12_001);
+      expect(linkSnapshot.targets.big!.entries).toHaveLength(12_001);
+      // Reported once, however many links reach it.
+      expect(Object.keys(linkSnapshot.targets)).toEqual(['big']);
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
       expect(manifest.linkTargetChanges).toEqual([]);
     }, 300_000);

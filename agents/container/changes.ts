@@ -72,11 +72,16 @@ export interface TargetState {
   readonly entries?: readonly TargetEntry[];
   readonly anchor?: TargetEntry;
 }
-export interface DeclaredLink extends Omit<Partial<TargetState>, 'status'> {
+export interface DeclaredLink {
   readonly link: string;
   readonly linkTarget?: string;
-  /** The target's path in the work tree, when it resolves inside it through real directories. */
+  /**
+   * The target's path in the work tree, when it resolves inside it; its state is in the snapshot's `targets`. With a
+   * target, `status` is that state's status.
+   */
   readonly target?: string;
+  /** For a link that stops before a target (`absent` or `through-link` on the way): the entry it stopped at. */
+  readonly anchor?: TargetEntry;
   /**
    * Besides the target states: `not-a-link` (the declared path is not a symlink), `outside` (the target is outside the
    * work tree, is the work tree itself, or passes through anything outside it on the way, which D cannot check from the
@@ -91,6 +96,8 @@ export interface DeclaredLink extends Omit<Partial<TargetState>, 'status'> {
  */
 export interface DeclaredLinkSnapshot {
   readonly links: readonly DeclaredLink[];
+  /** Each target's state, once, by path: two links to one target share it. */
+  readonly targets: Readonly<Record<string, TargetState>>;
 }
 /** A difference in a declared link's target between the snapshot and the inspection. */
 export interface LinkTargetChange {
@@ -191,7 +198,8 @@ export async function snapshotDeclaredLinks(storage: TaskFilesystems | Recovered
     memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
     args: ['-e', TREE_SCRIPT, 'snapshot', baseline, ...paths] }, { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const snapshot = JSON.parse(stdout) as DeclaredLinkSnapshot;
-  if (!Array.isArray(snapshot.links) || snapshot.links.length !== paths.length)
+  if (!Array.isArray(snapshot.links) || snapshot.links.length !== paths.length || typeof snapshot.targets !== 'object'
+    || snapshot.targets === null || snapshot.links.some(link => link.target !== undefined && !snapshot.targets[link.target]))
     throw new Error('The declared link snapshot did not cover every declared path.');
   return deepFreeze(snapshot);
 }
@@ -265,8 +273,9 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
   options: InspectOptions): Promise<TaskChangeManifest> {
   if (typeof options.base !== 'string' || !COMMIT_ID.test(options.base)) throw new Error('base must be a full commit ID.');
   const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
-  const links = options.linkSnapshot?.links;
-  if (!Array.isArray(links) || links.length > MAXIMUM_DECLARED_LINKS)
+  const links = options.linkSnapshot?.links, recorded = options.linkSnapshot?.targets;
+  if (!Array.isArray(links) || links.length > MAXIMUM_DECLARED_LINKS || typeof recorded !== 'object' || recorded === null
+    || links.some(link => link?.target !== undefined && !recorded[link.target]))
     throw new Error('linkSnapshot must be what snapshotDeclaredLinks returned.');
   for (const link of links) assertDeclaredPath(link?.link);
   const targets = [...new Set(links.flatMap(link => link.target === undefined ? [] : [link.target]))];
@@ -307,7 +316,7 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
     if (before.target !== undefined) {
       const now = output.targets[before.target];
       if (!now) throw new Error('The change inspection did not report every declared link target.');
-      found.push(...compareTarget(before.link, before.target, before as TargetState, now));
+      found.push(...compareTarget(before.link, before.target, recorded[before.target]!, now));
     }
     return found;
   });

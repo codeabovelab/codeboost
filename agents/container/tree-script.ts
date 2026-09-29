@@ -201,7 +201,7 @@ sub target_entry { my $path = shift; my $entry = entry($path); $entry->{oid} = f
 # existing entry. A target is watched when every existing part on the way is a real directory (past a missing one, by
 # name; see below). The path is tracked from the filesystem
 # root, so "/work/x" and "../work/x" are inside; anywhere else outside /work is outside.
-my $target_entries = 0;
+my $target_entries = 0; my %resolved_targets;
 # The anchor is the deepest entry on the way to the given path reached through real directories only: walking down one
 # part at a time, it stops at the first part that is missing, a link or not a directory. It never reads through a link.
 sub anchored {
@@ -250,10 +250,11 @@ sub resolve {
   }
   return { %record, status => "outside" } if @at < 2;
   my $target = join "/", @at[1 .. $#at];
-  # A dangling target, watched like any other: creating it, or what leads to it, is a change to it.
-  return { %record, target => text($target, "path"), %{ anchored("absent", $target) } } if $missing;
-  my @final = lstat $target;
-  return { %record, target => text($target, "path"), %{ $walk ? target_state($target) : { status => @final ? "present" : "absent" } } };
+  # A dangling target, past a missing directory or not, is watched like any other: creating it, or what leads to it, is
+  # a change to it. The target's own state (its entries, or its anchor) is reported once per target, not per link.
+  my @final = lstat $target; $resolved_targets{$target} = 1;
+  my $status = $missing || !@final ? "absent" : $walk ? target_state($target)->{status} : "present";
+  return { %record, target => text($target, "path"), status => $status };
 }
 # Each distinct target is walked once per run, so two declared links to one target count its entries once.
 my %target_states;
@@ -283,7 +284,11 @@ sub walk_target {
   return $link ? { status => "through-link", anchor => $link, entries => \@entries } : { status => "present", entries => \@entries };
 }
 
-if ($mode eq "snapshot") { emit({ links => [map { resolve($_, 1) } @ARGV] }) }
+# Each target's state once, keyed by path: two links to one target do not repeat its entries.
+if ($mode eq "snapshot") {
+  my @links = map { resolve($_, 1) } @ARGV;
+  emit({ links => \@links, targets => { map { (text($_, "target") => target_state($_)) } keys %resolved_targets } });
+}
 
 fail(2, "unknown mode") unless $mode eq "inspect";
 my $base = shift @ARGV;
@@ -405,10 +410,11 @@ if (@commitable) {
   # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
   # A submodule is checked out as a directory (the task clone is not recursive): that is its unchanged state, so it
   # stays. The commit step, which removes the same entries, would otherwise drop every submodule.
-  # Every .gitattributes leaves it too: where Git will not read the work tree's own (a symlink, one over 100 MB) it
-  # falls back to the index, which must not hold base's. So only attribute files the work tree has, and Git reads,
-  # decide; a regular one is added back below like any file.
-  my @gone = grep { !$work{$_} || m{(?:\A|/)\.gitattributes\z} || ($work{$_}{type} ne $base{$_}{type}
+  # Every regular .gitattributes leaves it too: where Git will not read the work tree's own (a symlink, one over 100 MB)
+  # it falls back to the index, which must not hold base's rules. So only attribute files the work tree has, and Git
+  # reads, decide; a regular one is added back below like any file. A tracked symlink stays as it is: its content is a
+  # link target, never rules, and the commit step keeps it.
+  my @gone = grep { !$work{$_} || ($base{$_}{type} eq "file" && m{(?:\A|/)\.gitattributes\z}) || ($work{$_}{type} ne $base{$_}{type}
     && !($base{$_}{type} eq "gitlink" && $work{$_}{type} eq "directory")) } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
