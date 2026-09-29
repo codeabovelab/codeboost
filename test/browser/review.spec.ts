@@ -10,6 +10,7 @@ import { choiceKeys } from '../../core/approvals.ts';
 import { ReviewService } from '../../runner/review.ts';
 import { startServer } from '../../web/server.ts';
 import type { MergeGateway, MergeQueueGateway } from '../../github/merge.ts';
+import { fixtureGit } from '../fixtures/git.ts';
 let root: string, app: Awaited<ReturnType<typeof startServer>>;
 // Resolves once the server has parsed the headers of the request that carries `marker` and is reading its body, so that partial request is provably admitted before shutdown starts.
 // Matching the marker matters: any other client on the port (a polling tab, a reused ephemeral port) also emits 'request' and would start shutdown too early.
@@ -114,7 +115,7 @@ test('opens an item selected while an assignment is in flight in the view its an
  const answered=page.waitForResponse('**/api/review');await page.getByRole('button',{name:'Refresh',exact:true}).click();await answered;await expect(page.locator('#banner')).not.toContainText('Linking changes');
  await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Full change',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
  // A code change on the still-stale item is a new state, so the choice made on the old one no longer holds.
- const repository=app.service.config.repository;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return 42;\n}\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','External change'],{cwd:repository,stdio:'pipe'});
+ const repository=app.service.config.repository;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return 42;\n}\n');fixtureGit(repository,'commit','-am','External change');
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
  // After approval, a new stale state opens the comparison again.
  await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);

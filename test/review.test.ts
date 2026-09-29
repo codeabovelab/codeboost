@@ -8,6 +8,7 @@ import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { startServer } from '../web/server.ts';
 import { approveItem, reviewedSegment } from '../core/approvals.ts';
+import { fixtureGit } from './fixtures/git.ts';
 // A passthrough, so the stale-key test can count how often load() serializes a segment.
 vi.mock('../core/approvals.ts', async original => { const actual = await original<typeof import('../core/approvals.ts')>(); return { ...actual, reviewedSegment: vi.fn(actual.reviewedSegment) }; });
 // Each integration case performs several bounded real-Git reads.
@@ -99,7 +100,7 @@ it('gives each stale state its own stale key, including states whose segments an
  view=service.act({action:'approve',item:'P1',token:view.token});expect(item('P1').staleKey).toBeNull();
  // P1 adds a line to an existing file and P2 then edits that same line, so the line is ambiguous between them.
  const readme=join(config.repository,'README.md'),original=readFileSync(readme,'utf8');
- const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am',message],{cwd:config.repository,stdio:'pipe'});return execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();};
+ const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);fixtureGit(config.repository,'commit','-am',message);return fixtureGit(config.repository,'rev-parse','HEAD');};
  const byP1=commit('Shared note.','P1 shared line'),byP2=commit('Shared note, revised.','P2 shared line'),snapshot=service.store.getSnapshot(config.identity);
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
  view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
@@ -111,14 +112,14 @@ it('gives a still-stale item a new stale key when it gains an ambiguous change',
  for(const id of ['P1','P2','P3'])view=service.act({action:'approve',item:id,confirmNoChange:item(id).count===0,token:view.token});view=service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});
  const before={key:item('P1').staleKey,reasons:item('P1').reasons,own:view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)};expect(item('P1').state).toBe('stale');
  const readme=join(config.repository,'README.md'),original=readFileSync(readme,'utf8');
- const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am',message],{cwd:config.repository,stdio:'pipe'});return execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();};
+ const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);fixtureGit(config.repository,'commit','-am',message);return fixtureGit(config.repository,'rev-parse','HEAD');};
  const byP1=commit('Shared note.','P1 shared line'),byP2=commit('Shared note, revised.','P2 shared line'),snapshot=service.store.getSnapshot(config.identity);
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
  view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
  expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(before.key);
  // P3 then edits the same line back to P2's text: the segment keeps its choice key but gains an owner, so the stale state is new.
  const shared=()=>view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!,second={key:item('P1').staleKey,segment:shared()};
- writeFileSync(readme,`${original}Shared note, draft.\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','P3 draft'],{cwd:config.repository,stdio:'pipe'});const byP3=execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();
+ writeFileSync(readme,`${original}Shared note, draft.\n`);fixtureGit(config.repository,'commit','-am','P3 draft');const byP3=fixtureGit(config.repository,'rev-parse','HEAD');
  const back=commit('Shared note, revised.','P3 restores the line'),current=service.store.getSnapshot(config.identity);
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:current.id},current.base,back,[{sha:byP3,owner:'P3',origin:'owned',sourceSha:null},{sha:back,owner:'P3',origin:'owned',sourceSha:null}]);
  view=service.load();expect(shared().key).toBe(second.segment.key);expect(shared().owners).not.toEqual(second.segment.owners);
@@ -132,7 +133,7 @@ it('gives each replaced head after a queue attempt its own stale key',()=>{
  const {service,config}=fixture();let view=service.load();
  service.store.saveReview(config.identity,view.expected,view.items.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
  const attempt=service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.example/pr/24');service.store.finishMergeAttempt(config.identity,attempt.id,{state:'failed',reason:'The pull request head changed after review.',requiresFreshReview:true});
- const replace=()=>{execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','Replace reviewed head'],{cwd:config.repository,stdio:'pipe'});return service.load();};
+ const replace=()=>{fixtureGit(config.repository,'commit','--allow-empty','-m','Replace reviewed head');return service.load();};
  const first=replace(),second=replace(),p3=(value:typeof view)=>value.items.find(item=>item.id==='P3')!;
  expect(p3(first).state).toBe('stale');expect(p3(second).reasons).toEqual(p3(first).reasons);expect(p3(second).staleKey).not.toBe(p3(first).staleKey);
 },30000);
