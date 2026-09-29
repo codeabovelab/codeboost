@@ -34,6 +34,8 @@ vi.mock('../agents/container/image.ts', async importOriginal => ({
 const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTaskFilesystemsAsync,
   removeTaskFilesystems } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
+const { inspectTaskChanges, manifestDigest, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES } =
+  await import('../agents/container/changes.ts');
 
 // Every fake Docker call starts a Node process, so a loaded machine needs more than the default 5 s per test.
 vi.setConfig({ testTimeout: 60_000 });
@@ -69,6 +71,7 @@ if (a === 'start' && fs.existsSync(path.join(state, 'hang-start'))) {
 if (a === 'start') process.exit(0);
 if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
   const name = args[args.indexOf('--name') + 1];
+  fs.writeFileSync(path.join(state, 'export-args.json'), JSON.stringify(args.filter(arg => arg.length < 200)));
   save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
   if (fs.existsSync(path.join(state, 'fail-export'))) {
     // Like --rm after the export script failed: the container is gone and the client reports the script's status.
@@ -82,10 +85,31 @@ if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
   }
   // Like the export script: the diff, cut to the limit it is given, base64-encoded; then --rm removes the container.
-  const diff = fs.readFileSync(path.join(state, 'export-diff')).subarray(0, Number(args.at(-1)));
+  // The script's arguments follow "-c": the script, $0, base, the limit, the baseline and the digest program.
+  const diff = fs.readFileSync(path.join(state, 'export-diff')).subarray(0, Number(args[args.indexOf('-c') + 4]));
   fs.rmSync(path.join(state, name + '.json'));
   process.stdout.write(diff.toString('base64'));
   process.exit(0);
+}
+// The seeder reports the metadata baseline as its last line.
+if (a === 'run' && args.includes('io.codeboost.task-storage=seeder')) {
+  if (!fs.existsSync(path.join(state, 'no-baseline'))) console.log('codeboost-metadata-baseline ' + 'b'.repeat(64));
+  process.exit(0);
+}
+// Like the change inspection: prints the canned result, then --rm removes the container.
+if (a === 'run' && args.includes('io.codeboost.task-storage=inspect')) {
+  const name = args[args.indexOf('--name') + 1];
+  fs.writeFileSync(path.join(state, 'inspect-args.json'), JSON.stringify(args.filter(arg => arg.length < 200)));
+  save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
+  if (fs.existsSync(path.join(state, 'hang-inspect'))) {
+    fs.writeFileSync(path.join(state, 'inspect-began'), '');
+    process.on('SIGTERM', () => {});
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+  }
+  fs.rmSync(path.join(state, name + '.json'));
+  // Exit only once the write is done: exiting at once cuts a pipe write past 64 KiB.
+  process.stdout.write(fs.readFileSync(path.join(state, 'inspect-output')), () => process.exit(0));
+  return;
 }
 if (a === 'run') process.exit(0);
 if (b === 'inspect') {
@@ -198,6 +222,13 @@ describe('asynchronous task storage allocation', () => {
     expect(hasLiveTaskStorage(RUNNER)).toBe(false);
   });
 
+  it('fails, and removes what it created, when the seeder reports no metadata baseline', async () => {
+    writeFileSync(join(state, 'no-baseline'), '');
+    await expect(prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner())).rejects.toThrow('metadata baseline');
+    expect(stored()).toEqual([]);
+    expect(hasLiveTaskStorage(RUNNER)).toBe(false);
+  });
+
   it('refuses a deadline longer than a Node timer can wait, before any Docker call', async () => {
     await expect(prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(), { timeoutMs: 2 ** 31 }))
       .rejects.toThrow('at most');
@@ -238,7 +269,15 @@ describe('task diff export', () => {
     writeFileSync(join(state, `${metadata}.json`), JSON.stringify({ kind: 'volume', labels: labels('metadata') }));
     writeFileSync(join(state, 'export-diff'), 'partial output\n');
     const handle = await adoptRecoveredTaskStorage(owned, { workVolume: work, metadataVolume: metadata });
-    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE })).diff.toString()).toBe('partial output\n');
+    // D keeps no baseline across a restart: F passes the one it recorded, and without it nothing runs.
+    calls.made = [];
+    await expect(exportTaskDiff(handle, { base: BASE, imageId: IMAGE })).rejects.toThrow('needs the metadataBaseline');
+    expect(calls.made).toEqual([]);
+    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE, metadataBaseline: 'c'.repeat(64) })).diff.toString())
+      .toBe('partial output\n');
+    // The script is given F's baseline to check the metadata against.
+    const args = JSON.parse(readFileSync(join(state, 'export-args.json'), 'utf8')) as string[];
+    expect(args[args.indexOf('export', args.indexOf('-c')) + 3]).toBe('c'.repeat(64));
   });
 
   it('refuses a volume that no longer carries the storage labels, before running anything', async () => {
@@ -284,6 +323,124 @@ describe('task diff export', () => {
     await expect(exportTaskDiff(filesystems, { base: BASE, imageId: IMAGE, maxBytes: 1024 * 1024 + 1 }))
       .rejects.toThrow('at most');
     await expect(exportTaskDiff(filesystems, { base: BASE, imageId: 'latest' })).rejects.toThrow('immutable');
+    expect(calls.made).toEqual([]);
+    removeTaskFilesystems(filesystems);
+  });
+});
+
+describe('task change inspection', () => {
+  const BASE = 'c'.repeat(40), BASELINE = 'b'.repeat(64);
+  const inspections = () => stored().filter(file => file.startsWith('codeboost-inspect-'));
+  const output = (digest: string) => JSON.stringify({ metadataDigest: digest, head: BASE, agentCommits: [], nestedGitlinkContent: [],
+    changes: [{ kind: 'add', path: 'new.txt', newType: 'file', newMode: '100644', newOid: 'd'.repeat(40), underGit: false,
+      ignored: false }], links: [], targets: {} });
+  const noLinks = { links: [], targets: {} };
+
+  it('builds the manifest from the container, comparing the metadata with the seeder baseline', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    expect(filesystems.metadataBaseline).toBe(BASELINE);
+    writeFileSync(join(state, 'inspect-output'), output(BASELINE));
+    const quiet = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks });
+    expect(quiet).toMatchObject({ base: BASE, metadataChanged: false, changes: [{ path: 'new.txt' }] });
+    expect(quiet.digest).toBe(manifestDigest(quiet));
+    expect(Object.isFrozen(quiet.changes[0])).toBe(true);
+    writeFileSync(join(state, 'inspect-output'), output('e'.repeat(64)));
+    const changed = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks });
+    expect(changed.metadataChanged).toBe(true);
+    expect(changed.digest).not.toBe(quiet.digest);
+    expect(inspections()).toEqual([]);
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('runs with the memory and output room the limits need: 1 GB, and a result far past 16 MiB', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    // 10,000 new links with long names and targets: within every limit, about 17 MB of JSON.
+    const changes = Array.from({ length: 10_000 }, (_, index) => ({ kind: 'add', path: `${index}`.padEnd(800, 'p'),
+      newType: 'symlink', newMode: '120000', newOid: 'd'.repeat(40), newLinkTarget: 't'.repeat(900), underGit: false,
+      ignored: false }));
+    const big = JSON.stringify({ metadataDigest: BASELINE, head: BASE, agentCommits: [], nestedGitlinkContent: [], changes,
+      links: [], targets: {} });
+    expect(big.length).toBeGreaterThan(16 * 1024 * 1024);
+    writeFileSync(join(state, 'inspect-output'), big);
+    expect((await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks })).changes).toHaveLength(10_000);
+    expect(JSON.parse(readFileSync(join(state, 'inspect-args.json'), 'utf8'))).toContain('--memory=1g');
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('reports only metadataChanged when the script found the metadata changed, and refuses a result that says otherwise', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: 'e'.repeat(64), metadataOnly: true }));
+    expect(await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks })).toMatchObject({
+      metadataChanged: true, changes: [], agentCommits: [], linkTargetChanges: [], nestedGitlinkContent: [] });
+    // A metadata-only result whose digest matches the baseline contradicts itself.
+    writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: BASELINE, metadataOnly: true }));
+    await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks }))
+      .rejects.toThrow('unexpected result');
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('needs the recorded baseline for a recovery handle, and refuses one that disagrees with its own', async () => {
+    const owned = owner(), labels = (kind: string) => ({ 'io.codeboost.runner': owned.runnerOwner,
+      'io.codeboost.attempt': owned.attemptId, 'io.codeboost.allocation': owned.allocationId, 'io.codeboost.task-storage': kind });
+    const work = `codeboost-work-${randomUUID()}`, metadata = `codeboost-metadata-${randomUUID()}`;
+    writeFileSync(join(state, `${work}.json`), JSON.stringify({ kind: 'volume', labels: labels('work') }));
+    writeFileSync(join(state, `${metadata}.json`), JSON.stringify({ kind: 'volume', labels: labels('metadata') }));
+    writeFileSync(join(state, 'inspect-output'), output(BASELINE));
+    const handle = await adoptRecoveredTaskStorage(owned, { workVolume: work, metadataVolume: metadata });
+    calls.made = [];
+    await expect(inspectTaskChanges(handle, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks }))
+      .rejects.toThrow('needs the metadataBaseline');
+    expect(calls.made).toEqual([]);
+    expect(await inspectTaskChanges(handle, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks, metadataBaseline: BASELINE }))
+      .toMatchObject({ metadataChanged: false });
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks,
+      metadataBaseline: 'e'.repeat(64) })).rejects.toThrow('does not match');
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('on abort, kills a docker run that ignores SIGTERM and removes the inspection container before settling', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'hang-inspect'), '');
+    const controller = new AbortController();
+    const waitForRun = setInterval(() => { if (existsSync(join(state, 'inspect-began'))) controller.abort(); }, 20);
+    const began = performance.now();
+    try {
+      const error = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: noLinks,
+        signal: controller.signal }).then(() => undefined, caught => caught);
+      expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    } finally { clearInterval(waitForRun); }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
+    expect(inspections()).toEqual([]);
+    rmSync(join(state, 'hang-inspect'));
+    removeTaskFilesystems(filesystems);
+  }, 60_000);
+
+  it('always accepts, at inspection, the largest set of declared links a snapshot accepts', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    const long = (prefix: string, index: number) => `${prefix}${index}`.padEnd(MAXIMUM_NAME_BYTES, 'x');
+    const anchor = { path: '.', type: 'directory' as const, mode: '40755', size: 0, ino: 1, ctime: '0', mtime: '0' };
+    const links = Array.from({ length: MAXIMUM_DECLARED_LINKS },
+      (_, index) => ({ link: long('link', index), status: 'absent' as const, target: long('target', index) }));
+    const targets = Object.fromEntries(links.map(link => [link.target, { status: 'absent' as const, anchor }]));
+    writeFileSync(join(state, 'inspect-output'), JSON.stringify({ metadataDigest: BASELINE, head: BASE, agentCommits: [],
+      nestedGitlinkContent: [], changes: [], links, targets }));
+    const manifest = await inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE, linkSnapshot: { links, targets } });
+    expect(manifest.linkTargetChanges).toEqual([]);
+    await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE,
+      linkSnapshot: { links: [...links, { link: 'one-more', status: 'not-a-link' }], targets } })).rejects.toThrow('linkSnapshot');
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('rejects an invalid base or a declared target outside the work tree before any Docker call', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    calls.made = [];
+    await expect(inspectTaskChanges(filesystems, { base: 'HEAD', imageId: IMAGE, linkSnapshot: noLinks }))
+      .rejects.toThrow('full commit ID');
+    for (const target of ['../etc', '/etc', '.git/config', 'a//b', 'a\nb'])
+      await expect(inspectTaskChanges(filesystems, { base: BASE, imageId: IMAGE,
+        linkSnapshot: { links: [{ link: 'l', status: 'present', target }], targets: { [target]: { status: 'present', entries: [] } } } }))
+        .rejects.toThrow('not a path');
     expect(calls.made).toEqual([]);
     removeTaskFilesystems(filesystems);
   });

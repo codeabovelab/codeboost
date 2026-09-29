@@ -9,7 +9,7 @@ import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemOwner } from './storage.ts';
 import { hasOwnerLabels, ownerLabels } from '../labels.ts';
 import { assertPhasePolicy } from '../policy.ts';
-export { prepareTaskFilesystems, removeTaskFilesystems } from './storage.ts';
+export { prepareTaskFilesystems, removeTaskFilesystems, UnusableRepositoryError } from './storage.ts';
 export type { TaskFilesystems, TaskStorageLimits } from './storage.ts';
 
 const validateSecrets = (profile: ContainerProfile, secrets: Readonly<Record<string, string>>) => {
