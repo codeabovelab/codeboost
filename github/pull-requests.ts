@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RunGh } from './merge.ts';
+import { ghEnvironment } from './gh-env.ts';
 
 const runFile = promisify(execFile);
 
@@ -32,7 +33,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
   constructor(config: { repository: string }, run?: RunGh) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository)) throw new Error('A GitHub repository is required to open pull requests.');
     this.repository = config.repository;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
+    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() })).stdout);
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
@@ -42,13 +43,15 @@ export class GhPullRequestGateway implements PullRequestGateway {
   }
 
   #pull(value: unknown, input: { base: string; headBranch: string }): OpenedPullRequest & { body: string } {
-    const pr = value as { number?: unknown; html_url?: unknown; draft?: unknown; body?: unknown; head?: { sha?: unknown; ref?: unknown; repo?: { full_name?: unknown } | null }; base?: { ref?: unknown; repo?: { full_name?: unknown } } };
+    const pr = value as { number?: unknown; html_url?: unknown; draft?: unknown; state?: unknown; body?: unknown; head?: { sha?: unknown; ref?: unknown; repo?: { full_name?: unknown } | null }; base?: { ref?: unknown; repo?: { full_name?: unknown } } };
     if (!pr || typeof pr !== 'object' || !Number.isSafeInteger(pr.number) || (pr.number as number) < 1 || typeof pr.html_url !== 'string' || !pr.html_url.startsWith('https://')
       || typeof pr.draft !== 'boolean' || (pr.body !== null && typeof pr.body !== 'string') || typeof pr.head?.sha !== 'string' || !SHA.test(pr.head.sha))
       throw new Error('GitHub returned an invalid pull request.');
     const same = (name: unknown) => typeof name === 'string' && name.toLowerCase() === this.repository.toLowerCase();
     if (pr.head.ref !== input.headBranch || !same(pr.head.repo?.full_name) || pr.base?.ref !== input.base || !same(pr.base.repo?.full_name))
       throw new Error('GitHub returned a pull request for a different branch.');
+    // A PR can be closed between any two calls; codeboost only records and reports an open one.
+    if (pr.state !== 'open') throw new Error(`Pull request #${pr.number} is not open.`);
     return { number: pr.number as number, url: pr.html_url, headSha: pr.head.sha, draft: pr.draft, body: pr.body ?? '' };
   }
 

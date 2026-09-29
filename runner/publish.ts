@@ -1,4 +1,5 @@
-import type { PlanIdentity } from '../core/identity.ts';
+import { createHash } from 'node:crypto';
+import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { pullRequestBody, pullRequestTitle } from '../core/pull-request-body.ts';
 import type { AlreadyFixedGateway, AlreadyFixedResult } from '../github/already-fixed.ts';
 import type { PullRequestGateway } from '../github/pull-requests.ts';
@@ -13,7 +14,14 @@ export interface BranchPusher {
   /** Makes `refs/heads/<branch>` on GitHub point at `head`. Settles only when the push finished or failed. */
   push(identity: PlanIdentity, input: { head: string; branch: string }, signal?: AbortSignal): Promise<void>;
 }
-export interface PublishConfig { repository: string; baseBranch: string }
+export interface PublishConfig {
+  repository: string; baseBranch: string;
+  /** How long an opening whose outcome was lost stays owned before an empty lookup may abandon it. Default 10 minutes. */
+  settleMs?: number; now?: () => number;
+}
+/** An earlier opening's outcome is still unknown; nothing new is opened until it settles. Retry later. */
+export class OpeningUnsettled extends Error {}
+export const DEFAULT_SETTLE_MS = 10 * 60_000;
 export type PublishOutcome =
   | { kind: 'opened'; number: number; url: string; draft: boolean; status: string }
   | { kind: 'possibly already fixed'; result: AlreadyFixedResult }
@@ -30,11 +38,15 @@ export class PullRequestPublisher {
     this.#store = store; this.#checks = deps.checks; this.#pulls = deps.pulls; this.#pusher = deps.pusher; this.#config = config;
   }
 
-  /** The task's branch. The task ID keeps branches of different tasks for the same issue apart. */
+  /**
+   * The task's branch. The readable slug may collide (`Task_42` and `task-42`); the suffix, a hash of the exact task
+   * identity, keeps branches of different tasks apart.
+   */
   branch(identity: PlanIdentity): string {
     const plan = this.#store.getPlan(identity);
-    const task = identity.taskId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'task';
-    return `codeboost/issue-${plan.issue}-${task}`;
+    const slug = identity.taskId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40).replace(/-+$/, '') || 'task';
+    const suffix = createHash('sha256').update(identityKey(identity)).digest('hex').slice(0, 16);
+    return `codeboost/issue-${plan.issue}-${slug}-${suffix}`;
   }
 
   /**
@@ -46,6 +58,7 @@ export class PullRequestPublisher {
     const recovered = await this.#recover(identity, signal);
     if (recovered) return recovered;
     const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
+    if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
     if (snapshot.head === snapshot.base) {
       if (!draft) this.#store.transitionTask(identity, task.stateVersion, 'needs human');
       return { kind: 'no changes' };
@@ -69,12 +82,12 @@ export class PullRequestPublisher {
     signal?.throwIfAborted();
     if (earlier && live) {
       if (live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
-      this.#store.assertReadyToRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
+      const stateVersion = this.#store.assertReadyToRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
       const pr = await this.#pulls.refresh(live.number, {
         base: earlier.base, headBranch: branch, draft, ready: !draft, marker: marker(earlier.openingId),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
-      const status = this.#store.recordPullRequestOpened(identity, earlier.openingId, pr, snapshot.head);
+      const status = this.#store.recordPullRequestOpened(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
       return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
     }
     // The last await before the irreversible call is behind us: beginPullRequest re-reads the task state in its transaction.
@@ -89,14 +102,23 @@ export class PullRequestPublisher {
     return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
   }
 
-  /** An opening whose GitHub outcome was lost (a crash or a timeout): adopt the PR if GitHub has it, else abandon it. */
+  /**
+   * An opening whose GitHub outcome was lost (a crash or a timeout): adopt the PR if GitHub has it. An empty lookup
+   * does not prove the request was refused while GitHub may still apply or show it, so the opening stays owned until
+   * the settle time has passed; only then is it abandoned. The caller retries after OpeningUnsettled.
+   */
   async #recover(identity: PlanIdentity, signal?: AbortSignal): Promise<PublishOutcome | null> {
     const lost = this.#store.taskPullRequests(identity).find((pr: TaskPullRequest) => pr.state === 'opening');
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
     const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal);
     signal?.throwIfAborted();
-    if (!pr) { this.#store.abandonPullRequestOpening(identity, lost.openingId); return null; }
+    if (!pr) {
+      const age = (this.#config.now ?? Date.now)() - Date.parse(lost.createdAt);
+      if (!(age >= (this.#config.settleMs ?? DEFAULT_SETTLE_MS))) throw new OpeningUnsettled('An earlier pull request opening has not settled yet. Try again later.');
+      this.#store.abandonPullRequestOpening(identity, lost.openingId);
+      return null;
+    }
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, pr);
     return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
   }

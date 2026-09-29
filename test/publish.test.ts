@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
-import { PullRequestPublisher, type BranchPusher } from '../runner/publish.ts';
+import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
+import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
 import { GhPullRequestGateway, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway, AlreadyFixedInput, AlreadyFixedResult } from '../github/already-fixed.ts';
 import { fenced, pullRequestBody, pullRequestTitle, MAX_BODY } from '../core/pull-request-body.ts';
@@ -12,7 +13,8 @@ const identity = { repositoryId: 'repo', taskId: 'Task_42', planId: 'plan' };
 const plan: Plan = { schema_version: 1, issue: 12, revision: 1, summary: 'Stop the crash', questions: [], items: [
   { id: 'P1', title: 'Guard input', intent: 'Reject empty input', files: [{ path: 'a.ts', kind: 'edit', renamed_from: null, change: 'Check it' }], acceptance: [{ type: 'cmd', text: 'npm test' }], depends_on: [] }] };
 const context: PlanContext = { identity, issue: 12, baseEntries: [{ path: 'a.ts', kind: 'file' }], pathKey: p => p, allowedCommands: [['npm', 'test']] };
-const config = { repository: 'owner/repo', baseBranch: 'main' };
+const config: PublishConfig = { repository: 'owner/repo', baseBranch: 'main' };
+const BRANCH = /^codeboost\/issue-12-task-42-[0-9a-f]{16}$/;
 
 /** A task whose last attempt settled while it runs, with head `oid(2)` over base `oid(1)` and one owned commit. */
 function runningTask(options: { head?: string } = {}) {
@@ -30,7 +32,7 @@ function runningTask(options: { head?: string } = {}) {
 
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
-  push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number } } = {}) {
+  push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig> } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 };
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ?? [{ outcome: 'clear', baseHead: oid(9) }];
@@ -49,8 +51,8 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       live.set(input.marker, pr); return pr;
     },
   };
-  const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
-  return { log, checks, opened, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher }, config) };
+  const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
+  return { log, checks, opened, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher }, { ...config, ...options.config }) };
 }
 
 describe('opening the task PR', () => {
@@ -62,7 +64,7 @@ describe('opening the task PR', () => {
     expect(log).toEqual(['check', 'push codeboost/issue-12-task-42 002', 'open ready']);
     expect(checks[0]).toMatchObject({ issue: 12, taskBase: oid(1), baseBranch: 'main', ownPullRequests: [] });
     expect([...checks[0]!.ownCommits]).toEqual([oid(2)]);
-    expect(opened[0]).toMatchObject({ base: 'main', headBranch: 'codeboost/issue-12-task-42', title: 'Stop the crash (#12)' });
+    expect(opened[0]).toMatchObject({ base: 'main', headBranch: expect.stringMatching(BRANCH), title: 'Stop the crash (#12)' });
     expect(opened[0]!.body).toContain(opened[0]!.marker);
     expect(store.getTask(identity).status).toBe('in review');
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, headSha: oid(2), draft: false }]);
@@ -140,6 +142,33 @@ describe('opening the task PR', () => {
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     await expect(harness(store).publisher.publish(identity)).rejects.toThrow(/cannot be opened while the task is queued/);
   });
+  it('keeps the branches of tasks whose IDs normalize alike apart', () => {
+    const store = runningTask();
+    const other = { ...identity, taskId: 'task-42' };
+    store.createPlan(JSON.stringify(plan), 'json', { ...context, identity: other }, oid(1), oid(2));
+    const publisher = harness(store).publisher;
+    expect(publisher.branch(identity)).toMatch(BRANCH);
+    expect(publisher.branch(other)).not.toBe(publisher.branch(identity));
+    expect(publisher.branch(other)).toMatch(BRANCH);
+  });
+  it('checks the task status before the no-changes shortcut', async () => {
+    const queuedTask = runningTask({ head: oid(1) });
+    queuedTask.transitionTask(identity, queuedTask.getTask(identity).stateVersion, 'queued');
+    await expect(harness(queuedTask).publisher.publish(identity)).rejects.toThrow(/while the task is queued/);
+    expect(queuedTask.getTask(identity).status).toBe('queued');
+    const cancelled = runningTask({ head: oid(1) });
+    cancelled.cancelTask(identity, cancelled.getTask(identity).stateVersion, crypto.randomUUID());
+    await expect(harness(cancelled).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(/while the task is cancelled/);
+  });
+  it('records a PR whose response arrives after the task changed, without letting it move the task', async () => {
+    const store = runningTask();
+    const { publisher } = harness(store, { open: async input => {
+      store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
+      return { number: 6, url: 'https://github.com/owner/repo/pull/6', headSha: oid(2), draft: input.draft };
+    } });
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 6, status: 'running' });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 6 }]);
+  });
   it('moves to needs human when the branch head moved before GitHub read it', async () => {
     const store = runningTask();
     const { publisher } = harness(store, { open: async input => ({ number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(77), draft: input.draft }) });
@@ -180,10 +209,15 @@ describe('recovering a lost opening', () => {
     expect(second.log).toEqual([`find <!-- codeboost:opening=${lost!.openingId} -->`]);
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 55 }]);
   });
-  it('abandons an opening GitHub never saw, then checks again and opens a new PR', async () => {
+  it('keeps an unconfirmed opening owned until it settles, then abandons it, checks again and opens a new PR', async () => {
     const store = runningTask();
     await expect(harness(store, { open: async () => { throw new Error('timeout'); } }).publisher.publish(identity)).rejects.toThrow('timeout');
-    const second = harness(store);
+    // Within the settle time an empty lookup proves nothing: the opening stays owned and nothing is posted.
+    const early = harness(store);
+    await expect(early.publisher.publish(identity)).rejects.toThrow(OpeningUnsettled);
+    expect(early.log).toEqual([expect.stringMatching(/^find /)]);
+    expect(store.taskPullRequests(identity).map(pr => pr.state)).toEqual(['opening']);
+    const second = harness(store, { config: { now: () => Date.now() + 10 * 60_000 } });
     expect(await second.publisher.publish(identity)).toMatchObject({ kind: 'opened', status: 'in review' });
     expect(second.log).toEqual([expect.stringMatching(/^find /), 'check', 'push codeboost/issue-12-task-42 002', 'open ready']);
     expect(store.taskPullRequests(identity).map(pr => pr.state)).toEqual(['abandoned', 'opened']);
@@ -251,9 +285,17 @@ describe('the PR description', () => {
   });
 });
 
+describe('gh subprocess environment', () => {
+  it('passes only the allowlisted variables, and turns prompts off', () => {
+    const env = ghEnvironment({ PATH: '/bin', GH_TOKEN: 't', AWS_SECRET_ACCESS_KEY: 'x', ANTHROPIC_API_KEY: 'y', HOME: '/h' });
+    expect(env).toEqual({ PATH: '/bin', GH_TOKEN: 't', HOME: '/h', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_PAGER: 'cat', NO_COLOR: '1' });
+    expect(GH_ENV_ALLOWLIST).not.toContain('ANTHROPIC_API_KEY' as never);
+  });
+});
+
 describe('GitHub PR adapter', () => {
   const marker = '<!-- codeboost:opening=11111111-1111-4111-8111-111111111111 -->';
-  const response = (over: Record<string, unknown> = {}) => ({ number: 7, html_url: 'https://github.com/owner/repo/pull/7', draft: true, body: `${marker}\nplan`,
+  const response = (over: Record<string, unknown> = {}) => ({ number: 7, html_url: 'https://github.com/owner/repo/pull/7', state: 'open', draft: true, body: `${marker}\nplan`,
     head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: { full_name: 'Owner/Repo' } }, base: { ref: 'main', repo: { full_name: 'owner/repo' } }, ...over });
   const input = { base: 'main', headBranch: 'codeboost/issue-12-task', title: 'T', body: `${marker}\nplan`, draft: true, marker };
   it('opens with literal argv and validates the answer', async () => {
@@ -265,7 +307,7 @@ describe('GitHub PR adapter', () => {
   });
   it('refuses answers for another branch or repository, and bodies without the marker', async () => {
     for (const over of [{ head: { sha: oid(2), ref: 'other', repo: { full_name: 'owner/repo' } } }, { head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: { full_name: 'fork/repo' } } },
-      { base: { ref: 'dev', repo: { full_name: 'owner/repo' } } }, { body: 'no marker' }, { number: 0 }, { head: { sha: 'x', ref: 'codeboost/issue-12-task', repo: { full_name: 'owner/repo' } } }]) {
+      { base: { ref: 'dev', repo: { full_name: 'owner/repo' } } }, { body: 'no marker' }, { state: 'closed' }, { number: 0 }, { head: { sha: 'x', ref: 'codeboost/issue-12-task', repo: { full_name: 'owner/repo' } } }]) {
       const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response(over)));
       await expect(gh.open(input), JSON.stringify(over)).rejects.toThrow();
     }
@@ -283,6 +325,9 @@ describe('GitHub PR adapter', () => {
     expect(calls.map(call => call.slice(0, 3))).toEqual([['api', '-X', 'PATCH'], ['pr', 'ready', '7'], ['api', '-H', 'Accept: application/vnd.github+json']]);
     expect(calls[1]).toEqual(['pr', 'ready', '7', '--repo', 'owner/repo']);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ number: 8 }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/different/);
+    // Closed between the lookup and the refresh: refused, so the task never moves to in review without an open PR.
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ state: 'closed' }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/not open/);
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ state: 'closed' })])).findOpened(input)).rejects.toThrow(/not open/);
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];

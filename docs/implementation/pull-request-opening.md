@@ -9,7 +9,8 @@
 - When the check is clear, codeboost pushes the task head to the task's branch and opens the PR. The task moves to **in review**.
 - A task in **needs human** gets a draft PR with its open problems. If the check matches, no draft is opened and the task stays in needs human.
 - A later run of the same task reuses its PR while it is still open. It does not open a second one.
-- codeboost records each opening before it calls GitHub. If the outcome is lost, the next publish finds the PR by a marker in its description.
+- codeboost records each opening before it calls GitHub. If the outcome is lost, the next publish finds the PR by a marker in its description. An opening that GitHub does not show yet stays owned for 10 minutes before it is abandoned.
+- A GitHub response changes the task status only if the task is unchanged since the call began.
 
 ## Terms
 
@@ -48,22 +49,26 @@ A cancelled check throws. It does not return `unknown`.
 
 Publish runs these steps in order:
 
-1. **Recover.** If an opening is still `opening`, look for an open PR from the task branch whose description has its marker. If one exists, record it as opened. If none exists, mark the opening `abandoned` and continue.
-2. **No changes.** If the task head is its base, open nothing. A running task moves to needs human.
+1. **Recover.** If an opening is still `opening`, look for an open PR from the task branch whose description has its marker. If one exists, record it as opened. If none exists, the request may still be in flight or not yet visible. So publish stops with `OpeningUnsettled` until the opening is 10 minutes old (`settleMs`). After that, it marks the opening `abandoned` and continues.
+2. **Status and no changes.** Refuse unless the task is running (or in needs human, for a draft). If the task head is its base, open nothing. A running task moves to needs human.
 3. **Check.** Run the check. Record the result, and any status change, in one transaction. That transaction refuses if the task changed during the check.
 4. **Find the earlier PR.** If the task has an opened PR on the same branch, ask GitHub whether it is still open.
-5. **Push.** Push the task head to `codeboost/issue-<issue>-<task>`.
+5. **Push.** Push the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
 6. **Re-read.** Right before the GitHub call, the Store confirms that the latest check is clear and that the task is unchanged since that check: same state version, same snapshot, same head.
 7. **Open or reuse.** Open a new PR, or update the open earlier PR and mark it ready. Record the result.
 
-After step 7, the task moves as follows:
+Each opening or refresh owns the task state version at the moment it passed step 6. The PR is always recorded. The status changes only when the task still has that version. Every status change, admission and context change increases the version. So a response that arrives after the task changed never moves it.
 
-| Task status before publish | PR | Status after |
+| Task during the GitHub call | PR | Status after |
 |---|---|---|
-| running | Opened or reused, head as pushed | in review |
-| running | Head on GitHub differs from the pushed head | needs human |
-| needs human | Draft opened or updated | needs human |
-| cancelled (during the call) | Opened | cancelled; the PR is recorded so it can be closed later |
+| Unchanged, running | Open, head as pushed | in review |
+| Unchanged, running | Open, head on GitHub differs from the pushed head | needs human |
+| Unchanged, needs human | Draft opened or updated | needs human |
+| Changed (cancelled, reassigned, new attempt, new head) | Opened | Unchanged; the PR is recorded so it can be reused or closed later |
+
+The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.
+
+**Environment.** Each `gh` process gets only an allowlist of variables: the path, home and locale; GitHub tokens, host and configuration directories; and proxy and CA settings (`github/gh-env.ts`). Prompts, the pager and update checks are turned off.
 
 ## The PR description
 
@@ -82,12 +87,12 @@ The description stays under 60,000 characters. If the full plan is too long, onl
 
 ## Tests
 
-`test/already-fixed.test.ts` and `test/publish.test.ts` cover each row above. Each guard was also broken on purpose, and a test failed each time: own-PR and own-commit exclusion, repository-qualified exclusion, every bound, the ancestor check, the fail-closed catch, the issue-number boundary, the state-version and head re-read, reuse of the earlier PR, lost-opening recovery, the fence length, and the description bounds.
+`test/already-fixed.test.ts` and `test/publish.test.ts` cover each row above. Each guard was also broken on purpose, and a test failed each time: own-PR and own-commit exclusion, repository-qualified exclusion, every bound, the ancestor check, the fail-closed catch, the issue-number boundary, the state-version and head re-read, the status check before the no-changes shortcut, the version-owned status change, the open-state check, the settle time, the branch hash, the environment allowlist, reuse of the earlier PR, lost-opening recovery, the fence length, and the description bounds.
 
 ## Test this document with a reader
 
 Ask someone new to lane F to answer these questions from this page alone. Then fix any section they could not use.
 
 1. Why does a check that cannot be completed open no PR?
-2. What happens to a PR that opens after the task was cancelled?
+2. What happens to a PR that opens after the task was cancelled or reassigned?
 3. Why is the second run's PR not a new PR?

@@ -28,6 +28,8 @@ export interface ReviewNote { id: string; item: string; kind: 'question' | 'chan
 export interface TaskPullRequest {
   openingId: string; repository: string; base: string; headBranch: string; headSha: string; draft: boolean;
   state: 'opening' | 'opened' | 'abandoned'; number: number | null; url: string | null; createdAt: string;
+  /** The task state version this opening owns; only a response for that exact version may change the task status. */
+  ownerVersion: number;
 }
 export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
@@ -887,7 +889,7 @@ export class Store {
         state_version INTEGER NOT NULL, checked_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_pull_requests (
         opening_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), repository TEXT NOT NULL, base TEXT NOT NULL,
-        head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL,
+        head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL, owner_version INTEGER NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('opening','opened','abandoned')), number INTEGER, url TEXT,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         CHECK ((state = 'opened') = (number IS NOT NULL AND url IS NOT NULL)));
@@ -900,6 +902,7 @@ export class Store {
       openingId: row.opening_id as string, repository: row.repository as string, base: row.base as string, headBranch: row.head_branch as string,
       headSha: row.head_sha as string, draft: row.draft === 1, state: row.state as TaskPullRequest['state'],
       number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
+      ownerVersion: row.owner_version as number,
     };
   }
   /** Every PR codeboost opened or started to open for the task, oldest first. */
@@ -948,18 +951,23 @@ export class Store {
       this.#assertCheckedHead(identity, input);
       if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opening'", key)) throw new GuardRefusal('A pull request is already being opened; recover it first.');
       const openingId = randomUUID(), now = new Date().toISOString();
-      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,state,number,url,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0, now, now);
       this.#touch(key);
+      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,state,number,url,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
+        this.#task(key).state_version as number, now, now);
       return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
     });
   }
-  /** The same guard for reusing the task's open PR: nothing changed since a clear check of this head. */
-  assertReadyToRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): void {
+  /**
+   * The same guard for reusing the task's open PR: nothing changed since a clear check of this head. Returns the state
+   * version the refresh owns.
+   */
+  assertReadyToRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): number {
     const key = identityKey(identity);
-    this.#transaction(() => {
+    return this.#transaction(() => {
       this.#assertCheckedHead(identity, input);
       if (!this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened'", key, input.openingId)) throw new GuardRefusal('Unknown pull request.');
+      return this.#task(key).state_version as number;
     });
   }
   #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
@@ -970,10 +978,13 @@ export class Store {
     if (snapshot.id !== check.snapshotId || snapshot.head !== input.headSha) throw new GuardRefusal('The task head changed after the check.');
   }
   /**
-   * The PR exists. The record is kept even if the task closed meanwhile, so the PR can still be found and closed; only
-   * a running task moves to in review (or needs human, when the pushed head moved before GitHub read it).
+   * The PR exists. The record is kept whatever happened to the task meanwhile, so the PR can still be found and closed.
+   * The task status changes only when the task is unchanged since the opening or refresh began (its owned state
+   * version): then a running task moves to in review, or to needs human when the pushed head moved before GitHub read it.
    */
-  recordPullRequestOpened(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, refreshedHead?: string): TaskStatus {
+  recordPullRequestOpened(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean },
+    refreshed?: { head: string; stateVersion: number }): TaskStatus {
+    const refreshedHead = refreshed?.head;
     if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
     const key = identityKey(identity);
     return this.#transaction(() => {
@@ -985,8 +996,10 @@ export class Store {
       const expectedHead = refreshedHead ?? row.head_sha as string;
       this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, updated_at=? WHERE opening_id=?",
         pr.number, pr.url, pr.draft ? 1 : 0, expectedHead, new Date().toISOString(), openingId);
-      const task = this.#task(key);
-      if (task.status === 'running' && !this.#activeAttempt(key)) {
+      const task = this.#task(key), owned = refreshed?.stateVersion ?? row.owner_version as number;
+      // Every status change and every admission increases the state version, so an unchanged version means the task is
+      // still in the status the opening was guarded for (running, or needs human for a draft) with no attempt active.
+      if (task.state_version === owned) {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', pr.headSha === expectedHead && !pr.draft ? 'in review' : 'needs human', key);
       }
       this.#touch(key);

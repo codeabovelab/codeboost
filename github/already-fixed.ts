@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import type { RunGh } from './merge.ts';
+import { ghEnvironment } from './gh-env.ts';
 
 const runFile = promisify(execFile);
 
@@ -91,7 +92,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
   constructor(config: GhAlreadyFixedConfig, run?: RunGh) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository)) throw new Error('A GitHub repository is required for the already-fixed check.');
     this.repository = config.repository;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
+    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() })).stdout);
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
