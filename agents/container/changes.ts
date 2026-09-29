@@ -15,10 +15,10 @@ export type EntryType = 'file' | 'symlink' | 'gitlink' | 'directory' | 'other';
 
 /**
  * One difference between the work tree and the tree of `base`, read without following links (#66). Every file is read
- * and hashed as the blob Git would store, with the work tree's attributes, as a commit would; a tracked file counts as
- * changed when that blob or its mode differs from `base`. So what the audit approves is what a commit stores, and a
- * file whose stored blob would not change (an honest CRLF checkout, say) is not a change. A link target is compared
- * as it is.
+ * and hashed as the blob Git would store, with the work tree's attributes (only those: a deleted `.gitattributes` no
+ * longer applies); a tracked file counts as changed when that blob or its mode differs from `base`. A file whose stored
+ * blob would not change (an honest CRLF checkout, say) is not a change. The commit step (#66 part 2) must store exactly
+ * these blobs, built the same way, so what the audit approves is what is committed. A link target is compared as it is.
  */
 export interface TaskChange {
   readonly path: string;

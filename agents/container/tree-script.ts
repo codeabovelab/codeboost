@@ -110,8 +110,10 @@ my @GIT = ("git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/d
 sub exit_reason { my $status = shift; return $status == -1 ? "could not start" : ($status & 127) ? "killed by signal " . ($status & 127) : "status " . ($status >> 8) }
 # Run Git in the work tree, optionally feeding it a file, and return its standard output. With $strict, an error Git
 # reports but survives (an encoding it could not apply) fails the run: the answer is not what a commit would store.
-# A warning does not: Git has ignored something (a negative attribute pattern, a symlinked .gitattributes, a macro
-# where macros are not allowed) exactly as a commit would, so the answer still holds. Any other line fails it too.
+# A warning does not: Git has ignored something (a negative attribute pattern, a symlinked .gitattributes) exactly as a
+# commit would, so the answer still holds. Nor do the two complaints Git prints without a prefix about an attribute line
+# it skips ("<name> is not a valid attribute name: <file>:<line>", "<macro> not allowed: <file>:<line>"). Any other line
+# fails it.
 my $stderr_file = "/tmp/git-stderr";
 sub git_in {
   my ($input, $strict, @args) = @_;
@@ -128,7 +130,9 @@ sub git_in {
   my ($first, $in_warning);
   for my $line (split /\n/, $errors) {
     if ($line =~ /^warning: /) { $in_warning = 1; next }
-    if ($line =~ /^(?:error|fatal): / || !$in_warning) { $first = $line; last }
+    if ($line =~ /^(?:error|fatal): /) { $first = $line; last }
+    next if $line =~ /(?: is not a valid attribute name| not allowed): [^:]*\.gitattributes:\d+\z/;
+    if (!$in_warning) { $first = $line; last }
   }
   # Name the Git command itself, past any "-c name=value" pairs in front of it.
   my @rest = @args; splice @rest, 0, 2 while @rest && $rest[0] eq "-c";
@@ -365,17 +369,19 @@ while (@pending) {
 close $ignore_in; waitpid($ignore_pid, 0);
 fail(4, "git check-ignore failed (status " . ($? >> 8) . ")") if ($? >> 8) > 1 || ($? & 127);
 
-# Git blob IDs for what would be committed: every tracked and new file, hashed as git add would store it. Every file is
+# Git blob IDs for what would be committed: every tracked and new file, hashed as git add stores a file. Every file is
 # read: a file's times do not always move when its content does (not every way of writing to tmpfs updates them), so an
 # unchanged stat proves nothing. They are hashed into a scratch index built from base, as the seeded index is, with
-# --info-only so no object is written: Git then applies the work tree's attributes exactly as git add does, including
-# leaving a text=auto file's CRLF alone when base already stores it that way.
+# --info-only so no object is written: Git applies the work tree's attributes as git add does, including leaving a
+# text=auto file's CRLF alone when base already stores it that way. The commit step must build from this same scratch
+# index procedure, so what it stores is what was audited.
 my @commitable = grep { $work{$_}{type} eq "file" && !under_git_path($_) } sort keys %work;
 if (@commitable) {
   local $ENV{GIT_INDEX_FILE} = "/tmp/scratch-index";
   git("read-tree", $base);
-  # What is gone, or is no longer the same type, leaves the scratch index first, as git add -A handles it: Git reads a
-  # deleted .gitattributes from the index, and must not hash the rest with rules the work tree no longer has.
+  # What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
+  # the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
+  # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
   my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");

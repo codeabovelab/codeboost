@@ -1156,6 +1156,13 @@ describe('real Docker agent isolation', () => {
       await expect(inspect()).rejects.toThrow(/exit 6\): the attributes file \.gitattributes is not a regular file/);
     }, 180_000);
 
+    it('lets through a warning that runs over two lines', async () => {
+      const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '!foo text\n') });
+      asAgent(data.filesystems, 'printf "edited\\n" > file.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(manifest.changes.map(change => change.path)).toEqual(['file.txt']);
+    }, 180_000);
+
     it('hashes with the attributes the work tree has: a deleted .gitattributes no longer applies', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '*.txt text\n') });
       asAgent(data.filesystems, 'rm .gitattributes && printf "trusted\\r\\n" > file.txt');
@@ -1168,9 +1175,10 @@ describe('real Docker agent isolation', () => {
 
     it('inspects a repository whose attribute files make Git warn, as a commit of it would succeed', async () => {
       const data = fixture({ hostile: source => {
-        // A negative pattern, a macro where macros are not allowed, and a symlinked .gitattributes: Git warns about
-        // each and ignores it, as it does on commit.
-        writeFileSync(join(source, '.gitattributes'), '!foo text\n');
+        // A macro where macros are not allowed and an invalid attribute name (Git complains without a warning prefix),
+        // and a symlinked .gitattributes: Git ignores each, as it does on commit. The root file has no warning of its
+        // own, so nothing else excuses the unprefixed lines.
+        writeFileSync(join(source, '.gitattributes'), '* -=x\n');
         mkdirSync(join(source, 'v')); writeFileSync(join(source, 'v', '.gitattributes'), '[attr]mybin -diff -text\n');
         writeFileSync(join(source, 'v', 'a.txt'), 'a\n');
         mkdirSync(join(source, 'c')); writeFileSync(join(source, 'c', 'attrs'), '*.txt text\n');
