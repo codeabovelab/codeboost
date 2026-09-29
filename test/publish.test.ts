@@ -308,6 +308,8 @@ describe('gh subprocess environment', () => {
     const env = ghEnvironment({ PATH: '/bin', GH_TOKEN: 't', AWS_SECRET_ACCESS_KEY: 'x', ANTHROPIC_API_KEY: 'y', HOME: '/h' });
     expect(env).toEqual({ PATH: '/bin', GH_TOKEN: 't', HOME: '/h', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_PAGER: 'cat', NO_COLOR: '1' });
     expect(GH_ENV_ALLOWLIST).not.toContain('ANTHROPIC_API_KEY' as never);
+    // Linux keyring sign-in needs the session bus.
+    expect(ghEnvironment({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', XDG_RUNTIME_DIR: '/run/user/1' })).toMatchObject({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', XDG_RUNTIME_DIR: '/run/user/1' });
   });
 });
 

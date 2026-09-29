@@ -68,7 +68,7 @@ Each opening or refresh owns the task state version at the moment it passed step
 
 The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.
 
-**Environment.** Each `gh` process gets only an allowlist of variables: the path, home and locale; GitHub tokens, host and configuration directories; and proxy and CA settings (`github/gh-env.ts`). Prompts, the pager and update checks are turned off.
+**Environment.** Each `gh` process gets only an allowlist of variables: the path, home and locale; GitHub tokens, host and configuration directories; the D-Bus session bus that Linux keyring sign-in uses; and proxy and CA settings (`github/gh-env.ts`). Prompts, the pager and update checks are turned off.
 
 ## The PR description
 
