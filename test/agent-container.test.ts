@@ -826,7 +826,7 @@ describe('real Docker agent isolation', () => {
       'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden',
       'mkdir tracked && printf "a\\n" > tracked/f && g add tracked/f && g commit -qm tracked && printf "b\\n" > tracked/f && chmod 000 tracked',
       // An ignored directory: the untracked scan never enters it, so Git would report its tracked file as deleted.
-      'printf "gone/\\n" >> .git/info/exclude && mkdir gone && printf "a\\n" > gone/f && g add -f gone/f && g commit -qm gone && chmod 000 gone']) {
+      'mkdir -p .git/info && printf "gone/\\n" >> .git/info/exclude && mkdir gone && printf "a\\n" > gone/f && g add -f gone/f && g commit -qm gone && chmod 000 gone']) {
       const failing = fixture();
       agentChanges(failing.filesystems, extra);
       await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('could not read part of the task worktree');
@@ -883,7 +883,9 @@ describe('real Docker agent isolation', () => {
     }, 120_000);
 
   it('marks the export truncated when there are more untracked files than it adds', async () => {
-    const data = fixture();
+    // Enough inodes for 21,000 files; the default test storage allows 512.
+    const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 25_000, metadataBytes: 16 * 1024 * 1024,
+      metadataInodes: 512 } });
     // Past 20,000 untracked files the export stops adding them; their diffs alone already pass the 1 MiB limit.
     agentChanges(data.filesystems, 'mkdir many && cd many && for i in $(seq 1 21000); do : > "e$i"; done');
     const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
