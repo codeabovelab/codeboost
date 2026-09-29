@@ -24,7 +24,7 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest> = {})
   ({ changes, agentCommits: [], metadataChanged: false, linkTargetChanges: [], nestedGitlinkContent: [], digest: `digest-${changes.length}`, ...over });
 
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
-  commit?: (item: string) => Promise<void>; release?: () => Promise<void> } = {}) {
+  commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const store = new Store(join(dir, 'state.sqlite'));
   store.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
@@ -50,6 +50,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const sources: ExecutionSources = { planContext: () => context, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
   const deps = executionDeps(store, workspace, (input, prompt, ws) => {
+    if (options.startError) throw options.startError;
     log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
     return { attemptId: input.attemptId, settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }), cancel: () => undefined };
   }, sources, RUNNER_OWNER);
@@ -123,5 +124,17 @@ describe('item execution', () => {
     const { runner, executor } = setup({ release: async () => { throw new Error('docker down'); } });
     await expect(executor.runTask(identity)).rejects.toThrow(/Needs restart/);
     expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
+  });
+  it('releases task storage after the terminal write when D settles with another attempt\'s result', async () => {
+    const { store, executor, log } = setup({ exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed' });
+    expect(log.some(line => line.startsWith('inspect'))).toBe(false);
+    expect(log).toContain('release P1 after failed');
+    expect(store.getSnapshot(identity).head).toBe(oid(2));
+  });
+  it('releases task storage after the terminal write when D\'s start call throws', async () => {
+    const { executor, log } = setup({ startError: new Error('docker refused') });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Launch failed: docker refused' });
+    expect(log).toContain('release P1 after failed');
   });
 });
