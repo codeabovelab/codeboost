@@ -49,6 +49,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Before requesting or re-requesting an automated Copilot review, self-review the full current diff, fix every issue found, and repeat the self-review and fix cycle until a complete pass finds no new issues. Re-run the relevant validation after fixes; only then request Copilot review.
 - Each self-review pass rereads every changed function in full against the base, not only the lines changed since the previous round. Code unchanged since the first commit of the PR still gets reviewed in every pass.
 - Treat every behavioural claim the change makes, in code comments, the PR body or docs (for example "pauses every 1,000 entries", "settles only after exit", "never throws", "bounded by N seconds"), as something to verify. Trace each claim through every path that can break it, including nested loops, callbacks, error paths and early returns, and give it a test that fails if the claim is false.
+- A test's setup must leave the state the production path would: if production never runs a step (such as a commit that refreshes Git's index), the test must not run it before the behaviour under test either.
 - The author's self-review is not enough for concurrency, process, subprocess, timer or resource-cleanup code. Before requesting Copilot review, also run an independent review that does not share the author's context: `/codex review`, a separate review agent, or `/code-review` at `high` effort or above. Fix its findings like any other.
 - Run final validation against the exact pushed head after the last change.
 - Report current test counts separately from historical milestone counts.
@@ -95,6 +96,12 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Give every subprocess an explicit allowlisted environment. Pass credentials only to the component that needs them, through a separate channel. Name-based scrubbing of an inherited environment is not isolation. Run Git with the repository's hardened invocation: no user or system config, no hooks, no lazy fetch, no network protocols.
 - Treat paths read from a durable record or discovered on disk as untrusted. Before deleting, opening or probing one, validate its exact location and name, not only its basename, and never follow a link to it. Keep files that other local users must not plant or swap, such as lock files, in a directory only the current user can write. Write durable records through a unique temporary file opened exclusively, and delete it if the write fails.
 - Exclude other processes with an OS-level lock held for the owner's lifetime, keyed by the resource's stable identity rather than a path spelling. A PID liveness check never authorizes taking over a lock. Run shared one-time startup work single-flight under that lock, and keep the lock until the work has finished.
+
+## Agent-controlled content
+
+- When a subprocess reports a problem only as a warning and carries on, decide pass or fail by what each message means for the result, not by whether anything was printed: fail on messages that mean it did less than it should (for example could not read a path), and let through messages about harmless input the agent controls. Test both a benign case and a failing case, and filter the output as it arrives so that no volume of benign messages can push a failure out of a bounded buffer.
+- Quote or escape agent-controlled text (file names, paths, branch names) wherever it lands in output that people or tools parse, such as diffs, notices, logs or reports, so it cannot forge that output's structure.
+- A hardened Git invocation must also keep Git out of nested repositories and populated submodules, whose own config and hooks are the agent's: pass `--ignore-submodules` on the command line (the config default does not bind plumbing or override `.gitmodules`), and never run Git with a nested repository as its working directory.
 
 ## Blinded experiments
 

@@ -5,7 +5,7 @@ import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
-import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment } from '../core/approvals.ts';
+import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 
@@ -66,11 +66,11 @@ export class ReviewService {
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
     // Names each stale item's stale state from every input that decides it, so the page keeps a reviewer's view choice only while that state is unchanged.
     const staleKeys = new Map<string, string | null>();
-    // Every field an approval covers, hashed once per segment, so a segment shared by many stale items is not serialized once per owner.
+    // Every field an approval covers, in the approval fingerprint's canonical form, hashed once per segment so a segment shared by many stale items is not serialized once per owner.
     const reviewedDigests = new Map<string, string>();
     const reviewedDigest = (segment: typeof segments[number]) => {
       let digest = reviewedDigests.get(segment.key);
-      if (digest === undefined) reviewedDigests.set(segment.key, digest = createHash('sha256').update(JSON.stringify(reviewedSegment(segment))).digest('hex'));
+      if (digest === undefined) reviewedDigests.set(segment.key, digest = createHash('sha256').update(stable(reviewedSegment(segment))).digest('hex'));
       return digest;
     };
     const staleKey = (item: PlanItem): string | null => {

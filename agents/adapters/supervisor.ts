@@ -14,6 +14,7 @@ export const OUTPUT_LIMITS = Object.freeze({
 });
 const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const CAPTURE_ABORT_GRACE_MS = 1_000;
+const ACKNOWLEDGEMENT_RETRY_MS = 250;
 const DIAGNOSTIC_BYTES = 1024;
 const active = new Map<string, InvocationHandle>();
 const activeProfiles = new WeakSet<ContainerProfile>();
@@ -363,6 +364,27 @@ export function readBoundedContainerFile(container: string, source: string, maxi
   });
 }
 
+/**
+ * Run as root inside the container: write the deferred output acknowledgement `collected-<token>` that the wrapper
+ * waits for. It is idempotent, so a retry succeeds after an attempt that died once it had created the file: a
+ * complete file is kept, and a partial one is unlinked and written again. Only root can create entries in the
+ * control directory, and without capabilities root cannot reopen its own read-only file for writing.
+ */
+export const ACKNOWLEDGEMENT_SCRIPT = [
+  "const fs=require('node:fs'),c=fs.constants,token=process.argv[1],directory='/run/codeboost-control';",
+  "let dirfd,fd,existing;try{dirfd=fs.openSync(directory,c.O_RDONLY|c.O_DIRECTORY|c.O_NOFOLLOW);",
+  "const name='/proc/self/fd/'+dirfd+'/collected-'+token,create=()=>fs.openSync(name,",
+  'c.O_WRONLY|c.O_CREAT|c.O_EXCL|c.O_NOFOLLOW,0o444);',
+  "try{fd=create()}catch(error){if(error.code!=='EEXIST')throw error;",
+  'existing=fs.openSync(name,c.O_RDONLY|c.O_NOFOLLOW|c.O_NONBLOCK);const stat=fs.fstatSync(existing,{bigint:true});',
+  "if(!stat.isFile()||stat.nlink!==1n)throw new Error('UNSAFE_ACK');",
+  "const complete=fs.readFileSync(existing,'utf8')===token;fs.closeSync(existing);existing=undefined;",
+  'if(!complete){fs.unlinkSync(name);fd=create()}}',
+  "if(fd!==undefined){fs.writeFileSync(fd,token);fs.fsyncSync(fd);const stat=fs.fstatSync(fd,{bigint:true});",
+  "if(!stat.isFile()||stat.nlink!==1n)throw new Error('UNSAFE_ACK')}}finally{if(existing!==undefined)fs.closeSync(existing);",
+  'if(fd!==undefined)fs.closeSync(fd);if(dirfd!==undefined)fs.closeSync(dirfd)}',
+].join('');
+
 export function isInvocationActive(attemptId: string): boolean {
   return ownsAttempt(attemptId);
 }
@@ -417,6 +439,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
   let decodeAbort: AbortController | undefined;
   let protocolToken: string | undefined, protocolStarted = false, protocolReady = false;
+  let readyStatus: number | undefined, acknowledgementFailures = 0;
   let protocolBuffer = Buffer.alloc(0);
   // Setup (container create and validation) runs inside the handle; a stop kills its in-flight Docker call.
   const setupAbort = new AbortController();
@@ -443,21 +466,27 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     void operation.finally(() => controls.delete(operation));
     return operation;
   };
-  const acknowledgeDeferredOutput = (token: string) => {
-    const script = [
-      "const fs=require('node:fs'),token=process.argv[1],directory='/run/codeboost-control';",
-      'let dirfd,fd;try{dirfd=fs.openSync(directory,fs.constants.O_RDONLY|fs.constants.O_DIRECTORY|fs.constants.O_NOFOLLOW);',
-      "fd=fs.openSync('/proc/self/fd/'+dirfd+'/collected-'+token,",
-      'fs.constants.O_WRONLY|fs.constants.O_CREAT|fs.constants.O_EXCL|fs.constants.O_NOFOLLOW,0o444);',
-      "fs.writeFileSync(fd,token);fs.fsyncSync(fd);const stat=fs.fstatSync(fd,{bigint:true});",
-      "if(!stat.isFile()||stat.nlink!==1n)throw new Error('UNSAFE_ACK')}finally{if(fd!==undefined)fs.closeSync(fd);",
-      'if(dirfd!==undefined)fs.closeSync(dirfd)}',
-    ].join('');
-    return runControl(['exec', '--user', '0', container, 'node', '-e', script, token]);
-  };
+  const acknowledgeDeferredOutput = (token: string) =>
+    runControl(['exec', '--user', '0', container, 'node', '-e', ACKNOWLEDGEMENT_SCRIPT, token]);
   const later = (callback: () => void, delay: number) => {
     const timer = setTimeout(() => { timers.delete(timer); callback(); }, delay);
     timer.unref(); timers.add(timer); return timer;
+  };
+  /**
+   * The wrapper exits as soon as it sees the acknowledgement, and that exit can kill the acknowledging `docker exec`
+   * before it reports success. The exec's status therefore decides nothing: a failed attempt is retried until one
+   * succeeds, the container exits, or a stop ends the invocation. The close handler accepts the output only if the
+   * container exited with the READY status, as the wrapper does after it has seen the acknowledgement; any other
+   * exit status, or a signal to the attached client, fails closed. A container killed from outside cannot be told
+   * apart when its kill status equals the READY status, but its output was already collected in full by then.
+   */
+  const acknowledge = (token: string) => {
+    if (closed || stopReason) return;
+    void acknowledgeDeferredOutput(token).then(success => {
+      if (success || closed || stopReason) return;
+      acknowledgementFailures += 1;
+      later(() => acknowledge(token), ACKNOWLEDGEMENT_RETRY_MS);
+    });
   };
   const terminate = () => {
     if (terminating || closed || !child) return;
@@ -600,18 +629,9 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       return true;
     }
     protocolReady = true;
+    readyStatus = Number(ready[2]);
     const readyToken = ready[1]!;
-    void decodeOutput().then(() => {
-      if (decodedOutput && !stopReason) {
-        void acknowledgeDeferredOutput(readyToken)
-          .then(success => {
-            if (!success) {
-              failureDetail ??= 'Deferred output acknowledgement failed.';
-              stop('capture-failure');
-            }
-          });
-      }
-    });
+    void decodeOutput().then(() => { if (decodedOutput) acknowledge(readyToken); });
     return true;
   };
   const captureStderr = (value: Buffer | string) => {
@@ -732,6 +752,12 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       if (decodePromise) await decodePromise;
       if (!stopReason && profile.deferredOutput && !decodedOutput) {
         stopReason = 'capture-failure'; failureDetail ??= 'Deferred output protocol did not complete.';
+      }
+      if (stopReason === 'timeout' && acknowledgementFailures)
+        failureDetail ??= `Deferred output acknowledgement failed ${acknowledgementFailures} times.`;
+      if (!stopReason && profile.deferredOutput && (signal !== null || exitCode !== readyStatus)) {
+        stopReason = 'capture-failure';
+        failureDetail ??= 'Container exited without taking the deferred output acknowledgement.';
       }
       if (decodedOutput && !stopReason) {
         finalStdout = Buffer.from(decodedOutput.text);

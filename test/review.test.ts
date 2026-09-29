@@ -116,6 +116,11 @@ it('gives a still-stale item a new stale key when it gains an ambiguous change',
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
  view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
  expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(before.key);
+ // P2 re-commits the shared line with CRLF only. Approvals ignore line endings, so the stale state and its key stay the same.
+ const unchanged=item('P1').staleKey;writeFileSync(readme,`${original}Shared note, revised.\r\n`);fixtureGit(config.repository,'commit','-am','P2 line endings');const crlf=fixtureGit(config.repository,'rev-parse','HEAD'),endings=service.store.getSnapshot(config.identity);
+ service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:endings.id},endings.base,crlf,[{sha:crlf,owner:'P2',origin:'owned',sourceSha:null}]);
+ const lf=view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!;view=service.load();const ending=view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!;
+ expect(ending.content).toContain('\r');expect(ending.owners).toEqual(lf.owners);expect(item('P1').staleKey).toBe(unchanged);
  // P3 then edits the same line back to P2's text: the segment keeps its choice key but gains an owner, so the stale state is new.
  const shared=()=>view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!,second={key:item('P1').staleKey,segment:shared()};
  writeFileSync(readme,`${original}Shared note, draft.\n`);fixtureGit(config.repository,'commit','-am','P3 draft');const byP3=fixtureGit(config.repository,'rev-parse','HEAD');

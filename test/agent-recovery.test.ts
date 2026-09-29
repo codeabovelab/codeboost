@@ -161,6 +161,17 @@ describe('recoverLeftovers', () => {
     expect(names()).toContain(agent!.name);
   });
 
+  it('removes a leftover export container with the other transient containers, keeping the storage', async () => {
+    const mine = attempt(A, 'attempt-a'), storageLabels = mine.objects[0]!.labels;
+    const exporter: FakeObject = { kind: 'container', id: id(), name: `codeboost-export-${randomUUID()}`,
+      labels: { ...storageLabels, 'io.codeboost.task-storage': 'export' } };
+    daemon.objects.push(exporter);
+    const report = await recoverLeftovers(A);
+    expect(report.removed.map(resource => resource.name)).toContain(exporter.name);
+    expect(names()).not.toContain(exporter.name);
+    expect(report.storage).toHaveLength(1);
+  });
+
   it('reports objects without a runner label and never removes them', async () => {
     attempt(A, 'attempt-a');
     const legacy: FakeObject[] = [
