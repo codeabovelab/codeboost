@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { GhAlreadyFixedGateway, MAX_BASE_COMMITS, mentionsIssue, type AlreadyFixedInput } from '../github/already-fixed.ts';
+import { DEFAULT_CHECK_DEADLINE_MS, GhAlreadyFixedGateway, MAX_BASE_COMMITS, mentionsIssue, type AlreadyFixedInput } from '../github/already-fixed.ts';
 
 const sha = (n: number) => n.toString(16).padStart(40, '0');
 const repo = 'Owner/Repo';
@@ -107,6 +107,10 @@ describe('the pre-PR already-fixed check', () => {
     }));
     expect(await gh.check(input())).toEqual({ outcome: 'unknown', reason: 'The check did not finish within 1 s.' });
     expect(aborted).toBe(true);
+  });
+  it('defaults to a deadline below the 15-second serving request budget', () => {
+    expect(DEFAULT_CHECK_DEADLINE_MS).toBeLessThan(15_000);
+    expect(new GhAlreadyFixedGateway({ repository: repo }).deadlineMs).toBe(DEFAULT_CHECK_DEADLINE_MS);
   });
   it('passes cancellation through instead of reporting it as unknown', async () => {
     const controller = new AbortController();

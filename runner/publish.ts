@@ -34,6 +34,8 @@ const marker = (openingId: string) => `<!-- codeboost:opening=${openingId} -->`;
 
 export class PullRequestPublisher {
   #store: Store; #checks: AlreadyFixedGateway; #pulls: PullRequestGateway; #pusher: BranchPusher; #config: PublishConfig;
+  /** Tasks with a publish in progress. One publish per task at a time, so an update is never cleared or overtaken while its GitHub calls run. */
+  #inflight = new Set<string>();
   constructor(store: Store, deps: { checks: AlreadyFixedGateway; pulls: PullRequestGateway; pusher: BranchPusher }, config: PublishConfig) {
     this.#store = store; this.#checks = deps.checks; this.#pulls = deps.pulls; this.#pusher = deps.pusher; this.#config = config;
   }
@@ -54,6 +56,15 @@ export class PullRequestPublisher {
    * Order: recover a lost opening; check; push; record the opening; open. A match or an unreadable check opens nothing.
    */
   async publish(identity: PlanIdentity, input: { problems?: readonly string[] } = {}, signal?: AbortSignal): Promise<PublishOutcome> {
+    signal?.throwIfAborted();
+    const key = identityKey(identity);
+    if (this.#inflight.has(key)) throw new GuardRefusal('A pull request is already being published for this task.');
+    this.#inflight.add(key);
+    try { return await this.#publish(identity, input, signal); }
+    finally { this.#inflight.delete(key); }
+  }
+
+  async #publish(identity: PlanIdentity, input: { problems?: readonly string[] }, signal?: AbortSignal): Promise<PublishOutcome> {
     const draft = input.problems !== undefined;
     const recovered = await this.#recover(identity, signal);
     if (recovered) return recovered;

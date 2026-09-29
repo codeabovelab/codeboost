@@ -283,6 +283,38 @@ describe('recovering a lost opening', () => {
     expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
   });
+  it('does not push when a review note is added while the earlier PR is looked up', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    const again = harness(store, { live, next, onFind: () => {
+      store.addReviewNote(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'P1', 'question', 'Why this file?');
+    } });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(again.log.some(line => line.startsWith('push'))).toBe(false);
+  });
+  it('runs one publish per task at a time', async () => {
+    const store = runningTask();
+    let release!: () => void;
+    const pushed = new Promise<void>(resolve => { release = resolve; });
+    const { publisher } = harness(store, { push: () => pushed });
+    const first = publisher.publish(identity);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    await expect(publisher.publish(identity)).rejects.toThrow(/already being published/);
+    release();
+    expect(await first).toMatchObject({ kind: 'opened', status: 'in review' });
+    // The guard is released afterwards.
+    await expect(publisher.publish(identity)).rejects.toThrow(/while the task is in review/);
+  });
+  it('changes nothing when the signal is already aborted', async () => {
+    const store = runningTask({ head: oid(1) });
+    const controller = new AbortController(); controller.abort();
+    const { publisher, log } = harness(store);
+    await expect(publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
+    expect(log).toEqual([]);
+    expect(store.getTask(identity).status).toBe('running');
+  });
   it('opens a new PR when the earlier draft was closed, and still excludes the old draft from the check', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');

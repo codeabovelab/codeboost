@@ -33,7 +33,7 @@ export interface TaskPullRequest {
   /** An update of this open PR that started and has not been confirmed; the PR may already show it. */
   refresh: { head: string; draft: boolean; stateVersion: number } | null;
 }
-export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; checkedAt: string }
+export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; reviewVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
 export interface MergeAttempt {
   id: string; kind: 'queue' | 'direct'; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
@@ -888,7 +888,7 @@ export class Store {
       CREATE TABLE IF NOT EXISTS already_fixed_checks (
         id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), snapshot_id TEXT NOT NULL,
         outcome TEXT NOT NULL CHECK (outcome IN ('clear','found','unknown')), result TEXT NOT NULL,
-        state_version INTEGER NOT NULL, checked_at TEXT NOT NULL);
+        state_version INTEGER NOT NULL, review_version INTEGER NOT NULL, checked_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_pull_requests (
         opening_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), repository TEXT NOT NULL, base TEXT NOT NULL,
         head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL, owner_version INTEGER NOT NULL,
@@ -917,7 +917,7 @@ export class Store {
   latestAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
     const key = identityKey(identity); this.#task(key);
     const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? ORDER BY rowid DESC LIMIT 1', key);
-    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, checkedAt: row.checked_at as string } : null;
+    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   /** Publishing runs after the task's last attempt settled, while the task is running, or in needs human for a draft PR. */
   #assertPublishable(key: string, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
@@ -940,9 +940,11 @@ export class Store {
       if (input.result.outcome !== 'clear' && !input.draft) this.#run("UPDATE tasks SET status='possibly already fixed' WHERE plan_key=?", key);
       this.#touch(key);
       const id = randomUUID(), checkedAt = new Date().toISOString(), stateVersion = this.#task(key).state_version as number;
-      this.#run('INSERT INTO already_fixed_checks (id,plan_key,snapshot_id,outcome,result,state_version,checked_at) VALUES (?,?,?,?,?,?,?)',
-        id, key, input.snapshotId, input.result.outcome, encode(input.result), stateVersion, checkedAt);
-      return { id, snapshotId: input.snapshotId, result: input.result, stateVersion, checkedAt };
+      // Review input (approvals, choices, notes) advances review_version without touching the task; bind the check to both.
+      const reviewVersion = this.#current(key).review_version as number;
+      this.#run('INSERT INTO already_fixed_checks (id,plan_key,snapshot_id,outcome,result,state_version,review_version,checked_at) VALUES (?,?,?,?,?,?,?,?)',
+        id, key, input.snapshotId, input.result.outcome, encode(input.result), stateVersion, reviewVersion, checkedAt);
+      return { id, snapshotId: input.snapshotId, result: input.result, stateVersion, reviewVersion, checkedAt };
     });
   }
   /**
@@ -996,6 +998,7 @@ export class Store {
     const key = identityKey(identity), task = this.#task(key), check = this.latestAlreadyFixed(identity);
     if (!check || check.id !== input.checkId || check.result.outcome !== 'clear') throw new GuardRefusal('A clear already-fixed check must come right before opening a pull request.');
     this.#assertPublishable(key, task, check.stateVersion, input.draft);
+    if (this.#current(key).review_version !== check.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
     const snapshot = this.getSnapshot(identity);
     if (snapshot.id !== check.snapshotId || snapshot.head !== input.headSha) throw new GuardRefusal('The task head changed after the check.');
   }

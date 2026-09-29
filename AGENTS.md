@@ -70,6 +70,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - When a relation can be added and removed (a manually linked PR, a label, an assignment), replay its add and remove events in order and count only its latest state. An add event alone does not prove the relation still holds.
 - After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
 - Check an operation's source-state preconditions before any shortcut or early return that writes state or reports success, not only on the main path.
+- Honour a cancellation signal that is already aborted before the first durable write, not only after awaits: a path with no await otherwise writes after the caller cancelled.
 - Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
 - Budget a multi-stage validation across all sequential stages; giving each stage the full request allowance does not create an overall deadline.
 - Preserve the distinction between an explicit unbound identity and missing or malformed authorization metadata. Missing or malformed identities must fail closed.

@@ -42,20 +42,20 @@ A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue U
 - a closed issue with no close event;
 - a linked item that is missing, of an unknown type, or in a malformed response;
 - a GitHub error or invalid JSON;
-- the whole check running past its single deadline (45 seconds by default). Reaching the deadline stops the running `gh` call.
+- the whole check running past its single deadline (12 seconds by default, below the 15-second request budget). Reaching the deadline stops the running `gh` call.
 
 A cancelled check throws. It does not return `unknown`.
 
 ## Publishing
 
-Publish runs these steps in order:
+Only one publish runs per task at a time; a second one is refused. A publish whose signal is already aborted changes nothing. Publish runs these steps in order:
 
 1. **Recover.** If an opening is still `opening`, look for an open PR from the task branch whose description has its marker. If one exists, record it as opened. If none exists, the request may still be in flight or not yet visible. So publish stops with `OpeningUnsettled` until the opening is 10 minutes old (`settleMs`). After that, it marks the opening `abandoned` and continues.
 2. **Status and no changes.** Refuse unless the task is running (or in needs human, for a draft). If the task head is its base, open nothing. A running task moves to needs human.
 3. **Check.** Run the check. Record the result, and any status change, in one transaction. That transaction refuses if the task changed during the check.
 4. **Find the earlier PR.** If the task has an opened PR on the same branch, ask GitHub whether it is still open.
 5. **Push.** Re-read the task as in step 6, then push the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
-6. **Re-read.** Right before the GitHub call, the Store confirms that the latest check is clear and that the task is unchanged since that check: same state version, same snapshot, same head.
+6. **Re-read.** Right before the GitHub call, the Store confirms that the latest check is clear and that nothing changed since that check: same task state version, same review version (approvals, choices and notes), same snapshot, same head.
 7. **Open or reuse.** Open a new PR, or update the open earlier PR and mark it ready (or a draft). An update is recorded before it starts. If its confirmation is lost, the next publish drops the record in step 1 and repeats the update after a new check; the update is idempotent. Record the result.
 
 Each opening or refresh owns the task state version at the moment it passed step 6. The PR is always recorded. The status changes only when the task still has that version. Every status change, admission and context change increases the version. So a response that arrives after the task changed never moves it.

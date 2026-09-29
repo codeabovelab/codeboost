@@ -33,8 +33,8 @@ export interface AlreadyFixedGateway { check(input: AlreadyFixedInput, signal?: 
 
 export const MAX_TIMELINE_ITEMS = 100;
 export const MAX_BASE_COMMITS = 250;
-/** One deadline for the whole check, below the default serving request budget. Each `gh` call no longer gets its own. */
-export const DEFAULT_CHECK_DEADLINE_MS = 45_000;
+/** One deadline for the whole check, below the 15-second serving request budget (`web/server.ts`). */
+export const DEFAULT_CHECK_DEADLINE_MS = 12_000;
 const PAGE = 100;
 
 const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
