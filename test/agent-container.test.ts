@@ -1247,6 +1247,16 @@ describe('real Docker agent isolation', () => {
       await expect(inspect()).rejects.toThrow(/is not a name the manifest can carry/);
     }, 180_000);
 
+    it('reads an empty attribute value in base\'s rules', async () => {
+      const data = fixture({ hostile: source => {
+        writeFileSync(join(source, '.gitattributes'), '* filter=\n'); writeFileSync(join(source, 'z.txt'), 'z\n');
+      } });
+      // The edited file sorts last, so its empty value is the last field Git prints.
+      asAgent(data.filesystems, 'printf "edited\\n" > z.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      expect(manifest.changes.map(change => change.path)).toEqual(['z.txt']);
+    }, 180_000);
+
     it('lets through a warning that runs over two lines', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '!foo text\n') });
       asAgent(data.filesystems, 'printf "edited\\n" > file.txt');

@@ -483,8 +483,11 @@ my %as_checked_out;
   if (@differ) {
     open(my $list, ">", "/tmp/attr-paths") or fail(4, "could not write the paths to check: $!");
     print $list map { "$_\0" } @differ; close $list or fail(4, "could not write the paths to check: $!");
+    # An attribute's value can be empty ("filter="), so empty fields are kept; only the final terminator's is dropped.
     my @fields = split /\0/, git_in_mirror("/tmp/attr-paths", "check-attr", "-z", "--stdin",
-      "text", "eol", "crlf", "ident", "working-tree-encoding", "filter");
+      "text", "eol", "crlf", "ident", "working-tree-encoding", "filter"), -1;
+    pop @fields if @fields && $fields[-1] eq "";
+    fail(4, "git check-attr returned an incomplete answer") if @fields % 3;
     while (@fields) { my ($path, $attr, $value) = splice @fields, 0, 3; $converts{$path} = 1 if $value ne "unspecified" }
     # Repository config can convert line endings for every file, with no attribute at all.
     my $pid = open(my $out, "-|", @GIT, "config", "--get-regexp", "^core\\.(autocrlf|eol)\$") or fail(4, "could not run git: $!");
