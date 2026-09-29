@@ -172,6 +172,17 @@ describe('stops and settlement', () => {
     expect(cleaned()).toBe(1);
     expect(store.getAttempt(A, attempt.id).state).toBe('cancelled');
   });
+  it('fails with the preparation error and removes preparation files when preparation fails', async () => {
+    const { store, runner, launches, preparations, cleaned } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    preparations[0]!.reject(new Error('clone failed'));
+    await runner.settled(A);
+    expect(launches).toHaveLength(0);
+    expect(cleaned()).toBe(1);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Preparation failed: clone failed' });
+    expect(() => runner.start(B, request(store, B))).not.toThrow();
+  });
   it('fails with the launch error when D start throws and no stop is recorded', async () => {
     const { store, runner, preparations, failStart } = setup();
     failStart(new Error('docker unavailable'));
@@ -228,6 +239,8 @@ describe('storage failures', () => {
     launches[0]!.settle({ exitCode: null, stopReason: 'capture-failure' });
     await until(() => !runner.isActive(A), 'settlement');
     expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'start-not-saved' });
+    expect(store.getAttempt(A, attempt.id).state).toBe('pending');
+    expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
   });
   it('still cancels and awaits the handle when reading the refused attempt fails', async () => {
     const { store, runner, launches, preparations } = setup();
@@ -314,6 +327,18 @@ describe('review regressions', () => {
     expect(launches).toHaveLength(0);
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: null });
     expect(store.getTask(A).status).not.toBe('needs human');
+  });
+  it('shows the cancel task stop after a preparation timeout, and closes the task', async () => {
+    const { store, runner, preparations } = setup({ prepareIgnoresAbort: true });
+    const attempt = runner.start(A, request(store, A, { deadline: Date.now() + 30 }));
+    await until(() => preparations.length === 1, 'preparation');
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'cancelled', saved: true });
+    preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+    expect(store.getTask(A).status).toBe('cancelled');
   });
   it('refuses a stop once the terminal write is done and only cleanup remains', async () => {
     const { store, runner, launches, preparations, deps } = setup();

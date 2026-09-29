@@ -123,7 +123,11 @@ export class RunnerCoordinator {
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
     const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
     const job = this.#jobs.get(identityKey(identity));
-    if (outcome === 'stopping' && job) this.#requestStop(job, 'cancelled');
+    if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason && !job.ended) {
+      // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout);
+      // keep the job's reason in step with it so status shows the stop.
+      job.firstReason = 'cancelled'; job.reasonSaved = true;
+    }
     return outcome;
   }
   isActive(identity: PlanIdentity): boolean { return this.#jobs.has(identityKey(identity)); }
