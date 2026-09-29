@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { lstatSync, opendirSync, readlinkSync } from 'node:fs';
-import { dirname, isAbsolute, join, relative } from 'node:path';
+import { lstatSync, opendirSync, readdirSync, readlinkSync } from 'node:fs';
+import { basename, dirname, isAbsolute, join, relative } from 'node:path';
 import type { TaskClone } from '../contract.ts';
 import { assertTaskClone } from '../../git/clone.ts';
 import { assertBuiltAgentImage } from './image.ts';
@@ -240,6 +240,11 @@ const MAXIMUM_LINK_HOPS = 40;
  * once the agent made them directories, and every part after them that does exist is still checked: a `..` can climb
  * back to a real link. An absolute target is refused, so a target the host lacks cannot hide an escape.
  */
+// Whether the directory holding `path` has an entry named exactly as `path` spells it, byte for byte.
+const exactName = (path: string) => {
+  try { return readdirSync(dirname(path), { encoding: 'buffer' }).some(name => name.equals(Buffer.from(basename(path)))); }
+  catch { return false; }
+};
 const linkStaysInside = (staging: string, link: string) => {
   let current = dirname(link), hops = 0;
   const components = readlinkSync(link).split('/');
@@ -256,6 +261,9 @@ const linkStaysInside = (staging: string, link: string) => {
     let stat: ReturnType<typeof lstatSync> | undefined;
     try { stat = lstatSync(current, { throwIfNoEntry: false }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOTDIR') throw error; }
+    // A host file system that ignores case or Unicode normalization (macOS) finds "D" where only "d" exists; the
+    // container's does not, so a part counts only when its directory holds exactly that name.
+    if (stat && !exactName(current)) stat = undefined;
     if (!stat?.isSymbolicLink()) continue;
     if (++hops > MAXIMUM_LINK_HOPS) return true;
     const target = readlinkSync(current);

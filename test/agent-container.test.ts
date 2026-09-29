@@ -187,6 +187,12 @@ describe('real Docker agent isolation', () => {
       symlinkSync('../..', join(source, 'deep', 'er', 'top'));
       symlinkSync('deep/er/top/../run/codeboost-auth/codex/auth.json', join(source, 'chained'));
     }],
+    // "D" is missing in the container, where names are exact; a host that ignores case (macOS) finds the link "d"
+    // there. Once the agent creates D, the ".." after it climbs out of the checkout.
+    ['a link through a name that only matches another in a different case', (source: string) => {
+      mkdirSync(join(source, 'x', 'y'), { recursive: true }); writeFileSync(join(source, 'x', 'y', 'k'), '');
+      symlinkSync('x/y', join(source, 'd')); symlinkSync('D/../../etc/hostname', join(source, 'a'));
+    }],
     // Behind a part that is missing, or under a file: once the agent makes it a directory, the ".." climbs back to
     // d/esc, which leads to the checkout's parent.
     ...(['m/../d/esc/../etc/hostname', 'f/x/../../d/esc/../etc/hostname'] as const).map(target => [
