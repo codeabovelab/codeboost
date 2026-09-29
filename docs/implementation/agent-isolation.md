@@ -68,9 +68,10 @@ Use only these entry points to run an agent:
    if not, it removes what it made and refuses. Cleanup removes an object by the ID captured at its create, even if
    its labels are wrong; an object found only by name (including task storage) must carry all three owner labels. Call
    `removeTaskFilesystems` when the task ends. It refuses a repository that has a
-   symbolic link with an absolute target or a target outside the checkout, before it
-   creates any storage. Report this to the user as a repository the agent cannot run
-   on; do not retry it.
+   symbolic link with an absolute target or one that can lead outside the checkout (resolved in the container as its
+   kernel would, even once the agent creates a missing directory on the way), or any link in its Git metadata; the
+   seeder checks this and the allocation removes what it made, then throws an `UnusableRepositoryError`. Report
+   this to the user as a repository the agent cannot run on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
 4. `startCodexInvocation` or `startClaudeInvocation` returns a handle at once and runs
@@ -80,17 +81,48 @@ Use only these entry points to run an agent:
    call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
    credential only as the function argument.
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before
-   `removeTaskFilesystems`. `base` is the full ID of the last commit codeboost made in that storage. It returns at
-   most 1 MiB of diff (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
+   `removeTaskFilesystems`. `base` is the full ID of the commit the storage was seeded from (the clone's head). For a
+   recovery handle, also pass the `metadataBaseline` you recorded (step 6). It returns at most 1 MiB of diff
+   (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
    A changed file over 8 MiB, an untracked nested repository, a path Git will not add, an entry named `.git`, a fifo
    or socket, an ignored untracked path, a submodule directory with content, and a changed file whose `ident` or
    `working-tree-encoding` attribute changes what the diff shows each appear as a `codeboost:` notice line. When Git
    fails, the error carries Git's last two error lines.
-6. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
+6. To audit what a writable attempt changed (#66, `agents/container/changes.ts`):
+   - **Record the baseline.** The storage value carries `metadataBaseline`, a digest of the metadata volume that the
+     seeder takes as its last step. Record it with the allocation. `snapshotDeclaredLinks`, `inspectTaskChanges` and
+     `exportTaskDiff` each check the metadata against it before running any Git command, and need it back
+     (`metadataBaseline`) for a recovery handle.
+   - **Before launch**, call `snapshotDeclaredLinks(storage, paths, { imageId })` with the item's declared paths.
+     For each declared symlink it records where it resolves, one part at a time as the kernel would, and the state of
+     the target and everything beneath it. A link on the way, a target that is a link, or a link inside a directory
+     target shows as `through-link`. Do not launch an item with a `through-link` declared link: a write through it
+     lands somewhere its target does not cover. Keep the result.
+   - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
+     change manifest: every difference between the work tree and `base`, read without following links, with content
+     IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
+     directory that `base`'s own ignore rules ignore, with no tracked entry beneath it, is one entry (`ignored: true`). It also returns `agentCommits`,
+     `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`. If the metadata changed, no Git
+     command runs: the manifest has `metadataChanged: true` and every other list empty.
+   - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
+     failed. Route it to needs human, as for link target changes and nested gitlink content.
+   - **Refusals.** It refuses, and never returns part of the answer, when:
+     - there are more than 10,000 changes (a populated submodule counts as one);
+     - a name or link target it reports is longer than 1,024 bytes, is not strict UTF-8, or holds a Unicode control,
+       format, line or paragraph separator, or unassigned character (unchanged names are never checked);
+     - the recorded targets hold more than 20,000 entries;
+     - it cannot read something;
+     - `base` is not a commit in the storage, or Git fails;
+     - for a snapshot, the metadata changed since seeding (an export refuses then too).
+
+     Treat a refusal as needs human.
+   - **Both calls** run in a read-only container with no network, take `signal`, `onProcessGroup` and `timeoutMs`
+     (default 120 s), and settle only after their container is gone.
+7. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
-   token. It removes agent containers, egress proxies, seeders, export containers and networks, and resolves once they are gone. It keeps
-   task storage whole (both volumes and the keeper) and returns one recovery handle per allocation, carrying its
-   attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
+   token. It removes agent containers, egress proxies, seeders, export and inspection containers and networks, and
+   resolves once they are gone. It keeps task storage whole (both volumes and the keeper) and returns one recovery
+   handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
    a runner label (from older builds), objects of this runner that D does not create, and storage whose parts
    disagree are listed in `unowned` and never touched. An object counts as D's only with exactly one kind label,
