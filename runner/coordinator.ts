@@ -50,6 +50,8 @@ interface Job {
    * the terminal write is done. A later stop has nothing left to change.
    */
   decided?: boolean;
+  /** A cancel task the Store recorded on a job that no longer takes stops; shown in status only. */
+  cancelShown?: boolean;
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: 'result-not-saved' | 'start-not-saved' }
@@ -138,13 +140,13 @@ export class RunnerCoordinator {
     }
     const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
     if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason) {
-      // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout);
-      // keep the job's reason in step with it so status shows the stop.
-      job.firstReason = 'cancelled'; job.reasonSaved = true;
-      // It mirrors a write that may roll back with the caller's transaction; if it did, the job had no reason after all.
+      // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout).
+      // Status shows it, but it never becomes the job's reason: the write may roll back with the caller's transaction,
+      // and the terminal write reads the row's own reason anyway.
+      job.cancelShown = true;
       queueMicrotask(() => {
-        try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== 'cancelled' && job.firstReason === 'cancelled') job.firstReason = null; }
-        catch { /* unreadable: keep the Store's reported outcome */ }
+        try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== 'cancelled') job.cancelShown = false; }
+        catch { /* unreadable: keep showing what the Store reported */ }
       });
     }
     return outcome;
@@ -154,7 +156,8 @@ export class RunnerCoordinator {
     const key = identityKey(identity), job = this.#jobs.get(key), marker = this.#markers.get(key);
     return {
       active: !!job,
-      stopRequested: job?.firstReason ? { attemptId: job.attemptId, reason: job.firstReason, saved: job.reasonSaved } : null,
+      stopRequested: job?.firstReason ? { attemptId: job.attemptId, reason: job.firstReason, saved: job.reasonSaved }
+        : job?.cancelShown ? { attemptId: job.attemptId, reason: 'cancelled', saved: true } : null,
       unresolved: marker ? { attemptId: marker.attemptId, reason: marker.reason } : null,
     };
   }

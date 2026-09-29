@@ -450,6 +450,42 @@ describe('review regressions', () => {
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Launch failed: untrusted image' });
     expect(store.getTask(A).status).toBe('running');
   });
+  it('keeps the launch failure when a rolled-back cancel task lands just before the terminal write', async () => {
+    for (let k = 0; k <= 5; k++) {
+      const { store, runner, preparations, deps, failStart } = setup();
+      let finish!: () => void, cleanupStarted = false;
+      deps.cleanupPreparation = () => { cleanupStarted = true; return new Promise<void>(resolve => { finish = resolve; }); };
+      failStart(new Error('untrusted image'));
+      const attempt = runner.start(A, request(store, A));
+      await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+      await until(() => cleanupStarted, 'cleanup');
+      finish();
+      for (let i = 0; i < k; i++) await Promise.resolve();
+      if (runner.isActive(A)) {
+        expect(() => store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+          runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID());
+          throw new Error('commit failed');
+        })).toThrow(/commit failed/);
+      }
+      await runner.settled(A);
+      expect(store.getAttempt(A, attempt.id), `after ${k} microtasks`).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Launch failed: untrusted image' });
+    }
+  });
+  it('still closes the task with a committed cancel task after a launch failure', async () => {
+    const { store, runner, preparations, deps, failStart } = setup();
+    let finish!: () => void, cleanupStarted = false;
+    deps.cleanupPreparation = () => { cleanupStarted = true; return new Promise<void>(resolve => { finish = resolve; }); };
+    failStart(new Error('untrusted image'));
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => cleanupStarted, 'cleanup');
+    expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'cancelled', saved: true });
+    finish();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+    expect(store.getTask(A).status).toBe('cancelled');
+  });
   it('refuses a stop once the terminal write is done and only cleanup remains', async () => {
     const { store, runner, launches, preparations, deps } = setup();
     let finish!: () => void, cleanupStarted = false;
