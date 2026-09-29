@@ -758,6 +758,7 @@ describe('real Docker agent isolation', () => {
       'printf "!ignored text\\n" >> .gitattributes', 'mkdir -p tools', 'printf "*.log\\n" > tools/gitignore',
       'ln -s tools/gitignore .gitignore',
       'printf "enc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes', 'printf "plain\\n" > enc.txt',
+      'printf "dash content\\n" > ./-', 'printf "after dash\\n" > z-after.txt',
       // A nested repository whose name tries to forge a hunk for another file.
       'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
       extra].join('\n'));
@@ -780,9 +781,13 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('b/binary.dat');
     expect(text).toContain('GIT binary patch');
     expect(text).toContain('untracked directory nested/ is a nested repository');
-    // A symlink is named with its target, not followed or mistaken for a nested repository.
-    expect(text).toContain('codeboost: untracked symlink dir-link -> linked-dir');
+    // A symlink is diffed as the link it is, not followed or mistaken for a nested repository.
+    expect(text).toContain('b/dir-link');
+    expect(text).toContain('new file mode 120000');
     expect(text).not.toContain('dir-link is a nested repository');
+    // A file named "-" is a name, not standard input, and the files after it are still exported.
+    expect(text).toContain('+dash content');
+    expect(text).toContain('+after dash');
     // The hostile name stays on one quoted line: no forged hunk line appears.
     expect(text).not.toMatch(/^\+forged$/m);
     expect(text).toMatch(/untracked directory \$'evil\\n.*is a nested repository/);

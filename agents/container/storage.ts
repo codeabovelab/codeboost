@@ -519,11 +519,11 @@ export interface ExportOptions extends PreparationOptions {
   /** Overall deadline for the Docker work, cleanup excluded. Default 60 s. */
   readonly timeoutMs?: number;
 }
-// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff --binary`
+// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: one `git diff --binary`
 // compares `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every
-// commit) and never refreshes the index (GIT_OPTIONAL_LOCKS=0); each new untracked file is diffed against /dev/null.
-// An untracked symlink or nested repository, which that cannot represent, is named in a notice line instead, quoted so
-// an agent-chosen name cannot forge diff lines. Output stops at
+// commit), with new untracked files added as intent-to-add entries to a private copy of the index in /tmp, and never
+// refreshes the real index (GIT_OPTIONAL_LOCKS=0). An untracked nested repository, which Git cannot diff, is named in a
+// notice line instead, quoted so an agent-chosen name cannot forge diff lines. Output stops at
 // `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
 // Every stage's status is checked: a Git failure fails the export instead of passing off partial output as the diff;
 // only SIGPIPE (141) from the producer is expected, when `head` stops reading at the limit. A Git warning that it could
@@ -561,23 +561,24 @@ const EXPORT_SCRIPT = [
   'done < <(g ls-files -z --deleted)',
   'produce() {',
   '  set -eo pipefail',
-  '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" --',
-  '  g ls-files -z --others --exclude-standard | while IFS= read -r -d "" path; do',
-  '    # git diff --no-index follows a symlink (into a directory it cannot diff, or to another file\'s content), so a',
-  '    # symlink is named with its target instead. %q keeps agent-chosen names on one line.',
-  '    if [ -L "$path" ]; then',
-  '      printf "codeboost: untracked symlink %q -> %q\\n" "$path" "$(readlink -- "$path")"',
-  '      continue',
-  '    fi',
-  '    if [ -d "$path" ]; then',
+  '  # New untracked files join a private copy of the index as intent-to-add entries, so one `git diff <base>` shows',
+  '  # them with tracked changes, in a single Git process however many there are. Paths are literal pathspecs, so a',
+  '  # name such as "-" or "*" is just a name. Anything Git writes goes to /tmp, never to either volume. An untracked',
+  '  # nested repository cannot be diffed and is named in a notice instead; %q keeps its agent-chosen name on one line.',
+  '  cp .git/index /tmp/export-index',
+  '  mkdir -p /tmp/export-objects',
+  '  export GIT_INDEX_FILE=/tmp/export-index GIT_OBJECT_DIRECTORY=/tmp/export-objects',
+  '  export GIT_ALTERNATE_OBJECT_DIRECTORIES=/work/.git/objects GIT_LITERAL_PATHSPECS=1',
+  '  : > /tmp/export-new',
+  '  while IFS= read -r -d "" path; do',
+  '    if [ -d "$path" ] && [ ! -L "$path" ]; then',
   '      printf "codeboost: untracked directory %q is a nested repository; its contents are not exported\\n" "$path"',
-  '      continue',
+  '    else',
+  '      printf "%s\\0" "$path" >> /tmp/export-new',
   '    fi',
-  '    status=0',
-  '    g diff --binary --no-color --no-ext-diff --no-textconv --no-index -- /dev/null "$path" || status=$?',
-  '    # 0: no difference, 1: difference shown; anything else is a failure.',
-  '    [ "$status" -le 1 ] || exit "$status"',
-  '  done',
+  '  done < <(g ls-files -z --others --exclude-standard)',
+  '  if [ -s /tmp/export-new ]; then g add --intent-to-add --pathspec-from-file=/tmp/export-new --pathspec-file-nul; fi',
+  '  g diff --binary --no-color --no-ext-diff --no-textconv "$base" --',
   '}',
   'set +e',
   '# Git only warns about a directory or path it cannot read, then diffs it as absent: untracked files vanish and tracked',
@@ -621,7 +622,7 @@ function* exportSteps(workVolume: string, metadataVolume: string, owner: Resourc
     const args = ['run', '--rm', '--name', name, '--label', 'io.codeboost.task-storage=export', ...ownerLabelArgs(owner),
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=256m', '--cpus=.5',
-      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=16m',
+      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
       '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
       '--entrypoint', 'bash', options.imageId, '-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1)];
