@@ -829,6 +829,21 @@ describe('real Docker agent isolation', () => {
       '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');
   }, 120_000);
 
+  it('names files over 8 MiB instead of diffing them, so one large file cannot exhaust memory or the deadline', async () => {
+    const data = fixture({ limits: { workBytes: 96 * 1024 * 1024, workInodes: 512, metadataBytes: 64 * 1024 * 1024,
+      metadataInodes: 512 } });
+    agentChanges(data.filesystems, ['head -c 9437184 /dev/urandom > tracked-big.bin', 'g add tracked-big.bin',
+      'g commit -qm big', 'head -c 1000 /dev/urandom >> tracked-big.bin', 'head -c 20971520 /dev/urandom > new-big.bin',
+      'printf "small\\n" > small.txt'].join(' && '));
+    const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+    const text = exported.diff.toString('utf8');
+    expect(text).toContain('codeboost: tracked-big.bin changed but is over 8 MiB; its content is not exported');
+    expect(text).toContain('codeboost: new-big.bin changed but is over 8 MiB; its content is not exported');
+    expect(text).not.toContain('diff --git a/tracked-big.bin');
+    expect(text).not.toContain('diff --git a/new-big.bin');
+    expect(text).toContain('+small');
+  }, 180_000);
+
   it('marks the export truncated when there are more untracked files than it adds', async () => {
     const data = fixture();
     // Past 20,000 untracked files the export stops adding them; their diffs alone already pass the 1 MiB limit.
