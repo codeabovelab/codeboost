@@ -206,6 +206,47 @@ describe('storage failures', () => {
     await until(() => !runner.isActive(A), 'settlement');
     expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'start-not-saved' });
   });
+  it('still cancels and awaits the handle when reading the refused attempt fails', async () => {
+    const { store, runner, launches, preparations } = setup();
+    vi.spyOn(store, 'markRunning').mockImplementation(() => {
+      vi.spyOn(store, 'getAttempt').mockImplementation(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+      return false;
+    });
+    runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    expect(launches[0]!.cancels).toEqual(['cancelled']);
+    for (let i = 0; i < 20; i++) await tick();
+    expect(runner.isActive(A)).toBe(true);
+    vi.mocked(store.getAttempt).mockRestore();
+    launches[0]!.settle({ exitCode: null, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(runner.isActive(A)).toBe(false);
+  });
+  it('ends the attempt instead of stranding it when the task budget cannot be read at admission', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const req = request(store, A);
+    vi.spyOn(store, 'getTask').mockImplementationOnce(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    const attempt = runner.start(A, req);
+    await runner.settled(A);
+    expect(preparations).toHaveLength(0);
+    expect(launches).toHaveLength(0);
+    expect(runner.isActive(A)).toBe(false);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Could not arm the task time limit: disk' });
+  });
+  it('refuses all new work after D settles with unreleased resources', async () => {
+    const { store, runner, launches, preparations } = setup({ limits: { writable: 1, readOnly: 1 } });
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle({ exitCode: null, stopReason: 'capture-failure', unreleased: [{ kind: 'container', name: 'agent-x' }] });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id).state).toBe('failed');
+    expect(runner.unreleased).toEqual([{ kind: 'container', name: 'agent-x' }]);
+    expect(() => runner.start(B, request(store, B))).toThrow(/Needs restart/);
+    expect(() => runner.start(B, request(store, B, { kind: 'planning', item: null }))).toThrow(/Needs restart/);
+  });
 });
 
 describe('cancel task, limits and shutdown', () => {

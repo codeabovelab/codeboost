@@ -1,5 +1,5 @@
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
-import { captureInvocation, type InvocationHandle, type InvocationInput, type InvocationResult, type StopReason, type TaskClone } from '../agents/contract.ts';
+import { captureInvocation, type InvocationHandle, type InvocationInput, type InvocationResult, type StopReason, type TaskClone, type UnreleasedResource } from '../agents/contract.ts';
 import type { AttemptRecord, Store } from './store.ts';
 import { ATTEMPT_PHASES, GuardRefusal, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason } from './lifecycle.ts';
 
@@ -58,11 +58,15 @@ export class RunnerCoordinator {
   #store: Store; #deps: RunnerDeps; #limits: SlotLimits;
   #jobs = new Map<string, Job>(); #markers = new Map<string, Marker>();
   #closing = false;
+  /** Set once D settles with `unreleased`: no new work until a restart's recovery confirms their removal. */
+  #unreleased: UnreleasedResource[] | null = null;
   constructor(store: Store, deps: RunnerDeps, limits: SlotLimits = { writable: 1, readOnly: 1 }) {
     if (![limits.writable, limits.readOnly].every(n => Number.isSafeInteger(n) && n >= 1)) throw new Error('Slot limits must be positive integers.');
     this.#store = store; this.#deps = deps; this.#limits = limits;
   }
   get closing(): boolean { return this.#closing; }
+  /** Resources D could not confirm removed; non-null keeps the runner closed to new work until restart. */
+  get unreleased(): readonly UnreleasedResource[] | null { return this.#unreleased; }
   #now(): number { return this.#deps.now?.() ?? Date.now(); }
   #used(group: Group): number {
     let used = 0;
@@ -76,6 +80,7 @@ export class RunnerCoordinator {
    */
   start(identity: PlanIdentity, request: StartRequest): AttemptRecord {
     if (this.#closing) throw new GuardRefusal('The runner is shutting down.');
+    if (this.#unreleased) throw new GuardRefusal('Needs restart: an agent\'s cleanup could not be confirmed, so its containers or files may remain.');
     const key = identityKey(identity);
     if (this.#jobs.has(key)) throw new GuardRefusal('An attempt is already active for this task.');
     const marker = this.#markers.get(key);
@@ -89,7 +94,6 @@ export class RunnerCoordinator {
     try { attempt = this.#store.admitAttempt(identity, { ...request, now: this.#now() }); }
     catch (error) { this.#jobs.delete(key); throw error; }
     job.attemptId = attempt.id; job.attempt = attempt;
-    this.#arm(job, attempt);
     job.done = this.#run(job, attempt).catch(error => this.#unexpected(job, error));
     return attempt;
   }
@@ -163,6 +167,9 @@ export class RunnerCoordinator {
   }
   async #run(job: Job, attempt: AttemptRecord): Promise<void> {
     try {
+      // Armed before the first await, so still in admission's turn. A failed read ends the attempt before preparation.
+      try { this.#arm(job, attempt); }
+      catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Could not arm the task time limit: ${message(error)}` }); }
       let prepared: PreparedAttempt;
       try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
       catch (error) { return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error)); }
@@ -186,17 +193,21 @@ export class RunnerCoordinator {
       if (running === undefined) {
         // A storage error, not a stop: keep ownership until D settles, then hold the slot under a marker.
         handle.cancel('capture-failure');
-        await handle.settled.catch(() => undefined);
+        const result = await handle.settled.catch(() => undefined);
+        if (result) this.#noteUnreleased(result);
         this.#markers.set(job.key, { group: job.group, attemptId: attempt.id, reason: 'start-not-saved' });
         return;
       }
       if (!running) {
         // Refused because a first reason is now recorded: a normal stop.
-        const durable = this.#store.getAttempt(job.identity, attempt.id).firstReason;
+        // A read failure must not strand the live handle: fall back to the in-memory reason and still await D.
+        let durable: FirstReason | null = null;
+        try { durable = this.#store.getAttempt(job.identity, attempt.id).firstReason; } catch { /* keep the in-memory reason */ }
         if (durable && !job.firstReason) job.firstReason = durable;
         handle.cancel(D_REASON[job.firstReason ?? 'cancelled']);
       } else if (job.firstReason) handle.cancel(D_REASON[job.firstReason]);
       const result = await handle.settled;
+      this.#noteUnreleased(result);
       let valid = false, value: unknown, detail = result.stderr ? bounded(result.stderr) : undefined;
       if (!job.firstReason && result.exitCode === 0 && !result.stopReason) {
         try { value = this.#deps.validate(attempt, result); valid = true; }
@@ -207,6 +218,12 @@ export class RunnerCoordinator {
       for (const timer of job.timers) clearTimeout(timer);
       if (this.#jobs.get(job.key) === job) this.#jobs.delete(job.key);
     }
+  }
+  /** D gave up on cleanup (presence, not length, is the signal): fail closed until restart, as Ask does. */
+  #noteUnreleased(result: InvocationResult): void {
+    if (result.unreleased === undefined) return;
+    this.#unreleased = [...(this.#unreleased ?? []), ...result.unreleased];
+    console.error(`Runner job ${result.attemptId} left resources whose removal was not confirmed; new work is refused until restart.`);
   }
   #preparationDetail(job: Job, error?: unknown): { stopReason?: StopReason; detail?: string } {
     if (job.preparationTimedOut && !job.firstReason) return { stopReason: 'timeout', detail: 'Timed out while preparing.' };
