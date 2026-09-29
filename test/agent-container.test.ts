@@ -1350,6 +1350,17 @@ describe('real Docker agent isolation', () => {
       await expect(inspect()).rejects.toThrow(`more than ${MAXIMUM_CHANGES} new entries`);
     }, 240_000);
 
+    it('fails, never truncates, on more than 10,000 changes of any kind', async () => {
+      // Deletions pass the walk's own early limit on new entries, so this reaches the count of every change.
+      const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 14_000, metadataBytes: 32 * 1024 * 1024,
+        metadataInodes: 512 }, hostile: source => {
+        mkdirSync(join(source, 'many')); for (let i = 0; i <= MAXIMUM_CHANGES; i += 1) writeFileSync(join(source, 'many', String(i)), '');
+      } });
+      asAgent(data.filesystems, 'rm -rf many');
+      await expect(inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } }))
+        .rejects.toThrow(`more than ${MAXIMUM_CHANGES} changes`);
+    }, 300_000);
+
     it('counts each declared target once, so a target the snapshot accepted is inspected too', async () => {
       const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 14_000, metadataBytes: 16 * 1024 * 1024,
         metadataInodes: 512 }, hostile: source => {

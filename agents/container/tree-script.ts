@@ -496,10 +496,10 @@ my %as_checked_out;
   # CRLF under a later text rule) is written as it is too. Whatever rules the work tree has now, it is untouched.
   # This reads the file once, in the script, so it is cheap.
   $as_checked_out{$_} = 1 for grep { file_id($_) eq $base{$_}{oid} } @differ;
-  # What is left and converts is compared with checkout: one Git process each, so the number is capped.
+  # What is left and converts is compared with checkout, one Git process each (a few milliseconds apiece). Untouched
+  # legacy files can need it as well as changed ones, so their number is not a change count: the run's deadline bounds
+  # the work instead.
   my @compare = grep { $converts{$_} && !$as_checked_out{$_} } @differ;
-  fail(9, "more than $MAXIMUM_CHANGES changed files need comparing with base's checkout; the change set is too large to"
-    . " inspect") if @compare > $MAXIMUM_CHANGES;
   for my $path (@compare) {
     my $bytes = git_in_mirror(undef, "cat-file", "--filters", "--path=$path", $base{$path}{oid});
     $as_checked_out{$path} = 1 if blob_id($bytes) eq file_id($path);

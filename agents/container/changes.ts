@@ -17,9 +17,10 @@ export type EntryType = 'file' | 'symlink' | 'gitlink' | 'directory' | 'other';
  * One difference between the work tree and the tree of `base`, read without following links (#66). Every file is read
  * and hashed as the blob Git would store, with the work tree's attributes (only those: a deleted `.gitattributes`, or
  * one Git will not read, such as a symlink, applies no rules); a tracked file counts as changed when that blob or its
- * mode differs from `base`. A file whose stored blob would not change (an honest CRLF checkout, say), or whose bytes
- * are exactly what checking out base's blob writes under base's own attributes, as the clone's checkout wrote it (a
- * file base stores in a form Git would now store differently), is not a change.
+ * mode differs from `base`. Its content is unchanged when the blob Git would store is base's (an honest CRLF
+ * checkout, say), when its bytes are exactly base's blob whatever rules the work tree has now, or when its bytes are
+ * exactly what checking out base's blob writes under base's own attributes, as the clone's checkout wrote it (a file
+ * base stores in a form Git would now store differently).
  * The commit step (#66 part 2) builds its tree from `base` plus these changes, storing each file the same way, so what
  * the audit approves is what is committed. A link target is compared as it is.
  */
