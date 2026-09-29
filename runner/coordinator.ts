@@ -141,6 +141,11 @@ export class RunnerCoordinator {
       // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout);
       // keep the job's reason in step with it so status shows the stop.
       job.firstReason = 'cancelled'; job.reasonSaved = true;
+      // It mirrors a write that may roll back with the caller's transaction; if it did, the job had no reason after all.
+      queueMicrotask(() => {
+        try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== 'cancelled' && job.firstReason === 'cancelled') job.firstReason = null; }
+        catch { /* unreadable: keep the Store's reported outcome */ }
+      });
     }
     return outcome;
   }

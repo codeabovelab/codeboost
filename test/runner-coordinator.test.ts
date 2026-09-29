@@ -431,6 +431,25 @@ describe('review regressions', () => {
     }
     expect(firstInactive).toEqual({ attemptId: attempt.id, reason: 'result-not-saved' });
   });
+  it('drops the adopted cancel when the cancel task rolls back, keeping the launch failure', async () => {
+    const { store, runner, preparations, deps, failStart } = setup();
+    let finish!: () => void, cleanupStarted = false;
+    deps.cleanupPreparation = () => { cleanupStarted = true; return new Promise<void>(resolve => { finish = resolve; }); };
+    failStart(new Error('untrusted image'));
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => cleanupStarted, 'cleanup');
+    expect(() => store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+      expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+      throw new Error('commit failed');
+    })).toThrow(/commit failed/);
+    await tick();
+    expect(runner.status(A).stopRequested).toBeNull();
+    finish();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Launch failed: untrusted image' });
+    expect(store.getTask(A).status).toBe('running');
+  });
   it('refuses a stop once the terminal write is done and only cleanup remains', async () => {
     const { store, runner, launches, preparations, deps } = setup();
     let finish!: () => void, cleanupStarted = false;
