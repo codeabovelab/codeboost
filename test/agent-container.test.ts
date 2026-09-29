@@ -1004,7 +1004,7 @@ describe('real Docker agent isolation', () => {
       const data = fixture({ hostile: source => {
         mkdirSync(join(source, 'd', 'lib'), { recursive: true }); writeFileSync(join(source, 'd', 'lib', 'x'), 'x\n');
         symlinkSync('d/lib', join(source, 'L'));
-        // Through a missing directory and back up: where that leads depends on what m becomes, so nothing is watched.
+        // Through a missing directory and back up: followed by name, as the only place it can ever lead.
         mkdirSync(join(source, 'real')); writeFileSync(join(source, 'real', 'f'), 'f\n'); symlinkSync('real', join(source, 'via'));
         writeFileSync(join(source, 'plain'), 'p\n');
         symlinkSync('m/../via/f', join(source, 'M')); symlinkSync('m/../plain', join(source, 'P'));
@@ -1013,10 +1013,9 @@ describe('real Docker agent isolation', () => {
       } });
       const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['L', 'M', 'P'], { imageId });
       expect(linkSnapshot.links[0]).toMatchObject({ link: 'L', status: 'present', target: 'd/lib' });
-      for (const record of linkSnapshot.links.slice(1)) {
-        expect(record).toMatchObject({ status: 'absent', anchor: { path: '.' } });
-        expect(record.target).toBeUndefined();
-      }
+      // M's way, followed by name, goes through the link via: through-link. P's leads to plain, which is watched.
+      expect(linkSnapshot.links[1]).toMatchObject({ link: 'M', status: 'through-link', target: 'via/f' });
+      expect(linkSnapshot.links[2]).toMatchObject({ link: 'P', status: 'present', target: 'plain' });
       // Untouched: nothing to report for any of them.
       expect((await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId })).linkTargetChanges)
         .toEqual([]);
@@ -1029,6 +1028,22 @@ describe('real Docker agent isolation', () => {
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('docs')).toMatchObject({ kind: 'modify', oldType: 'file', newType: 'directory' });
       expect(byPath.get('docs/api/x')).toMatchObject({ kind: 'add' });
+    }, 180_000);
+
+    it('watches the old target of a dangling link the item retargets, whatever lies on the way', async () => {
+      const data = fixture({ hostile: source => {
+        // Past a missing directory and back up, and through a file in the middle: neither resolves today.
+        symlinkSync('m/../x', join(source, 'L')); writeFileSync(join(source, 'f'), 'f\n'); symlinkSync('f/x', join(source, 'L2'));
+      } });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['L', 'L2'], { imageId });
+      expect(linkSnapshot.links).toMatchObject([{ link: 'L', status: 'absent', target: 'x' }, { link: 'L2', status: 'absent', target: 'f/x' }]);
+      // Write through each old target, then point each link elsewhere, as an item editing the links might.
+      asAgent(data.filesystems, ['mkdir m && printf "evil\\n" > L && rmdir m && ln -sfn y L',
+        'rm f && mkdir f && printf "evil\\n" > L2 && ln -sfn g L2'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest.linkTargetChanges).toEqual(expect.arrayContaining([
+        { link: 'L', target: 'x', path: 'L', change: 'retargeted' }, { link: 'L', target: 'x', path: 'x', change: 'status' },
+        { link: 'L2', target: 'f/x', path: 'L2', change: 'retargeted' }, { link: 'L2', target: 'f/x', path: 'f/x', change: 'status' }]));
     }, 180_000);
 
     it('reports what Git would skip: ignored files and directories under base\'s rules, fifos and .git parts', async () => {

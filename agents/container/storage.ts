@@ -249,7 +249,10 @@ const linkStaysInside = (staging: string, link: string) => {
     current = component === '..' ? dirname(current) : join(current, component);
     if (!within(staging, current)) return false;
     if (!exists || component === '..') continue;
-    const stat = lstatSync(current, { throwIfNoEntry: false });
+    // A path under a file (ENOTDIR) does not exist either: the link dangles there, as it does past a missing part.
+    let stat: ReturnType<typeof lstatSync> | undefined;
+    try { stat = lstatSync(current, { throwIfNoEntry: false }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOTDIR') throw error; }
     if (!stat) { exists = false; continue; }
     if (!stat.isSymbolicLink()) continue;
     if (++hops > MAXIMUM_LINK_HOPS) return true;

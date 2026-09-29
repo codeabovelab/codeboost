@@ -262,16 +262,13 @@ sub resolve {
   # From the filesystem root: ("work", ...) is inside the work tree.
   my @at = $raw =~ m{^/} ? () : ("work", @parents);
   my @parts = grep { $_ ne "" && $_ ne "." } split m{/}, $raw;
-  # Once a directory on the way is missing, the rest is followed by name: that is where the link leads if the missing
-  # directories are created as directories, so the target stays the same whether they exist or not. A ".." after a
-  # missing part cannot be followed by name (what it climbs back into is not known), so that link is absent with no
-  # target.
+  # Once a part on the way is missing, or is not a directory, the rest is followed by name, ".." included: that is
+  # the only place the link can ever lead (the part would have to become a directory), so the target is recorded and
+  # watched whether it exists or not. A link on that path still makes it through-link: the target's walk checks every
+  # part.
   my $missing = 0;
   for my $i (0 .. $#parts) {
-    if ($parts[$i] eq "..") {
-      return { %record, %{ anchored("absent", join "/", @at[1 .. $#at]) } } if $missing;
-      pop @at; next;
-    }
+    if ($parts[$i] eq "..") { pop @at; next }
     push @at, $parts[$i];
     return { %record, status => "outside" } if $at[0] ne "work";
     return { %record, status => "metadata" } if @at > 1 && $at[1] eq ".git";
@@ -279,14 +276,14 @@ sub resolve {
     my $path = join "/", @at[1 .. $#at]; my @here = lstat $path;
     if (!@here) { $missing = 1; next }
     return { %record, %{ anchored("through-link", $path) } } if -l _;
-    return { %record, %{ anchored("absent", $path) } } if $i < $#parts && !-d _;
+    $missing = 1 if $i < $#parts && !-d _;
   }
   return { %record, status => "outside" } if @at < 2;
   my $target = join "/", @at[1 .. $#at];
   # A dangling target, past a missing directory or not, is watched like any other: creating it, or what leads to it, is
   # a change to it. The target's own state (its entries, or its anchor) is reported once per target, not per link.
   my @final = lstat $target; $resolved_targets{$target} = 1;
-  my $status = $missing || !@final ? "absent" : $walk ? target_state($target)->{status} : "present";
+  my $status = $walk ? target_state($target)->{status} : @final ? "present" : "absent";
   return { %record, target => text($target, "path"), status => $status };
 }
 # Each distinct target is walked once per run, so two declared links to one target count its entries once.
