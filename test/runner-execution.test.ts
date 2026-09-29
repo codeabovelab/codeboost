@@ -10,6 +10,7 @@ import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
 const oid = (n: number) => n.toString(16).padStart(40, '0');
+const RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const plan: Plan = { schema_version: 1, issue: 1, revision: 1, summary: 'Two items', questions: [], items: [
   { id: 'P1', title: 'First', intent: 'Change a', files: [{ path: 'a.ts', kind: 'edit', renamed_from: null, change: 'x' }], acceptance: [{ type: 'cmd', text: 'npm test' }], depends_on: [] },
@@ -47,19 +48,19 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
     },
   };
   const sources: ExecutionSources = { planContext: () => context, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
-  const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [];
+  const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
   const deps = executionDeps(store, workspace, (input, prompt, ws) => {
-    log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv);
+    log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
     return { attemptId: input.attemptId, settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }), cancel: () => undefined };
-  }, sources);
+  }, sources, RUNNER_OWNER);
   const runner = new RunnerCoordinator(store, deps);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, runner, executor: new ItemExecutor(store, runner, sources), log, commits, prompts, argv };
+  return { store, runner, executor: new ItemExecutor(store, runner, sources), log, commits, prompts, argv, owners };
 }
 
 describe('item execution', () => {
   it('runs items in order, commits each with trailers, and records owned ledger entries', async () => {
-    const { store, executor, log, commits, prompts, argv } = setup();
+    const { store, executor, log, commits, prompts, argv, owners } = setup();
     expect(await executor.runTask(identity)).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
     expect(commits.map(c => [c.item, c.baseHead.slice(-3), c.trailers, c.paths, c.message])).toEqual([
       ['P1', '002', { 'Plan-Item': 'P1', 'Plan-Revision': 'r1' }, ['a.ts'], 'P1: First'],
@@ -72,6 +73,7 @@ describe('item execution', () => {
       'materialize P2 @064', 'snapshot P2 []', 'start P2', 'inspect P2 @064', 'commit P2 -> 065', 'release P2 after completed']);
     expect(prompts[0]).toContain('<plan_item_data>');
     expect(argv[0]).toEqual([['npm', 'test']]);
+    expect(owners[0]).toBe(RUNNER_OWNER);
     expect(argv[1]).toEqual([]);
   });
   it('reports a planned-but-unchanged item without committing', async () => {

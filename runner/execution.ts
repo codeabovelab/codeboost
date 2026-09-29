@@ -36,10 +36,14 @@ export const SAFETY_VIOLATION = 'Safety violation:';
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: unknown }
 
-/** RunnerDeps for execute attempts: fresh workspace, prompt, agent, then audit and the runner's own commit. */
-export function executionDeps(store: Store, workspace: TaskWorkspace, launch: AgentLauncher, sources: ExecutionSources): RunnerDeps {
+/**
+ * RunnerDeps for execute attempts: fresh workspace, prompt, agent, then audit and the runner's own commit.
+ * `runnerOwner` is the database's runner token (`Store.runnerOwnerToken`); `workspace` must allocate task storage under it.
+ */
+export function executionDeps(store: Store, workspace: TaskWorkspace, launch: AgentLauncher, sources: ExecutionSources, runnerOwner: string): RunnerDeps {
   const identityOf = (attempt: AttemptRecord): PlanIdentity => findIdentity(store, attempt);
   return {
+    runnerOwner,
     async prepare(attempt, signal) {
       if (attempt.kind !== 'execute' || !attempt.item) throw new Error('Execution deps run execute attempts for one plan item.');
       const identity = identityOf(attempt), plan = store.getPlan(identity, attempt.context.planRevision);
