@@ -832,13 +832,17 @@ describe('real Docker agent isolation', () => {
   it('names files over 8 MiB instead of diffing them, so one large file cannot exhaust memory or the deadline', async () => {
     const data = fixture({ limits: { workBytes: 96 * 1024 * 1024, workInodes: 512, metadataBytes: 64 * 1024 * 1024,
       metadataInodes: 512 } });
-    agentChanges(data.filesystems, ['head -c 9437184 /dev/urandom > tracked-big.bin', 'g add tracked-big.bin',
-      'g commit -qm big', 'head -c 1000 /dev/urandom >> tracked-big.bin', 'head -c 20971520 /dev/urandom > new-big.bin',
-      'printf "small\\n" > small.txt'].join(' && '));
+    agentChanges(data.filesystems, ['head -c 9437184 /dev/urandom > tracked-big.bin',
+      'head -c 9437184 /dev/urandom > touched-big.bin', 'g add tracked-big.bin touched-big.bin', 'g commit -qm big',
+      'head -c 1000 /dev/urandom >> tracked-big.bin',
+      // Same size, new timestamp: porcelain git diff would read both versions in full to compare them.
+      'touch -d "@$(( $(date +%s) + 60 ))" touched-big.bin',
+      'head -c 20971520 /dev/urandom > new-big.bin', 'printf "small\\n" > small.txt'].join(' && '));
     const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
     const text = exported.diff.toString('utf8');
-    expect(text).toContain('codeboost: tracked-big.bin changed but is over 8 MiB; its content is not exported');
-    expect(text).toContain('codeboost: new-big.bin changed but is over 8 MiB; its content is not exported');
+    expect(text).toContain('codeboost: tracked-big.bin is over 8 MiB; if it changed, its content is not exported');
+    expect(text).toContain('codeboost: touched-big.bin is over 8 MiB; if it changed, its content is not exported');
+    expect(text).toContain('codeboost: new-big.bin is over 8 MiB; if it changed, its content is not exported');
     expect(text).not.toContain('diff --git a/tracked-big.bin');
     expect(text).not.toContain('diff --git a/new-big.bin');
     expect(text).toContain('+small');
