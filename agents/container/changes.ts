@@ -267,7 +267,8 @@ interface InspectOutput {
  * (reported in `nestedGitlinkContent`); a new directory that base's rules ignore is one entry. Each declared link is
  * resolved again and each target the snapshot recorded is compared with what is there now. Runs in a read-only
  * container over the storage with no network. It fails, rather than returns part of the answer, on: more than
- * `MAXIMUM_CHANGES` changes; a name or link target longer than `MAXIMUM_NAME_BYTES` or not strict printable UTF-8; more
+ * `MAXIMUM_CHANGES` changes; a reported name or link target longer than `MAXIMUM_NAME_BYTES`, not strict UTF-8, or
+ * holding a Unicode control, format, separator or unassigned character (Cc, Cf, Zl, Zp, Cn); more
  * than `MAXIMUM_TARGET_ENTRIES` entries beneath the recorded targets; anything it cannot read; a `base` that is not a
  * commit there; and any Git failure. F treats every refusal as needs human.
  */

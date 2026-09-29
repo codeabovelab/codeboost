@@ -107,7 +107,8 @@ Use only these entry points to run an agent:
      failed. Route it to needs human, as for link target changes and nested gitlink content.
    - **Refusals.** It refuses, and never returns part of the answer, when:
      - there are more than 10,000 changes;
-     - a name or link target is longer than 1,024 bytes, or is not strict UTF-8 free of control and format characters;
+     - a name or link target it reports is longer than 1,024 bytes, is not strict UTF-8, or holds a Unicode control,
+       format, line or paragraph separator, or unassigned character (unchanged names are never checked);
      - the recorded targets hold more than 20,000 entries;
      - it cannot read something;
      - `base` is not a commit in the storage, or Git fails;

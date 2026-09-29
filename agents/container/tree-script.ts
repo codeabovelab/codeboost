@@ -14,8 +14,9 @@
  * Both first compare the metadata digest with `baseline`, before any Git command: if it differs, a snapshot refuses
  * (exit 10) and an inspection prints only the digest and `metadataOnly`.
  *
- * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes. A path or link target that is not strict
- * UTF-8 without control characters cannot be put in the manifest (exit 8). More than MAXIMUM_CHANGES changes, more than
+ * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes. A reported path or link target that is not
+ * strict UTF-8, holds a control, format, separator or unassigned character, or is over MAXIMUM_NAME_BYTES cannot be
+ * put in the manifest (exit 8); an unchanged one is never checked. More than MAXIMUM_CHANGES changes, more than
  * MAXIMUM_TARGET_ENTRIES target entries, or more output than the bound cannot be returned whole (exit 9). A directory
  * or file it cannot read fails it (exit 6), since what is inside is unknown. Exit 3 is a bad base, exit 4 a Git failure,
  * exit 2 a bad argument, exit 5 an unexpected failure of the script itself. None of these returns part of the answer.
@@ -59,7 +60,8 @@ sub text {
   my ($bytes, $what) = @_;
   fail(8, "$what " . shown(substr($bytes, 0, 64)) . "... is longer than $MAXIMUM_NAME_BYTES bytes") if length $bytes > $MAXIMUM_NAME_BYTES;
   my $text = eval { Encode::decode("UTF-8", $bytes, Encode::FB_CROAK | Encode::LEAVE_SRC) };
-  fail(8, "$what " . shown($bytes) . " is not printable UTF-8")
+  fail(8, "$what " . shown($bytes) . " is not a name the manifest can carry (strict UTF-8 with no control, format,"
+    . " separator or unassigned character)")
     if !defined $text || $text =~ /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/;
   return $text;
 }
@@ -209,7 +211,8 @@ sub under_git_path { return scalar grep { lc $_ eq ".git" } split m{/}, shift }
 # What the walk keeps of each entry: its type and Git mode, and a link's content. A large checkout holds many.
 sub walk_entry {
   my $path = shift; my @stat = lstat $path; return undef unless @stat;
-  if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => text($target, "the link target of " . shown($path)) } }
+  # The link target is checked as a name only if it is reported, like the path itself.
+  if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => $target } }
   # Every file is hashed below; one that cannot be read fails the run here, with its name, rather than inside Git.
   if (-f _) { fail(6, "could not read " . shown($path) . ": permission denied") unless -r _; return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } }
   return { type => "directory" } if -d _;
@@ -337,13 +340,13 @@ mkdir "/tmp/ignore" or fail(4, "could not create the ignore tree: $!");
 mkdir "/tmp/attributes" or fail(4, "could not create the attribute mirror: $!");
 for my $record (split /\0/, git("ls-tree", "-r", "-z", "--full-tree", $base)) {
   my ($meta, $path) = split /\t/, $record, 2; my ($git_mode, $kind, $oid) = split / /, $meta;
-  text($path, "path");
   $base{$path} = { gitMode => $git_mode, oid => $oid,
     type => $git_mode eq "160000" ? "gitlink" : $git_mode eq "120000" ? "symlink" : "file" };
   my @parts = split m{/}, $path; my $name = pop @parts;
   $base_directory{join "/", @parts[0 .. $_]} = 1 for 0 .. $#parts;
-  # Base's attribute files too: the checkout comparison below reads base's rules, as the clone's checkout did.
-  if ($name eq ".gitattributes" && $git_mode =~ /^100/) {
+  # Base's attribute files too: the checkout comparison below reads base's rules, as the clone's checkout did. The
+  # checkout read a symlinked one from the index, as its target text, so that text is mirrored as a regular file.
+  if ($name eq ".gitattributes" && $git_mode =~ /^(?:100|120)/) {
     my $dir = "/tmp/attributes"; for my $part (@parts) { $dir .= "/$part"; mkdir $dir unless -d $dir }
     open(my $file, ">", "$dir/.gitattributes") or fail(4, "could not write the attribute mirror: $!");
     binmode $file; print $file git("cat-file", "blob", $oid); close $file or fail(4, "could not write the attribute mirror: $!");
@@ -406,7 +409,7 @@ my (%work, @nested, %has_child, %ignored, %collapsed);
 my $new_entries = 0;
 my @pending = grep { $_ ne ".git" } children(".");
 while (@pending) {
-  my $path = shift @pending; text($path, "path");
+  my $path = shift @pending;
   my $entry = walk_entry($path) // fail(6, "could not stat " . shown($path) . ": $!");
   $work{$path} = $entry;
   my @parts = split m{/}, $path; pop @parts; $has_child{join "/", @parts} = 1 if @parts;
@@ -538,7 +541,10 @@ push @changes, grep { !$paired_delete{$_->{path}} } @deleted;
 push @changes, grep { !$paired_add{$_->{path}} } @added;
 fail(9, "more than $MAXIMUM_CHANGES changes; the change set is too large to inspect") if @changes > $MAXIMUM_CHANGES;
 @changes = sort { $a->{path} cmp $b->{path} } @changes;
+# Names are checked only here, as they go into the manifest: an unchanged path with any name is never refused.
 for my $change (@changes) {
+  $change->{newLinkTarget} = text($change->{newLinkTarget}, "the link target of " . shown($change->{path}))
+    if defined $change->{newLinkTarget};
   $change->{path} = text($change->{path}, "path");
   $change->{oldPath} = text($change->{oldPath}, "path") if defined $change->{oldPath};
 }

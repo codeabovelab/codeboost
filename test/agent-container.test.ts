@@ -1228,6 +1228,25 @@ describe('real Docker agent isolation', () => {
         newOid: createHash('sha1').update('blob 9\0trusted\r\n').digest('hex') })]);
     }, 180_000);
 
+    it('reports nothing for a file untouched since the checkout under base\'s symlinked .gitattributes', async () => {
+      // The clone's checkout read the link's target text from the index as rules, and wrote file.txt with CRLF.
+      const data = fixture({ hostile: source => symlinkSync('*.txt eol=crlf', join(source, '.gitattributes')) });
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      expect(manifest.changes).toEqual([]);
+    }, 180_000);
+
+    it('checks a name only when it reports it: an unchanged file in base may have any name', async () => {
+      // A zero-width non-joiner (Unicode Cf), ordinary in Persian names.
+      const data = fixture({ hostile: source => writeFileSync(join(source, 'mi\u200cxam.md'), 'm\n') });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      expect((await inspect()).changes).toEqual([]);
+      asAgent(data.filesystems, 'printf "edited\\n" > file.txt');
+      expect((await inspect()).changes.map(change => change.path)).toEqual(['file.txt']);
+      // Reported, the same name is refused.
+      asAgent(data.filesystems, 'printf "e\\n" > "$(printf "mi\\342\\200\\214xam.md")"');
+      await expect(inspect()).rejects.toThrow(/is not a name the manifest can carry/);
+    }, 180_000);
+
     it('lets through a warning that runs over two lines', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '!foo text\n') });
       asAgent(data.filesystems, 'printf "edited\\n" > file.txt');
@@ -1300,19 +1319,19 @@ describe('real Docker agent isolation', () => {
         metadataInodes: 512 } });
       const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       asAgent(data.filesystems, `printf "x\\n" > "$(printf "bad\\377")"`);
-      await expect(inspect()).rejects.toThrow(/bad\\xff is not printable UTF-8/);
+      await expect(inspect()).rejects.toThrow(/bad\\xff is not a name the manifest can carry/);
       // A surrogate code point: a lax decoder accepts it, and Node would show it as U+FFFD, like another real name.
       asAgent(data.filesystems, `rm -f bad*; printf "x\\n" > "$(printf "s\\355\\240\\200")"`);
-      await expect(inspect()).rejects.toThrow(/s\\xed\\xa0\\x80 is not printable UTF-8/);
+      await expect(inspect()).rejects.toThrow(/s\\xed\\xa0\\x80 is not a name the manifest can carry/);
       // An invisible right-to-left mark: "x" and "x\u200f" would show as one name.
       asAgent(data.filesystems, `rm -f s*; printf "x\\n" > "$(printf "x\\342\\200\\217")"`);
-      await expect(inspect()).rejects.toThrow(/x\\xe2\\x80\\x8f is not printable UTF-8/);
+      await expect(inspect()).rejects.toThrow(/x\\xe2\\x80\\x8f is not a name the manifest can carry/);
       // A format character from Unicode 15 (U+13439), newer than the image's Perl knows: refused, not let through.
       asAgent(data.filesystems, `rm -f x*; printf "x\\n" > "$(printf "a.txt\\360\\223\\220\\271")"`);
-      await expect(inspect()).rejects.toThrow(/a\.txt\\xf0\\x93\\x90\\xb9 is not printable UTF-8/);
+      await expect(inspect()).rejects.toThrow(/a\.txt\\xf0\\x93\\x90\\xb9 is not a name the manifest can carry/);
       // A C1 control character (U+009B, which some terminals read as the start of an escape sequence).
       asAgent(data.filesystems, `rm -f a.txt*; printf "x\\n" > "$(printf "c\\302\\233")"`);
-      await expect(inspect()).rejects.toThrow(/c\\xc2\\x9b is not printable UTF-8/);
+      await expect(inspect()).rejects.toThrow(/c\\xc2\\x9b is not a name the manifest can carry/);
       // A name longer than the manifest carries.
       asAgent(data.filesystems, `rm -f c*; mkdir -p "$(printf 'd%.0s' $(seq 1 200))" && cd "$(printf 'd%.0s' $(seq 1 200))" && for i in 1 2 3 4 5 6; do mkdir "$(printf 'e%.0s' $(seq 1 200))" && cd "$(printf 'e%.0s' $(seq 1 200))"; done && : > f`);
       await expect(inspect()).rejects.toThrow(`longer than ${MAXIMUM_NAME_BYTES} bytes`);
