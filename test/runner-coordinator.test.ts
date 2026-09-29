@@ -272,6 +272,67 @@ describe('storage failures', () => {
   });
 });
 
+describe('review regressions', () => {
+  it('does not launch an already admitted attempt once D has reported unreleased resources', async () => {
+    const { store, runner, launches, preparations } = setup();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    runner.start(A, request(store, A));
+    const b = runner.start(B, request(store, B, { kind: 'planning', item: null }));
+    await until(() => preparations.length === 2, 'preparations');
+    preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle({ exitCode: null, stopReason: 'capture-failure', unreleased: [] });
+    await runner.settled(A);
+    preparations[1]!.resolve();
+    await runner.settled(B);
+    expect(launches).toHaveLength(1);
+    expect(store.getAttempt(B, b.id)).toMatchObject({ state: 'failed', firstReason: null });
+    expect(store.getAttempt(B, b.id).diagnostic).toMatch(/cleanup could not be confirmed/);
+  });
+  it('keeps a preparation timeout when shutdown arrives while preparation is still stopping', async () => {
+    const { store, runner, preparations } = setup({ prepareIgnoresAbort: true });
+    const attempt = runner.start(A, request(store, A, { deadline: Date.now() + 30 }));
+    await until(() => preparations.length === 1, 'preparation');
+    await new Promise(resolve => setTimeout(resolve, 60));
+    expect(preparations[0]!.signal.aborted).toBe(true);
+    const closing = runner.close();
+    expect(runner.status(A).stopRequested).toBeNull();
+    preparations[0]!.resolve();
+    await closing;
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Timed out while preparing.' });
+  });
+  it('ends stale, not time-limit, when the context changed and the budget is also spent at the launch check', async () => {
+    let clock = Date.now();
+    const { store, runner, launches, preparations, deps } = setup();
+    deps.now = () => clock;
+    const attempt = runner.start(A, request(store, A, { budgetMs: 60_000, deadline: clock + 600_000 }));
+    await until(() => preparations.length === 1, 'preparation');
+    store.setAssignment(A, store.getTask(A).stateVersion, 'reassigned', 'hash');
+    clock += 120_000;
+    preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(launches).toHaveLength(0);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: null });
+    expect(store.getTask(A).status).not.toBe('needs human');
+  });
+  it('refuses a stop once the terminal write is done and only cleanup remains', async () => {
+    const { store, runner, launches, preparations, deps } = setup();
+    let finish!: () => void, cleanupStarted = false;
+    deps.cleanupPreparation = () => { cleanupStarted = true; return new Promise<void>(resolve => { finish = resolve; }); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle();
+    await until(() => cleanupStarted, 'cleanup');
+    expect(store.getAttempt(A, attempt.id).state).toBe('completed');
+    expect(runner.stop(A, attempt.id, 'cancelled')).toBe(false);
+    expect(runner.status(A)).toMatchObject({ active: true, stopRequested: null });
+    finish();
+    await runner.settled(A);
+    expect(runner.isActive(A)).toBe(false);
+  });
+});
+
 describe('cancel task, limits and shutdown', () => {
   it('stops the running attempt on cancel task and closes the task when it settles, even with a valid result', async () => {
     const { store, runner, launches, preparations } = setup();

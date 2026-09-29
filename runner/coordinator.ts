@@ -45,6 +45,8 @@ type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
   firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean; staleCause?: string;
+  /** The terminal write is done; only host-side cleanup remains, so a stop has nothing left to change. */
+  ended?: boolean;
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: 'result-not-saved' | 'start-not-saved' }
@@ -53,6 +55,7 @@ const D_REASON: Record<FirstReason, StopReason> = { cancelled: 'cancelled', stal
 /** setTimeout accepts at most 2^31-1 ms; longer waits are re-armed. */
 const MAX_TIMER = 2_147_483_647;
 const PREPARATION_TIMEOUT = 'Timed out while preparing.';
+const NOT_STARTED_UNRELEASED = 'Not started: an earlier agent\'s cleanup could not be confirmed. Restart codeboost to run it again.';
 
 /**
  * One runner coordinator per process and Store. Owns in-memory jobs, slots and unresolved markers.
@@ -146,6 +149,8 @@ export class RunnerCoordinator {
   }
 
   #requestStop(job: Job, reason: FirstReason): boolean {
+    // The attempt deadline passed before launch: it ends `failed` with no first reason, so a later stop cannot claim it.
+    if (job.ended || (job.preparationTimedOut && !job.firstReason)) return false;
     if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
     job.firstReason = reason;
     try {
@@ -187,9 +192,12 @@ export class RunnerCoordinator {
       const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
       if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
-      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}); }
-      if (now >= attempt.deadline) return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT });
+      // A context change comes before both time checks, as in the settlement order and startup recovery.
       if (!sameContext(row.context, this.#store.currentContext(job.identity))) return await this.#endBeforeLaunch(job, attempt, {});
+      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}); }
+      if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }); }
+      // Fail closed: once D reported resources it could not remove, no new invocation starts, even one already admitted.
+      if (this.#unreleased) return await this.#endBeforeLaunch(job, attempt, { detail: NOT_STARTED_UNRELEASED });
       let handle: InvocationHandle;
       try {
         const input = captureInvocation({ clone: prepared.clone, phase: ATTEMPT_PHASES[attempt.kind], vendor: prepared.vendor,
@@ -225,6 +233,7 @@ export class RunnerCoordinator {
       // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
       if (job.firstReason === 'stale') detail = job.staleCause;
       const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
+      job.ended = true;
       // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
       if (saved) await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
     } finally {
