@@ -1087,6 +1087,29 @@ describe('real Docker agent isolation', () => {
       expect(byPath.get('sub/.gitignore')).toMatchObject({ kind: 'modify', oldType: 'file', newType: 'directory' });
     }, 180_000);
 
+    it('lists, never collapses, a directory below a .gitignore file the agent turned into a directory', async () => {
+      const data = fixture({ hostile: source => {
+        // Everything ignored but directories, C files and ignore files: a directory-only negation decides.
+        writeFileSync(join(source, '.gitignore'), '*\n!*/\n!*.c\n!.gitignore\n');
+        mkdirSync(join(source, 'sub')); writeFileSync(join(source, 'sub', '.gitignore'), '# rules\n');
+      } });
+      asAgent(data.filesystems, ['rm sub/.gitignore', 'mkdir -p sub/.gitignore/newdir other/newdir',
+        'printf "c\\n" > sub/.gitignore/newdir/x.c', 'printf "c\\n" > other/newdir/x.c'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const paths = manifest.changes.map(change => change.path);
+      expect(paths).toContain('other/newdir/x.c');
+      expect(paths).toContain('sub/.gitignore/newdir/x.c');
+    }, 180_000);
+
+    it('keeps a deletion a deletion when the file reappears only under a .git part', async () => {
+      const data = fixture({ hostile: source => writeFileSync(join(source, 'secret.txt'), 'secret\n') });
+      asAgent(data.filesystems, 'mkdir -p x/.git && mv secret.txt x/.git/');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const byPath = new Map(manifest.changes.map(change => [change.path, change]));
+      expect(byPath.get('secret.txt')).toMatchObject({ kind: 'delete' });
+      expect(byPath.get('x/.git/secret.txt')).toMatchObject({ kind: 'add', underGit: true });
+    }, 180_000);
+
     it('reports what a commit would store: nothing for an honest CRLF checkout, the stored blob under ident', async () => {
       const data = fixture({ hostile: source => {
         writeFileSync(join(source, '.gitattributes'), '*.txt eol=crlf\nid.c ident\n');
@@ -1183,6 +1206,18 @@ describe('real Docker agent isolation', () => {
       await expect(inspect()).rejects.toThrow(/exit 6\): the attributes file \.gitattributes is not a regular file/);
     }, 180_000);
 
+    it('applies no rules from a .gitattributes Git will not read, never base\'s copy from the index', async () => {
+      const data = fixture({ limits: { workBytes: 192 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024,
+        metadataInodes: 512 }, hostile: source => writeFileSync(join(source, '.gitattributes'), '*.txt text\n') });
+      // Over 100 MB, Git ignores the work tree's .gitattributes (with a warning) and would fall back to base's
+      // "*.txt text" in the index. The file stays a regular file, so only the rule that every .gitattributes leaves
+      // the scratch index prevents that.
+      asAgent(data.filesystems, '{ printf "*.txt -text\\n"; head -c 105000000 /dev/zero | tr "\\0" "#"; } > .gitattributes && printf "trusted\\r\\n" > file.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(manifest.changes).toContainEqual(expect.objectContaining({ kind: 'modify', path: 'file.txt',
+        newOid: createHash('sha1').update('blob 9\0trusted\r\n').digest('hex') }));
+    }, 240_000);
+
     it('lets through a warning that runs over two lines', async () => {
       const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '!foo text\n') });
       asAgent(data.filesystems, 'printf "edited\\n" > file.txt');
@@ -1247,10 +1282,10 @@ describe('real Docker agent isolation', () => {
       const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 14_000, metadataBytes: 16 * 1024 * 1024,
         metadataInodes: 512 }, hostile: source => {
         mkdirSync(join(source, 'big')); for (let i = 0; i < 12_000; i += 1) writeFileSync(join(source, 'big', String(i)), '');
-        symlinkSync('big', join(source, 'biglink'));
+        symlinkSync('big', join(source, 'biglink')); symlinkSync('big', join(source, 'biglink2'));
       } });
-      // More than half the limit: counted twice, the inspection would refuse what the snapshot accepted.
-      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['biglink'], { imageId });
+      // More than half the limit, reached by two links: counted twice, either run would refuse.
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['biglink', 'biglink2'], { imageId });
       expect(linkSnapshot.links[0]!.entries).toHaveLength(12_001);
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
       expect(manifest.linkTargetChanges).toEqual([]);

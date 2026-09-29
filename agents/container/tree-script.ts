@@ -5,17 +5,20 @@
  * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime,
  *   link target and a regular file's content. Content is hashed rather than trusted to the times, which a write does
  *   not always move; loose objects and packs, which are named by their content and most of the volume, are not.
- * - `snapshot <link>...` (in /work) resolves each declared link as the kernel would in an agent container, one part at
- *   a time, and records the state of its target and everything beneath it.
- * - `inspect <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of `base`,
- *   hashing every file as a commit would store it, resolves each declared link again (without walking its target), and
- *   reports the state now of each target the snapshot recorded, the metadata digest and HEAD.
+ * - `snapshot <baseline> <link>...` (in /work) resolves each declared link as the kernel would in an agent container,
+ *   one part at a time, and records the state of its target and everything beneath it.
+ * - `inspect <baseline> <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of
+ *   `base`, hashing every file as a commit would store it, resolves each declared link again (without walking its
+ *   target), and reports the state now of each target the snapshot recorded, the metadata digest and HEAD.
+ *
+ * Both first compare the metadata digest with `baseline`, before any Git command: if it differs, a snapshot refuses
+ * (exit 10) and an inspection prints only the digest and `metadataOnly`.
  *
  * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes. A path or link target that is not strict
  * UTF-8 without control characters cannot be put in the manifest (exit 8). More than MAXIMUM_CHANGES changes, more than
  * MAXIMUM_TARGET_ENTRIES target entries, or more output than the bound cannot be returned whole (exit 9). A directory
- * or file it cannot read fails it (exit 6), since what is inside is unknown. Exit 3 is a bad base, exit 4 a Git failure.
- * None of these returns part of the answer.
+ * or file it cannot read fails it (exit 6), since what is inside is unknown. Exit 3 is a bad base, exit 4 a Git failure,
+ * exit 2 a bad argument, exit 5 an unexpected failure of the script itself. None of these returns part of the answer.
  */
 export const MAXIMUM_CHANGES = 10_000;
 /** Entries recorded beneath all declared links' targets together, in one snapshot or inspection. */
@@ -195,7 +198,8 @@ sub target_entry { my $path = shift; my $entry = entry($path); $entry->{oid} = f
 # Resolve a declared link as the kernel does in an agent container, where the work tree is /work, one part at a time.
 # A part that is a link, before ".." or as the last part, stops it (through-link): a write would go on to wherever that
 # link points. A missing part, or one that is not a directory, leaves it dangling (absent), anchored on the nearest
-# existing entry. Only a target reached through real directories is watched. The path is tracked from the filesystem
+# existing entry. A target is watched when every existing part on the way is a real directory (past a missing one, by
+# name; see below). The path is tracked from the filesystem
 # root, so "/work/x" and "../work/x" are inside; anywhere else outside /work is outside.
 my $target_entries = 0;
 # The anchor is the deepest entry on the way to the given path reached through real directories only: walking down one
@@ -251,10 +255,13 @@ sub resolve {
   my @final = lstat $target;
   return { %record, target => text($target, "path"), %{ $walk ? target_state($target) : { status => @final ? "present" : "absent" } } };
 }
+# Each distinct target is walked once per run, so two declared links to one target count its entries once.
+my %target_states;
+sub target_state { my $target = shift; return $target_states{$target} //= walk_target($target) }
 # The state of a target: absent, present with every entry beneath it walked without following links, or through-link
 # when a part on the way is a link (the agent may have made one since the snapshot) or a link inside a directory target
 # leads elsewhere. Its parents are checked one part at a time, so nothing outside the work tree is ever read.
-sub target_state {
+sub walk_target {
   my $target = shift; my @parents = split m{/}, $target; pop @parents; my $prefix = "";
   for my $part (@parents) {
     $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
@@ -333,12 +340,13 @@ sub is_ignored {
   my ($path, $directory) = @_; my $mirror = "/tmp/ignore";
   my @parts = split m{/}, $path; my $name = pop @parts;
   # Every parent is a directory in the work tree (the walk is inside it), so it is made one in the mirror too. The mirror
-  # holds only directories and base's .gitignore files, and a rule file is never moved: where one stands in the way (the
-  # agent made a directory named .gitignore), nothing deeper is mirrored. Git then sees no directory there, so a
-  # directory-only pattern does not match below it: that can only list more, never hide anything.
+  # holds only directories and base's .gitignore files, and a rule file is never moved. Where one stands in the way (the
+  # agent made a directory named .gitignore), nothing deeper can be mirrored, so Git could not tell what is a directory
+  # there and a directory-only pattern (a negation such as "!*/") would be misapplied. Such a path is taken as not
+  # ignored, without asking: it is listed, never collapsed.
   for my $part (@parts, $directory ? ($name) : ()) {
     $mirror .= "/$part";
-    last if -e $mirror && !-d $mirror;
+    return 0 if -e $mirror && !-d $mirror;
     next if -d $mirror;
     mkdir $mirror or fail(4, "could not mirror a directory: $!");
   }
@@ -397,7 +405,10 @@ if (@commitable) {
   # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
   # A submodule is checked out as a directory (the task clone is not recursive): that is its unchanged state, so it
   # stays. The commit step, which removes the same entries, would otherwise drop every submodule.
-  my @gone = grep { !$work{$_} || ($work{$_}{type} ne $base{$_}{type}
+  # Every .gitattributes leaves it too: where Git will not read the work tree's own (a symlink, one over 100 MB) it
+  # falls back to the index, which must not hold base's. So only attribute files the work tree has, and Git reads,
+  # decide; a regular one is added back below like any file.
+  my @gone = grep { !$work{$_} || m{(?:\A|/)\.gitattributes\z} || ($work{$_}{type} ne $base{$_}{type}
     && !($base{$_}{type} eq "gitlink" && $work{$_}{type} eq "directory")) } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
@@ -444,9 +455,10 @@ for my $path (sort keys %work) {
   next if $new->{type} eq "directory" && ($base_directory{$path} || $has_child{$path});
   push @added, change("add", $path, undef, $new, $ignored{$path});
 }
-# An exact rename: a deleted and an added entry of the same type with the same stored content, paired in path order.
+# An exact rename: a deleted and an added entry of the same type with the same stored content, paired in path order. An
+# entry under a .git part is never stored, so it is never the new half of a rename: the deletion stays a deletion.
 my %by_content;
-push @{ $by_content{"$_->{newType}:$_->{newOid}"} }, $_ for grep { defined $_->{newOid} } @added;
+push @{ $by_content{"$_->{newType}:$_->{newOid}"} }, $_ for grep { defined $_->{newOid} && !under_git_path($_->{path}) } @added;
 my (%paired_add, %paired_delete);
 for my $gone (@deleted) {
   my $match = shift @{ $by_content{"$gone->{oldType}:" . ($gone->{oldOid} // "")} // [] } or next;
