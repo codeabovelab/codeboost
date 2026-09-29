@@ -1,5 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
+import { ghEnvironment } from './gh-env.ts';
 
 const runFile = promisify(execFile);
 const PAGE_SIZE = 100;
@@ -156,6 +157,7 @@ export class GhIssueGateway implements IssueGateway {
     this.run = run ?? (async (args, options) => (await runFile('gh', [...args], {
       maxBuffer: ISSUE_PAGE_MAX_BYTES,
       signal: options?.signal,
+      env: ghEnvironment(),
     })).stdout);
     this.now = now;
   }
