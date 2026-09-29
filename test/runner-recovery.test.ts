@@ -164,6 +164,8 @@ describe('finalizing interrupted attempts', () => {
   });
   it('repairs a confirmed merge whose task status or event is missing', () => {
     const { store, raw } = fixture();
+    // Only a task in review can start a merge.
+    raw(`UPDATE tasks SET status='in review'`);
     const state = { revision: 1, snapshotId: store.getSnapshot(id(1)).id, reviewVersion: store.reviewVersion(id(1)) };
     const merge = store.beginMergeAttempt(id(1), state, oid(2), null, 'direct');
     store.finishMergeAttempt(id(1), merge.id, { state: 'merged' });
