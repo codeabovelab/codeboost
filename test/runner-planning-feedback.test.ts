@@ -1,6 +1,8 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { request as httpRequest } from 'node:http';
+import { DatabaseSync } from 'node:sqlite';
 import { createHash, randomUUID } from 'node:crypto';
 import { choiceKeys } from '../core/approvals.ts';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -159,6 +161,28 @@ describe('planning API for lane G', () => {
     calls[1]!.resolve(JSON.stringify(reply(view.plan.revision)));
     for (let i = 0; i < 50 && (await api(app, 'GET', `/api/plan/suggestions/${ready}`)).body.state !== 'ready'; i++) await new Promise(r => setTimeout(r, 20));
     expect((await api(app, 'POST', `/api/plan/suggestions/${ready}/cancel`, { actionId: randomUUID() })).body.result).toEqual({ state: 'cancelled' });
+  });
+  it('starts no planning agent for a suggestion request that finishes arriving after shutdown began', async () => {
+    const { deps, calls } = planning();
+    const { app, config, close } = await serve({ planning: deps });
+    const view = await review(app), url = new URL(app.url);
+    const text = JSON.stringify({ expectedRevision: view.plan.revision, snapshotId: view.snapshot.id, feedback: '', actionId: randomUUID() });
+    let finish!: () => void;
+    const response = new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/plan/suggestions', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => { res.resume(); resolve(res.statusCode!); });
+      req.on('error', reject); req.write(text.slice(0, 5)); finish = () => req.end(text.slice(5));
+    });
+    await new Promise(r => setTimeout(r, 20));
+    const closing = close();
+    await new Promise(r => setTimeout(r, 20));
+    finish();
+    expect(await response).toBe(503);
+    await closing;
+    expect(calls).toHaveLength(0);
+    // No suggestion request was allocated either.
+    const db = new DatabaseSync(config.database);
+    try { expect(db.prepare('SELECT COUNT(*) AS n FROM requests').get()).toEqual({ n: 0 }); } finally { db.close(); }
   });
   it('settles a pending suggestion at shutdown instead of leaving it pending', async () => {
     const { deps, calls } = planning();

@@ -97,6 +97,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         return { revision: service.store.importRevision(input.source, input.format as 'json' | 'yaml', service.planContext(), input.expectedRevision as number).revision };
       }
       if (started) {
+        // Like Ask and the runner, no new agent starts once shutdown began; 503 is not recorded, so the UI may resend.
+        if (stopping) throw new ShuttingDownError();
         if (!suggestions || !planning) throw new GuardRefusal('Planning agent not available yet.');
         const plan = service.store.getPlan(identity), snapshot = service.store.getSnapshot(identity);
         if (input.expectedRevision !== plan.revision || input.snapshotId !== snapshot.id) throw new GuardRefusal('Stale plan revision or snapshot. Reload before asking for suggestions.');
