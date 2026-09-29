@@ -8,6 +8,7 @@ import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { DockerError, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../process-group.ts';
+import { TREE_SCRIPT } from './tree-script.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
 
@@ -19,6 +20,12 @@ export interface TaskFilesystems {
   readonly workInodes: number;
   readonly metadataBytes: number;
   readonly metadataInodes: number;
+  /**
+   * SHA-256 over every entry of the metadata volume (path, inode, mode, owner, size, ctime, mtime, link target), taken
+   * by the seeder as its last step. F records it: `inspectTaskChanges` compares it to report any change under `.git`,
+   * and needs it back for a recovery handle.
+   */
+  readonly metadataBaseline: string;
 }
 export interface TaskStorageLimits {
   readonly workBytes: number;
@@ -59,15 +66,17 @@ const createDeadline = (timeoutMs: number) => {
   };
 };
 /** One Docker call a storage step needs run, a wait, or a point where a long walk lets other work (and an abort) in. */
-type StorageStep = { readonly args: readonly string[]; readonly timeoutMs: number; readonly cancellable: boolean }
+type StorageStep = { readonly args: readonly string[]; readonly timeoutMs: number; readonly cancellable: boolean;
+  readonly maxBuffer?: number }
   | { readonly sleepMs: number } | typeof PAUSE;
 type Steps<T> = Generator<StorageStep, T, DockerOutcome | undefined>;
 const PAUSE = Symbol('pause');
 // Entries walked between pauses, so the asynchronous variant never holds the event loop for a whole checkout.
 const PAUSE_EVERY = 1_000;
 /** Ask the driver to run one Docker call. Allocation calls are cancellable; cleanup calls never are. */
-function* run(args: readonly string[], timeoutMs: number, cancellable: boolean): Steps<DockerOutcome> {
-  return (yield { args, timeoutMs, cancellable })!;
+function* run(args: readonly string[], timeoutMs: number, cancellable: boolean,
+  maxBuffer?: number): Steps<DockerOutcome> {
+  return (yield { args, timeoutMs, cancellable, maxBuffer })!;
 }
 /** Run one Docker call that must succeed; its failure throws a `DockerError` that `createOutcomeUnknown` reads. */
 function* must(args: readonly string[], timeoutMs: number): Steps<string> {
@@ -86,7 +95,7 @@ function runSteps<T>(steps: Steps<T>): T {
     else if ('sleepMs' in step) { sleep(step.sleepMs); next = steps.next(); }
     else {
       const result = spawnSync('docker', [...step.args], { encoding: 'utf8', timeout: step.timeoutMs, killSignal: 'SIGKILL',
-        env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: 16 * 1024 * 1024 });
+        env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: step.maxBuffer ?? 16 * 1024 * 1024 });
       const error = result.error ?? (result.status === null
         ? new Error(`docker ${step.args[0] ?? ''} was killed by ${result.signal}.`) : undefined);
       next = steps.next({ status: error ? null : result.status, stdout: String(result.stdout ?? ''),
@@ -120,7 +129,7 @@ async function runStepsAsync<T>(steps: Steps<T>, options: PreparationOptions): P
     } else {
       next = steps.next(await runInProcessGroup('docker', step.args, { env: dockerEnvironment(),
         timeoutMs: step.timeoutMs, signal: step.cancellable ? options.signal : undefined,
-        onProcessGroup: options.onProcessGroup }));
+        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer }));
     }
   }
   return next.value;
@@ -188,6 +197,13 @@ export function assertTaskFilesystems(filesystems: TaskFilesystems, clone?: Task
     || clone.directory !== identity.trustedClone.directory
     || assertTaskClone(identity.trustedClone) !== identity.clone.directory || clone.head !== identity.clone.head))
     throw new Error('Task filesystems do not belong to the invocation clone.');
+}
+
+/** The metadata baseline of storage this process allocated; undefined for a recovery handle, whose F records it. */
+export function taskMetadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage): string | undefined {
+  if (recoveredStorage.has(storage as RecoveredTaskStorage)) return undefined;
+  assertTaskFilesystems(storage as TaskFilesystems);
+  return (storage as TaskFilesystems).metadataBaseline;
 }
 
 /** The owner labels this task storage carries. */
@@ -342,7 +358,9 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
       'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --git-dir=/metadata --work-tree=/work -c safe.directory=*'
         + ' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.bigFileThreshold=8m update-index -q --refresh'
         + ' >/dev/null',
-      'chown 10001:10001 /metadata/index'].join('; ');
+      'chown 10001:10001 /metadata/index',
+      // The baseline of the metadata as it now stands; from here only codeboost may change it.
+      'printf "codeboost-metadata-baseline %s\\n" "$(perl -e "$1" digest /metadata)"'].join('; ');
     // Create and start separately: once the create returns, the keeper is ours by ID even if its start fails.
     const keeperId = yield* allocate(keeper, ['create', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m', '--cpus=.25',
@@ -351,16 +369,18 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
       '--entrypoint', 'sleep', imageId, 'infinity']);
     if (!DOCKER_ID.test(keeperId)) throw new Error('Docker did not return the created keeper ID.');
     yield* must(['start', keeperId], remaining());
-    yield* allocate(seeder, ['run', '--rm', '--name', seeder, '--label', 'io.codeboost.task-storage=seeder', ...labels,
+    const seeded = yield* allocate(seeder, ['run', '--rm', '--name', seeder, '--label', 'io.codeboost.task-storage=seeder', ...labels,
       '--read-only', '--user', '0:0', '--network=none', '--cap-drop=ALL', '--cap-add=CHOWN',
       '--cap-add=DAC_OVERRIDE', '--cap-add=FOWNER', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32',
       '--memory=128m', '--cpus=.25', '--mount', `type=bind,source=${staging},target=/run/codeboost-staging,readonly`,
       '--mount', `type=volume,source=${workVolume},target=/work`, '--mount', `type=volume,source=${metadataVolume},target=/metadata`,
-      '--entrypoint', 'sh', imageId, '-c', seed]);
+      '--entrypoint', 'sh', imageId, '-c', seed, 'seed', TREE_SCRIPT]);
     // Reject a staging directory swapped while the seeder was reading it.
     assertTaskClone(clone);
     remaining();
-    const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits });
+    const metadataBaseline = /^codeboost-metadata-baseline ([0-9a-f]{64})$/m.exec(seeded)?.[1];
+    if (!metadataBaseline) throw new Error('The seeder did not report the metadata baseline.');
+    const filesystems = Object.freeze({ keeper, workVolume, metadataVolume, ...limits, metadataBaseline });
     allocations.set(filesystems, Object.freeze({ owner, trustedClone: clone,
       clone: Object.freeze({ ...clone, directory: staging }), limits: Object.freeze({ ...limits }) }));
     releaseAllocationId(allocationId);
@@ -734,44 +754,98 @@ export const EXPORT_SCRIPT = [
   'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ] || [ "${statuses[3]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');
 
-function* exportSteps(workVolume: string, metadataVolume: string, owner: ResourceOwner, options: ExportOptions,
-  maxBytes: number): Steps<TaskDiff> {
-  const remaining = createDeadline(options.timeoutMs ?? 60_000);
+/** A container run over both volumes of task storage, read-only, as the storage user, with no network. */
+interface StorageScript {
+  /** The `io.codeboost.task-storage` kind the container carries; recovery removes a leftover one. */
+  readonly kind: 'export' | 'inspect';
+  /** Names the operation in messages, for example "Task diff export". */
+  readonly operation: string;
+  /** Ends "Task work volume is missing; ..." when a volume is gone. */
+  readonly consequence: string;
+  readonly entrypoint: string;
+  readonly args: readonly string[];
+  /** Bytes of standard output kept; more fails the run (ENOBUFS). Default 16 MiB. */
+  readonly maxOutputBytes?: number;
+}
+export interface StorageScriptOptions extends PreparationOptions {
+  /** The immutable ID of the built agent image, whose tools run the script. */
+  readonly imageId: string;
+  /** Overall deadline for the Docker work, cleanup excluded. */
+  readonly timeoutMs?: number;
+}
+
+function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: ResourceOwner, script: StorageScript,
+  imageId: string, timeoutMs: number): Steps<string> {
+  const remaining = createDeadline(timeoutMs);
   // Mount nothing that is not this storage: each volume must still carry its kind and all three owner labels.
   for (const [name, kind] of [[workVolume, 'work'], [metadataVolume, 'metadata']] as const) {
     const inspect = yield* run(['volume', 'inspect', name], remaining(), true);
     if (inspect.status === null) throw new DockerError(['volume', 'inspect', name], inspect);
-    if (inspect.status !== 0) throw new Error(`Task ${kind} volume is missing; the diff cannot be exported.`);
+    if (inspect.status !== 0) throw new Error(`Task ${kind} volume is missing; ${script.consequence}.`);
     const labels = (JSON.parse(inspect.stdout || '[]')[0] as { Labels?: Record<string, string> } | undefined)?.Labels;
     if (labels?.['io.codeboost.task-storage'] !== kind || !hasOwnerLabels(labels, owner))
       throw new Error(`Task ${kind} volume does not carry this storage's labels.`);
   }
-  const name = `codeboost-export-${randomUUID()}`;
+  const name = `codeboost-${script.kind}-${randomUUID()}`;
   let unsettled = false;
   try {
-    const args = ['run', '--rm', '--name', name, '--label', 'io.codeboost.task-storage=export', ...ownerLabelArgs(owner),
+    const args = ['run', '--rm', '--name', name, '--label', `io.codeboost.task-storage=${script.kind}`, ...ownerLabelArgs(owner),
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', '--memory=256m', '--cpus=.5',
       '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
       '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
-      '--entrypoint', 'bash', options.imageId, '-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1)];
-    const outcome = yield* run(args, remaining(), true);
+      '--entrypoint', script.entrypoint, imageId, ...script.args];
+    const outcome = yield* run(args, remaining(), true, script.maxOutputBytes);
     if (outcome.status !== 0) {
       const error = new DockerError(args, outcome);
       // A client stopped before the daemon answered may still have started the container.
       unsettled = createOutcomeUnknown(error);
       throw error;
     }
-    const bytes = Buffer.from(outcome.stdout.trim(), 'base64');
-    return Object.freeze({ diff: bytes.subarray(0, maxBytes), truncated: bytes.length > maxBytes });
+    return outcome.stdout;
   } catch (error) {
     // `--rm` removes a container that ran to completion; one whose client was killed is still running, so remove it
-    // by name once its labels are confirmed, uncancelled, before the export settles.
+    // by name once its labels are confirmed, uncancelled, before the operation settles.
     try { yield* cleanup([name], [], owner, unsettled ? new Set([name]) : new Set()); }
     catch (cleanupError) {
-      throw new AggregateError([error, cleanupError], 'Task diff export failed and its container cleanup did not settle.');
+      throw new AggregateError([error, cleanupError], `${script.operation} failed and its container cleanup did not settle.`);
     }
+    throw error;
+  }
+}
+
+/**
+ * Run a script over task storage (the value `prepareTaskFilesystems` returned, or a recovery handle) in a read-only
+ * container with no network, and return its standard output. For D's own storage operations; not part of the contract.
+ * On abort or at the deadline the client is stopped and the container, which outlives a killed client, is removed; the
+ * promise settles only after both. An abort rejects with an `AbortError`, unless that container's cleanup did not
+ * settle, which rejects with an `AggregateError`.
+ */
+export async function runStorageScript(storage: TaskFilesystems | RecoveredTaskStorage, script: StorageScript,
+  options: StorageScriptOptions): Promise<string> {
+  if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId)) throw new Error(`${script.operation} requires the immutable built image ID.`);
+  assertBuiltAgentImage(options.imageId);
+  let owner: ResourceOwner, workVolume: string | undefined, metadataVolume: string | undefined;
+  const recovered = recoveredStorage.get(storage as RecoveredTaskStorage);
+  if (recovered) {
+    owner = recovered.owner;
+    ({ workVolume, metadataVolume } = storage as RecoveredTaskStorage);
+  } else {
+    const allocated = storage as TaskFilesystems;
+    owner = taskFilesystemOwner(allocated);
+    ({ workVolume, metadataVolume } = allocated);
+  }
+  if (!workVolume || !metadataVolume) throw new Error(`Task storage has no work or metadata volume; ${script.consequence}.`);
+  const cancelled = (cause?: unknown) => Object.assign(new Error(`${script.operation} was cancelled.`, { cause }),
+    { name: 'AbortError', code: 'ABORT_ERR' });
+  if (options.signal?.aborted) throw cancelled();
+  try {
+    return await runStepsAsync(storageScriptSteps(workVolume, metadataVolume, owner, script, options.imageId,
+      options.timeoutMs ?? 60_000), options);
+  } catch (error) {
+    if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
+      throw cancelled(error);
     throw error;
   }
 }
@@ -792,25 +866,9 @@ export async function exportTaskDiff(storage: TaskFilesystems | RecoveredTaskSto
     throw new Error(`maxBytes must be a positive integer of at most ${MAXIMUM_EXPORT_BYTES}.`);
   if (typeof options.base !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(options.base))
     throw new Error('base must be a full commit ID.');
-  if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId)) throw new Error('Export requires the immutable built image ID.');
-  assertBuiltAgentImage(options.imageId);
-  let owner: ResourceOwner, workVolume: string | undefined, metadataVolume: string | undefined;
-  const recovered = recoveredStorage.get(storage as RecoveredTaskStorage);
-  if (recovered) {
-    owner = recovered.owner;
-    ({ workVolume, metadataVolume } = storage as RecoveredTaskStorage);
-  } else {
-    const allocated = storage as TaskFilesystems;
-    owner = taskFilesystemOwner(allocated);
-    ({ workVolume, metadataVolume } = allocated);
-  }
-  if (!workVolume || !metadataVolume) throw new Error('Task storage has no work or metadata volume; nothing to export.');
-  if (options.signal?.aborted)
-    throw Object.assign(new Error('Task diff export was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
-  try { return await runStepsAsync(exportSteps(workVolume, metadataVolume, owner, options, maxBytes), options); }
-  catch (error) {
-    if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
-      throw Object.assign(new Error('Task diff export was cancelled.', { cause: error }), { name: 'AbortError', code: 'ABORT_ERR' });
-    throw error;
-  }
+  const stdout = await runStorageScript(storage, { kind: 'export', operation: 'Task diff export',
+    consequence: 'the diff cannot be exported', entrypoint: 'bash',
+    args: ['-c', EXPORT_SCRIPT, 'export', options.base, String(maxBytes + 1)] }, options);
+  const bytes = Buffer.from(stdout.trim(), 'base64');
+  return Object.freeze({ diff: bytes.subarray(0, maxBytes), truncated: bytes.length > maxBytes });
 }

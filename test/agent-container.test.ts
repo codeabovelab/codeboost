@@ -1,5 +1,5 @@
 import { execFileSync, spawnSync } from 'node:child_process';
-import { randomBytes, randomUUID } from 'node:crypto';
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -13,6 +13,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT } from '../agents/container/storage.ts';
+import { inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, snapshotDeclaredLinks } from '../agents/container/changes.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
@@ -875,6 +876,183 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('untracked directory nested/ is a nested repository');
     expect(text).not.toContain('nested/.git');
   }, 120_000);
+
+  // An agent's own writes, mounted as every agent container mounts task storage: the work tree writable, the metadata
+  // read-only.
+  const asAgent = (filesystems: ReturnType<typeof prepareTaskFilesystems>, script: string) => docker('run', '--rm',
+    '--network=none', '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
+    '--mount', `type=volume,source=${filesystems.workVolume},target=/work`,
+    '--mount', `type=volume,source=${filesystems.metadataVolume},target=/work/.git,readonly`,
+    '--entrypoint', 'bash', imageId, '-c', `set -e; cd /work; ${script}`);
+
+  describe('change inspection (#66)', () => {
+    it('reports nothing for untouched storage, and the metadata baseline survives an export and an agent\'s Git', async () => {
+      const data = fixture();
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, [], { imageId });
+      expect(data.filesystems.metadataBaseline).toMatch(/^[0-9a-f]{64}$/);
+      await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+      asAgent(data.filesystems, 'git status >/dev/null && git log -1 >/dev/null');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest).toMatchObject({ base: data.clone.head, changes: [], agentCommits: [], metadataChanged: false,
+        linkTargetChanges: [], nestedGitlinkContent: [] });
+      expect(manifest.digest).toBe(manifestDigest(manifest));
+    }, 180_000);
+
+    it('reports a new symlink, and writes through declared links to a file, a directory child and a dangling target', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'd'));
+        for (const [name, text] of [['d/t.txt', 't'], ['q.txt', 'q'], ['r.txt', 'r']] as const) writeFileSync(join(source, name), `${text}\n`);
+        for (const [link, target] of [['link', 'd/t.txt'], ['dlink', 'd'], ['dang', 'gone'], ['quiet', 'q.txt'],
+          ['rewrite', 'r.txt'], ['still', 'missing'], ['moved', 'q.txt']] as const) symlinkSync(target, join(source, link));
+      } });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems,
+        ['link', 'dlink', 'dang', 'quiet', 'rewrite', 'still', 'moved', 'file.txt'], { imageId });
+      expect(linkSnapshot.links.map(link => [link.link, link.status, link.target])).toEqual([
+        ['link', 'present', 'd/t.txt'], ['dlink', 'present', 'd'], ['dang', 'absent', 'gone'], ['quiet', 'present', 'q.txt'],
+        ['rewrite', 'present', 'r.txt'], ['still', 'absent', 'missing'], ['moved', 'present', 'q.txt'],
+        ['file.txt', 'not-a-link', undefined]]);
+      asAgent(data.filesystems, [
+        'printf "through\\n" > link', 'printf "child\\n" > dlink/new.txt', 'printf "made\\n" > dang',
+        // The same bytes written again: nothing to diff, but still a write through the link.
+        'printf "r\\n" > rewrite', 'ln -s /etc/passwd newlink',
+        // A new file beside the still-dangling target, in the directory above it: not a write through the link.
+        'printf "sibling\\n" > beside.txt',
+        // Pointed elsewhere: the link itself changed.
+        'ln -sfn d/t.txt moved'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
+      expect(manifest.linkTargetChanges).toEqual(expect.arrayContaining([
+        { link: 'link', target: 'd/t.txt', path: 'd/t.txt', change: 'content' },
+        { link: 'dlink', target: 'd', path: 'd/new.txt', change: 'created' },
+        { link: 'dang', target: 'gone', path: 'gone', change: 'status' },
+        { link: 'rewrite', target: 'r.txt', path: 'r.txt', change: 'identity' }]));
+      expect(manifest.linkTargetChanges.filter(change => change.link === 'quiet')).toEqual([]);
+      expect(manifest.linkTargetChanges.filter(change => change.link === 'still')).toEqual([]);
+      expect(manifest.linkTargetChanges).toContainEqual({ link: 'moved', target: 'q.txt', path: 'moved', change: 'retargeted' });
+      expect(manifest.changes).toEqual(expect.arrayContaining([
+        expect.objectContaining({ kind: 'modify', path: 'd/t.txt' }), expect.objectContaining({ kind: 'add', path: 'd/new.txt' }),
+        expect.objectContaining({ kind: 'add', path: 'gone', newType: 'file' }),
+        { kind: 'add', path: 'newlink', newType: 'symlink', newMode: '120000', newOid: expect.stringMatching(/^[0-9a-f]{40}$/),
+          newLinkTarget: '/etc/passwd', underGit: false, ignored: false }]));
+      expect(manifest.changes.map(change => change.path)).not.toContain('r.txt');
+    }, 180_000);
+
+    it('resolves a declared link one part at a time: a link before ".." stops it, as the kernel would', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'd', 'e'), { recursive: true });
+        writeFileSync(join(source, 'secret'), 'top\n'); writeFileSync(join(source, 'd', 'secret'), 'inner\n');
+        writeFileSync(join(source, 'd', 'e', 'keep'), '');
+        symlinkSync('d/e', join(source, 'a')); symlinkSync('a/../secret', join(source, 'x'));
+        symlinkSync('d/e/../secret', join(source, 'y'));
+      } });
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['x', 'y'], { imageId });
+      // x goes through the link a (to d/e), so it reaches d/secret, not the top-level secret its text suggests.
+      expect(linkSnapshot.links[0]).toMatchObject({ link: 'x', status: 'through-link', anchor: { path: 'a', type: 'symlink' } });
+      expect(linkSnapshot.links[0]!.target).toBeUndefined();
+      // Through real directories only, y resolves by name.
+      expect(linkSnapshot.links[1]).toMatchObject({ link: 'y', status: 'present', target: 'd/secret' });
+    }, 180_000);
+
+    it('reports what Git would skip: ignored files and directories under base\'s rules, fifos and .git parts', async () => {
+      const data = fixture({ hostile: source => {
+        writeFileSync(join(source, '.gitignore'), '*.log\nbuild/\n');
+        mkdirSync(join(source, 'kept')); writeFileSync(join(source, 'kept', 'tracked.log'), 'tracked\n');
+        git(source, 'add', '-f', 'kept/tracked.log');
+      } });
+      asAgent(data.filesystems, [
+        'printf "x\\n" > x.log', 'mkfifo pipe', 'mkdir -p out/.git && printf "p\\n" > out/.git/payload',
+        // Ignored output: one entry for the directory, whatever is inside, links included.
+        'mkdir -p build/deep && printf "o\\n" > build/deep/o.bin && ln -s /etc build/deep/etc',
+        // A directory holding a tracked file is never collapsed, even under an ignore rule.
+        'printf "changed\\n" > kept/tracked.log && printf "n\\n" > kept/new.log',
+        // The agent's own ignore rules do not count: this file is still listed as not ignored.
+        'printf "*.secret\\n" >> .gitignore && printf "s\\n" > hidden.secret'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const byPath = new Map(manifest.changes.map(change => [change.path, change]));
+      expect(byPath.get('x.log')).toMatchObject({ kind: 'add', newType: 'file', ignored: true });
+      expect(byPath.get('pipe')).toEqual({ kind: 'add', path: 'pipe', newType: 'other', underGit: false, ignored: false });
+      expect(byPath.get('out/.git/payload')).toMatchObject({ kind: 'add', underGit: true, ignored: false });
+      expect(byPath.get('build')).toEqual({ kind: 'add', path: 'build', newType: 'directory', underGit: false, ignored: true });
+      expect([...byPath.keys()].filter(path => path.startsWith('build/'))).toEqual([]);
+      expect(byPath.get('kept/tracked.log')).toMatchObject({ kind: 'modify' });
+      expect(byPath.get('kept/new.log')).toMatchObject({ kind: 'add', ignored: true });
+      expect(byPath.get('hidden.secret')).toMatchObject({ kind: 'add', ignored: false });
+    }, 180_000);
+
+    it('reports what a commit would store: nothing for an honest CRLF checkout, the stored blob under ident', async () => {
+      const data = fixture({ hostile: source => {
+        writeFileSync(join(source, '.gitattributes'), '*.txt eol=crlf\nid.c ident\n');
+        writeFileSync(join(source, 'a.txt'), 'one\ntwo\n'); writeFileSync(join(source, 'id.c'), '$Id$\n');
+      } });
+      const untouched = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      // The checkout wrote CRLF and an expanded $Id$; Git would store what base has, so neither is a change.
+      expect(untouched.changes).toEqual([]);
+      asAgent(data.filesystems, 'printf "one\\r\\nTWO\\r\\n" > a.txt && printf "\\$Id: anything \\$\\n" > id.c');
+      const edited = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      // The CRLF edit is one line; the $Id$ keyword is stored collapsed, so what a commit would store did not change.
+      expect(edited.changes.map(change => change.path)).toEqual(['a.txt']);
+      // Stored with LF, as eol=crlf converts it: the blob of "one\ntwo" with the edit, not of the CRLF bytes on disk.
+      expect(edited.changes[0]!.newOid).toBe(createHash('sha1').update('blob 8\0one\nTWO\n').digest('hex'));
+    }, 180_000);
+
+    it('names every file exactly: a name that starts with a quote, and one that looks like a paired rename', async () => {
+      const data = fixture({ hostile: source => { writeFileSync(join(source, 'foo'), 'same\n'); writeFileSync(join(source, 'Q'), 'q\n');
+        writeFileSync(join(source, 'Z'), 'z\n'); } });
+      asAgent(data.filesystems, [
+        // A rename, and a new file whose name is the deleted path behind a dash.
+        'mv foo bar', 'printf "evil\\n" > ./-foo',
+        // A deletion, and a rename onto a name that is the deleted path behind a dash.
+        'rm Q', 'mv Z ./-Q',
+        // Git unquotes a hashed path that starts with a double quote: this one must still be hashed as itself.
+        `printf "quoted\\n" > '"x"'`, 'printf "other\\n" > x'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      const byPath = new Map(manifest.changes.map(change => [change.path, change]));
+      expect(byPath.get('bar')).toMatchObject({ kind: 'rename', oldPath: 'foo' });
+      expect(byPath.get('-foo')).toMatchObject({ kind: 'add' });
+      expect(byPath.get('-Q')).toMatchObject({ kind: 'rename', oldPath: 'Z' });
+      expect(byPath.get('Q')).toMatchObject({ kind: 'delete' });
+      expect(byPath.get('"x"')!.newOid).not.toBe(byPath.get('x')!.newOid);
+    }, 180_000);
+
+    it('reports content in a gitlink directory, and anything that changed the metadata', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'sm'));
+        git(source, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},sm`);
+      } });
+      asAgent(data.filesystems, 'printf "work\\n" > sm/work.c');
+      const quiet = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(quiet.nestedGitlinkContent).toEqual(['sm']);
+      expect(quiet.changes.map(change => change.path)).not.toContain('sm/work.c');
+      expect(quiet).toMatchObject({ agentCommits: [], metadataChanged: false });
+      // Any write under .git, not only a commit: a changed mode on the config file.
+      docker('run', '--rm', '--network=none', '--user', '10001:10001',
+        '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'chmod', imageId,
+        '600', '/work/.git/config');
+      const chmodded = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(chmodded).toMatchObject({ agentCommits: [], metadataChanged: true });
+      // Agents mount the metadata read-only, so they cannot commit; this stands in for that protection failing.
+      docker('run', '--rm', '--network=none', '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
+        '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`,
+        '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'git', imageId,
+        '-C', '/work', '-c', 'user.name=agent', '-c', 'user.email=agent@example.com', 'commit', '-q', '--allow-empty', '-m', 'agent');
+      const committed = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(committed.agentCommits.length).toBeGreaterThan(0);
+      expect(committed.metadataChanged).toBe(true);
+      expect(committed.digest).not.toBe(quiet.digest);
+    }, 180_000);
+
+    it('fails, never truncates, on too many changes and on a name that is not UTF-8', async () => {
+      const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 12_000, metadataBytes: 16 * 1024 * 1024,
+        metadataInodes: 512 } });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      asAgent(data.filesystems, `printf "x\\n" > "$(printf "bad\\377")"`);
+      await expect(inspect()).rejects.toThrow(/bad\\xff is not printable UTF-8/);
+      // A surrogate code point: a lax decoder accepts it, and Node would show it as U+FFFD, like another real name.
+      asAgent(data.filesystems, `rm -f bad*; printf "x\\n" > "$(printf "s\\355\\240\\200")"`);
+      await expect(inspect()).rejects.toThrow(/s\\xed\\xa0\\x80 is not printable UTF-8/);
+      asAgent(data.filesystems, `rm -f s*; mkdir many; cd many; for i in $(seq 1 ${MAXIMUM_CHANGES + 1}); do : > "$i"; done`);
+      await expect(inspect()).rejects.toThrow(`more than ${MAXIMUM_CHANGES} changes`);
+    }, 240_000);
+  });
 
   it('names what the diff cannot show: a submodule directory with content, and attributes that rewrite bytes', async () => {
     // The base commit has a submodule, which the non-recursive task clone leaves as an empty directory, and a tracked

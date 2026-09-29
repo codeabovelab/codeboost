@@ -86,11 +86,32 @@ Use only these entry points to run an agent:
    or socket, an ignored untracked path, a submodule directory with content, and a changed file whose `ident` or
    `working-tree-encoding` attribute changes what the diff shows each appear as a `codeboost:` notice line. When Git
    fails, the error carries Git's last two error lines.
-6. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
+6. To audit what a writable attempt changed (#66, `agents/container/changes.ts`):
+   - **Record the baseline.** The storage value carries `metadataBaseline`, a digest of the metadata volume that the
+     seeder takes as its last step. Record it with the allocation. `inspectTaskChanges` needs it back for a recovery
+     handle.
+   - **Before launch**, call `snapshotDeclaredLinks(storage, paths, { imageId })` with the item's declared paths.
+     For each declared symlink it records where the target resolves (by name, never through a link) and the state of
+     the target and everything beneath it. Keep the result.
+   - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
+     change manifest: every difference between the work tree and `base`, read without following links and hashed as
+     raw bytes, so ignored files, fifos, entries under a `.git` part and attribute tricks are all visible. It also
+     returns `agentCommits`, `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`.
+   - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
+     failed. Route it to needs human, as for link target changes and nested gitlink content.
+   - **Refusals.** It refuses, and never returns part of the answer, when:
+     - there are more than 10,000 changes;
+     - a name or link target is not printable UTF-8;
+     - it cannot read something.
+
+     Treat a refusal as needs human.
+   - **Both calls** run in a read-only container with no network, take `signal`, `onProcessGroup` and `timeoutMs`
+     (default 120 s), and settle only after their container is gone.
+7. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
-   token. It removes agent containers, egress proxies, seeders, export containers and networks, and resolves once they are gone. It keeps
-   task storage whole (both volumes and the keeper) and returns one recovery handle per allocation, carrying its
-   attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
+   token. It removes agent containers, egress proxies, seeders, export and inspection containers and networks, and
+   resolves once they are gone. It keeps task storage whole (both volumes and the keeper) and returns one recovery
+   handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
    a runner label (from older builds), objects of this runner that D does not create, and storage whose parts
    disagree are listed in `unowned` and never touched. An object counts as D's only with exactly one kind label,
