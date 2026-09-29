@@ -113,12 +113,16 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     if (!/^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/.test(input.baseBranch)) throw new Error('Invalid base branch name.');
     if (input.ownPullRequests.some(number => !Number.isSafeInteger(number) || number < 1)) throw new Error('Invalid pull request number.');
     // Every stage shares one deadline; reaching it aborts the running `gh` call and makes the check unknown.
-    // The two stages are independent and run together; the first failure stops the other.
+    // The two stages are independent and run together. The first failure stops the other, and the check still waits for
+    // both to settle, so it never returns while a `gh` process it started is running.
     const deadline = AbortSignal.timeout(this.deadlineMs), failed = new AbortController();
     const stages = AbortSignal.any([...(signal ? [signal] : []), deadline, failed.signal]);
-    const stop = (error: unknown) => { failed.abort(); throw error; };
+    let first: { error: unknown } | null = null;
+    const stop = (error: unknown) => { first ??= { error }; failed.abort(); throw error; };
     try {
-      const [matches, { baseHead, commits }] = await Promise.all([this.#timeline(input, stages).catch(stop), this.#baseCommits(input, stages).catch(stop)]);
+      const settled = await Promise.allSettled([this.#timeline(input, stages).catch(stop), this.#baseCommits(input, stages).catch(stop)]);
+      if (first) throw (first as { error: unknown }).error;
+      const [matches, { baseHead, commits }] = settled.map(result => (result as PromiseFulfilledResult<unknown>).value) as [AlreadyFixedMatch[], { baseHead: string; commits: { sha: string; message: string }[] }];
       for (const commit of commits) {
         if (input.ownCommits.has(commit.sha) || !mentionsIssue(commit.message, this.repository, input.issue)) continue;
         matches.push({ kind: 'commit', sha: commit.sha, subject: commit.message.split('\n', 1)[0]!.slice(0, 200) });

@@ -1,9 +1,8 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import type { RunGh } from './merge.ts';
 import { ghEnvironment } from './gh-env.ts';
+import { runWithInput } from './run-with-input.ts';
 
-const runFile = promisify(execFile);
+/** A `gh` runner that can also write a request body to stdin (`gh api --input -`). */
+export type RunGhWithInput = (args: readonly string[], options?: { signal?: AbortSignal; input?: string }) => Promise<string>;
 
 export interface OpenPullRequestInput {
   base: string;
@@ -29,18 +28,21 @@ export interface PullRequestGateway {
 const SHA = /^[a-f0-9]{40}$/;
 const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/;
 
-/** GitHub CLI adapter for opening a task's PR. All arguments are literal argv; no shell is involved. */
+/**
+ * GitHub CLI adapter for opening a task's PR. All arguments are literal argv; no shell is involved. The title and
+ * description go as a JSON request body on stdin, never as arguments.
+ */
 export class GhPullRequestGateway implements PullRequestGateway {
   readonly repository: string;
-  readonly run: RunGh;
-  constructor(config: { repository: string }, run?: RunGh) {
+  readonly run: RunGhWithInput;
+  constructor(config: { repository: string }, run?: RunGhWithInput) {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository)) throw new Error('A GitHub repository is required to open pull requests.');
     this.repository = config.repository;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() })).stdout);
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { input: options?.input, timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
   }
 
-  async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
-    const output = await this.run(args, { signal });
+  async #json(args: readonly string[], signal?: AbortSignal, body?: Record<string, unknown>): Promise<unknown> {
+    const output = await this.run(body ? [...args, '--input', '-'] : args, { signal, ...(body ? { input: JSON.stringify(body) } : {}) });
     try { return JSON.parse(output); }
     catch { throw new Error('GitHub returned invalid JSON.'); }
   }
@@ -67,8 +69,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
   async open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
     if (!input.body.includes(input.marker)) throw new Error('The pull request description must carry its marker.');
-    const response = await this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`,
-      '-f', `title=${input.title}`, '-f', `body=${input.body}`, '-f', `head=${input.headBranch}`, '-f', `base=${input.base}`, '-F', `draft=${input.draft}`], signal);
+    const response = await this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
+      { title: input.title, body: input.body, head: input.headBranch, base: input.base, draft: input.draft });
     const { body, ...pr } = this.#pull(response, input);
     if (!body.includes(input.marker)) throw new Error('GitHub returned a pull request without its marker.');
     return pr;
@@ -92,8 +94,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
     if (!input.body.includes(input.marker)) throw new Error('The pull request description must carry its marker.');
-    const patched = this.#pull(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`,
-      '-f', `title=${input.title}`, '-f', `body=${input.body}`], signal), input);
+    const patched = this.#pull(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal,
+      { title: input.title, body: input.body }), input);
     if (patched.number !== number || !patched.body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });

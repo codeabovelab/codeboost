@@ -3,6 +3,7 @@ import { Store } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
+import { runWithInput } from '../github/run-with-input.ts';
 import { GhPullRequestGateway, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway, AlreadyFixedInput, AlreadyFixedResult } from '../github/already-fixed.ts';
 import { fenced, neutralizeReferences, pullRequestBody, pullRequestTitle, MAX_BODY } from '../core/pull-request-body.ts';
@@ -412,6 +413,11 @@ describe('the PR description', () => {
     const body = pullRequestBody({ plan, marker: 'm', problems: Array.from({ length: 20 }, () => '😀'.repeat(2500)) });
     expect(body.length).toBeLessThan(MAX_BODY);
   });
+  it('cuts each shown problem to exactly the documented 2,000 characters', () => {
+    const body = pullRequestBody({ plan, marker: 'm', problems: ['a'.repeat(3000)] });
+    expect(body).toContain(`${'a'.repeat(1999)}…\n`);
+    expect(body).not.toContain('a'.repeat(2000));
+  });
   it('bounds the open problems it shows', () => {
     const body = pullRequestBody({ plan, marker: 'm', problems: Array.from({ length: 25 }, (_, i) => `problem ${i} ${'z'.repeat(3000)}`) });
     expect(body).toContain('(5 more in codeboost)');
@@ -442,6 +448,25 @@ describe('the PR description', () => {
   });
 });
 
+describe('running gh with a request body on stdin', () => {
+  it('passes a body far past the per-argument limit, including a NUL, through stdin', async () => {
+    const body = `${'€'.repeat(60_000)}\u0000end`;
+    const out = await runWithInput(process.execPath, ['-e', 'let n=0;process.stdin.on("data",c=>n+=c.length).on("end",()=>process.stdout.write(String(n)))'], { input: body });
+    expect(Number(out)).toBe(Buffer.byteLength(body));
+  });
+  it('rejects on abort only after the process has exited', async () => {
+    const controller = new AbortController();
+    const started = runWithInput(process.execPath, ['-e', 'process.on("SIGTERM",()=>setTimeout(()=>process.exit(1),150));setInterval(()=>{},1000)'], { signal: controller.signal });
+    await new Promise(resolve => setTimeout(resolve, 200));
+    const aborted = Date.now(); controller.abort(new Error('stop'));
+    await expect(started).rejects.toThrow('stop');
+    expect(Date.now() - aborted).toBeGreaterThanOrEqual(100);
+  });
+  it('reports a failing exit with its stderr', async () => {
+    await expect(runWithInput(process.execPath, ['-e', 'console.error("HTTP 422");process.exit(1)'], {})).rejects.toThrow(/exit 1\): HTTP 422/);
+  });
+});
+
 describe('gh subprocess environment', () => {
   it('passes only the allowlisted variables, and turns prompts off', () => {
     const env = ghEnvironment({ PATH: '/bin', GH_TOKEN: 't', AWS_SECRET_ACCESS_KEY: 'x', ANTHROPIC_API_KEY: 'y', HOME: '/h' });
@@ -457,12 +482,13 @@ describe('GitHub PR adapter', () => {
   const response = (over: Record<string, unknown> = {}) => ({ number: 7, html_url: 'https://github.com/owner/repo/pull/7', state: 'open', draft: true, body: `${marker}\nplan`,
     head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: { full_name: 'Owner/Repo' } }, base: { ref: 'main', repo: { full_name: 'owner/repo' } }, ...over });
   const input = { base: 'main', headBranch: 'codeboost/issue-12-task', title: 'T', body: `${marker}\nplan`, draft: true, marker };
-  it('opens with literal argv and validates the answer', async () => {
-    const calls: string[][] = [];
-    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { calls.push([...args]); return JSON.stringify(response()); });
+  it('opens with literal argv, sends the title and description as a JSON body on stdin, and validates the answer', async () => {
+    const calls: string[][] = [], inputs: (string | undefined)[] = [];
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async (args, options) => { calls.push([...args]); inputs.push(options?.input); return JSON.stringify(response()); });
     expect(await gh.open(input)).toEqual({ number: 7, url: 'https://github.com/owner/repo/pull/7', headSha: oid(2), draft: true });
-    expect(calls[0]).toEqual(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', 'repos/owner/repo/pulls',
-      '-f', 'title=T', '-f', `body=${marker}\nplan`, '-f', 'head=codeboost/issue-12-task', '-f', 'base=main', '-F', 'draft=true']);
+    expect(calls[0]).toEqual(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', 'repos/owner/repo/pulls', '--input', '-']);
+    expect(JSON.parse(inputs[0]!)).toEqual({ title: 'T', body: `${marker}\nplan`, head: 'codeboost/issue-12-task', base: 'main', draft: true });
+    expect(calls[0]!.join(' ')).not.toContain('plan');
   });
   it('refuses answers for another branch or repository, and bodies without the marker', async () => {
     for (const over of [{ head: { sha: oid(2), ref: 'other', repo: { full_name: 'owner/repo' } } }, { head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: { full_name: 'fork/repo' } } },

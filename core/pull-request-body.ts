@@ -63,7 +63,7 @@ export function pullRequestTitle(plan: Plan): string {
 export function pullRequestBody(input: { plan: Plan; marker: string; problems?: readonly string[] }): string {
   const { plan, marker } = input;
   // The full problems stay in codeboost; the description shows a bounded summary of them.
-  const all = input.problems ?? [], shown = all.slice(0, MAX_PROBLEMS).map(problem => neutralizeReferences(cut(problem, MAX_PROBLEM + 1)));
+  const all = input.problems ?? [], shown = all.slice(0, MAX_PROBLEMS).map(problem => neutralizeReferences(cut(problem, MAX_PROBLEM)));
   const problems = all.length > shown.length ? [...shown, `(${all.length - shown.length} more in codeboost)`] : shown;
   const build = (full: boolean) => [
     marker,

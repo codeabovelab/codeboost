@@ -126,6 +126,15 @@ describe('the pre-PR already-fixed check', () => {
     expect(DEFAULT_CHECK_DEADLINE_MS).toBeLessThan(15_000);
     expect(new GhAlreadyFixedGateway({ repository: repo }).deadlineMs).toBe(DEFAULT_CHECK_DEADLINE_MS);
   });
+  it('returns only after the stopped stage has settled', async () => {
+    let timelineSettled = false;
+    const gh = new GhAlreadyFixedGateway({ repository: repo, deadlineMs: 10_000 }, async (args, options) => {
+      if (args[1] === 'graphql') return new Promise((_, reject) => options?.signal?.addEventListener('abort', () => setTimeout(() => { timelineSettled = true; reject(new Error('killed')); }, 100)));
+      throw new Error('HTTP 502');
+    });
+    expect(await gh.check(input())).toMatchObject({ outcome: 'unknown' });
+    expect(timelineSettled).toBe(true);
+  });
   it('passes cancellation through instead of reporting it as unknown', async () => {
     const controller = new AbortController();
     const gh = new GhAlreadyFixedGateway({ repository: repo }, async () => { controller.abort(); throw new Error('aborted'); });

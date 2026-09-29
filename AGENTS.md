@@ -65,6 +65,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 
 - A bounded safety scan must fail closed when its limit is exceeded. Never truncate evidence and report the result as clear.
 - Align subprocess output limits with every payload the schema accepts, or tighten the upstream page and field bounds; valid bounded input must not fail only because the transport budget is smaller.
+- Pass text whose size follows user or agent input to a subprocess on stdin, never as an argument: the OS limits one argument's size and cannot pass a NUL, so valid bounded input can fail to spawn.
 - Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
 - Preserve repository identity with pull request numbers in cross-reference scans. Never resolve or exclude a repository-qualified reference by number alone.
 - When a relation can be added and removed (a manually linked PR, a label, an assignment), replay its add and remove events in order and count only its latest state. An add event alone does not prove the relation still holds.
