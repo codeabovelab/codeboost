@@ -54,7 +54,7 @@ export interface GhMergeConfig {
   method?: 'merge' | 'squash' | 'rebase';
 }
 
-type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
+export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
 
 function confirmedMergeRefusal(message: string): boolean {
   return /required (?:approving )?review|required status check|branch protection|merge conflict|not mergeable|head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|pull request.*(?:closed|draft)|merge method.*not allowed/i.test(message);

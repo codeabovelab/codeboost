@@ -5,6 +5,7 @@ import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
+import type { AlreadyFixedResult } from '../github/already-fixed.ts';
 import {
   ATTEMPT_PHASES, CLOSED_STATUSES, MERGEABLE_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
@@ -23,6 +24,12 @@ export interface SuggestionRequest { state: SuggestionState; revision: number; s
 export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
 export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
+/** A PR codeboost opened (or is opening) for a task. `opening` means the outcome of the GitHub call is not yet known. */
+export interface TaskPullRequest {
+  openingId: string; repository: string; base: string; headBranch: string; headSha: string; draft: boolean;
+  state: 'opening' | 'opened' | 'abandoned'; number: number | null; url: string | null; createdAt: string;
+}
+export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
 export interface MergeAttempt {
   id: string; kind: 'queue' | 'direct'; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
@@ -78,8 +85,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 6) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 7) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -108,6 +115,7 @@ export class Store {
           );
           PRAGMA user_version=5;`);
         if (version < 6) this.#migrateV6();
+        if (version < 7) this.#migrateV7();
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -870,4 +878,128 @@ export class Store {
     }));
   }
 
+  // ---- F2d: the pre-PR already-fixed check and PR opening ----
+  #migrateV7(): void {
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS already_fixed_checks (
+        id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), snapshot_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('clear','found','unknown')), result TEXT NOT NULL,
+        state_version INTEGER NOT NULL, checked_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_pull_requests (
+        opening_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), repository TEXT NOT NULL, base TEXT NOT NULL,
+        head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('opening','opened','abandoned')), number INTEGER, url TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        CHECK ((state = 'opened') = (number IS NOT NULL AND url IS NOT NULL)));
+      CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_number ON task_pull_requests (lower(repository), number) WHERE number IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_opening ON task_pull_requests (plan_key) WHERE state = 'opening';
+      PRAGMA user_version=7;`);
+  }
+  #pullRequestRecord(row: Record<string, SQLOutputValue>): TaskPullRequest {
+    return {
+      openingId: row.opening_id as string, repository: row.repository as string, base: row.base as string, headBranch: row.head_branch as string,
+      headSha: row.head_sha as string, draft: row.draft === 1, state: row.state as TaskPullRequest['state'],
+      number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
+    };
+  }
+  /** Every PR codeboost opened or started to open for the task, oldest first. */
+  taskPullRequests(identity: PlanIdentity): TaskPullRequest[] {
+    const key = identityKey(identity); this.#task(key);
+    return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
+  }
+  latestAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
+    const key = identityKey(identity); this.#task(key);
+    const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? ORDER BY rowid DESC LIMIT 1', key);
+    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, checkedAt: row.checked_at as string } : null;
+  }
+  /** Publishing runs after the task's last attempt settled, while the task is running, or in needs human for a draft PR. */
+  #assertPublishable(key: string, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
+    if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+    if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
+    if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
+    if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+  }
+  /**
+   * Records a pre-PR check. A match, or a check that could not be completed, moves a running task to possibly already
+   * fixed in the same transaction. A needs-human task keeps its status; its draft PR is not opened.
+   */
+  recordAlreadyFixed(identity: PlanIdentity, expectedStateVersion: number, input: { snapshotId: string; draft: boolean; result: AlreadyFixedResult }): AlreadyFixedCheck {
+    if (!['clear', 'found', 'unknown'].includes(input.result?.outcome)) throw new Error('Invalid already-fixed result.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key);
+      this.#assertPublishable(key, task, expectedStateVersion, input.draft);
+      if (this.#current(key).snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
+      if (input.result.outcome !== 'clear' && !input.draft) this.#run("UPDATE tasks SET status='possibly already fixed' WHERE plan_key=?", key);
+      this.#touch(key);
+      const id = randomUUID(), checkedAt = new Date().toISOString(), stateVersion = this.#task(key).state_version as number;
+      this.#run('INSERT INTO already_fixed_checks (id,plan_key,snapshot_id,outcome,result,state_version,checked_at) VALUES (?,?,?,?,?,?,?)',
+        id, key, input.snapshotId, input.result.outcome, encode(input.result), stateVersion, checkedAt);
+      return { id, snapshotId: input.snapshotId, result: input.result, stateVersion, checkedAt };
+    });
+  }
+  /**
+   * Records the intent to open a PR, immediately before the GitHub call. It requires a clear check with no task change
+   * since it was recorded, so the check and the PR bind to the same head (AGENTS.md: re-read before an irreversible action).
+   */
+  beginPullRequest(identity: PlanIdentity, input: { checkId: string; repository: string; base: string; headBranch: string; headSha: string; draft: boolean }): TaskPullRequest {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#assertCheckedHead(identity, input);
+      if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opening'", key)) throw new GuardRefusal('A pull request is already being opened; recover it first.');
+      const openingId = randomUUID(), now = new Date().toISOString();
+      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,state,number,url,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0, now, now);
+      this.#touch(key);
+      return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
+    });
+  }
+  /** The same guard for reusing the task's open PR: nothing changed since a clear check of this head. */
+  assertReadyToRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      this.#assertCheckedHead(identity, input);
+      if (!this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened'", key, input.openingId)) throw new GuardRefusal('Unknown pull request.');
+    });
+  }
+  #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
+    const key = identityKey(identity), task = this.#task(key), check = this.latestAlreadyFixed(identity);
+    if (!check || check.id !== input.checkId || check.result.outcome !== 'clear') throw new GuardRefusal('A clear already-fixed check must come right before opening a pull request.');
+    this.#assertPublishable(key, task, check.stateVersion, input.draft);
+    const snapshot = this.getSnapshot(identity);
+    if (snapshot.id !== check.snapshotId || snapshot.head !== input.headSha) throw new GuardRefusal('The task head changed after the check.');
+  }
+  /**
+   * The PR exists. The record is kept even if the task closed meanwhile, so the PR can still be found and closed; only
+   * a running task moves to in review (or needs human, when the pushed head moved before GitHub read it).
+   */
+  recordPullRequestOpened(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, refreshedHead?: string): TaskStatus {
+    if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      // Opening completes an `opening` row; a refresh updates the task's existing PR to the head it was checked at.
+      const row = refreshedHead === undefined
+        ? this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opening'", key, openingId)
+        : this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened' AND number=?", key, openingId, pr.number);
+      if (!row) throw new GuardRefusal('No pull request is being opened with this ID.');
+      const expectedHead = refreshedHead ?? row.head_sha as string;
+      this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, updated_at=? WHERE opening_id=?",
+        pr.number, pr.url, pr.draft ? 1 : 0, expectedHead, new Date().toISOString(), openingId);
+      const task = this.#task(key);
+      if (task.status === 'running' && !this.#activeAttempt(key)) {
+        this.#run('UPDATE tasks SET status=? WHERE plan_key=?', pr.headSha === expectedHead && !pr.draft ? 'in review' : 'needs human', key);
+      }
+      this.#touch(key);
+      return this.#task(key).status as TaskStatus;
+    });
+  }
+  /** Recovery found no PR for an opening whose outcome was lost; a new check and opening follow. */
+  abandonPullRequestOpening(identity: PlanIdentity, openingId: string): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      if (this.#run("UPDATE task_pull_requests SET state='abandoned', updated_at=? WHERE plan_key=? AND opening_id=? AND state='opening'", new Date().toISOString(), key, openingId).changes !== 1)
+        throw new GuardRefusal('No pull request is being opened with this ID.');
+      this.#touch(key);
+    });
+  }
 }

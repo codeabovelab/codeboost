@@ -1,0 +1,103 @@
+import type { PlanIdentity } from '../core/identity.ts';
+import { pullRequestBody, pullRequestTitle } from '../core/pull-request-body.ts';
+import type { AlreadyFixedGateway, AlreadyFixedResult } from '../github/already-fixed.ts';
+import type { PullRequestGateway } from '../github/pull-requests.ts';
+import { GuardRefusal } from './lifecycle.ts';
+import type { Store, TaskPullRequest } from './store.ts';
+
+/**
+ * F2d: the pre-PR "already fixed" check and PR opening (design, "Checking whether the issue is already fixed" and
+ * "Needs human"). Pushing the task head to its branch is D's export plus a runner push; until that exists it is injected.
+ */
+export interface BranchPusher {
+  /** Makes `refs/heads/<branch>` on GitHub point at `head`. Settles only when the push finished or failed. */
+  push(identity: PlanIdentity, input: { head: string; branch: string }, signal?: AbortSignal): Promise<void>;
+}
+export interface PublishConfig { repository: string; baseBranch: string }
+export type PublishOutcome =
+  | { kind: 'opened'; number: number; url: string; draft: boolean; status: string }
+  | { kind: 'possibly already fixed'; result: AlreadyFixedResult }
+  /** A needs-human task whose check matched: no draft PR is opened, and the task stays in needs human. */
+  | { kind: 'draft skipped'; result: AlreadyFixedResult }
+  /** The task head is its base: there is nothing to open a PR for. A running task moves to needs human. */
+  | { kind: 'no changes' };
+
+const marker = (openingId: string) => `<!-- codeboost:opening=${openingId} -->`;
+
+export class PullRequestPublisher {
+  #store: Store; #checks: AlreadyFixedGateway; #pulls: PullRequestGateway; #pusher: BranchPusher; #config: PublishConfig;
+  constructor(store: Store, deps: { checks: AlreadyFixedGateway; pulls: PullRequestGateway; pusher: BranchPusher }, config: PublishConfig) {
+    this.#store = store; this.#checks = deps.checks; this.#pulls = deps.pulls; this.#pusher = deps.pusher; this.#config = config;
+  }
+
+  /** The task's branch. The task ID keeps branches of different tasks for the same issue apart. */
+  branch(identity: PlanIdentity): string {
+    const plan = this.#store.getPlan(identity);
+    const task = identity.taskId.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'task';
+    return `codeboost/issue-${plan.issue}-${task}`;
+  }
+
+  /**
+   * Opens the task's PR, or a draft PR with the open problems when `problems` is given (the task is in needs human).
+   * Order: recover a lost opening; check; push; record the opening; open. A match or an unreadable check opens nothing.
+   */
+  async publish(identity: PlanIdentity, input: { problems?: readonly string[] } = {}, signal?: AbortSignal): Promise<PublishOutcome> {
+    const draft = input.problems !== undefined;
+    const recovered = await this.#recover(identity, signal);
+    if (recovered) return recovered;
+    const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
+    if (snapshot.head === snapshot.base) {
+      if (!draft) this.#store.transitionTask(identity, task.stateVersion, 'needs human');
+      return { kind: 'no changes' };
+    }
+    const prs = this.#store.taskPullRequests(identity);
+    const result = await this.#checks.check({
+      issue: plan.issue, taskBase: snapshot.base, baseBranch: this.#config.baseBranch,
+      ownPullRequests: prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!),
+      ownCommits: new Set(this.#store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha)),
+    }, signal);
+    signal?.throwIfAborted();
+    const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
+    if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
+    const branch = this.branch(identity);
+    // The task's earlier PR (a needs-human draft) is reused while it is still open: GitHub allows one open PR per branch.
+    const earlier = prs.filter(pr => pr.state === 'opened' && pr.headBranch === branch && pr.base === this.#config.baseBranch
+      && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).at(-1);
+    const live = earlier ? await this.#pulls.findOpened({ base: earlier.base, headBranch: branch, marker: marker(earlier.openingId) }, signal) : null;
+    signal?.throwIfAborted();
+    await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+    signal?.throwIfAborted();
+    if (earlier && live) {
+      if (live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
+      this.#store.assertReadyToRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
+      const pr = await this.#pulls.refresh(live.number, {
+        base: earlier.base, headBranch: branch, draft, ready: !draft, marker: marker(earlier.openingId),
+        title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
+      }, signal);
+      const status = this.#store.recordPullRequestOpened(identity, earlier.openingId, pr, snapshot.head);
+      return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+    }
+    // The last await before the irreversible call is behind us: beginPullRequest re-reads the task state in its transaction.
+    const opening = this.#store.beginPullRequest(identity, {
+      checkId: check.id, repository: this.#config.repository, base: this.#config.baseBranch, headBranch: branch, headSha: snapshot.head, draft,
+    });
+    const pr = await this.#pulls.open({
+      base: opening.base, headBranch: branch, draft, marker: marker(opening.openingId),
+      title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(opening.openingId), problems: input.problems }),
+    }, signal);
+    const status = this.#store.recordPullRequestOpened(identity, opening.openingId, pr);
+    return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+  }
+
+  /** An opening whose GitHub outcome was lost (a crash or a timeout): adopt the PR if GitHub has it, else abandon it. */
+  async #recover(identity: PlanIdentity, signal?: AbortSignal): Promise<PublishOutcome | null> {
+    const lost = this.#store.taskPullRequests(identity).find((pr: TaskPullRequest) => pr.state === 'opening');
+    if (!lost) return null;
+    if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
+    const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal);
+    signal?.throwIfAborted();
+    if (!pr) { this.#store.abandonPullRequestOpening(identity, lost.openingId); return null; }
+    const status = this.#store.recordPullRequestOpened(identity, lost.openingId, pr);
+    return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+  }
+}
