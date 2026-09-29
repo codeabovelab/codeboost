@@ -119,9 +119,10 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
 
 /**
  * Crash recovery for one database (#51 item 4). Acts only on objects whose `io.codeboost.runner` label is
- * `runnerOwner`: it removes agent containers, egress proxies, seeders and networks, and resolves only once they are
- * gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per allocation. Objects from
- * older builds without a runner label, and anything it does not recognise, are reported and never touched.
+ * `runnerOwner`: it removes agent containers, egress proxies, seeders, export containers and networks, and resolves
+ * only once they are gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per
+ * allocation. Objects from older builds without a runner label, and anything it does not recognise, are reported and
+ * never touched.
  *
  * Call it only while holding the database's single-runner lock and before admitting work: it removes every agent
  * container of this runner. It refuses to run while this process holds task storage of the runner, which every agent

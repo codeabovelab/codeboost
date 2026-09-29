@@ -82,10 +82,11 @@ Use only these entry points to run an agent:
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before
    `removeTaskFilesystems`. `base` is the full ID of the last commit codeboost made in that storage. It returns at
    most 1 MiB of diff (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
-   A changed file over 8 MiB or an untracked nested repository appears as a `codeboost:` notice line, not a diff.
+   A changed file over 8 MiB, an untracked nested repository, or a path Git will not add appears as a `codeboost:`
+   notice line, not a diff.
 6. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
-   token. It removes agent containers, egress proxies, seeders and networks, and resolves once they are gone. It keeps
+   token. It removes agent containers, egress proxies, seeders, export containers and networks, and resolves once they are gone. It keeps
    task storage whole (both volumes and the keeper) and returns one recovery handle per allocation, carrying its
    attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without

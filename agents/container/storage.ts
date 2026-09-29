@@ -334,7 +334,15 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
       'find /run/codeboost-staging -mindepth 1 -maxdepth 1 ! -name .git'
         + ' -exec cp -a --no-preserve=ownership,timestamps -t /work/ {} +',
       'cp -a --no-preserve=ownership,timestamps /run/codeboost-staging/.git/. /metadata/', 'mkdir -p /work/.git',
-      'chown -R 10001:10001 /work /metadata'].join('; ');
+      'chown -R 10001:10001 /work /metadata',
+      // The copy gave every file new timestamps and inodes, so the copied index sees every tracked file as changed.
+      // Refresh it once, after the chown (which changes ctimes) and a second after the copy, so no entry is racily
+      // clean. The volumes stay mounted behind the keeper, so these stat values hold for later containers.
+      'sleep 1',
+      'GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null git --git-dir=/metadata --work-tree=/work -c safe.directory=*'
+        + ' -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.bigFileThreshold=8m update-index -q --refresh'
+        + ' >/dev/null',
+      'chown 10001:10001 /metadata/index'].join('; ');
     // Create and start separately: once the create returns, the keeper is ours by ID even if its start fails.
     const keeperId = yield* allocate(keeper, ['create', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m', '--cpus=.25',
@@ -578,7 +586,7 @@ const EXPORT_SCRIPT = [
   '  # Tracked changes: the real index, read only, without the large files.',
   '  excluded=()',
   '  while IFS= read -r -d "" path; do excluded+=(":(exclude,literal)$path"); done < /tmp/export-large',
-  '  if [ "${#excluded[@]}" -gt 1000 ]; then echo "more than 1,000 changed files are over 8 MiB" >&2; exit 7; fi',
+  '  if [ "${#excluded[@]}" -gt 1000 ]; then exit 7; fi',
   '  g diff --ignore-submodules=dirty --binary --no-color --no-ext-diff --no-textconv "$base" -- . \\',
   '    ${excluded[@]+"${excluded[@]}"}',
   '  # One perl pass splits the untracked list at C speed, reading all of it so Git never writes to a closed pipe:',
@@ -653,6 +661,7 @@ const EXPORT_SCRIPT = [
   '  echo "git could not read part of the task worktree: $(printf %s "$failure" | head -c 300 | tr -d "\\000-\\010\\013-\\037")" >&2',
   '  exit 6',
   'fi',
+  'if [ "${statuses[0]}" -eq 7 ]; then echo "more than 1,000 changed files are over 8 MiB; the diff cannot be exported" >&2; exit 7; fi',
   'if [ "${statuses[0]}" -ne 0 ] && [ "${statuses[0]}" -ne 141 ]; then echo "git failed while exporting the diff (status ${statuses[0]})" >&2; exit 4; fi',
   'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');

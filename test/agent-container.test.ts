@@ -836,6 +836,19 @@ describe('real Docker agent isolation', () => {
       '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');
   }, 120_000);
 
+  it('exports freshly seeded storage without treating every tracked file as changed', async () => {
+    // A large tracked file the agent never touches, and an edit made without Git, as an agent that never commits
+    // leaves it: nothing refreshes the index after seeding except the seeder itself.
+    const data = fixture({ limits: { workBytes: 48 * 1024 * 1024, workInodes: 512, metadataBytes: 48 * 1024 * 1024,
+      metadataInodes: 512 }, hostile: source => writeFileSync(join(source, 'untouched-big.bin'), randomBytes(9 * 1024 * 1024)) });
+    docker('run', '--rm', '--network=none', '--user', '10001:10001',
+      '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`, '--entrypoint', 'sh', imageId, '-c',
+      'printf "edited\\n" > /work/file.txt');
+    const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
+    expect(text).toContain('+edited');
+    expect(text).not.toContain('untouched-big.bin');
+  }, 180_000);
+
   it('names files over 8 MiB instead of diffing them, so one large file cannot exhaust memory or the deadline', async () => {
     const data = fixture({ limits: { workBytes: 96 * 1024 * 1024, workInodes: 512, metadataBytes: 64 * 1024 * 1024,
       metadataInodes: 512 } });
