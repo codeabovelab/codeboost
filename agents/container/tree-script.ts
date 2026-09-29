@@ -3,8 +3,8 @@
  * so the seeder's metadata baseline and a later inspection compute the metadata digest the same way:
  *
  * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime,
- *   link target and, outside `objects/`, a regular file's content. Content is hashed rather than trusted to the times,
- *   which a write does not always move; object files are content-addressed and most of the volume, so they are not.
+ *   link target and a regular file's content. Content is hashed rather than trusted to the times, which a write does
+ *   not always move; loose objects and packs, which are named by their content and most of the volume, are not.
  * - `snapshot <link>...` (in /work) resolves each declared link as the kernel would in an agent container, one part at
  *   a time, and records the state of its target and everything beneath it.
  * - `inspect <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of `base`,
@@ -84,8 +84,9 @@ sub metadata_digest {
     my $path = shift @pending; my $full = $path eq "." ? $root : "$root/$path";
     my @stat = lstat $full; fail(6, "could not stat metadata " . shown($path) . ": $!") unless @stat;
     my ($link, $directory, $file) = (-l _, -d _, -f _);
-    # Object files are content-addressed and make up most of the volume; hashing them would slow every allocation.
-    my $content = $link ? readlink $full : $file && $path !~ m{^objects/} ? file_digest($full) : "";
+    # Loose objects and packs are named by their content and make up most of the volume; hashing them would slow every
+    # allocation. Every other file (pack indexes, info/alternates, refs, the index) is hashed.
+    my $content = $link ? readlink $full : $file && $path !~ m{^objects/(?:[0-9a-f]{2}/[0-9a-f]+|pack/pack-[0-9a-f]+\.pack)\z} ? file_digest($full) : "";
     $sha->add(join("\0", $path, @stat[1, 2, 4, 5, 7, 10, 9], $content), "\0");
     unshift @pending, map { join_path($path, $_) } children($full) if $directory;
   }
@@ -107,9 +108,10 @@ my @GIT = ("git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/d
   "-c", "core.trustctime=true", "-c", "core.checkStat=default", "-c", "core.filemode=true", "-c", "core.symlinks=true",
   "-c", "core.ignoreStat=false", "-c", "core.safecrlf=false", "-c", "core.untrackedCache=false");
 sub exit_reason { my $status = shift; return $status == -1 ? "could not start" : ($status & 127) ? "killed by signal " . ($status & 127) : "status " . ($status >> 8) }
-# Run Git in the work tree, optionally feeding it a file, and return its standard output. With $strict, anything Git
-# writes to stderr fails the run: an error it reports but survives (an encoding it could not apply) means an answer
-# that is not what a commit would store.
+# Run Git in the work tree, optionally feeding it a file, and return its standard output. With $strict, an error Git
+# reports but survives (an encoding it could not apply) fails the run: the answer is not what a commit would store.
+# A warning does not: Git has ignored something (a negative attribute pattern, a symlinked .gitattributes, a macro
+# where macros are not allowed) exactly as a commit would, so the answer still holds. Any other line fails it too.
 my $stderr_file = "/tmp/git-stderr";
 sub git_in {
   my ($input, $strict, @args) = @_;
@@ -122,12 +124,18 @@ sub git_in {
   local $/; my $output = <$out> // ""; close $out;
   my $errors = "";
   if ($strict && open(my $captured, "<", $stderr_file)) { $errors = <$captured> // ""; close $captured }
-  my ($first) = split /\n/, $errors;
+  # A warning can run over several lines; a line that follows one without a prefix of its own belongs to it.
+  my ($first, $in_warning);
+  for my $line (split /\n/, $errors) {
+    if ($line =~ /^warning: /) { $in_warning = 1; next }
+    if ($line =~ /^(?:error|fatal): / || !$in_warning) { $first = $line; last }
+  }
   # Name the Git command itself, past any "-c name=value" pairs in front of it.
   my @rest = @args; splice @rest, 0, 2 while @rest && $rest[0] eq "-c";
   # Git's line can quote an agent-chosen name: it stays one line of printable ASCII.
   (my $line = substr($first // "", 0, 300)) =~ s/([^\x20-\x7e])/sprintf("\\x%02x", ord $1)/ge;
-  fail(4, "git $rest[0] failed (" . exit_reason($?) . ")" . ($line ne "" ? ": $line" : "")) if $? || $errors ne "";
+  fail(4, "git $rest[0] " . ($? ? "failed (" . exit_reason($?) . ")" : "reported an error") . ($line ne "" ? ": $line" : ""))
+    if $? || defined $first;
   return $output;
 }
 sub git { return git_in(undef, 0, @_) }
@@ -257,8 +265,12 @@ if ($mode eq "snapshot") { emit({ links => [map { resolve($_, 1) } @ARGV] }) }
 fail(2, "unknown mode") unless $mode eq "inspect";
 my $base = shift @ARGV;
 fail(3, "base is not a full commit ID") unless $base =~ /^[0-9a-f]{40}([0-9a-f]{24})?$/;
-my $exists = system(@GIT, "cat-file", "-e", "$base^{commit}");
-fail(4, "git cat-file failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127);
+# --verify -q exits 1, silently, for a name that is not a commit here; anything else is Git failing.
+my $exists = do {
+  my $pid = open(my $out, "-|", @GIT, "rev-parse", "--verify", "-q", "$base^{commit}") or fail(4, "could not run git: $!");
+  local $/; my $ignored = <$out>; close $out; $?;
+};
+fail(4, "git rev-parse failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127) || ($? >> 8) > 1;
 fail(3, "base $base is not a commit in this task storage") if $exists != 0;
 my $link_count = shift @ARGV;
 fail(2, "bad link count") unless defined $link_count && $link_count =~ /^\d+$/ && $link_count <= @ARGV;
@@ -362,6 +374,14 @@ my @commitable = grep { $work{$_}{type} eq "file" && !under_git_path($_) } sort 
 if (@commitable) {
   local $ENV{GIT_INDEX_FILE} = "/tmp/scratch-index";
   git("read-tree", $base);
+  # What is gone, or is no longer the same type, leaves the scratch index first, as git add -A handles it: Git reads a
+  # deleted .gitattributes from the index, and must not hash the rest with rules the work tree no longer has.
+  my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} } sort keys %base;
+  if (@gone) {
+    open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
+    print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");
+    git_in("/tmp/removed-paths", 1, "update-index", "--force-remove", "-z", "--stdin");
+  }
   open(my $list, ">", "/tmp/hash-paths") or fail(4, "could not write the paths to hash: $!");
   print $list map { "$_\0" } @commitable; close $list or fail(4, "could not write the paths to hash: $!");
   # A path that replaces a base file or directory (docs becoming docs/api/x) replaces its entries.

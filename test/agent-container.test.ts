@@ -1150,10 +1150,36 @@ describe('real Docker agent isolation', () => {
       const data = fixture();
       const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
       asAgent(data.filesystems, 'printf "file.txt working-tree-encoding=NOPE-ENC\\n" > .gitattributes');
-      await expect(inspect()).rejects.toThrow(/git update-index failed \(status 0\): error: failed to encode/);
+      await expect(inspect()).rejects.toThrow(/git update-index reported an error: error: failed to encode/);
       // A fifo where Git reads attributes would block it until the deadline.
       asAgent(data.filesystems, 'rm .gitattributes && mkfifo .gitattributes');
       await expect(inspect()).rejects.toThrow(/exit 6\): the attributes file \.gitattributes is not a regular file/);
+    }, 180_000);
+
+    it('hashes with the attributes the work tree has: a deleted .gitattributes no longer applies', async () => {
+      const data = fixture({ hostile: source => writeFileSync(join(source, '.gitattributes'), '*.txt text\n') });
+      asAgent(data.filesystems, 'rm .gitattributes && printf "trusted\\r\\n" > file.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      // Without the text attribute, git add stores the CRLF.
+      expect(manifest.changes).toEqual(expect.arrayContaining([expect.objectContaining({ kind: 'delete', path: '.gitattributes' }),
+        expect.objectContaining({ kind: 'modify', path: 'file.txt',
+          newOid: createHash('sha1').update('blob 9\0trusted\r\n').digest('hex') })]));
+    }, 180_000);
+
+    it('inspects a repository whose attribute files make Git warn, as a commit of it would succeed', async () => {
+      const data = fixture({ hostile: source => {
+        // A negative pattern, a macro where macros are not allowed, and a symlinked .gitattributes: Git warns about
+        // each and ignores it, as it does on commit.
+        writeFileSync(join(source, '.gitattributes'), '!foo text\n');
+        mkdirSync(join(source, 'v')); writeFileSync(join(source, 'v', '.gitattributes'), '[attr]mybin -diff -text\n');
+        writeFileSync(join(source, 'v', 'a.txt'), 'a\n');
+        mkdirSync(join(source, 'c')); writeFileSync(join(source, 'c', 'attrs'), '*.txt text\n');
+        mkdirSync(join(source, 'w')); symlinkSync('../c/attrs', join(source, 'w', '.gitattributes'));
+        writeFileSync(join(source, 'w', 'b.txt'), 'b\n');
+      } });
+      asAgent(data.filesystems, 'printf "edited\\n" > v/a.txt && printf "edited\\n" > w/b.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(manifest.changes.map(change => change.path)).toEqual(['v/a.txt', 'w/b.txt']);
     }, 180_000);
 
     it('reads every file: an edit the index vouches for is still a change', async () => {
