@@ -95,10 +95,8 @@ export interface ProcessControl {
 export const hostProcesses: ProcessControl = {
   isAlive(pgid, startedAt) {
     try { process.kill(-pgid, 0); } catch { return false; }
-    try {
-      const started = Date.parse(execFileSync('ps', ['-o', 'lstart=', '-p', String(pgid)], { encoding: 'utf8' }).trim());
-      return Number.isFinite(started) && Math.abs(started - startedAt) < 2_000;
-    } catch { return true; } // Alive but unreadable: treat as ours and stop it (fail closed).
+    try { return startTimeMatches(execFileSync('ps', ['-o', 'lstart=', '-p', String(pgid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }), startedAt); }
+    catch { return true; } // Alive but unreadable: treat as ours and stop it (fail closed).
   },
   async terminate(pgid, graceMs) {
     const alive = () => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
@@ -109,6 +107,12 @@ export const hostProcesses: ProcessControl = {
     while (alive()) await new Promise(resolve => setTimeout(resolve, 50));
   },
 };
+
+/** Whether `ps -o lstart=` output names the recorded start time. An unreadable time counts as a match (fail closed). */
+export function startTimeMatches(lstart: string, startedAt: number): boolean {
+  const started = Date.parse(lstart.trim());
+  return !Number.isFinite(started) || Math.abs(started - startedAt) < 2_000;
+}
 
 export interface RecoveredStorage { readonly attemptId: string; readonly allocationId: string; readonly handle: unknown }
 export interface RecoveryDeps {
@@ -156,14 +160,17 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     const attempt = interrupted.find(a => a.id === storage.attemptId);
     if (!attempt || !WRITABLE_KINDS.includes(attempt.kind)) continue;
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(new Error('Export timed out.')), o.exportDeadlineMs ?? 60_000);
+    const exporting = o.deps.exportTaskDiff(storage.handle, EXPORT_LIMIT, controller.signal);
     try {
-      const diff = await Promise.race([o.deps.exportTaskDiff(storage.handle, EXPORT_LIMIT, controller.signal),
+      const diff = await Promise.race([exporting,
         new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }))]);
       const file = join(o.diagnosticsDir, `${storage.attemptId}.diff`);
       writeFileSync(file, diff.subarray(0, EXPORT_LIMIT), { mode: 0o600 });
       exports[storage.attemptId] = { diagnosticRef: file };
     } catch (error) { exports[storage.attemptId] = { failure: error instanceof Error ? error.message : String(error) }; }
     finally { clearTimeout(timer); }
+    // A timed-out export must stop before step 4 removes its storage. D stops on abort; if it does not, fail closed.
+    if (controller.signal.aborted) await stopped(exporting, o.graceMs ?? 5_000, storage.attemptId);
   }
   // 3. Finalization phase: one transaction; a failure stops startup.
   const finalized = o.store.recoverInterrupted(now(), exports);
@@ -173,6 +180,8 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     await o.deps.abortRebase(rebase.planKey, rebase.marker);
   }
   for (const storage of matched) await o.deps.removeTaskFilesystems(storage.handle);
+  // Step 7's set, read after finalization so it also holds preparations an earlier startup already finalized.
+  const blocked = [...new Set([...unowned, ...o.store.unownedPreparations()])];
   const removedDirectories: string[] = [], unknownEntries: string[] = [];
   const attemptsDir = join(o.runnerRoot, o.runnerOwner, 'attempts');
   const rootDev = lstatSync(o.runnerRoot, { throwIfNoEntry: false })?.dev;
@@ -180,15 +189,22 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     const entry = join(attemptsDir, name), st = lstatSync(entry);
     const owned = st.isDirectory() && !st.isSymbolicLink() && st.dev === rootDev && isUuidV4(name) && o.store.attemptOwner(name) !== null;
     if (!owned) { unknownEntries.push(entry); continue; }
-    if (unowned.includes(name)) continue; // step 7 keeps it for --release-preparation
+    if (blocked.includes(name)) continue; // step 7 keeps it for --release-preparation
     rmSync(entry, { recursive: true, force: true }); removedDirectories.push(entry);
   }
   // 5. Confirmed merges get their closed status and task-closed event.
   const repairedMerges = o.store.reconcileMergedTasks();
   // 7. An unidentifiable preparation child may exist: fail closed until the user releases it.
-  const blocked = [...unowned, ...o.store.unownedPreparations().filter(id => !unowned.includes(id))];
   if (blocked.length) throw new RecoveryBlocked('Preparation started but its process was never recorded; stop it, then run --release-preparation', blocked);
   return { finalized, requeue: finalized.filter(f => f.requeued).map(f => f.planKey), removedDirectories, unknownEntries, unmatchedStorage, repairedMerges };
+}
+
+/** Wait for an aborted export to settle, up to graceMs; otherwise stop startup before its storage is touched. */
+async function stopped(exporting: Promise<unknown>, graceMs: number, attemptId: string): Promise<void> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const settled = await Promise.race([exporting.then(() => true, () => true), new Promise<false>(resolve => { timer = setTimeout(() => resolve(false), graceMs); })]);
+  clearTimeout(timer);
+  if (!settled) throw new RecoveryBlocked('A partial-output export did not stop after its deadline; its task storage was left in place', [attemptId]);
 }
 
 /** --release-preparation: remove an attempt directory only when no process has a file open or a working directory in it. */
@@ -205,6 +221,8 @@ export function releasePreparation(o: { store: Store; runnerRoot: string; runner
 }
 /** Processes with a file open or a working directory under dir. Throws if the check cannot run (fail closed). */
 export function hostOpenFiles(dir: string): string[] {
+  // /proc links and lsof report resolved paths, so compare against the resolved directory.
+  dir = realpathSync(dir);
   if (process.platform === 'linux') {
     const users: string[] = [];
     for (const pid of readdirSync('/proc').filter(name => /^\d+$/.test(name))) {

@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { LockHeld, RecoveryBlocked, acquireRunnerLock, recoverStartup, releasePreparation, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
+import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, recoverStartup, releasePreparation, startTimeMatches, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -218,12 +218,27 @@ describe('startup recovery sequence', () => {
     const attempt = admit(id(1)); store.markRunning(id(1), attempt.id);
     const { d, calls } = deps({
       recoverLeftovers: async () => ({ storage: [{ attemptId: attempt.id, allocationId: randomUUID(), handle: 'h' }], unowned: [] }),
-      exportTaskDiff: () => new Promise(() => undefined),
+      // D's export stops a moment after its signal aborts.
+      exportTaskDiff: (_h, _m, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => setTimeout(() => { calls.push('export-stopped'); reject(signal.reason); }, 40), { once: true })),
     });
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d, exportDeadlineMs: 30 });
     expect(store.getAttempt(id(1), attempt.id)).toMatchObject({ state: 'failed', diagnosticRef: null });
     expect(store.getAttempt(id(1), attempt.id).diagnostic).toMatch(/Partial output could not be exported: Export timed out/);
-    expect(calls).toContain('remove:h');
+    // The storage is removed only after the export stopped using it.
+    expect(calls.indexOf('export-stopped')).toBeGreaterThan(-1);
+    expect(calls.indexOf('remove:h')).toBeGreaterThan(calls.indexOf('export-stopped'));
+  });
+  it('stops startup, leaving storage and the attempt untouched, when a timed-out export does not stop', async () => {
+    const { d: root, store, admit } = fixture();
+    const attempt = admit(id(1)); store.markRunning(id(1), attempt.id);
+    const { d, calls } = deps({
+      recoverLeftovers: async () => ({ storage: [{ attemptId: attempt.id, allocationId: randomUUID(), handle: 'h' }], unowned: [] }),
+      exportTaskDiff: () => new Promise(() => undefined),
+    });
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d, exportDeadlineMs: 30, graceMs: 30 }))
+      .rejects.toThrow(/did not stop/);
+    expect(calls.some(c => c.startsWith('remove'))).toBe(false);
+    expect(store.getAttempt(id(1), attempt.id).state).toBe('running');
   });
   it('removes nothing when the finalization transaction fails', async () => {
     const { d: root, store, admit } = fixture();
@@ -253,9 +268,29 @@ describe('startup recovery sequence', () => {
     const run = () => recoverStartup({ store, runnerOwner: token, runnerRoot, diagnosticsDir: join(root, 'd'), deps: deps().d });
     await expect(run()).rejects.toBeInstanceOf(RecoveryBlocked);
     expect(existsSync(dirPath)).toBe(true);
+    // A second startup finds the attempt already finalized, and still keeps its directory for the release check.
+    await expect(run()).rejects.toBeInstanceOf(RecoveryBlocked);
+    expect(existsSync(dirPath)).toBe(true);
     expect(() => releasePreparation({ store, runnerRoot, runnerOwner: token, attemptId: attempt.id, openFiles: () => ['4242'] })).toThrow(/still using/);
     releasePreparation({ store, runnerRoot, runnerOwner: token, attemptId: attempt.id, openFiles: () => [] });
     expect(existsSync(dirPath)).toBe(false);
     await expect(run()).resolves.toMatchObject({ finalized: [] });
+  });
+});
+
+describe('host process checks', () => {
+  it('treats a start time it cannot read as a match, so a live group is still stopped', () => {
+    const at = Date.parse('Sat Sep 26 02:01:04 2026');
+    expect(startTimeMatches('Sat Sep 26 02:01:04 2026\n', at)).toBe(true);
+    expect(startTimeMatches('Sat Sep 26 02:01:04 2026', at + 60_000)).toBe(false);
+    // procps under a Japanese locale; Date.parse cannot read it.
+    expect(startTimeMatches('土  9月 26 02:01:04 2026', at + 60_000)).toBe(true);
+  });
+  it('finds a process working in the attempt directory when the path goes through a symlink', async () => {
+    const root = dir(), real = join(root, 'real'), attempt = join(real, 'attempt');
+    mkdirSync(attempt, { recursive: true }); symlinkSync(real, join(root, 'link'));
+    const child = spawn('sleep', ['30'], { cwd: attempt, stdio: 'ignore' }); children.push(child);
+    await once(child, 'spawn');
+    expect(hostOpenFiles(join(root, 'link', 'attempt'))).toContain(String(child.pid));
   });
 });
