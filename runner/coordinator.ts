@@ -20,7 +20,10 @@ export interface RunnerDeps {
    * It never leaves work running after it settles.
    */
   prepare(attempt: AttemptRecord, signal: AbortSignal): Promise<PreparedAttempt>;
-  /** Remove host-side preparation files only. Task storage waits for the terminal write. */
+  /**
+   * Remove host-side preparation files only: before the terminal write when D never ran, after it once D settled.
+   * Task storage waits for the terminal write.
+   */
   cleanupPreparation(attempt: AttemptRecord): Promise<void>;
   /** D's start call: returns a handle at once, or throws with nothing left running. */
   start(input: InvocationInput, prepared: PreparedAttempt): InvocationHandle;
@@ -41,7 +44,7 @@ export interface RunnerStatus {
 type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
-  firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean;
+  firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean; staleCause?: string;
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: 'result-not-saved' | 'start-not-saved' }
@@ -49,6 +52,7 @@ interface Marker { group: Group; attemptId: string; reason: 'result-not-saved' |
 const D_REASON: Record<FirstReason, StopReason> = { cancelled: 'cancelled', stale: 'cancelled', shutdown: 'shutdown', 'time-limit': 'timeout' };
 /** setTimeout accepts at most 2^31-1 ms; longer waits are re-armed. */
 const MAX_TIMER = 2_147_483_647;
+const PREPARATION_TIMEOUT = 'Timed out while preparing.';
 
 /**
  * One runner coordinator per process and Store. Owns in-memory jobs, slots and unresolved markers.
@@ -101,11 +105,16 @@ export class RunnerCoordinator {
   retry(identity: PlanIdentity, attemptId: string, request: Omit<StartRequest, 'retryOf'>): AttemptRecord {
     return this.start(identity, { ...request, retryOf: attemptId });
   }
-  /** User stop or detected staleness. The first reason wins; nothing is freed until settlement. */
-  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale'): boolean {
+  /**
+   * User stop or detected staleness. The first reason wins; nothing is freed until settlement.
+   * `cause` says what made the attempt stale (for example "plan revision 4 replaced 3") and is kept only if `stale` wins.
+   */
+  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale', cause?: string): boolean {
     const job = this.#jobs.get(identityKey(identity));
     if (!job || job.attemptId !== attemptId) return false;
-    return this.#requestStop(job, reason);
+    const won = this.#requestStop(job, reason);
+    if (won && reason === 'stale' && cause !== undefined) job.staleCause = bounded(cause);
+    return won;
   }
   /** Cancel task: the Store records the reason and the pending close; the coordinator stops the running work. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
@@ -163,7 +172,7 @@ export class RunnerCoordinator {
     };
     const budget = this.#store.getTask(job.identity).budgetDeadline;
     if (budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
-    at(attempt.deadline, () => { if (!job.handle && !job.firstReason) { job.preparationTimedOut = true; job.controller.abort(new Error('Timed out while preparing.')); } });
+    at(attempt.deadline, () => { if (!job.handle && !job.firstReason) { job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT)); } });
   }
   async #run(job: Job, attempt: AttemptRecord): Promise<void> {
     try {
@@ -179,7 +188,7 @@ export class RunnerCoordinator {
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
       if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
       if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}); }
-      if (now >= attempt.deadline) return await this.#endBeforeLaunch(job, attempt, { stopReason: 'timeout', detail: 'Timed out while preparing.' });
+      if (now >= attempt.deadline) return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT });
       if (!sameContext(row.context, this.#store.currentContext(job.identity))) return await this.#endBeforeLaunch(job, attempt, {});
       let handle: InvocationHandle;
       try {
@@ -213,7 +222,11 @@ export class RunnerCoordinator {
         try { value = this.#deps.validate(attempt, result); valid = true; }
         catch (error) { detail = `Invalid output: ${message(error)}`; }
       }
-      this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
+      // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
+      if (job.firstReason === 'stale') detail = job.staleCause;
+      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail });
+      // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
+      if (saved) await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
     } finally {
       for (const timer of job.timers) clearTimeout(timer);
       if (this.#jobs.get(job.key) === job) this.#jobs.delete(job.key);
@@ -225,14 +238,15 @@ export class RunnerCoordinator {
     this.#unreleased = [...(this.#unreleased ?? []), ...result.unreleased];
     console.error(`Runner job ${result.attemptId} left resources whose removal was not confirmed; new work is refused until restart.`);
   }
-  #preparationDetail(job: Job, error?: unknown): { stopReason?: StopReason; detail?: string } {
-    if (job.preparationTimedOut && !job.firstReason) return { stopReason: 'timeout', detail: 'Timed out while preparing.' };
+  #preparationDetail(job: Job, error?: unknown): { detail?: string } {
+    // D never ran, so there is no D stop reason; without one the Store keeps this text instead of "Timed out.".
+    if (job.preparationTimedOut && !job.firstReason) return { detail: PREPARATION_TIMEOUT };
     return error === undefined || job.firstReason ? {} : { detail: `Preparation failed: ${message(error)}` };
   }
   /** Ending without a handle: host-side cleanup, then the terminal write from the first reason. */
-  async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { stopReason?: StopReason; detail?: string }): Promise<void> {
+  async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }): Promise<void> {
     await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
-    this.#settle(job, { stopReason: s.stopReason, exitCode: null, signal: null, valid: false, detail: s.detail });
+    this.#settle(job, { exitCode: null, signal: null, valid: false, detail: job.firstReason === 'stale' ? job.staleCause : s.detail });
   }
   #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string }): Classification | undefined {
     try {

@@ -71,17 +71,39 @@ async function until(check: () => boolean, label: string) {
 }
 
 describe('admission and slots', () => {
-  it('runs an attempt to completion and frees its slot', async () => {
-    const { store, runner, launches, preparations } = setup();
+  it('runs an attempt to completion, removes its preparation files and frees its slot', async () => {
+    const { store, runner, launches, preparations, cleaned } = setup();
     const attempt = runner.start(A, request(store, A));
     await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
     await until(() => launches.length === 1, 'launch');
     expect(launches[0]!.input.runnerOwner).toBe(RUNNER_OWNER);
     expect(store.getAttempt(A, attempt.id).state).toBe('running');
+    expect(cleaned()).toBe(0);
     launches[0]!.settle();
     await runner.settled(A);
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'completed', result: { text: 'done' } });
+    expect(cleaned()).toBe(1);
     expect(runner.isActive(A)).toBe(false);
+  });
+  it('records the stale cause, not the agent stderr', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    runner.stop(A, attempt.id, 'stale', 'plan revision 2 replaced 1');
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled', stderr: 'npm ERR! killed' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', diagnostic: 'plan revision 2 replaced 1' });
+  });
+  it('uses the default stale text, not stderr, when no cause is given', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    runner.stop(A, attempt.id, 'stale');
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled', stderr: 'npm ERR! killed' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', diagnostic: 'The plan, snapshot, assignment or referenced code changed.' });
   });
   it('lets exactly one of two same-tick admissions take the single writable slot', () => {
     const { store, runner } = setup();
@@ -182,8 +204,8 @@ describe('storage failures', () => {
     await runner.settled(A);
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
   });
-  it('holds the slot under an unresolved marker when the terminal write fails', async () => {
-    const { store, runner, launches, preparations } = setup();
+  it('holds the slot under an unresolved marker, and keeps preparation files, when the terminal write fails', async () => {
+    const { store, runner, launches, preparations, cleaned } = setup();
     const attempt = runner.start(A, request(store, A));
     await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
     await until(() => launches.length === 1, 'launch');
@@ -191,6 +213,7 @@ describe('storage failures', () => {
     launches[0]!.settle();
     await runner.settled(A);
     expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'result-not-saved' });
+    expect(cleaned()).toBe(0);
     expect(() => runner.start(A, request(store, A))).toThrow(/Needs restart/);
     expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
   });
@@ -274,8 +297,20 @@ describe('cancel task, limits and shutdown', () => {
     const attempt = runner.start(A, request(store, A, { deadline: Date.now() + 30 }));
     await runner.settled(A);
     expect(launches).toHaveLength(0);
-    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Timed out.' });
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Timed out while preparing.' });
     expect(store.getTask(A).status).toBe('running');
+  });
+  it('fails without calling D when the launch check sees an expired attempt deadline', async () => {
+    let clock = Date.now();
+    const { store, runner, launches, preparations, deps } = setup();
+    deps.now = () => clock;
+    const attempt = runner.start(A, request(store, A, { deadline: clock + 60_000 }));
+    await until(() => preparations.length === 1, 'preparation');
+    clock += 61_000;
+    preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(launches).toHaveLength(0);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Timed out while preparing.' });
   });
   it('rejects new work once shutdown starts and waits for D to settle', async () => {
     const { store, runner, launches, preparations } = setup();
@@ -302,6 +337,20 @@ describe('cancel task, limits and shutdown', () => {
     await closing;
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: 'shutdown', diagnostic: 'Timed out.' });
   });
+  it('keeps an unsaved stop reason when shutdown arrives', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    vi.spyOn(store, 'recordFirstReason').mockImplementation(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    runner.stop(A, attempt.id, 'stale');
+    const closing = runner.close();
+    expect(launches[0]!.cancels).toEqual(['cancelled', 'cancelled']);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'stale', saved: false });
+    launches[0]!.settle({ exitCode: null, stopReason: 'cancelled' });
+    await closing;
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
+  });
   it('keeps an existing stop reason when shutdown arrives', async () => {
     const { store, runner, launches, preparations } = setup();
     const attempt = runner.start(A, request(store, A));
@@ -309,6 +358,8 @@ describe('cancel task, limits and shutdown', () => {
     await until(() => launches.length === 1, 'launch');
     runner.stop(A, attempt.id, 'stale');
     const closing = runner.close();
+    expect(launches[0]!.cancels).toEqual(['cancelled', 'cancelled']);
+    expect(runner.status(A).stopRequested).toMatchObject({ reason: 'stale' });
     launches[0]!.settle();
     await closing;
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
