@@ -751,6 +751,9 @@ describe('real Docker agent isolation', () => {
       'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
       'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
       'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link',
+      // Ordinary line-ending attributes make Git warn about these files; a warning must not fail the export.
+      'printf "* text=auto\\n*.bat text eol=crlf\\n" > .gitattributes', 'printf "a\\r\\nb\\r\\n" > crlf.txt',
+      'printf "x\\n" > unix.bat',
       // A nested repository whose name tries to forge a hunk for another file.
       'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
       extra].join('\n'));
@@ -786,6 +789,8 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('+changed');
     expect(text).toContain('b/untracked.txt');
     expect(text).toContain('+brand new');
+    expect(text).toContain('b/crlf.txt');
+    expect(text).toContain('b/unix.bat');
     const cut = await exportTaskDiff(filesystems, { base: data.clone.head, imageId, maxBytes: 20 });
     expect(cut).toEqual({ diff: exported.diff.subarray(0, 20), truncated: true });
     await expect(exportTaskDiff(filesystems, { base: 'c'.repeat(40), imageId })).rejects.toThrow('is not a commit');

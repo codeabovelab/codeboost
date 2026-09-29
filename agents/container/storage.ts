@@ -530,14 +530,15 @@ export interface ExportOptions extends PreparationOptions {
 // stderr also fails it: for a directory or path it cannot read, Git only warns and diffs it as absent.
 // Repository config is trusted: only codeboost writes the metadata volume, which every agent container mounts
 // read-only. Worktree attributes are the agent's, but a filter or diff driver needs config to run anything; external
-// diff programs and text conversion are off, and the worktree and attributes file are pinned.
+// diff programs and text conversion are off, and the worktree and attributes file are pinned. core.safecrlf is off
+// so ordinary line-ending attributes (`text=auto`, `eol=crlf`) do not warn on stderr and fail a correct export.
 const EXPORT_SCRIPT = [
   'set -eu',
   'base=$1 limit=$2',
   'export HOME=/tmp GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null GIT_OPTIONAL_LOCKS=0 GIT_TERMINAL_PROMPT=0 GIT_NO_LAZY_FETCH=1',
   'cd /work',
   'g() { git --no-pager --no-replace-objects -c core.hooksPath=/dev/null -c core.fsmonitor=false -c core.worktree=/work \\',
-  '  -c core.attributesFile=/dev/null "$@"; }',
+  '  -c core.attributesFile=/dev/null -c core.safecrlf=false "$@"; }',
   'g cat-file -e "$base^{commit}" 2>/dev/null || { echo "base $base is not a commit in this task storage" >&2; exit 3; }',
   'produce() {',
   '  set -eo pipefail',
