@@ -849,6 +849,42 @@ describe('real Docker agent isolation', () => {
     expect(text).not.toContain('untouched-big.bin');
   }, 180_000);
 
+  it('names every entry Git would skip without a word, instead of dropping what is inside', async () => {
+    const data = fixture();
+    agentChanges(data.filesystems, [
+      // A tracked directory that becomes a repository: Git no longer looks for new files in it.
+      'mkdir src && printf "a\\n" > src/a.txt && g add src && g commit -qm src',
+      '(cd src && git init -q) && printf "new\\n" > src/new.txt',
+      // Something named .git that is not a repository: Git never lists it or anything inside.
+      'mkdir -p out/.git && printf "payload\\n" > out/.git/payload',
+      'mkfifo pipe',
+      // A directory that ignores itself: Git lists it and its contents, and it is named once.
+      'mkdir gen && printf "*\\n" > gen/.gitignore && printf "important\\n" > gen/code.py',
+      // A clone made on a case-insensitive host (macOS) records core.ignorecase=true; the work volume is case-sensitive,
+      // and with it Git would take .GIT for .git and FILE.txt for the tracked file.txt, and drop both.
+      'g config core.ignorecase true && printf "upper\\n" > FILE.txt'].join(' && '));
+    const text = (await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId })).diff.toString('utf8');
+    expect(text).toContain('codeboost: src/.git is a .git entry, which Git skips');
+    expect(text).toContain('codeboost: out/.git is a .git entry, which Git skips');
+    expect(text).toContain('codeboost: pipe is a fifo or socket; it is not exported');
+    expect(text).toMatch(/^codeboost: untracked gen\/ is ignored; it is not exported$/m);
+    expect(text).not.toContain('gen/code.py');
+    expect(text).toContain('codeboost: untracked .GIT/f is a name Git will not add');
+    expect(text).toContain('+upper');
+    // Covered as a whole already: the untracked nested repository's own .git is not named again.
+    expect(text).toContain('untracked directory nested/ is a nested repository');
+    expect(text).not.toContain('nested/.git');
+  }, 120_000);
+
+  it('says what Git reported when it fails', async () => {
+    const data = fixture();
+    // agentChanges also replaces a tracked directory with a link to /etc/ssl, so Git first prints an error about a file
+    // behind it that does not stop it; the reason must still be the one Git stopped on.
+    agentChanges(data.filesystems, 'rm file.txt && mkfifo file.txt');
+    await expect(exportTaskDiff(data.filesystems, { base: data.clone.head, imageId }))
+      .rejects.toThrow(/git failed while exporting the diff \(status \d+\): error: file\.txt: unsupported file type; fatal: /);
+  }, 120_000);
+
   it('names files over 8 MiB instead of diffing them, so one large file cannot exhaust memory or the deadline', async () => {
     const data = fixture({ limits: { workBytes: 96 * 1024 * 1024, workInodes: 512, metadataBytes: 64 * 1024 * 1024,
       metadataInodes: 512 } });
