@@ -999,7 +999,8 @@ export class Store {
       const task = this.#task(key), owned = refreshed?.stateVersion ?? row.owner_version as number;
       // Every status change and every admission increases the state version, so an unchanged version means the task is
       // still in the status the opening was guarded for (running, or needs human for a draft) with no attempt active.
-      if (task.state_version === owned) {
+      // A needs-human task stays there whatever the PR looks like; only a running task can move to in review.
+      if (task.state_version === owned && task.status === 'running') {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', pr.headSha === expectedHead && !pr.draft ? 'in review' : 'needs human', key);
       }
       this.#touch(key);

@@ -11,7 +11,9 @@ const MAX_PROBLEMS = 20, MAX_PROBLEM = 2000;
  * The fence is longer than any backtick run in the text, so the text cannot end the block.
  */
 export function fenced(text: string): string {
-  const longest = Math.max(0, ...[...text.matchAll(/`+/g)].map(match => match[0].length));
+  // A loop, not Math.max(...runs): plan text is not length-bounded, and spreading every run can overflow the stack.
+  let longest = 0;
+  for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
   const fence = '`'.repeat(Math.max(3, longest + 1));
   return `${fence}text\n${text.replace(/\r\n?/g, '\n')}\n${fence}`;
 }

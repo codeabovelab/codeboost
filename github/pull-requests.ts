@@ -19,7 +19,7 @@ export interface PullRequestGateway {
   open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest>;
   /** The open PR from `headBranch` into `base` whose description carries `marker`, or null when there is none. */
   findOpened(input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest | null>;
-  /** Replaces the title and description of an open PR codeboost opened, and marks it ready for review when `ready`. */
+  /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
   refresh(number: number, input: OpenPullRequestInput & { ready: boolean }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
 
@@ -90,7 +90,9 @@ export class GhPullRequestGateway implements PullRequestGateway {
     const patched = this.#pull(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`,
       '-f', `title=${input.title}`, '-f', `body=${input.body}`], signal), input);
     if (patched.number !== number || !patched.body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
+    // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
+    else if (input.draft && !patched.draft) await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
     const { body, ...pr } = this.#pull(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal), input);
     if (pr.number !== number || !body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
     return pr;

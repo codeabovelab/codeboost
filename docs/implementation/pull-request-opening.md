@@ -63,7 +63,7 @@ Each opening or refresh owns the task state version at the moment it passed step
 |---|---|---|
 | Unchanged, running | Open, head as pushed | in review |
 | Unchanged, running | Open, head on GitHub differs from the pushed head | needs human |
-| Unchanged, needs human | Draft opened or updated | needs human |
+| Unchanged, needs human | Draft opened, or the earlier PR updated and turned back into a draft | needs human |
 | Changed (cancelled, reassigned, new attempt, new head) | Opened | Unchanged; the PR is recorded so it can be reused or closed later |
 
 The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.

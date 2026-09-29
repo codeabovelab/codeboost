@@ -32,7 +32,7 @@ function runningTask(options: { head?: string } = {}) {
 
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
-  push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig> } = {}) {
+  push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 };
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ?? [{ outcome: 'clear', baseHead: oid(9) }];
@@ -47,7 +47,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     async findOpened(input) { log.push(`find ${input.marker}`); return options.found !== undefined ? options.found : live.get(input.marker) ?? null; },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
-      const pr = { ...live.get(input.marker)!, draft: input.draft, headSha: store.getSnapshot(identity).head };
+      const pr = { ...live.get(input.marker)!, draft: options.draftAfterRefresh ?? input.draft, headSha: store.getSnapshot(identity).head };
       live.set(input.marker, pr); return pr;
     },
   };
@@ -235,6 +235,21 @@ describe('recovering a lost opening', () => {
     expect(again.opened[0]!.body).not.toContain('Needs human');
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false, headSha: oid(3), state: 'opened' }]);
   });
+  it('keeps a needs-human task in needs human when it reuses its earlier ready PR, and turns that PR back into a draft', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    expect(store.getTask(identity).status).toBe('in review');
+    rerun(store);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity, { problems: ['still failing'] })).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'needs human' });
+    expect(again.log.at(-1)).toBe('refresh 100 draft');
+    expect(store.getTask(identity).status).toBe('needs human');
+    // Even if GitHub still reports the PR as ready, a needs-human task never moves to in review.
+    rerun(store);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    expect(await harness(store, { live, next, draftAfterRefresh: false }).publisher.publish(identity, { problems: ['x'] })).toMatchObject({ draft: false, status: 'needs human' });
+  });
   it('opens a new PR when the earlier draft was closed, and still excludes the old draft from the check', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
@@ -264,6 +279,9 @@ describe('the PR description', () => {
     expect(body.split('\n').slice(0, 2)).toEqual(['<!-- codeboost:opening=00000000-0000-4000-8000-000000000000 -->', 'Fixes #12']);
     expect(body).toContain('````text\nP1: Guard input\n  Intent: Closes #1 @admin ```\n# injected');
     expect(fenced('a ```` b')).toMatch(/^`````text\n/);
+  });
+  it('handles text with very many backtick runs without overflowing the stack', () => {
+    expect(fenced('`a'.repeat(300_000)).startsWith('```text\n')).toBe(true);
   });
   it('lists only item titles when the full plan is too long, and refuses when even that is too long', () => {
     const long: Plan = { ...plan, items: [{ ...plan.items[0]!, intent: 'x'.repeat(MAX_BODY) }] };
@@ -324,6 +342,10 @@ describe('GitHub PR adapter', () => {
     expect(await gh.refresh(7, { ...input, draft: false, ready: true })).toMatchObject({ number: 7, draft: false });
     expect(calls.map(call => call.slice(0, 3))).toEqual([['api', '-X', 'PATCH'], ['pr', 'ready', '7'], ['api', '-H', 'Accept: application/vnd.github+json']]);
     expect(calls[1]).toEqual(['pr', 'ready', '7', '--repo', 'owner/repo']);
+    const undo: string[][] = [];
+    await new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { undo.push([...args]); return args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })); })
+      .refresh(7, { ...input, draft: true, ready: false });
+    expect(undo[1]).toEqual(['pr', 'ready', '7', '--undo', '--repo', 'owner/repo']);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ number: 8 }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/different/);
     // Closed between the lookup and the refresh: refused, so the task never moves to in review without an open PR.
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ state: 'closed' }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/not open/);
