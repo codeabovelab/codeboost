@@ -817,7 +817,7 @@ describe('real Docker agent isolation', () => {
       'printf "gone/\\n" >> .git/info/exclude && mkdir gone && printf "a\\n" > gone/f && g add -f gone/f && g commit -qm gone && chmod 000 gone']) {
       const failing = fixture();
       agentChanges(failing.filesystems, extra);
-      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow(/could not read part of the task worktree|git failed/);
+      await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('could not read part of the task worktree');
     }
     // No export container is left, and the storage still validates for the next launch.
     expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
