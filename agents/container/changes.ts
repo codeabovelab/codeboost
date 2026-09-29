@@ -7,6 +7,8 @@ import { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TA
 export { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES };
 // Walking a large checkout holds every path in memory: more than an export needs.
 const INSPECTION_MEMORY = '1g';
+// The scratch index an inspection hashes into holds an entry for every file of base.
+const INSPECTION_TMP = '512m';
 
 /** What an entry is, as the change manifest reports it. `other` is a fifo, socket or device. */
 export type EntryType = 'file' | 'symlink' | 'gitlink' | 'directory' | 'other';
@@ -181,7 +183,7 @@ export async function snapshotDeclaredLinks(storage: TaskFilesystems | Recovered
   if (paths.length === 0) return deepFreeze({ links: [] });
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Declared link snapshot',
     consequence: 'declared links cannot be recorded', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
-    memory: INSPECTION_MEMORY,
+    memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
     args: ['-e', TREE_SCRIPT, 'snapshot', ...paths] }, { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const snapshot = JSON.parse(stdout) as DeclaredLinkSnapshot;
   if (!Array.isArray(snapshot.links) || snapshot.links.length !== paths.length)
@@ -273,7 +275,7 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
   assertArguments([...links.map(link => link.link), ...targets]);
   const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Task change inspection',
     consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
-    memory: INSPECTION_MEMORY,
+    memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
     args: ['-e', TREE_SCRIPT, 'inspect', options.base, String(links.length), ...links.map(link => link.link), ...targets] },
   { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   const output = JSON.parse(stdout) as InspectOutput;

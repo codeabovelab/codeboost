@@ -22,7 +22,7 @@ export interface TaskFilesystems {
   readonly metadataInodes: number;
   /**
    * SHA-256 over every entry of the metadata volume (path, inode, mode, owner, size, ctime, mtime, link target, and a
-   * file's content), taken by the seeder as its last step. F records it: `inspectTaskChanges` compares it to report any change under `.git`,
+   * file's content outside `objects/`), taken by the seeder as its last step. F records it: `inspectTaskChanges` compares it to report any change under `.git`,
    * and needs it back for a recovery handle.
    */
   readonly metadataBaseline: string;
@@ -360,7 +360,8 @@ function* allocation(clone: TaskClone, limits: TaskStorageLimits, imageId: strin
         + ' >/dev/null',
       'chown 10001:10001 /metadata/index',
       // The baseline of the metadata as it now stands; from here only codeboost may change it.
-      'printf "codeboost-metadata-baseline %s\\n" "$(perl -e "$1" digest /metadata)"'].join('; ');
+      // Assigned first, so a failing digest stops the seeder with Perl's own error.
+      'baseline=$(perl -e "$1" digest /metadata)', 'printf "codeboost-metadata-baseline %s\\n" "$baseline"'].join('; ');
     // Create and start separately: once the create returns, the keeper is ours by ID even if its start fails.
     const keeperId = yield* allocate(keeper, ['create', '--name', keeper, '--read-only', '--user', '10001:10001', '--network=none',
       '--cap-drop=ALL', '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=32', '--memory=128m', '--cpus=.25',
@@ -768,6 +769,8 @@ interface StorageScript {
   readonly maxOutputBytes?: number;
   /** The container's memory limit. Default 256m. */
   readonly memory?: '256m' | '1g';
+  /** The size of its /tmp. Default 64m. */
+  readonly tmpBytes?: '64m' | '512m';
 }
 export interface StorageScriptOptions extends PreparationOptions {
   /** The immutable ID of the built agent image, whose tools run the script. */
@@ -794,7 +797,7 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
     const args = ['run', '--rm', '--name', name, '--label', `io.codeboost.task-storage=${script.kind}`, ...ownerLabelArgs(owner),
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', `--memory=${script.memory ?? '256m'}`, '--cpus=.5',
-      '--tmpfs', '/tmp:rw,nosuid,nodev,noexec,size=64m',
+      '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${script.tmpBytes ?? '64m'}`,
       '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
       '--entrypoint', script.entrypoint, imageId, ...script.args];

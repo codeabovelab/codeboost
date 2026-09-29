@@ -3,8 +3,8 @@
  * so the seeder's metadata baseline and a later inspection compute the metadata digest the same way:
  *
  * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime,
- *   link target and a regular file's content. Content is hashed rather than trusted to the times, which a write does
- *   not always move.
+ *   link target and, outside `objects/`, a regular file's content. Content is hashed rather than trusted to the times,
+ *   which a write does not always move; object files are content-addressed and most of the volume, so they are not.
  * - `snapshot <link>...` (in /work) resolves each declared link as the kernel would in an agent container, one part at
  *   a time, and records the state of its target and everything beneath it.
  * - `inspect <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of `base`,
@@ -84,7 +84,8 @@ sub metadata_digest {
     my $path = shift @pending; my $full = $path eq "." ? $root : "$root/$path";
     my @stat = lstat $full; fail(6, "could not stat metadata " . shown($path) . ": $!") unless @stat;
     my ($link, $directory, $file) = (-l _, -d _, -f _);
-    my $content = $link ? readlink $full : $file ? file_digest($full) : "";
+    # Object files are content-addressed and make up most of the volume; hashing them would slow every allocation.
+    my $content = $link ? readlink $full : $file && $path !~ m{^objects/} ? file_digest($full) : "";
     $sha->add(join("\0", $path, @stat[1, 2, 4, 5, 7, 10, 9], $content), "\0");
     unshift @pending, map { join_path($path, $_) } children($full) if $directory;
   }
@@ -105,19 +106,31 @@ my @GIT = ("git", "--no-pager", "--no-replace-objects", "-c", "core.hooksPath=/d
   "-c", "core.attributesFile=/dev/null", "-c", "core.excludesFile=/dev/null", "-c", "core.ignorecase=false",
   "-c", "core.trustctime=true", "-c", "core.checkStat=default", "-c", "core.filemode=true", "-c", "core.symlinks=true",
   "-c", "core.ignoreStat=false", "-c", "core.safecrlf=false", "-c", "core.untrackedCache=false");
-# Run Git in the work tree, optionally feeding it a file, and return its standard output.
+sub exit_reason { my $status = shift; return $status == -1 ? "could not start" : ($status & 127) ? "killed by signal " . ($status & 127) : "status " . ($status >> 8) }
+# Run Git in the work tree, optionally feeding it a file, and return its standard output. With $strict, anything Git
+# writes to stderr fails the run: an error it reports but survives (an encoding it could not apply) means an answer
+# that is not what a commit would store.
+my $stderr_file = "/tmp/git-stderr";
 sub git_in {
-  my ($input, @args) = @_;
+  my ($input, $strict, @args) = @_;
   my $pid = open(my $out, "-|"); fail(4, "could not run git: $!") unless defined $pid;
   if (!$pid) {
     if (defined $input) { open(STDIN, "<", $input) or die "could not open git input: $!" }
+    if ($strict) { open(STDERR, ">", $stderr_file) or die "could not capture git errors: $!" }
     exec(@GIT, "-c", "core.worktree=/work", @args) or die "could not run git: $!";
   }
   local $/; my $output = <$out> // ""; close $out;
-  fail(4, "git $args[0] failed (status " . ($? >> 8) . ")") if $?;
+  my $errors = "";
+  if ($strict && open(my $captured, "<", $stderr_file)) { $errors = <$captured> // ""; close $captured }
+  my ($first) = split /\n/, $errors;
+  # Name the Git command itself, past any "-c name=value" pairs in front of it.
+  my @rest = @args; splice @rest, 0, 2 while @rest && $rest[0] eq "-c";
+  # Git's line can quote an agent-chosen name: it stays one line of printable ASCII.
+  (my $line = substr($first // "", 0, 300)) =~ s/([^\x20-\x7e])/sprintf("\\x%02x", ord $1)/ge;
+  fail(4, "git $rest[0] failed (" . exit_reason($?) . ")" . ($line ne "" ? ": $line" : "")) if $? || $errors ne "";
   return $output;
 }
-sub git { return git_in(undef, @_) }
+sub git { return git_in(undef, 0, @_) }
 
 my $format = git("rev-parse", "--show-object-format"); chomp $format;
 my $algorithm = $format eq "sha256" ? 256 : 1;
@@ -139,13 +152,18 @@ sub entry {
   else { $entry{type} = "other" }
   return \%entry;
 }
+sub under_git_path { return scalar grep { lc $_ eq ".git" } split m{/}, shift }
 # What the walk keeps of each entry: its type and Git mode, and a link's content. A large checkout holds many.
 sub walk_entry {
   my $path = shift; my @stat = lstat $path; return undef unless @stat;
   if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => text($target, "the link target of " . shown($path)) } }
   # Every file is hashed below; one that cannot be read fails the run here, with its name, rather than inside Git.
   if (-f _) { fail(6, "could not read " . shown($path) . ": permission denied") unless -r _; return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } }
-  return { type => -d _ ? "directory" : "other" };
+  return { type => "directory" } if -d _;
+  # Git opens every .gitattributes it meets while hashing; a fifo or device there would block it until the deadline.
+  my @parts = split m{/}, $path;
+  fail(6, "the attributes file " . shown($path) . " is not a regular file") if $parts[-1] eq ".gitattributes";
+  return { type => "other" };
 }
 # A target entry also carries the file's raw content ID: the snapshot compares identity, not what Git would store.
 sub target_entry { my $path = shift; my $entry = entry($path); $entry->{oid} = file_id($path) if $entry->{type} eq "file"; return { path => text($path, "path"), %$entry } }
@@ -239,8 +257,9 @@ if ($mode eq "snapshot") { emit({ links => [map { resolve($_, 1) } @ARGV] }) }
 fail(2, "unknown mode") unless $mode eq "inspect";
 my $base = shift @ARGV;
 fail(3, "base is not a full commit ID") unless $base =~ /^[0-9a-f]{40}([0-9a-f]{24})?$/;
-fail(3, "base $base is not a commit in this task storage")
-  unless system(@GIT, "cat-file", "-e", "$base^{commit}") == 0;
+my $exists = system(@GIT, "cat-file", "-e", "$base^{commit}");
+fail(4, "git cat-file failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127);
+fail(3, "base $base is not a commit in this task storage") if $exists != 0;
 my $link_count = shift @ARGV;
 fail(2, "bad link count") unless defined $link_count && $link_count =~ /^\d+$/ && $link_count <= @ARGV;
 my @links = splice @ARGV, 0, $link_count; my @targets = @ARGV;
@@ -256,7 +275,7 @@ for my $record (split /\0/, git("ls-tree", "-r", "-z", "--full-tree", $base)) {
     type => $git_mode eq "160000" ? "gitlink" : $git_mode eq "120000" ? "symlink" : "file" };
   my @parts = split m{/}, $path; my $name = pop @parts;
   $base_directory{join "/", @parts[0 .. $_]} = 1 for 0 .. $#parts;
-  if ($name eq ".gitignore" && $git_mode =~ /^1006/) {
+  if ($name eq ".gitignore" && $git_mode =~ /^100/) {
     my $dir = "/tmp/ignore"; for my $part (@parts) { $dir .= "/$part"; mkdir $dir unless -d $dir }
     open(my $file, ">", "$dir/.gitignore") or fail(4, "could not write the ignore tree: $!");
     binmode $file; print $file git("cat-file", "blob", $oid); close $file or fail(4, "could not write the ignore tree: $!");
@@ -334,21 +353,31 @@ while (@pending) {
 close $ignore_in; waitpid($ignore_pid, 0);
 fail(4, "git check-ignore failed (status " . ($? >> 8) . ")") if ($? >> 8) > 1 || ($? & 127);
 
-# Git blob IDs for what would be committed: every tracked and new file, hashed by Git with the work tree's attributes,
-# exactly as a commit would store them. Every file is read: a file's times do not always move when its content does
-# (not every way of writing to tmpfs updates them), so an unchanged stat proves nothing.
-my @hash = grep { $work{$_}{type} eq "file" } sort keys %work;
-if (@hash) {
+# Git blob IDs for what would be committed: every tracked and new file, hashed as git add would store it. Every file is
+# read: a file's times do not always move when its content does (not every way of writing to tmpfs updates them), so an
+# unchanged stat proves nothing. They are hashed into a scratch index built from base, as the seeded index is, with
+# --info-only so no object is written: Git then applies the work tree's attributes exactly as git add does, including
+# leaving a text=auto file's CRLF alone when base already stores it that way.
+my @commitable = grep { $work{$_}{type} eq "file" && !under_git_path($_) } sort keys %work;
+if (@commitable) {
+  local $ENV{GIT_INDEX_FILE} = "/tmp/scratch-index";
+  git("read-tree", $base);
   open(my $list, ">", "/tmp/hash-paths") or fail(4, "could not write the paths to hash: $!");
-  # Git unquotes a line that starts with a double quote, so every path goes in quoted: a name is only ever a name.
-  print $list map { (my $q = $_) =~ s/(["\\])/\\$1/g; "\"$q\"\n" } @hash;
-  close $list or fail(4, "could not write the paths to hash: $!");
-  my @ids = split /\n/, git_in("/tmp/hash-paths", "hash-object", "--stdin-paths");
-  fail(4, "git hash-object returned " . scalar(@ids) . " IDs for " . scalar(@hash) . " files") unless @ids == @hash;
-  $work{$hash[$_]}{oid} = $ids[$_] for 0 .. $#hash;
+  print $list map { "$_\0" } @commitable; close $list or fail(4, "could not write the paths to hash: $!");
+  # A path that replaces a base file or directory (docs becoming docs/api/x) replaces its entries.
+  git_in("/tmp/hash-paths", 1, "-c", "core.protectNTFS=false", "-c", "core.protectHFS=false",
+    "update-index", "--add", "--replace", "--info-only", "-z", "--stdin");
+  my %wanted = map { $_ => 1 } @commitable;
+  for my $record (split /\0/, git("ls-files", "-s", "-z")) {
+    my ($meta, $path) = split /\t/, $record, 2; next unless $wanted{$path};
+    $work{$path}{oid} = (split / /, $meta)[1];
+  }
+  defined $work{$_}{oid} or fail(4, "git did not hash " . shown($_)) for @commitable;
 }
+# A file under a .git part can never be committed; its ID is its bytes, for the record.
+$work{$_}{oid} = file_id($_) for grep { $work{$_}{type} eq "file" && under_git_path($_) } keys %work;
 
-sub under_git { return (grep { lc $_ eq ".git" } split m{/}, shift) ? JSON::PP::true : JSON::PP::false }
+sub under_git { return under_git_path(shift) ? JSON::PP::true : JSON::PP::false }
 my (@changes, @deleted, @added);
 sub change {
   my ($kind, $path, $old, $new, $ignored) = @_;

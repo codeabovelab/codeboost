@@ -1133,6 +1133,29 @@ describe('real Docker agent isolation', () => {
       expect(committed.digest).not.toBe(quiet.digest);
     }, 180_000);
 
+    it('hashes as git add does: CRLF that base stores under text=auto stays CRLF', async () => {
+      const data = fixture({ hostile: source => {
+        // Committed with CRLF before text=auto was set: git add leaves such a file's line endings alone.
+        writeFileSync(join(source, 'crlf.txt'), 'a\r\n'); git(source, 'add', 'crlf.txt'); git(source, 'commit', '-m', 'crlf');
+        writeFileSync(join(source, '.gitattributes'), '* text=auto\n');
+      } });
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect((await inspect()).changes).toEqual([]);
+      asAgent(data.filesystems, 'printf "b\\r\\n" > crlf.txt');
+      expect((await inspect()).changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'crlf.txt',
+        newOid: createHash('sha1').update('blob 3\0b\r\n').digest('hex') })]);
+    }, 180_000);
+
+    it('fails with Git\'s reason when it cannot hash as a commit would, and names a .gitattributes it could not open', async () => {
+      const data = fixture();
+      const inspect = () => inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      asAgent(data.filesystems, 'printf "file.txt working-tree-encoding=NOPE-ENC\\n" > .gitattributes');
+      await expect(inspect()).rejects.toThrow(/git update-index failed \(status 0\): error: failed to encode/);
+      // A fifo where Git reads attributes would block it until the deadline.
+      asAgent(data.filesystems, 'rm .gitattributes && mkfifo .gitattributes');
+      await expect(inspect()).rejects.toThrow(/exit 6\): the attributes file \.gitattributes is not a regular file/);
+    }, 180_000);
+
     it('reads every file: an edit the index vouches for is still a change', async () => {
       const data = fixture();
       // Edit file.txt, then mark it assume-unchanged, so Git's own check skips it, as it skips a file whose times did
