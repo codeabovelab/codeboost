@@ -187,6 +187,14 @@ describe('real Docker agent isolation', () => {
       symlinkSync('../..', join(source, 'deep', 'er', 'top'));
       symlinkSync('deep/er/top/../run/codeboost-auth/codex/auth.json', join(source, 'chained'));
     }],
+    // Behind a part that is missing, or under a file: once the agent makes it a directory, the ".." climbs back to
+    // d/esc, which leads to the checkout's parent.
+    ...(['m/../d/esc/../etc/hostname', 'f/x/../../d/esc/../etc/hostname'] as const).map(target => [
+      `a link through ${target.split('/')[0] === 'm' ? 'a missing directory' : 'a file'} that climbs back to an escaping link`,
+      (source: string) => {
+        mkdirSync(join(source, 'd')); symlinkSync('..', join(source, 'd', 'esc')); writeFileSync(join(source, 'f'), 'f\n');
+        symlinkSync(target, join(source, 'L'));
+      }] as const),
   ] as const)('refuses to seed a repository with %s, before any storage exists', async (_label, hostile) => {
     const owned = () => [docker('volume', 'ls', '--quiet', '--filter', 'label=io.codeboost.allocation'),
       docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.allocation')].join('\n').split('\n').filter(Boolean);
@@ -1013,8 +1021,8 @@ describe('real Docker agent isolation', () => {
       } });
       const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['L', 'M', 'P'], { imageId });
       expect(linkSnapshot.links[0]).toMatchObject({ link: 'L', status: 'present', target: 'd/lib' });
-      // M's way, followed by name, goes through the link via: through-link. P's leads to plain, which is watched.
-      expect(linkSnapshot.links[1]).toMatchObject({ link: 'M', status: 'through-link', target: 'via/f' });
+      // M's way, followed by name past m, meets the link via: through-link. P's leads to plain, which is watched.
+      expect(linkSnapshot.links[1]).toMatchObject({ link: 'M', status: 'through-link', anchor: { path: 'via' } });
       expect(linkSnapshot.links[2]).toMatchObject({ link: 'P', status: 'present', target: 'plain' });
       // Untouched: nothing to report for any of them.
       expect((await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId })).linkTargetChanges)
@@ -1028,6 +1036,16 @@ describe('real Docker agent isolation', () => {
       const byPath = new Map(manifest.changes.map(change => [change.path, change]));
       expect(byPath.get('docs')).toMatchObject({ kind: 'modify', oldType: 'file', newType: 'directory' });
       expect(byPath.get('docs/api/x')).toMatchObject({ kind: 'add' });
+    }, 180_000);
+
+    it('sees a link that a ".." behind a missing directory climbs back to', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'd')); mkdirSync(join(source, 'y', 'z'), { recursive: true }); writeFileSync(join(source, 'y', 'z', 'k'), '');
+        symlinkSync('../y/z', join(source, 'd', 'esc')); symlinkSync('m/../d/esc/../x', join(source, 'L'));
+      } });
+      // Once the agent makes m a directory, a write through L goes through d/esc and lands in y: not a watched target.
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['L'], { imageId });
+      expect(linkSnapshot.links[0]).toMatchObject({ link: 'L', status: 'through-link', anchor: { path: 'd/esc' } });
     }, 180_000);
 
     it('watches the old target of a dangling link the item retargets, whatever lies on the way', async () => {

@@ -262,21 +262,18 @@ sub resolve {
   # From the filesystem root: ("work", ...) is inside the work tree.
   my @at = $raw =~ m{^/} ? () : ("work", @parents);
   my @parts = grep { $_ ne "" && $_ ne "." } split m{/}, $raw;
-  # Once a part on the way is missing, or is not a directory, the rest is followed by name, ".." included: that is
-  # the only place the link can ever lead (the part would have to become a directory), so the target is recorded and
-  # watched whether it exists or not. A link on that path still makes it through-link: the target's walk checks every
-  # part.
-  my $missing = 0;
+  # Past a part that is missing or not a directory the way is followed by name, ".." included: that is the only place
+  # the link can ever lead (the part would have to become a directory), so the target is recorded and watched whether
+  # it exists or not. Every part that does exist is still checked, even after a missing one: a ".." can climb back
+  # into real directories, and a link met there makes it through-link.
   for my $i (0 .. $#parts) {
     if ($parts[$i] eq "..") { pop @at; next }
     push @at, $parts[$i];
     return { %record, status => "outside" } if $at[0] ne "work";
     return { %record, status => "metadata" } if @at > 1 && $at[1] eq ".git";
-    next if @at == 1 || $missing;
+    next if @at == 1;
     my $path = join "/", @at[1 .. $#at]; my @here = lstat $path;
-    if (!@here) { $missing = 1; next }
-    return { %record, %{ anchored("through-link", $path) } } if -l _;
-    $missing = 1 if $i < $#parts && !-d _;
+    return { %record, %{ anchored("through-link", $path) } } if @here && -l _;
   }
   return { %record, status => "outside" } if @at < 2;
   my $target = join "/", @at[1 .. $#at];

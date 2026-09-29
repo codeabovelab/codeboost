@@ -236,11 +236,12 @@ const MAXIMUM_LINK_HOPS = 40;
 /**
  * Resolve a link as the container kernel will, with the checkout standing for /work. Each existing link along the way
  * is followed, `..` is applied to the resolved path, and the path must stay inside the checkout after every step.
- * Components that do not exist here are applied textually: /work mirrors the checkout, so they are missing there too,
- * and a target the host lacks (such as a container mount under /run) cannot hide an escape.
+ * Components that do not exist here (missing, or under a file) are applied textually, as the kernel would resolve them
+ * once the agent made them directories, and every part after them that does exist is still checked: a `..` can climb
+ * back to a real link. An absolute target is refused, so a target the host lacks cannot hide an escape.
  */
 const linkStaysInside = (staging: string, link: string) => {
-  let current = dirname(link), hops = 0, exists = true;
+  let current = dirname(link), hops = 0;
   const components = readlinkSync(link).split('/');
   if (components[0] === '') return false;
   while (components.length) {
@@ -248,13 +249,14 @@ const linkStaysInside = (staging: string, link: string) => {
     if (component === '' || component === '.') continue;
     current = component === '..' ? dirname(current) : join(current, component);
     if (!within(staging, current)) return false;
-    if (!exists || component === '..') continue;
-    // A path under a file (ENOTDIR) does not exist either: the link dangles there, as it does past a missing part.
+    if (component === '..') continue;
+    // Every part that exists is checked, even past one that is missing or under a file (ENOTDIR): the agent can
+    // create the missing directory, and a ".." can climb back to a real link, which is followed here as the kernel
+    // would follow it then.
     let stat: ReturnType<typeof lstatSync> | undefined;
     try { stat = lstatSync(current, { throwIfNoEntry: false }); }
     catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOTDIR') throw error; }
-    if (!stat) { exists = false; continue; }
-    if (!stat.isSymbolicLink()) continue;
+    if (!stat?.isSymbolicLink()) continue;
     if (++hops > MAXIMUM_LINK_HOPS) return true;
     const target = readlinkSync(current);
     if (target.startsWith('/')) return false;
