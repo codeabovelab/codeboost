@@ -6,3 +6,4 @@ dist/
 .codeboost-local/
 playwright-report/
 test-results/
+.vitest/
