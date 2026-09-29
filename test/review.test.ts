@@ -1,5 +1,5 @@
 import { afterEach, it, expect, vi } from 'vitest';
-import { mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { execFileSync } from 'node:child_process';
@@ -76,6 +76,53 @@ it('marks unchanged items stale after a same-snapshot plan amendment',()=>{
  view=service.load();expect(view.items.every(item=>item.state==='stale'&&item.reasons.includes('Plan revision changed after the queue attempt'))).toBe(true);
  const first=view.items[0]!;view=service.act({action:'approve',item:first.id,confirmNoChange:first.count===0,token:view.token});expect(view.items.find(item=>item.id===first.id)?.state).toBe('approved');
 });
+it('gives each stale state its own stale key, including states whose segments and reasons repeat',()=>{
+ const {service,config}=fixture();let view=service.load();const item=(id:string)=>view.items.find(value=>value.id===id)!;
+ const own=(id:string)=>view.segments.filter(segment=>segment.row===id).map(segment=>segment.key);
+ expect(view.items.every(value=>value.staleKey===null)).toBe(true);
+ view=service.act({action:'approve',item:'P1',token:view.token});view=service.act({action:'approve',item:'P3',confirmNoChange:true,token:view.token});expect(item('P1').staleKey).toBeNull();
+ const unplanned=()=>view.segments.find(segment=>segment.row==='Unplanned')!.key;
+ view=service.act({action:'assign',key:unplanned(),item:'P1',token:view.token});
+ const first={p1:item('P1').staleKey,p3:item('P3').staleKey,p3Reasons:item('P3').reasons};
+ expect(item('P1').state).toBe('stale');expect(first.p1).toMatch(/^[0-9a-f]{64}$/);expect(item('P3').state).toBe('stale');expect(first.p3).toMatch(/^[0-9a-f]{64}$/);
+ view=service.load();expect(item('P1').staleKey).toBe(first.p1);expect(item('P3').staleKey).toBe(first.p3);
+ // P1 changes again: P3's own segments and reasons stay the same, but its dependency's stale state is new.
+ view=service.act({action:'assign',key:unplanned(),item:'P1',token:view.token});
+ const second={p1:item('P1').staleKey,p1Segments:own('P1'),p1Reasons:item('P1').reasons};
+ expect(second.p1).not.toBe(first.p1);expect(item('P3').reasons).toEqual(first.p3Reasons);expect(item('P3').staleKey).not.toBe(first.p3);
+ // Re-approving P3 while P1 keeps it stale changes only P3's approval.
+ const p3Before=item('P3').staleKey;view=service.act({action:'approve',item:'P3',confirmNoChange:true,token:view.token});
+ expect(item('P3').state).toBe('stale');expect(item('P3').reasons).toEqual(first.p3Reasons);expect(item('P3').staleKey).not.toBe(p3Before);
+ // P1 is approved at its current code, then an ambiguous change it shares makes it stale with the same own segments and reasons as before.
+ view=service.act({action:'approve',item:'P1',token:view.token});expect(item('P1').staleKey).toBeNull();
+ // P1 adds a line to an existing file and P2 then edits that same line, so the line is ambiguous between them.
+ const readme=join(config.repository,'README.md'),original=readFileSync(readme,'utf8');
+ const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am',message],{cwd:config.repository,stdio:'pipe'});return execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();};
+ const byP1=commit('Shared note.','P1 shared line'),byP2=commit('Shared note, revised.','P2 shared line'),snapshot=service.store.getSnapshot(config.identity);
+ service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
+ view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
+ expect(item('P1').state).toBe('stale');expect(own('P1')).toEqual(second.p1Segments);expect(item('P1').reasons).toEqual(second.p1Reasons);
+ expect(item('P1').staleKey).not.toBe(second.p1);expect(item('P1').staleKey).not.toBe(first.p1);
+});
+it('gives a still-stale item a new stale key when it gains an ambiguous change',()=>{
+ const {service,config}=fixture();let view=service.load();const item=(id:string)=>view.items.find(value=>value.id===id)!;
+ view=service.act({action:'approve',item:'P1',token:view.token});view=service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});
+ const before={key:item('P1').staleKey,reasons:item('P1').reasons,own:view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)};expect(item('P1').state).toBe('stale');
+ const readme=join(config.repository,'README.md'),original=readFileSync(readme,'utf8');
+ const commit=(line:string,message:string)=>{writeFileSync(readme,`${original}${line}\n`);execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am',message],{cwd:config.repository,stdio:'pipe'});return execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();};
+ const byP1=commit('Shared note.','P1 shared line'),byP2=commit('Shared note, revised.','P2 shared line'),snapshot=service.store.getSnapshot(config.identity);
+ service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
+ view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
+ expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(before.key);
+});
+it('gives each replaced head after a queue attempt its own stale key',()=>{
+ const {service,config}=fixture();let view=service.load();
+ service.store.saveReview(config.identity,view.expected,view.items.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
+ const attempt=service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.example/pr/24');service.store.finishMergeAttempt(config.identity,attempt.id,{state:'failed',reason:'The pull request head changed after review.',requiresFreshReview:true});
+ const replace=()=>{execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','Replace reviewed head'],{cwd:config.repository,stdio:'pipe'});return service.load();};
+ const first=replace(),second=replace(),p3=(value:typeof view)=>value.items.find(item=>item.id==='P3')!;
+ expect(p3(first).state).toBe('stale');expect(p3(second).reasons).toEqual(p3(first).reasons);expect(p3(second).staleKey).not.toBe(p3(first).staleKey);
+},30000);
 it('refuses no-change confirmation while the item still owns ambiguous changes',async()=>{
  const {service,config}=fixture();const {writeFileSync}=await import('node:fs');const {execFileSync}=await import('node:child_process');
  writeFileSync(join(config.repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');

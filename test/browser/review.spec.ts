@@ -110,7 +110,9 @@ test('opens an item selected while an assignment is in flight in the view its an
  expect(app.service.load().items.find(item=>item.id==='P1')!.state).toBe('stale');
  // An explicit choice survives the next answer.
  await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
- await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Full change',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ // Every check below already holds before the Refresh answer, so wait until that answer is rendered.
+ const answered=page.waitForResponse('**/api/review');await page.getByRole('button',{name:'Refresh',exact:true}).click();await answered;await expect(page.locator('#banner')).not.toContainText('Linking changes');
+ await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();await expect(page.getByRole('button',{name:'Full change',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
  // A code change on the still-stale item is a new state, so the choice made on the old one no longer holds.
  const repository=app.service.config.repository;writeFileSync(join(repository,'retry.ts'),'export function delay(attempt: number) {\n  return 42;\n}\n');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','External change'],{cwd:repository,stdio:'pipe'});
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
@@ -120,18 +122,18 @@ test('opens an item selected while an assignment is in flight in the view its an
  let view=app.service.load();view=app.service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned'&&segment.path==='retry.ts')!.key,item:'P1',token:view.token});expect(view.items.find(item=>item.id==='P1')!.state).toBe('stale');
  await page.getByRole('button',{name:'Refresh',exact:true}).click();await expect(page.getByText('! Stale:',{exact:false}).first()).toBeVisible();await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
 });
-test('ends an explicit view choice when any field the approval fingerprint covers changes',async({page})=>{
+test('keeps an explicit view choice only while the server names the same stale state',async({page})=>{
  let view=app.service.load();view=app.service.act({action:'approve',item:'P1',confirmNoChange:false,token:view.token});
  view=app.service.act({action:'assign',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,item:'P1',token:view.token});expect(view.items.find(item=>item.id==='P1')!.state).toBe('stale');
- // Each step changes one fingerprint field of P1's segments in the answer and leaves the path, content and reasons as they were.
- const edits:Array<(segment:Record<string,any>)=>void>=[segment=>{segment.context=`${segment.context} moved`;},segment=>{segment.owners=[...segment.owners,'P2'];},segment=>{segment.oldPath=`${segment.oldPath ?? segment.path}.old`;}];let applied=0;
- await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();for(const segment of body.segments)if(segment.row==='P1')for(const edit of edits.slice(0,applied))edit(segment);await route.fulfill({response,json:body});});
+ // The answer is the server's own, except that P1's staleKey can be replaced; nothing else about P1 changes.
+ let staleKey:string|null=null;
+ await page.route('**/api/review',async route=>{const response=await route.fetch(),body=await response.json();if(staleKey)body.items.find((item:{id:string})=>item.id==='P1').staleKey=staleKey;await route.fulfill({response,json:body});});
+ const refresh=async()=>{const answered=page.waitForResponse('**/api/review');await page.getByRole('button',{name:'Refresh',exact:true}).click();await answered;await expect(page.locator('#banner')).not.toContainText('Linking changes');};
  await page.goto(app.url);await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
- for(const _ of edits){
-  await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
-  applied++;await page.getByRole('button',{name:'Refresh',exact:true}).click();
-  await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
- }
+ await page.getByRole('button',{name:'Full change',exact:true}).click();await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ await refresh();await expect(page.getByRole('button',{name:'Full change',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toHaveCount(0);
+ staleKey='0'.repeat(64);await refresh();
+ await expect(page.getByRole('button',{name:'Since approval',exact:true})).toHaveAttribute('aria-pressed','true');await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
 });
 test('shows file metadata and no-change confirmation, supports narrow desktop and keyboard',async({page})=>{
   await page.goto(app.url);await page.getByRole('button',{name:/P2 Document retry behavior/}).click();await expect(page.getByText('File mode changed',{exact:false})).toBeVisible();await expect(page.getByText('✕ Out of scope',{exact:true})).toBeVisible();

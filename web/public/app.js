@@ -17,7 +17,7 @@ let data,
   selected,
   change = 0,
   mode = "question",
-  // The reviewer's explicit view choice, held only for the item and stale state it was made on; otherwise a stale item opens the comparison.
+  // The reviewer's explicit view choice, held only for the item and server-named stale state (staleKey) it was made on; otherwise a stale item opens the comparison.
   sinceChoice = null,
   busy = false;
 let reviewGeneration = 0;
@@ -209,18 +209,9 @@ async function act(command) {
     renderAttachment();
   }
 }
-const staleState = (item) =>
-  JSON.stringify([
-    item.reasons,
-    // The same segment fields as the approval fingerprint in core/approvals.ts, so every change that can make an item stale is a new state.
-    data.segments
-      .filter((s) => s.row === item.id)
-      .map((s) => [s.path, s.oldPath, s.kind, s.operation, s.content, s.context, [...s.owners].sort()]),
-    data.plan.items.find((p) => p.id === item.id),
-  ]);
 const showSince = (item) =>
   item?.state === "stale" &&
-  (sinceChoice?.item === item.id && sinceChoice.state === staleState(item) ? sinceChoice.value : true);
+  (sinceChoice?.item === item.id && sinceChoice.state === item.staleKey ? sinceChoice.value : true);
 function select(id) {
   rememberDraft();
   selected = id;
@@ -301,7 +292,7 @@ function render() {
       : "";
   document.querySelectorAll("[data-since]").forEach((button) =>
     button.addEventListener("click", () => {
-      sinceChoice = { item: item.id, state: staleState(item), value: button.dataset.since === "true" };
+      sinceChoice = { item: item.id, state: item.staleKey, value: button.dataset.since === "true" };
       renderCode();
     }),
   );
