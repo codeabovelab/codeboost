@@ -12,11 +12,11 @@ const INSPECTION_MEMORY = '1g';
 export type EntryType = 'file' | 'symlink' | 'gitlink' | 'directory' | 'other';
 
 /**
- * One difference between the work tree and the tree of `base`, read without following links (#66). A tracked file
- * counts as changed only when its stat no longer matches the index the seeder refreshed from `base` (its ctime, which
- * no agent can set, changes on any write) and Git would now store different content. Content IDs are the blobs Git
- * would store, hashed with the work tree's attributes as a commit would, so what the audit approves is what a commit
- * stores. A link target is compared as it is.
+ * One difference between the work tree and the tree of `base`, read without following links (#66). Every file is read
+ * and hashed as the blob Git would store, with the work tree's attributes, as a commit would; a tracked file counts as
+ * changed when that blob or its mode differs from `base`. So what the audit approves is what a commit stores, and a
+ * file whose stored blob would not change (an honest CRLF checkout, say) is not a change. A link target is compared
+ * as it is.
  */
 export interface TaskChange {
   readonly path: string;

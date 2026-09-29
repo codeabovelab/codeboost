@@ -1119,6 +1119,19 @@ describe('real Docker agent isolation', () => {
       expect(committed.digest).not.toBe(quiet.digest);
     }, 180_000);
 
+    it('reads every file: an edit the index vouches for is still a change', async () => {
+      const data = fixture();
+      // Edit file.txt, then mark it assume-unchanged, so Git's own check skips it, as it skips a file whose times did
+      // not move with its content. Nothing may rely on Git's view of the index.
+      asAgent(data.filesystems, 'printf "hidden edit\\n" > file.txt');
+      docker('run', '--rm', '--network=none', '--user', '10001:10001', '--tmpfs', '/tmp', '--env', 'HOME=/tmp',
+        '--mount', `type=volume,source=${data.filesystems.workVolume},target=/work`,
+        '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'git', imageId,
+        '-C', '/work', 'update-index', '--assume-unchanged', 'file.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [] } });
+      expect(manifest.changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'file.txt' })]);
+    }, 180_000);
+
     it('fails, never truncates, on too many changes and on a name that is not UTF-8', async () => {
       const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 12_000, metadataBytes: 16 * 1024 * 1024,
         metadataInodes: 512 } });

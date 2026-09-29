@@ -2,14 +2,14 @@
  * The Perl program D runs inside task storage to read it without following links (#66). One program serves three modes,
  * so the seeder's metadata baseline and a later inspection compute the metadata digest the same way:
  *
- * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime
- *   and link target. ctime changes on every write, chmod, chown, link or rename, and no one without CAP_SYS_TIME can set
- *   it, so an equal digest means nothing under `root` was touched.
+ * - `digest <root>` prints one SHA-256 over every entry under `root`: its path, inode, mode, owner, size, ctime, mtime,
+ *   link target and a regular file's content. Content is hashed rather than trusted to the times, which a write does
+ *   not always move.
  * - `snapshot <link>...` (in /work) resolves each declared link as the kernel would in an agent container, one part at
  *   a time, and records the state of its target and everything beneath it.
- * - `inspect <base> <link>... -- <target>...` (in /work) compares the work tree with the tree of `base`, resolves each
- *   declared link again (without walking its target), and reports the state now of each target the snapshot recorded,
- *   the metadata digest and HEAD.
+ * - `inspect <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of `base`,
+ *   hashing every file as a commit would store it, resolves each declared link again (without walking its target), and
+ *   reports the state now of each target the snapshot recorded, the metadata digest and HEAD.
  *
  * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes. A path or link target that is not strict
  * UTF-8 without control characters cannot be put in the manifest (exit 8). More than MAXIMUM_CHANGES changes, more than
@@ -72,15 +72,21 @@ sub emit {
   print $output; exit 0;
 }
 
+sub file_digest {
+  my $path = shift;
+  sysopen(my $handle, $path, O_RDONLY | O_NOFOLLOW) or fail(6, "could not read metadata " . shown($path) . ": $!");
+  binmode $handle; my $sha = Digest::SHA->new(256); $sha->addfile($handle); close $handle; return $sha->hexdigest;
+}
 # Paths are hashed relative to the root, so the seeder (at /metadata) and an inspection (at /work/.git) agree.
 sub metadata_digest {
   my $root = shift; my $sha = Digest::SHA->new(256); my @pending = (".");
   while (@pending) {
     my $path = shift @pending; my $full = $path eq "." ? $root : "$root/$path";
     my @stat = lstat $full; fail(6, "could not stat metadata " . shown($path) . ": $!") unless @stat;
-    my $target = -l _ ? readlink $full : "";
-    $sha->add(join("\0", $path, @stat[1, 2, 4, 5, 7, 10, 9], $target), "\0");
-    unshift @pending, map { join_path($path, $_) } children($full) if -d _;
+    my ($link, $directory, $file) = (-l _, -d _, -f _);
+    my $content = $link ? readlink $full : $file ? file_digest($full) : "";
+    $sha->add(join("\0", $path, @stat[1, 2, 4, 5, 7, 10, 9], $content), "\0");
+    unshift @pending, map { join_path($path, $_) } children($full) if $directory;
   }
   return $sha->hexdigest;
 }
@@ -322,18 +328,10 @@ while (@pending) {
 close $ignore_in; waitpid($ignore_pid, 0);
 fail(4, "git check-ignore failed (status " . ($? >> 8) . ")") if ($? >> 8) > 1 || ($? & 127);
 
-# Tracked paths whose stat no longer matches the index. The seeder refreshed the index from base and nothing but
-# codeboost writes the metadata, so any other tracked file is as base has it: its ctime, which no agent can set, is
-# unchanged. Gitlinks are handled above; Git never looks inside one.
-my %touched;
-{
-  my @fields = split /\0/, git("diff-files", "--raw", "-z", "--ignore-submodules=all", "--no-renames");
-  while (@fields) { shift @fields; my $path = shift @fields; $touched{$path} = 1 if defined $path }
-}
-
-# Git blob IDs for what would be committed: changed tracked files and new files, hashed by Git with the work tree's
-# attributes, exactly as a commit would store them.
-my @hash = grep { $work{$_}{type} eq "file" && ($base{$_} ? $touched{$_} || $base{$_}{type} ne "file" : 1) } sort keys %work;
+# Git blob IDs for what would be committed: every tracked and new file, hashed by Git with the work tree's attributes,
+# exactly as a commit would store them. Every file is read: a file's times do not always move when its content does
+# (not every way of writing to tmpfs updates them), so an unchanged stat proves nothing.
+my @hash = grep { $work{$_}{type} eq "file" } sort keys %work;
 if (@hash) {
   open(my $list, ">", "/tmp/hash-paths") or fail(4, "could not write the paths to hash: $!");
   # Git unquotes a line that starts with a double quote, so every path goes in quoted: a name is only ever a name.
@@ -359,8 +357,6 @@ for my $path (sort keys %base) {
   if (!$new) { push @deleted, change("delete", $path, $old); next }
   if ($old->{type} eq "gitlink") { push @changes, change("modify", $path, $old, $new) if $new->{type} ne "directory"; next }
   if ($new->{type} ne $old->{type}) { push @changes, change("modify", $path, $old, $new); next }
-  # An untouched file keeps base's blob; its mode is still compared, since lstat saw it.
-  $new->{oid} //= $old->{oid};
   my ($content, $mode) = ($new->{oid} ne $old->{oid}, $new->{gitMode} ne $old->{gitMode});
   push @changes, change($content ? "modify" : "mode", $path, $old, $new) if $content || $mode;
 }
