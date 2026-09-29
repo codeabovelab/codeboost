@@ -294,7 +294,7 @@ describe('recovering a lost opening', () => {
     await expect(again.publisher.publish(identity)).rejects.toThrow(/review changed/);
     expect(again.log.some(line => line.startsWith('push'))).toBe(false);
   });
-  it('runs one publish per task at a time', async () => {
+  it('runs one publish per task at a time, across publishers over the same Store', async () => {
     const store = runningTask();
     let release!: () => void;
     const pushed = new Promise<void>(resolve => { release = resolve; });
@@ -302,6 +302,8 @@ describe('recovering a lost opening', () => {
     const first = publisher.publish(identity);
     await new Promise(resolve => setTimeout(resolve, 0));
     await expect(publisher.publish(identity)).rejects.toThrow(/already being published/);
+    // A second publisher over the same Store is refused too.
+    await expect(harness(store).publisher.publish(identity)).rejects.toThrow(/already being published/);
     release();
     expect(await first).toMatchObject({ kind: 'opened', status: 'in review' });
     // The guard is released afterwards.
