@@ -9,6 +9,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Define the lifecycle states and ownership before implementation: pending, running, completed, failed, cancelled, stale, and closing.
 - Treat persisted state, in-memory jobs, subprocesses, HTTP requests, and rendered UI as separate state holders. Define how each transitions and settles.
 - Never apply a background response without proving it is still current. Use a generation, attempt ID, version, or guarded merge so older polling responses cannot overwrite newer actions.
+- A current response may still move a record only along a transition allowed from the state the action was guarded for. Derive the new status from that state as well as the response; a response alone must never move a record out of a state that waits for a person.
 - Do not release a concurrency slot when cancellation is requested. Keep the job tracked until its underlying invocation or subprocess has terminated.
 - Do not let a retry replace a locally active job, even when its persisted lease has expired or wall-clock time changes.
 - Validate retry context against the current snapshot, plan revision, assignment, and referenced code. If any context is stale, disable retry and require a new request.
@@ -67,6 +68,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Exclude the subject of a duplicate or supersession check by stable identity only. A shared branch name or other mutable attribute does not prove two records are the same subject.
 - Preserve repository identity with pull request numbers in cross-reference scans. Never resolve or exclude a repository-qualified reference by number alone.
 - After the final asynchronous external validation, re-read the local generation immediately before an irreversible action. A generation check performed before that await is insufficient.
+- Check an operation's source-state preconditions before any shortcut or early return that writes state or reports success, not only on the main path.
 - Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
 - Budget a multi-stage validation across all sequential stages; giving each stage the full request allowance does not create an overall deadline.
 - Preserve the distinction between an explicit unbound identity and missing or malformed authorization metadata. Missing or malformed identities must fail closed.
@@ -94,6 +96,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 
 - Treat the cleanup handle of an external resource (container, volume, network, temporary directory) as owned state. If removal fails, keep the handle, record it durably before its in-memory owner can be dropped (shutdown, crash, abandon, restart), and fail closed until removal is confirmed. Never delete the durable evidence before the final release report has been saved.
 - Give every subprocess an explicit allowlisted environment. Pass credentials only to the component that needs them, through a separate channel. Name-based scrubbing of an inherited environment is not isolation. Run Git with the repository's hardened invocation: no user or system config, no hooks, no lazy fetch, no network protocols.
+- Build that allowlist from each tool's documented credential and configuration channels on every supported platform (for example, the D-Bus session bus that a Linux keyring uses), and test that each is passed.
 - Treat paths read from a durable record or discovered on disk as untrusted. Before deleting, opening or probing one, validate its exact location and name, not only its basename, and never follow a link to it. Keep files that other local users must not plant or swap, such as lock files, in a directory only the current user can write. Write durable records through a unique temporary file opened exclusively, and delete it if the write fails.
 - Exclude other processes with an OS-level lock held for the owner's lifetime, keyed by the resource's stable identity rather than a path spelling. A PID liveness check never authorizes taking over a lock. Run shared one-time startup work single-flight under that lock, and keep the lock until the work has finished.
 
@@ -101,6 +104,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 
 - When a subprocess reports a problem only as a warning and carries on, decide pass or fail by what each message means for the result, not by whether anything was printed: fail on messages that mean it did less than it should (for example could not read a path), and let through messages about harmless input the agent controls. Test both a benign case and a failing case, and filter the output as it arrives so that no volume of benign messages can push a failure out of a bounded buffer.
 - Quote or escape agent-controlled text (file names, paths, branch names) wherever it lands in output that people or tools parse, such as diffs, notices, logs or reports, so it cannot forge that output's structure.
+- Never spread a collection whose size follows unbounded input into function arguments (`Math.max(...runs)`); engines limit the argument count, so use a loop.
 - A hardened Git invocation must also keep Git out of nested repositories and populated submodules, whose own config and hooks are the agent's: pass `--ignore-submodules` on the command line (the config default does not bind plumbing or override `.gitmodules`), and never run Git with a nested repository as its working directory.
 
 ## Blinded experiments
