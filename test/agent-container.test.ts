@@ -751,6 +751,10 @@ describe('real Docker agent isolation', () => {
       'printf "changed\\n" > file.txt', 'printf "staged only\\n" > staged.txt', 'g add staged.txt',
       'printf "\\000\\377\\001" > binary.dat', 'printf "brand new\\n" > untracked.txt',
       'mkdir nested', '(cd nested && git init -q)', 'mkdir linked-dir', 'ln -s linked-dir dir-link',
+      // A tracked directory replaced by a link to /etc/ssl, whose private/ this user cannot read. What is behind the
+      // link is not the task's: its files are deleted, and Git's warnings about /etc/ssl/private must not fail the export.
+      'mkdir -p ssl/private', 'printf "cert\\n" > ssl/cert.pem', 'printf "key\\n" > ssl/private/key.pem',
+      'g add ssl', 'g commit -qm ssl', 'rm -rf ssl', 'ln -s /etc/ssl ssl',
       // Ordinary line-ending attributes make Git warn about these files; a warning must not fail the export.
       'printf "* text=auto\\n*.bat text eol=crlf\\n" > .gitattributes', 'printf "a\\r\\nb\\r\\n" > crlf.txt',
       'printf "x\\n" > unix.bat',
@@ -802,6 +806,7 @@ describe('real Docker agent isolation', () => {
     expect(text).toContain('+changed');
     expect(text).toContain('b/untracked.txt');
     expect(text).toContain('+brand new');
+    expect(text).toContain('b/ssl');
     expect(text).toContain('b/crlf.txt');
     expect(text).toContain('b/unix.bat');
     expect(text).toContain('b/enc.txt');
