@@ -29,7 +29,8 @@ export const MAXIMUM_DECLARED_LINKS = 200;
 /** Bytes in one path or link target the manifest carries; a longer one fails the run (exit 8). */
 export const MAXIMUM_NAME_BYTES = 1_024;
 // JSON at most doubles a name (a quote or backslash is escaped; control characters are refused). A change carries at
-// most three names, a target entry or a link record at most five, each with under 1 KiB of other fields.
+// most three names (a populated gitlink, which counts as a change, one), a target entry or a link record at most five,
+// each with under 1 KiB of other fields.
 const KIB = 1024;
 /** The largest output the limits above allow; the script also refuses to print more. */
 export const MAXIMUM_TREE_OUTPUT = MAXIMUM_CHANGES * (3 * 2 * MAXIMUM_NAME_BYTES + KIB)
@@ -470,10 +471,10 @@ $work{$_}{oid} = file_id($_) for grep { $work{$_}{type} eq "file" && under_git_p
 
 # A tracked file whose bytes are exactly what checking out base's blob writes is untouched, whatever re-hashing it would
 # give: base can store a file Git would now store differently (committed with CRLF before a text rule, or an expanded
-# $Id$ before an ident rule). Both steps read base's attribute files, mirrored in /tmp/attributes, never the work
-# tree's: check-attr picks the files whose checkout converts (with the repository's line-ending config), and
-# cat-file --filters writes base's blob for each as the clone's checkout did. One process per such file, so past the
-# change limit the run refuses before it starts them.
+# $Id$ before an ident rule), or the agent can add a rule that would store an untouched file differently. A file whose
+# bytes are base's blob is untouched. Otherwise both steps read base's attribute files, mirrored in /tmp/attributes,
+# never the work tree's: check-attr picks the files whose checkout converts (with the repository's line-ending
+# config), and cat-file --filters writes base's blob for each as the clone's checkout did.
 my %as_checked_out;
 {
   my @differ = grep { $work{$_} && $work{$_}{type} eq "file" && $base{$_}{type} eq "file" && $work{$_}{oid} ne $base{$_}{oid} }
@@ -491,8 +492,14 @@ my %as_checked_out;
     fail(4, "git config failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127) || ($? >> 8) > 1;
     %converts = map { $_ => 1 } @differ if $config =~ /^core\.(?:autocrlf(?! false\b)|eol )/m;
   }
-  my @compare = grep { $converts{$_} } @differ;
-  fail(9, "more than $MAXIMUM_CHANGES changes; the change set is too large to inspect") if @compare > $MAXIMUM_CHANGES;
+  # Bytes exactly base's blob: what a checkout without conversion writes, and a file base stores unnormalized (legacy
+  # CRLF under a later text rule) is written as it is too. Whatever rules the work tree has now, it is untouched.
+  # This reads the file once, in the script, so it is cheap.
+  $as_checked_out{$_} = 1 for grep { file_id($_) eq $base{$_}{oid} } @differ;
+  # What is left and converts is compared with checkout: one Git process each, so the number is capped.
+  my @compare = grep { $converts{$_} && !$as_checked_out{$_} } @differ;
+  fail(9, "more than $MAXIMUM_CHANGES changed files need comparing with base's checkout; the change set is too large to"
+    . " inspect") if @compare > $MAXIMUM_CHANGES;
   for my $path (@compare) {
     my $bytes = git_in_mirror(undef, "cat-file", "--filters", "--path=$path", $base{$path}{oid});
     $as_checked_out{$path} = 1 if blob_id($bytes) eq file_id($path);
@@ -539,7 +546,8 @@ for my $gone (@deleted) {
 }
 push @changes, grep { !$paired_delete{$_->{path}} } @deleted;
 push @changes, grep { !$paired_add{$_->{path}} } @added;
-fail(9, "more than $MAXIMUM_CHANGES changes; the change set is too large to inspect") if @changes > $MAXIMUM_CHANGES;
+# A populated gitlink is reported too, one name each, so it counts against the same limit.
+fail(9, "more than $MAXIMUM_CHANGES changes; the change set is too large to inspect") if @changes + @nested > $MAXIMUM_CHANGES;
 @changes = sort { $a->{path} cmp $b->{path} } @changes;
 # Names are checked only here, as they go into the manifest: an unchanged path with any name is never refused.
 for my $change (@changes) {

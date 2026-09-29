@@ -106,7 +106,8 @@ Use only these entry points to run an agent:
    - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
      failed. Route it to needs human, as for link target changes and nested gitlink content.
    - **Refusals.** It refuses, and never returns part of the answer, when:
-     - there are more than 10,000 changes;
+     - there are more than 10,000 changes (a populated submodule counts as one), or more than 10,000 changed files
+       whose checkout converts and must be compared with base's checkout;
      - a name or link target it reports is longer than 1,024 bytes, is not strict UTF-8, or holds a Unicode control,
        format, line or paragraph separator, or unassigned character (unchanged names are never checked);
      - the recorded targets hold more than 20,000 entries;

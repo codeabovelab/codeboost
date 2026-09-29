@@ -1270,6 +1270,14 @@ describe('real Docker agent isolation', () => {
       expect((await inspect()).changes).toEqual([expect.objectContaining({ kind: 'modify', path: 'a.txt' })]);
     }, 180_000);
 
+    it('reports nothing for a file whose bytes are base\'s blob, whatever rule the agent adds', async () => {
+      // Base stores CRLF with no rule at all; the agent adds a text rule that would store the file differently.
+      const data = fixture({ hostile: source => writeFileSync(join(source, 'a.txt'), 'a\r\nb\r\n') });
+      asAgent(data.filesystems, 'printf "*.txt text\\n" > .gitattributes');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      expect(manifest.changes.map(change => change.path)).toEqual(['.gitattributes']);
+    }, 180_000);
+
     it('compares with checkout under base\'s attributes, not the ones the agent left', async () => {
       const data = fixture({ hostile: source => {
         // u.txt is stored with CRLF though base's rule would normalize it: committed before the rule existed.
