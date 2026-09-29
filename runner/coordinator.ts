@@ -104,7 +104,7 @@ export class RunnerCoordinator {
     try { attempt = this.#store.admitAttempt(identity, { ...request, now: this.#now() }); }
     catch (error) { this.#jobs.delete(key); throw error; }
     job.attemptId = attempt.id; job.attempt = attempt;
-    job.done = this.#run(job, attempt).catch(error => this.#unexpected(job, error));
+    job.done = this.#run(job, attempt);
     return attempt;
   }
   /** Retry is a new attempt bound to the latest failed or cancelled one. */
@@ -131,7 +131,7 @@ export class RunnerCoordinator {
       try {
         if (this.#store.getTask(identity).stateVersion === expectedStateVersion
           && this.#store.recordFirstReason(job.identity, job.attemptId, job.firstReason)) {
-          job.reasonSaved = true;
+          job.reasonSaved = true; this.#confirmSaved(job);
           expectedStateVersion = this.#store.getTask(identity).stateVersion;
         }
       } catch { /* still unsaved; the Store's own write below is likely to fail the same way */ }
@@ -177,11 +177,22 @@ export class RunnerCoordinator {
         const durable = this.#store.getAttempt(job.identity, job.attemptId).firstReason;
         if (durable) job.firstReason = durable;
       }
-      job.reasonSaved = true;
+      job.reasonSaved = true; this.#confirmSaved(job);
     } catch { job.reasonSaved = false; }
     job.controller.abort(new Error(`Stopped: ${job.firstReason}`));
     job.handle?.cancel(D_REASON[job.firstReason]);
     return true;
+  }
+  /**
+   * A reason write may be part of the caller's transaction (userAction) and roll back with it. Once that transaction
+   * has ended, check the row, so an undone write shows as unsaved and the next cancel task saves it again.
+   */
+  #confirmSaved(job: Job): void {
+    queueMicrotask(() => {
+      if (!job.firstReason || !job.reasonSaved) return;
+      try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== job.firstReason) job.reasonSaved = false; }
+      catch { /* unreadable: keep what the write reported */ }
+    });
   }
   /** Task budget and, before launch, the attempt deadline. D enforces the deadline once it runs. */
   #arm(job: Job, attempt: AttemptRecord): void {
@@ -199,9 +210,15 @@ export class RunnerCoordinator {
   }
   async #run(job: Job, attempt: AttemptRecord): Promise<void> {
     try {
-      // Armed before the first await, so still in admission's turn. A failed read ends the attempt before preparation.
+      // Admission may be part of the caller's transaction (userAction). Start nothing until that transaction has ended:
+      // if it rolled back, the row is gone and the job only gives back its reservation.
+      await null;
+      if (!this.#store.getAttempts(job.identity).some(row => row.id === attempt.id)) return;
+      // A failed read ends the attempt before preparation.
       try { this.#arm(job, attempt); }
       catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Could not arm the task time limit: ${message(error)}` }); }
+      // A stop can land before this point; do not start preparation for it.
+      if (job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
       let prepared: PreparedAttempt;
       try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
       catch (error) { return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error)); }
@@ -258,6 +275,9 @@ export class RunnerCoordinator {
       job.decided = true;
       // Host-side preparation files go after the terminal write, so a failed write leaves them for startup recovery.
       if (saved) await this.#deps.cleanupPreparation(attempt).catch(() => undefined);
+    } catch (error) {
+      // Set the marker before the job goes, so the slot is never free in between.
+      this.#unexpected(job, error);
     } finally {
       for (const timer of job.timers) clearTimeout(timer);
       if (this.#jobs.get(job.key) === job) this.#jobs.delete(job.key);
@@ -293,7 +313,6 @@ export class RunnerCoordinator {
   #unexpected(job: Job, error: unknown): void {
     // Fail closed: an unexpected error keeps the slot held until restart.
     this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });
-    if (this.#jobs.get(job.key) === job) this.#jobs.delete(job.key);
     console.error(`Runner job ${job.attemptId} failed unexpectedly: ${message(error)}`);
   }
 }

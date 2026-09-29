@@ -384,6 +384,53 @@ describe('review regressions', () => {
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale', diagnostic: 'plan revision 2 replaced 1' });
     expect(store.getTask(A).status).toBe('cancelled');
   });
+  it('starts no preparation and gives back the slot when the caller\'s transaction rolls back admission', async () => {
+    const { store, runner, preparations } = setup();
+    const req = request(store, A);
+    expect(() => store.userAction(A, { actionId: randomUUID(), kind: 'retry', request: {} }, () => {
+      runner.start(A, req);
+      throw new Error('commit failed');
+    })).toThrow(/commit failed/);
+    await runner.settled(A);
+    expect(preparations).toHaveLength(0);
+    expect(runner.isActive(A)).toBe(false);
+    expect(store.getAttempts(A)).toHaveLength(0);
+    expect(() => runner.start(B, request(store, B))).not.toThrow();
+  });
+  it('shows a reason as unsaved when its write rolled back with the caller\'s transaction, and saves it on the next cancel', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    vi.spyOn(store, 'recordFirstReason').mockImplementationOnce(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    runner.stop(A, attempt.id, 'stale', 'plan revision 2 replaced 1');
+    expect(() => store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+      runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID());
+      throw new Error('commit failed');
+    })).toThrow(/commit failed/);
+    await tick();
+    expect(store.getAttempt(A, attempt.id).firstReason).toBeNull();
+    expect(runner.status(A).stopRequested).toMatchObject({ reason: 'stale', saved: false });
+    expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
+  });
+  it('never leaves the slot free between an unexpected failure and its marker', async () => {
+    const { store, runner, preparations } = setup();
+    vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    vi.spyOn(store, 'getAttempt').mockImplementation(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    preparations[0]!.resolve();
+    // Check after every microtask, so a turn with neither the job nor its marker would be seen.
+    let firstInactive: unknown = 'never inactive';
+    for (let i = 0; i < 1000; i++) {
+      await Promise.resolve();
+      if (!runner.isActive(A)) { firstInactive = runner.status(A).unresolved; break; }
+    }
+    expect(firstInactive).toEqual({ attemptId: attempt.id, reason: 'result-not-saved' });
+  });
   it('refuses a stop once the terminal write is done and only cleanup remains', async () => {
     const { store, runner, launches, preparations, deps } = setup();
     let finish!: () => void, cleanupStarted = false;
