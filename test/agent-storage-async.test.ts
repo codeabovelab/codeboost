@@ -35,6 +35,8 @@ const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTa
   removeTaskFilesystems } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
 
+// Every fake Docker call starts a Node process, so a loaded machine needs more than the default 5 s per test.
+vi.setConfig({ testTimeout: 60_000 });
 const RUNNER = '0123456789abcdef0123456789abcdef';
 const IMAGE = `sha256:${'a'.repeat(64)}`;
 const LIMITS = { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 };

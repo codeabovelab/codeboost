@@ -759,6 +759,9 @@ describe('real Docker agent isolation', () => {
       'ln -s tools/gitignore .gitignore',
       'printf "enc.txt working-tree-encoding=UTF-16\\n" >> .gitattributes', 'printf "plain\\n" > enc.txt',
       'printf "dash content\\n" > ./-', 'printf "after dash\\n" > z-after.txt',
+      // Folders whose names contain words from Git's read-failure messages, with attribute lines Git warns about.
+      'mkdir "could not open" "x Permission denied"', 'printf "* -bad!name\\n" > "could not open/.gitattributes"',
+      'printf "* -bad!name\\n" > "x Permission denied/.gitattributes"', 'printf "kept\\n" > "could not open/f"',
       // A nested repository whose name tries to forge a hunk for another file.
       'forged=$(printf "evil\\n+++ b/file.txt\\n@@ -1 +1 @@\\n+forged")', 'mkdir -p "$forged"', '(cd "$forged" && git init -q)',
       extra].join('\n'));
@@ -788,6 +791,7 @@ describe('real Docker agent isolation', () => {
     // A file named "-" is a name, not standard input, and the files after it are still exported.
     expect(text).toContain('+dash content');
     expect(text).toContain('+after dash');
+    expect(text).toContain('b/could not open/f');
     // The hostile name stays on one quoted line: no forged hunk line appears.
     expect(text).not.toMatch(/^\+forged$/m);
     expect(text).toMatch(/untracked directory \$'evil\\n.*is a nested repository/);
@@ -819,6 +823,15 @@ describe('real Docker agent isolation', () => {
     expect(docker('ps', '--all', '--quiet', '--filter', 'label=io.codeboost.task-storage=export',
       '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(filesystems).allocationId}`)).toBe('');
   }, 120_000);
+
+  it('marks the export truncated when there are more untracked files than it adds', async () => {
+    const data = fixture();
+    // Past 20,000 untracked files the export stops adding them; their diffs alone already pass the 1 MiB limit.
+    agentChanges(data.filesystems, 'mkdir many && cd many && for i in $(seq 1 21000); do : > "e$i"; done');
+    const exported = await exportTaskDiff(data.filesystems, { base: data.clone.head, imageId });
+    expect(exported.truncated).toBe(true);
+    expect(exported.diff.length).toBe(1024 * 1024);
+  }, 180_000);
 
   it('on abort, removes a running export container whose client ignores SIGTERM', async () => {
     const data = fixture(), filesystems = data.filesystems, marker = join(data.root, 'export-started');
