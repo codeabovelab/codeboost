@@ -71,6 +71,7 @@ if (a === 'start' && fs.existsSync(path.join(state, 'hang-start'))) {
 if (a === 'start') process.exit(0);
 if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
   const name = args[args.indexOf('--name') + 1];
+  fs.writeFileSync(path.join(state, 'export-args.json'), JSON.stringify(args.filter(arg => arg.length < 200)));
   save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
   if (fs.existsSync(path.join(state, 'fail-export'))) {
     // Like --rm after the export script failed: the container is gone and the client reports the script's status.
@@ -272,8 +273,11 @@ describe('task diff export', () => {
     calls.made = [];
     await expect(exportTaskDiff(handle, { base: BASE, imageId: IMAGE })).rejects.toThrow('needs the metadataBaseline');
     expect(calls.made).toEqual([]);
-    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE, metadataBaseline: 'b'.repeat(64) })).diff.toString())
+    expect((await exportTaskDiff(handle, { base: BASE, imageId: IMAGE, metadataBaseline: 'c'.repeat(64) })).diff.toString())
       .toBe('partial output\n');
+    // The script is given F's baseline to check the metadata against.
+    const args = JSON.parse(readFileSync(join(state, 'export-args.json'), 'utf8')) as string[];
+    expect(args[args.indexOf('export', args.indexOf('-c')) + 3]).toBe('c'.repeat(64));
   });
 
   it('refuses a volume that no longer carries the storage labels, before running anything', async () => {

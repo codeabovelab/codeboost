@@ -207,8 +207,8 @@ export function taskMetadataBaseline(storage: TaskFilesystems | RecoveredTaskSto
 }
 /**
  * The baseline to check the metadata against: D's own for storage this process allocated (a given one must match it),
- * or the one F recorded, which a recovery handle needs. Only a runner commit (#66 part 2) may change the metadata after
- * seeding; it is the last step on a storage, and is to return the new baseline.
+ * or the one F recorded, which a recovery handle needs. Nothing but a runner commit (#66 part 2) may change the
+ * metadata after seeding, and that commit is the last step on a storage: no check runs after it.
  */
 export function resolveMetadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage, given: string | undefined): string {
   const known = taskMetadataBaseline(storage);
@@ -553,7 +553,7 @@ export interface TaskDiff {
   readonly truncated: boolean;
 }
 export interface ExportOptions extends PreparationOptions {
-  /** The last commit codeboost made in this storage (or the clone's head): a full commit ID. */
+  /** The commit the storage was seeded from (the clone's head): a full commit ID. */
   readonly base: string;
   /** The immutable ID of the built agent image, whose Git runs the export. */
   readonly imageId: string;
@@ -564,9 +564,11 @@ export interface ExportOptions extends PreparationOptions {
   /** The storage's `metadataBaseline`, which F recorded at allocation. Required for a recovery handle. */
   readonly metadataBaseline?: string;
 }
-// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume: `git diff --binary`
-// compares `base` with the working tree (committed, staged and unstaged changes alike, since codeboost makes every
-// commit) without refreshing the real index (GIT_OPTIONAL_LOCKS=0), and new untracked files are diffed through a
+// Runs as the task-storage user with both volumes read-only. It writes nothing to either volume. It first checks the
+// metadata against the seeder's baseline: agents cannot write it, so an agent's work is edits and new files, never
+// commits or staging, and a change means a protection failed and no Git command may run. `git diff --binary` compares
+// `base` with the working tree without refreshing the real index (GIT_OPTIONAL_LOCKS=0), and new untracked files are
+// diffed through a
 // separate intent-to-add index in /tmp. An untracked nested repository, which Git cannot diff, is named in a
 // notice line instead, quoted so an agent-chosen name cannot forge diff lines. Output stops at
 // `limit` bytes inside the container, so the Docker work is bounded too, and is base64-encoded so any bytes survive.
@@ -876,7 +878,7 @@ export async function runStorageScript(storage: TaskFilesystems | RecoveredTaskS
 }
 
 /**
- * Export the diff of task storage against `base`, the last commit codeboost made there, for a stopped attempt's partial
+ * Export the diff of task storage against `base`, the commit it was seeded from, for a stopped attempt's partial
  * output (#51 item 6). It accepts the value `prepareTaskFilesystems` returned or a recovery handle, runs Git in a
  * read-only container that has no network, and returns at most `maxBytes` (1 MiB at most) with `truncated` set when
  * the diff was longer. `maxBytes` bounds the returned data; `timeoutMs` and `signal` bound the Docker work. On abort or

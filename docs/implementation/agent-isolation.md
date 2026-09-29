@@ -80,8 +80,9 @@ Use only these entry points to run an agent:
    call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
    credential only as the function argument.
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before
-   `removeTaskFilesystems`. `base` is the full ID of the last commit codeboost made in that storage. It returns at
-   most 1 MiB of diff (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
+   `removeTaskFilesystems`. `base` is the full ID of the commit the storage was seeded from (the clone's head). For a
+   recovery handle, also pass the `metadataBaseline` you recorded (step 6). It returns at most 1 MiB of diff
+   (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
    A changed file over 8 MiB, an untracked nested repository, a path Git will not add, an entry named `.git`, a fifo
    or socket, an ignored untracked path, a submodule directory with content, and a changed file whose `ident` or
    `working-tree-encoding` attribute changes what the diff shows each appear as a `codeboost:` notice line. When Git

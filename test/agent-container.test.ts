@@ -832,15 +832,18 @@ describe('real Docker agent isolation', () => {
     // A Git failure part-way through fails the export; it is never passed off as a complete diff.
     // Anything the export cannot read fails it: Git would otherwise drop untracked files or show tracked ones as deleted.
     const tracked = (name: string) => (source: string) => { agentBase(source); mkdirSync(join(source, name)); writeFileSync(join(source, name, 'f'), 'a\n'); };
-    for (const { extra, hostile, beforeSeed } of [
+    for (const { extra, hostile } of [
       { extra: 'printf "secret\\n" > unreadable.txt && chmod 000 unreadable.txt' },
       { extra: 'mkdir hidden && printf "x\\n" > hidden/untracked.txt && chmod 000 hidden' },
       { hostile: tracked('tracked'), extra: 'printf "b\\n" > tracked/f && chmod 000 tracked' },
-      // An ignored directory: the untracked scan never enters it, so Git would report its tracked file as deleted.
-      { hostile: tracked('gone'), beforeSeed: (clone: string) => {
-        mkdirSync(join(clone, '.git', 'info'), { recursive: true }); writeFileSync(join(clone, '.git', 'info', 'exclude'), 'gone/\n');
-      }, extra: 'chmod 000 gone' }]) {
-      const failing = fixture({ hostile: hostile ?? agentBase, beforeSeed });
+      // An ignored directory (base's .gitignore) holding a tracked file: the untracked scan never enters it, so Git
+      // would report that file as deleted.
+      { hostile: (source: string) => {
+        agentBase(source); mkdirSync(join(source, 'd', 'gone'), { recursive: true });
+        writeFileSync(join(source, 'd', 'gone', 'f'), 'a\n'); writeFileSync(join(source, 'd', '.gitignore'), 'gone/\n');
+        git(source, 'add', '-f', 'd/gone/f');
+      }, extra: 'chmod 000 d/gone' }]) {
+      const failing = fixture({ hostile: hostile ?? agentBase });
       agentChanges(failing.filesystems, extra);
       await expect(exportTaskDiff(failing.filesystems, { base: failing.clone.head, imageId })).rejects.toThrow('could not read part of the task worktree');
     }

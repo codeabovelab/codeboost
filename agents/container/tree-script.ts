@@ -395,7 +395,10 @@ if (@commitable) {
   # What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
   # the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
   # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
-  my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} } sort keys %base;
+  # A submodule is checked out as a directory (the task clone is not recursive): that is its unchanged state, so it
+  # stays. The commit step, which removes the same entries, would otherwise drop every submodule.
+  my @gone = grep { !$work{$_} || ($work{$_}{type} ne $base{$_}{type}
+    && !($base{$_}{type} eq "gitlink" && $work{$_}{type} eq "directory")) } sort keys %base;
   if (@gone) {
     open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
     print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");
