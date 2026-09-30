@@ -97,9 +97,14 @@ describe('post-run audit', () => {
     expect(auditRun(item, manifest([file('/etc/passwd', { kind: 'add', oldType: undefined })]), exact))
       .toEqual({ kind: 'violation', violations: ['Invalid path in the change report: "/etc/passwd".'] });
   });
-  it('counts a case-only rename once under a case-folding identity', () => {
+  it('counts a case-only rename once under a case-folding identity, whether reported as a rename or as a delete and an add', () => {
     const renamed: PlanItem = { ...item, files: [{ path: 'README.md', kind: 'rename', renamed_from: 'Readme.md', change: 'x' }] };
     expect(auditRun(renamed, manifest([file('README.md', { kind: 'rename', oldPath: 'Readme.md' })]), folded)).toMatchObject({ kind: 'commit', inScope: ['README.md'] });
+    const split = manifest([file('Readme.md', { kind: 'delete', newType: undefined }), file('README.md', { kind: 'add', oldType: undefined })]);
+    expect(auditRun(renamed, split, folded)).toMatchObject({ kind: 'commit', inScope: ['Readme.md', 'README.md'], outOfScope: [] });
+    // Undeclared, the same pair is a scope finding, not a safety violation; two adds of one folded path are still refused.
+    expect(auditRun(item, manifest([file('notes', { kind: 'delete', newType: undefined }), file('NOTES', { kind: 'add', oldType: undefined })]), folded)).toMatchObject({ kind: 'commit', outOfScope: ['notes', 'NOTES'] });
+    expect(auditRun(item, manifest([file('notes', { kind: 'add', oldType: undefined }), file('NOTES', { kind: 'add', oldType: undefined })]), folded)).toMatchObject({ kind: 'violation' });
   });
   it('counts two spellings of one path under a case-folding identity as a duplicate', () => {
     expect(auditRun(item, manifest([file('SRC/Retry.ts'), file('src/retry.ts')]), folded)).toMatchObject({ kind: 'violation' });

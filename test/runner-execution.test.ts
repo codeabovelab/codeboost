@@ -596,4 +596,46 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('needs human');
     expect(commits).toEqual([]);
   });
+  it('pays an owed scope pause from a review status too', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+  });
+  it('never turns needs human into needs amendment with a scope pause', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('keeps possibly already fixed as a human gate for a safety finding', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'possibly already fixed'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/possibly already fixed; it moves to needs human/) });
+    expect(store.getTask(identity).status).toBe('possibly already fixed');
+  });
+  it('keeps task storage before launch when the terminal write fails', async () => {
+    const { runner, executor, log } = setup({ settleError: true, startError: new Error('docker refused') });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'pending' });
+    expect(log.some(line => line.startsWith('release'))).toBe(false);
+    expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
+  });
+  it('finds a checkpoint by its commit head, and refuses a pause at an unknown snapshot', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
+    const paused = await h.executor.runTask(identity) as { checkpointId: string };
+    const store = h.store;
+    expect(store.checkpointAtHead(identity, oid(100))?.id).toBe(paused.checkpointId);
+    expect(store.checkpointAtHead(identity, oid(2))).toBeNull();
+    expect(() => store.pauseForAmendment(identity, { revision: 1, snapshotId: 'no-such-snapshot' }, { item: 'P1', baseEntries: [], completedItems: ['P1'], outOfScopePaths: ['x'] }))
+      .toThrow(/Unknown snapshot/);
+  });
 });

@@ -118,8 +118,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         message: `${item.id}: ${item.title}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
       }, signal); }
       catch (error) {
-        if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
-        // D's refusal text can name agent-chosen paths: quote it (AGENTS.md).
+        // D's refusal text can name agent-chosen paths: quote it (AGENTS.md). A stop records its first reason before it
+        // aborts, so a stopped commit still ends as that stop, whatever this text says.
         throw new FinishFailure(`The runner commit was refused: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
       }
       // The ID goes into the ledger inside the terminal write; a malformed one must fail the attempt, not that write.

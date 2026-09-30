@@ -111,13 +111,17 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   if (manifest.nestedGitlinkContent.length) violations.push(`Content appeared under a gitlink: ${list(manifest.nestedGitlinkContent)}.`);
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
   // Each path appears once, under the trusted path identity: two entries for one path contradict each other.
-  const seen = new Set<string>();
+  const seen = new Map<string, ManifestChange>();
   for (const change of manifest.changes) {
     // A case-only rename's two sides are one path under a folding identity; count it once for this change.
     const keys = new Set([change.path, ...(change.oldPath ? [change.oldPath] : [])].map(pathKey));
     for (const key of keys) {
-      if (seen.has(key)) return { kind: 'violation', violations: [`The change report lists ${q(key)} more than once.`] };
-      seen.add(key);
+      const earlier = seen.get(key);
+      // A case-only rename that Git reports as a delete and an add (the file also changed a lot) is one path too.
+      const splitRename = earlier && !earlier.oldPath && !change.oldPath && earlier.path !== change.path
+        && new Set([earlier.kind, change.kind]).size === 2 && [earlier.kind, change.kind].every(kind => kind === 'add' || kind === 'delete');
+      if (earlier && !splitRename) return { kind: 'violation', violations: [`The change report lists ${q(key)} more than once.`] };
+      seen.set(key, change);
     }
   }
   for (const change of manifest.changes) {
