@@ -470,7 +470,7 @@ describe('guards found by the independent review', () => {
     await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: null }]);
   });
-  it('reports drafts unsupported when recovery cannot turn a lost draft opening back into a draft', async () => {
+  it('reports drafts unsupported when a lost draft opening cannot be turned back into a draft', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
