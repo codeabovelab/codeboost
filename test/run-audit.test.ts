@@ -54,9 +54,17 @@ describe('post-run audit', () => {
       expect((outcome as { violations: string[] }).violations.join(' '), label).toMatch(reason);
     }
   });
-  it('refuses a change path of . or ..', () => {
-    for (const path of ['..', '.', 'a/../..'])
+  it('refuses a change path of . or .., any non-canonical spelling, and .git in any case at any depth', () => {
+    for (const path of ['..', '.', 'a/../..', 'x/../.git/hooks/pre-commit', './.git/config', './a.ts', 'a//b', 'dir/', 'sub/.git/config', '.GIT/config', 'src/.Git'])
       expect(auditRun(item, manifest([file(path)]), exact), path).toMatchObject({ kind: 'violation' });
+    expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: 'x/../.git/config' })]), exact)).toMatchObject({ kind: 'violation' });
+  });
+  it('limits the saved paths as JSON, and does not count a rename\'s old path', () => {
+    // 100 paths of 4,000 control characters are under the raw byte cap but about 2.4 MB as JSON.
+    expect(auditRun(item, manifest(Array.from({ length: 100 }, (_, i) => file(`${'\u0001'.repeat(4000)}${i}`, { kind: 'add', oldType: undefined }))), exact))
+      .toEqual({ kind: 'violation', violations: ['The change report is too large to audit.'] });
+    // A long old path is not saved, so it does not count.
+    expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: `docs/${'o'.repeat(600_000)}.md` })]), exact)).toMatchObject({ kind: 'commit' });
   });
   it('stops on every safety violation before any scope decision', () => {
     const cases: [string, ChangeManifest][] = [

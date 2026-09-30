@@ -166,16 +166,13 @@ export class ItemExecutor {
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [...done] });
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
-    if (owed) return this.#pause(identity, owed.row, owed.result, stopped, []);
-    // A recorded pause holds until a person approves continuing on the current revision (plan-format.md: "After a
-    // person approves a revised plan and continuation"); the items it already completed are not run again.
+    if (owed) return this.#pause(identity, owed.row, owed.result, stopped, [], true);
+    // Continuing after a scope pause (plan-format.md: reconcile the executed prefix with the audited head, validate the
+    // remaining items from that checkpoint) is not built yet (#88), so a paused task runs no further items: fail closed.
     const checkpoint = this.#store.latestCheckpoint(identity);
-    if (checkpoint) {
-      if (this.#store.continuationRevision(identity, checkpoint.id) !== plan.revision)
-        return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', `${checkpoint.item} changed files outside its plan item; approve continuing on the amended plan before running more items.`);
-      if (!options.fromItem || checkpoint.completedItems.includes(options.fromItem))
-        return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', `Continue after ${checkpoint.item}: name the next item to run, not one that already ran.`);
-    }
+    if (checkpoint)
+      return stopped(options.fromItem ?? plan.items[start]!.id, 'not started',
+        `${checkpoint.item} changed files outside its plan item. Continuing after a scope pause is not supported yet (#88), so this task runs no further items.`);
     /** Where the next item must start: the context the previous item left, or the current one for the first item. */
     let expected: { snapshotId: string; assignmentId: string; referencedCodeHash: string } | null = null;
     for (const item of plan.items.slice(start)) {
@@ -231,7 +228,7 @@ export class ItemExecutor {
     const row = this.#store.getAttempts(identity).filter(entry => entry.kind === 'execute' && entry.state === 'completed').at(-1);
     const result = row?.result as ExecutionResult | undefined;
     if (!row || !result?.outOfScope?.length) return null;
-    return row.item && this.#store.checkpointFor(identity, row.item, result.head) ? null : { row, result };
+    return this.#store.checkpointAtHead(identity, result.head) ? null : { row, result };
   }
   /**
    * The scope pause. The checkpoint names the revision the item ran against and the snapshot its own commit created, so
@@ -239,7 +236,7 @@ export class ItemExecutor {
    * longer running) returns stopped; anything else is thrown, and the next run pauses first.
    */
   #pause(identity: PlanIdentity, row: AttemptRecord, result: ExecutionResult,
-    stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[]): ExecutionOutcome {
+    stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[], owed = false): ExecutionOutcome {
     const item = row.item!;
     const snapshotId = this.#store.snapshotWithHead(identity, result.head);
     if (!snapshotId) throw new Error(`The snapshot of ${item}'s commit is missing.`);
@@ -249,7 +246,7 @@ export class ItemExecutor {
       checkpointId = this.#write(() => this.#store.pauseForAmendment(identity, { revision: row.context.planRevision, snapshotId }, {
         item, baseEntries: this.#sources.planContext(identity).baseEntries,
         completedItems: items.slice(0, items.findIndex(entry => entry.id === item) + 1).map(entry => entry.id), outOfScopePaths: result.outOfScope,
-      })).id;
+      }, { owed })).id;
     } catch (error) {
       if (!(error instanceof GuardRefusal)) throw error;
       return stopped(item, row.state, `${item} changed files outside its plan item, but the task could not pause for amendment: ${error.message}`);

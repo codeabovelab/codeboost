@@ -360,23 +360,24 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('needs amendment');
     expect(h.commits.map(c => c.item)).toEqual(['P1']);
   });
-  it('holds a recorded pause until a person approves continuing on an amended plan, then runs only the next item', async () => {
+  it('runs no further items once a task has a scope checkpoint, even after an approved continuation (not supported yet)', async () => {
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
     const paused = await h.executor.runTask(identity);
     expect(paused).toMatchObject({ kind: 'needs amendment', item: 'P1' });
     const store = h.store;
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
-    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/approve continuing/) });
+    const refused = { kind: 'stopped', state: 'not started', reason: expect.stringMatching(/Continuing after a scope pause is not supported yet/) };
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject(refused);
     const amended = { ...plan, revision: 2, items: [{ ...plan.items[0]!, files: [...plan.items[0]!.files, { path: 'extra.ts', kind: 'add', renamed_from: null, change: 'z' }] }, plan.items[1]!] };
-    store.importRevision(JSON.stringify(amended), 'json', { ...context, baseEntries: context.baseEntries }, 1);
+    store.importRevision(JSON.stringify(amended), 'json', context, 1);
     store.approveContinuation(identity, (paused as { checkpointId: string }).checkpointId, { revision: 2, snapshotId: store.getSnapshot(identity).id });
-    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/name the next item/) });
-    expect(await h.executor.runTask(identity, { fromItem: 'P1' })).toMatchObject({ kind: 'stopped', state: 'not started' });
-    // A later snapshot with the same head does not make the approved pause owed again.
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject(refused);
+    // A later snapshot with the same head does not make the recorded pause owed again.
     const snapshot = store.getSnapshot(identity);
     store.recordHistory(identity, { revision: 2, snapshotId: snapshot.id }, snapshot.base, snapshot.head, []);
-    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toEqual({ kind: 'executed', items: ['P2'], unchanged: [] });
-    expect(h.commits.map(c => c.item)).toEqual(['P1', 'P2']);
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject(refused);
+    expect(store.getTask(identity).status).toBe('queued');
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
   });
   it('fails the attempt when the workspace makes no new commit for a changed item', async () => {
     const { store, executor } = setup({ commitHead: oid(2) });
@@ -406,5 +407,23 @@ describe('item execution', () => {
     runner = h.runner; store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
     expect(store.getTask(identity).status).toBe('running');
+  });
+  it('keeps a queued status someone set during release: this run neither pauses nor escalates over it', async () => {
+    let store!: Store;
+    const toQueued = async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued'); };
+    const scoped = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: toQueued });
+    store = scoped.store;
+    expect(await scoped.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('queued');
+    const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toQueued });
+    store = unsafe.store;
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/is queued, so it was not moved to needs human/) });
+    expect(store.getTask(identity).status).toBe('queued');
+  });
+  it('keeps task storage when a foreign result\'s terminal write fails', async () => {
+    const { runner, executor, log } = setup({ settleError: true, exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'running' });
+    expect(log.some(line => line.startsWith('release'))).toBe(false);
+    expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
 });

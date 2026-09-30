@@ -509,17 +509,17 @@ export class Store {
    * (plan-format.md, "After each run"). The checkpoint and the move to needs amendment commit together, so a refused
    * status change (a closed task, an active attempt or merge) records no checkpoint either.
    */
-  pauseForAmendment(identity: PlanIdentity, ranAt: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>): Checkpoint {
+  pauseForAmendment(identity: PlanIdentity, ranAt: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>, options: { owed?: boolean } = {}): Checkpoint {
     const key = identityKey(identity);
     return this.#transaction(() => {
       if (!this.#get('SELECT 1 FROM snapshots WHERE key=? AND id=?', key, ranAt.snapshotId)) throw new Error('Unknown snapshot.');
       const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
       if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
         throw new Error('Checkpoint must describe the executed plan prefix.');
-      // Only the executor's own task pauses: running, or queued for its next run (a pause owed from an earlier run). A
-      // status someone set since (for example needs human or needs approval) is kept.
+      // Only the executor's own task pauses. In the run that found it, that is a running task: any status someone set
+      // since (queued included) is kept. A pause owed from an earlier run is also paid from queued, the next run's start.
       const status = this.#task(key).status;
-      if (status !== 'running' && status !== 'queued') throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
+      if (status !== 'running' && !(options.owed && status === 'queued')) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
       const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
@@ -527,13 +527,13 @@ export class Store {
     });
   }
   /**
-   * The scope checkpoint recorded for this item's commit, found by the item and the commit's head (not by the latest
-   * snapshot, which a later snapshot with the same head would shadow), or null if its pause was never recorded.
+   * The scope checkpoint recorded for a runner commit, found by the commit's head (not by the latest snapshot, which a
+   * later snapshot with the same head would shadow), or null if its pause was never recorded.
    */
-  checkpointFor(identity: PlanIdentity, item: string, head: string): Checkpoint | null {
+  checkpointAtHead(identity: PlanIdentity, head: string): Checkpoint | null {
     for (const row of this.#db.prepare('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC').all(identityKey(identity))) {
       const checkpoint = decode<Checkpoint>(row.data);
-      if (checkpoint.item === item && this.getSnapshot(identity, checkpoint.snapshotId).head === head) return checkpoint;
+      if (this.getSnapshot(identity, checkpoint.snapshotId).head === head) return checkpoint;
     }
     return null;
   }

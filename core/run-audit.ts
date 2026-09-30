@@ -61,8 +61,8 @@ function malformed(manifest: ChangeManifest): string | null {
     if ((needsNew && !TYPES.has(change.newType as string)) || (!needsNew && change.newType !== undefined)) return `The change at ${change.path} has an invalid new entry type.`;
     if (change.newType === 'symlink' && typeof change.newLinkTarget !== 'string') return `The link at ${change.path} has no target.`;
     if (change.linkTargetTraversesLink !== undefined && typeof change.linkTargetTraversesLink !== 'boolean') return `The link at ${change.path} has an invalid traversal flag.`;
-    // Only `path` is saved (in the result's scope lists and a checkpoint), so only it counts toward the result limit.
-    bytes += Buffer.byteLength(change.path) + 3;
+    // Only `path` is saved (in the result's scope lists and a checkpoint), so only it counts, as the JSON that stores it.
+    bytes += Buffer.byteLength(JSON.stringify(change.path)) + 1;
   }
   if (bytes > MAX_PATH_BYTES) return 'The change report is too large to audit.';
   return null;
@@ -95,7 +95,11 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
   for (const change of manifest.changes) {
     const paths = [change.path, ...(change.oldPath ? [change.oldPath] : [])];
-    if (change.underGit || paths.some(path => path === '.git' || path.startsWith('.git/'))) { violations.push(`The agent changed ${change.path} under .git.`); continue; }
+    // A path must be in canonical form: another spelling (./, a/../, //, a trailing /) could reach .git or hide a match.
+    if (paths.some(path => path !== posix.normalize(path) || path.endsWith('/') || path.startsWith('./')))
+      { violations.push(`Path not in canonical form in the change report: ${change.path}.`); continue; }
+    // Git refuses a .git part of any case at any depth, so the audit does too.
+    if (change.underGit || paths.some(path => path.split('/').some((part: string) => part.toLowerCase() === '.git'))) { violations.push(`The agent changed ${change.path} under .git.`); continue; }
     if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || ['.', '..'].includes(posix.normalize(path)) || path.includes('\0')))
       { violations.push(`Invalid path in the change report: ${change.path}.`); continue; }
     if (change.oldType === 'gitlink' || change.newType === 'gitlink') { violations.push(`Plan items cannot change gitlinks: ${change.path}.`); continue; }
