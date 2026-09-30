@@ -39,7 +39,7 @@ const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>(
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void } = {}) {
   const publishConfig = { ...config, ...options.config };
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
@@ -48,7 +48,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
   const results = options.results ? [...options.results] : [];
   // Like GitHub, the default check reports every visible open PR on the branch (it links the issue) unless it is listed as own.
   const gate: AlreadyFixedGateway = { async check(input) {
-    log.push('check'); checks.push(input);
+    log.push('check'); checks.push(input); options.onCheck?.();
     if (options.results) return results.shift() ?? { outcome: 'clear', baseHead: oid(9) };
     const foreign = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !input.ownPullRequests.includes(pr.number));
     return foreign.length ? { outcome: 'found', baseHead: oid(9), matches: foreign.map(([, pr]) => ({ kind: 'pull request' as const, repository: 'owner/repo', number: pr.number, state: 'OPEN' as const, draft: pr.draft })) }
@@ -1102,6 +1102,8 @@ describe('the PR description', () => {
     expect(body).toContain('Fixes #12');
     expect(body.replace('Fixes #12', '').replace('(#12)', '')).not.toMatch(/#\d|GH-\d|\/issues\/\d/i);
     expect(neutralizeReferences('owner/repo#9 and #x and GH-a')).toBe('owner/repo＃9 and #x and GH-a');
+    // Lowercase and pull-request URL forms are references too.
+    expect(neutralizeReferences('gh-7 and https://github.com/owner/repo/pull/8')).toBe('gh‑7 and https://github.com/owner/repo/pull∕8');
   });
   it('cuts titles and problems by code point, and never leaves an empty summary', () => {
     const emoji = '😀'.repeat(300);
@@ -1225,6 +1227,12 @@ describe('GitHub PR adapter', () => {
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async args => args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })))
       .refresh(7, { ...input, draft: true, ready: false })).rejects.toThrow(/did not turn the pull request into a draft/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ number: 8 }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/different/);
+    // The PATCH answer itself is checked, before any ready change: another PR there stops the refresh even if a read-back would pass.
+    const patched: string[][] = [];
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
+      patched.push([...args]); if (args[0] === 'pr') return ''; return JSON.stringify(response(args.includes('PATCH') ? { number: 8 } : { draft: false }));
+    }).refresh(7, { ...input, draft: false, ready: true })).rejects.toThrow(/different/);
+    expect(patched.some(args => args[0] === 'pr')).toBe(false);
     // Closed between the lookup and the refresh: refused, so the task never moves to in review without an open PR.
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ state: 'closed' }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/not open/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ state: 'closed' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/not open/);
@@ -1345,6 +1353,14 @@ describe('GitHub PR adapter', () => {
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'someone else' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/did not open/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response(), response()])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/More than one of the task's pull requests/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'a' }), response({ number: 8, body: 'b' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/invalid pull request list/);
+  });
+  it('validates every PR it reads: an https URL, and head and base in this repository', async () => {
+    const lookup = (pr: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([pr])).findOpened({ ...input, markers: [marker] });
+    await expect(lookup(response({ html_url: 'http://github.com/owner/repo/pull/7' }))).rejects.toThrow(/invalid pull request/);
+    await expect(lookup({ ...response(), base: { ref: 'main', repo: { full_name: 'other/repo' } } })).rejects.toThrow(/different branch/);
+    // A marked PR without a readable base is refused, not taken as being in no base.
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([{ ...response(), base: { repo: { full_name: 'owner/repo' } } }]))
+      .findOwned({ headBranch: input.headBranch, markers: [marker] })).rejects.toThrow(/invalid pull request/);
   });
   it('refuses the task\'s own PR retargeted to another base, and ignores anyone else\'s PR from the branch into another base', async () => {
     const elsewhere = (over: Record<string, unknown> = {}) => ({ ...response(over), base: { ...response().base, ref: 'release' } });
@@ -1862,6 +1878,31 @@ describe('shutdown and PRs left ready', () => {
     expect(drafts).toBe(2);
     expect(error.message).not.toMatch(/could not be made a draft/);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
+  it('records nothing after an abort during the check, the push, or the needs-human draft change', async () => {
+    // During the check: no result is recorded and the task stays running.
+    let store = runningTask(), controller = new AbortController();
+    await expect(harness(store, { onCheck: () => controller.abort() }).publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
+    expect(store.latestAlreadyFixed(identity)).toBeNull();
+    expect(store.getTask(identity).status).toBe('running');
+    // During the push of a new branch: no opening is recorded, so nothing is left to settle.
+    store = runningTask(); controller = new AbortController();
+    const pushed = harness(store, { push: async () => { controller.abort(); } });
+    await expect(pushed.publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
+    expect(store.taskPullRequests(identity)).toEqual([]);
+    expect(pushed.log.some(line => line.startsWith('open'))).toBe(false);
+    // During the draft change before a needs-human update: no update is recorded and nothing is pushed.
+    store = runningTask(); controller = new AbortController();
+    const live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    let drafts = 0;
+    // The draft step's change fails once (a note); the main path's lands, then the abort.
+    const again = harness(store, { live, next, onDraft: () => { if (++drafts === 1) throw new Error('timeout marking the PR a draft'); controller.abort(); } });
+    await expect(again.publisher.publish(identity, { problems: ['x'] }, controller.signal)).rejects.toThrow();
+    expect(drafts).toBe(2);
+    expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();

@@ -1139,7 +1139,6 @@ export class Store {
       if (plan.snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
     });
   }
-  /** Records that the task's open PR is now a draft (after a check matched). The task status does not change. */
   /**
    * Records the draft state GitHub shows for the task's open PR. It also repairs a record whose draft change landed on
    * GitHub but was never recorded (a crash or cancel right after the call). Guarded by the state version the caller
