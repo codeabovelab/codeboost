@@ -535,8 +535,13 @@ describe('item execution', () => {
     const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
       release: async () => { if (store.getAttempts(identity).length === 1) store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human'); } });
     store = h.store;
+    let version = 0;
+    const releaseDone = h.workspace.release.bind(h.workspace);
+    h.workspace.release = async ws => { await releaseDone(ws); version = store.getTask(identity).stateVersion; };
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(h.findings.get(store.getAttempts(identity)[0]!.id)).toBeUndefined();
+    // Settled without a needs human -> needs human write.
+    expect(store.getTask(identity).stateVersion).toBe(version);
   });
   it('keeps a finding owed when a merge in progress refuses the escalation, and escalates it on the next run', async () => {
     let store!: Store;
@@ -824,5 +829,28 @@ describe('item execution', () => {
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
     // Paid from the durable result: no item ran again.
     expect(store.getAttempts(identity)).toHaveLength(2);
+  });
+  it('stops before the next item when only the context generation changes during the run', async () => {
+    let store!: Store;
+    const h = setup({ release: async () => {
+      if (store.getAttempts(identity).length !== 1) return;
+      const current = store.currentContext(identity);
+      store.setAssignment(identity, store.getTask(identity).stateVersion, current.assignmentId, current.referencedCodeHash);
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'], reason: expect.stringMatching(/snapshot or assignment changed/) });
+    expect(h.runner.status(identity).unresolved).toBeNull();
+  });
+  it('pays nothing owed once shutdown began', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    await h.executor.runTask(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    h.runner.rejectAdmission();
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started', reason: 'The review server is shutting down.' });
+    expect(store.getTask(identity).status).toBe('queued');
+    expect(h.findings.get(store.getAttempts(identity)[0]!.id)).toBeDefined();
   });
 });

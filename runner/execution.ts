@@ -1,6 +1,6 @@
 import type { PlanIdentity } from '../core/identity.ts';
 import type { PlanContext } from '../core/plan.ts';
-import type { InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
+import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
@@ -185,6 +185,8 @@ export class ItemExecutor {
     if (start < 0) throw new Error('Unknown plan item.');
     const done: string[] = [], unchanged: string[] = [];
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [...done] });
+    // Shutdown began (admission is closed): pay nothing owed and start nothing; the next run after restart does.
+    if (this.#runner.closing) return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', 'The review server is shutting down.');
     // An earlier run of this task that is still finishing (its storage release) settles its own findings and pause.
     if (this.#runner.isActive(identity))
       return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', 'An earlier run of this task is still finishing; start it again when that run has ended.');
@@ -203,7 +205,7 @@ export class ItemExecutor {
       return stopped(options.fromItem ?? plan.items[start]!.id, 'not started',
         `${checkpoint.item} changed files outside its plan item. Continuing after a scope pause is not supported yet (#88), so this task runs no further items.`);
     /** Where the next item must start: the context the previous item left, or the current one for the first item. */
-    let expected: { snapshotId: string; assignmentId: string; referencedCodeHash: string } | null = null;
+    let expected: InvocationContext | null = null;
     for (const item of plan.items.slice(start)) {
       // Admission reads the context in this same turn, so it cannot notice a change saved during an earlier item.
       const current = this.#store.currentContext(identity);
@@ -212,7 +214,7 @@ export class ItemExecutor {
         return stopped(item.id, 'not started', `The task's status changed to ${this.#store.getTask(identity).status} during the run; ${item.id} was not started.`);
       if (this.#store.getPlan(identity).revision !== plan.revision)
         return stopped(item.id, 'not started', `The plan changed to a new revision during the run; review it before running ${item.id}.`);
-      if (expected && (current.snapshotId !== expected.snapshotId || current.assignmentId !== expected.assignmentId || current.referencedCodeHash !== expected.referencedCodeHash))
+      if (expected && !sameContext(current, expected))
         return stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
       let attempt: AttemptRecord;
       try {
@@ -241,7 +243,8 @@ export class ItemExecutor {
       if (result.outOfScope.length) return this.#pause(identity, row, result, stopped, done);
       const snapshotId = result.unchanged ? row.context.snapshotId : this.#store.snapshotWithHead(identity, result.head);
       if (!snapshotId) throw new Error(`The snapshot of ${item.id}'s commit is missing.`);
-      expected = { snapshotId, assignmentId: row.context.assignmentId, referencedCodeHash: row.context.referencedCodeHash };
+      // The item's own commit (recordHistory) raised the context generation by exactly one; any other change is not ours.
+      expected = { ...row.context, snapshotId, stateVersion: row.context.stateVersion + (result.unchanged ? 0 : 1) };
     }
     return { kind: 'executed', items: done, unchanged };
   }
