@@ -280,15 +280,6 @@ export class PullRequestPublisher {
     return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
   }
 
-  /** Adopts, as facts with the versions read right now, every PR among `owned` whose opening is recorded as abandoned. */
-  #adoptOwned(identity: PlanIdentity, rows: readonly TaskPullRequest[], owned: readonly (OpenedPullRequest & { marker: string })[]): void {
-    for (const pr of owned) {
-      const row = rows.find(candidate => marker(candidate.openingId) === pr.marker);
-      if (row?.state === 'abandoned')
-        this.#store.adoptOpening(identity, row.openingId, pr, { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
-    }
-  }
-
   /** Whether a lost opening is the current publish's own: neither the task nor its review changed since it began, and the mode matches. */
   #isCurrent(identity: PlanIdentity, lost: TaskPullRequest, draft: boolean): boolean {
     return this.#store.getTask(identity).stateVersion === lost.ownerVersion && this.#store.reviewVersion(identity) === lost.ownerReviewVersion && lost.draft === draft;
@@ -351,10 +342,10 @@ export class PullRequestPublisher {
       try { found = await this.#pulls.markDraft(pr.number, { base: pr.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
-        const current = this.#isCurrent(identity, lost, draft);
-        // The task is in needs human: the next publish's draft step adopts its other open PRs.
+        // Definite: the PR is recorded as it is, and the main path reports it (`draft unsupported`, or the misplaced
+        // refusal for a PR it would not accept).
         this.#store.recordPullRequestOpened(identity, lost.openingId, pr, false);
-        return current ? { kind: 'draft unsupported', number: pr.number } : null;
+        return null;
       }
     }
     // The recovered opening finishes this publish only if it is this publish's own work: same task version and same
@@ -362,11 +353,9 @@ export class PullRequestPublisher {
     // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
     const current = this.#isCurrent(identity, lost, draft);
     // Moving the task to in review is a change, not an observation: only for a PR the main path would accept, in the
-    // configured base with no other of the task's PRs open. Any other is recorded, and made a draft by the head settle.
+    // configured base with no other of the task's PRs open. Any other is recorded; the main path drafts and refuses it.
     const mayReview = pr.base === this.#config.baseBranch && owned.length === 1;
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found, mayReview);
-    // The task's other open PRs are facts too: an abandoned opening's PR among them is adopted, so it can be found.
-    this.#adoptOwned(identity, rows, owned.filter(other => other !== pr));
     // It ends the publish only for a PR the main path would accept. Any other goes on to the main path, which makes all of
     // the task's PRs drafts and refuses with what a person has to do, as it does for every misplaced PR.
     if (current && mayReview) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);

@@ -1826,6 +1826,30 @@ describe('shutdown and PRs left ready', () => {
     expect(again.log).toContain('draft 100');
     expect(task.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
   });
+  it('refuses a lost draft opening moved to another base in a repository without drafts, like any misplaced PR', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    for (const [m, pr] of live) { live.set(m, { ...pr, draft: false }); baseOf.get(live)!.set(m, 'develop'); }
+    const again = harness(store, { live, next, draftsUnsupported: true });
+    await expect(again.publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(/now targets develop, not main.*#100 stays ready for review: this repository does not support draft/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: false }]);
+  });
+  it('reports only what is still true in the misplaced refusal: a draft change that failed and then landed is not reported', async () => {
+    // A ready PR in review; the task then needs a person, and someone moves the PR to develop.
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
+    // The first draft step's change fails; the misplaced run's lands.
+    let drafts = 0;
+    const again = harness(store, { live, next, onDraft: () => { if (++drafts === 1) throw new Error('timeout marking the PR a draft'); } });
+    const error = await again.publisher.publish(identity, { problems: ['x'] }).catch(e => e);
+    expect(error).toBeInstanceOf(PullRequestMisplaced);
+    expect(drafts).toBe(2);
+    expect(error.message).not.toMatch(/could not be made a draft/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
     const later = { now: () => Date.now() + 10 * 60_000 };
