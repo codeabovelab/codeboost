@@ -228,13 +228,14 @@ describe('opening the task PR', () => {
     await expect(harness(cancelled).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(/while the task is cancelled/);
   });
   it('records a PR whose response arrives after the task changed, without letting it move the task', async () => {
-    const store = runningTask();
-    const { publisher } = harness(store, { open: async input => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher } = harness(store, { live, open: async input => {
       store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
-      return { number: 6, url: 'https://github.com/owner/repo/pull/6', headSha: oid(2), draft: input.draft };
+      const pr = { number: 6, url: 'https://github.com/owner/repo/pull/6', headSha: oid(2), draft: input.draft }; live.set(input.marker, pr); return pr;
     } });
-    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 6, status: 'running' });
-    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 6 }]);
+    // Recorded, the task not moved, and the PR made a draft: the task is not in review.
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 6, status: 'running', draft: true });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 6, draft: true }]);
   });
   it('keeps the task running and makes the PR a draft when GitHub shows another head than the one pushed', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>();
@@ -360,8 +361,11 @@ describe('guards found by the independent review', () => {
     for (const [m, pr] of live) live.set(m, { ...pr, draft: false, headSha: oid(3) });
     // Then the task is cancelled: the next publish refuses on status, but first records what GitHub shows.
     store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
-    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false, headSha: oid(3), refresh: null }]);
+    const settled = harness(store, { live, next });
+    await expect(settled.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    // The landed ready update is recorded, then the PR is made a draft: the task is cancelled, so it must not stay ready.
+    expect(settled.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(3), refresh: null }]);
   });
   it('refuses to publish while an attempt is active', async () => {
     const store = runningTask();
@@ -464,15 +468,98 @@ describe('guards found by the independent review', () => {
   });
 });
 
+describe('independent review round 3', () => {
+  const note = (store: Store) => store.addReviewNote(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'P1', 'question', 'Why this file?');
+  const toBase = (store: Store) => {
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
+  };
+  it('makes a recovered ready PR a draft when its task was cancelled meanwhile', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
+  });
+  it('re-reads the task after a refused draft change on the no-changes path', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    toBase(store);
+    await expect(harness(store, { live, next, draftsUnsupported: true, onDraft: () => note(store) }).publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('propagates a Store failure after a head-mismatch draft change that landed, instead of reporting a ready PR', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher } = harness(store, { live, onDraft: () => store.closeWrites(), open: async input => {
+      const pr = { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(77), draft: input.draft }; live.set(input.marker, pr); return pr;
+    } });
+    await expect(publisher.publish(identity)).rejects.toThrow();
+  });
+  it('does not end a publish with a lost opening of the other mode, even with unchanged versions', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    // A draft publish now: the lost ready opening is recorded (its own versions are unchanged, so the task moves to in
+    // review), but it does not end this publish, which continues and refuses on status.
+    await expect(harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(/draft pull request cannot be opened while the task is in review/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }]);
+    expect(store.getTask(identity).status).toBe('in review');
+  });
+  it('does not move the task to in review when a recovered ready opening is now a draft', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: true });
+    expect(await harness(store, { live, next }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'running' });
+  });
+  it('stops after an abort during the refresh push, before any change to the PR', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    const controller = new AbortController();
+    const again = harness(store, { live, next, push: async () => { controller.abort(new Error('stop')); } });
+    await expect(again.publisher.publish(identity, {}, controller.signal)).rejects.toThrow('stop');
+    expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
+  });
+});
+
+describe('Store guards the review listed as untested', () => {
+  const clear = (store: Store) => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
+  it('allows only one opening in flight per task', () => {
+    const store = runningTask();
+    store.beginPullRequest(identity, { checkId: clear(store).id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    // A fresh clear check, so only the one-opening rule can refuse.
+    expect(() => store.beginPullRequest(identity, { checkId: clear(store).id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false })).toThrow(/already being opened/);
+  });
+  it('confirms a refresh only for the head and version it recorded', () => {
+    const store = runningTask();
+    const opening = store.beginPullRequest(identity, { checkId: clear(store).id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    store.recordPullRequestOpened(identity, opening.openingId, { number: 7, url: 'https://github.com/owner/repo/pull/7', headSha: oid(2), draft: false });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'running' === 'running' ? 'queued' : 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id); store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    const version = store.beginRefresh(identity, { checkId: clear(store).id, openingId: opening.openingId, headSha: oid(2), draft: false });
+    const pr = { number: 7, url: 'https://github.com/owner/repo/pull/7', headSha: oid(2), draft: false };
+    expect(() => store.recordRefreshConfirmed(identity, opening.openingId, pr, { head: oid(3), stateVersion: version })).toThrow(/No update/);
+    expect(() => store.recordRefreshConfirmed(identity, opening.openingId, pr, { head: oid(2), stateVersion: version + 1 })).toThrow(/No update/);
+    expect(store.recordRefreshConfirmed(identity, opening.openingId, pr, { head: oid(2), stateVersion: version })).toBe('in review');
+  });
+});
+
 describe('PR records', () => {
   it('keeps the record of a PR that opened after the task was cancelled, without reopening the task', async () => {
-    const store = runningTask();
-    const { publisher } = harness(store, { open: async input => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher } = harness(store, { live, open: async input => {
       store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
-      return { number: 9, url: 'https://github.com/owner/repo/pull/9', headSha: oid(2), draft: input.draft };
+      const pr = { number: 9, url: 'https://github.com/owner/repo/pull/9', headSha: oid(2), draft: input.draft }; live.set(input.marker, pr); return pr;
     } });
-    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 9, status: 'cancelled' });
-    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 9 }]);
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 9, status: 'cancelled', draft: true });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 9, draft: true }]);
   });
   it('refreshes only an opened PR: an abandoned opening must be adopted first', async () => {
     const store = runningTask();
@@ -1048,6 +1135,21 @@ describe('GitHub PR adapter', () => {
     expect(Date.now() - started).toBeLessThan(1_500);
     expect(lastSignal?.aborted).toBe(true);
     expect(calls).toBeLessThan(5);
+  });
+  it('refuses a read-back of another PR, and rethrows an abort from the draft change', async () => {
+    const other = '<!-- codeboost:opening=22222222-2222-4222-8222-222222222222 -->';
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
+      if (args[0] === 'pr') return '';
+      return args.includes('PATCH') ? JSON.stringify(response()) : JSON.stringify(response({ body: `${other}\nplan` }));
+    });
+    await expect(gh.refresh(7, { ...input, ready: false })).rejects.toThrow(/different pull request/);
+    const controller = new AbortController(); let gets = 0;
+    const aborting = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
+      if (args[0] === 'pr') { controller.abort(new Error('stop')); throw new Error('killed'); }
+      gets++; return JSON.stringify(response({ draft: true }));
+    });
+    await expect(aborting.markDraft(7, input, controller.signal)).rejects.toThrow();
+    expect(gets).toBe(0);
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];

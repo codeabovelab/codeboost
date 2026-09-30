@@ -120,6 +120,9 @@ describe('the pre-PR already-fixed check', () => {
       { totalCount: 101 }, { hasNextPage: true }, { nodes: [cross(pr(1))], totalCount: 2 },
       { commits: Array.from({ length: MAX_BASE_COMMITS + 1 }, (_, i) => ({ sha: sha(2000 + i), message: 'x' })) }, { status: 'diverged' }, { status: 'behind' },
       { commits: [{ sha: sha(5), message: 'x' }], totalCommits: 2 },
+      // Validation of the issue state, a linked PR's state and draft flag, and a closing commit's SHA.
+      { state: 'WEIRD' }, { nodes: [cross(pr(1, 'UNKNOWN'))] }, { nodes: [cross(pr(1, 'OPEN', { isDraft: 'no' }))] },
+      { state: 'CLOSED', nodes: [closed({ __typename: 'Commit', oid: 'short' })] },
       // The base branch moved between pages (the count changed), and a page longer than the reported total.
       { commits: Array.from({ length: 150 }, (_, i) => ({ sha: sha(3000 + i), message: 'x' })), totalCommitsLater: 151 },
       { commits: Array.from({ length: 160 }, (_, i) => ({ sha: sha(3000 + i), message: 'x' })), totalCommits: 120 },

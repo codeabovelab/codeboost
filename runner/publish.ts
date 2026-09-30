@@ -118,7 +118,12 @@ export class PullRequestPublisher {
         try {
           const drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
           stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, drafted.number, drafted.draft, { stateVersion, reviewVersion });
-        } catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
+        } catch (error) {
+          if (!(error instanceof DraftsUnsupported)) throw error;
+          leftReady = live.number;
+          // Re-read after the refused call's await, as a successful one is by recordPullRequestDraft.
+          this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
+        }
       }
       if (!draft) this.#store.transitionTask(identity, stateVersion, 'needs human');
       return leftReady === undefined ? { kind: 'no changes' } : { kind: 'no changes', leftReady };
@@ -205,16 +210,15 @@ export class PullRequestPublisher {
     draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
     const opened = { kind: 'opened' as const, number: pr.number, url: pr.url, draft: pr.draft, status };
     if (draft || pr.draft || (status === 'in review' && pr.headSha === head)) return opened;
-    try {
-      const drafted = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(openingId) }, signal);
-      // A fact about the PR, recorded against the versions read right now (no await since).
-      this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
-        { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
-      return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
-    } catch {
-      // The PR stays ready; the next publish sees it (live, not a draft) and reconciles it.
-      return { ...opened, leftReady: pr.number };
-    }
+    let drafted;
+    // Only the GitHub call's failure becomes leftReady (the PR stays ready; the next publish reconciles it). A Store
+    // failure after a draft change that landed propagates, so it is not misreported as a ready PR.
+    try { drafted = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(openingId) }, signal); }
+    catch { return { ...opened, leftReady: pr.number }; }
+    // A fact about the PR, recorded against the versions read right now (no await since).
+    this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
+      { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+    return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
   }
 
   /** Whether a lost opening is the current publish's own: neither the task nor its review changed since it began, and the mode matches. */
@@ -239,6 +243,7 @@ export class PullRequestPublisher {
       const observed = await this.#pulls.findOpened({ base: refreshing.base, headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
       signal?.throwIfAborted();
       this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, observed);
+      if (observed && observed.number === refreshing.number) await this.#draftIfNotPublishable(identity, refreshing, observed, signal);
     }
     // Read once: the settlements above are the only writes before this point.
     const prs = this.#store.taskPullRequests(identity);
@@ -279,6 +284,23 @@ export class PullRequestPublisher {
     // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
     const current = this.#isCurrent(identity, lost, draft);
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
-    return current ? this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal) : null;
+    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);
+    await this.#draftIfNotPublishable(identity, lost, found, signal);
+    return null;
+  }
+
+  /**
+   * After recovery records a PR (a lost opening, or an update whose confirmation was lost), a ready PR whose task can no
+   * longer be published as ready (cancelled, needs human, possibly already fixed, and so on) is made a draft at once:
+   * the main path may refuse on status, and nothing else would. A running task's main path reconciles the PR itself.
+   */
+  async #draftIfNotPublishable(identity: PlanIdentity, row: TaskPullRequest, pr: { number: number; draft: boolean }, signal?: AbortSignal): Promise<void> {
+    const status = this.#store.getTask(identity).status;
+    if (pr.draft || status === 'running' || status === 'in review') return;
+    let drafted;
+    try { drafted = await this.#pulls.markDraft(pr.number, { base: row.base, headBranch: row.headBranch, marker: marker(row.openingId) }, signal); }
+    catch (error) { if (error instanceof DraftsUnsupported) return; throw error; }
+    this.#store.recordPullRequestDraft(identity, row.openingId, drafted.number, drafted.draft,
+      { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
   }
 }
