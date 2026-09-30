@@ -5,10 +5,12 @@ import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 import { cutText } from '../core/text.ts';
 
 /**
- * The pre-PR "already fixed" check (design, "Checking whether the issue is already fixed"). It reports a match when
- * something other than this task closed the issue, when another open or merged PR links to the issue, or when a new
- * commit on the base branch mentions it. The task's own PRs and commits are excluded by repository and number or by
- * SHA only. Every read is bounded; a response past a bound, or one that cannot be read, is `unknown`, never clear.
+ * The pre-PR "already fixed" check (design, "Checking whether the issue is already fixed"). It reports a match when the
+ * issue is closed (by anything, including this task's own merged PR or own commit, which mean the fix is already in),
+ * when another open PR or any merged PR links to the issue (this task's own merged PR included), or when a new commit
+ * on the base branch mentions it. Only this task's own open PRs (by repository and number) and its own commits in the
+ * base comparison (by SHA) are excluded. Every read is bounded; a response past a bound, or one that cannot be read,
+ * is `unknown`, never clear.
  */
 export type AlreadyFixedMatch =
   | { kind: 'closed'; by: string }

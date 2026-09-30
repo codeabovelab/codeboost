@@ -19,7 +19,8 @@ export interface PullRequestGateway {
   open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest>;
   /**
    * The open PR from `headBranch` into `base`, with the one of `markers` its description carries, or null when there is
-   * no open PR. An open PR that carries none of them was not opened by codeboost, and is refused.
+   * no open PR. An open PR that carries none of them (always the case with no markers) was not opened by codeboost, and
+   * is refused.
    */
   findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
@@ -79,8 +80,9 @@ export class GhPullRequestGateway implements PullRequestGateway {
 
   #validate(input: { base: string; headBranch: string; marker?: string; markers?: readonly string[] }): void {
     if (!BRANCH.test(input.base) || !BRANCH.test(input.headBranch)) throw new Error('Invalid branch name.');
+    // A lookup may carry no markers (the task has no PR yet); every other call names the PR's own marker.
     const markers = input.markers ?? [input.marker];
-    if (!markers.length || markers.some(marker => typeof marker !== 'string' || !/^<!-- codeboost:[a-z-]+=[0-9a-f-]{36} -->$/.test(marker))) throw new Error('Invalid pull request marker.');
+    if ((input.markers === undefined && !markers.length) || markers.some(marker => typeof marker !== 'string' || !/^<!-- codeboost:[a-z-]+=[0-9a-f-]{36} -->$/.test(marker))) throw new Error('Invalid pull request marker.');
   }
 
   async open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest> {

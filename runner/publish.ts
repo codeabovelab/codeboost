@@ -91,7 +91,9 @@ export class PullRequestPublisher {
     // it is still open: GitHub allows one open PR per branch. It is looked up before the check, because an abandoned
     // opening's PR links the issue too and has no recorded number; the marker proves it is the task's own.
     const candidates = this.#branchRows(prs, branch, this.#config.baseBranch).filter(pr => pr.state !== 'opening');
-    const live = candidates.length ? await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal) : null;
+    // Always asked, even with no known markers: an open PR on this branch that codeboost did not open is refused here,
+    // before the push could move it.
+    const live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal);
     signal?.throwIfAborted();
     const earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
     const own = new Set(prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!));
@@ -121,23 +123,25 @@ export class PullRequestPublisher {
     const ready = leftReady === undefined ? {} : { leftReady };
     if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result, ...ready } : { kind: 'possibly already fixed', result, ...ready };
     if (earlier && live) {
-      // The push is a refresh's first GitHub write (it moves the open PR's head), so the refresh is recorded before it,
-      // with no await since recordAlreadyFixed. A task change during the push then cannot strand a half-updated PR.
+      // A needs-human task's ready PR becomes a draft first, before anything else about it changes: if the repository
+      // has no drafts, the refusal comes while the PR is still exactly as it was (no push, no new description).
+      if (draft && !live.draft) {
+        try { await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal); }
+        catch (error) { if (error instanceof DraftsUnsupported) return { kind: 'draft unsupported', number: live.number }; throw error; }
+        signal?.throwIfAborted();
+      }
+      // The push is a refresh's first content write (it moves the open PR's head), so the refresh is recorded before it;
+      // beginRefresh re-reads the task after the draft change's await. A task change during the push cannot strand it.
       const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft,
         ...(earlier.state === 'abandoned' ? { adopt: { number: live.number, url: live.url } } : {}) });
       await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
       signal?.throwIfAborted();
-      let pr;
-      try {
-        pr = await this.#pulls.refresh(live.number, {
-          base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
-          title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
-        }, signal);
-      } catch (error) {
-        if (!(error instanceof DraftsUnsupported)) throw error;
-        this.#store.abandonRefresh(identity, earlier.openingId);
-        return { kind: 'draft unsupported', number: live.number };
-      }
+      // Any failure here, including a draft refusal after the PR was made ready again meanwhile, leaves the update
+      // recorded as in flight; the next publish drops it and starts again from the draft step above.
+      const pr = await this.#pulls.refresh(live.number, {
+        base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
+        title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
+      }, signal);
       const status = this.#store.recordRefreshConfirmed(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
       return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
     }

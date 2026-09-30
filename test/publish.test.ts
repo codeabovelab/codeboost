@@ -94,7 +94,7 @@ describe('opening the task PR', () => {
     const { publisher, log, checks, opened } = harness(store);
     const outcome = await publisher.publish(identity);
     expect(outcome).toMatchObject({ kind: 'opened', number: 100, draft: false, status: 'in review' });
-    expect(log).toEqual(['check', 'push codeboost/issue-12-task-42 002', 'open ready']);
+    expect(log).toEqual(['find ', 'check', 'push codeboost/issue-12-task-42 002', 'open ready']);
     expect(checks[0]).toMatchObject({ issue: 12, taskBase: oid(1), baseBranch: 'main', ownPullRequests: [] });
     expect([...checks[0]!.ownCommits]).toEqual([oid(2)]);
     expect(opened[0]).toMatchObject({ base: 'main', headBranch: expect.stringMatching(BRANCH), title: 'Stop the crash (#12)' });
@@ -108,7 +108,7 @@ describe('opening the task PR', () => {
     const result: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'pull request', repository: 'owner/repo', number: 401, state: 'OPEN', draft: false }] };
     const { publisher, log } = harness(store, { results: [result] });
     expect(await publisher.publish(identity)).toEqual({ kind: 'possibly already fixed', result });
-    expect(log).toEqual(['check']);
+    expect(log).toEqual(['find ', 'check']);
     expect(store.getTask(identity).status).toBe('possibly already fixed');
     expect(store.taskPullRequests(identity)).toEqual([]);
     expect(store.latestAlreadyFixed(identity)!.result).toEqual(result);
@@ -117,7 +117,7 @@ describe('opening the task PR', () => {
     const store = runningTask();
     const { publisher, log } = harness(store, { results: [{ outcome: 'unknown', reason: 'GitHub could not be read.' }] });
     expect(await publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
-    expect(log).toEqual(['check']);
+    expect(log).toEqual(['find ', 'check']);
     expect(store.getTask(identity).status).toBe('possibly already fixed');
   });
   it('opens a draft PR with the open problems for a needs-human task, and keeps it in needs human', async () => {
@@ -134,7 +134,7 @@ describe('opening the task PR', () => {
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     const { publisher, log } = harness(store, { results: [{ outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] }] });
     expect(await publisher.publish(identity, { problems: ['x'] })).toMatchObject({ kind: 'draft skipped' });
-    expect(log).toEqual(['check']);
+    expect(log).toEqual(['find ', 'check']);
     expect(store.getTask(identity).status).toBe('needs human');
   });
   it('opens no PR when the task changed nothing, and moves it to needs human', async () => {
@@ -166,6 +166,13 @@ describe('opening the task PR', () => {
     await expect(publisher.publish(identity)).rejects.toThrow(/review changed/);
     expect(log.some(line => line.startsWith('open'))).toBe(false);
     expect(store.taskPullRequests(identity)).toEqual([]);
+  });
+  it('refuses a PR on the branch that codeboost did not open before pushing, even when the task has no PR records', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    live.set('<!-- someone else -->', { number: 77, url: 'https://github.com/owner/repo/pull/77', headSha: oid(8), draft: false });
+    const { publisher, log } = harness(store, { live });
+    await expect(publisher.publish(identity)).rejects.toThrow(/did not open/);
+    expect(log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
   });
   it('refuses to open when the head moved during the check', async () => {
     const store = runningTask();
@@ -218,6 +225,34 @@ describe('opening the task PR', () => {
   });
 });
 
+describe('schema v7', () => {
+  it('upgrades a populated v6 database: adds the check and PR tables, keeps the tasks', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs'), { tmpdir } = await import('node:os'), { join } = await import('node:path');
+    const { DatabaseSync } = await import('node:sqlite');
+    const dir = mkdtempSync(join(tmpdir(), 'codeboost-v7-')), path = join(dir, 'state.sqlite');
+    try {
+      const first = new Store(path);
+      first.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
+      first.transitionTask(identity, first.getTask(identity).stateVersion, 'queued');
+      const before = first.getTask(identity);
+      first.close();
+      const legacy = new DatabaseSync(path);
+      legacy.exec('DROP TABLE task_pull_requests; DROP TABLE already_fixed_checks; PRAGMA user_version=6;');
+      legacy.close();
+      const upgraded = new Store(path);
+      stores.push(upgraded);
+      expect(upgraded.getTask(identity)).toMatchObject({ status: 'queued', stateVersion: before.stateVersion });
+      expect(upgraded.taskPullRequests(identity)).toEqual([]);
+      expect(upgraded.latestAlreadyFixed(identity)).toBeNull();
+      const db = new DatabaseSync(path, { readOnly: true });
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 7 });
+      const names = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND (name LIKE '%pull_requests%' OR name='already_fixed_checks') AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name").all().map(row => row.name);
+      expect(names).toEqual(['already_fixed_checks', 'task_pull_requests', 'task_pull_requests_number', 'task_pull_requests_opening']);
+      db.close();
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+});
+
 describe('PR records', () => {
   it('keeps the record of a PR that opened after the task was cancelled, without reopening the task', async () => {
     const store = runningTask();
@@ -250,13 +285,16 @@ describe('a repository without draft PRs', () => {
     // Nothing is left in flight: the next publish does not wait for a settle time.
     expect(await harness(store, { draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null });
   });
-  it('leaves the existing ready PR as it is, and drops the unconfirmed refresh', async () => {
+  it('leaves the existing ready PR exactly as it is: the draft refusal comes before any push or description change', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     await harness(store, { live, next }).publisher.publish(identity);
     rerun(store);
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
-    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
+    const again = harness(store, { live, next, draftsUnsupported: true });
+    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    // The draft step comes first, so the refusal leaves the PR exactly as it was: no push, no new description.
+    expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(2) }]);
   });
   it('reports a ready PR it could not make a draft when the check matches', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
@@ -688,6 +726,12 @@ describe('GitHub PR adapter', () => {
   it('fails markDraft when GitHub never shows the PR as a draft', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })));
     await expect(gh.markDraft(7, input)).rejects.toThrow(/did not turn the pull request into a draft/);
+  });
+  it('looks up the branch with no markers: an open PR there is refused, no PR is null', async () => {
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response()])).findOpened({ ...input, markers: [] })).rejects.toThrow(/did not open/);
+    expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => '[]').findOpened({ ...input, markers: [] })).toBeNull();
+    // Every other call still needs its marker.
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => '{}').markDraft(7, { ...input, marker: '' })).rejects.toThrow(/marker/);
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];
