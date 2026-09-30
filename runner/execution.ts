@@ -100,6 +100,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         // Contract (Publishing step 2): an inspection that refuses sends the task to needs human.
         return violation(`The change inspection refused: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
       }
+      // The commit step refuses a tree that no longer matches this digest; without one that guard has nothing to check.
+      if (typeof manifest?.digest !== 'string' || !manifest.digest) return violation('The change report has no digest.');
       let outcome: ReturnType<typeof auditRun>;
       try { outcome = auditRun(item, manifest, sources.planContext(identity).pathKey); }
       catch (error) { return violation(`The change report could not be audited: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }

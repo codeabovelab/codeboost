@@ -573,4 +573,27 @@ describe('item execution', () => {
     expect(h.store.getLedger(identity)).toEqual([]);
     expect(h.runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
+  it('pauses for amendment over a review status set during release, so a merge cannot go past the finding', async () => {
+    for (const status of ['in review', 'approved but merge blocked'] as const) {
+      let store!: Store;
+      const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+        release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, status); } });
+      store = h.store;
+      expect(await h.executor.runTask(identity), status).toMatchObject({ kind: 'needs amendment', item: 'P1' });
+      expect(store.getTask(identity).status, status).toBe('needs amendment');
+    }
+  });
+  it('escalates a safety violation over approved but merge blocked too', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+  });
+  it('sends a change report without a digest to needs human', async () => {
+    const { store, executor, commits } = setup({ manifests: { P1: { ...manifest([change('a.ts')]), digest: undefined as unknown as string } } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: `${SAFETY_VIOLATION} The change report has no digest.` });
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(commits).toEqual([]);
+  });
 });

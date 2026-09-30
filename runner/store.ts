@@ -516,10 +516,12 @@ export class Store {
       const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
       if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
         throw new Error('Checkpoint must describe the executed plan prefix.');
-      // Only the executor's own task pauses. In the run that found it, that is a running task: any status someone set
-      // since (queued included) is kept. A pause owed from an earlier run is also paid from queued, the next run's start.
+      // Only the executor's own task pauses. In the run that found it, that is a running task, or a review status someone
+      // set since (a merge must not go past the finding); a queued status set since is kept, and the next run pays the
+      // pause from there. A human gate is kept too. A pause owed from an earlier run is paid from queued as well.
       const status = this.#task(key).status;
-      if (status !== 'running' && !(options.owed && status === 'queued')) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
+      const pausable = status === 'running' || status === 'in review' || status === 'approved but merge blocked' || (options.owed === true && status === 'queued');
+      if (!pausable) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
       const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));

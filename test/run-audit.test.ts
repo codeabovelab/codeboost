@@ -80,6 +80,23 @@ describe('post-run audit', () => {
         .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
     expect(auditRun(item, manifest([file('src/.github-notes.md', { kind: 'add', oldType: undefined })]), exact)).toMatchObject({ kind: 'commit' });
   });
+  it('ends a name where NTFS does (a stream separator or a backslash) before comparing it with .git', () => {
+    for (const path of ['.git:x', '.git::$INDEX_ALLOCATION/config', 'git~1:s', '.git\\config', 'GIT~1\\hooks', 'a/.g\u200eit', 'a/.g\u202ait', 'a/.g\u206bit', 'a/.gi\u200ft'])
+      expect(auditRun(item, manifest([file(path, { kind: 'add', oldType: undefined })]), exact), path).toMatchObject({ kind: 'violation' });
+  });
+  it('refuses a declared link retargeted to the repository root', () => {
+    for (const target of ['.', './', 'a/..'])
+      expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)
+        .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target is the repository root.'] });
+  });
+  it('refuses a declared link renamed to an undeclared path, a directory entry, and an absolute path', () => {
+    expect(auditRun(item, manifest([file('lnk2', { kind: 'rename', oldPath: 'link', oldType: 'symlink', newType: 'symlink', newLinkTarget: 'src/retry.ts', linkTargetTraversesLink: false })]), exact))
+      .toEqual({ kind: 'violation', violations: ['A pre-existing symlink changed at an undeclared path: "lnk2".'] });
+    expect(auditRun(item, manifest([file('build', { kind: 'add', oldType: undefined, newType: 'directory' })]), exact))
+      .toEqual({ kind: 'violation', violations: ['Unexpected directory entry: "build".'] });
+    expect(auditRun(item, manifest([file('/etc/passwd', { kind: 'add', oldType: undefined })]), exact))
+      .toEqual({ kind: 'violation', violations: ['Invalid path in the change report: "/etc/passwd".'] });
+  });
   it('counts a case-only rename once under a case-folding identity', () => {
     const renamed: PlanItem = { ...item, files: [{ path: 'README.md', kind: 'rename', renamed_from: 'Readme.md', change: 'x' }] };
     expect(auditRun(renamed, manifest([file('README.md', { kind: 'rename', oldPath: 'Readme.md' })]), folded)).toMatchObject({ kind: 'commit', inScope: ['README.md'] });

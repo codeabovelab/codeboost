@@ -41,7 +41,9 @@ const KINDS = new Set(['add', 'modify', 'delete', 'rename', 'mode']);
  * any case; on NTFS with trailing dots or spaces and as the 8.3 short name `git~1`; on HFS with ignorable code points.
  */
 export function isDotGit(part: string): boolean {
-  const plain = part.replace(/[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g, '').toLowerCase().replace(/[. ]+$/, '');
+  // NTFS ends a name at a stream separator (`:`) or a backslash, then drops trailing dots and spaces.
+  const name = part.split(/[:\\]/)[0]!;
+  const plain = name.replace(/[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g, '').toLowerCase().replace(/[. ]+$/, '');
   return plain === '.git' || plain === 'git~1';
 }
 /** Agent-controlled text in a finding is quoted (AGENTS.md), and each list is cut short, so a reason stays readable. */
@@ -83,8 +85,11 @@ function malformed(manifest: ChangeManifest): string | null {
 function unsafeLinkTarget(linkPath: string, target: string): string | null {
   if (!target || target.includes('\0')) return 'empty or invalid target';
   if (target.startsWith('/')) return 'absolute target';
-  const resolved = posix.normalize(posix.join(posix.dirname(linkPath), target));
+  // A trailing slash names the same directory: `./` and `a/../` are the root, like `.`.
+  const resolved = posix.normalize(posix.join(posix.dirname(linkPath), target)).replace(/\/+$/, '') || '.';
   if (resolved === '..' || resolved.startsWith('../')) return 'target leaves the repository';
+  // The repository root contains .git: a link to it reaches the metadata through one more path part.
+  if (resolved === '.') return 'target is the repository root';
   // As for paths: Git's metadata is `.git` in any case, at any depth.
   if (resolved.split('/').some(isDotGit)) return 'target enters .git';
   return null;
