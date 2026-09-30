@@ -90,9 +90,10 @@ describe('post-run audit', () => {
     for (const path of ['x\\.git\\hooks\\post-checkout', 'a/b\\.GIT'])
       expect(auditRun(item, manifest([file(path, { kind: 'add', oldType: undefined })]), exact), path).toMatchObject({ kind: 'violation' });
   });
-  it('refuses bad link targets: .git behind a backslash or cancelled by .., empty, or with a NUL', () => {
+  it('refuses bad link targets: a Windows path form, .git cancelled by .., empty, or with a NUL', () => {
     const link = (target: string) => manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]);
-    expect(auditRun(item, link('sub\\.git\\config'), exact)).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
+    for (const target of ['sub\\.git\\config', '..\\..\\outside', 'C:\\Windows', 'c:outside'])
+      expect(auditRun(item, link(target), exact), target).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target uses a Windows path form.'] });
     expect(auditRun(item, link('.git/../src/retry.ts'), exact)).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
     for (const target of ['', 'src/re\0try.ts'])
       expect(auditRun(item, link(target), exact), JSON.stringify(target)).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": empty or invalid target.'] });

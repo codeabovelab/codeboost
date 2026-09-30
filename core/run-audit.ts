@@ -86,6 +86,9 @@ function malformed(manifest: ChangeManifest): string | null {
 function unsafeLinkTarget(linkPath: string, target: string): string | null {
   if (!target || target.includes('\0')) return 'empty or invalid target';
   if (target.startsWith('/')) return 'absolute target';
+  // A backslash or a drive prefix would be a separator or an absolute path on NTFS, where the audit's other checks
+  // (which use POSIX paths) could not see an escape: link text in this repository is POSIX-only.
+  if (target.includes('\\') || /^[A-Za-z]:/.test(target)) return 'target uses a Windows path form';
   // Checked as written too: a `.git` part that a later `..` cancels (`.git/../src`) still names the metadata on the way.
   if (target.split(/[/\\]/).some(isDotGit)) return 'target enters .git';
   // A trailing slash names the same directory: `./` and `a/../` are the root, like `.`.
