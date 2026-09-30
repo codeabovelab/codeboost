@@ -59,13 +59,14 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
           __typename
           ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } ... on ProjectV2 { number } } }
           ... on CrossReferencedEvent { source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
-          ... on ConnectedEvent { subject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
-          ... on DisconnectedEvent { subject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
+          ... on ConnectedEvent { source { ...Linked } subject { ...Linked } }
+          ... on DisconnectedEvent { source { ...Linked } subject { ...Linked } }
         }
       }
     }
   }
-}`;
+}
+fragment Linked on ReferencedSubject { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } }`;
 
 class Unknown extends Error {}
 const object = (value: unknown, label: string): Record<string, unknown> => {
@@ -181,11 +182,16 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
         else throw new Unknown('GitHub returned an unknown closer.');
         continue;
       }
-      const field = node.__typename === 'CrossReferencedEvent' ? 'source' : node.__typename === 'ConnectedEvent' || node.__typename === 'DisconnectedEvent' ? 'subject' : null;
-      if (!field) throw new Unknown('GitHub returned an unexpected timeline event.');
-      const source = object(node[field], 'linked item');
-      if (source.__typename === 'Issue') continue;
-      if (source.__typename !== 'PullRequest') throw new Unknown('GitHub returned an unknown linked item.');
+      const manual = node.__typename === 'ConnectedEvent' || node.__typename === 'DisconnectedEvent';
+      if (node.__typename !== 'CrossReferencedEvent' && !manual) throw new Unknown('GitHub returned an unexpected timeline event.');
+      // A manual link has two sides, the issue and what it is linked to, and which side GitHub reports as the subject
+      // depends on where the link was made. So both are read: the linked PR is the side that is a PR.
+      const sides = (manual ? [node.source, node.subject] : [node.source]).map(side => object(side, 'linked item'));
+      if (sides.some(side => side.__typename !== 'Issue' && side.__typename !== 'PullRequest')) throw new Unknown('GitHub returned an unknown linked item.');
+      const pulls = sides.filter(side => side.__typename === 'PullRequest');
+      if (!pulls.length) continue;
+      if (pulls.length > 1) throw new Unknown('GitHub returned a link between two pull requests on the issue timeline.');
+      const source = pulls[0]!;
       const repo = repositoryName(source.repository), number = positive(source.number, 'pull request number');
       if (!['OPEN', 'CLOSED', 'MERGED'].includes(source.state as string) || typeof source.isDraft !== 'boolean') throw new Unknown('GitHub returned an invalid pull request state.');
       // The task's own open PR is not a match; its own merged PR is: the fix is already in.

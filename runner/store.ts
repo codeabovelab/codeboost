@@ -922,6 +922,8 @@ export class Store {
         CHECK ((state = 'opened') = (number IS NOT NULL AND url IS NOT NULL)));
       CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_number ON task_pull_requests (lower(repository), number) WHERE number IS NOT NULL;
       CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_opening ON task_pull_requests (plan_key) WHERE state = 'opening';
+      CREATE INDEX IF NOT EXISTS already_fixed_checks_task ON already_fixed_checks (plan_key);
+      CREATE INDEX IF NOT EXISTS task_pull_requests_task ON task_pull_requests (plan_key);
       PRAGMA user_version=7;`);
   }
   #pullRequestRecord(row: Record<string, SQLOutputValue>): TaskPullRequest {

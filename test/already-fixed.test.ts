@@ -6,8 +6,9 @@ const repo = 'Owner/Repo';
 const pr = (number: number, state = 'OPEN', extra: Record<string, unknown> = {}) =>
   ({ __typename: 'PullRequest', number, state, isDraft: false, repository: { nameWithOwner: repo }, ...extra });
 const cross = (source: unknown) => ({ __typename: 'CrossReferencedEvent', source });
-const connected = (subject: unknown) => ({ __typename: 'ConnectedEvent', subject });
-const disconnected = (subject: unknown) => ({ __typename: 'DisconnectedEvent', subject });
+const issue = { __typename: 'Issue' };
+const connected = (subject: unknown, source: unknown = issue) => ({ __typename: 'ConnectedEvent', source, subject });
+const disconnected = (subject: unknown, source: unknown = issue) => ({ __typename: 'DisconnectedEvent', source, subject });
 const closed = (closer: unknown) => ({ __typename: 'ClosedEvent', closer });
 
 interface Fake { state?: string; nodes?: unknown[]; totalCount?: number; hasNextPage?: boolean; errors?: unknown; nameWithOwner?: string;
@@ -57,6 +58,12 @@ describe('the pre-PR already-fixed check', () => {
   });
   it('replays manual links: a later disconnect removes a connected PR, a later connect restores it, a cross-reference stays', async () => {
     expect(await gateway({ nodes: [connected(pr(401)), disconnected(pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
+    // A link made from the PR's side reports the PR as the source and the issue as the subject; it counts the same way.
+    expect(await gateway({ nodes: [connected(issue, pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ number: 401 }] });
+    expect(await gateway({ nodes: [connected(pr(401)), disconnected(issue, pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
+    // Two PRs, or a side of an unknown type, cannot be read as a link to this issue.
+    expect(await gateway({ nodes: [connected(pr(401), pr(402))] }).gh.check(input())).toMatchObject({ outcome: 'unknown' });
+    expect(await gateway({ nodes: [connected(pr(401), { __typename: 'Discussion' })] }).gh.check(input())).toMatchObject({ outcome: 'unknown' });
     expect(await gateway({ nodes: [connected(pr(401)), disconnected(pr(401)), connected(pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ number: 401 }] });
     expect(await gateway({ nodes: [cross(pr(401)), connected(pr(401)), disconnected(pr(401))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ number: 401 }] });
   });
@@ -93,6 +100,7 @@ describe('the pre-PR already-fixed check', () => {
   });
   it('treats an issue closed by a Projects workflow as closed by someone else, not as unreadable', async () => {
     expect(await gateway({ state: 'CLOSED', nodes: [closed({ __typename: 'ProjectV2', number: 3 })] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: 'a project workflow' }] });
+    expect(await gateway({ state: 'CLOSED', nodes: [closed({ __typename: 'Mystery' })] }).gh.check(input())).toMatchObject({ outcome: 'unknown', reason: expect.stringMatching(/unknown closer/) });
   });
   it('runs the timeline and base-commit reads together, and a failure in one stops the other', async () => {
     let timelineAborted = false;

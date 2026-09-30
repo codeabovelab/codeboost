@@ -30,7 +30,7 @@ The check matches when any of these is true:
 | Signal | Source | Not a match |
 |---|---|---|
 | The issue is closed. | The issue state and its latest close event (GraphQL). The closer is a PR, a commit, or a Projects workflow. A close by the task's own PR or own commit also counts: it means that PR merged, so the fix is already in. | A reopened issue. |
-| Another open or merged PR links to the issue. | Cross-reference events, and manual links: "connected" and "disconnected" events replayed in order. | The task's own open PRs, matched by repository and number (its own merged PR is a match). Closed, unmerged PRs. A manual link whose latest event is a disconnect. |
+| Another open or merged PR links to the issue. | Cross-reference events, and manual links: "connected" and "disconnected" events replayed in order. Both sides of a manual link are read, because which side GitHub reports as the subject depends on where the link was made; the linked PR is the side that is a PR, and a link between two PRs or to an unknown type makes the check `unknown`. | The task's own open PRs, matched by repository and number (its own merged PR is a match). Closed, unmerged PRs. A manual link whose latest event is a disconnect. |
 | A new commit on the base branch mentions the issue. | The commits from the task's base to the current base branch head. | Own commits. `#123` when the issue is `#12`. `other/repo#12`. |
 
 A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue URL. A PR in another repository that links the issue counts as a match. It is not excluded by number, because its number belongs to another repository.

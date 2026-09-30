@@ -273,8 +273,8 @@ describe('schema v7', () => {
       expect(upgraded.latestAlreadyFixed(identity)).toBeNull();
       const db = new DatabaseSync(path, { readOnly: true });
       expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 7 });
-      const names = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND (name LIKE '%pull_requests%' OR name='already_fixed_checks') AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name").all().map(row => row.name);
-      expect(names).toEqual(['already_fixed_checks', 'task_pull_requests', 'task_pull_requests_number', 'task_pull_requests_opening']);
+      const names = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND (name LIKE '%pull_requests%' OR name LIKE 'already_fixed_checks%') AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name").all().map(row => row.name);
+      expect(names).toEqual(['already_fixed_checks', 'already_fixed_checks_task', 'task_pull_requests', 'task_pull_requests_number', 'task_pull_requests_opening', 'task_pull_requests_task']);
       db.close();
     } finally { rmSync(dir, { recursive: true, force: true }); }
   });
@@ -1128,6 +1128,12 @@ describe('running gh with a request body on stdin', () => {
   });
   it('reports a failing exit with its stderr', async () => {
     await expect(runWithInput(process.execPath, ['-e', 'console.error("HTTP 422");process.exit(1)'], {})).rejects.toThrow(/exit 1\): HTTP 422/);
+  });
+  it('reports a process that exits without reading a large body by its exit status, without crashing on the broken pipe', async () => {
+    await expect(runWithInput(process.execPath, ['-e', 'process.exit(3)'], { input: 'x'.repeat(10 * 1024 * 1024) })).rejects.toThrow(/exit 3/);
+  });
+  it('stops a process whose output passes the limit', async () => {
+    await expect(runWithInput(process.execPath, ['-e', 'process.stdout.write("x".repeat(1 << 20));setInterval(()=>{},1000)'], { maxBuffer: 1024, killGraceMs: 100 })).rejects.toThrow(/exceeded its limit/);
   });
 });
 
