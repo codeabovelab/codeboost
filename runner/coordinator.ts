@@ -379,7 +379,7 @@ export class RunnerCoordinator {
   async #removePreparation(job: Job, attempt: AttemptRecord): Promise<boolean> {
     try { await this.#deps.cleanupPreparation(attempt); return true; }
     catch (error) {
-      console.error(`Runner job ${job.attemptId} could not remove its preparation files: ${message(error)}`);
+      console.error(`Runner job ${job.attemptId} could not remove its preparation files: ${JSON.stringify(message(error))}`);
       return false;
     }
   }
@@ -392,7 +392,7 @@ export class RunnerCoordinator {
     if (!this.#deps.release) return;
     try { await this.#deps.release(attempt, prepared); }
     catch (error) {
-      console.error(`Runner job ${job.attemptId} could not remove its task storage: ${message(error)}`);
+      console.error(`Runner job ${job.attemptId} could not remove its task storage: ${JSON.stringify(message(error))}`);
       if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'storage-not-removed' });
     }
   }
@@ -408,7 +408,7 @@ export class RunnerCoordinator {
   #unexpected(job: Job, error: unknown): void {
     // Fail closed: an unexpected error keeps the slot held until restart.
     this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });
-    console.error(`Runner job ${job.attemptId} failed unexpectedly: ${message(error)}`);
+    console.error(`Runner job ${job.attemptId} failed unexpectedly: ${JSON.stringify(message(error))}`);
   }
 }
 const message = (error: unknown) => bounded(error instanceof Error ? error.message : String(error));

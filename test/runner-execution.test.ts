@@ -740,4 +740,44 @@ describe('item execution', () => {
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: expect.stringMatching(/The change inspection refused: "inspection timed out"/) });
     expect(store.getTask(identity).status).toBe('needs human');
   });
+  it('does not pay an owed finding through the shutdown capability once the write gate has closed', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, capability: s => s.shutdownCapability(),
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    await h.executor.runTask(identity);
+    const attemptId = store.getAttempts(identity)[0]!.id;
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    store.closeWrites();
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/could not be moved to needs human yet: The review server is shutting down/) });
+    expect(store.getTask(identity).status).toBe('queued');
+    expect(h.findings.get(attemptId)).toBeDefined();
+  });
+  it('leaves a run that is still releasing to settle its own scope pause and finding', async () => {
+    for (const unsafe of [false, true]) {
+      let executor!: ItemExecutor, second: Promise<unknown> | undefined;
+      const h = setup({ manifests: { P1: unsafe ? manifest([change('a.ts')], { metadataChanged: true }) : manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+        release: async () => { second = executor.runTask(identity); await second; } });
+      executor = h.executor;
+      expect(await h.executor.runTask(identity), String(unsafe)).toMatchObject({ kind: unsafe ? 'needs human' : 'needs amendment', item: 'P1' });
+      expect(await second, String(unsafe)).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/still finishing/) });
+    }
+  });
+  it('reports the needs-restart cause, and keeps the finding owed, when a finding\'s terminal write failed', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, settleError: true });
+    const outcome = await h.executor.runTask(identity) as { kind: string; reason: string };
+    expect(outcome.kind).toBe('stopped');
+    expect(outcome.reason).toMatch(/Needs restart: the last result could not be saved\./);
+    expect(h.findings.get(h.store.getAttempts(identity)[0]!.id)).toBeDefined();
+  });
+  it('ends as the stop, not a refused commit, when a stop lands and the commit then rejects', async () => {
+    let runner!: RunnerCoordinator, store!: Store;
+    const h = setup({ commit: async () => {
+      runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled');
+      throw new Error('commit aborted');
+    } });
+    runner = h.runner; store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(store.getLedger(identity)).toEqual([]);
+  });
 });

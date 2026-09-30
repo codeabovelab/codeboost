@@ -156,6 +156,8 @@ export type ExecutionOutcome =
   | { kind: 'needs human'; item: string; reason: string; completed: string[] }
   | { kind: 'stopped'; item: string; state: string; reason: string | null; completed: string[] };
 const refusal = (error: unknown) => error instanceof GuardRefusal || error instanceof ShuttingDownError;
+/** A write outside settlement: no shutdown capability. */
+const direct = <T>(fn: () => T): T => fn();
 /**
  * Statuses that wait for a person; leaving one needs its own user action (runner-lifecycle.md), so a safety finding is
  * owed there instead. Review statuses are not gates: a finding moves them to needs human, so the task cannot be merged.
@@ -183,10 +185,13 @@ export class ItemExecutor {
     if (start < 0) throw new Error('Unknown plan item.');
     const done: string[] = [], unchanged: string[] = [];
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [...done] });
+    // An earlier run of this task that is still finishing (its storage release) settles its own findings and pause.
+    if (this.#runner.isActive(identity))
+      return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', 'An earlier run of this task is still finishing; start it again when that run has ended.');
     // A safety finding not yet acted on (a failed write, a human gate at the time) goes to needs human first.
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);
-      if (finding) return this.#escalate(identity, earlier, finding, stopped, []);
+      if (finding) return this.#escalate(identity, earlier, finding, stopped, [], true);
     }
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
@@ -247,8 +252,13 @@ export class ItemExecutor {
    * The finding is settled only once acted on, so a failed write leaves it owed too.
    */
   #escalate(identity: PlanIdentity, row: AttemptRecord, violation: string,
-    stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[]): ExecutionOutcome {
+    stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[], owed = false): ExecutionOutcome {
     const item = row.item!, task = this.#store.getTask(identity);
+    // The terminal write failed: the attempt still counts as active, so the move waits for restart; keep the finding owed.
+    if (row.state === 'pending' || row.state === 'running') {
+      const unresolved = this.#runner.status(identity).unresolved;
+      return stopped(item, row.state, `${violation} ${unresolved ? NEEDS_RESTART[unresolved.reason] : 'Needs restart: the attempt\'s outcome could not be saved.'}`);
+    }
     if (CLOSED_STATUSES.includes(task.status)) {
       this.#findings.settle(row.id);
       return stopped(item, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
@@ -260,10 +270,12 @@ export class ItemExecutor {
     }
     if (HUMAN_GATES.includes(task.status))
       return stopped(item, row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
-    try { this.#write(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
+    // Settling this run's own attempt writes through the shutdown capability; paying an owed finding at the start of a
+    // new run is that run's decision, so it does not, and the closed write gate refuses it like any other.
+    try { (owed ? direct : this.#write)(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
     catch (error) {
-      if (!(error instanceof GuardRefusal)) throw error;
-      return stopped(item, row.state, `${violation} The task could not be moved to needs human yet: ${error.message}`);
+      if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
+      return stopped(item, row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);
     }
     this.#findings.settle(row.id);
     return { kind: 'needs human', item, reason: violation, completed: [...done] };
@@ -288,13 +300,13 @@ export class ItemExecutor {
     const items = this.#store.getPlan(identity, row.context.planRevision).items;
     let checkpointId: string;
     try {
-      checkpointId = this.#write(() => this.#store.pauseForAmendment(identity, { revision: row.context.planRevision, snapshotId }, {
+      checkpointId = (owed ? direct : this.#write)(() => this.#store.pauseForAmendment(identity, { revision: row.context.planRevision, snapshotId }, {
         item, baseEntries: this.#sources.planContext(identity).baseEntries,
         completedItems: items.slice(0, items.findIndex(entry => entry.id === item) + 1).map(entry => entry.id), outOfScopePaths: result.outOfScope,
       }, { owed })).id;
     } catch (error) {
-      if (!(error instanceof GuardRefusal)) throw error;
-      return stopped(item, row.state, `${item} changed files outside its plan item, but the task could not pause for amendment: ${error.message}`);
+      if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
+      return stopped(item, row.state, `${item} changed files outside its plan item, but the task could not pause for amendment: ${(error as Error).message}`);
     }
     return { kind: 'needs amendment', item, outOfScope: result.outOfScope, checkpointId, completed: [...done] };
   }
