@@ -85,7 +85,8 @@ export class PullRequestPublisher {
     if (recovered) return recovered;
     const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
     const reviewVersion = this.#store.reviewVersion(identity);
-    if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
+    // The full publish guard (status, no attempt, merge, requeue or rebase) before any GitHub call.
+    this.#store.assertPublishableNow(identity, draft);
     const prs = this.#store.taskPullRequests(identity), branch = this.branch(identity);
     // The task's earlier PR (a needs-human draft, or an abandoned opening's PR that became visible later) is reused while
     // it is still open: GitHub allows one open PR per branch. It is looked up before the check, because an abandoned
@@ -207,13 +208,15 @@ export class PullRequestPublisher {
    * of the whole publish (AGENTS.md: a later step's failure must not turn a succeeded irreversible action into one).
    */
   async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
-    draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
+    draft: boolean, status: string, branch: string, signal?: AbortSignal, base = this.#config.baseBranch): Promise<PublishOutcome> {
     const opened = { kind: 'opened' as const, number: pr.number, url: pr.url, draft: pr.draft, status };
-    if (draft || pr.draft || (status === 'in review' && pr.headSha === head)) return opened;
+    // Left ready only for a ready publish whose task is now in review at the pushed head; a draft publish's PR is always
+    // a draft, whatever GitHub returned.
+    if (pr.draft || (!draft && status === 'in review' && pr.headSha === head)) return opened;
     let drafted;
     // Only the GitHub call's failure becomes leftReady (the PR stays ready; the next publish reconciles it). A Store
     // failure after a draft change that landed propagates, so it is not misreported as a ready PR.
-    try { drafted = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(openingId) }, signal); }
+    try { drafted = await this.#pulls.markDraft(pr.number, { base, headBranch: branch, marker: marker(openingId) }, signal); }
     catch { return { ...opened, leftReady: pr.number }; }
     // A fact about the PR, recorded against the versions read right now (no await since).
     this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
@@ -240,6 +243,7 @@ export class PullRequestPublisher {
     // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed. What
     // GitHub shows now (draft flag, head) is recorded first, so a change that did land is not forgotten.
     for (const refreshing of this.#store.taskPullRequests(identity).filter(pr => pr.refresh !== null)) {
+      if (refreshing.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request update is in flight in another repository.');
       const observed = await this.#pulls.findOpened({ base: refreshing.base, headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
       signal?.throwIfAborted();
       this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, observed);
@@ -284,7 +288,7 @@ export class PullRequestPublisher {
     // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
     const current = this.#isCurrent(identity, lost, draft);
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
-    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);
+    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal, lost.base);
     await this.#draftIfNotPublishable(identity, lost, found, signal);
     return null;
   }
@@ -295,8 +299,9 @@ export class PullRequestPublisher {
    * the main path may refuse on status, and nothing else would. A running task's main path reconciles the PR itself.
    */
   async #draftIfNotPublishable(identity: PlanIdentity, row: TaskPullRequest, pr: { number: number; draft: boolean }, signal?: AbortSignal): Promise<void> {
-    const status = this.#store.getTask(identity).status;
-    if (pr.draft || status === 'running' || status === 'in review') return;
+    // A task in review keeps a ready PR; one the main path will go on to publish as ready reconciles it there. Any other
+    // task (including a running one with an active attempt, pending requeue, rebase or merge) gets a draft now.
+    if (pr.draft || this.#store.getTask(identity).status === 'in review' || this.#store.canPublish(identity, false)) return;
     let drafted;
     try { drafted = await this.#pulls.markDraft(pr.number, { base: row.base, headBranch: row.headBranch, marker: marker(row.openingId) }, signal); }
     catch (error) { if (error instanceof DraftsUnsupported) return; throw error; }

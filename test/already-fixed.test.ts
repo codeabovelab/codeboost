@@ -11,7 +11,7 @@ const disconnected = (subject: unknown) => ({ __typename: 'DisconnectedEvent', s
 const closed = (closer: unknown) => ({ __typename: 'ClosedEvent', closer });
 
 interface Fake { state?: string; nodes?: unknown[]; totalCount?: number; hasNextPage?: boolean; errors?: unknown; nameWithOwner?: string;
-  commits?: { sha: string; message: string }[]; status?: string; totalCommits?: number; totalCommitsLater?: number; baseRef?: string; fail?: RegExp }
+  commits?: { sha: string; message: string }[]; status?: string; totalCommits?: number; totalCommitsLater?: number; baseSha?: string; baseRef?: string; fail?: RegExp }
 function gateway(fake: Fake = {}) {
   const calls: string[][] = [];
   const nodes = fake.nodes ?? [];
@@ -25,7 +25,7 @@ function gateway(fake: Fake = {}) {
       data: { repository: { nameWithOwner: fake.nameWithOwner ?? 'owner/repo', issue: { state: fake.state ?? 'OPEN',
         timelineItems: { totalCount: fake.totalCount ?? nodes.length, pageInfo: { hasNextPage: fake.hasNextPage ?? false }, nodes } } } },
     });
-    if (joined.includes('/git/ref/heads/')) return JSON.stringify({ ref: `refs/heads/${fake.baseRef ?? 'main'}`, object: { sha: sha(99) } });
+    if (joined.includes('/git/ref/heads/')) return JSON.stringify({ ref: `refs/heads/${fake.baseRef ?? 'main'}`, object: { sha: fake.baseSha ?? sha(99) } });
     const page = Number(/[?&]page=(\d+)/.exec(joined)![1]);
     return JSON.stringify({ status: fake.status ?? 'ahead', total_commits: page > 1 && fake.totalCommitsLater !== undefined ? fake.totalCommitsLater : fake.totalCommits ?? commits.length,
       commits: commits.slice((page - 1) * 100, page * 100).map(c => ({ sha: c.sha, commit: { message: c.message } })) });
@@ -120,6 +120,8 @@ describe('the pre-PR already-fixed check', () => {
       { totalCount: 101 }, { hasNextPage: true }, { nodes: [cross(pr(1))], totalCount: 2 },
       { commits: Array.from({ length: MAX_BASE_COMMITS + 1 }, (_, i) => ({ sha: sha(2000 + i), message: 'x' })) }, { status: 'diverged' }, { status: 'behind' },
       { commits: [{ sha: sha(5), message: 'x' }], totalCommits: 2 },
+      // A commit without a message, an invalid base head, and a non-integer commit count.
+      { commits: [{ sha: sha(5), message: undefined as unknown as string }] }, { baseSha: 'HEAD' }, { totalCommits: 1.5, commits: [{ sha: sha(5), message: 'x' }] },
       // Validation of the issue state, a linked PR's state and draft flag, and a closing commit's SHA.
       { state: 'WEIRD' }, { nodes: [cross(pr(1, 'UNKNOWN'))] }, { nodes: [cross(pr(1, 'OPEN', { isDraft: 'no' }))] },
       { state: 'CLOSED', nodes: [closed({ __typename: 'Commit', oid: 'short' })] },

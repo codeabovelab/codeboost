@@ -551,6 +551,80 @@ describe('Store guards the review listed as untested', () => {
   });
 });
 
+describe('independent review round 4', () => {
+  const clear = (store: Store, draft = false) => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft, result: { outcome: 'clear', baseHead: oid(9) } });
+  it('makes a recovered ready PR a draft when its running task has an attempt active', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false, headSha: oid(3) });
+    store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/attempt is still active/);
+    expect(again.log).toContain('draft 100');
+    // The full guard refuses before the check runs.
+    expect(again.log).not.toContain('check');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: null }]);
+  });
+  it('refuses a pending update recorded for another repository, instead of clearing it unseen', async () => {
+    const store = runningTask();
+    const opening = store.beginPullRequest(identity, { checkId: clear(store).id, repository: 'other/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    store.recordPullRequestOpened(identity, opening.openingId, { number: 7, url: 'https://github.com/other/repo/pull/7', headSha: oid(2), draft: false });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id); store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    store.beginRefresh(identity, { checkId: clear(store).id, openingId: opening.openingId, headSha: oid(2), draft: false });
+    const { publisher, log } = harness(store);
+    await expect(publisher.publish(identity)).rejects.toThrow(/in flight in another repository/);
+    expect(log).toEqual([]);
+    expect(store.taskPullRequests(identity)[0]!.refresh).not.toBeNull();
+  });
+  it("does not pass another repository's PR numbers to the check as the task's own", async () => {
+    const store = runningTask();
+    const opening = store.beginPullRequest(identity, { checkId: clear(store).id, repository: 'other/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    store.recordPullRequestOpened(identity, opening.openingId, { number: 7, url: 'https://github.com/other/repo/pull/7', headSha: oid(2), draft: false });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id); store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    const { publisher, checks } = harness(store);
+    await publisher.publish(identity);
+    expect(checks[0]!.ownPullRequests).toEqual([]);
+  });
+  it('does not take a record for another base as the branch PR', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next, config: { baseBranch: 'develop' } }).publisher.publish(identity);
+    rerun(store);
+    // Now publishing into main: the develop record is not a candidate, so the branch PR is not codeboost's for main.
+    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/did not open/);
+  });
+  it('stops after an abort during the branch lookup, before the check', async () => {
+    const store = runningTask(), controller = new AbortController();
+    const { publisher, log } = harness(store, { onFind: () => controller.abort(new Error('stop')) });
+    await expect(publisher.publish(identity, {}, controller.signal)).rejects.toThrow('stop');
+    expect(log).not.toContain('check');
+  });
+  it('requires the latest check to be clear before an opening', () => {
+    const store = runningTask();
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: true, result: { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'x' }] } });
+    expect(() => store.beginPullRequest(identity, { checkId: check.id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: true })).toThrow(/clear already-fixed check/);
+  });
+  it('matches the PR number when confirming a refresh or recording a draft flag', () => {
+    const store = runningTask();
+    const opening = store.beginPullRequest(identity, { checkId: clear(store).id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    store.recordPullRequestOpened(identity, opening.openingId, { number: 7, url: 'https://github.com/owner/repo/pull/7', headSha: oid(2), draft: false });
+    const versions = () => ({ stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity) });
+    expect(() => store.recordPullRequestDraft(identity, opening.openingId, 8, true, versions())).toThrow(/Unknown pull request/);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id); store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    const version = store.beginRefresh(identity, { checkId: clear(store).id, openingId: opening.openingId, headSha: oid(2), draft: false });
+    expect(() => store.recordRefreshConfirmed(identity, opening.openingId, { number: 8, url: 'u', headSha: oid(2), draft: false }, { head: oid(2), stateVersion: version })).toThrow(/No update/);
+  });
+});
+
 describe('PR records', () => {
   it('keeps the record of a PR that opened after the task was cancelled, without reopening the task', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>();
@@ -686,10 +760,12 @@ describe('recovering a lost opening', () => {
     expect(await again.publisher.publish(identity, { problems: ['still failing'] })).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'needs human' });
     expect(again.log.at(-1)).toBe('refresh 100 draft');
     expect(store.getTask(identity).status).toBe('needs human');
-    // Even if GitHub still reports the PR as ready, a needs-human task never moves to in review.
+    // Even if GitHub still reports the PR as ready, a needs-human task never moves to in review, and its PR is made a draft.
     rerun(store);
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
-    expect(await harness(store, { live, next, draftAfterRefresh: false }).publisher.publish(identity, { problems: ['x'] })).toMatchObject({ draft: false, status: 'needs human' });
+    const last = harness(store, { live, next, draftAfterRefresh: false });
+    expect(await last.publisher.publish(identity, { problems: ['x'] })).toMatchObject({ draft: true, status: 'needs human' });
+    expect(last.log.at(-1)).toBe('draft 100');
   });
   it('does not push when the task changed while the earlier PR was looked up (the check refuses to record)', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };

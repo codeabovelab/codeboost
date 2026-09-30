@@ -1114,6 +1114,17 @@ export class Store {
       return this.#task(key).state_version as number;
     });
   }
+  /** Whether the task can be published in this mode right now (status, no attempt, merge, requeue or rebase). */
+  canPublish(identity: PlanIdentity, draft: boolean): boolean {
+    const key = identityKey(identity), task = this.#task(key);
+    try { this.#assertPublishable(key, task, task.state_version as number, draft); return true; }
+    catch (error) { if (error instanceof GuardRefusal) return false; throw error; }
+  }
+  /** The full publish guard at the current state version, before any GitHub call: refuse early, with its reason. */
+  assertPublishableNow(identity: PlanIdentity, draft: boolean): void {
+    const key = identityKey(identity), task = this.#task(key);
+    this.#assertPublishable(key, task, task.state_version as number, draft);
+  }
   /** The task, its review and its head are exactly as a publish read them before its last await. */
   assertUnchangedSince(identity: PlanIdentity, input: { stateVersion: number; reviewVersion: number; snapshotId: string; draft: boolean }): void {
     const key = identityKey(identity);
