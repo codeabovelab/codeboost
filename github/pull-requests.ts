@@ -1,5 +1,5 @@
 import { ghEnvironment } from './gh-env.ts';
-import { runWithInput } from './run-with-input.ts';
+import { CommandFailed, runWithInput } from './run-with-input.ts';
 import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 
 /** A `gh` runner that can also write a request body to stdin (`gh api --input -`). */
@@ -22,7 +22,8 @@ export interface PullRequestGateway {
   /**
    * The open PR from `headBranch` into `base`, with the one of `markers` its description carries, or null when there is
    * no open PR. An open PR that carries none of them (always the case with no markers) was not opened by codeboost, and
-   * is refused.
+   * is refused. A PR from the branch into another base is ignored, unless it carries one of `markers` (the task's own PR,
+   * retargeted by a person): that is refused.
    */
   findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
@@ -42,11 +43,13 @@ export class DraftsUnsupported extends Error {}
  */
 export class PullRequestRefused extends Error {}
 const DRAFTS_UNSUPPORTED = /draft pull requests? (?:are|is) not supported/i;
+/** What a refusal is matched against: `gh`'s own stderr, never the stdout body that can echo text codeboost sent. */
+const refusalText = (error: unknown): string => error instanceof CommandFailed ? error.stderr : error instanceof Error ? error.message : '';
 /** Runs a GitHub call that asks for a draft, turning GitHub's "not supported" refusal into DraftsUnsupported. */
 async function draftCall<T>(call: () => Promise<T>): Promise<T> {
   try { return await call(); }
   catch (error) {
-    if (error instanceof Error && DRAFTS_UNSUPPORTED.test(error.message)) throw new DraftsUnsupported('This repository does not support draft pull requests.');
+    if (DRAFTS_UNSUPPORTED.test(refusalText(error))) throw new DraftsUnsupported('This repository does not support draft pull requests.');
     throw error;
   }
 }
@@ -119,8 +122,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
     let response;
     try { response = input.draft ? await draftCall(post) : await post(); }
     catch (error) {
-      if (error instanceof DraftsUnsupported || signal.aborted || !(error instanceof Error) || !/\(HTTP 422\)/.test(error.message)) throw error;
-      throw new PullRequestRefused(`GitHub refused to open the pull request: ${error.message}`);
+      if (error instanceof DraftsUnsupported || !/\(HTTP 422\)/.test(refusalText(error))) throw error;
+      throw new PullRequestRefused(`GitHub refused to open the pull request: ${(error as Error).message}`);
     }
     const { body, ...pr } = this.#pull(response, input);
     if (markerOf(body) !== input.marker) throw new Error('GitHub returned a pull request without its marker.');
@@ -133,16 +136,25 @@ export class GhPullRequestGateway implements PullRequestGateway {
     signal = this.#bounded(signal);
     this.#validate(input);
     const owner = this.repository.split('/')[0]!;
-    // Not filtered by base: GitHub allows one open PR per head and base, so a PR that a person retargeted to another base
-    // would not be found, and a second PR would be opened from the same branch. It is refused instead.
+    // Not filtered by base on GitHub's side: GitHub allows one open PR per head and base, so the task's own PR that a
+    // person retargeted to another base would be missed, and a second PR opened from the same branch.
     const query = new URLSearchParams({ state: 'open', head: `${owner}:${input.headBranch}`, per_page: '100' });
     const response = await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls?${query}`], signal);
     if (!Array.isArray(response)) throw new Error('GitHub returned an invalid pull request list.');
-    if (response.length > 1) throw new Error(`More than one open pull request comes from ${input.headBranch}.`);
-    if (!response.length) return null;
-    const base = (response[0] as { base?: { ref?: unknown } } | null)?.base?.ref;
-    if (typeof base === 'string' && base !== input.base) throw new Error(`The open pull request from ${input.headBranch} targets ${base}, not ${input.base}; codeboost will not open a second one.`);
-    const { body, ...pr } = this.#pull(response[0], input);
+    const baseOf = (pr: unknown) => (pr as { base?: { ref?: unknown } } | null)?.base?.ref;
+    const here = response.filter(pr => baseOf(pr) === input.base);
+    if (here.length > 1) throw new Error('GitHub returned an invalid pull request list.');
+    if (!here.length) {
+      // A PR into another base is someone else's (a backport from this branch, say) and is left alone, unless it carries
+      // one of the task's markers: then it is the task's own PR, retargeted, and a person has to decide.
+      for (const other of response) {
+        const { number, body } = other as { number?: unknown; body?: unknown };
+        if (typeof body === 'string' && input.markers.includes(markerOf(body)))
+          throw new Error(`The task's pull request #${String(number)} from ${input.headBranch} now targets ${String(baseOf(other))}, not ${input.base}. Retarget it to ${input.base} or close it.`);
+      }
+      return null;
+    }
+    const { body, ...pr } = this.#pull(here[0], input);
     const found = input.markers.filter(marker => markerOf(body) === marker);
     if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
     return { ...pr, marker: found[0]! };

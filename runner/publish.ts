@@ -128,7 +128,7 @@ export class PullRequestPublisher {
     // it is still open: the branch has at most one open PR (GitHub allows one per base, and the lookup refuses one into
     // another base). It is looked up before the check, because an abandoned
     // opening's PR links the issue too and has no recorded number; the marker proves it is the task's own.
-    const candidates = this.#branchRows(prs, branch, this.#config.baseBranch).filter(pr => pr.state !== 'opening');
+    const candidates = this.#branchRows(prs, branch).filter(pr => pr.state !== 'opening');
     // Always asked, even with no known markers: an open PR on this branch that codeboost did not open is refused here,
     // before the push could move it.
     const live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal);
@@ -213,7 +213,8 @@ export class PullRequestPublisher {
       // Any failure here, including a draft refusal after the PR was made ready again meanwhile, leaves the update
       // recorded as in flight; the next publish settles it and starts again from the draft step above.
       const pr = await this.#pulls.refresh(live.number, {
-        base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
+        // The PR's base on GitHub: the lookup only returns a PR into the configured base.
+        base: this.#config.baseBranch, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
         beforeReady: () => { this.#assertOpen(); this.#store.assertRefreshCurrent(identity, earlier.openingId, draft); },
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
@@ -274,9 +275,12 @@ export class PullRequestPublisher {
     return this.#store.getTask(identity).stateVersion === lost.ownerVersion && this.#store.reviewVersion(identity) === lost.ownerReviewVersion && lost.draft === draft;
   }
 
-  /** The task's PR records for one branch into one base, in the configured repository. */
-  #branchRows(prs: readonly TaskPullRequest[], branch: string, base: string): TaskPullRequest[] {
-    return prs.filter(pr => pr.headBranch === branch && pr.base === base && pr.repository.toLowerCase() === this.#config.repository.toLowerCase());
+  /**
+   * The task's PR records for one branch, whatever their base, in the configured repository: their markers go with every
+   * lookup, so the task's own PR is recognised even after the base setting changed or a person retargeted it.
+   */
+  #branchRows(prs: readonly TaskPullRequest[], branch: string): TaskPullRequest[] {
+    return prs.filter(pr => pr.headBranch === branch && pr.repository.toLowerCase() === this.#config.repository.toLowerCase());
   }
 
   /**
@@ -298,7 +302,7 @@ export class PullRequestPublisher {
     const lost = prs.find((pr: TaskPullRequest) => pr.state === 'opening');
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
-    const rows = this.#branchRows(prs, lost.headBranch, lost.base);
+    const rows = this.#branchRows(prs, lost.headBranch);
     const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
     if (pr && pr.marker !== marker(lost.openingId)) {
@@ -367,7 +371,7 @@ export class PullRequestPublisher {
         branches.set(`${pr.base}\n${pr.headBranch}`, { base: pr.base, headBranch: pr.headBranch });
     }
     for (const { base, headBranch } of branches.values()) {
-      const rows = this.#branchRows(prs, headBranch, base).filter(pr => pr.state !== 'opening');
+      const rows = this.#branchRows(prs, headBranch).filter(pr => pr.state !== 'opening');
       let live;
       try { live = await this.#pulls.findOpened({ base, headBranch, markers: rows.map(row => marker(row.openingId)) }, signal); }
       catch (error) {

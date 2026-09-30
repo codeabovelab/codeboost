@@ -3,7 +3,7 @@ import { Store } from '../runner/store.ts';
 import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
-import { runWithInput } from '../github/run-with-input.ts';
+import { CommandFailed, runWithInput } from '../github/run-with-input.ts';
 import { DraftsUnsupported, GhPullRequestGateway, PullRequestRefused, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway, AlreadyFixedInput, AlreadyFixedResult } from '../github/already-fixed.ts';
 import { fenced, neutralizeReferences, pullRequestBody, pullRequestTitle, MAX_BODY } from '../core/pull-request-body.ts';
@@ -34,12 +34,15 @@ function runningTask(options: { head?: string } = {}) {
   return store;
 }
 
+const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>();
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
   onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
+  // Each PR's base, by marker (like GitHub, a PR opened into a base stays there); unset means the configured base.
+  const bases = baseOf.get(live) ?? new Map<string, string>(); baseOf.set(live, bases);
   const results = options.results ? [...options.results] : [];
   // Like GitHub, the default check reports every visible open PR on the branch (it links the issue) unless it is listed as own.
   const gate: AlreadyFixedGateway = { async check(input) {
@@ -57,16 +60,22 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       // Like GitHub: one open PR per branch.
       if ([...live].some(([, pr]) => !closed.has(pr.number))) throw new PullRequestRefused('GitHub refused to open the pull request: A pull request already exists. (HTTP 422)');
       const pr = { number: counter.value++, url: 'https://github.com/owner/repo/pull/1', headSha: store.getSnapshot(identity).head, draft: input.draft };
-      live.set(input.marker, pr);
+      live.set(input.marker, pr); bases.set(input.marker, input.base);
       if (options.openTimesOut) throw new Error('timeout');
       return pr;
     },
     async findOpened(input) {
       log.push(`find ${input.markers.join(' ')}`); options.onFind?.();
       if (options.found !== undefined) return options.found && { ...options.found, marker: input.markers.at(-1)! };
-      // GitHub shows at most one open PR per branch; find it among every live PR, then match its marker.
-      const open = [...live].find(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m));
-      if (!open) return null;
+      // Like the adapter: the branch's open PR into this base, matched by marker; a PR into another base is ignored unless
+      // it is the task's own (retargeted), which is refused.
+      const visible = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m));
+      const open = visible.find(([m]) => (bases.get(m) ?? input.base) === input.base);
+      if (!open) {
+        const moved = visible.find(([m]) => input.markers.includes(m));
+        if (moved) throw new Error(`The task's pull request #${moved[1].number} now targets ${bases.get(moved[0])}, not ${input.base}.`);
+        return null;
+      }
       if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
       return { ...open[1], marker: open[0] };
     },
@@ -600,8 +609,11 @@ describe('independent review round 4', () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     await harness(store, { live, next, config: { baseBranch: 'develop' } }).publisher.publish(identity);
     rerun(store);
-    // Now publishing into main: the develop record is not a candidate, so the branch PR is not codeboost's for main.
-    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/did not open/);
+    // Now publishing into main: the task's own PR still targets develop, so a person has to retarget or close it; no
+    // second PR is opened from the same branch.
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/#100 now targets develop, not main/);
+    expect(again.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
   });
   it('stops after an abort during the branch lookup, before the check', async () => {
     const store = runningTask(), controller = new AbortController();
@@ -1304,12 +1316,21 @@ describe('GitHub PR adapter', () => {
     expect(calls[0]!.at(-1)).toBe('repos/owner/repo/pulls?state=open&head=owner%3Acodeboost%2Fissue-12-task&per_page=100');
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => '[]').findOpened({ ...input, markers: [marker] })).toBeNull();
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'someone else' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/did not open/);
-    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response(), response()])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/More than one/);
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response(), response()])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/invalid pull request list/);
   });
-  it('refuses the branch PR a person retargeted to another base, instead of missing it and opening a second one', async () => {
-    const retargeted = { ...response(), base: { ...response().base, ref: 'release' } };
-    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([retargeted])).findOpened({ ...input, markers: [marker] }))
-      .rejects.toThrow(/targets release, not main/);
+  it('refuses the task\'s own PR retargeted to another base, and ignores anyone else\'s PR from the branch into another base', async () => {
+    const elsewhere = (over: Record<string, unknown> = {}) => ({ ...response(over), base: { ...response().base, ref: 'release' } });
+    const lookup = (list: unknown[]) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(list)).findOpened({ ...input, markers: [marker] });
+    await expect(lookup([elsewhere()])).rejects.toThrow(/#7 .* now targets release, not main\. Retarget it to main or close it/);
+    // A backport someone opened from the branch: not the task's, and not in the way.
+    expect(await lookup([elsewhere({ number: 8, body: 'backport' })])).toBeNull();
+    expect(await lookup([elsewhere({ number: 8, body: 'backport' }), response()])).toMatchObject({ number: 7, marker });
+  });
+  it('matches refusals against gh\'s stderr only, not the response body echoed on stdout', async () => {
+    const echoed = new CommandFailed('gh failed (exit 1): gh: Server Error (HTTP 502)\n{"body":"Draft pull requests are not supported (HTTP 422)"}', 'gh: Server Error (HTTP 502)');
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw echoed; });
+    const error = await gh.open({ ...input, draft: true }).catch(e => e);
+    expect(error).toBe(echoed);
   });
   it('turns a validation refusal of the opening into PullRequestRefused, with the reason GitHub gave', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => {
