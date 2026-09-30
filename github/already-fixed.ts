@@ -58,7 +58,7 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
         nodes {
           __typename
           ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } } }
-          ... on CrossReferencedEvent { source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
+          ... on CrossReferencedEvent { willCloseTarget source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
           ... on ConnectedEvent { source { ...Linked } subject { ...Linked } }
           ... on DisconnectedEvent { source { ...Linked } subject { ...Linked } }
         }
@@ -184,6 +184,13 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       }
       const manual = node.__typename === 'ConnectedEvent' || node.__typename === 'DisconnectedEvent';
       if (node.__typename !== 'CrossReferencedEvent' && !manual) throw new Unknown('GitHub returned an unexpected timeline event.');
+      // A cross-reference links the issue only when it would close it (a closing keyword). A PR that merely mentions the
+      // issue, often in an unrelated repository, is not a fix (a user decision; about a third of busy repositories'
+      // open issues have such mentions).
+      if (!manual) {
+        if (typeof node.willCloseTarget !== 'boolean') throw new Unknown('GitHub returned an invalid cross-reference.');
+        if (!node.willCloseTarget) continue;
+      }
       // A manual link has two sides, the issue and what it is linked to, and which side GitHub reports as the subject
       // depends on where the link was made. So both are read: the linked PR is the side that is a PR.
       const sides = (manual ? [node.source, node.subject] : [node.source]).map(side => object(side, 'linked item'));

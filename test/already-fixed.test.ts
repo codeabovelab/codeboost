@@ -5,7 +5,7 @@ const sha = (n: number) => n.toString(16).padStart(40, '0');
 const repo = 'Owner/Repo';
 const pr = (number: number, state = 'OPEN', extra: Record<string, unknown> = {}) =>
   ({ __typename: 'PullRequest', number, state, isDraft: false, repository: { nameWithOwner: repo }, ...extra });
-const cross = (source: unknown) => ({ __typename: 'CrossReferencedEvent', source });
+const cross = (source: unknown, willCloseTarget: unknown = true) => ({ __typename: 'CrossReferencedEvent', willCloseTarget, source });
 const issue = { __typename: 'Issue' };
 const connected = (subject: unknown, source: unknown = issue) => ({ __typename: 'ConnectedEvent', source, subject });
 const disconnected = (subject: unknown, source: unknown = issue) => ({ __typename: 'DisconnectedEvent', source, subject });
@@ -45,6 +45,7 @@ describe('the timeline query', () => {
     const query = calls.find(args => args[1] === 'graphql')!.find(arg => arg.startsWith('query='))!.slice('query='.length);
     for (const event of ['ConnectedEvent', 'DisconnectedEvent']) expect(query).toContain(`... on ${event} { source { ...Linked } subject { ...Linked } }`);
     expect(query).toContain('fragment Linked on ReferencedSubject');
+    expect(query).toContain('... on CrossReferencedEvent { willCloseTarget source {');
     // A ProjectV2 closer is read by its type name only: any field on ProjectV2 needs the read:project scope, and GitHub
     // then refuses the whole query.
     expect(query).not.toMatch(/on ProjectV2/);
@@ -67,6 +68,9 @@ describe('the pre-PR already-fixed check', () => {
     expect(calls.map(call => call.find(arg => arg.startsWith('repos/')) ?? call[1])).toEqual(['graphql', 'repos/Owner/Repo/git/ref/heads/main', `repos/Owner/Repo/compare/${sha(1)}...${sha(99)}?per_page=100&page=1`]);
   });
   it('finds other open or merged PRs that link the issue, but not closed ones', async () => {
+    // A PR that only mentions the issue, here or in another repository, is not a link.
+    expect(await gateway({ nodes: [cross(pr(401), false), cross(pr(402, 'MERGED', { repository: { nameWithOwner: 'someone/else' } }), false)] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
+    expect(await gateway({ nodes: [cross(pr(401), 'yes')] }).gh.check(input())).toMatchObject({ outcome: 'unknown' });
     const { gh } = gateway({ nodes: [cross(pr(401)), connected(pr(402, 'MERGED', { isDraft: false })), cross(pr(403, 'CLOSED')), cross(pr(401))] });
     expect(await gh.check(input())).toMatchObject({ outcome: 'found', matches: [
       { kind: 'pull request', repository: repo, number: 401, state: 'OPEN' }, { kind: 'pull request', number: 402, state: 'MERGED' }] });
