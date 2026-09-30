@@ -1,3 +1,4 @@
+import { existsSync } from 'node:fs';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
@@ -1147,6 +1148,13 @@ describe('running gh with a request body on stdin', () => {
     await expect(runWithInput(process.execPath, ['-e', script], { pipeGraceMs: 100 })).resolves.toBe('');
     expect(Date.now() - started).toBeLessThan(2_000);
   });
+  it('starts nothing when the signal is already aborted', async () => {
+    const controller = new AbortController(); controller.abort(new Error('cancelled first'));
+    const marker = `${process.env.TMPDIR ?? '/tmp'}/codeboost-started-${process.pid}-${Date.now()}`;
+    await expect(runWithInput(process.execPath, ['-e', `require('fs').writeFileSync(${JSON.stringify(marker)}, 'x')`], { signal: controller.signal })).rejects.toThrow('cancelled first');
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(existsSync(marker)).toBe(false);
+  });
   it('reports a failing exit with its stderr', async () => {
     await expect(runWithInput(process.execPath, ['-e', 'console.error("HTTP 422");process.exit(1)'], {})).rejects.toThrow(/exit 1\): HTTP 422/);
   });
@@ -1166,6 +1174,11 @@ describe('gh subprocess environment', () => {
     // Windows needs its system and profile directories, and has no `cat` for a pager.
     expect(ghEnvironment({ SYSTEMROOT: 'C:\\Windows', APPDATA: 'A', LOCALAPPDATA: 'L', USERPROFILE: 'U', PATHEXT: '.EXE' }, 'win32'))
       .toMatchObject({ SYSTEMROOT: 'C:\\Windows', APPDATA: 'A', LOCALAPPDATA: 'L', USERPROFILE: 'U', PATHEXT: '.EXE', GH_PAGER: '' });
+    // Every allowlisted variable is passed on as it is: GitHub hosts, tokens and configuration, proxies and CAs.
+    const every = Object.fromEntries(GH_ENV_ALLOWLIST.map(name => [name, `value of ${name}`]));
+    expect(ghEnvironment(every)).toMatchObject(every);
+    for (const name of ['GH_HOST', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN', 'GH_CONFIG_DIR', 'XDG_CONFIG_HOME', 'HTTPS_PROXY', 'https_proxy', 'NO_PROXY', 'SSL_CERT_FILE', 'SSL_CERT_DIR', 'TEMP', 'TMP'])
+      expect(GH_ENV_ALLOWLIST, name).toContain(name as never);
     // Linux keyring sign-in needs the session bus.
     expect(ghEnvironment({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', XDG_RUNTIME_DIR: '/run/user/1' })).toMatchObject({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', XDG_RUNTIME_DIR: '/run/user/1' });
   });

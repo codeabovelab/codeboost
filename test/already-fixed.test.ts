@@ -58,7 +58,7 @@ describe('issue mentions in commit messages', () => {
   it('matches this issue by number, GH- form, qualified name or URL, and nothing else', () => {
     for (const message of ['Fix #12', 'fixes #12.', '(#12)', 'Resolve GH-12', 'owner/repo#12', 'See https://github.com/Owner/Repo/issues/12 for context'])
       expect(mentionsIssue(message, repo, 12), message).toBe(true);
-    for (const message of ['Fix #123', 'Fix #1', 'other/repo#12', 'x#12', 'issue 12', 'https://github.com/owner/repo/issues/120', 'https://github.com/other/repo/issues/12', 'GH-120', 'owner/repo2#12', 'https://example.com/#12'])
+    for (const message of ['Fix #123', 'Fix #1', 'other/repo#12', 'x#12', 'issue 12', 'https://github.com/owner/repo/issues/120', 'https://github.com/other/repo/issues/12', 'GH-120', 'owner/repo2#12', 'https://example.com/#12', 'XGH-12', 'foo-GH-12'])
       expect(mentionsIssue(message, repo, 12), message).toBe(false);
   });
 });
@@ -158,6 +158,11 @@ describe('the pre-PR already-fixed check', () => {
     const { gh, calls } = gateway({ commits });
     expect(await gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'commit', sha: sha(1229) }] });
     expect(calls.filter(call => call.some(arg => arg.includes('/compare/')))).toHaveLength(3);
+  });
+  it('fails closed at once on an empty comparison page that should hold commits, without asking for more', async () => {
+    const { gh, calls } = gateway({ commits: [], totalCommits: 5 });
+    expect(await gh.check(input())).toMatchObject({ outcome: 'unknown', reason: expect.stringMatching(/incomplete commit list/) });
+    expect(calls.filter(call => call.some(arg => arg.includes('/compare/')))).toHaveLength(1);
   });
   it('fails closed past every bound and on unreadable or inconsistent answers', async () => {
     const cases: Fake[] = [
