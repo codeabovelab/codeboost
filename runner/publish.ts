@@ -95,9 +95,15 @@ export class PullRequestPublisher {
     // before the push could move it.
     const live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal);
     signal?.throwIfAborted();
-    const earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
+    let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
     // What GitHub shows is the truth for the draft flag: a draft change whose record was lost is repaired here.
     let stateVersion = task.stateVersion;
+    // An abandoned opening's PR that is now visible is adopted at once, whatever the check says next, so the record
+    // always names every PR the task has on GitHub (for reuse, cancel or cleanup). It does not change the task status.
+    if (earlier && live && earlier.state === 'abandoned') {
+      stateVersion = this.#store.adoptOpening(identity, earlier.openingId, live, stateVersion);
+      earlier = { ...earlier, state: 'opened', number: live.number, url: live.url, draft: live.draft };
+    }
     if (earlier && live && earlier.state === 'opened' && earlier.number === live.number && earlier.draft !== live.draft)
       stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, live.number, live.draft, stateVersion);
     const own = new Set(prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!));
@@ -117,7 +123,7 @@ export class PullRequestPublisher {
     const needsDraft = result.outcome !== 'clear' && earlier && live && !live.draft;
     if (needsDraft) this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
     let drafted = null, leftReady: number | undefined;
-    if (needsDraft) {
+    if (needsDraft && earlier && live) {
       try { drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal); }
       catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
     }
@@ -136,8 +142,7 @@ export class PullRequestPublisher {
       }
       // The push is a refresh's first content write (it moves the open PR's head), so the refresh is recorded before it;
       // beginRefresh re-reads the task after the draft change's await. A task change during the push cannot strand it.
-      const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft,
-        ...(earlier.state === 'abandoned' ? { adopt: { number: live.number, url: live.url } } : {}) });
+      const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
       await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
       signal?.throwIfAborted();
       // Any failure here, including a draft refusal after the PR was made ready again meanwhile, leaves the update

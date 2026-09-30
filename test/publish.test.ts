@@ -557,6 +557,32 @@ describe('recovering from an abandoned opening whose PR appears later', () => {
     expect(store.taskPullRequests(identity)).toMatchObject([{ openingId: first!.openingId, state: 'opened', number: 100 }, { state: 'abandoned' }]);
     expect(third.log.filter(line => line.startsWith('open'))).toEqual([]);
   });
+  it('adopts an abandoned opening\'s PR as soon as it is seen, even when the check then matches', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    // The opening is abandoned after its settle time; a new POST is refused (the first PR exists), leaving one opening.
+    await expect(harness(store, { live, next, hidden, config: later }).publisher.publish(identity)).rejects.toThrow(/already exists/);
+    hidden.clear();
+    const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+    expect(await harness(store, { live, next, results: [found], config: later }).publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
+    // The first opening's PR is now recorded with its number and URL, so it can be found and closed later.
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, url: expect.stringContaining('github.com') }, { state: 'abandoned' }]);
+  });
+  it('does not adopt when the task changed during the lookup', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    await expect(harness(store, { live, next, hidden, config: later }).publisher.publish(identity)).rejects.toThrow(/already exists/);
+    hidden.clear();
+    // Recovery drops the second opening; then the task changes while the branch lookup runs.
+    let finds = 0;
+    const again = harness(store, { live, next, config: later, onFind: () => { if (++finds === 2) store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code'); } });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/Stale task state/);
+    expect(store.taskPullRequests(identity).map(pr => pr.state)).toEqual(['abandoned', 'abandoned']);
+  });
   it('refuses before pushing when the branch PR has the earlier marker but another number', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
@@ -788,6 +814,20 @@ describe('GitHub PR adapter', () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ draft: false })));
     await expect(gh.open({ ...input, draft: true })).rejects.toThrow(/as ready, not as a draft/);
     expect(await gh.open({ ...input, draft: false })).toMatchObject({ draft: false });
+  });
+  it('bounds a whole refresh by one deadline, not a fresh allowance per command or poll', async () => {
+    let calls = 0, lastSignal: AbortSignal | undefined;
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo', operationMs: 300 }, async (args, options) => {
+      calls++; lastSignal = options?.signal;
+      await new Promise(resolve => setTimeout(resolve, 40));
+      // GitHub never shows the pushed head, so the refresh would poll 5 times at 500 ms without the deadline.
+      return args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false, head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: { full_name: 'owner/repo' } } }));
+    });
+    const started = Date.now();
+    await expect(gh.refresh(7, { ...input, draft: false, ready: true, headSha: oid(3) })).rejects.toThrow();
+    expect(Date.now() - started).toBeLessThan(1_500);
+    expect(lastSignal?.aborted).toBe(true);
+    expect(calls).toBeLessThan(5);
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];

@@ -47,6 +47,8 @@ async function draftCall<T>(call: () => Promise<T>): Promise<T> {
  * agent-controlled, so a marker-shaped string there never identifies a PR.
  */
 export const markerOf = (body: string): string => body.split('\n', 1)[0]!.trim();
+/** The longest one open, lookup, refresh or draft change may take in total, whatever the caller's signal. */
+export const PR_OPERATION_DEADLINE_MS = 60_000;
 /** GitHub updates a PR's head a moment after a push; the read-back waits up to this many polls for the pushed head. */
 export const HEAD_POLLS = 5, HEAD_POLL_MS = 500;
 
@@ -58,10 +60,20 @@ export const HEAD_POLLS = 5, HEAD_POLL_MS = 500;
 export class GhPullRequestGateway implements PullRequestGateway {
   readonly repository: string;
   readonly run: RunGhWithInput;
-  constructor(config: { repository: string }, run?: RunGhWithInput) {
+  /** One deadline for a whole operation (every command and poll wait in it), not a fresh allowance per command. */
+  readonly operationMs: number;
+  constructor(config: { repository: string; operationMs?: number }, run?: RunGhWithInput) {
     if (!REPOSITORY.test(config.repository)) throw new Error('A GitHub repository is required to open pull requests.');
+    if (config.operationMs !== undefined && (!Number.isSafeInteger(config.operationMs) || config.operationMs < 1)) throw new Error('Invalid operation deadline.');
     this.repository = config.repository;
+    this.operationMs = config.operationMs ?? PR_OPERATION_DEADLINE_MS;
     this.run = run ?? ((args, options) => runWithInput('gh', args, { input: options?.input, timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
+  }
+
+  /** The caller's signal combined with this operation's single deadline; every command and wait in it uses the result. */
+  #bounded(signal?: AbortSignal): AbortSignal {
+    const deadline = AbortSignal.timeout(this.operationMs);
+    return signal ? AbortSignal.any([signal, deadline]) : deadline;
   }
 
   async #json(args: readonly string[], signal?: AbortSignal, body?: Record<string, unknown>): Promise<unknown> {
@@ -91,6 +103,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
   }
 
   async open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest> {
+    signal = this.#bounded(signal);
     this.#validate(input);
     if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
     const post = () => this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
@@ -104,6 +117,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
   }
 
   async findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {
+    signal = this.#bounded(signal);
     this.#validate(input);
     const owner = this.repository.split('/')[0]!;
     const query = new URLSearchParams({ state: 'open', head: `${owner}:${input.headBranch}`, base: input.base, per_page: '100' });
@@ -118,6 +132,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
   }
 
   async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+    signal = this.#bounded(signal);
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
     if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
@@ -136,6 +151,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
 
   /** The caller has just read the PR as ready, so this changes it straight away and reads the result back once. */
   async markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+    signal = this.#bounded(signal);
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
     let refused: unknown = null;

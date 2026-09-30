@@ -1064,6 +1064,22 @@ export class Store {
       return this.#task(key).status as TaskStatus;
     });
   }
+  /**
+   * An abandoned opening whose PR became visible is the task's PR after all: record its number, URL and draft state so
+   * it can be reused, closed or cleaned up. The task status does not change. Guarded by the state version the caller
+   * read; returns the new state version.
+   */
+  adoptOpening(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; draft: boolean }, expectedStateVersion: number): number {
+    if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      if (this.#task(key).state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='abandoned'",
+        pr.number, pr.url, pr.draft ? 1 : 0, new Date().toISOString(), key, openingId).changes !== 1) throw new GuardRefusal('No abandoned opening with this ID.');
+      this.#touch(key);
+      return this.#task(key).state_version as number;
+    });
+  }
   /** The task, its review and its head are exactly as a publish read them before its last await. */
   assertUnchangedSince(identity: PlanIdentity, input: { stateVersion: number; reviewVersion: number; snapshotId: string; draft: boolean }): void {
     const key = identityKey(identity);
