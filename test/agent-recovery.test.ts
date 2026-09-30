@@ -161,15 +161,16 @@ describe('recoverLeftovers', () => {
     expect(names()).toContain(agent!.name);
   });
 
-  it('removes a leftover export container with the other transient containers, keeping the storage', async () => {
+  it.each(['export', 'inspect'])('removes a leftover %s container with the other transient containers, keeping the storage', async kind => {
     const mine = attempt(A, 'attempt-a'), storageLabels = mine.objects[0]!.labels;
-    const exporter: FakeObject = { kind: 'container', id: id(), name: `codeboost-export-${randomUUID()}`,
-      labels: { ...storageLabels, 'io.codeboost.task-storage': 'export' } };
-    daemon.objects.push(exporter);
+    const transient: FakeObject = { kind: 'container', id: id(), name: `codeboost-${kind}-${randomUUID()}`,
+      labels: { ...storageLabels, 'io.codeboost.task-storage': kind } };
+    daemon.objects.push(transient);
     const report = await recoverLeftovers(A);
-    expect(report.removed.map(resource => resource.name)).toContain(exporter.name);
-    expect(names()).not.toContain(exporter.name);
+    expect(report.removed.map(resource => resource.name)).toContain(transient.name);
+    expect(names()).not.toContain(transient.name);
     expect(report.storage).toHaveLength(1);
+    expect(report.unowned).toEqual([]);
   });
 
   it('reports objects without a runner label and never removes them', async () => {

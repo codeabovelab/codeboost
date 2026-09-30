@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it } from 'vitest';
@@ -167,7 +168,7 @@ it('preserves owned and missing/null foreign provenance through repeated rebase 
   expect(recovered.getRewrites(identity, snapshot.id)).toHaveLength(3);
 });
 it('feeds persisted remapped ownership into the linking engine on real Git history', () => {
-  const dir = directory(); const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const dir = directory(); const git = (...args: string[]) => fixtureGit(dir, ...args);
   git('init', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid'); git('config', 'commit.gpgsign', 'false');
   const commit = () => { git('add', 'a'); git('commit', '-m', 'Change'); return git('rev-parse', 'HEAD'); };
   writeFileSync(join(dir, 'a'), 'before\n'); const base = commit(); writeFileSync(join(dir, 'a'), 'after\n'); const head = commit();

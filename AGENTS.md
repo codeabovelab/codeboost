@@ -117,6 +117,10 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Neutralise issue references (`#N`, `GH-N`, `owner/repo#N`, issue URLs) in any text codeboost writes that can become a commit message, such as a PR title or description, and neutralise @-mentions in any of that text that is not fenced (a title). Code fences do not protect commit messages, and GitHub closes issues from closing keywords in default-branch commits.
 - Never spread a collection whose size follows unbounded input into function arguments (`Math.max(...runs)`); engines limit the argument count, so use a loop.
 - A hardened Git invocation must also keep Git out of nested repositories and populated submodules, whose own config and hooks are the agent's: pass `--ignore-submodules` on the command line (the config default does not bind plumbing or override `.gitmodules`), and never run Git with a nested repository as its working directory.
+- Decide a filesystem fact (whether a name exists, where a link resolves, what a path's entries are) on the file system that will serve it, not on a copy. A host that folds case or Unicode normalization, or decodes names as text, answers differently from the container's; check links and names inside the container, as its kernel resolves them, by raw bytes.
+- Never infer that agent-written content is unchanged from timestamps, sizes or an index's stat cache: not every write moves them (tmpfs, for one). Compare the content itself.
+- Hand agent-chosen names to tools as literal data: disable or sidestep pathspec magic (a leading `:`), quote them in the tool's own input format (a leading `"` in `--stdin-paths`), pass them as bytes, and keep empty fields when splitting NUL-separated output. Check a name's safety only where it is reported, never refusing unchanged input for a name the report never carries.
+- Check a trust root before anything reads it. When a tool reads config or rules from storage an agent could have reached (Git and the metadata volume), compare that storage with its trusted baseline first, and run nothing if it changed.
 
 ## Blinded experiments
 

@@ -2,7 +2,6 @@ import { afterEach, it, expect, vi } from 'vitest';
 import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { execFileSync } from 'node:child_process';
 import { DatabaseSync } from 'node:sqlite';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
@@ -36,8 +35,8 @@ it('keeps both sides of a declared rename in scope after manual reassignment',()
  service.store.importRevision(JSON.stringify(plan),'json',{identity,issue:plan.issue,baseEntries:['retry.ts','README.md','run.sh'].map(path=>({path,kind:'file' as const})),pathKey:path=>path,allowedCommands:[]},plan.revision);
  renameSync(join(config.repository,'retry.ts'),join(config.repository,'renamed.ts'));
  writeFileSync(join(config.repository,'renamed.ts'),'export function delay(attempt: number) {\n  return Math.min(5000, 200 * 2 ** attempt);\n}\n');
- execFileSync('git',['-c','core.hooksPath=/dev/null','add','-A'],{cwd:config.repository});
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-m','Rename retry implementation'],{cwd:config.repository,stdio:'pipe'});
+ fixtureGit(config.repository,'add','-A');
+ fixtureGit(config.repository,'commit','-m','Rename retry implementation');
  let view=service.load();const segmentPath=(segment:typeof view.segments[number]):string=>{
   const path=segment.operation==='-'?(segment.oldPath??segment.path):segment.path;return path??'';
  };
@@ -65,7 +64,7 @@ it('requires every item to be reviewed again after a queued head is replaced',()
  const {service,config}=fixture();let view=service.load();
  service.store.saveReview(config.identity,view.expected,view.items.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
  const attempt=service.store.beginMergeAttempt(config.identity,{...view.expected,reviewVersion:view.expected.reviewVersion!},view.snapshot.head);service.store.queueMergeAttempt(config.identity,attempt.id,'https://github.example/pr/24');service.store.finishMergeAttempt(config.identity,attempt.id,{state:'failed',reason:'The pull request head changed after review.',requiresFreshReview:true});
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','Replace reviewed head'],{cwd:config.repository,stdio:'pipe'});
+ fixtureGit(config.repository,'commit','--allow-empty','-m','Replace reviewed head');
  view=service.load();expect(view.items.every(item=>item.state==='stale'&&item.reasons.includes('Pull request snapshot changed after the queue attempt'))).toBe(true);
  const [first,...remaining]=view.items;service.store.saveReview(config.identity,view.expected,[approveItem(view.plan,view.segments,first!.id,config.identity,first!.count===0)],[]);view=service.load();expect(view.items.find(item=>item.id===first!.id)?.state).toBe('approved');expect(view.items.filter(item=>item.id!==first!.id).every(item=>item.state==='stale')).toBe(true);
  service.store.saveReview(config.identity,view.expected,remaining.map(item=>approveItem(view.plan,view.segments,item.id,config.identity,item.count===0)),[]);view=service.load();
@@ -143,10 +142,10 @@ it('gives each replaced head after a queue attempt its own stale key',()=>{
  expect(p3(first).state).toBe('stale');expect(p3(second).reasons).toEqual(p3(first).reasons);expect(p3(second).staleKey).not.toBe(p3(first).staleKey);
 },30000);
 it('refuses no-change confirmation while the item still owns ambiguous changes',async()=>{
- const {service,config}=fixture();const {writeFileSync}=await import('node:fs');const {execFileSync}=await import('node:child_process');
+ const {service,config}=fixture();const {writeFileSync}=await import('node:fs');
  writeFileSync(join(config.repository,'retry.ts'),'export function delay(attempt: number) {\n  return Math.min(10000, 200 * 2 ** attempt);\n}\n');
- execFileSync('git',['-c','core.hooksPath=/dev/null','commit','-am','P2 changes retry'],{cwd:config.repository,stdio:'pipe'});
- const head=execFileSync('git',['rev-parse','HEAD'],{cwd:config.repository,encoding:'utf8'}).trim();const snapshot=service.store.getSnapshot(config.identity);
+ fixtureGit(config.repository,'commit','-am','P2 changes retry');
+ const head=fixtureGit(config.repository,'rev-parse','HEAD');const snapshot=service.store.getSnapshot(config.identity);
  service.store.recordHistory(config.identity,{revision:1,snapshotId:snapshot.id},snapshot.base,head,[{sha:head,owner:'P2',origin:'owned',sourceSha:null}]);
  const view=service.load();expect(view.items[0]!.count).toBe(0);expect(view.segments.some(s=>s.row==='Ambiguous'&&s.owners.includes('P1'))).toBe(true);
  expect(()=>service.act({action:'approve',item:'P1',confirmNoChange:true,token:view.token})).toThrow(/ambiguous/i);
@@ -166,6 +165,6 @@ it('preserves removed-side snippets and marks their references outdated after HE
  const {service,config}=fixture();let view=service.load();const segment=view.segments.find(s=>s.row==='P1'&&s.kind!=='file'&&s.operation==='-')!;
  view=service.act({action:'note',item:'P1',kind:'change',text:'Keep this?',reference:{key:segment.key,start:segment.oldLine,end:segment.oldLine},token:view.token});
  const ref=view.notes[0]!.reference!;expect(ref.side).toBe('old');
- const {execFileSync}=await import('node:child_process');execFileSync('git',['-c','core.hooksPath=/dev/null','commit','--allow-empty','-m','new revision'],{cwd:config.repository,stdio:'pipe'});
+ fixtureGit(config.repository,'commit','--allow-empty','-m','new revision');
  view=service.load();expect(view.notes[0]!.outdated).toBe(true);expect(view.notes[0]!.reference).toEqual(ref);
 });

@@ -1,12 +1,13 @@
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-// The asynchronous clone and storage allocation pause every 1,000 entries they walk, including entries read from one
-// huge directory, so the event loop (and an abort) is never held for a whole directory (#51 item 5).
+// The asynchronous clone pauses every 1,000 entries it walks, including entries read from one huge directory, so the
+// event loop (and an abort) is never held for a whole directory (#51 item 5). Storage allocation walks nothing on the
+// host: its link check runs in the seeder (#66).
 const trace = vi.hoisted(() => ({ run: 0, longest: 0, total: 0 }));
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -29,8 +30,7 @@ const { prepareTaskFilesystemsAsync } = await import('../agents/container/storag
 const ENTRIES = 2_500;
 let root = '';
 const realSetImmediate = globalThis.setImmediate;
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 const repository = () => {
   const source = join(root, 'source'), parent = join(root, 'staging');
   mkdirSync(source); mkdirSync(parent);
@@ -62,14 +62,15 @@ describe('pauses while walking one large directory', () => {
     expect(trace.longest).toBeLessThanOrEqual(1_000);
   }, 60_000);
 
-  it('in the asynchronous storage allocation, checking the checkout for links', async () => {
+  it('in the asynchronous storage allocation, by not walking the checkout on the host at all', async () => {
     const input = repository();
     const clone = createTaskClone(input);
     const wide = join(clone.directory, 'wide');
     mkdirSync(wide);
     for (let index = 0; index < ENTRIES; index++) writeFileSync(join(wide, `entry-${index}`), '');
     trace.run = 0; trace.longest = 0; trace.total = 0;
-    // No Docker on PATH: the allocation fails at its first Docker call, after the link walk has finished.
+    // No Docker on PATH: the allocation fails at its first Docker call. The link check runs in the seeder, in the
+    // container, so nothing before that call reads the checkout's directories on the host.
     const path = process.env.PATH;
     process.env.PATH = '/nonexistent';
     try {
@@ -77,7 +78,6 @@ describe('pauses while walking one large directory', () => {
         metadataInodes: 512 }, `sha256:${'a'.repeat(64)}`, { runnerOwner: '0'.repeat(32), attemptId: 'walk',
         allocationId: randomUUID() })).rejects.toThrow();
     } finally { process.env.PATH = path; }
-    expect(trace.total).toBeGreaterThanOrEqual(ENTRIES);
-    expect(trace.longest).toBeLessThanOrEqual(1_000);
+    expect(trace.total).toBe(0);
   }, 60_000);
 });

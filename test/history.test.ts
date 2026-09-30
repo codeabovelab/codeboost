@@ -1,7 +1,7 @@
 import { mkdtempSync, readdirSync, mkdirSync, writeFileSync, existsSync, rmSync, chmodSync, symlinkSync, renameSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { afterEach, expect, it, vi } from 'vitest';
 import { readHistory } from '../git/history.ts';
 import { linkHistory } from '../core/linking.ts';
@@ -17,7 +17,7 @@ const dirs: string[] = [];
 afterEach(() => { for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function fixture(initial: Record<string, string> = { 'a.txt': 'one\ntwo\nthree\n' }) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-history-')); dirs.push(dir);
-  const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+  const git = (...args: string[]) => fixtureGit(dir, ...args);
   git('init', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid'); git('config', 'commit.gpgsign', 'false');
   const write = (path: string, text: string | Buffer) => { mkdirSync(dirname(join(dir, path)), { recursive: true }); writeFileSync(join(dir, path), text); };
   const ledger = new Map<string, string>();
@@ -167,6 +167,15 @@ it('Git built-ins cannot be overridden by repository shell aliases', () => {
   for (const name of ['rev-parse', 'rev-list', 'diff', 'cat-file']) f.git('config', `alias.${name}`, '!touch alias-executed');
   expect(f.segments().length).toBeGreaterThan(0);
   expect(existsSync(join(f.dir, 'alias-executed'))).toBe(false);
+});
+it('ignores inherited user Git attributes outside the GIT_ namespace', () => {
+  const f = fixture(); f.write('a.txt', 'ONE\ntwo\nthree\n'); f.commit('P1');
+  const read = () => readHistory(f.dir, f.base).final.map(file => file.contexts);
+  const expected = read(); expect(expected.flat()).not.toHaveLength(0);
+  const home = mkdtempSync(join(tmpdir(), 'codeboost-history-home-')); dirs.push(home);
+  mkdirSync(join(home, 'git')); writeFileSync(join(home, 'git', 'attributes'), '* -diff\n');
+  vi.stubEnv('XDG_CONFIG_HOME', home); vi.stubEnv('HOME', home);
+  try { expect(read()).toEqual(expected); } finally { vi.unstubAllEnvs(); }
 });
 it('isolates repository selection from inherited Git environment variables', () => {
   const expected = fixture(); expected.write('a.txt', 'expected repo\n'); expected.commit('P1');

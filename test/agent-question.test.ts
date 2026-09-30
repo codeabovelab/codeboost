@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { randomBytes } from 'node:crypto';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
@@ -10,8 +10,7 @@ import { QuestionWorker } from '../runner/question-agent.ts';
 // the vendor CLI in the "questions" phase. Runs with the other Docker suites, one file at a time.
 const roots: string[] = [];
 afterAll(() => { for (const root of roots) rmSync(root, { recursive: true, force: true }); });
-const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args],
-  { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
+const git = fixtureGit;
 
 function repository(secret: string) {
   const root = mkdtempSync(join(tmpdir(), 'question-container-')); roots.push(root);

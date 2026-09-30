@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { Store } from '../runner/store.ts';
 import type { ReviewConfig } from '../runner/review.ts';
 import type { Plan } from '../core/plan.ts';
-import { isolatedGitEnvironment } from './git-environment.ts';
+import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from './git-environment.ts';
 /** Disposable fixture only. Never runs against the user's working repository. */
 export function createDemo(directory: string): ReviewConfig {
   const requested = resolve(directory), temporary = resolve(tmpdir());
@@ -35,7 +35,7 @@ export function createDemo(directory: string): ReviewConfig {
   }
   if (existsSync(root)) throw new Error('Demo directory exists without a configuration. Choose a new empty path.');
   mkdirSync(root, { recursive: true }); const repository = join(root, 'retry-service'); mkdirSync(repository);
-  const git = (...args: string[]) => execFileSync('git', ['-c','core.hooksPath=/dev/null',...args], { cwd: repository, env: isolatedGitEnvironment(), encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }).trim();
+  const git = (...args: string[]) => execFileSync('git', [...HARDENED_GIT_OPTIONS,...args], { cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', stdio: ['ignore','pipe','pipe'] }).trim();
   git('init','-b','main'); git('config','user.name','Codeboost Demo'); git('config','user.email','demo@example.invalid'); git('config','commit.gpgsign','false');
   const write = (path: string, text: string | Buffer) => writeFileSync(join(repository,path),text);
   const commit = (message: string) => { git('add','-A');git('commit','-m',message);return git('rev-parse','HEAD'); };
