@@ -180,7 +180,7 @@ describe('stops and settlement', () => {
     await runner.settled(A);
     expect(launches).toHaveLength(0);
     expect(cleaned()).toBe(1);
-    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Preparation failed: clone failed' });
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Preparation failed: "clone failed"' });
     expect(() => runner.start(B, request(store, B))).not.toThrow();
   });
   it('fails with the launch error when D start throws and no stop is recorded', async () => {
@@ -556,7 +556,7 @@ describe('copilot review', () => {
     preparations[0]!.reject(new Error('clone failed'));
     await runner.settled(A);
     expect(launches).toHaveLength(0);
-    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: clone failed' });
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: "clone failed"' });
     expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'preparation-not-removed' });
     expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
   });

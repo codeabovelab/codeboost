@@ -358,7 +358,8 @@ export class RunnerCoordinator {
   #preparationDetail(job: Job, error?: unknown): { detail?: string } {
     // D never ran, so there is no D stop reason; without one the Store keeps this text instead of "Timed out.".
     if (job.preparationTimedOut && !job.firstReason) return { detail: PREPARATION_TIMEOUT };
-    return error === undefined || job.firstReason ? {} : { detail: `Preparation failed: ${message(error)}` };
+    // Preparation errors can name repository paths an agent chose (an earlier item's files): quote them (AGENTS.md).
+    return error === undefined || job.firstReason ? {} : { detail: `Preparation failed: ${JSON.stringify(message(error))}` };
   }
   /** Ending without a handle: host-side cleanup, then the terminal write from the first reason. */
   async #endBeforeLaunch(job: Job, attempt: AttemptRecord, s: { detail?: string }, prepared?: PreparedAttempt): Promise<void> {

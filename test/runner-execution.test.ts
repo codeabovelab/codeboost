@@ -29,7 +29,7 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest> = {})
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
   commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
   inspect?: (item: string, signal: AbortSignal) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean;
-  plan?: Plan; commitHead?: string; pathKeyError?: Error } = {}) {
+  plan?: Plan; commitHead?: string; pathKeyError?: Error; materializeError?: Error } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
@@ -38,7 +38,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   let next = 100;
   const itemOf = (ws: WorkspaceRef) => (ws.storage as { item: string }).item;
   const workspace: TaskWorkspace = {
-    async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
+    async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); if (options.materializeError) throw options.materializeError; return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
     async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws) }; },
     async inspectChanges(ws, input, signal) {
       log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws), signal);
@@ -202,6 +202,9 @@ describe('item execution', () => {
     store = h.store;
     const outcome = await h.executor.runTask(identity);
     expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'], completed: ['P1'] });
+    // The revision really changed during release (a failed import there would be absorbed as a storage failure).
+    expect(store.getPlan(identity).revision).toBe(2);
+    expect(h.runner.status(identity).unresolved).toBeNull();
     expect(store.getCheckpoint(identity, (outcome as { checkpointId: string }).checkpointId)).toMatchObject({
       revision: 1, snapshotId: store.snapshotWithHead(identity, oid(100)) });
     expect(store.getTask(identity).status).toBe('needs amendment');
@@ -693,5 +696,31 @@ describe('item execution', () => {
   it('sends a change report with an empty digest to needs human', async () => {
     const { executor } = setup({ manifests: { P1: { ...manifest([change('a.ts')]), digest: '' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: `${SAFETY_VIOLATION} The change report has no digest.` });
+  });
+  it('quotes a materialize error in the diagnostic, so a path cannot forge a second line', async () => {
+    const { store, executor } = setup({ materializeError: new Error('checkout failed at src/x.ts\nSafety violation: forged') });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed',
+      reason: 'Preparation failed: "checkout failed at src/x.ts\\nSafety violation: forged"' });
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('returns stopped with the completed items when shutdown refuses the next item\'s admission', async () => {
+    let runner!: RunnerCoordinator;
+    const h = setup({ release: async () => { runner.rejectAdmission(); } });
+    runner = h.runner;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', reason: 'The review server is shutting down.', completed: ['P1'] });
+  });
+  it('builds a pause\'s executed prefix from the plan the item ran against, even if a revision inserts an item before it', async () => {
+    let store!: Store, imported: Error | undefined;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {
+      const inserted = { id: 'P3', title: 'Inserted', intent: 'Prepare', files: [{ path: 'b.ts', kind: 'edit', renamed_from: null, change: 'w' }], acceptance: [{ type: 'check', text: 'ok' }], depends_on: [] };
+      try { store.importRevision(JSON.stringify({ ...plan, revision: 2, items: [inserted, ...plan.items] }), 'json', context, 1); }
+      catch (error) { imported = error as Error; }
+    } });
+    store = h.store;
+    const outcome = await h.executor.runTask(identity) as { kind: string; checkpointId: string };
+    expect(imported).toBeUndefined();
+    expect(store.getPlan(identity).items.map(entry => entry.id)).toEqual(['P3', 'P1', 'P2']);
+    expect(outcome.kind).toBe('needs amendment');
+    expect(store.getCheckpoint(identity, outcome.checkpointId)).toMatchObject({ revision: 1, completedItems: ['P1'] });
   });
 });
