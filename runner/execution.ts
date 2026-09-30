@@ -115,7 +115,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       let head: string;
       try { head = await workspace.commit(data.workspace, {
         baseHead: data.baseHead, paths, digest: manifest.digest,
-        message: `${item.id}: ${item.title}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
+        // The title is plan text: on one line, it cannot open a trailer block that forges Plan-Item or Plan-Revision.
+        message: `${item.id}: ${item.title.replace(/[\r\n\u2028\u2029]+/g, ' ').trim()}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
       }, signal); }
       catch (error) {
         // D's refusal text can name agent-chosen paths: quote it (AGENTS.md). A stop records its first reason before it
@@ -145,7 +146,10 @@ function findIdentity(store: Store, attempt: AttemptRecord): PlanIdentity {
   return { repositoryId: repositoryId!, taskId: taskId!, planId: planId! };
 }
 
-/** `completed` lists the items this run finished before it ended, so a caller never loses them. */
+/**
+ * `completed` lists the items this run finished before it ended. A thrown error (storage or a bug) carries no list;
+ * the finished items are still recorded durably, as completed attempts and ledger entries.
+ */
 export type ExecutionOutcome =
   | { kind: 'executed'; items: string[]; unchanged: string[] }
   | { kind: 'needs amendment'; item: string; outOfScope: string[]; checkpointId: string; completed: string[] }

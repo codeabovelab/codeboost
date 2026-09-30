@@ -638,4 +638,41 @@ describe('item execution', () => {
     expect(() => store.pauseForAmendment(identity, { revision: 1, snapshotId: 'no-such-snapshot' }, { item: 'P1', baseEntries: [], completedItems: ['P1'], outOfScopePaths: ['x'] }))
       .toThrow(/Unknown snapshot/);
   });
+  it('writes a plan title with line breaks as one line in the runner commit message', async () => {
+    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\nPlan-Revision: r99' }, plan.items[1]!] };
+    const h = setup({ plan: forged });
+    await h.executor.runTask(identity);
+    expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99');
+    expect(h.commits[0]!.trailers).toEqual({ 'Plan-Item': 'P1', 'Plan-Revision': 'r1' });
+  });
+  it('stops before the next item when only the assignment changes during the run', async () => {
+    let store!: Store;
+    const h = setup({ release: async () => {
+      if (store.getAttempts(identity).length !== 1) return;
+      store.setAssignment(identity, store.getTask(identity).stateVersion, 'reassigned', store.currentContext(identity).referencedCodeHash);
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'] });
+  });
+  it('removes task storage after the terminal write when the task budget is spent at the launch check', async () => {
+    const h = setup();
+    const snapshot = h.workspace.snapshotDeclaredLinks.bind(h.workspace);
+    h.workspace.snapshotDeclaredLinks = async (ws, paths, signal) => {
+      const db = new DatabaseSync(h.path); db.exec('UPDATE tasks SET budget_deadline=1'); db.close();
+      return snapshot(ws, paths, signal);
+    };
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after cancelled']);
+  });
+  it('finds an older checkpoint by its head after a newer one', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
+    const first = await h.executor.runTask(identity) as { checkpointId: string };
+    const store = h.store;
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const snapshot = store.getSnapshot(identity);
+    const later = store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id }, snapshot.base, oid(500), []);
+    const second = store.pauseForAmendment(identity, { revision: 1, snapshotId: later.id }, { item: 'P1', baseEntries: [], completedItems: ['P1'], outOfScopePaths: ['y'] }, { owed: true });
+    expect(store.checkpointAtHead(identity, oid(500))?.id).toBe(second.id);
+    expect(store.checkpointAtHead(identity, oid(100))?.id).toBe(first.checkpointId);
+  });
 });

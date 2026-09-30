@@ -41,8 +41,9 @@ const KINDS = new Set(['add', 'modify', 'delete', 'rename', 'mode']);
  * any case; on NTFS with trailing dots or spaces and as the 8.3 short name `git~1`; on HFS with ignorable code points.
  */
 export function isDotGit(part: string): boolean {
-  // NTFS ends a name at a stream separator (`:`) or a backslash, then drops trailing dots and spaces.
-  const name = part.split(/[:\\]/)[0]!;
+  // NTFS ends a name at a stream separator (`:`), then drops trailing dots and spaces. Callers split on `\` as well
+  // as `/`, since NTFS reads a backslash as a directory separator.
+  const name = part.split(':')[0]!;
   const plain = name.replace(/[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g, '').toLowerCase().replace(/[. ]+$/, '');
   return plain === '.git' || plain === 'git~1';
 }
@@ -91,7 +92,7 @@ function unsafeLinkTarget(linkPath: string, target: string): string | null {
   // The repository root contains .git: a link to it reaches the metadata through one more path part.
   if (resolved === '.') return 'target is the repository root';
   // As for paths: Git's metadata is `.git` in any case, at any depth.
-  if (resolved.split('/').some(isDotGit)) return 'target enters .git';
+  if (resolved.split(/[/\\]/).some(isDotGit)) return 'target enters .git';
   return null;
 }
 
@@ -111,17 +112,19 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   if (manifest.nestedGitlinkContent.length) violations.push(`Content appeared under a gitlink: ${list(manifest.nestedGitlinkContent)}.`);
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
   // Each path appears once, under the trusted path identity: two entries for one path contradict each other.
-  const seen = new Map<string, ManifestChange>();
+  const seen = new Map<string, ManifestChange[]>();
   for (const change of manifest.changes) {
     // A case-only rename's two sides are one path under a folding identity; count it once for this change.
     const keys = new Set([change.path, ...(change.oldPath ? [change.oldPath] : [])].map(pathKey));
     for (const key of keys) {
-      const earlier = seen.get(key);
-      // A case-only rename that Git reports as a delete and an add (the file also changed a lot) is one path too.
-      const splitRename = earlier && !earlier.oldPath && !change.oldPath && earlier.path !== change.path
-        && new Set([earlier.kind, change.kind]).size === 2 && [earlier.kind, change.kind].every(kind => kind === 'add' || kind === 'delete');
-      if (earlier && !splitRename) return { kind: 'violation', violations: [`The change report lists ${q(key)} more than once.`] };
-      seen.set(key, change);
+      const entries = [...(seen.get(key) ?? []), change];
+      seen.set(key, entries);
+      if (entries.length === 1) continue;
+      // The only second entry allowed is a case-only rename that Git reports as one delete and one add (the file also
+      // changed a lot): exactly two entries, one delete and one add, with different spellings.
+      const [a, b] = entries as [ManifestChange, ManifestChange];
+      const splitRename = entries.length === 2 && a.path !== b.path && [a.kind, b.kind].sort().join() === 'add,delete';
+      if (!splitRename) return { kind: 'violation', violations: [`The change report lists ${q(key)} more than once.`] };
     }
   }
   for (const change of manifest.changes) {
@@ -130,7 +133,7 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
     if (paths.some(path => path !== posix.normalize(path) || path.endsWith('/') || path.startsWith('./')))
       { violations.push(`Path not in canonical form in the change report: ${q(change.path)}.`); continue; }
     // Git refuses a .git part in any spelling it treats as .git, at any depth, so the audit does too.
-    if (change.underGit || paths.some(path => path.split('/').some(isDotGit))) { violations.push(`The agent changed ${q(change.path)} under .git.`); continue; }
+    if (change.underGit || paths.some(path => path.split(/[/\\]/).some(isDotGit))) { violations.push(`The agent changed ${q(change.path)} under .git.`); continue; }
     if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || ['.', '..'].includes(posix.normalize(path)) || path.includes('\0')))
       { violations.push(`Invalid path in the change report: ${q(change.path)}.`); continue; }
     if (change.oldType === 'gitlink' || change.newType === 'gitlink') { violations.push(`Plan items cannot change gitlinks: ${q(change.path)}.`); continue; }

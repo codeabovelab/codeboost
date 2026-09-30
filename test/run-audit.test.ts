@@ -84,6 +84,13 @@ describe('post-run audit', () => {
     for (const path of ['.git:x', '.git::$INDEX_ALLOCATION/config', 'git~1:s', '.git\\config', 'GIT~1\\hooks', 'a/.g\u200eit', 'a/.g\u202ait', 'a/.g\u206bit', 'a/.gi\u200ft'])
       expect(auditRun(item, manifest([file(path, { kind: 'add', oldType: undefined })]), exact), path).toMatchObject({ kind: 'violation' });
   });
+  it('reads a backslash as a directory separator when looking for .git', () => {
+    for (const path of ['x\\.git\\hooks\\post-checkout', 'a/b\\.GIT'])
+      expect(auditRun(item, manifest([file(path, { kind: 'add', oldType: undefined })]), exact), path).toMatchObject({ kind: 'violation' });
+  });
+  it('trusts D\'s underGit flag on its own', () => {
+    expect(auditRun(item, manifest([file('src/retry.ts', { underGit: true })]), exact)).toEqual({ kind: 'violation', violations: ['The agent changed "src/retry.ts" under .git.'] });
+  });
   it('refuses a declared link retargeted to the repository root', () => {
     for (const target of ['.', './', 'a/..'])
       expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)
@@ -105,6 +112,15 @@ describe('post-run audit', () => {
     // Undeclared, the same pair is a scope finding, not a safety violation; two adds of one folded path are still refused.
     expect(auditRun(item, manifest([file('notes', { kind: 'delete', newType: undefined }), file('NOTES', { kind: 'add', oldType: undefined })]), folded)).toMatchObject({ kind: 'commit', outOfScope: ['notes', 'NOTES'] });
     expect(auditRun(item, manifest([file('notes', { kind: 'add', oldType: undefined }), file('NOTES', { kind: 'add', oldType: undefined })]), folded)).toMatchObject({ kind: 'violation' });
+    // Only one delete and one add, with different spellings and no rename entry, make a split rename.
+    const add = (path: string) => file(path, { kind: 'add', oldType: undefined }), del = (path: string) => file(path, { kind: 'delete', newType: undefined });
+    for (const [label, changes] of [
+      ['add, delete, add', [add('src/aB.ts'), del('src/Ab.ts'), add('src/ab.ts')]],
+      ['delete, add, delete, add', [del('src/Ab.ts'), add('src/aB.ts'), del('src/AB.ts'), add('src/ab.ts')]],
+      ['delete and add of one spelling', [del('src/ab.ts'), add('src/ab.ts')]],
+      ['a rename and an add', [file('src/ab.ts', { kind: 'rename', oldPath: 'src/x.ts' }), add('src/AB.ts')]],
+    ] as [string, ManifestChange[]][])
+      expect(auditRun(item, manifest(changes), folded), label).toMatchObject({ kind: 'violation' });
   });
   it('counts two spellings of one path under a case-folding identity as a duplicate', () => {
     expect(auditRun(item, manifest([file('SRC/Retry.ts'), file('src/retry.ts')]), folded)).toMatchObject({ kind: 'violation' });
