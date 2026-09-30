@@ -1743,17 +1743,20 @@ describe('shutdown and PRs left ready', () => {
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await expect(harness(store, { live, next, openTimesOut: true, config: { baseBranch: 'develop' } }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
     for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    // Recovery turns it back into a draft where it is, records it, and leaves the refusal to the main path.
     const again = harness(store, { live, next });
-    expect(await again.publisher.publish(identity, { problems: ['x'] })).toMatchObject({ kind: 'opened', number: 100, draft: true });
+    await expect(again.publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(PullRequestMisplaced);
+    expect(again.log).toContain('draft 100');
     expect(live.get([...live.keys()][0]!)).toMatchObject({ draft: true });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
   });
   it('drafts a recovered PR whose head differs in its own base when the base setting changed', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     await expect(harness(store, { live, next, openTimesOut: true, config: { baseBranch: 'develop' } }).publisher.publish(identity)).rejects.toThrow('timeout');
     for (const [m, pr] of live) live.set(m, { ...pr, headSha: oid(77) });
-    const outcome = await harness(store, { live, next }).publisher.publish(identity);
-    expect(outcome).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'running' });
-    expect(outcome).not.toHaveProperty('leftReady');
+    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(PullRequestMisplaced);
+    expect(store.getTask(identity).status).toBe('running');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
   });
   it('never puts the task in review for a recovered PR outside the configured base: it records it and drafts it', async () => {
     for (const setup of ['retarget', 'base change'] as const) {
@@ -1762,7 +1765,8 @@ describe('shutdown and PRs left ready', () => {
       await expect(harness(store, { live, next, openTimesOut: true, config: first }).publisher.publish(identity)).rejects.toThrow('timeout');
       if (setup === 'retarget') for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
       const again = harness(store, { live, next });
-      expect(await again.publisher.publish(identity), setup).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'running' });
+      await expect(again.publisher.publish(identity), setup).rejects.toThrow(/now targets develop, not main/);
+      expect(store.getTask(identity).status, setup).toBe('running');
       expect(store.taskPullRequests(identity), setup).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
     }
   });
@@ -1776,8 +1780,9 @@ describe('shutdown and PRs left ready', () => {
     await expect(harness(store, { live, next, hidden, openTimesOut: true, config: later }).publisher.publish(identity)).rejects.toThrow('timeout');
     hidden.clear();
     const again = harness(store, { live, next });
-    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 101, draft: true, status: 'running' });
-    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }, { state: 'opened', number: 101, draft: true }]);
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/More than one of the task's pull requests/);
+    expect(store.getTask(identity).status).toBe('running');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }, { state: 'opened', number: 101, draft: true }]);
   });
   it('drafts a running task\'s PR that a person retargeted, before refusing, however it got there', async () => {
     // A lost opening that is not this publish's own (the task changed since), then a retarget.
@@ -1789,11 +1794,11 @@ describe('shutdown and PRs left ready', () => {
     await expect(again.publisher.publish(identity)).rejects.toThrow(/now targets develop, not main/);
     expect(again.log).toContain('draft 100');
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
-    // A current lost opening whose draft change fails once: the next publish drafts it.
+    // A current lost opening whose draft change fails once: the refusal says so, and the next publish drafts it.
     store = runningTask(); live = new Map(); next = { value: 100 };
     await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
     for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
-    expect(await harness(store, { live, next, draftFails: true }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'running', leftReady: 100 });
+    await expect(harness(store, { live, next, draftFails: true }).publisher.publish(identity)).rejects.toThrow(/now targets develop.*#100 could not be made a draft/);
     again = harness(store, { live, next });
     await expect(again.publisher.publish(identity)).rejects.toThrow(/now targets develop, not main/);
     expect(again.log).toContain('draft 100');

@@ -137,8 +137,9 @@ export class PullRequestPublisher {
       if (!(error instanceof PullRequestMisplaced)) throw error;
       // The task's PRs are not where it can publish, and a person has to decide: none of them stays ready meanwhile,
       // although the task itself could otherwise be published as ready.
-      const all = [...new Set([...notes, ...await this.#draftStranded(identity, signal, true)])];
-      throw new PullRequestMisplaced(all.length ? `${error.message} ${all.join(' ')}` : error.message);
+      // Only this run's notes: it looks every PR up again, so an earlier run's failure it has since fixed is not reported.
+      const latest = await this.#draftStranded(identity, signal, true);
+      throw new PullRequestMisplaced(latest.length ? `${error.message} ${latest.join(' ')}` : error.message);
     }
     signal?.throwIfAborted();
     let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
@@ -262,7 +263,8 @@ export class PullRequestPublisher {
    * of the whole publish (AGENTS.md: a later step's failure must not turn a succeeded irreversible action into one).
    */
   async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
-    draft: boolean, status: string, branch: string, signal?: AbortSignal, base = this.#config.baseBranch): Promise<PublishOutcome> {
+    draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
+    const base = this.#config.baseBranch;
     const opened = { kind: 'opened' as const, number: pr.number, url: pr.url, draft: pr.draft, status };
     // Left ready only for a ready publish whose task is now in review at the pushed head; a draft publish's PR is always
     // a draft, whatever GitHub returned.
@@ -365,7 +367,9 @@ export class PullRequestPublisher {
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found, mayReview);
     // The task's other open PRs are facts too: an abandoned opening's PR among them is adopted, so it can be found.
     this.#adoptOwned(identity, rows, owned.filter(other => other !== pr));
-    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal, pr.base);
+    // It ends the publish only for a PR the main path would accept. Any other goes on to the main path, which makes all of
+    // the task's PRs drafts and refuses with what a person has to do, as it does for every misplaced PR.
+    if (current && mayReview) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);
     return null;
   }
 
