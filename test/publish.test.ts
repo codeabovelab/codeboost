@@ -263,6 +263,14 @@ describe('PR records', () => {
     expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 9, status: 'cancelled' });
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 9 }]);
   });
+  it('refreshes only an opened PR: an abandoned opening must be adopted first', async () => {
+    const store = runningTask();
+    const clear = () => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
+    const opening = store.beginPullRequest(identity, { checkId: clear().id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    store.abandonPullRequestOpening(identity, opening.openingId);
+    expect(() => store.beginRefresh(identity, { checkId: clear().id, openingId: opening.openingId, headSha: oid(2), draft: false })).toThrow(/Unknown pull request/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'abandoned', number: null, refresh: null }]);
+  });
   it('binds an opening to the checked head, with no task change since the check', async () => {
     const store = runningTask();
     const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
