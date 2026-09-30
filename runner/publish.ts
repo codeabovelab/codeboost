@@ -23,7 +23,8 @@ export interface PublishConfig {
 export class OpeningUnsettled extends Error {}
 export const DEFAULT_SETTLE_MS = 10 * 60_000;
 export type PublishOutcome =
-  | { kind: 'opened'; number: number; url: string; draft: boolean; status: string }
+  /** `leftReady`: the PR opened or was updated, but could not be made a draft although its task is not in review. */
+  | { kind: 'opened'; number: number; url: string; draft: boolean; status: string; leftReady?: number }
   /** `leftReady`: the task's earlier PR could not be made a draft because the repository does not support drafts. */
   | { kind: 'possibly already fixed'; result: AlreadyFixedResult; leftReady?: number }
   /** A needs-human task whose check matched: no draft PR is opened, and the task stays in needs human. */
@@ -33,8 +34,11 @@ export type PublishOutcome =
    * that needs a person). `number` is the task's existing PR, left as it was, if there is one. Nothing is left in flight.
    */
   | { kind: 'draft unsupported'; number: number | null }
-  /** The task head is its base: there is nothing to open a PR for. A running task moves to needs human. */
-  | { kind: 'no changes' };
+  /**
+   * The task head is its base: there is nothing to open a PR for. A running task moves to needs human. `leftReady`: the
+   * task's earlier PR could not be made a draft because the repository does not support drafts.
+   */
+  | { kind: 'no changes'; leftReady?: number };
 
 const marker = (openingId: string) => `<!-- codeboost:opening=${openingId} -->`;
 /**
@@ -102,15 +106,22 @@ export class PullRequestPublisher {
     }
     if (earlier && live && earlier.state === 'opened' && earlier.number === live.number && earlier.draft !== live.draft)
       stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, live.number, live.draft, { stateVersion, reviewVersion });
+    // Checked before any GitHub change on every path: a refused publish must neither draft the PR nor move the branch.
+    if (earlier && live && earlier.state === 'opened' && live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
     // Nothing to publish: the task's PR, if it is open and ready, must not stay ready for review.
     if (snapshot.head === snapshot.base) {
+      // The full publish guard (versions, snapshot, status, no attempt, merge, requeue or rebase), after the lookup's
+      // await: interrupted work waiting to be requeued must not be sent to a person as "no changes".
+      this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
+      let leftReady: number | undefined;
       if (earlier && live && !live.draft) {
-        this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
-        const drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
-        stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, drafted.number, drafted.draft, { stateVersion, reviewVersion });
+        try {
+          const drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
+          stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, drafted.number, drafted.draft, { stateVersion, reviewVersion });
+        } catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
       }
       if (!draft) this.#store.transitionTask(identity, stateVersion, 'needs human');
-      return { kind: 'no changes' };
+      return leftReady === undefined ? { kind: 'no changes' } : { kind: 'no changes', leftReady };
     }
     const own = new Set(prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!));
     if (live) own.add(live.number);
@@ -120,8 +131,6 @@ export class PullRequestPublisher {
       ownCommits: new Set(this.#store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha)),
     }, signal);
     signal?.throwIfAborted();
-    // Checked before any GitHub change: a refused publish must neither draft the PR nor move the branch.
-    if (earlier && live && earlier.state === 'opened' && live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
     // A task that is not published as ready never leaves its PR ready for review: on a match its earlier ready PR becomes
     // a draft. This comes before the result is recorded, so if it fails the task is still running and a retry repeats it.
     // It is still a GitHub change for this task, so the task is re-read first: a reassignment or review during the check
@@ -187,17 +196,25 @@ export class PullRequestPublisher {
   }
 
   /**
-   * A ready PR that GitHub shows at another head than the one pushed (GitHub has not caught up, or someone else pushed)
-   * is not ready for review: the task stays running and the PR becomes a draft until a later publish reconciles it.
+   * A ready PR is left ready only for a task now in review. Otherwise (GitHub shows another head than the one pushed,
+   * or the task or its review changed during the call) it becomes a draft until a later publish reconciles it. The
+   * open or refresh already succeeded and is recorded, so a failure here is reported as `leftReady`, not as a failure
+   * of the whole publish (AGENTS.md: a later step's failure must not turn a succeeded irreversible action into one).
    */
   async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
     draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
-    if (draft || pr.draft || pr.headSha === head) return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
-    const drafted = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(openingId) }, signal);
-    // A fact about the PR, recorded against the versions read right now (no await since).
-    this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
-      { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
-    return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
+    const opened = { kind: 'opened' as const, number: pr.number, url: pr.url, draft: pr.draft, status };
+    if (draft || pr.draft || (status === 'in review' && pr.headSha === head)) return opened;
+    try {
+      const drafted = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(openingId) }, signal);
+      // A fact about the PR, recorded against the versions read right now (no await since).
+      this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
+        { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+      return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
+    } catch {
+      // The PR stays ready; the next publish sees it (live, not a draft) and reconciles it.
+      return { ...opened, leftReady: pr.number };
+    }
   }
 
   /** Whether a lost opening is the current publish's own: neither the task nor its review changed since it began, and the mode matches. */

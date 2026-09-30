@@ -289,18 +289,25 @@ describe('review changes during GitHub calls', () => {
     expect(store.getTask(identity).status).toBe('running');
   });
   it('records a PR opened while the review changed, but does not move the task to in review', async () => {
-    const store = runningTask();
-    const { publisher } = harness(store, { open: async input => { note(store); return { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(2), draft: input.draft }; } });
-    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 5, status: 'running' });
-    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5 }]);
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher } = harness(store, { live, open: async input => {
+      note(store); const pr = { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(2), draft: input.draft }; live.set(input.marker, pr); return pr;
+    } });
+    // The task is not in review, so its PR is not left ready for review either.
+    const outcome = await publisher.publish(identity);
+    expect(outcome).toMatchObject({ kind: 'opened', number: 5, status: 'running', draft: true });
+    expect(outcome).not.toHaveProperty('leftReady');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5, draft: true }]);
   });
   it('records a refresh that landed while the review changed, but does not move the task to in review', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
     rerun(store);
-    expect(await harness(store, { live, next, onRefresh: () => note(store) }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'running' });
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(3) }]);
+    const outcome = await harness(store, { live, next, onRefresh: () => note(store) }).publisher.publish(identity);
+    expect(outcome).toMatchObject({ kind: 'opened', number: 100, status: 'running', draft: true });
+    expect(outcome).not.toHaveProperty('leftReady');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(3), draft: true }]);
   });
   it('does not end a publish with a recovered opening whose review has changed since', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
@@ -381,6 +388,63 @@ describe('guards found by the independent review', () => {
         expect(log.some(line => line.startsWith('push'))).toBe(false);
       } finally { rmSync(dir, { recursive: true, force: true }); }
     }
+  });
+  it('refuses the no-changes path for interrupted work waiting to be requeued, instead of sending it to a person', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs'), { tmpdir } = await import('node:os'), { join } = await import('node:path');
+    const { DatabaseSync } = await import('node:sqlite');
+    const dir = mkdtempSync(join(tmpdir(), 'codeboost-guard-')), path = join(dir, 'state.sqlite');
+    try {
+      const first = new Store(path);
+      first.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(1));
+      first.close();
+      const db = new DatabaseSync(path); db.exec("UPDATE tasks SET status='running', requeue_pending=1"); db.close();
+      const store = new Store(path); stores.push(store);
+      await expect(harness(store).publisher.publish(identity)).rejects.toThrow(/requeued/);
+      expect(store.getTask(identity).status).toBe('running');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  });
+  it('moves a no-changes task to needs human and reports a ready PR it could not draft', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
+    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity)).toEqual({ kind: 'no changes', leftReady: 100 });
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('refuses a PR-number mismatch before the no-changes draft change', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    for (const [m, pr] of live) live.set(m, { ...pr, number: 999 });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/different pull request/);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+  });
+  it('reports a PR it could not draft after a head mismatch, without failing the publish that opened it', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher } = harness(store, { live, draftFails: true, open: async input => {
+      const pr = { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(77), draft: input.draft }; live.set(input.marker, pr); return pr;
+    } });
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 5, draft: false, status: 'running', leftReady: 5 });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5, headSha: oid(77) }]);
+  });
+  it('does not take a different PR number as what GitHub shows for an unconfirmed update', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, number: 999, draft: false, headSha: oid(8) });
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: null }]);
   });
   it('reports drafts unsupported when recovery cannot turn a lost draft opening back into a draft', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
