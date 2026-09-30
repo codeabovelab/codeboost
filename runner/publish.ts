@@ -254,7 +254,8 @@ export class PullRequestPublisher {
    * of the whole publish (AGENTS.md: a later step's failure must not turn a succeeded irreversible action into one).
    */
   async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
-    draft: boolean, status: string, branch: string, signal?: AbortSignal, base = this.#config.baseBranch): Promise<PublishOutcome> {
+    draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
+    const base = this.#config.baseBranch;
     const opened = { kind: 'opened' as const, number: pr.number, url: pr.url, draft: pr.draft, status };
     // Left ready only for a ready publish whose task is now in review at the pushed head; a draft publish's PR is always
     // a draft, whatever GitHub returned.
@@ -293,7 +294,7 @@ export class PullRequestPublisher {
     // GitHub shows now (draft flag, head) is recorded first, so a change that did land is not forgotten.
     for (const refreshing of this.#store.taskPullRequests(identity).filter(pr => pr.refresh !== null)) {
       if (refreshing.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request update is in flight in another repository.');
-      const observed = await this.#pulls.findOpened({ base: refreshing.base, headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
+      const observed = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
       signal?.throwIfAborted();
       this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, observed);
     }
@@ -303,7 +304,7 @@ export class PullRequestPublisher {
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
     const rows = this.#branchRows(prs, lost.headBranch);
-    const pr = await this.#pulls.findOpened({ base: lost.base, headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
+    const pr = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
     if (pr && pr.marker !== marker(lost.openingId)) {
       // The branch's open PR belongs to another of the task's openings, so this opening's request created nothing
@@ -329,7 +330,7 @@ export class PullRequestPublisher {
     let found: { number: number; url: string; headSha: string; draft: boolean } = pr;
     // Only when this publish is itself a draft publish; a ready publish's main path marks the PR ready anyway.
     if (lost.draft && draft && !pr.draft) {
-      try { found = await this.#pulls.markDraft(pr.number, { base: lost.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
+      try { found = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
         const current = this.#isCurrent(identity, lost, draft);
@@ -342,7 +343,7 @@ export class PullRequestPublisher {
     // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
     const current = this.#isCurrent(identity, lost, draft);
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
-    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal, lost.base);
+    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);
     return null;
   }
 
@@ -365,12 +366,14 @@ export class PullRequestPublisher {
     const prs = this.#store.taskPullRequests(identity), notes: string[] = [];
     const reason = (error: unknown) => error instanceof Error ? error.message : String(error);
     // One lookup per branch with a PR recorded as ready, or with an abandoned opening whose PR may have appeared since.
-    const branches = new Map<string, { base: string; headBranch: string }>();
+    // Looked up into the configured base, like every lookup: a record's base is where it was opened, and the gateway
+    // refuses the task's own PR found in another base, so a PR moved by a person or a base change is reported, not missed.
+    const base = this.#config.baseBranch, branches = new Set<string>();
     for (const pr of prs) {
       if (pr.repository.toLowerCase() === this.#config.repository.toLowerCase() && ((pr.state === 'opened' && !pr.draft) || pr.state === 'abandoned'))
-        branches.set(`${pr.base}\n${pr.headBranch}`, { base: pr.base, headBranch: pr.headBranch });
+        branches.add(pr.headBranch);
     }
-    for (const { base, headBranch } of branches.values()) {
+    for (const headBranch of branches) {
       const rows = this.#branchRows(prs, headBranch).filter(pr => pr.state !== 'opening');
       let live;
       try { live = await this.#pulls.findOpened({ base, headBranch, markers: rows.map(row => marker(row.openingId)) }, signal); }

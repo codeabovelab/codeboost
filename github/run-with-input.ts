@@ -1,12 +1,12 @@
 import { spawn } from 'node:child_process';
 
 /**
- * A command that exited with a failure. The message carries stderr and the response body `gh api` prints on stdout;
- * `stderr` alone is what callers match refusals against, because stdout can echo text codeboost sent (a PR body).
+ * A command that exited with a failure. The message carries stderr and the start of stdout, where `gh api` prints the
+ * response body with GitHub's reason; both are also kept whole, for callers that recognise a refusal.
  */
 export class CommandFailed extends Error {
-  readonly stderr: string;
-  constructor(message: string, stderr: string) { super(message); this.stderr = stderr; }
+  readonly stderr: string; readonly stdout: string;
+  constructor(message: string, stderr: string, stdout: string) { super(message); this.stderr = stderr; this.stdout = stdout; }
 }
 
 /**
@@ -55,7 +55,7 @@ export function runWithInput(command: string, args: readonly string[], options: 
       // `gh api` prints only the error's summary on stderr and the response body, with GitHub's reason, on stdout.
       const stdout = code !== 0 ? Buffer.concat(out).toString('utf8').trim() : '';
       if (failure) reject(failure);
-      else if (code !== 0) reject(new CommandFailed(`${command} failed (${signal ?? `exit ${code}`}): ${stderr.slice(0, 2000)}${stdout ? `\n${stdout.slice(0, 2000)}` : ''}`, stderr));
+      else if (code !== 0) reject(new CommandFailed(`${command} failed (${signal ?? `exit ${code}`}): ${stderr.slice(0, 2000)}${stdout ? `\n${stdout.slice(0, 2000)}` : ''}`, stderr, stdout));
       else resolve(Buffer.concat(out).toString('utf8'));
     };
     child.on('close', finish);

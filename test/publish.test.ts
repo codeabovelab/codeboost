@@ -81,6 +81,8 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
+      // Like the adapter's read-back: the PR must be into the base asked for.
+      if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
       options.onDraft?.();
       if (options.draftsUnsupported) throw new DraftsUnsupported('no drafts');
       if (options.draftFails) throw new Error('timeout marking the PR a draft');
@@ -88,6 +90,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
+      if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
       options.onRefresh?.();
       input.beforeReady?.();
       if (options.refreshFails) throw new Error('timeout reading the PR back');
@@ -1241,9 +1244,13 @@ describe('GitHub PR adapter', () => {
     await expect(refused.markDraft(7, input)).rejects.toThrow('HTTP 403');
   });
   it('turns GitHub refusing drafts into DraftsUnsupported on open, refresh and markDraft', async () => {
-    const unsupported = new Error('gh: Draft pull requests are not supported in this repository. (HTTP 422)');
+    // As gh reports it: `gh api` prints only the summary on stderr and GitHub's reason in the JSON body on stdout;
+    // `gh pr ready --undo` prints the GraphQL error on stderr.
+    const unsupported = new CommandFailed('gh failed (exit 1): gh: Validation Failed (HTTP 422)', 'gh: Validation Failed (HTTP 422)',
+      JSON.stringify({ message: 'Validation Failed', errors: [{ resource: 'PullRequest', code: 'custom', message: 'Draft pull requests are not supported in this repository.' }] }));
+    const undo = new CommandFailed('gh failed (exit 1): GraphQL: Draft pull requests are not supported in this repository.', 'GraphQL: Draft pull requests are not supported in this repository. (convertPullRequestToDraft)', '');
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
-      if (args[0] === 'pr' || args.includes('POST')) throw unsupported; return JSON.stringify(response({ draft: false }));
+      if (args[0] === 'pr') throw undo; if (args.includes('POST')) throw unsupported; return JSON.stringify(response({ draft: false }));
     });
     await expect(gh.open({ ...input, draft: true })).rejects.toBeInstanceOf(DraftsUnsupported);
     await expect(gh.refresh(7, { ...input, draft: true, ready: false })).rejects.toBeInstanceOf(DraftsUnsupported);
@@ -1327,25 +1334,31 @@ describe('GitHub PR adapter', () => {
     expect(await lookup([elsewhere({ number: 8, body: 'backport' }), response()])).toMatchObject({ number: 7, marker });
   });
   it('matches refusals against gh\'s stderr only, not the response body echoed on stdout', async () => {
-    const echoed = new CommandFailed('gh failed (exit 1): gh: Server Error (HTTP 502)\n{"body":"Draft pull requests are not supported (HTTP 422)"}', 'gh: Server Error (HTTP 502)');
+    const echoed = new CommandFailed('gh failed (exit 1): gh: Server Error (HTTP 502)', 'gh: Server Error (HTTP 502)', '{"body":"Draft pull requests are not supported (HTTP 422)"}');
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw echoed; });
     const error = await gh.open({ ...input, draft: true }).catch(e => e);
     expect(error).toBe(echoed);
   });
   it('turns a validation refusal of the opening into PullRequestRefused, with the reason GitHub gave', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => {
-      throw new Error('gh failed (exit 1): gh: Validation Failed (HTTP 422)\n{"message":"Validation Failed","errors":[{"message":"No commits between main and codeboost/x"}]}');
+      throw new CommandFailed('gh failed (exit 1): gh: Validation Failed (HTTP 422)\n{"message":"Validation Failed","errors":[{"message":"No commits between main and codeboost/x"}]}',
+        'gh: Validation Failed (HTTP 422)', '{"message":"Validation Failed","errors":[{"message":"No commits between main and codeboost/x"}]}');
     });
     const error = await gh.open({ ...input, draft: false }).catch(e => e);
     expect(error).toBeInstanceOf(PullRequestRefused);
     expect(error.message).toMatch(/No commits between/);
     // Other failures (a timeout, a 5xx) stay ambiguous: the opening stays owned.
-    const flaky = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw new Error('gh failed (exit 1): gh: Server Error (HTTP 502)'); });
+    const flaky = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw new CommandFailed('gh failed (exit 1): gh: Server Error (HTTP 502)', 'gh: Server Error (HTTP 502)', ''); });
     expect(await flaky.open({ ...input, draft: false }).catch(e => e)).not.toBeInstanceOf(PullRequestRefused);
+    // Only a finished gh run is read: any other error, whatever its text, is not a refusal.
+    const other = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw new Error('gh: Validation Failed (HTTP 422)'); });
+    expect(await other.open({ ...input, draft: false }).catch(e => e)).not.toBeInstanceOf(PullRequestRefused);
   });
   it('keeps the response body gh prints on stdout in the failure', async () => {
-    await expect(runWithInput(process.execPath, ['-e', 'console.error("gh: Validation Failed (HTTP 422)");console.log(JSON.stringify({errors:[{message:"No commits between"}]}));process.exit(1)'], {}))
-      .rejects.toThrow(/HTTP 422\)\n\{"errors":\[\{"message":"No commits between"/);
+    const error = await runWithInput(process.execPath, ['-e', 'console.error("gh: Validation Failed (HTTP 422)");console.log(JSON.stringify({errors:[{message:"No commits between"}]}));process.exit(1)'], {}).catch(e => e);
+    expect(error).toBeInstanceOf(CommandFailed);
+    expect(error.message).toMatch(/HTTP 422\)\n\{"errors":\[\{"message":"No commits between"/);
+    expect(error).toMatchObject({ stderr: 'gh: Validation Failed (HTTP 422)', stdout: '{"errors":[{"message":"No commits between"}]}' });
   });
 });
 
@@ -1640,6 +1653,45 @@ describe('shutdown and PRs left ready', () => {
     const again = harness(store, { live, next, draftsUnsupported: true });
     expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
     expect(again.log).toContain('check');
+  });
+  it('converges after a base change once the person retargets the PR, even when the update is then lost', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next, config: { baseBranch: 'develop' } }).publisher.publish(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    // The base setting is now main: the task's own PR into develop is refused until a person moves it.
+    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/now targets develop, not main/);
+    const bases = baseOf.get(live)!;
+    for (const m of live.keys()) bases.set(m, 'main');
+    // The update into main is recorded, then its confirmation is lost.
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow(/timeout/);
+    // Recovery looks the PR up in the configured base too, settles the update, and the publish finishes.
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
+    expect(again.log.some(line => line.startsWith('open'))).toBe(false);
+  });
+  it('recovers a lost opening in the configured base after a base change and a retarget', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true, config: { baseBranch: 'develop' } }).publisher.publish(identity)).rejects.toThrow('timeout');
+    const bases = baseOf.get(live)!;
+    for (const m of live.keys()) bases.set(m, 'main');
+    const again = harness(store, { live, next });
+    await again.publisher.publish(identity);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }]);
+    expect(again.log.some(line => line.startsWith('open'))).toBe(false);
+  });
+  it('drafts a stopped task\'s PR in the configured base after a base change and a retarget', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next, config: { baseBranch: 'develop' } }).publisher.publish(identity);
+    const bases = baseOf.get(live)!;
+    for (const m of live.keys()) bases.set(m, 'main');
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
   });
   it('refuses gateways configured for another repository', () => {
     const store = runningTask();

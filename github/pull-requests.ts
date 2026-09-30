@@ -43,8 +43,22 @@ export class DraftsUnsupported extends Error {}
  */
 export class PullRequestRefused extends Error {}
 const DRAFTS_UNSUPPORTED = /draft pull requests? (?:are|is) not supported/i;
-/** What a refusal is matched against: `gh`'s own stderr, never the stdout body that can echo text codeboost sent. */
-const refusalText = (error: unknown): string => error instanceof CommandFailed ? error.stderr : error instanceof Error ? error.message : '';
+/**
+ * What a refusal is matched against: `gh`'s stderr (`gh: <message> (HTTP 422)`) and GitHub's own error fields in the
+ * response body `gh api` prints on stdout (`message`, `errors[].message`, where a validation reason such as "A pull
+ * request already exists" is). Never the raw stdout, which could echo text codeboost sent, and nothing from a failure
+ * that is not a finished `gh` run.
+ */
+function refusalText(error: unknown): string {
+  if (!(error instanceof CommandFailed)) return '';
+  const reasons = [error.stderr];
+  try {
+    const body = JSON.parse(error.stdout) as { message?: unknown; errors?: unknown } | null;
+    if (typeof body?.message === 'string') reasons.push(body.message);
+    if (Array.isArray(body?.errors)) for (const item of body.errors) if (typeof item?.message === 'string') reasons.push(item.message);
+  } catch { /* no JSON body: stderr alone */ }
+  return reasons.join('\n');
+}
 /** Runs a GitHub call that asks for a draft, turning GitHub's "not supported" refusal into DraftsUnsupported. */
 async function draftCall<T>(call: () => Promise<T>): Promise<T> {
   try { return await call(); }
