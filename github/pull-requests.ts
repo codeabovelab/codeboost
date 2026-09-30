@@ -98,6 +98,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
     const response = input.draft ? await draftCall(post) : await post();
     const { body, ...pr } = this.#pull(response, input);
     if (markerOf(body) !== input.marker) throw new Error('GitHub returned a pull request without its marker.');
+    // The PR exists, but not in the requested state: failing keeps the opening owned, and recovery turns it into a draft.
+    if (input.draft && !pr.draft) throw new Error('GitHub opened the pull request as ready, not as a draft.');
     return pr;
   }
 

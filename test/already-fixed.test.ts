@@ -120,6 +120,7 @@ describe('the pre-PR already-fixed check', () => {
       { totalCount: 101 }, { hasNextPage: true }, { nodes: [cross(pr(1))], totalCount: 2 },
       { commits: Array.from({ length: MAX_BASE_COMMITS + 1 }, (_, i) => ({ sha: sha(2000 + i), message: 'x' })) }, { status: 'diverged' }, { status: 'behind' },
       { commits: [{ sha: sha(5), message: 'x' }], totalCommits: 2 },
+      { commits: [{ sha: sha(5), message: 'x' }, { sha: sha(5), message: 'x' }] },
       { errors: [{ message: 'rate limited' }] }, { nameWithOwner: 'other/repo' }, { baseRef: 'other' },
       { state: 'CLOSED' }, { nodes: [cross(null)] }, { nodes: [cross({ __typename: 'Discussion' })] },
       { nodes: [cross(pr(1, 'OPEN', { repository: null }))] }, { nodes: [{ __typename: 'LabeledEvent' }] },

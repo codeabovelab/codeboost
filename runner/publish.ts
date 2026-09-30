@@ -77,7 +77,7 @@ export class PullRequestPublisher {
 
   async #publish(identity: PlanIdentity, input: { problems?: readonly string[] }, signal?: AbortSignal): Promise<PublishOutcome> {
     const draft = input.problems !== undefined;
-    const recovered = await this.#recover(identity, signal);
+    const recovered = await this.#recover(identity, draft, signal);
     if (recovered) return recovered;
     const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
     const reviewVersion = this.#store.reviewVersion(identity);
@@ -172,6 +172,11 @@ export class PullRequestPublisher {
     return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
   }
 
+  /** Whether a lost opening is the current publish's own: the task has not changed since it began, and the mode matches. */
+  #isCurrent(identity: PlanIdentity, lost: TaskPullRequest, draft: boolean): boolean {
+    return this.#store.getTask(identity).stateVersion === lost.ownerVersion && lost.draft === draft;
+  }
+
   /** The task's PR records for one branch into one base, in the configured repository. */
   #branchRows(prs: readonly TaskPullRequest[], branch: string, base: string): TaskPullRequest[] {
     return prs.filter(pr => pr.headBranch === branch && pr.base === base && pr.repository.toLowerCase() === this.#config.repository.toLowerCase());
@@ -182,7 +187,7 @@ export class PullRequestPublisher {
    * does not prove the request was refused while GitHub may still apply or show it, so the opening stays owned until
    * the settle time has passed; only then is it abandoned. The caller retries after OpeningUnsettled.
    */
-  async #recover(identity: PlanIdentity, signal?: AbortSignal): Promise<PublishOutcome | null> {
+  async #recover(identity: PlanIdentity, draft: boolean, signal?: AbortSignal): Promise<PublishOutcome | null> {
     // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed.
     const refreshing = this.#store.taskPullRequests(identity).find(pr => pr.refresh !== null);
     if (refreshing) this.#store.abandonRefresh(identity, refreshing.openingId);
@@ -210,15 +215,21 @@ export class PullRequestPublisher {
     // failure keeps the opening owned (the next publish retries); drafts being unsupported is definite, so the PR is
     // recorded as it is and reported.
     let found: { number: number; url: string; headSha: string; draft: boolean } = pr;
-    if (lost.draft && !pr.draft) {
+    // Only when this publish is itself a draft publish; a ready publish's main path marks the PR ready anyway.
+    if (lost.draft && draft && !pr.draft) {
       try { found = await this.#pulls.markDraft(pr.number, { base: lost.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
+        const current = this.#isCurrent(identity, lost, draft);
         this.#store.recordPullRequestOpened(identity, lost.openingId, pr);
-        return { kind: 'draft unsupported', number: pr.number };
+        return current ? { kind: 'draft unsupported', number: pr.number } : null;
       }
     }
+    // The recovered opening finishes this publish only if it is this publish's own work: same task version and same
+    // draft mode. Otherwise (the task was rerun, or moved between ready and needs human) the PR is recorded and this
+    // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
+    const current = this.#isCurrent(identity, lost, draft);
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
-    return { kind: 'opened', number: found.number, url: found.url, draft: found.draft, status };
+    return current ? { kind: 'opened', number: found.number, url: found.url, draft: found.draft, status } : null;
   }
 }

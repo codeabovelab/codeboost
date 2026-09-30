@@ -329,6 +329,18 @@ describe('recovering a lost opening', () => {
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
     expect(store.getTask(identity).status).toBe('needs human');
   });
+  it('records a recovered opening from an older run, then continues the current publish with the new head and mode', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    // A needs-human draft POST lands, but its answer is lost.
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    // The person sends the task back; it reruns (new head oid3) and now publishes as ready.
+    rerun(store);
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, draft: false, status: 'in review' });
+    expect(again.log.filter(line => !line.startsWith('find'))).toEqual(['check', 'push codeboost/issue-12-task-42 003', 'refresh 100 ready']);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: false, headSha: oid(3) }]);
+  });
   it('keeps an unconfirmed opening owned until it settles, then abandons it, checks again and opens a new PR', async () => {
     const store = runningTask();
     await expect(harness(store, { open: async () => { throw new Error('timeout'); } }).publisher.publish(identity)).rejects.toThrow('timeout');
@@ -771,6 +783,11 @@ describe('GitHub PR adapter', () => {
     // Our PR whose plan text quotes an older marker still matches exactly one: its own first line.
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: `${marker}\nplan quoting ${other}` })]))
       .findOpened({ ...input, markers: [other, marker] })).toMatchObject({ marker });
+  });
+  it('fails a draft opening that GitHub created as ready, so the opening stays owned for recovery', async () => {
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ draft: false })));
+    await expect(gh.open({ ...input, draft: true })).rejects.toThrow(/as ready, not as a draft/);
+    expect(await gh.open({ ...input, draft: false })).toMatchObject({ draft: false });
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];

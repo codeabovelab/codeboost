@@ -220,6 +220,8 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
         const entry = object(raw, 'commit');
         const message = object(entry.commit, 'commit').message;
         if (typeof entry.sha !== 'string' || !SHA.test(entry.sha) || typeof message !== 'string') throw new Unknown('GitHub returned an invalid commit.');
+        // Each commit once: a repeated SHA means another commit is missing, so the list cannot be trusted as complete.
+        if (commits.some(commit => commit.sha === entry.sha)) throw new Unknown('GitHub returned a commit twice in the comparison.');
         commits.push({ sha: entry.sha, message });
       }
       if (total === 0) break;
