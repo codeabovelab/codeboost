@@ -24,7 +24,8 @@ export interface PullRequestGateway {
    */
   findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
-  refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
+  /** `beforeReady` runs after the description update's await and before any ready or draft change; if it throws, no such change is made. */
+  refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest>;
   /** Turns an open PR codeboost opened back into a draft; a no-op for a draft. */
   markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
@@ -131,7 +132,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return { ...pr, marker: found[0]! };
   }
 
-  async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+  async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     signal = this.#bounded(signal);
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
@@ -139,6 +140,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
     const patched = this.#pull(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal,
       { title: input.title, body: input.body }), input);
     if (patched.number !== number || markerOf(patched.body) !== input.marker) throw new Error('GitHub returned a different pull request.');
+    // The caller's re-check after the PATCH's await: a task change during it must not lead to a ready change.
+    input.beforeReady?.();
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
     else if (input.draft && !patched.draft) await draftCall(() => this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal }));

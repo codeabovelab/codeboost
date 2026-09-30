@@ -173,6 +173,7 @@ export class PullRequestPublisher {
       // recorded as in flight; the next publish settles it and starts again from the draft step above.
       const pr = await this.#pulls.refresh(live.number, {
         base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
+        beforeReady: () => this.#store.assertRefreshCurrent(identity, earlier.openingId, draft),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
       const status = this.#store.recordRefreshConfirmed(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
@@ -259,8 +260,16 @@ export class PullRequestPublisher {
     signal?.throwIfAborted();
     if (pr && pr.marker !== marker(lost.openingId)) {
       // The branch's open PR belongs to another of the task's openings, so this opening's request created nothing
-      // (GitHub allows one open PR per branch). Drop it; the main path reuses, or adopts, the PR that is there.
+      // (GitHub allows one open PR per branch). Drop it. If that other opening was abandoned, its PR is adopted here,
+      // not only on the main path, which a task that can no longer publish never reaches; then it is made a draft if
+      // the task cannot be published as ready.
       this.#store.abandonPullRequestOpening(identity, lost.openingId);
+      const owner = rows.find(row => marker(row.openingId) === pr.marker);
+      if (owner?.state === 'abandoned') {
+        this.#store.adoptOpening(identity, owner.openingId, pr,
+          { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+        await this.#draftIfNotPublishable(identity, owner, pr, signal);
+      }
       return null;
     }
     if (!pr) {
