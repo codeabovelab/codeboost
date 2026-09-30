@@ -52,6 +52,9 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   const violations: string[] = [];
   if (!Array.isArray(manifest.changes) || manifest.changes.length > MAX_CHANGES) return { kind: 'violation', violations: ['The change report is missing or too large to audit.'] };
   if (manifest.metadataChanged) violations.push('The agent changed Git metadata under .git.');
+  // Agents never commit: the metadata volume is read-only to them, so any agent commit is a violation, never undone (#66).
+  if (!Array.isArray(manifest.agentCommits)) violations.push('The change report has no agent commit list.');
+  else if (manifest.agentCommits.length) violations.push(`The agent made its own commits: ${manifest.agentCommits.slice(0, 5).join(', ')}.`);
   for (const path of manifest.linkTargetChanges) violations.push(`A declared symlink target changed: ${path}.`);
   for (const path of manifest.nestedGitlinkContent) violations.push(`Content appeared under a gitlink: ${path}.`);
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));

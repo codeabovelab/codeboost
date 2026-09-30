@@ -1,10 +1,12 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
-import { ItemExecutor, SAFETY_VIOLATION, executionDeps, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
+import { ItemExecutor, SAFETY_VIOLATION, SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
+import type { ShutdownCapability } from '../runner/lifecycle.ts';
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -24,7 +26,8 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest> = {})
   ({ changes, agentCommits: [], metadataChanged: false, linkTargetChanges: [], nestedGitlinkContent: [], digest: `digest-${changes.length}`, ...over });
 
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
-  commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error } = {}) {
+  commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
+  inspect?: (item: string) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const store = new Store(join(dir, 'state.sqlite'));
   store.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
@@ -34,8 +37,11 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const itemOf = (ws: WorkspaceRef) => (ws.storage as { item: string }).item;
   const workspace: TaskWorkspace = {
     async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
-    async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); return { item: itemOf(ws) }; },
-    async inspectChanges(ws, input) { log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); return options.manifests?.[itemOf(ws)] ?? manifest([change(itemOf(ws) === 'P1' ? 'a.ts' : 'b.ts')]); },
+    async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws) }; },
+    async inspectChanges(ws, input) {
+      log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws));
+      return options.manifests?.[itemOf(ws)] ?? manifest([change(itemOf(ws) === 'P1' ? 'a.ts' : 'b.ts')]);
+    },
     async commit(ws, input) {
       await options.commit?.(itemOf(ws));
       const head = oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, paths: input.paths, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
@@ -49,14 +55,16 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   };
   const sources: ExecutionSources = { planContext: () => context, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
+  const findings = new SafetyFindings(), capability = options.capability?.(store);
+  if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
   const deps = executionDeps(store, workspace, (input, prompt, ws) => {
     if (options.startError) throw options.startError;
     log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
     return { attemptId: input.attemptId, settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }), cancel: () => undefined };
-  }, sources, RUNNER_OWNER);
-  const runner = new RunnerCoordinator(store, deps);
+  }, sources, RUNNER_OWNER, findings);
+  const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, runner, executor: new ItemExecutor(store, runner, sources), log, commits, prompts, argv, owners };
+  return { store, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
 }
 
 describe('item execution', () => {
@@ -120,9 +128,16 @@ describe('item execution', () => {
     expect(store.getLedger(identity)).toEqual([]);
     expect(store.getSnapshot(identity).head).toBe(oid(2));
   });
-  it('holds the slot under a marker when task storage cannot be released', async () => {
+  it('holds the slot under a storage marker when task storage cannot be released, and stops the run with the items done', async () => {
     const { runner, executor } = setup({ release: async () => { throw new Error('docker down'); } });
-    await expect(executor.runTask(identity)).rejects.toThrow(/Needs restart/);
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started',
+      reason: 'Needs restart: the last attempt\'s task storage could not be removed.', completed: ['P1'] });
+    expect(runner.status(identity).unresolved).toMatchObject({ reason: 'storage-not-removed' });
+  });
+  it('never removes task storage when the terminal write fails, and reports the unsaved result', async () => {
+    const { runner, executor, log } = setup({ settleError: true });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'running', completed: [] });
+    expect(log.some(line => line.startsWith('release'))).toBe(false);
     expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
   it('releases task storage after the terminal write when D settles with another attempt\'s result', async () => {
@@ -136,5 +151,76 @@ describe('item execution', () => {
     const { executor, log } = setup({ startError: new Error('docker refused') });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Launch failed: docker refused' });
     expect(log).toContain('release P1 after failed');
+  });
+  it('does not take the agent\'s stderr for a safety violation', async () => {
+    const { store, executor } = setup({ exit: { P1: { exitCode: 1, stderr: `${SAFETY_VIOLATION} fake` } } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed' });
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('sends the task to needs human when the change inspection refuses', async () => {
+    const { store, executor, commits, log } = setup({ inspect: async () => { throw new Error('manifest digest mismatch'); } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
+      reason: `${SAFETY_VIOLATION} The change inspection refused: manifest digest mismatch` });
+    expect(commits).toEqual([]);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(log).toContain('release P1 after failed');
+  });
+  it('keeps a safety violation when the context goes stale during the audit', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      inspect: async () => { store.setAssignment(identity, store.getTask(identity).stateVersion, 'reassigned', 'hash-2'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('removes task storage after the terminal write when preparation fails after allocating it', async () => {
+    const { store, runner, executor, log } = setup({ snapshotError: new Error('declared link goes through a link') });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Preparation failed: declared link goes through a link' });
+    expect(log).toEqual(['materialize P1 @002', 'snapshot P1 []', 'release P1 after failed']);
+    expect(runner.status(identity).unresolved).toBeNull();
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('stops before the next item when the plan gets a new revision during the run', async () => {
+    let store!: Store;
+    const h = setup({ release: async () => {
+      if (store.getPlan(identity).revision !== 1) return;
+      const revised = { ...plan, revision: 2, items: plan.items.map(entry => entry.id === 'P2' ? { ...entry, title: 'Second CHANGED' } : entry) };
+      store.importRevision(JSON.stringify(revised), 'json', context, 1);
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'] });
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
+  });
+  it('does not bind a checkpoint to a revision the item did not run against', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {
+      if (store.getPlan(identity).revision === 1) store.importRevision(JSON.stringify({ ...plan, revision: 2, summary: 'Revised' }), 'json', context, 1);
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', completed: ['P1'] });
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('returns a stopped outcome, with no checkpoint, when the task closed before it could pause for amendment', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {
+      store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    } });
+    store = h.store;
+    const outcome = await h.executor.runTask(identity);
+    expect(outcome).toMatchObject({ kind: 'stopped', item: 'P1', completed: ['P1'] });
+    expect(store.getTask(identity).status).toBe('cancelled');
+  });
+  it('pauses for amendment through the capability after the shutdown write gate closed', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+      capability: s => s.shutdownCapability(), release: async () => { store.closeWrites(); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+  });
+  it('stages both paths of a rename in the runner commit', async () => {
+    const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })]) } });
+    await executor.runTask(identity);
+    expect(commits[0]!.paths).toEqual(['a.ts', 'old.ts']);
   });
 });

@@ -503,6 +503,18 @@ export class Store {
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint)); return checkpoint;
     });
   }
+  /**
+   * F2's scope pause: the checkpoint and the move to needs amendment commit together, so a refused status change
+   * (a closed task, an active attempt or merge) records no checkpoint either.
+   */
+  pauseForAmendment(identity: PlanIdentity, expected: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>): Checkpoint {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const checkpoint = this.recordCheckpoint(identity, expected, evidence);
+      this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
+      return checkpoint;
+    });
+  }
   getCheckpoint(identity: PlanIdentity, id: string): Checkpoint {
     const row = this.#get('SELECT data FROM checkpoints WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown checkpoint.'); return decode<Checkpoint>(row.data);

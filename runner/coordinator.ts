@@ -15,6 +15,14 @@ export interface PreparedAttempt {
 export interface HistoryRecord { readonly base: string; readonly head: string; readonly entries: readonly LedgerEntry[] }
 /** A finish step's failure with its own actionable diagnostic (for example a safety violation). */
 export class FinishFailure extends Error {}
+/**
+ * Preparation failed after it allocated task storage. `allocated` lets the coordinator remove that storage after the
+ * terminal write, as on every other path (runner-lifecycle.md, "Task storage is never removed before the terminal write").
+ */
+export class PreparationFailure extends Error {
+  readonly allocated: PreparedAttempt;
+  constructor(cause: unknown, allocated: PreparedAttempt) { super(cause instanceof Error ? cause.message : String(cause), { cause }); this.allocated = allocated; }
+}
 export interface RunnerDeps {
   /**
    * The runner token D labels every resource with (32 lowercase hex characters). `prepare` must allocate task storage
@@ -56,10 +64,10 @@ export interface RunnerStatus {
   unresolved: { attemptId: string; reason: UnresolvedReason } | null;
 }
 /**
- * Why a task's slot stays held until restart: the terminal write failed, pending -> running failed, or the host-side
- * preparation files could not be removed.
+ * Why a task's slot stays held until restart: the terminal write failed, pending -> running failed, the host-side
+ * preparation files could not be removed, or task storage could not be removed after a saved terminal write.
  */
-export type UnresolvedReason = 'result-not-saved' | 'start-not-saved' | 'preparation-not-removed';
+export type UnresolvedReason = 'result-not-saved' | 'start-not-saved' | 'preparation-not-removed' | 'storage-not-removed';
 type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
@@ -83,6 +91,7 @@ const NEEDS_RESTART: Record<UnresolvedReason, string> = {
   'result-not-saved': 'Needs restart: the last result could not be saved.',
   'start-not-saved': 'Needs restart: the start of the last attempt could not be saved.',
   'preparation-not-removed': 'Needs restart: the last attempt\'s preparation files could not be removed.',
+  'storage-not-removed': 'Needs restart: the last attempt\'s task storage could not be removed.',
 };
 const FOREIGN_RESULT = 'The agent returned a result for a different attempt; it was not saved.';
 const NOT_STARTED_UNRELEASED = 'Not started: an earlier agent\'s cleanup could not be confirmed. Restart codeboost to run it again.';
@@ -259,7 +268,10 @@ export class RunnerCoordinator {
       if (job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
       let prepared: PreparedAttempt;
       try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
-      catch (error) { return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error)); }
+      catch (error) {
+        // Storage that preparation allocated before it failed is removed after the terminal write, like every other path.
+        return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error), error instanceof PreparationFailure ? error.allocated : undefined);
+      }
       if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
       // Launch check: one synchronous turn, no await between the checks and D's start call.
       const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
@@ -376,7 +388,10 @@ export class RunnerCoordinator {
   async #release(job: Job, attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void> {
     if (!this.#deps.release) return;
     try { await this.#deps.release(attempt, prepared); }
-    catch { if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' }); }
+    catch (error) {
+      console.error(`Runner job ${job.attemptId} could not remove its task storage: ${message(error)}`);
+      if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'storage-not-removed' });
+    }
   }
   #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord }): Classification | undefined {
     try {

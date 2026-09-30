@@ -22,9 +22,13 @@ describe('post-run audit', () => {
       .toMatchObject({ kind: 'commit', outOfScope: ['docs/New.md'] });
   });
   it('reports planned-but-unchanged, and uses the trusted path identity', () => {
-    expect(auditRun(item, manifest([], { agentCommits: ['abc'] }), exact)).toMatchObject({ kind: 'commit', unchanged: true });
+    expect(auditRun(item, manifest([]), exact)).toMatchObject({ kind: 'commit', unchanged: true });
     expect(auditRun(item, manifest([file('SRC/Retry.ts')]), folded)).toMatchObject({ inScope: ['SRC/Retry.ts'] });
     expect(auditRun(item, manifest([file('SRC/Retry.ts')]), exact)).toMatchObject({ outOfScope: ['SRC/Retry.ts'] });
+  });
+  it('treats any agent commit as a safety violation, even with no file changes (#66: never undone)', () => {
+    expect(auditRun(item, manifest([], { agentCommits: ['abc'] }), exact)).toEqual({ kind: 'violation', violations: ['The agent made its own commits: abc.'] });
+    expect(auditRun(item, manifest([file('src/retry.ts')], { agentCommits: undefined as unknown as string[] }), exact)).toMatchObject({ kind: 'violation' });
   });
   it('stops on every safety violation before any scope decision', () => {
     const cases: [string, ChangeManifest][] = [
