@@ -1580,6 +1580,47 @@ describe('shutdown and PRs left ready', () => {
     await expect(publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5 }]);
   });
+  it('refuses the main path when the task changes during the lookup that adopts an abandoned opening', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    await expect(harness(store, { live, next, hidden, config: later }).publisher.publish(identity)).rejects.toThrow(/already exists/);
+    // Recovery abandons the second opening; during the main path's lookup the PR appears and the assignment changes.
+    const again = harness(store, { live, next, hidden, config: later, onFind: () => {
+      if (again.log.length > 1) { hidden.clear(); store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code'); }
+    } });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/Stale task state/);
+    expect(again.log.some(line => line.startsWith('push') || line === 'check')).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'abandoned' }, { state: 'abandoned' }]);
+  });
+  /** A needs-human draft opening whose outcome was lost; its PR was then made ready on GitHub. */
+  async function lostDraftMadeReady() {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    return { store, live, next };
+  }
+  it('does not draft a recovered draft opening for a ready publish: the main path marks it ready', async () => {
+    const { store, live, next } = await lostDraftMadeReady();
+    // The task went back and ran again; it is now published as ready.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+  });
+  it('continues to the main path when a recovered draft opening is not this publish\'s own and drafts are unsupported', async () => {
+    const { store, live, next } = await lostDraftMadeReady();
+    // The task changed since the opening (same status, new version), so the opening is not this publish's own.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    const again = harness(store, { live, next, draftsUnsupported: true });
+    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    expect(again.log).toContain('check');
+  });
   it('refuses gateways configured for another repository', () => {
     const store = runningTask();
     const { pulls } = harness(store);
