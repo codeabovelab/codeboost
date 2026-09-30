@@ -42,6 +42,11 @@ async function draftCall<T>(call: () => Promise<T>): Promise<T> {
     throw error;
   }
 }
+/**
+ * A PR's marker is its description's first line and nothing else. Plan text and problems later in the description are
+ * agent-controlled, so a marker-shaped string there never identifies a PR.
+ */
+export const markerOf = (body: string): string => body.split('\n', 1)[0]!.trim();
 /** GitHub updates a PR's head a moment after a push; the read-back waits up to this many polls for the pushed head. */
 export const HEAD_POLLS = 5, HEAD_POLL_MS = 500;
 
@@ -87,12 +92,12 @@ export class GhPullRequestGateway implements PullRequestGateway {
 
   async open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
-    if (!input.body.includes(input.marker)) throw new Error('The pull request description must carry its marker.');
+    if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
     const post = () => this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
       { title: input.title, body: input.body, head: input.headBranch, base: input.base, draft: input.draft });
     const response = input.draft ? await draftCall(post) : await post();
     const { body, ...pr } = this.#pull(response, input);
-    if (!body.includes(input.marker)) throw new Error('GitHub returned a pull request without its marker.');
+    if (markerOf(body) !== input.marker) throw new Error('GitHub returned a pull request without its marker.');
     return pr;
   }
 
@@ -105,7 +110,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     if (!Array.isArray(response) || response.length > 1) throw new Error('GitHub returned an invalid pull request list.');
     if (!response.length) return null;
     const { body, ...pr } = this.#pull(response[0], input);
-    const found = input.markers.filter(marker => body.includes(marker));
+    const found = input.markers.filter(marker => markerOf(body) === marker);
     if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
     return { ...pr, marker: found[0]! };
   }
@@ -113,10 +118,10 @@ export class GhPullRequestGateway implements PullRequestGateway {
   async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
-    if (!input.body.includes(input.marker)) throw new Error('The pull request description must carry its marker.');
+    if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
     const patched = this.#pull(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal,
       { title: input.title, body: input.body }), input);
-    if (patched.number !== number || !patched.body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
+    if (patched.number !== number || markerOf(patched.body) !== input.marker) throw new Error('GitHub returned a different pull request.');
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
     else if (input.draft && !patched.draft) await draftCall(() => this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal }));
@@ -144,7 +149,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
   async #readBack(number: number, input: { base: string; headBranch: string; marker: string }, done: (pr: OpenedPullRequest) => boolean, signal?: AbortSignal): Promise<OpenedPullRequest> {
     for (let poll = 1; ; poll++) {
       const { body, ...pr } = this.#pull(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal), input);
-      if (pr.number !== number || !body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
+      if (pr.number !== number || markerOf(body) !== input.marker) throw new Error('GitHub returned a different pull request.');
       if (done(pr) || poll >= HEAD_POLLS) return pr;
       await new Promise<void>((resolve, reject) => {
         signal?.throwIfAborted();

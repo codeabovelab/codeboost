@@ -1075,12 +1075,19 @@ export class Store {
     });
   }
   /** Records that the task's open PR is now a draft (after a check matched). The task status does not change. */
-  recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean): void {
+  /**
+   * Records the draft state GitHub shows for the task's open PR. It also repairs a record whose draft change landed on
+   * GitHub but was never recorded (a crash or cancel right after the call). Guarded by the state version the caller
+   * read, so a task change is still noticed; returns the new state version.
+   */
+  recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean, expectedStateVersion: number): number {
     const key = identityKey(identity);
-    this.#transaction(() => {
+    return this.#transaction(() => {
+      if (this.#task(key).state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (this.#run("UPDATE task_pull_requests SET draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='opened' AND number=?",
         draft ? 1 : 0, new Date().toISOString(), key, openingId, number).changes !== 1) throw new GuardRefusal('Unknown pull request.');
       this.#touch(key);
+      return this.#task(key).state_version as number;
     });
   }
   /** Recovery found no PR for an opening whose outcome was lost; a new check and opening follow. */

@@ -96,6 +96,10 @@ export class PullRequestPublisher {
     const live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal);
     signal?.throwIfAborted();
     const earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
+    // What GitHub shows is the truth for the draft flag: a draft change whose record was lost is repaired here.
+    let stateVersion = task.stateVersion;
+    if (earlier && live && earlier.state === 'opened' && earlier.number === live.number && earlier.draft !== live.draft)
+      stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, live.number, live.draft, stateVersion);
     const own = new Set(prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!));
     if (live) own.add(live.number);
     const result = await this.#checks.check({
@@ -111,15 +115,15 @@ export class PullRequestPublisher {
     // It is still a GitHub change for this task, so the task is re-read first: a reassignment or review during the check
     // means this publish is stale and must not touch the current generation's PR.
     const needsDraft = result.outcome !== 'clear' && earlier && live && !live.draft;
-    if (needsDraft) this.#store.assertUnchangedSince(identity, { stateVersion: task.stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
+    if (needsDraft) this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
     let drafted = null, leftReady: number | undefined;
     if (needsDraft) {
       try { drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal); }
       catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
     }
     signal?.throwIfAborted();
-    const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
-    if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft);
+    const check = this.#store.recordAlreadyFixed(identity, stateVersion, { snapshotId: snapshot.id, draft, result });
+    if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft, check.stateVersion);
     const ready = leftReady === undefined ? {} : { leftReady };
     if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result, ...ready } : { kind: 'possibly already fixed', result, ...ready };
     if (earlier && live) {
@@ -202,7 +206,19 @@ export class PullRequestPublisher {
       this.#store.abandonPullRequestOpening(identity, lost.openingId);
       return null;
     }
-    const status = this.#store.recordPullRequestOpened(identity, lost.openingId, pr);
-    return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+    // A lost draft opening must end as a draft: if the PR was made ready meanwhile, turn it back before confirming. Any
+    // failure keeps the opening owned (the next publish retries); drafts being unsupported is definite, so the PR is
+    // recorded as it is and reported.
+    let found: { number: number; url: string; headSha: string; draft: boolean } = pr;
+    if (lost.draft && !pr.draft) {
+      try { found = await this.#pulls.markDraft(pr.number, { base: lost.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
+      catch (error) {
+        if (!(error instanceof DraftsUnsupported)) throw error;
+        this.#store.recordPullRequestOpened(identity, lost.openingId, pr);
+        return { kind: 'draft unsupported', number: pr.number };
+      }
+    }
+    const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
+    return { kind: 'opened', number: found.number, url: found.url, draft: found.draft, status };
   }
 }
