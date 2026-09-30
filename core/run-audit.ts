@@ -34,7 +34,7 @@ export type AuditOutcome =
 
 const MAX_CHANGES = 10_000;
 /** Every path in the report together; keeps the saved result (scope lists included) far below its 1 MiB limit. */
-const MAX_PATH_BYTES = 256 * 1024;
+const MAX_PATH_BYTES = 480 * 1024;
 const KINDS = new Set(['add', 'modify', 'delete', 'rename', 'mode']);
 const TYPES = new Set(['file', 'symlink', 'gitlink', 'directory', 'other']);
 
@@ -51,17 +51,18 @@ function malformed(manifest: ChangeManifest): string | null {
   let bytes = 0;
   for (const change of manifest.changes) {
     if (!change || typeof change !== 'object' || typeof change.path !== 'string' || !change.path) return 'A change has no path.';
-    if (change.oldPath !== undefined && (typeof change.oldPath !== 'string' || !change.oldPath)) return `The change at ${change.path} has an invalid old path.`;
+    // Only a rename has an old path; on any other kind it would be staged as if it were part of the change.
+    if (change.kind === 'rename' ? typeof change.oldPath !== 'string' || !change.oldPath : change.oldPath !== undefined) return `The change at ${change.path} has an invalid old path.`;
     if (!KINDS.has(change.kind)) return `The change at ${change.path} has an unknown kind.`;
     if (typeof change.underGit !== 'boolean') return `The change at ${change.path} does not say whether it is under .git.`;
     // add has only a new entry, delete only an old one, every other kind both.
     const needsOld = change.kind !== 'add', needsNew = change.kind !== 'delete';
     if ((needsOld && !TYPES.has(change.oldType as string)) || (!needsOld && change.oldType !== undefined)) return `The change at ${change.path} has an invalid old entry type.`;
     if ((needsNew && !TYPES.has(change.newType as string)) || (!needsNew && change.newType !== undefined)) return `The change at ${change.path} has an invalid new entry type.`;
-    if (change.kind === 'rename' && !change.oldPath) return `The rename at ${change.path} has no old path.`;
     if (change.newType === 'symlink' && typeof change.newLinkTarget !== 'string') return `The link at ${change.path} has no target.`;
     if (change.linkTargetTraversesLink !== undefined && typeof change.linkTargetTraversesLink !== 'boolean') return `The link at ${change.path} has an invalid traversal flag.`;
-    bytes += Buffer.byteLength(change.path) + (change.oldPath ? Buffer.byteLength(change.oldPath) : 0);
+    // Only `path` is saved (in the result's scope lists and a checkpoint), so only it counts toward the result limit.
+    bytes += Buffer.byteLength(change.path) + 3;
   }
   if (bytes > MAX_PATH_BYTES) return 'The change report is too large to audit.';
   return null;
@@ -95,7 +96,7 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   for (const change of manifest.changes) {
     const paths = [change.path, ...(change.oldPath ? [change.oldPath] : [])];
     if (change.underGit || paths.some(path => path === '.git' || path.startsWith('.git/'))) { violations.push(`The agent changed ${change.path} under .git.`); continue; }
-    if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || path.includes('\0')))
+    if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || ['.', '..'].includes(posix.normalize(path)) || path.includes('\0')))
       { violations.push(`Invalid path in the change report: ${change.path}.`); continue; }
     if (change.oldType === 'gitlink' || change.newType === 'gitlink') { violations.push(`Plan items cannot change gitlinks: ${change.path}.`); continue; }
     if (change.newType === 'symlink') {

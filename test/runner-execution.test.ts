@@ -349,4 +349,62 @@ describe('item execution', () => {
     await h.executor.runTask(identity);
     expect(h.log).toContain('snapshot P1 [c.ts,a.ts]');
   });
+  it('pays a pause owed from an earlier run when the task is queued again, instead of getting stuck', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
+  });
+  it('holds a recorded pause until a person approves continuing on an amended plan, then runs only the next item', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
+    const paused = await h.executor.runTask(identity);
+    expect(paused).toMatchObject({ kind: 'needs amendment', item: 'P1' });
+    const store = h.store;
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/approve continuing/) });
+    const amended = { ...plan, revision: 2, items: [{ ...plan.items[0]!, files: [...plan.items[0]!.files, { path: 'extra.ts', kind: 'add', renamed_from: null, change: 'z' }] }, plan.items[1]!] };
+    store.importRevision(JSON.stringify(amended), 'json', { ...context, baseEntries: context.baseEntries }, 1);
+    store.approveContinuation(identity, (paused as { checkpointId: string }).checkpointId, { revision: 2, snapshotId: store.getSnapshot(identity).id });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/name the next item/) });
+    expect(await h.executor.runTask(identity, { fromItem: 'P1' })).toMatchObject({ kind: 'stopped', state: 'not started' });
+    // A later snapshot with the same head does not make the approved pause owed again.
+    const snapshot = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: 2, snapshotId: snapshot.id }, snapshot.base, snapshot.head, []);
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toEqual({ kind: 'executed', items: ['P2'], unchanged: [] });
+    expect(h.commits.map(c => c.item)).toEqual(['P1', 'P2']);
+  });
+  it('fails the attempt when the workspace makes no new commit for a changed item', async () => {
+    const { store, executor } = setup({ commitHead: oid(2) });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'The workspace made no new commit for a changed item; nothing was published.' });
+    expect(store.getLedger(identity).some(entry => entry.owner === 'P1')).toBe(false);
+  });
+  it('names the real cause when the start of an attempt could not be saved', async () => {
+    const h = setup();
+    h.store.markRunning = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'pending', reason: 'Needs restart: the start of the last attempt could not be saved.' });
+  });
+  it('stops before the next item when only the referenced code changes during the run', async () => {
+    let store!: Store;
+    const h = setup({ release: async () => {
+      if (store.getAttempts(identity).length !== 1) return;
+      store.setAssignment(identity, store.getTask(identity).stateVersion, store.currentContext(identity).assignmentId, 'new-code-hash');
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'] });
+  });
+  it('treats an AbortError from the inspection as the stop', async () => {
+    let runner!: RunnerCoordinator, store!: Store;
+    const h = setup({ inspect: async () => {
+      runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled');
+      throw Object.assign(new Error('The operation was aborted'), { name: 'AbortError' });
+    } });
+    runner = h.runner; store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(store.getTask(identity).status).toBe('running');
+  });
 });

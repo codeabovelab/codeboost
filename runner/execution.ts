@@ -3,7 +3,7 @@ import type { PlanContext } from '../core/plan.ts';
 import type { InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
-import { FinishFailure, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
+import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
 import { GuardRefusal, ShuttingDownError, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
 
@@ -114,6 +114,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       }, signal);
       // The ID goes into the ledger inside the terminal write; a malformed one must fail the attempt, not that write.
       if (typeof head !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head)) throw new FinishFailure('The workspace returned an invalid commit ID; nothing was published.');
+      if (head === data.baseHead) throw new FinishFailure('The workspace made no new commit for a changed item; nothing was published.');
       const snapshot = store.getSnapshot(identity, attempt.context.snapshotId);
       return {
         value: { head, unchanged: false, inScope: outcome.inScope, outOfScope: outcome.outOfScope } satisfies ExecutionResult,
@@ -166,6 +167,15 @@ export class ItemExecutor {
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
     if (owed) return this.#pause(identity, owed.row, owed.result, stopped, []);
+    // A recorded pause holds until a person approves continuing on the current revision (plan-format.md: "After a
+    // person approves a revised plan and continuation"); the items it already completed are not run again.
+    const checkpoint = this.#store.latestCheckpoint(identity);
+    if (checkpoint) {
+      if (this.#store.continuationRevision(identity, checkpoint.id) !== plan.revision)
+        return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', `${checkpoint.item} changed files outside its plan item; approve continuing on the amended plan before running more items.`);
+      if (!options.fromItem || checkpoint.completedItems.includes(options.fromItem))
+        return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', `Continue after ${checkpoint.item}: name the next item to run, not one that already ran.`);
+    }
     /** Where the next item must start: the context the previous item left, or the current one for the first item. */
     let expected: { snapshotId: string; assignmentId: string; referencedCodeHash: string } | null = null;
     for (const item of plan.items.slice(start)) {
@@ -204,7 +214,7 @@ export class ItemExecutor {
         // Still pending or running: the terminal write failed and the slot is held until restart.
         const unresolved = this.#runner.status(identity).unresolved;
         return stopped(item.id, row.state, row.state === 'pending' || row.state === 'running'
-          ? `Needs restart: the result of ${item.id} could not be saved.${unresolved ? ` (${unresolved.reason})` : ''}` : row.diagnostic);
+          ? (unresolved ? NEEDS_RESTART[unresolved.reason] : `Needs restart: the outcome of ${item.id} could not be saved.`) : row.diagnostic);
       }
       const result = row.result as ExecutionResult;
       done.push(item.id);
@@ -221,8 +231,7 @@ export class ItemExecutor {
     const row = this.#store.getAttempts(identity).filter(entry => entry.kind === 'execute' && entry.state === 'completed').at(-1);
     const result = row?.result as ExecutionResult | undefined;
     if (!row || !result?.outOfScope?.length) return null;
-    const snapshotId = this.#store.snapshotWithHead(identity, result.head);
-    return snapshotId && this.#store.hasCheckpointAt(identity, snapshotId) ? null : { row, result };
+    return row.item && this.#store.checkpointFor(identity, row.item, result.head) ? null : { row, result };
   }
   /**
    * The scope pause. The checkpoint names the revision the item ran against and the snapshot its own commit created, so

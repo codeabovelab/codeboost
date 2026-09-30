@@ -87,7 +87,7 @@ const D_REASON: Record<FirstReason, StopReason> = { cancelled: 'cancelled', stal
 /** setTimeout accepts at most 2^31-1 ms; longer waits are re-armed. */
 const MAX_TIMER = 2_147_483_647;
 const PREPARATION_TIMEOUT = 'Timed out while preparing.';
-const NEEDS_RESTART: Record<UnresolvedReason, string> = {
+export const NEEDS_RESTART: Readonly<Record<UnresolvedReason, string>> = {
   'result-not-saved': 'Needs restart: the last result could not be saved.',
   'start-not-saved': 'Needs restart: the start of the last attempt could not be saved.',
   'preparation-not-removed': 'Needs restart: the last attempt\'s preparation files could not be removed.',

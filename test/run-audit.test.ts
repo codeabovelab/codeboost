@@ -38,15 +38,25 @@ describe('post-run audit', () => {
       ['add without a new type', manifest([{ path: 'src/new.ts', kind: 'add', underGit: false } as ManifestChange]), /invalid new entry type/],
       ['modify without an old type', manifest([file('src/retry.ts', { oldType: undefined })]), /invalid old entry type/],
       ['unknown kind', manifest([file('src/retry.ts', { kind: 'chmod' as ManifestChange['kind'] })]), /unknown kind/],
-      ['rename without an old path', manifest([file('docs/New.md', { kind: 'rename' })]), /no old path/],
+      ['rename without an old path', manifest([file('docs/New.md', { kind: 'rename' })]), /invalid old path/],
+      ['old path on a modify', manifest([file('src/retry.ts', { oldPath: 'src/other.ts' })]), /invalid old path/],
+      ['non-string old path', manifest([file('docs/New.md', { kind: 'rename', oldPath: 7 as unknown as string })]), /invalid old path/],
+      ['delete with a new type', manifest([file('src/retry.ts', { kind: 'delete' })]), /invalid new entry type/],
+      ['add with an old type', manifest([file('src/new.ts', { kind: 'add' })]), /invalid old entry type/],
+      ['non-boolean traversal flag', manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: 'x', linkTargetTraversesLink: 'no' as unknown as boolean })]), /traversal flag/],
+      ['non-string list entry', manifest([file('src/retry.ts')], { nestedGitlinkContent: [{ path: 'm' }] as unknown as string[] }), /no nestedGitlinkContent list/],
       ['link without a target', manifest([file('link', { oldType: 'symlink', newType: 'symlink' })]), /has no target/],
-      ['too many path bytes', manifest(Array.from({ length: 300 }, (_, i) => file(`${'x'.repeat(1000)}${i}`))), /too large/],
+      ['too many path bytes', manifest(Array.from({ length: 600 }, (_, i) => file(`${'x'.repeat(1000)}${i}`))), /too large/],
     ];
     for (const [label, report, reason] of cases) {
       const outcome = auditRun(item, report, exact);
       expect(outcome.kind, label).toBe('violation');
       expect((outcome as { violations: string[] }).violations.join(' '), label).toMatch(reason);
     }
+  });
+  it('refuses a change path of . or ..', () => {
+    for (const path of ['..', '.', 'a/../..'])
+      expect(auditRun(item, manifest([file(path)]), exact), path).toMatchObject({ kind: 'violation' });
   });
   it('stops on every safety violation before any scope decision', () => {
     const cases: [string, ChangeManifest][] = [

@@ -516,19 +516,31 @@ export class Store {
       const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
       if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
         throw new Error('Checkpoint must describe the executed plan prefix.');
-      // Only the executor's own running task pauses; a status someone set since (for example needs human) is kept.
-      if (this.#task(key).status !== 'running') throw new GuardRefusal('The task is no longer running, so it was not paused for amendment.');
+      // Only the executor's own task pauses: running, or queued for its next run (a pause owed from an earlier run). A
+      // status someone set since (for example needs human or needs approval) is kept.
+      const status = this.#task(key).status;
+      if (status !== 'running' && status !== 'queued') throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
       const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
       return checkpoint;
     });
   }
-  /** Whether a scope checkpoint was recorded at this snapshot: its item's pause is already on record. */
-  hasCheckpointAt(identity: PlanIdentity, snapshotId: string): boolean {
-    for (const row of this.#db.prepare('SELECT data FROM checkpoints WHERE key=?').all(identityKey(identity)))
-      if (decode<Checkpoint>(row.data).snapshotId === snapshotId) return true;
-    return false;
+  /**
+   * The scope checkpoint recorded for this item's commit, found by the item and the commit's head (not by the latest
+   * snapshot, which a later snapshot with the same head would shadow), or null if its pause was never recorded.
+   */
+  checkpointFor(identity: PlanIdentity, item: string, head: string): Checkpoint | null {
+    for (const row of this.#db.prepare('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC').all(identityKey(identity))) {
+      const checkpoint = decode<Checkpoint>(row.data);
+      if (checkpoint.item === item && this.getSnapshot(identity, checkpoint.snapshotId).head === head) return checkpoint;
+    }
+    return null;
+  }
+  /** The most recent scope checkpoint of this plan, or null. */
+  latestCheckpoint(identity: PlanIdentity): Checkpoint | null {
+    const row = this.#get('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
+    return row ? decode<Checkpoint>(row.data) : null;
   }
   /** The latest snapshot of this plan whose head is `head` (the one a runner commit created), or null. */
   snapshotWithHead(identity: PlanIdentity, head: string): string | null {

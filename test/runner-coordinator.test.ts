@@ -522,6 +522,17 @@ describe('copilot review', () => {
     expect(cleaned()).toBe(1);
     expect(() => runner.start(B, request(store, B))).not.toThrow();
   });
+  it('keeps preparation files for startup recovery when a foreign result\'s terminal write fails', async () => {
+    const { store, runner, launches, preparations, cleaned } = setup();
+    vi.spyOn(store, 'settleAttempt').mockImplementation(() => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); });
+    runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle({ attemptId: randomUUID() });
+    await runner.settled(A);
+    expect(cleaned()).toBe(0);
+    expect(runner.status(A).unresolved).toMatchObject({ reason: 'result-not-saved' });
+  });
   it('holds the slot when preparation files cannot be removed after D settles', async () => {
     const { store, runner, launches, preparations, deps } = setup();
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
