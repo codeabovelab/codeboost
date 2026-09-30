@@ -18,6 +18,8 @@ describe('post-run audit', () => {
       .toEqual({ kind: 'commit', inScope: ['src/retry.ts', 'docs/New.md'], outOfScope: [], unchanged: false, needsAmendment: false });
     expect(auditRun(item, manifest([file('src/retry.ts'), file('src/extra.ts', { kind: 'add', oldType: undefined })]), exact))
       .toMatchObject({ kind: 'commit', outOfScope: ['src/extra.ts'], needsAmendment: true });
+    // Both sides of a rename are findings when neither is declared.
+    expect(auditRun(item, manifest([file('x.ts', { kind: 'rename', oldPath: 'y.ts' })]), exact)).toMatchObject({ kind: 'commit', outOfScope: ['x.ts', 'y.ts'] });
     // The undeclared source is the finding, not the declared destination.
     expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: 'docs/unlisted.md' })]), exact))
       .toMatchObject({ kind: 'commit', inScope: [], outOfScope: ['docs/unlisted.md'] });

@@ -325,7 +325,8 @@ export class RunnerCoordinator {
         if (foreignSaved && !(await this.#removePreparation(job, attempt))) this.#holdForPreparation(job);
         return;
       }
-      let valid = false, value: unknown, history: HistoryRecord | undefined, detail = result.stderr ? bounded(result.stderr) : undefined;
+      // The agent's stderr is its own text: quote it (AGENTS.md), so it cannot forge a runner line in the diagnostic.
+      let valid = false, value: unknown, history: HistoryRecord | undefined, detail = result.stderr ? JSON.stringify(bounded(result.stderr)) : undefined;
       if (!job.firstReason && result.exitCode === 0 && !result.stopReason) {
         try {
           if (this.#deps.finish) { const done = await this.#deps.finish(attempt, result, prepared, job.controller.signal); value = done.value; history = done.history; }
