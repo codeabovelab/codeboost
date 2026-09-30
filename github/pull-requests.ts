@@ -22,11 +22,16 @@ export interface PullRequestGateway {
   /**
    * The open PR from `headBranch` into `base`, with the one of `markers` its description carries, or null when there is
    * no open PR. An open PR that carries none of them (always the case with no markers) was not opened by codeboost, and
-   * is refused. A PR from the branch into another base is ignored, unless it carries one of `markers` (the task's own PR,
-   * retargeted by a person): that is refused. With `anyBase`, only the task's own PR is looked for, in whatever base it
-   * is (for making it a draft, which is safe anywhere), and anyone else's PR from the branch is ignored.
+   * is refused. The task's own PRs (those carrying one of `markers`) must be at most one, and into `base`: its own PR in
+   * another base (retargeted by a person, or left by a base change) is refused, and so are two of its own PRs. Anyone
+   * else's PR from the branch into another base (a backport, say) is ignored. For the calls that change a PR's content.
    */
-  findOpened(input: { base: string; headBranch: string; markers: readonly string[]; anyBase?: boolean }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string; base: string }) | null>;
+  findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
+  /**
+   * Every open PR from `headBranch` that carries one of `markers`, in whatever base, with that base. Nothing is refused
+   * for being in another base: for recording what GitHub shows and for making PRs drafts, both safe in any base.
+   */
+  findOwned(input: { headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string; base: string })[]>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
   /** `beforeReady` runs after the description update's await and before any ready or draft change; if it throws, no such change is made. */
   refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest>;
@@ -121,8 +126,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return { number: pr.number as number, url: pr.html_url, headSha: pr.head.sha, draft: pr.draft, body: pr.body ?? '' };
   }
 
-  #validate(input: { base: string; headBranch: string; marker?: string; markers?: readonly string[] }): void {
-    if (!BRANCH.test(input.base) || !BRANCH.test(input.headBranch)) throw new Error('Invalid branch name.');
+  #validate(input: { base?: string; headBranch: string; marker?: string; markers?: readonly string[] }): void {
+    if ((input.base !== undefined && !BRANCH.test(input.base)) || !BRANCH.test(input.headBranch)) throw new Error('Invalid branch name.');
     // A lookup may carry no markers (the task has no PR yet); every other call names the PR's own marker.
     const markers = input.markers ?? [input.marker];
     if ((input.markers === undefined && !markers.length) || markers.some(marker => typeof marker !== 'string' || !/^<!-- codeboost:[a-z-]+=[0-9a-f-]{36} -->$/.test(marker))) throw new Error('Invalid pull request marker.');
@@ -147,41 +152,51 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return pr;
   }
 
-  async findOpened(input: { base: string; headBranch: string; markers: readonly string[]; anyBase?: boolean }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string; base: string }) | null> {
-    signal = this.#bounded(signal);
-    this.#validate(input);
+  /**
+   * Every open PR from the branch, in any base. Not filtered by base on GitHub's side: GitHub allows one open PR per head
+   * and base, so the task's own PR that a person retargeted would be missed, and a second PR opened from the same branch.
+   */
+  async #branchPulls(headBranch: string, signal: AbortSignal): Promise<unknown[]> {
     const owner = this.repository.split('/')[0]!;
-    // Not filtered by base on GitHub's side: GitHub allows one open PR per head and base, so the task's own PR that a
-    // person retargeted to another base would be missed, and a second PR opened from the same branch.
-    const query = new URLSearchParams({ state: 'open', head: `${owner}:${input.headBranch}`, per_page: '100' });
+    const query = new URLSearchParams({ state: 'open', head: `${owner}:${headBranch}`, per_page: '100' });
     const response = await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls?${query}`], signal);
     if (!Array.isArray(response)) throw new Error('GitHub returned an invalid pull request list.');
-    const baseOf = (pr: unknown) => (pr as { base?: { ref?: unknown } } | null)?.base?.ref;
-    if (input.anyBase) {
-      const own = response.filter(pr => { const body = (pr as { body?: unknown } | null)?.body; return typeof body === 'string' && input.markers.includes(markerOf(body)); });
-      if (own.length > 1) throw new Error(`More than one of the task's pull requests is open from ${input.headBranch}.`);
-      if (!own.length) return null;
-      const base = baseOf(own[0]);
+    return response;
+  }
+
+  /** The task's own PRs among `pulls`: those whose description's first line is one of `markers`, each with its base. */
+  #owned(pulls: readonly unknown[], headBranch: string, markers: readonly string[]): (OpenedPullRequest & { marker: string; base: string })[] {
+    return pulls.flatMap(value => {
+      const body = (value as { body?: unknown } | null)?.body;
+      if (typeof body !== 'string' || !markers.includes(markerOf(body))) return [];
+      const base = (value as { base?: { ref?: unknown } }).base?.ref;
       if (typeof base !== 'string' || !BRANCH.test(base)) throw new Error('GitHub returned an invalid pull request.');
-      const { body, ...pr } = this.#pull(own[0], { base, headBranch: input.headBranch });
-      return { ...pr, marker: markerOf(body), base };
-    }
-    const here = response.filter(pr => baseOf(pr) === input.base);
+      const { body: _, ...pr } = this.#pull(value, { base, headBranch });
+      return [{ ...pr, marker: markerOf(body), base }];
+    });
+  }
+
+  async findOwned(input: { headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string; base: string })[]> {
+    signal = this.#bounded(signal);
+    this.#validate(input);
+    return this.#owned(await this.#branchPulls(input.headBranch, signal), input.headBranch, input.markers);
+  }
+
+  async findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {
+    signal = this.#bounded(signal);
+    this.#validate(input);
+    const pulls = await this.#branchPulls(input.headBranch, signal);
+    const own = this.#owned(pulls, input.headBranch, input.markers);
+    if (own.length > 1) throw new Error(`More than one of the task's pull requests is open from ${input.headBranch} (${own.map(pr => `#${pr.number} into ${pr.base}`).join(', ')}). Close all but one.`);
+    if (own.length === 1 && own[0]!.base !== input.base)
+      throw new Error(`The task's pull request #${own[0]!.number} from ${input.headBranch} now targets ${own[0]!.base}, not ${input.base}. Retarget it to ${input.base} or close it.`);
+    const here = pulls.filter(pr => (pr as { base?: { ref?: unknown } } | null)?.base?.ref === input.base);
     if (here.length > 1) throw new Error('GitHub returned an invalid pull request list.');
-    if (!here.length) {
-      // A PR into another base is someone else's (a backport from this branch, say) and is left alone, unless it carries
-      // one of the task's markers: then it is the task's own PR, retargeted, and a person has to decide.
-      for (const other of response) {
-        const { number, body } = other as { number?: unknown; body?: unknown };
-        if (typeof body === 'string' && input.markers.includes(markerOf(body)))
-          throw new Error(`The task's pull request #${String(number)} from ${input.headBranch} now targets ${String(baseOf(other))}, not ${input.base}. Retarget it to ${input.base} or close it.`);
-      }
-      return null;
-    }
+    if (!here.length) return null;
     const { body, ...pr } = this.#pull(here[0], input);
     const found = input.markers.filter(marker => markerOf(body) === marker);
     if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
-    return { ...pr, marker: found[0]!, base: input.base };
+    return { ...pr, marker: found[0]! };
   }
 
   async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest> {

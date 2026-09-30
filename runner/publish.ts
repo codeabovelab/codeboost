@@ -254,8 +254,7 @@ export class PullRequestPublisher {
    * of the whole publish (AGENTS.md: a later step's failure must not turn a succeeded irreversible action into one).
    */
   async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
-    draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
-    const base = this.#config.baseBranch;
+    draft: boolean, status: string, branch: string, signal?: AbortSignal, base = this.#config.baseBranch): Promise<PublishOutcome> {
     const opened = { kind: 'opened' as const, number: pr.number, url: pr.url, draft: pr.draft, status };
     // Left ready only for a ready publish whose task is now in review at the pushed head; a draft publish's PR is always
     // a draft, whatever GitHub returned.
@@ -294,7 +293,9 @@ export class PullRequestPublisher {
     // GitHub shows now (draft flag, head) is recorded first, so a change that did land is not forgotten.
     for (const refreshing of this.#store.taskPullRequests(identity).filter(pr => pr.refresh !== null)) {
       if (refreshing.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request update is in flight in another repository.');
-      const observed = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
+      // An observation in any base: recording what GitHub shows is safe wherever the PR is, and a refusal here would keep
+      // the update in flight and stop the draft step below from running.
+      const [observed = null] = await this.#pulls.findOwned({ headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
       signal?.throwIfAborted();
       this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, observed);
     }
@@ -304,16 +305,19 @@ export class PullRequestPublisher {
     if (!lost) return null;
     if (lost.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request was being opened in another repository.');
     const rows = this.#branchRows(prs, lost.headBranch);
-    const pr = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
+    // The task's own PRs in any base: the lost opening's PR is recorded wherever it is now (a person may have moved it).
+    const owned = await this.#pulls.findOwned({ headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
-    if (pr && pr.marker !== marker(lost.openingId)) {
-      // The branch's open PR belongs to another of the task's openings, so this opening's request created nothing
-      // (the branch has at most one open PR). Drop it. If that other opening was abandoned, its PR is adopted here,
-      // not only on the main path, which a task that can no longer publish never reaches.
+    const pr = owned.find(candidate => candidate.marker === marker(lost.openingId));
+    const blocking = pr ? undefined : owned.find(candidate => candidate.base === lost.base);
+    if (blocking) {
+      // Another of the task's openings has the open PR from this branch into the base this opening asked for, so this
+      // opening's request created nothing (GitHub allows one per head and base). Drop it. If that other opening was
+      // abandoned, its PR is adopted here, not only on the main path, which a task that can no longer publish never reaches.
       this.#store.abandonPullRequestOpening(identity, lost.openingId);
-      const owner = rows.find(row => marker(row.openingId) === pr.marker);
+      const owner = rows.find(row => marker(row.openingId) === blocking.marker);
       if (owner?.state === 'abandoned') {
-        this.#store.adoptOpening(identity, owner.openingId, pr,
+        this.#store.adoptOpening(identity, owner.openingId, blocking,
           { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
       }
       return null;
@@ -330,7 +334,7 @@ export class PullRequestPublisher {
     let found: { number: number; url: string; headSha: string; draft: boolean } = pr;
     // Only when this publish is itself a draft publish; a ready publish's main path marks the PR ready anyway.
     if (lost.draft && draft && !pr.draft) {
-      try { found = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
+      try { found = await this.#pulls.markDraft(pr.number, { base: pr.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
         const current = this.#isCurrent(identity, lost, draft);
@@ -343,7 +347,7 @@ export class PullRequestPublisher {
     // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
     const current = this.#isCurrent(identity, lost, draft);
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
-    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);
+    if (current) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal, pr.base);
     return null;
   }
 
@@ -366,45 +370,47 @@ export class PullRequestPublisher {
     const prs = this.#store.taskPullRequests(identity), notes: string[] = [];
     const reason = (error: unknown) => error instanceof Error ? error.message : String(error);
     // One lookup per branch with a PR recorded as ready, or with an abandoned opening whose PR may have appeared since.
-    // A record's base is only where the PR was opened; the lookup finds the task's own PR in any base.
-    const base = this.#config.baseBranch, branches = new Set<string>();
+    // A record's base is only where the PR was opened; the lookup finds the task's own PRs in any base.
+    const branches = new Set<string>();
     for (const pr of prs) {
       if (pr.repository.toLowerCase() === this.#config.repository.toLowerCase() && ((pr.state === 'opened' && !pr.draft) || pr.state === 'abandoned'))
         branches.add(pr.headBranch);
     }
     for (const headBranch of branches) {
       const rows = this.#branchRows(prs, headBranch).filter(pr => pr.state !== 'opening');
-      let live;
-      // In any base: a stopped task's PR is drafted wherever it is (a draft is safe anywhere), even one left in an old base.
-      try { live = await this.#pulls.findOpened({ base, headBranch, markers: rows.map(row => marker(row.openingId)), anyBase: true }, signal); }
+      let owned;
+      // In any base: a stopped task's PRs are drafted wherever they are (a draft is safe anywhere), all of them.
+      try { owned = await this.#pulls.findOwned({ headBranch, markers: rows.map(row => marker(row.openingId)) }, signal); }
       catch (error) {
         if (signal?.aborted) throw error;
-        notes.push(`The open pull request from ${headBranch} could not be looked up, so one of this task's pull requests may still be ready for review; the next publish tries again (${reason(error)}).`);
+        notes.push(`The open pull requests from ${headBranch} could not be looked up, so one of this task's pull requests may still be ready for review; the next publish tries again (${reason(error)}).`);
         continue;
       }
       signal?.throwIfAborted();
-      const row = live && rows.find(candidate => marker(candidate.openingId) === live.marker);
-      // No open PR (closed or merged), or it is not the one recorded for its opening: nothing is ready for review here.
-      if (!live || !row || (row.state === 'opened' && row.number !== live.number)) continue;
-      // Versions read right now, with no await since: recording what GitHub shows is a fact, even after a cancel.
-      const current = () => ({ stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
-      if (row.state === 'abandoned') this.#store.adoptOpening(identity, row.openingId, live, current());
-      let drafted = live;
-      // Re-read after the lookup's await: a task that was approved meanwhile keeps its PR ready.
-      if (!live.draft && !keepsReady()) {
-        try { drafted = { ...await this.#pulls.markDraft(live.number, { base: live.base, headBranch, marker: live.marker }, signal), marker: live.marker, base: live.base }; }
-        catch (error) {
-          if (signal?.aborted) throw error;
-          notes.push(error instanceof DraftsUnsupported
-            ? `Pull request #${live.number} stays ready for review: this repository does not support draft pull requests.`
-            : `Pull request #${live.number} could not be made a draft and may still be ready for review; the next publish tries again (${reason(error)}).`);
-          continue;
+      for (const live of owned) {
+        const row = rows.find(candidate => marker(candidate.openingId) === live.marker);
+        // Not the one recorded for its opening: nothing known is ready for review here.
+        if (!row || (row.state === 'opened' && row.number !== live.number)) continue;
+        // Versions read right now, with no await since: recording what GitHub shows is a fact, even after a cancel.
+        const current = () => ({ stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+        if (row.state === 'abandoned') this.#store.adoptOpening(identity, row.openingId, live, current());
+        let drafted: { number: number; draft: boolean } = live;
+        // Re-read after the lookup's await: a task that was approved meanwhile keeps its PR ready.
+        if (!live.draft && !keepsReady()) {
+          try { drafted = await this.#pulls.markDraft(live.number, { base: live.base, headBranch, marker: live.marker }, signal); }
+          catch (error) {
+            if (signal?.aborted) throw error;
+            notes.push(error instanceof DraftsUnsupported
+              ? `Pull request #${live.number} stays ready for review: this repository does not support draft pull requests.`
+              : `Pull request #${live.number} could not be made a draft and may still be ready for review; the next publish tries again (${reason(error)}).`);
+            continue;
+          }
         }
+        // The record is corrected only where it differs: the draft change just made, or one GitHub already shows.
+        const recorded = row.state === 'abandoned' ? live.draft : row.draft;
+        if (drafted.draft !== recorded) this.#store.recordPullRequestDraft(identity, row.openingId, drafted.number, drafted.draft, current());
+        signal?.throwIfAborted();
       }
-      // The record is corrected only where it differs: the draft change just made, or one GitHub already shows.
-      const recorded = row.state === 'abandoned' ? live.draft : row.draft;
-      if (drafted.draft !== recorded) this.#store.recordPullRequestDraft(identity, row.openingId, drafted.number, drafted.draft, current());
-      signal?.throwIfAborted();
     }
     return notes;
   }
