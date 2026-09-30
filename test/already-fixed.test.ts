@@ -4,14 +4,14 @@ import { CHECK_KILL_GRACE_MS, CHECK_PIPE_GRACE_MS, DEFAULT_CHECK_DEADLINE_MS, Gh
 const sha = (n: number) => n.toString(16).padStart(40, '0');
 const repo = 'Owner/Repo';
 const pr = (number: number, state = 'OPEN', extra: Record<string, unknown> = {}) =>
-  ({ __typename: 'PullRequest', number, state, isDraft: false, repository: { nameWithOwner: repo }, ...extra });
+  ({ __typename: 'PullRequest', number, state, isDraft: false, baseRefName: 'main', repository: { nameWithOwner: repo }, ...extra });
 const cross = (source: unknown, willCloseTarget: unknown = true) => ({ __typename: 'CrossReferencedEvent', willCloseTarget, source });
 const issue = { __typename: 'Issue' };
 const connected = (subject: unknown, source: unknown = issue) => ({ __typename: 'ConnectedEvent', source, subject });
 const disconnected = (subject: unknown, source: unknown = issue) => ({ __typename: 'DisconnectedEvent', source, subject });
 const closed = (closer: unknown) => ({ __typename: 'ClosedEvent', closer });
 
-interface Fake { state?: string; nodes?: unknown[]; totalCount?: number; hasNextPage?: boolean; errors?: unknown; nameWithOwner?: string;
+interface Fake { defaultBranch?: unknown; state?: string; nodes?: unknown[]; totalCount?: number; hasNextPage?: boolean; errors?: unknown; nameWithOwner?: string;
   commits?: { sha: string; message: string }[]; status?: string; totalCommits?: number; totalCommitsLater?: number; baseSha?: string; baseRef?: string; fail?: RegExp }
 function gateway(fake: Fake = {}) {
   const calls: string[][] = [];
@@ -23,7 +23,7 @@ function gateway(fake: Fake = {}) {
     if (fake.fail?.test(joined)) throw new Error('HTTP 502');
     if (args[1] === 'graphql') return JSON.stringify({
       ...(fake.errors !== undefined ? { errors: fake.errors } : {}),
-      data: { repository: { nameWithOwner: fake.nameWithOwner ?? 'owner/repo', issue: { state: fake.state ?? 'OPEN',
+      data: { repository: { nameWithOwner: fake.nameWithOwner ?? 'owner/repo', defaultBranchRef: fake.defaultBranch === undefined ? { name: 'main' } : fake.defaultBranch, issue: { state: fake.state ?? 'OPEN',
         timelineItems: { totalCount: fake.totalCount ?? nodes.length, pageInfo: { hasNextPage: fake.hasNextPage ?? false }, nodes } } } },
     });
     if (joined.includes('/git/ref/heads/')) return JSON.stringify({ ref: `refs/heads/${fake.baseRef ?? 'main'}`, object: { sha: fake.baseSha ?? sha(99) } });
@@ -46,6 +46,8 @@ describe('the timeline query', () => {
     for (const event of ['ConnectedEvent', 'DisconnectedEvent']) expect(query).toContain(`... on ${event} { source { ...Linked } subject { ...Linked } }`);
     expect(query).toContain('fragment Linked on ReferencedSubject');
     expect(query).toContain('... on CrossReferencedEvent { willCloseTarget source {');
+    expect(query).toContain('defaultBranchRef { name }');
+    expect(query).toMatch(/on CrossReferencedEvent \{ willCloseTarget source \{[^}]*baseRefName/);
     // A ProjectV2 closer is read by its type name only: any field on ProjectV2 needs the read:project scope, and GitHub
     // then refuses the whole query.
     expect(query).not.toMatch(/on ProjectV2/);
@@ -71,6 +73,21 @@ describe('the pre-PR already-fixed check', () => {
     // A PR that only mentions the issue, here or in another repository, is not a link.
     expect(await gateway({ nodes: [cross(pr(401), false), cross(pr(402, 'MERGED', { repository: { nameWithOwner: 'someone/else' } }), false)] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
     expect(await gateway({ nodes: [cross(pr(401), 'yes')] }).gh.check(input())).toMatchObject({ outcome: 'unknown' });
+  });
+  it('with a base that is not the default branch, also counts a PR here into that base that references the issue', async () => {
+    const develop = (number: number, over: Record<string, unknown> = {}) => cross(pr(number, 'OPEN', { baseRefName: 'develop', ...over }), false);
+    const onDevelop = input({ baseBranch: 'develop' });
+    // GitHub reports willCloseTarget false for any PR into a non-default branch, even with "Fixes #12".
+    expect(await gateway({ nodes: [develop(401)], baseRef: 'develop' }).gh.check(onDevelop)).toMatchObject({ outcome: 'found', matches: [{ number: 401 }] });
+    expect(await gateway({ nodes: [develop(401, { state: 'MERGED' })], baseRef: 'develop' }).gh.check(onDevelop)).toMatchObject({ outcome: 'found', matches: [{ number: 401, state: 'MERGED' }] });
+    // Not into that base, not in this repository, or the base is the default branch: a mention still is not a link.
+    expect(await gateway({ nodes: [develop(401, { baseRefName: 'main' })], baseRef: 'develop' }).gh.check(onDevelop)).toMatchObject({ outcome: 'clear' });
+    expect(await gateway({ nodes: [develop(401, { repository: { nameWithOwner: 'someone/else' } })], baseRef: 'develop' }).gh.check(onDevelop)).toMatchObject({ outcome: 'clear' });
+    expect(await gateway({ nodes: [develop(401)], baseRef: 'develop', defaultBranch: { name: 'develop' } }).gh.check(onDevelop)).toMatchObject({ outcome: 'clear' });
+    // Fails closed without a readable default branch or PR base.
+    expect(await gateway({ nodes: [], baseRef: 'develop', defaultBranch: null }).gh.check(onDevelop)).toMatchObject({ outcome: 'unknown' });
+    expect(await gateway({ nodes: [], baseRef: 'develop', defaultBranch: { name: '' } }).gh.check(onDevelop)).toMatchObject({ outcome: 'unknown' });
+    expect(await gateway({ nodes: [develop(401, { baseRefName: 7 })], baseRef: 'develop' }).gh.check(onDevelop)).toMatchObject({ outcome: 'unknown' });
     const { gh } = gateway({ nodes: [cross(pr(401)), connected(pr(402, 'MERGED', { isDraft: false })), cross(pr(403, 'CLOSED')), cross(pr(401))] });
     expect(await gh.check(input())).toMatchObject({ outcome: 'found', matches: [
       { kind: 'pull request', repository: repo, number: 401, state: 'OPEN' }, { kind: 'pull request', number: 402, state: 'MERGED' }] });

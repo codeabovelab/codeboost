@@ -50,6 +50,7 @@ const PAGE = 100;
 const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
   repository(owner: $owner, name: $name) {
     nameWithOwner
+    defaultBranchRef { name }
     issue(number: $number) {
       state
       timelineItems(first: ${MAX_TIMELINE_ITEMS}, itemTypes: [CLOSED_EVENT, CROSS_REFERENCED_EVENT, CONNECTED_EVENT, DISCONNECTED_EVENT]) {
@@ -58,7 +59,7 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
         nodes {
           __typename
           ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } } }
-          ... on CrossReferencedEvent { willCloseTarget source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
+          ... on CrossReferencedEvent { willCloseTarget source { __typename ... on PullRequest { number state isDraft baseRefName repository { nameWithOwner } } } }
           ... on ConnectedEvent { source { ...Linked } subject { ...Linked } }
           ... on DisconnectedEvent { source { ...Linked } subject { ...Linked } }
         }
@@ -153,6 +154,12 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     const repository = object(object(response.data, 'response').repository, 'repository');
     const self = repositoryName(repository).toLowerCase();
     if (self !== this.repository.toLowerCase()) throw new Unknown('GitHub returned a different repository.');
+    const defaultBranch = object(repository.defaultBranchRef, 'default branch').name;
+    if (typeof defaultBranch !== 'string' || !defaultBranch) throw new Unknown('GitHub returned an invalid default branch.');
+    // GitHub closes issues only from PRs into the default branch, so willCloseTarget is false for every PR into another
+    // branch. With such a base, a PR in this repository into that same base that references the issue counts too (a user
+    // decision): it is most likely the same fix, and a mention elsewhere still is not.
+    const intoOtherBase = defaultBranch !== input.baseBranch;
     const issue = object(repository.issue, 'issue');
     if (issue.state !== 'OPEN' && issue.state !== 'CLOSED') throw new Unknown('GitHub returned an invalid issue state.');
     const timeline = object(issue.timelineItems, 'timeline');
@@ -186,11 +193,8 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       if (node.__typename !== 'CrossReferencedEvent' && !manual) throw new Unknown('GitHub returned an unexpected timeline event.');
       // A cross-reference links the issue only when it would close it (a closing keyword). A PR that merely mentions the
       // issue, often in an unrelated repository, is not a fix (a user decision; about a third of busy repositories'
-      // open issues have such mentions).
-      if (!manual) {
-        if (typeof node.willCloseTarget !== 'boolean') throw new Unknown('GitHub returned an invalid cross-reference.');
-        if (!node.willCloseTarget) continue;
-      }
+      // open issues have such mentions). The exception for a non-default base is applied below, once the PR is read.
+      if (!manual && typeof node.willCloseTarget !== 'boolean') throw new Unknown('GitHub returned an invalid cross-reference.');
       // A manual link has two sides, the issue and what it is linked to, and which side GitHub reports as the subject
       // depends on where the link was made. So both are read: the linked PR is the side that is a PR.
       const sides = (manual ? [node.source, node.subject] : [node.source]).map(side => object(side, 'linked item'));
@@ -201,6 +205,10 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       const source = pulls[0]!;
       const repo = repositoryName(source.repository), number = positive(source.number, 'pull request number');
       if (!['OPEN', 'CLOSED', 'MERGED'].includes(source.state as string) || typeof source.isDraft !== 'boolean') throw new Unknown('GitHub returned an invalid pull request state.');
+      if (!manual && !node.willCloseTarget) {
+        if (typeof source.baseRefName !== 'string') throw new Unknown('GitHub returned an invalid pull request base.');
+        if (!(intoOtherBase && repo.toLowerCase() === self && source.baseRefName === input.baseBranch)) continue;
+      }
       // The task's own open PR is not a match; its own merged PR is: the fix is already in.
       if (isOwn(repo, number) && source.state !== 'MERGED') continue;
       const key = `${repo.toLowerCase()}#${number}`;
