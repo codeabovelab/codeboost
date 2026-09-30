@@ -366,8 +366,7 @@ export class PullRequestPublisher {
     const prs = this.#store.taskPullRequests(identity), notes: string[] = [];
     const reason = (error: unknown) => error instanceof Error ? error.message : String(error);
     // One lookup per branch with a PR recorded as ready, or with an abandoned opening whose PR may have appeared since.
-    // Looked up into the configured base, like every lookup: a record's base is where it was opened, and the gateway
-    // refuses the task's own PR found in another base, so a PR moved by a person or a base change is reported, not missed.
+    // A record's base is only where the PR was opened; the lookup finds the task's own PR in any base.
     const base = this.#config.baseBranch, branches = new Set<string>();
     for (const pr of prs) {
       if (pr.repository.toLowerCase() === this.#config.repository.toLowerCase() && ((pr.state === 'opened' && !pr.draft) || pr.state === 'abandoned'))
@@ -376,7 +375,8 @@ export class PullRequestPublisher {
     for (const headBranch of branches) {
       const rows = this.#branchRows(prs, headBranch).filter(pr => pr.state !== 'opening');
       let live;
-      try { live = await this.#pulls.findOpened({ base, headBranch, markers: rows.map(row => marker(row.openingId)) }, signal); }
+      // In any base: a stopped task's PR is drafted wherever it is (a draft is safe anywhere), even one left in an old base.
+      try { live = await this.#pulls.findOpened({ base, headBranch, markers: rows.map(row => marker(row.openingId)), anyBase: true }, signal); }
       catch (error) {
         if (signal?.aborted) throw error;
         notes.push(`The open pull request from ${headBranch} could not be looked up, so one of this task's pull requests may still be ready for review; the next publish tries again (${reason(error)}).`);
@@ -392,7 +392,7 @@ export class PullRequestPublisher {
       let drafted = live;
       // Re-read after the lookup's await: a task that was approved meanwhile keeps its PR ready.
       if (!live.draft && !keepsReady()) {
-        try { drafted = { ...await this.#pulls.markDraft(live.number, { base, headBranch, marker: live.marker }, signal), marker: live.marker }; }
+        try { drafted = { ...await this.#pulls.markDraft(live.number, { base: live.base, headBranch, marker: live.marker }, signal), marker: live.marker, base: live.base }; }
         catch (error) {
           if (signal?.aborted) throw error;
           notes.push(error instanceof DraftsUnsupported

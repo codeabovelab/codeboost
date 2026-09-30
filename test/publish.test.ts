@@ -66,10 +66,14 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async findOpened(input) {
       log.push(`find ${input.markers.join(' ')}`); options.onFind?.();
-      if (options.found !== undefined) return options.found && { ...options.found, marker: input.markers.at(-1)! };
+      if (options.found !== undefined) return options.found && { ...options.found, marker: input.markers.at(-1)!, base: input.base };
       // Like the adapter: the branch's open PR into this base, matched by marker; a PR into another base is ignored unless
       // it is the task's own (retargeted), which is refused.
       const visible = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m));
+      if (input.anyBase) {
+        const own = visible.find(([m]) => input.markers.includes(m));
+        return own ? { ...own[1], marker: own[0], base: bases.get(own[0]) ?? input.base } : null;
+      }
       const open = visible.find(([m]) => (bases.get(m) ?? input.base) === input.base);
       if (!open) {
         const moved = visible.find(([m]) => input.markers.includes(m));
@@ -77,7 +81,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
         return null;
       }
       if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
-      return { ...open[1], marker: open[0] };
+      return { ...open[1], marker: open[0], base: input.base };
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
@@ -1333,6 +1337,14 @@ describe('GitHub PR adapter', () => {
     expect(await lookup([elsewhere({ number: 8, body: 'backport' })])).toBeNull();
     expect(await lookup([elsewhere({ number: 8, body: 'backport' }), response()])).toMatchObject({ number: 7, marker });
   });
+  it('finds the task\'s own PR in any base for a draft change, and ignores anyone else\'s', async () => {
+    const elsewhere = (over: Record<string, unknown> = {}) => ({ ...response(over), base: { ...response().base, ref: 'release' } });
+    const lookup = (list: unknown[]) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(list)).findOpened({ ...input, markers: [marker], anyBase: true });
+    expect(await lookup([elsewhere()])).toMatchObject({ number: 7, marker, base: 'release' });
+    expect(await lookup([response()])).toMatchObject({ number: 7, marker, base: 'main' });
+    expect(await lookup([elsewhere({ number: 8, body: 'backport' }), response({ number: 9, body: 'someone else' })])).toBeNull();
+    await expect(lookup([elsewhere(), response()])).rejects.toThrow(/More than one of the task's pull requests/);
+  });
   it('matches refusals against gh\'s stderr only, not the response body echoed on stdout', async () => {
     const echoed = new CommandFailed('gh failed (exit 1): gh: Server Error (HTTP 502)', 'gh: Server Error (HTTP 502)', '{"body":"Draft pull requests are not supported (HTTP 422)"}');
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw echoed; });
@@ -1681,6 +1693,35 @@ describe('shutdown and PRs left ready', () => {
     await again.publisher.publish(identity);
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }]);
     expect(again.log.some(line => line.startsWith('open'))).toBe(false);
+  });
+  it('drafts a stopped task\'s PR left in its old base after a base change, without a retarget', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next, config: { baseBranch: 'develop' } }).publisher.publish(identity);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled\.$/);
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
+  it('turns a lost draft opening back into a draft in the configured base after a base change and a retarget', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await expect(harness(store, { live, next, openTimesOut: true, config: { baseBranch: 'develop' } }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    const bases = baseOf.get(live)!;
+    for (const [m, pr] of live) { live.set(m, { ...pr, draft: false }); bases.set(m, 'main'); }
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity, { problems: ['x'] })).toMatchObject({ kind: 'opened', number: 100, draft: true });
+    expect(again.log).toContain('draft 100');
+  });
+  it('drafts a recovered ready PR whose head differs in the configured base after a base change and a retarget', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true, config: { baseBranch: 'develop' } }).publisher.publish(identity)).rejects.toThrow('timeout');
+    const bases = baseOf.get(live)!;
+    for (const [m, pr] of live) { live.set(m, { ...pr, headSha: oid(77) }); bases.set(m, 'main'); }
+    const again = harness(store, { live, next });
+    const outcome = await again.publisher.publish(identity);
+    expect(outcome).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'running' });
+    expect(outcome).not.toHaveProperty('leftReady');
   });
   it('drafts a stopped task\'s PR in the configured base after a base change and a retarget', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
