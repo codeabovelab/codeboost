@@ -9,6 +9,7 @@ For features with background jobs, polling, retries, cancellation, or shutdown:
 - Define the lifecycle states and ownership before implementation: pending, running, completed, failed, cancelled, stale, and closing.
 - Treat persisted state, in-memory jobs, subprocesses, HTTP requests, and rendered UI as separate state holders. Define how each transitions and settles.
 - Never apply a background response without proving it is still current. Use a generation, attempt ID, version, or guarded merge so older polling responses cannot overwrite newer actions.
+- When the local state has more than one version counter (for example a task's state version and its plan's review version), an in-flight action owns all of them, and applying its response requires every one to be unchanged. One counter does not cover writes that advance only another.
 - A current response may still move a record only along a transition allowed from the state the action was guarded for. Derive the new status from that state as well as the response; a response alone must never move a record out of a state that waits for a person.
 - Do not release a concurrency slot when cancellation is requested. Keep the job tracked until its underlying invocation or subprocess has terminated.
 - Do not let a retry replace a locally active job, even when its persisted lease has expired or wall-clock time changes.

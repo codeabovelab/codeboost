@@ -128,7 +128,7 @@ export class PullRequestPublisher {
       catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
     }
     signal?.throwIfAborted();
-    const check = this.#store.recordAlreadyFixed(identity, stateVersion, { snapshotId: snapshot.id, draft, result });
+    const check = this.#store.recordAlreadyFixed(identity, stateVersion, { snapshotId: snapshot.id, reviewVersion, draft, result });
     if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft, check.stateVersion);
     const ready = leftReady === undefined ? {} : { leftReady };
     if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result, ...ready } : { kind: 'possibly already fixed', result, ...ready };
@@ -177,9 +177,9 @@ export class PullRequestPublisher {
     return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
   }
 
-  /** Whether a lost opening is the current publish's own: the task has not changed since it began, and the mode matches. */
+  /** Whether a lost opening is the current publish's own: neither the task nor its review changed since it began, and the mode matches. */
   #isCurrent(identity: PlanIdentity, lost: TaskPullRequest, draft: boolean): boolean {
-    return this.#store.getTask(identity).stateVersion === lost.ownerVersion && lost.draft === draft;
+    return this.#store.getTask(identity).stateVersion === lost.ownerVersion && this.#store.reviewVersion(identity) === lost.ownerReviewVersion && lost.draft === draft;
   }
 
   /** The task's PR records for one branch into one base, in the configured repository. */

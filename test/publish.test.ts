@@ -37,7 +37,7 @@ function runningTask(options: { head?: string } = {}) {
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ? [...options.results] : [];
@@ -72,12 +72,14 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
+      options.onDraft?.();
       if (options.draftsUnsupported) throw new DraftsUnsupported('no drafts');
       if (options.draftFails) throw new Error('timeout marking the PR a draft');
       const pr = { ...live.get(input.marker)!, draft: true }; live.set(input.marker, pr); return pr;
     },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
+      options.onRefresh?.();
       if (options.refreshFails) throw new Error('timeout reading the PR back');
       if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
       const pr = { ...live.get(input.marker)!, draft: options.draftAfterRefresh ?? input.draft, headSha: store.getSnapshot(identity).head };
@@ -253,6 +255,42 @@ describe('schema v7', () => {
   });
 });
 
+describe('review changes during GitHub calls', () => {
+  const note = (store: Store) => store.addReviewNote(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'P1', 'question', 'Why this file?');
+  it('refuses to record a matching check when the review changed during the draft change', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    rerun(store);
+    const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+    await expect(harness(store, { live, next, results: [found], onDraft: () => note(store) }).publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('records a PR opened while the review changed, but does not move the task to in review', async () => {
+    const store = runningTask();
+    const { publisher } = harness(store, { open: async input => { note(store); return { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(2), draft: input.draft }; } });
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 5, status: 'running' });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5 }]);
+  });
+  it('records a refresh that landed while the review changed, but does not move the task to in review', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    expect(await harness(store, { live, next, onRefresh: () => note(store) }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'running' });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(3) }]);
+  });
+  it('does not end a publish with a recovered opening whose review has changed since', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    note(store);
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
+    // The recovered opening was recorded, then publishing continued: a new check and a refresh under current review state.
+    expect(again.log).toContain('check');
+    expect(again.log.at(-1)).toBe('refresh 100 ready');
+  });
+});
+
 describe('PR records', () => {
   it('keeps the record of a PR that opened after the task was cancelled, without reopening the task', async () => {
     const store = runningTask();
@@ -265,7 +303,7 @@ describe('PR records', () => {
   });
   it('refreshes only an opened PR: an abandoned opening must be adopted first', async () => {
     const store = runningTask();
-    const clear = () => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
+    const clear = () => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
     const opening = store.beginPullRequest(identity, { checkId: clear().id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
     store.abandonPullRequestOpening(identity, opening.openingId);
     expect(() => store.beginRefresh(identity, { checkId: clear().id, openingId: opening.openingId, headSha: oid(2), draft: false })).toThrow(/Unknown pull request/);
@@ -273,10 +311,10 @@ describe('PR records', () => {
   });
   it('binds an opening to the checked head, with no task change since the check', async () => {
     const store = runningTask();
-    const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
+    const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
     const pr = { checkId: check.id, repository: 'owner/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false };
     expect(() => store.beginPullRequest(identity, { ...pr, headSha: oid(3) })).toThrow(/head changed/);
-    expect(() => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: 'old', draft: false, result: { outcome: 'clear', baseHead: oid(9) } })).toThrow(/head changed/);
+    expect(() => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: 'old', reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(9) } })).toThrow(/head changed/);
     store.beginPullRequest(identity, pr);
     expect(() => store.beginPullRequest(identity, pr)).toThrow(GuardRefusal);
   });

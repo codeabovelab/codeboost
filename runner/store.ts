@@ -30,6 +30,8 @@ export interface TaskPullRequest {
   state: 'opening' | 'opened' | 'abandoned'; number: number | null; url: string | null; createdAt: string;
   /** The task state version this opening owns; only a response for that exact version may change the task status. */
   ownerVersion: number;
+  /** The plan's review version this opening owns: review input (approvals, choices, notes) since then makes it stale. */
+  ownerReviewVersion: number;
   /** An update of this open PR that started and has not been confirmed; the PR may already show it. */
   refresh: { head: string; draft: boolean; stateVersion: number } | null;
 }
@@ -913,9 +915,9 @@ export class Store {
         state_version INTEGER NOT NULL, review_version INTEGER NOT NULL, checked_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS task_pull_requests (
         opening_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), repository TEXT NOT NULL, base TEXT NOT NULL,
-        head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL, owner_version INTEGER NOT NULL,
+        head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL, owner_version INTEGER NOT NULL, owner_review_version INTEGER NOT NULL,
         state TEXT NOT NULL CHECK (state IN ('opening','opened','abandoned')), number INTEGER, url TEXT,
-        refresh_head TEXT, refresh_draft INTEGER, refresh_version INTEGER,
+        refresh_head TEXT, refresh_draft INTEGER, refresh_version INTEGER, refresh_review_version INTEGER,
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
         CHECK ((state = 'opened') = (number IS NOT NULL AND url IS NOT NULL)));
       CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_number ON task_pull_requests (lower(repository), number) WHERE number IS NOT NULL;
@@ -927,7 +929,7 @@ export class Store {
       openingId: row.opening_id as string, repository: row.repository as string, base: row.base as string, headBranch: row.head_branch as string,
       headSha: row.head_sha as string, draft: row.draft === 1, state: row.state as TaskPullRequest['state'],
       number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
-      ownerVersion: row.owner_version as number,
+      ownerVersion: row.owner_version as number, ownerReviewVersion: row.owner_review_version as number,
       refresh: row.refresh_head === null ? null : { head: row.refresh_head as string, draft: row.refresh_draft === 1, stateVersion: row.refresh_version as number },
     };
   }
@@ -952,7 +954,7 @@ export class Store {
    * Records a pre-PR check. A match, or a check that could not be completed, moves a running task to possibly already
    * fixed in the same transaction. A needs-human task keeps its status; its draft PR is not opened.
    */
-  recordAlreadyFixed(identity: PlanIdentity, expectedStateVersion: number, input: { snapshotId: string; draft: boolean; result: AlreadyFixedResult }): AlreadyFixedCheck {
+  recordAlreadyFixed(identity: PlanIdentity, expectedStateVersion: number, input: { snapshotId: string; reviewVersion: number; draft: boolean; result: AlreadyFixedResult }): AlreadyFixedCheck {
     if (!['clear', 'found', 'unknown'].includes(input.result?.outcome)) throw new Error('Invalid already-fixed result.');
     const key = identityKey(identity);
     return this.#transaction(() => {
@@ -962,8 +964,10 @@ export class Store {
       if (input.result.outcome !== 'clear' && !input.draft) this.#run("UPDATE tasks SET status='possibly already fixed' WHERE plan_key=?", key);
       this.#touch(key);
       const id = randomUUID(), checkedAt = new Date().toISOString(), stateVersion = this.#task(key).state_version as number;
-      // Review input (approvals, choices, notes) advances review_version without touching the task; bind the check to both.
+      // Review input (approvals, choices, notes) advances review_version without touching the task; bind the check to both,
+      // and refuse a result the publish obtained before a review change (it would move the task on stale review state).
       const reviewVersion = this.#current(key).review_version as number;
+      if (reviewVersion !== input.reviewVersion) throw new GuardRefusal('The review changed during the check. Reload before writing.');
       this.#run('INSERT INTO already_fixed_checks (id,plan_key,snapshot_id,outcome,result,state_version,review_version,checked_at) VALUES (?,?,?,?,?,?,?,?)',
         id, key, input.snapshotId, input.result.outcome, encode(input.result), stateVersion, reviewVersion, checkedAt);
       return { id, snapshotId: input.snapshotId, result: input.result, stateVersion, reviewVersion, checkedAt };
@@ -980,9 +984,9 @@ export class Store {
       if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opening'", key)) throw new GuardRefusal('A pull request is already being opened; recover it first.');
       const openingId = randomUUID(), now = new Date().toISOString();
       this.#touch(key);
-      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,state,number,url,created_at,updated_at)
-        VALUES (?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
-        this.#task(key).state_version as number, now, now);
+      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,owner_review_version,state,number,url,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
+        this.#task(key).state_version as number, this.#current(key).review_version as number, now, now);
       return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
     });
   }
@@ -1000,8 +1004,8 @@ export class Store {
       if (row?.state !== 'opened') throw new GuardRefusal('Unknown pull request.');
       this.#touch(key);
       const version = this.#task(key).state_version as number;
-      this.#run('UPDATE task_pull_requests SET refresh_head=?, refresh_draft=?, refresh_version=?, updated_at=? WHERE opening_id=?',
-        input.headSha, input.draft ? 1 : 0, version, new Date().toISOString(), input.openingId);
+      this.#run('UPDATE task_pull_requests SET refresh_head=?, refresh_draft=?, refresh_version=?, refresh_review_version=?, updated_at=? WHERE opening_id=?',
+        input.headSha, input.draft ? 1 : 0, version, this.#current(key).review_version as number, new Date().toISOString(), input.openingId);
       return version;
     });
   }
@@ -1009,7 +1013,7 @@ export class Store {
   abandonRefresh(identity: PlanIdentity, openingId: string): void {
     const key = identityKey(identity);
     this.#transaction(() => {
-      if (this.#run("UPDATE task_pull_requests SET refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, updated_at=? WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL",
+      if (this.#run("UPDATE task_pull_requests SET refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL",
         new Date().toISOString(), key, openingId).changes !== 1) throw new GuardRefusal('No update of this pull request is in flight.');
       this.#touch(key);
     });
@@ -1030,7 +1034,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#confirmPullRequest(key, pr, () =>
       this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opening'", key, openingId),
-      row => ({ head: row.head_sha as string, owned: row.owner_version as number }), openingId, 'No pull request is being opened with this ID.');
+      row => ({ head: row.head_sha as string, owned: row.owner_version as number, ownedReview: row.owner_review_version as number }), openingId, 'No pull request is being opened with this ID.');
   }
   /** A refresh of the task's open PR landed, for the head and state version beginRefresh recorded. Same status rule. */
   recordRefreshConfirmed(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean },
@@ -1039,22 +1043,23 @@ export class Store {
     return this.#confirmPullRequest(key, pr, () =>
       this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened' AND number=? AND refresh_head=? AND refresh_version=?",
         key, openingId, pr.number, refresh.head, refresh.stateVersion),
-      () => ({ head: refresh.head, owned: refresh.stateVersion }), openingId, 'No update of this pull request is in flight.');
+      row => ({ head: refresh.head, owned: refresh.stateVersion, ownedReview: row.refresh_review_version as number }), openingId, 'No update of this pull request is in flight.');
   }
   #confirmPullRequest(key: string, pr: { number: number; url: string; headSha: string; draft: boolean }, find: () => Record<string, SQLOutputValue> | undefined,
-    expected: (row: Record<string, SQLOutputValue>) => { head: string; owned: number }, openingId: string, missing: string): TaskStatus {
+    expected: (row: Record<string, SQLOutputValue>) => { head: string; owned: number; ownedReview: number }, openingId: string, missing: string): TaskStatus {
     if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
     return this.#transaction(() => {
       const row = find();
       if (!row) throw new GuardRefusal(missing);
-      const { head, owned } = expected(row);
-      this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, updated_at=? WHERE opening_id=?",
+      const { head, owned, ownedReview } = expected(row);
+      this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE opening_id=?",
         pr.number, pr.url, pr.draft ? 1 : 0, head, new Date().toISOString(), openingId);
       const task = this.#task(key);
       // Every status change and every admission increases the state version, so an unchanged version means the task is
-      // still in the status the opening or refresh was guarded for with no attempt active. A needs-human task stays
-      // there whatever the PR looks like; only a running task can move to in review.
-      if (task.state_version === owned && task.status === 'running') {
+      // still in the status the opening or refresh was guarded for with no attempt active. Review input advances only the
+      // review version, so that must be unchanged too. A needs-human task stays there whatever the PR looks like; only a
+      // running task can move to in review.
+      if (task.state_version === owned && this.#current(key).review_version === ownedReview && task.status === 'running') {
         this.#run('UPDATE tasks SET status=? WHERE plan_key=?', pr.headSha === head && !pr.draft ? 'in review' : 'needs human', key);
       }
       this.#touch(key);
