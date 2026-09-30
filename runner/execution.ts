@@ -5,7 +5,7 @@ import { prepareExecution } from '../core/execution-prompt.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import { FinishFailure, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
-import { GuardRefusal, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { GuardRefusal, ShuttingDownError, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
 
 /**
  * F2b: per-item execution and the runner's commit step (design, "How codeboost runs a plan"; plan-format.md, "After
@@ -15,7 +15,10 @@ export interface WorkspaceRef { readonly clone: TaskClone; readonly storage: unk
 export interface TaskWorkspace {
   /** A fresh task filesystem from the recorded trusted head; never a reset of a used one. Abortable; settles only when its work stopped. */
   materialize(attempt: AttemptRecord, head: string, signal: AbortSignal): Promise<WorkspaceRef>;
-  /** No-follow snapshot of every declared symlink target, taken before launch. */
+  /**
+   * No-follow snapshot, taken before launch, of every declared path that is a symlink in this workspace. F passes every
+   * path the item declares: an earlier item may have renamed or added links, so only D sees the actual entries.
+   */
   snapshotDeclaredLinks(workspace: WorkspaceRef, paths: readonly string[], signal: AbortSignal): Promise<unknown>;
   /** The change manifest after the agent settled, plus a digest the commit step must match. */
   inspectChanges(workspace: WorkspaceRef, input: { baseHead: string; linkSnapshot: unknown }, signal: AbortSignal): Promise<ChangeManifest & { digest: string }>;
@@ -67,12 +70,12 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
         issue: sources.issue(identity), approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
       const vendor = sources.vendor(identity);
-      const declaredLinks = item.files.map(file => file.path).filter(path => context.baseEntries.some(entry => entry.kind === 'symlink' && context.pathKey(entry.path) === context.pathKey(path)));
+      const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
       // From here task storage exists: a failure hands it to the coordinator, which removes it after the terminal write.
       const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined };
       const prepared = { clone: ws.clone, vendor, approvedArgv: request.approvedArgv, private: data };
-      try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredLinks, signal); }
+      try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredPaths, signal); }
       catch (error) { throw new PreparationFailure(error, prepared); }
       return prepared;
     },
@@ -95,9 +98,14 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         // Contract (Publishing step 2): an inspection that refuses sends the task to needs human.
         return violation(`The change inspection refused: ${error instanceof Error ? error.message : String(error)}`);
       }
-      const outcome = auditRun(item, manifest, sources.planContext(identity).pathKey);
+      let outcome: ReturnType<typeof auditRun>;
+      try { outcome = auditRun(item, manifest, sources.planContext(identity).pathKey); }
+      catch (error) { return violation(`The change report could not be audited: ${error instanceof Error ? error.message : String(error)}`); }
       if (outcome.kind === 'violation') return violation(outcome.violations.join(' '));
       if (outcome.unchanged) return { value: { head: data.baseHead, unchanged: true, inScope: [], outOfScope: [] } satisfies ExecutionResult };
+      // Last check before the commit, after the last await: a stop, shutdown or context change makes nothing.
+      if (signal.aborted) throw signal.reason;
+      if (!sameContext(attempt.context, store.currentContext(identity))) throw new FinishFailure('The plan, snapshot or assignment changed during the audit; nothing was committed.');
       // Every change is in or out of scope here; a rename stages both its old and its new path.
       const paths = [...new Set(manifest.changes.flatMap(entry => [entry.path, ...(entry.oldPath ? [entry.oldPath] : [])]))];
       const head = await workspace.commit(data.workspace, {
@@ -189,16 +197,20 @@ export class ItemExecutor {
       done.push(item.id);
       if (result.unchanged) unchanged.push(item.id);
       if (result.outOfScope.length) {
-        // The checkpoint names the revision the item ran against; the snapshot is the one its own commit created.
-        const view = { revision: row.context.planRevision, snapshotId: this.#store.getSnapshot(identity).id };
+        // The checkpoint names the revision the item ran against and the snapshot its own commit created, so a revision
+        // or HEAD observation saved since cannot erase the finding: the task pauses either way.
+        const snapshotId = this.#store.snapshotWithHead(identity, result.head);
+        if (!snapshotId) throw new Error(`The snapshot of ${item.id}'s commit is missing.`);
+        const ranAt = { revision: row.context.planRevision, snapshotId };
         let checkpointId: string;
         try {
-          checkpointId = this.#write(() => this.#store.pauseForAmendment(identity, view, {
+          checkpointId = this.#write(() => this.#store.pauseForAmendment(identity, ranAt, {
             item: item.id, baseEntries: this.#sources.planContext(identity).baseEntries,
             completedItems: plan.items.slice(0, plan.items.indexOf(item) + 1).map(entry => entry.id), outOfScopePaths: result.outOfScope,
           })).id;
         } catch (error) {
-          if (!refusal(error) && !(error instanceof Error && /review state|executed plan prefix/i.test(error.message))) throw error;
+          // Only a refused status change (a closed task) ends here; anything else is a bug and is thrown.
+          if (!refusal(error)) throw error;
           return stopped(item.id, row.state, `${item.id} changed files outside its plan item, but the task could not pause for amendment: ${error instanceof Error ? error.message : String(error)}`);
         }
         return { kind: 'needs amendment', item: item.id, outOfScope: result.outOfScope, checkpointId, completed: [...done] };

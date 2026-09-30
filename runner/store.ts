@@ -504,16 +504,29 @@ export class Store {
     });
   }
   /**
-   * F2's scope pause: the checkpoint and the move to needs amendment commit together, so a refused status change
-   * (a closed task, an active attempt or merge) records no checkpoint either.
+   * F2's scope pause. `ranAt` is where the item actually ran: its plan revision and the snapshot its own commit
+   * created, not whatever is current, so a revision or HEAD observation saved since cannot erase the scope finding
+   * (plan-format.md, "After each run"). The checkpoint and the move to needs amendment commit together, so a refused
+   * status change (a closed task, an active attempt or merge) records no checkpoint either.
    */
-  pauseForAmendment(identity: PlanIdentity, expected: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>): Checkpoint {
+  pauseForAmendment(identity: PlanIdentity, ranAt: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>): Checkpoint {
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const checkpoint = this.recordCheckpoint(identity, expected, evidence);
+      if (!this.#get('SELECT 1 FROM snapshots WHERE key=? AND id=?', key, ranAt.snapshotId)) throw new Error('Unknown snapshot.');
+      const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
+      if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
+        throw new Error('Checkpoint must describe the executed plan prefix.');
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
+      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
+      this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
       return checkpoint;
     });
+  }
+  /** The latest snapshot of this plan whose head is `head` (the one a runner commit created), or null. */
+  snapshotWithHead(identity: PlanIdentity, head: string): string | null {
+    for (const row of this.#db.prepare('SELECT id, data FROM snapshots WHERE key=? ORDER BY rowid DESC').all(identityKey(identity)))
+      if (decode<Snapshot>(row.data).head === head) return row.id as string;
+    return null;
   }
   getCheckpoint(identity: PlanIdentity, id: string): Checkpoint {
     const row = this.#get('SELECT data FROM checkpoints WHERE key=? AND id=?', identityKey(identity), id);

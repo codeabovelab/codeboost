@@ -28,7 +28,8 @@ describe('post-run audit', () => {
   });
   it('treats any agent commit as a safety violation, even with no file changes (#66: never undone)', () => {
     expect(auditRun(item, manifest([], { agentCommits: ['abc'] }), exact)).toEqual({ kind: 'violation', violations: ['The agent made its own commits: abc.'] });
-    expect(auditRun(item, manifest([file('src/retry.ts')], { agentCommits: undefined as unknown as string[] }), exact)).toMatchObject({ kind: 'violation' });
+    for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
+      expect(auditRun(item, manifest([file('src/retry.ts')], { [field]: undefined as unknown as string[] }), exact)).toEqual({ kind: 'violation', violations: [`The change report has no ${field} list.`] });
   });
   it('stops on every safety violation before any scope decision', () => {
     const cases: [string, ChangeManifest][] = [

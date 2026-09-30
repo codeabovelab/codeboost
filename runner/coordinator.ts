@@ -320,8 +320,9 @@ export class RunnerCoordinator {
         const foreignSaved = this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false,
           detail: job.firstReason === 'stale' ? job.staleCause : FOREIGN_RESULT });
         job.decided = true;
-        // Task storage waits for the terminal write, as on every other path.
+        // Task storage and host-side preparation files wait for the terminal write, as on every other path.
         if (foreignSaved) await this.#release(job, attempt, prepared);
+        if (foreignSaved && !(await this.#removePreparation(job, attempt))) this.#holdForPreparation(job);
         return;
       }
       let valid = false, value: unknown, history: HistoryRecord | undefined, detail = result.stderr ? bounded(result.stderr) : undefined;

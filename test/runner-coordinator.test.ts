@@ -508,8 +508,8 @@ describe('copilot review', () => {
   it.each([
     ['another attempt', (input: InvocationInput) => ({ attemptId: randomUUID() })],
     ['another context', (input: InvocationInput) => ({ context: { ...input.context, stateVersion: input.context.stateVersion + 1 } })],
-  ] as const)('never validates or saves a result for %s', async (_label, foreign) => {
-    const { store, runner, launches, preparations, deps } = setup();
+  ] as const)('never validates or saves a result for %s, and still removes its preparation files', async (_label, foreign) => {
+    const { store, runner, launches, preparations, deps, cleaned } = setup();
     const validate = vi.spyOn(deps, 'validate');
     const attempt = runner.start(A, request(store, A));
     await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
@@ -519,6 +519,7 @@ describe('copilot review', () => {
     expect(validate).not.toHaveBeenCalled();
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', result: null,
       diagnostic: 'The agent returned a result for a different attempt; it was not saved.' });
+    expect(cleaned()).toBe(1);
     expect(() => runner.start(B, request(store, B))).not.toThrow();
   });
   it('holds the slot when preparation files cannot be removed after D settles', async () => {

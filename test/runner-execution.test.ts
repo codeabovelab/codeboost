@@ -1,5 +1,6 @@
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
+import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it } from 'vitest';
@@ -29,7 +30,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
   inspect?: (item: string) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
-  const store = new Store(join(dir, 'state.sqlite'));
+  const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
   store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
   const log: string[] = [], commits: { item: string; baseHead: string; paths: readonly string[]; trailers: Record<string, string>; digest: string; message: string }[] = [];
@@ -64,7 +65,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   }, sources, RUNNER_OWNER, findings);
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
+  return { store, path, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
 }
 
 describe('item execution', () => {
@@ -78,8 +79,8 @@ describe('item execution', () => {
       { sha: oid(100), owner: 'P1', origin: 'owned', sourceSha: null }, { sha: oid(101), owner: 'P2', origin: 'owned', sourceSha: null }]));
     expect(store.getSnapshot(identity).head).toBe(oid(101));
     expect(log).toEqual([
-      'materialize P1 @002', 'snapshot P1 []', 'start P1', 'inspect P1 @002', 'commit P1 -> 064', 'release P1 after completed',
-      'materialize P2 @064', 'snapshot P2 []', 'start P2', 'inspect P2 @064', 'commit P2 -> 065', 'release P2 after completed']);
+      'materialize P1 @002', 'snapshot P1 [a.ts]', 'start P1', 'inspect P1 @002', 'commit P1 -> 064', 'release P1 after completed',
+      'materialize P2 @064', 'snapshot P2 [b.ts]', 'start P2', 'inspect P2 @064', 'commit P2 -> 065', 'release P2 after completed']);
     expect(prompts[0]).toContain('<plan_item_data>');
     expect(argv[0]).toEqual([['npm', 'test']]);
     expect(owners[0]).toBe(RUNNER_OWNER);
@@ -176,7 +177,7 @@ describe('item execution', () => {
   it('removes task storage after the terminal write when preparation fails after allocating it', async () => {
     const { store, runner, executor, log } = setup({ snapshotError: new Error('declared link goes through a link') });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Preparation failed: declared link goes through a link' });
-    expect(log).toEqual(['materialize P1 @002', 'snapshot P1 []', 'release P1 after failed']);
+    expect(log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after failed']);
     expect(runner.status(identity).unresolved).toBeNull();
     expect(store.getTask(identity).status).toBe('running');
   });
@@ -191,14 +192,20 @@ describe('item execution', () => {
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'] });
     expect(h.commits.map(c => c.item)).toEqual(['P1']);
   });
-  it('does not bind a checkpoint to a revision the item did not run against', async () => {
+  it('still pauses for amendment, bound to where the item ran, when the plan changes after its attempt settled', async () => {
     let store!: Store;
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {
       if (store.getPlan(identity).revision === 1) store.importRevision(JSON.stringify({ ...plan, revision: 2, summary: 'Revised' }), 'json', context, 1);
     } });
     store = h.store;
-    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', completed: ['P1'] });
-    expect(store.getTask(identity).status).toBe('running');
+    const outcome = await h.executor.runTask(identity);
+    expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'], completed: ['P1'] });
+    expect(store.getCheckpoint(identity, (outcome as { checkpointId: string }).checkpointId)).toMatchObject({
+      revision: 1, snapshotId: store.snapshotWithHead(identity, oid(100)) });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    // The finding is not skipped by resuming at the next item.
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started' });
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
   });
   it('returns a stopped outcome, with no checkpoint, when the task closed before it could pause for amendment', async () => {
     let store!: Store;
@@ -209,6 +216,9 @@ describe('item execution', () => {
     const outcome = await h.executor.runTask(identity);
     expect(outcome).toMatchObject({ kind: 'stopped', item: 'P1', completed: ['P1'] });
     expect(store.getTask(identity).status).toBe('cancelled');
+    // The refused pause recorded no checkpoint either (one transaction).
+    const db = new DatabaseSync(h.path);
+    try { expect(db.prepare('SELECT COUNT(*) AS n FROM checkpoints').get()).toEqual({ n: 0 }); } finally { db.close(); }
   });
   it('pauses for amendment through the capability after the shutdown write gate closed', async () => {
     let store!: Store;
@@ -222,5 +232,36 @@ describe('item execution', () => {
     const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })]) } });
     await executor.runTask(identity);
     expect(commits[0]!.paths).toEqual(['a.ts', 'old.ts']);
+  });
+  it('treats an inspection aborted by a stop as that stop, not a finding', async () => {
+    let runner!: RunnerCoordinator, store!: Store;
+    const h = setup({ inspect: async () => {
+      runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled');
+      throw new Error('inspection aborted');
+    } });
+    runner = h.runner; store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(store.getTask(identity).status).toBe('running');
+    expect(h.commits).toEqual([]);
+  });
+  it('makes no commit when a stop lands during an inspection that ignores the abort', async () => {
+    let runner!: RunnerCoordinator, store!: Store;
+    const h = setup({ inspect: async () => { runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled'); } });
+    runner = h.runner; store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(h.commits).toEqual([]);
+  });
+  it('sends a malformed change report to needs human', async () => {
+    const { store, executor, commits } = setup({ manifests: { P1: manifest([change('a.ts')], { linkTargetChanges: undefined as unknown as string[] }) } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(commits).toEqual([]);
+  });
+  it('makes no commit when the context changes during the audit', async () => {
+    let store!: Store;
+    const h = setup({ inspect: async () => { store.setAssignment(identity, store.getTask(identity).stateVersion, 'reassigned', 'hash-2'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'stale' });
+    expect(h.commits).toEqual([]);
   });
 });
