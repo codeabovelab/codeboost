@@ -36,6 +36,21 @@ function gateway(fake: Fake = {}) {
 const input = (over: Partial<AlreadyFixedInput> = {}): AlreadyFixedInput =>
   ({ issue: 12, taskBase: sha(1), baseBranch: 'main', ownPullRequests: [], ownCommits: new Set(), ...over });
 
+describe('the timeline query', () => {
+  // The fake above answers any query, so the query text itself is checked here. Verified against GitHub with a default
+  // `gh auth login` token (scopes gist, read:org, repo, workflow).
+  it('reads both sides of a manual link and asks for no field that needs a scope beyond repo', async () => {
+    const { gh, calls } = gateway();
+    await gh.check(input());
+    const query = calls.find(args => args[1] === 'graphql')!.find(arg => arg.startsWith('query='))!.slice('query='.length);
+    for (const event of ['ConnectedEvent', 'DisconnectedEvent']) expect(query).toContain(`... on ${event} { source { ...Linked } subject { ...Linked } }`);
+    expect(query).toContain('fragment Linked on ReferencedSubject');
+    // A ProjectV2 closer is read by its type name only: any field on ProjectV2 needs the read:project scope, and GitHub
+    // then refuses the whole query.
+    expect(query).not.toMatch(/on ProjectV2/);
+  });
+});
+
 describe('issue mentions in commit messages', () => {
   it('matches this issue by number, GH- form, qualified name or URL, and nothing else', () => {
     for (const message of ['Fix #12', 'fixes #12.', '(#12)', 'Resolve GH-12', 'owner/repo#12', 'See https://github.com/Owner/Repo/issues/12 for context'])

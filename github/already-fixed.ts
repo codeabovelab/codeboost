@@ -57,7 +57,7 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
         pageInfo { hasNextPage }
         nodes {
           __typename
-          ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } ... on ProjectV2 { number } } }
+          ... on ClosedEvent { closer { __typename ... on PullRequest { number repository { nameWithOwner } } ... on Commit { oid } } }
           ... on CrossReferencedEvent { source { __typename ... on PullRequest { number state isDraft repository { nameWithOwner } } } }
           ... on ConnectedEvent { source { ...Linked } subject { ...Linked } }
           ... on DisconnectedEvent { source { ...Linked } subject { ...Linked } }

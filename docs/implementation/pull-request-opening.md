@@ -86,6 +86,8 @@ The adapter refuses any answer for a PR that is not open. A PR closed between th
 
 **Environment.** Each `gh` process gets only an allowlist of variables: the path, home and locale; GitHub tokens, host and configuration directories; the D-Bus session bus that Linux keyring sign-in uses; the Windows system and temporary directories; and proxy and CA settings (`github/gh-env.ts`). Prompts, the pager and update checks are turned off.
 
+**Token scopes.** The check and the PR calls need only the `repo` scope that a default `gh auth login` grants. The timeline query asks for no field that needs more: a Projects closer is read by its type name alone, because any field on `ProjectV2` needs `read:project`, and without that scope GitHub refuses the whole query, which would make every check `unknown`. A test checks the query text for this, and the query was run against GitHub with a default token.
+
 ## The PR description
 
 The description starts with the marker and `Fixes #<issue>`. The plan follows, inside a fenced code block. A draft also lists its open problems inside a fenced code block.
