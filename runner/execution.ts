@@ -5,7 +5,7 @@ import { prepareExecution } from '../core/execution-prompt.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
-import { GuardRefusal, ShuttingDownError, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { CLOSED_STATUSES, GuardRefusal, ShuttingDownError, bounded, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
 
 /**
  * F2b: per-item execution and the runner's commit step (design, "How codeboost runs a plan"; plan-format.md, "After
@@ -86,7 +86,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const data = prepared.private as Private, identity = identityOf(attempt);
       const plan = store.getPlan(identity, attempt.context.planRevision), item = plan.items.find(entry => entry.id === attempt.item)!;
       const violation = (reason: string): never => {
-        const text = `${SAFETY_VIOLATION} ${reason}`;
+        const text = bounded(`${SAFETY_VIOLATION} ${reason}`);
         findings.record(attempt.id, text);
         throw new FinishFailure(text);
       };
@@ -96,11 +96,11 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         // Only the stop's own abort error is the stop. Any other refusal is a finding, even if a stop is also pending.
         if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
         // Contract (Publishing step 2): an inspection that refuses sends the task to needs human.
-        return violation(`The change inspection refused: ${error instanceof Error ? error.message : String(error)}`);
+        return violation(`The change inspection refused: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
       }
       let outcome: ReturnType<typeof auditRun>;
       try { outcome = auditRun(item, manifest, sources.planContext(identity).pathKey); }
-      catch (error) { return violation(`The change report could not be audited: ${error instanceof Error ? error.message : String(error)}`); }
+      catch (error) { return violation(`The change report could not be audited: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
       if (outcome.kind === 'violation') return violation(outcome.violations.join(' '));
       if (outcome.unchanged) return { value: { head: data.baseHead, unchanged: true, inScope: [], outOfScope: [] } satisfies ExecutionResult };
       // Last check before the commit, after the last await: a stop, shutdown or context change makes nothing.
@@ -198,8 +198,9 @@ export class ItemExecutor {
       const violation = this.#findings.take(attempt.id);
       if (violation) {
         const task = this.#store.getTask(identity);
-        // Only the executor's own running task moves; a status someone set since is kept (no await since this read).
-        if (task.status !== 'running') return stopped(item.id, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
+        // A safety violation goes to needs human over any status someone set since (queued, a human gate), because a
+        // run from that status would launch the item again; only a closed task is left as it is (no await since this read).
+        if (CLOSED_STATUSES.includes(task.status)) return stopped(item.id, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
         try { this.#write(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
         catch (error) {
           if (!(error instanceof GuardRefusal)) throw error;

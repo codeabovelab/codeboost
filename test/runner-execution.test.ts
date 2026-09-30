@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import { ItemExecutor, SAFETY_VIOLATION, SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
-import { ShuttingDownError, type ShutdownCapability } from '../runner/lifecycle.ts';
+import { MAX_REASON, ShuttingDownError, type ShutdownCapability } from '../runner/lifecycle.ts';
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -67,7 +67,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   }, sources, RUNNER_OWNER, findings);
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, path, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
+  return { store, path, workspace, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
 }
 
 describe('item execution', () => {
@@ -163,7 +163,7 @@ describe('item execution', () => {
   it('sends the task to needs human when the change inspection refuses', async () => {
     const { store, executor, commits, log } = setup({ inspect: async () => { throw new Error('manifest digest mismatch'); } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
-      reason: `${SAFETY_VIOLATION} The change inspection refused: manifest digest mismatch` });
+      reason: `${SAFETY_VIOLATION} The change inspection refused: "manifest digest mismatch"` });
     expect(commits).toEqual([]);
     expect(store.getTask(identity).status).toBe('needs human');
     expect(log).toContain('release P1 after failed');
@@ -254,7 +254,7 @@ describe('item execution', () => {
     } });
     runner = h.runner; store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
-      reason: `${SAFETY_VIOLATION} The change inspection refused: metadata digest changed` });
+      reason: `${SAFETY_VIOLATION} The change inspection refused: "metadata digest changed"` });
     expect(store.getTask(identity).status).toBe('needs human');
   });
   it('makes no commit when a stop lands during an inspection that ignores the abort', async () => {
@@ -324,7 +324,7 @@ describe('item execution', () => {
     expect(runner.status(identity).unresolved).toBeNull();
     expect(log).toContain('release P1 after failed');
   });
-  it('keeps a status someone set during release instead of pausing or escalating over it', async () => {
+  it('keeps a human gate set during release instead of pausing over it, but still escalates a safety violation', async () => {
     let store!: Store;
     const toApproval = async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); };
     const scoped = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: toApproval });
@@ -333,13 +333,13 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('needs approval');
     const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toApproval });
     store = unsafe.store;
-    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
-    expect(store.getTask(identity).status).toBe('needs approval');
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
   });
   it('treats an audit that throws as a safety violation', async () => {
     const { store, executor, commits } = setup({ pathKeyError: new Error('Non-ASCII case-insensitive paths require an adapter.') });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
-      reason: `${SAFETY_VIOLATION} The change report could not be audited: Non-ASCII case-insensitive paths require an adapter.` });
+      reason: `${SAFETY_VIOLATION} The change report could not be audited: "Non-ASCII case-insensitive paths require an adapter."` });
     expect(store.getTask(identity).status).toBe('needs human');
     expect(commits).toEqual([]);
   });
@@ -408,7 +408,7 @@ describe('item execution', () => {
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
     expect(store.getTask(identity).status).toBe('running');
   });
-  it('keeps a queued status someone set during release: this run neither pauses nor escalates over it', async () => {
+  it('keeps a queued status set during release instead of pausing, but escalates a safety violation so the item is not re-run', async () => {
     let store!: Store;
     const toQueued = async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued'); };
     const scoped = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: toQueued });
@@ -417,13 +417,69 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('queued');
     const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toQueued });
     store = unsafe.store;
-    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/is queued, so it was not moved to needs human/) });
-    expect(store.getTask(identity).status).toBe('queued');
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started' });
+    expect(store.getAttempts(identity)).toHaveLength(1);
   });
   it('keeps task storage when a foreign result\'s terminal write fails', async () => {
     const { runner, executor, log } = setup({ settleError: true, exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'running' });
     expect(log.some(line => line.startsWith('release'))).toBe(false);
     expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
+  });
+  it('leaves a safety violation\'s task alone when it was cancelled during release', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID()); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/is cancelled, so it was not moved/) });
+    expect(store.getTask(identity).status).toBe('cancelled');
+  });
+  it('removes task storage after the terminal write when a stop lands during preparation', async () => {
+    let runner!: RunnerCoordinator, store!: Store;
+    const h = setup();
+    runner = h.runner; store = h.store;
+    const snapshot = h.workspace.snapshotDeclaredLinks.bind(h.workspace);
+    h.workspace.snapshotDeclaredLinks = async (ws, paths, signal) => { runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled'); return snapshot(ws, paths, signal); };
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after cancelled']);
+  });
+  it('removes task storage after the terminal write when the context goes stale before launch', async () => {
+    let store!: Store;
+    const h = setup();
+    store = h.store;
+    const snapshot = h.workspace.snapshotDeclaredLinks.bind(h.workspace);
+    h.workspace.snapshotDeclaredLinks = async (ws, paths, signal) => {
+      store.setAssignment(identity, store.getTask(identity).stateVersion, 'reassigned', 'hash-2'); return snapshot(ws, paths, signal);
+    };
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'stale' });
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after stale']);
+  });
+  it('refuses a scope pause whose executed prefix does not match the plan at the item\'s revision', () => {
+    const { store } = setup();
+    const snapshotId = store.getSnapshot(identity).id;
+    expect(() => store.pauseForAmendment(identity, { revision: 1, snapshotId }, { item: 'P2', baseEntries: [], completedItems: ['P2'], outOfScopePaths: ['x'] }))
+      .toThrow(/executed plan prefix/);
+    expect(() => store.pauseForAmendment(identity, { revision: 1, snapshotId }, { item: 'P1', baseEntries: [], completedItems: ['P1', 'P2'], outOfScopePaths: ['x'] }))
+      .toThrow(/executed plan prefix/);
+  });
+  it('bounds a finding whose text comes from the workspace', async () => {
+    const { executor } = setup({ inspect: async () => { throw new Error('x'.repeat(10_000)); } });
+    const outcome = await executor.runTask(identity) as { kind: string; reason: string };
+    expect(outcome.kind).toBe('needs human');
+    expect(outcome.reason.length).toBeLessThanOrEqual(MAX_REASON);
+  });
+  it('removes task storage after the terminal write when a cancel task lands on the row during preparation', async () => {
+    let store!: Store;
+    const h = setup();
+    store = h.store;
+    const snapshot = h.workspace.snapshotDeclaredLinks.bind(h.workspace);
+    h.workspace.snapshotDeclaredLinks = async (ws, paths, signal) => {
+      store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID()); return snapshot(ws, paths, signal);
+    };
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after cancelled']);
+    expect(store.getTask(identity).status).toBe('cancelled');
   });
 });

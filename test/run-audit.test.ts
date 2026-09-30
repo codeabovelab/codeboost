@@ -18,8 +18,9 @@ describe('post-run audit', () => {
       .toEqual({ kind: 'commit', inScope: ['src/retry.ts', 'docs/New.md'], outOfScope: [], unchanged: false, needsAmendment: false });
     expect(auditRun(item, manifest([file('src/retry.ts'), file('src/extra.ts', { kind: 'add', oldType: undefined })]), exact))
       .toMatchObject({ kind: 'commit', outOfScope: ['src/extra.ts'], needsAmendment: true });
+    // The undeclared source is the finding, not the declared destination.
     expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: 'docs/unlisted.md' })]), exact))
-      .toMatchObject({ kind: 'commit', outOfScope: ['docs/New.md'] });
+      .toMatchObject({ kind: 'commit', inScope: [], outOfScope: ['docs/unlisted.md'] });
   });
   it('reports planned-but-unchanged, and uses the trusted path identity', () => {
     expect(auditRun(item, manifest([]), exact)).toMatchObject({ kind: 'commit', unchanged: true });
@@ -27,7 +28,7 @@ describe('post-run audit', () => {
     expect(auditRun(item, manifest([file('SRC/Retry.ts')]), exact)).toMatchObject({ outOfScope: ['SRC/Retry.ts'] });
   });
   it('treats any agent commit as a safety violation, even with no file changes (#66: never undone)', () => {
-    expect(auditRun(item, manifest([], { agentCommits: ['abc'] }), exact)).toEqual({ kind: 'violation', violations: ['The agent made its own commits: abc.'] });
+    expect(auditRun(item, manifest([], { agentCommits: ['abc'] }), exact)).toEqual({ kind: 'violation', violations: ['The agent made its own commits: "abc".'] });
     for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
       expect(auditRun(item, manifest([file('src/retry.ts')], { [field]: undefined as unknown as string[] }), exact)).toEqual({ kind: 'violation', violations: [`The change report has no ${field} list.`] });
   });
@@ -53,6 +54,20 @@ describe('post-run audit', () => {
       expect(outcome.kind, label).toBe('violation');
       expect((outcome as { violations: string[] }).violations.join(' '), label).toMatch(reason);
     }
+  });
+  it('refuses a report that lists one path twice', () => {
+    expect(auditRun(item, manifest([file('src/retry.ts'), file('src/retry.ts', { kind: 'delete', newType: undefined })]), exact))
+      .toEqual({ kind: 'violation', violations: ['The change report lists "src/retry.ts" more than once.'] });
+    expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: 'docs/old.md' }), file('docs/old.md')]), exact)).toMatchObject({ kind: 'violation' });
+  });
+  it('refuses a declared link retargeted into .git in any case or at any depth', () => {
+    for (const target of ['.GIT/config', '.Git', 'vendor/.git/hooks', 'sub/.GiT'])
+      expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)
+        .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
+  });
+  it('quotes agent-controlled paths in findings and cuts long lists short', () => {
+    const outcome = auditRun(item, manifest([file('src/retry.ts')], { nestedGitlinkContent: ['a', 'b', 'c', 'd', 'e', 'f', 'g"; rm -rf /'] }), exact);
+    expect(outcome).toEqual({ kind: 'violation', violations: ['Content appeared under a gitlink: "a", "b", "c", "d", "e" and 2 more.'] });
   });
   it('refuses a change path of . or .., any non-canonical spelling, and .git in any case at any depth', () => {
     for (const path of ['..', '.', 'a/../..', 'x/../.git/hooks/pre-commit', './.git/config', './a.ts', 'a//b', 'dir/', 'sub/.git/config', '.GIT/config', 'src/.Git'])
