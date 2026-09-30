@@ -150,6 +150,11 @@ export type ExecutionOutcome =
   | { kind: 'needs human'; item: string; reason: string; completed: string[] }
   | { kind: 'stopped'; item: string; state: string; reason: string | null; completed: string[] };
 const refusal = (error: unknown) => error instanceof GuardRefusal || error instanceof ShuttingDownError;
+/**
+ * Statuses that wait for a person; leaving one needs its own user action (runner-lifecycle.md), so a safety finding is
+ * owed there instead. Review statuses are not gates: a finding moves them to needs human, so the task cannot be merged.
+ */
+const HUMAN_GATES: readonly string[] = ['needs amendment', 'needs approval', 'possibly already fixed'];
 
 /**
  * Runs a task's plan items in order, one execute attempt each. Stops at the first item that does not complete cleanly:
@@ -230,9 +235,9 @@ export class ItemExecutor {
     return { kind: 'executed', items: done, unchanged };
   }
   /**
-   * A safety finding sends the task to needs human (plan-format.md, "After each run"). From running or queued it moves
-   * now. A human-gated or review status is kept, because leaving it needs its own user action (runner-lifecycle.md),
-   * and the finding stays owed: the task's next run escalates it before anything else. A closed task needs nothing.
+   * A safety finding sends the task to needs human (plan-format.md, "After each run"). From running, queued or a review
+   * status it moves now. A human gate is kept, because leaving it needs its own user action (runner-lifecycle.md), and
+   * the finding stays owed: the task's next run escalates it before anything else. A closed task needs nothing.
    * The finding is settled only once acted on, so a failed write leaves it owed too.
    */
   #escalate(identity: PlanIdentity, row: AttemptRecord, violation: string,
@@ -242,7 +247,12 @@ export class ItemExecutor {
       this.#findings.settle(row.id);
       return stopped(item, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
     }
-    if (task.status !== 'running' && task.status !== 'queued')
+    // Already where the finding sends it: nothing is owed.
+    if (task.status === 'needs human') {
+      this.#findings.settle(row.id);
+      return { kind: 'needs human', item, reason: violation, completed: [...done] };
+    }
+    if (HUMAN_GATES.includes(task.status))
       return stopped(item, row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
     try { this.#write(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
     catch (error) {

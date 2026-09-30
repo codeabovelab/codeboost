@@ -65,10 +65,24 @@ describe('post-run audit', () => {
       expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)
         .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
   });
-  it('refuses removing or replacing a pre-existing symlink at an undeclared path, and allows it at a declared one', () => {
+  it('refuses removing, replacing or renaming a pre-existing symlink from an undeclared path, and allows it at a declared one', () => {
     for (const change of [file('lnk', { kind: 'delete', oldType: 'symlink', newType: undefined }), file('lnk', { oldType: 'symlink', newType: 'file' })])
-      expect(auditRun(item, manifest([change]), exact)).toEqual({ kind: 'violation', violations: ['A pre-existing symlink was removed or replaced at an undeclared path: "lnk".'] });
+      expect(auditRun(item, manifest([change]), exact)).toEqual({ kind: 'violation', violations: ['A pre-existing symlink was changed at an undeclared path: "lnk".'] });
+    expect(auditRun(item, manifest([file('link', { kind: 'rename', oldPath: 'lnk', oldType: 'symlink', newType: 'symlink', newLinkTarget: 'src/retry.ts', linkTargetTraversesLink: false })]), exact))
+      .toEqual({ kind: 'violation', violations: ['A pre-existing symlink was changed at an undeclared path: "lnk".'] });
     expect(auditRun(item, manifest([file('link', { kind: 'delete', oldType: 'symlink', newType: undefined })]), exact)).toMatchObject({ kind: 'commit', inScope: ['link'] });
+  });
+  it('refuses every spelling Git treats as .git, in paths and link targets', () => {
+    for (const path of ['.git /config', '.git./hooks', 'GIT~1/config', 'sub/.g\u200cit/hooks/post-checkout', '.GIT\ufeff'])
+      expect(auditRun(item, manifest([file(path)]), exact), path).toMatchObject({ kind: 'violation' });
+    for (const target of ['.git.', 'GIT~1', '.g\u200dit/config'])
+      expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)
+        .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
+    expect(auditRun(item, manifest([file('src/.github-notes.md', { kind: 'add', oldType: undefined })]), exact)).toMatchObject({ kind: 'commit' });
+  });
+  it('counts a case-only rename once under a case-folding identity', () => {
+    const renamed: PlanItem = { ...item, files: [{ path: 'README.md', kind: 'rename', renamed_from: 'Readme.md', change: 'x' }] };
+    expect(auditRun(renamed, manifest([file('README.md', { kind: 'rename', oldPath: 'Readme.md' })]), folded)).toMatchObject({ kind: 'commit', inScope: ['README.md'] });
   });
   it('counts two spellings of one path under a case-folding identity as a duplicate', () => {
     expect(auditRun(item, manifest([file('SRC/Retry.ts'), file('src/retry.ts')]), folded)).toMatchObject({ kind: 'violation' });

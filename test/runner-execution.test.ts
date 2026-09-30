@@ -67,7 +67,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   }, sources, RUNNER_OWNER, findings);
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, path, workspace, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
+  return { store, path, workspace, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
 }
 
 describe('item execution', () => {
@@ -514,5 +514,63 @@ describe('item execution', () => {
     expect(() => store.pauseForAmendment(identity, { revision: 1, snapshotId }, evidence, { owed: true })).toThrow(/is needs approval/);
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     expect(store.pauseForAmendment(identity, { revision: 1, snapshotId }, evidence, { owed: true })).toMatchObject({ revision: 1, completedItems: ['P1', 'P2'] });
+  });
+  it('escalates a safety violation over a review status, so the task cannot be merged past it', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('settles a finding whose task is already needs human, so it is not escalated again later', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { if (store.getAttempts(identity).length === 1) store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.findings.get(store.getAttempts(identity)[0]!.id)).toBeUndefined();
+  });
+  it('keeps a finding owed when a merge in progress refuses the escalation, and escalates it on the next run', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: async () => {
+      store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+      const snapshot = store.getSnapshot(identity);
+      store.beginMergeAttempt(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, snapshot.head, null, 'direct');
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/could not be moved to needs human yet: A merge is in progress/) });
+    const attemptId = store.getAttempts(identity)[0]!.id;
+    expect(h.findings.get(attemptId)).toBeDefined();
+    store.finishMergeAttempt(identity, store.getMergeAttempt(identity)!.id, { state: 'failed', reason: 'GitHub refused.' });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.findings.get(attemptId)).toBeUndefined();
+  });
+  it('escalates through the capability after the shutdown write gate closed', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, capability: s => s.shutdownCapability(),
+      release: async () => { store.closeWrites(); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('settles an owed finding when the task was closed before its next run', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    await h.executor.runTask(identity);
+    const attemptId = store.getAttempts(identity)[0]!.id;
+    expect(h.findings.get(attemptId)).toBeDefined();
+    store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/is cancelled/) });
+    expect(h.findings.get(attemptId)).toBeUndefined();
+  });
+  it('records completed and the ledger entry in one transaction: a failed history write leaves neither', async () => {
+    const h = setup();
+    h.store.recordHistory = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'running' });
+    expect(h.store.getLedger(identity)).toEqual([]);
+    expect(h.runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
 });

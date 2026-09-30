@@ -36,6 +36,14 @@ const MAX_CHANGES = 10_000;
 /** Every path in the report together; keeps the saved result (scope lists included) far below its 1 MiB limit. */
 const MAX_PATH_BYTES = 480 * 1024;
 const KINDS = new Set(['add', 'modify', 'delete', 'rename', 'mode']);
+/**
+ * Whether a path part names Git's metadata directory in any spelling Git itself refuses (read-cache.c, verify_path):
+ * any case; on NTFS with trailing dots or spaces and as the 8.3 short name `git~1`; on HFS with ignorable code points.
+ */
+export function isDotGit(part: string): boolean {
+  const plain = part.replace(/[\u200c-\u200f\u202a-\u202e\u206a-\u206f\ufeff]/g, '').toLowerCase().replace(/[. ]+$/, '');
+  return plain === '.git' || plain === 'git~1';
+}
 /** Agent-controlled text in a finding is quoted (AGENTS.md), and each list is cut short, so a reason stays readable. */
 const q = (text: string) => JSON.stringify(text.length > 300 ? `${text.slice(0, 300)}…` : text);
 const list = (items: readonly string[]) => items.slice(0, 5).map(q).join(', ') + (items.length > 5 ? ` and ${items.length - 5} more` : '');
@@ -78,7 +86,7 @@ function unsafeLinkTarget(linkPath: string, target: string): string | null {
   const resolved = posix.normalize(posix.join(posix.dirname(linkPath), target));
   if (resolved === '..' || resolved.startsWith('../')) return 'target leaves the repository';
   // As for paths: Git's metadata is `.git` in any case, at any depth.
-  if (resolved.split('/').some((part: string) => part.toLowerCase() === '.git')) return 'target enters .git';
+  if (resolved.split('/').some(isDotGit)) return 'target enters .git';
   return null;
 }
 
@@ -99,24 +107,28 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
   // Each path appears once, under the trusted path identity: two entries for one path contradict each other.
   const seen = new Set<string>();
-  for (const change of manifest.changes) for (const path of [change.path, ...(change.oldPath ? [change.oldPath] : [])]) {
-    const key = pathKey(path);
-    if (seen.has(key)) return { kind: 'violation', violations: [`The change report lists ${q(path)} more than once.`] };
-    seen.add(key);
+  for (const change of manifest.changes) {
+    // A case-only rename's two sides are one path under a folding identity; count it once for this change.
+    const keys = new Set([change.path, ...(change.oldPath ? [change.oldPath] : [])].map(pathKey));
+    for (const key of keys) {
+      if (seen.has(key)) return { kind: 'violation', violations: [`The change report lists ${q(key)} more than once.`] };
+      seen.add(key);
+    }
   }
   for (const change of manifest.changes) {
     const paths = [change.path, ...(change.oldPath ? [change.oldPath] : [])];
     // A path must be in canonical form: another spelling (./, a/../, //, a trailing /) could reach .git or hide a match.
     if (paths.some(path => path !== posix.normalize(path) || path.endsWith('/') || path.startsWith('./')))
       { violations.push(`Path not in canonical form in the change report: ${q(change.path)}.`); continue; }
-    // Git refuses a .git part of any case at any depth, so the audit does too.
-    if (change.underGit || paths.some(path => path.split('/').some((part: string) => part.toLowerCase() === '.git'))) { violations.push(`The agent changed ${q(change.path)} under .git.`); continue; }
+    // Git refuses a .git part in any spelling it treats as .git, at any depth, so the audit does too.
+    if (change.underGit || paths.some(path => path.split('/').some(isDotGit))) { violations.push(`The agent changed ${q(change.path)} under .git.`); continue; }
     if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || ['.', '..'].includes(posix.normalize(path)) || path.includes('\0')))
       { violations.push(`Invalid path in the change report: ${q(change.path)}.`); continue; }
     if (change.oldType === 'gitlink' || change.newType === 'gitlink') { violations.push(`Plan items cannot change gitlinks: ${q(change.path)}.`); continue; }
-    // Only a declared pre-existing link may change at all: deleting one, or turning it into a file, is a link change too.
-    if (change.oldType === 'symlink' && change.newType !== 'symlink' && !declared.has(pathKey(change.oldPath ?? change.path)))
-      { violations.push(`A pre-existing symlink was removed or replaced at an undeclared path: ${q(change.oldPath ?? change.path)}.`); continue; }
+    // Only a declared pre-existing link may change at all: deleting it, turning it into a file, or renaming it from an
+    // undeclared path is a link change too.
+    if (change.oldType === 'symlink' && !declared.has(pathKey(change.oldPath ?? change.path)))
+      { violations.push(`A pre-existing symlink was changed at an undeclared path: ${q(change.oldPath ?? change.path)}.`); continue; }
     if (change.newType === 'symlink') {
       if (change.oldType !== 'symlink') { violations.push(`New symlink or file-to-symlink conversion: ${q(change.path)}.`); continue; }
       if (!declared.has(pathKey(change.path))) { violations.push(`A pre-existing symlink changed at an undeclared path: ${q(change.path)}.`); continue; }
