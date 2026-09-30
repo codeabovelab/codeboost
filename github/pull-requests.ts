@@ -48,6 +48,11 @@ export class DraftsUnsupported extends Error {}
  * for the branch, and so on). A definite refusal: GitHub created nothing, so the opening is not left in flight.
  */
 export class PullRequestRefused extends Error {}
+/**
+ * The task's own PRs are not where the main path can publish: one is open into another base than the configured one,
+ * or two are open. A person has to retarget or close them; nothing about them is changed.
+ */
+export class PullRequestMisplaced extends Error {}
 const DRAFTS_UNSUPPORTED = /draft pull requests? (?:are|is) not supported/i;
 /**
  * What a refusal is matched against: `gh`'s stderr (`gh: <message> (HTTP 422)`) and GitHub's own error fields in the
@@ -187,9 +192,9 @@ export class GhPullRequestGateway implements PullRequestGateway {
     this.#validate(input);
     const pulls = await this.#branchPulls(input.headBranch, signal);
     const own = this.#owned(pulls, input.headBranch, input.markers);
-    if (own.length > 1) throw new Error(`More than one of the task's pull requests is open from ${input.headBranch} (${own.map(pr => `#${pr.number} into ${pr.base}`).join(', ')}). Close all but one.`);
+    if (own.length > 1) throw new PullRequestMisplaced(`More than one of the task's pull requests is open from ${input.headBranch} (${own.map(pr => `#${pr.number} into ${pr.base}`).join(', ')}). Close all but one.`);
     if (own.length === 1 && own[0]!.base !== input.base)
-      throw new Error(`The task's pull request #${own[0]!.number} from ${input.headBranch} now targets ${own[0]!.base}, not ${input.base}. Retarget it to ${input.base} or close it.`);
+      throw new PullRequestMisplaced(`The task's pull request #${own[0]!.number} from ${input.headBranch} now targets ${own[0]!.base}, not ${input.base}. Retarget it to ${input.base} or close it.`);
     const here = pulls.filter(pr => (pr as { base?: { ref?: unknown } } | null)?.base?.ref === input.base);
     if (here.length > 1) throw new Error('GitHub returned an invalid pull request list.');
     if (!here.length) return null;

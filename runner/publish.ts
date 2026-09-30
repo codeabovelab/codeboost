@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { pullRequestBody, pullRequestTitle } from '../core/pull-request-body.ts';
 import type { AlreadyFixedGateway, AlreadyFixedResult } from '../github/already-fixed.ts';
-import { DraftsUnsupported, PullRequestRefused, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
+import { DraftsUnsupported, PullRequestMisplaced, PullRequestRefused, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError } from './lifecycle.ts';
 import type { Store, TaskPullRequest } from './store.ts';
 
@@ -131,7 +131,15 @@ export class PullRequestPublisher {
     const candidates = this.#branchRows(prs, branch).filter(pr => pr.state !== 'opening');
     // Always asked, even with no known markers: an open PR on this branch that codeboost did not open is refused here,
     // before the push could move it.
-    const live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal);
+    let live;
+    try { live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal); }
+    catch (error) {
+      if (!(error instanceof PullRequestMisplaced) || signal?.aborted) throw error;
+      // The task's PRs are not where it can publish, and a person has to decide: none of them stays ready meanwhile,
+      // although the task itself could otherwise be published as ready.
+      const notes = await this.#draftStranded(identity, signal, true);
+      throw new PullRequestMisplaced(notes.length ? `${error.message} ${notes.join(' ')}` : error.message);
+    }
     signal?.throwIfAborted();
     let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
     // What GitHub shows is the truth for the draft flag: a draft change whose record was lost is repaired here.
@@ -342,6 +350,7 @@ export class PullRequestPublisher {
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
         const current = this.#isCurrent(identity, lost, draft);
+        // The task is in needs human: the next publish's draft step adopts its other open PRs.
         this.#store.recordPullRequestOpened(identity, lost.openingId, pr, false);
         return current ? { kind: 'draft unsupported', number: pr.number } : null;
       }
@@ -369,11 +378,12 @@ export class PullRequestPublisher {
    * which also adopts, may refuse first. A draft flag GitHub already shows is only recorded. A GitHub failure does not
    * replace the status refusal that follows: it is returned as a note for it, and the next publish tries again.
    */
-  async #draftStranded(identity: PlanIdentity, signal?: AbortSignal): Promise<string[]> {
+  async #draftStranded(identity: PlanIdentity, signal?: AbortSignal, misplaced = false): Promise<string[]> {
+    // `misplaced`: the main path found the task's PRs where it cannot publish, so being publishable keeps nothing ready.
     const keepsReady = () => {
       const status = this.#store.getTask(identity).status;
       // An approved task's PR must stay ready: GitHub does not merge a draft.
-      return MERGEABLE_STATUSES.includes(status) || status === 'merged' || this.#store.canPublish(identity, false);
+      return MERGEABLE_STATUSES.includes(status) || status === 'merged' || (!misplaced && this.#store.canPublish(identity, false));
     };
     if (keepsReady()) return [];
     const prs = this.#store.taskPullRequests(identity), notes: string[] = [];

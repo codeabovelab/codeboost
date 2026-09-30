@@ -4,7 +4,7 @@ import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
 import { CommandFailed, runWithInput } from '../github/run-with-input.ts';
-import { DraftsUnsupported, GhPullRequestGateway, PullRequestRefused, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
+import { DraftsUnsupported, GhPullRequestGateway, PullRequestMisplaced, PullRequestRefused, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway, AlreadyFixedInput, AlreadyFixedResult } from '../github/already-fixed.ts';
 import { fenced, neutralizeReferences, pullRequestBody, pullRequestTitle, MAX_BODY } from '../core/pull-request-body.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -73,8 +73,8 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       const visible = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m));
       const baseOfPr = (m: string) => bases.get(m) ?? publishConfig.baseBranch;
       const own = visible.filter(([m]) => input.markers.includes(m));
-      if (own.length > 1) throw new Error(`More than one of the task's pull requests is open (${own.map(([, pr]) => `#${pr.number}`).join(', ')}).`);
-      if (own.length === 1 && baseOfPr(own[0]![0]) !== input.base) throw new Error(`The task's pull request #${own[0]![1].number} now targets ${baseOfPr(own[0]![0])}, not ${input.base}.`);
+      if (own.length > 1) throw new PullRequestMisplaced(`More than one of the task's pull requests is open (${own.map(([, pr]) => `#${pr.number}`).join(', ')}).`);
+      if (own.length === 1 && baseOfPr(own[0]![0]) !== input.base) throw new PullRequestMisplaced(`The task's pull request #${own[0]![1].number} now targets ${baseOfPr(own[0]![0])}, not ${input.base}.`);
       const open = visible.find(([m]) => baseOfPr(m) === input.base);
       if (!open) return null;
       if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
@@ -1355,6 +1355,9 @@ describe('GitHub PR adapter', () => {
     const other = '<!-- codeboost:opening=22222222-2222-4222-8222-222222222222 -->';
     const lookup = (list: unknown[]) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(list)).findOpened({ ...input, markers: [marker, other] });
     await expect(lookup([elsewhere(), response({ number: 9, body: `${other}\nplan` })])).rejects.toThrow(/More than one of the task's pull requests .*#7 into release, #9 into main.*Close all but one/);
+    // Both are PullRequestMisplaced, so the publisher can draft the task's PRs before it refuses.
+    expect(await lookup([elsewhere(), response({ number: 9, body: `${other}\nplan` })]).catch(e => e)).toBeInstanceOf(PullRequestMisplaced);
+    expect(await lookup([elsewhere()]).catch(e => e)).toBeInstanceOf(PullRequestMisplaced);
   });
   it('matches refusals against gh\'s stderr only, not the response body echoed on stdout', async () => {
     const echoed = new CommandFailed('gh failed (exit 1): gh: Server Error (HTTP 502)', 'gh: Server Error (HTTP 502)', '{"body":"Draft pull requests are not supported (HTTP 422)"}');
@@ -1776,6 +1779,34 @@ describe('shutdown and PRs left ready', () => {
     expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 101, draft: true, status: 'running' });
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }, { state: 'opened', number: 101, draft: true }]);
   });
+  it('drafts a running task\'s PR that a person retargeted, before refusing, however it got there', async () => {
+    // A lost opening that is not this publish's own (the task changed since), then a retarget.
+    let store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
+    store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
+    let again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/now targets develop, not main/);
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+    // A current lost opening whose draft change fails once: the next publish drafts it.
+    store = runningTask(); live = new Map(); next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
+    expect(await harness(store, { live, next, draftFails: true }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'running', leftReady: 100 });
+    again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/now targets develop, not main/);
+    expect(again.log).toContain('draft 100');
+    // A PR in review, sent back to run again, then retargeted.
+    store = runningTask(); live = new Map(); next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
+    again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(PullRequestMisplaced);
+    expect(again.log).toContain('draft 100');
+    expect(again.log.some(line => line.startsWith('push'))).toBe(false);
+  });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
     const later = { now: () => Date.now() + 10 * 60_000 };
@@ -1804,6 +1835,8 @@ describe('shutdown and PRs left ready', () => {
     const again = harness(store, { live, next, closed });
     await expect(again.publisher.publish(identity)).rejects.toThrow(/More than one of the task's pull requests/);
     expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh') || line.startsWith('open'))).toBe(false);
+    // Neither stays ready while a person decides which one to keep.
+    expect(again.log).toEqual(expect.arrayContaining(['draft 100', 'draft 101']));
   });
   it('drafts a stopped task\'s PR left in its old base after a base change, without a retarget', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
