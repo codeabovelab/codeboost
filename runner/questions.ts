@@ -4,7 +4,7 @@ import { QuestionWorker } from './question-agent.ts';
 import { LeftoverLedger } from './question-leftovers.ts';
 import { StopError, type QuestionScope } from './question-container.ts';
 import type { ReviewNote } from './store.ts';
-import type { ShutdownCapability } from './lifecycle.ts';
+import { settleWith, type ShutdownCapability } from './lifecycle.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal, scope?: QuestionScope, timeoutMs?: number) => Promise<string>;
 const QUESTION_TIMEOUT_MS = 120_000;
 const SHUTDOWN_SETTLE_MS = 20_000;
@@ -30,7 +30,7 @@ export class Questions {
   /** Settlement writes (finishAnswer after abort) keep working after the Store write gate closes. */
   private write: <T>(fn: () => T) => T;
   constructor(service: ReviewService, agent?: QuestionAgent, capability?: ShutdownCapability) {
-    this.service=service; this.agent=agent; this.write = capability ? fn => capability.run(fn) : fn => fn();
+    this.service=service; this.agent=agent; this.write = settleWith(capability);
     // Beside the review database's canonical path, so a restart of the same review finds what an earlier session left.
     this.worker=new QuestionWorker(undefined,LeftoverLedger.forDatabase(service.config.database));
   }
@@ -70,7 +70,9 @@ export class Questions {
         if(typeof text!=='string'||!text.trim()||text.length>24000) throw new Error('Agent returned an empty or oversized answer.');
         this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'complete',text:text.trim()}));
       } catch(error) {
-        try { this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)})); } catch {}
+        try { this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)})); }
+        // The answer stays pending (the page shows it as interrupted); say why instead of dropping the error.
+        catch(saveError) { console.error(`Question ${id} could not record its failed answer: ${saveError instanceof Error?saveError.message:String(saveError)}`); }
       } finally {clearTimeout(timeout);}
     })();
     const settled = done.finally(async () => {

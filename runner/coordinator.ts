@@ -1,7 +1,7 @@
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { captureInvocation, type InvocationHandle, type InvocationInput, type InvocationResult, type StopReason, type TaskClone, type UnreleasedResource } from '../agents/contract.ts';
 import type { AttemptRecord, Store } from './store.ts';
-import { ATTEMPT_PHASES, GuardRefusal, ShuttingDownError, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason, type ShutdownCapability } from './lifecycle.ts';
+import { ATTEMPT_PHASES, GuardRefusal, ShuttingDownError, WRITABLE_KINDS, bounded, sameContext, type AttemptKind, type Classification, type FirstReason, type ShutdownCapability, settleWith } from './lifecycle.ts';
 
 /** What F's host-side preparation hands to D's start call. */
 export interface PreparedAttempt {
@@ -88,7 +88,7 @@ export class RunnerCoordinator {
   constructor(store: Store, deps: RunnerDeps, limits: SlotLimits = { writable: 1, readOnly: 1 }, capability?: ShutdownCapability) {
     if (![limits.writable, limits.readOnly].every(n => Number.isSafeInteger(n) && n >= 1)) throw new Error('Slot limits must be positive integers.');
     this.#store = store; this.#deps = deps; this.#limits = limits;
-    this.#write = capability ? fn => capability.run(fn) : fn => fn();
+    this.#write = settleWith(capability);
   }
   /** Shutdown step 1: reject admission synchronously, in the same turn as the server flag and the Store gate. */
   rejectAdmission(): void { this.#closing = true; }

@@ -634,6 +634,13 @@ export class Store {
     if (!row) throw new Error('Unknown attempt.');
     return this.#attemptRecord(row);
   }
+  /** The latest attempts, oldest first, for status views: results are flagged, not read. */
+  recentAttempts(identity: PlanIdentity, limit: number): (Omit<AttemptRecord, 'result'> & { hasResult: boolean })[] {
+    return this.#db.prepare(`SELECT * FROM (SELECT id, kind, phase, item, state, context, deadline, first_reason, stop_reason, exit_code, signal,
+      NULL AS result, result IS NOT NULL AS has_result, diagnostic, diagnostic_ref, created_at, started_at, settled_at, rowid AS row_order
+      FROM attempts WHERE plan_key=? ORDER BY rowid DESC LIMIT ?) ORDER BY row_order`).all(identityKey(identity), limit)
+      .map(row => { const { result: _result, ...attempt } = this.#attemptRecord(row); return { ...attempt, hasResult: row.has_result === 1 }; });
+  }
   getAttempts(identity: PlanIdentity): AttemptRecord[] {
     return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));
   }

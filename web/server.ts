@@ -36,13 +36,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const identity = config.identity;
   /** Reads only task and attempt rows; never rebuilds history or the review. */
   const runnerView = () => {
-    const task = service.store.getTask(identity), attempts = service.store.getAttempts(identity).slice(-20);
+    const task = service.store.getTask(identity), attempts = service.store.recentAttempts(identity, 20);
     const status = runner?.status(identity) ?? { active: false, stopRequested: null, unresolved: null };
     const last = attempts.find(attempt => attempt.id === task.currentAttemptId);
     const retryable = !!runner && !!last && (last.state === 'failed' || last.state === 'cancelled')
       && (task.status === 'running' || task.status === 'queued') && !task.requeuePending && task.cancelRequested === null
       && !status.active && !status.unresolved && sameContext(last.context, service.store.currentContext(identity));
-    return { available: !!runner, task, attempts: attempts.map(({ result, ...attempt }) => ({ ...attempt, hasResult: result !== null })),
+    return { available: !!runner, task, attempts,
       stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved };
   };
   const runnerAction = (input: Record<string, unknown>) => {

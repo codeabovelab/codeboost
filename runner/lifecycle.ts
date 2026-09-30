@@ -50,6 +50,10 @@ export class RefusalWithEffect extends GuardRefusal {
 export class ShuttingDownError extends Error { constructor() { super('The review server is shutting down.'); } }
 /** Lets settling coordinator code write after the gate closes. Only the server hands it out, and never to HTTP handlers. */
 export interface ShutdownCapability { run<T>(fn: () => T): T }
+/** How a coordinator runs its settlement writes: through the capability when it has one, directly otherwise (tests, demos). */
+export function settleWith(capability?: ShutdownCapability): <T>(fn: () => T) => T {
+  return capability ? fn => capability.run(fn) : fn => fn();
+}
 
 export function bounded(reason: string): string {
   const text = reason.trim() || 'No reason given.';

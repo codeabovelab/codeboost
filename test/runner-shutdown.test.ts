@@ -13,7 +13,8 @@ import { ShuttingDownError } from '../runner/lifecycle.ts';
 import type { RunnerDeps } from '../runner/coordinator.ts';
 import { fixtureGit } from './fixtures/git.ts';
 import type { InvocationResult } from '../agents/contract.ts';
-import type { MergeGateway, MergeQueueGateway, RemoteMergeState } from '../github/merge.ts';
+import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type RemoteMergeState } from '../github/merge.ts';
+import type { QuestionAgent } from '../runner/questions.ts';
 
 const roots: string[] = [];
 const cleanups: (() => Promise<void> | void)[] = [];
@@ -25,9 +26,9 @@ afterEach(async () => {
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 function demo() { const root = mkdtempSync(join(tmpdir(), 'codeboost-shutdown-')); roots.push(root); return createDemo(join(root, 'demo')); }
 type App = Awaited<ReturnType<typeof startServer>>;
-async function serve(deps?: RunnerDeps) {
+async function serve(deps?: RunnerDeps, agent: QuestionAgent = async () => 'answer') {
   const config = demo();
-  const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, deps);
+  const app = await startServer(config, 0, agent, undefined, 2_000, undefined, deps);
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await app.close(); } };
   cleanups.push(close);
@@ -109,6 +110,13 @@ describe('merge coordinator after the gate closes', () => {
     await expect(coordinator.pollQueue()).rejects.toBeInstanceOf(ShuttingDownError);
     expect(h.store.getMergeAttempt(h.identity)!.state).toBe('queued');
   });
+  it('still records GitHub\'s refusal after the gate closed, through the capability', async () => {
+    const h = harness({});
+    const capability = h.store.shutdownCapability();
+    (h.gateway.merge as ReturnType<typeof vi.fn>).mockImplementation(async () => { h.store.closeWrites(); throw new MergeSubmissionError('Pull request is not mergeable.', 'refused'); });
+    await expect(new MergeCoordinator(h.service, h.gateway, 14_000, capability).merge('t')).rejects.toThrow(/not mergeable/);
+    expect(h.store.getMergeAttempt(h.identity)).toMatchObject({ state: 'failed', reason: 'Pull request is not mergeable.' });
+  });
   it('still records a merge that GitHub completed after the gate closed, through the capability', async () => {
     const h = harness({});
     const capability = h.store.shutdownCapability();
@@ -152,6 +160,20 @@ describe('server shutdown', { timeout: 15_000 }, () => {
     const late = await fetch(`${origin(app)}/api/action`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' }, body: JSON.stringify({ action: 'note', kind: 'change', item: 'P1', text: 'late', token: view.token }) }).then(r => r.status, () => 'refused');
     expect([503, 'refused']).toContain(late);
     await closing;
+  });
+  it('records a running question\'s "Server stopped" answer after the write gate closed', async () => {
+    let asked!: () => void; const started = new Promise<void>(resolve => { asked = resolve; });
+    const { app, config, close } = await serve(undefined, (_prompt, signal) => {
+      asked(); return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+    });
+    const view = (await api(app, 'GET', '/api/review')).body;
+    expect((await api(app, 'POST', '/api/action', { action: 'note', kind: 'question', item: 'P1', text: 'Running at shutdown?', token: view.token })).status).toBe(200);
+    await started;
+    // questions.close() (step 6) aborts it after step 3 closed the gate; its answer is written through the capability.
+    await close();
+    const store = new Store(config.database); cleanups.push(() => store.close());
+    const note = store.getReviewNotes(config.identity).find(entry => entry.text === 'Running at shutdown?');
+    expect(note?.answer).toMatchObject({ status: 'failed', error: expect.stringMatching(/Server stopped/) });
   });
   it('rejects runner admission at step 1 and closes the write gate after the drain', async () => {
     const { deps } = { deps: { runnerOwner: '0123456789abcdef0123456789abcdef', prepare: async () => { throw new Error('unused'); }, cleanupPreparation: async () => undefined, start: () => { throw new Error('unused'); }, validate: () => null } as RunnerDeps };
@@ -227,7 +249,8 @@ describe('/api/runner', () => {
     const attempt = app.runner!.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'review', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
     for (let i = 0; i < 50 && settles.length === 0; i++) await tick();
     let view = (await api(app, 'GET', '/api/runner')).body;
-    expect(view).toMatchObject({ available: true, retryable: false, attempts: [{ id: attempt.id, state: 'running' }] });
+    expect(view).toMatchObject({ available: true, retryable: false, attempts: [{ id: attempt.id, state: 'running', hasResult: false }] });
+    expect(view.attempts[0]).not.toHaveProperty('result');
     const cancel = await api(app, 'POST', '/api/runner', { action: 'cancel-attempt', attemptId: attempt.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() });
     expect(cancel.body.result).toEqual({ outcome: 'stopping' });
     expect((await api(app, 'GET', '/api/runner')).body.stopRequested).toEqual({ attemptId: attempt.id, reason: 'cancelled', saved: true });

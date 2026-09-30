@@ -1,6 +1,6 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
-import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, type ShutdownCapability } from './lifecycle.ts';
+import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -47,7 +47,7 @@ export class MergeCoordinator {
   constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = 14_000, capability?: ShutdownCapability) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 14_000) throw new Error('Invalid merge operation deadline.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs;
-    this.#settle = capability ? fn => capability.run(fn) : fn => fn();
+    this.#settle = settleWith(capability);
   }
 
   #attempt(): MergeAttempt | null {
