@@ -1752,6 +1752,30 @@ describe('shutdown and PRs left ready', () => {
     expect(outcome).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'running' });
     expect(outcome).not.toHaveProperty('leftReady');
   });
+  it('never puts the task in review for a recovered PR outside the configured base: it records it and drafts it', async () => {
+    for (const setup of ['retarget', 'base change'] as const) {
+      const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+      const first = setup === 'retarget' ? {} : { baseBranch: 'develop' };
+      await expect(harness(store, { live, next, openTimesOut: true, config: first }).publisher.publish(identity)).rejects.toThrow('timeout');
+      if (setup === 'retarget') for (const m of live.keys()) baseOf.get(live)!.set(m, 'develop');
+      const again = harness(store, { live, next });
+      expect(await again.publisher.publish(identity), setup).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'running' });
+      expect(store.taskPullRequests(identity), setup).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
+    }
+  });
+  it('never puts the task in review while another of its PRs is open, and records that PR too', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    // Opening A into develop is lost and its PR stays hidden past the settle time, so it is abandoned.
+    await expect(harness(store, { live, next, openTimesOut: true, config: { baseBranch: 'develop' } }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    // Opening B into main is lost too; then A's PR shows up.
+    await expect(harness(store, { live, next, hidden, openTimesOut: true, config: later }).publisher.publish(identity)).rejects.toThrow('timeout');
+    hidden.clear();
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 101, draft: true, status: 'running' });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }, { state: 'opened', number: 101, draft: true }]);
+  });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
     const later = { now: () => Date.now() + 10 * 60_000 };

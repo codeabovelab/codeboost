@@ -1058,11 +1058,13 @@ export class Store {
   }
   /**
    * An opening's PR exists. The record is kept whatever happened to the task meanwhile, so the PR can still be found and
-   * closed. The task status changes only when the task is unchanged since the opening began (its owned state version).
+   * closed. The task status changes only when the task is unchanged since the opening began (its owned state version),
+   * and only when `mayReview`: recovery passes false for a PR the main path would refuse (in another base than the
+   * configured one, or with another of the task's PRs open), so such a PR is recorded but never puts the task in review.
    */
-  recordPullRequestOpened(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }): TaskStatus {
+  recordPullRequestOpened(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, mayReview = true): TaskStatus {
     const key = identityKey(identity);
-    return this.#confirmPullRequest(key, pr, () =>
+    return this.#confirmPullRequest(key, pr, mayReview, () =>
       this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opening'", key, openingId),
       row => ({ head: row.head_sha as string, owned: row.owner_version as number, ownedReview: row.owner_review_version as number }), openingId, 'No pull request is being opened with this ID.');
   }
@@ -1070,12 +1072,12 @@ export class Store {
   recordRefreshConfirmed(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean },
     refresh: { head: string; stateVersion: number }): TaskStatus {
     const key = identityKey(identity);
-    return this.#confirmPullRequest(key, pr, () =>
+    return this.#confirmPullRequest(key, pr, true, () =>
       this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened' AND number=? AND refresh_head=? AND refresh_version=?",
         key, openingId, pr.number, refresh.head, refresh.stateVersion),
       row => ({ head: refresh.head, owned: refresh.stateVersion, ownedReview: row.refresh_review_version as number }), openingId, 'No update of this pull request is in flight.');
   }
-  #confirmPullRequest(key: string, pr: { number: number; url: string; headSha: string; draft: boolean }, find: () => Record<string, SQLOutputValue> | undefined,
+  #confirmPullRequest(key: string, pr: { number: number; url: string; headSha: string; draft: boolean }, mayReview: boolean, find: () => Record<string, SQLOutputValue> | undefined,
     expected: (row: Record<string, SQLOutputValue>) => { head: string; owned: number; ownedReview: number }, openingId: string, missing: string): TaskStatus {
     if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
     return this.#transaction(() => {
@@ -1092,7 +1094,7 @@ export class Store {
       // running task can move to in review, and only with a ready PR at the head it pushed. A PR showing another head
       // (GitHub has not caught up, or someone else pushed) leaves the task running; the publisher makes it a draft and
       // the next publish reconciles it.
-      if (task.state_version === owned && this.#current(key).review_version === ownedReview && task.status === 'running'
+      if (mayReview && task.state_version === owned && this.#current(key).review_version === ownedReview && task.status === 'running'
         && pr.headSha === head && !pr.draft) {
         this.#run("UPDATE tasks SET status='in review' WHERE plan_key=?", key);
       }
