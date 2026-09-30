@@ -6,7 +6,7 @@ import { GhMergeGateway, type RunGh } from '../github/merge.ts';
 import { GhIssueGateway } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
-import { GH_ENV_ALLOWLIST } from '../github/gh-env.ts';
+import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
 
 // Every adapter's own runner, not an injected one: these are the runners the server uses.
 // Each adapter must send every `gh` call through `run`, or this test does not see it.
@@ -47,7 +47,8 @@ describe('default gh runners', () => {
   it.each(defaultRunners)('%s: passes the allowlisted variables and nothing unrelated', async (_name, runner) => {
     const lines = (await runner()(['api', 'user'])).split('\n');
     for (const [name, value] of Object.entries(expected)) expect(lines).toContain(`${name}=${value}`);
-    for (const setting of ['GH_PROMPT_DISABLED=1', 'GH_NO_UPDATE_NOTIFIER=1', 'GH_PAGER=cat', 'NO_COLOR=1']) expect(lines).toContain(setting);
+    // The fixed settings are what ghEnvironment adds to an empty environment on this platform.
+    for (const [name, value] of Object.entries(ghEnvironment({}))) expect(lines).toContain(`${name}=${value}`);
     expect(lines.some(line => line.startsWith('CODEBOOST_UNRELATED_SECRET='))).toBe(false);
   });
 });
