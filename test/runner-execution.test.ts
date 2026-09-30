@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
-import { ItemExecutor, SAFETY_VIOLATION, SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
+import { ItemExecutor, SAFETY_VIOLATION, SafetyFindings, executionDeps, type ExecutionOutcome, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
 import { MAX_REASON, ShuttingDownError, type ShutdownCapability } from '../runner/lifecycle.ts';
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
@@ -754,7 +754,7 @@ describe('item execution', () => {
     const attemptId = store.getAttempts(identity)[0]!.id;
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     store.closeWrites();
-    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/could not be moved to needs human yet: The review server is shutting down/) });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/could not be moved to needs human yet: The review server is shutting down/) });
     expect(store.getTask(identity).status).toBe('queued');
     expect(h.findings.get(attemptId)).toBeDefined();
   });
@@ -852,5 +852,17 @@ describe('item execution', () => {
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started', reason: 'The review server is shutting down.' });
     expect(store.getTask(identity).status).toBe('queued');
     expect(h.findings.get(store.getAttempts(identity)[0]!.id)).toBeDefined();
+  });
+  it('never lets a second run pay the first run\'s pause, whatever microtask it starts in', async () => {
+    for (let steps = 0; steps <= 24; steps++) {
+      let executor!: ItemExecutor, second: Promise<ExecutionOutcome> | undefined;
+      const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {
+        void (async () => { for (let i = 0; i < steps; i++) await null; second = executor.runTask(identity); })();
+      } });
+      executor = h.executor;
+      expect(await h.executor.runTask(identity), `after ${steps} steps`).toMatchObject({ kind: 'needs amendment', item: 'P1' });
+      for (let i = 0; i < 50 && !second; i++) await null;
+      expect((await second)?.kind, `after ${steps} steps`).toBe('stopped');
+    }
   });
 });

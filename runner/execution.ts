@@ -1,4 +1,4 @@
-import type { PlanIdentity } from '../core/identity.ts';
+import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import type { PlanContext } from '../core/plan.ts';
 import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
@@ -179,7 +179,19 @@ export class ItemExecutor {
     this.#store = store; this.#runner = runner; this.#sources = sources; this.#findings = findings;
     this.#deadlineMs = options.deadlineMs ?? 10 * 60_000; this.#write = settleWith(options.capability);
   }
+  /** Tasks with a runTask in progress here, from its start to its return: a second one waits for none of its steps. */
+  #inFlight = new Set<string>();
   async runTask(identity: PlanIdentity, options: { fromItem?: string } = {}): Promise<ExecutionOutcome> {
+    const key = identityKey(identity);
+    // Held for the whole run, so a second run can never pay this run's pause or finding, even in the microtasks between
+    // the coordinator dropping the job and this run resuming.
+    if (this.#inFlight.has(key)) return { kind: 'stopped', item: options.fromItem ?? this.#store.getPlan(identity).items[0]!.id, state: 'not started',
+      reason: 'An earlier run of this task is still finishing; start it again when that run has ended.', completed: [] };
+    this.#inFlight.add(key);
+    try { return await this.#runTask(identity, options); }
+    finally { this.#inFlight.delete(key); }
+  }
+  async #runTask(identity: PlanIdentity, options: { fromItem?: string }): Promise<ExecutionOutcome> {
     const plan = this.#store.getPlan(identity);
     const start = options.fromItem ? plan.items.findIndex(item => item.id === options.fromItem) : 0;
     if (start < 0) throw new Error('Unknown plan item.');
@@ -260,11 +272,11 @@ export class ItemExecutor {
     // The terminal write failed: the attempt still counts as active, so the move waits for restart; keep the finding owed.
     if (row.state === 'pending' || row.state === 'running') {
       const unresolved = this.#runner.status(identity).unresolved;
-      return stopped(item, row.state, `${violation} ${unresolved ? NEEDS_RESTART[unresolved.reason] : 'Needs restart: the attempt\'s outcome could not be saved.'}`);
+      return stopped(item, owed ? 'not started' : row.state, `${violation} ${unresolved ? NEEDS_RESTART[unresolved.reason] : 'Needs restart: the attempt\'s outcome could not be saved.'}`);
     }
     if (CLOSED_STATUSES.includes(task.status)) {
       this.#findings.settle(row.id);
-      return stopped(item, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
+      return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
     }
     // Already where the finding sends it: nothing is owed.
     if (task.status === 'needs human') {
@@ -272,13 +284,13 @@ export class ItemExecutor {
       return { kind: 'needs human', item, reason: violation, completed: [...done] };
     }
     if (HUMAN_GATES.includes(task.status))
-      return stopped(item, row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
+      return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
     // Settling this run's own attempt writes through the shutdown capability; paying an owed finding at the start of a
     // new run is that run's decision, so it does not, and the closed write gate refuses it like any other.
     try { (owed ? direct : this.#write)(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
     catch (error) {
       if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
-      return stopped(item, row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);
+      return stopped(item, owed ? 'not started' : row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);
     }
     this.#findings.settle(row.id);
     return { kind: 'needs human', item, reason: violation, completed: [...done] };
@@ -312,7 +324,7 @@ export class ItemExecutor {
       }, { owed })).id;
     } catch (error) {
       if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
-      return stopped(item, row.state, `${item} changed files outside its plan item, but the task could not pause for amendment: ${(error as Error).message}`);
+      return stopped(item, owed ? 'not started' : row.state, `${item} changed files outside its plan item, but the task could not pause for amendment: ${(error as Error).message}`);
     }
     return { kind: 'needs amendment', item, outOfScope: result.outOfScope, checkpointId, completed: [...done] };
   }
