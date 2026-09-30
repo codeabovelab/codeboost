@@ -43,8 +43,10 @@ export function runWithInput(command: string, args: readonly string[], options: 
       if (pipes) clearTimeout(pipes);
       options.signal?.removeEventListener('abort', onAbort);
       const stderr = Buffer.concat(err).toString('utf8').trim();
+      // `gh api` prints only the error's summary on stderr and the response body, with GitHub's reason, on stdout.
+      const stdout = code !== 0 ? Buffer.concat(out).toString('utf8').trim() : '';
       if (failure) reject(failure);
-      else if (code !== 0) reject(new Error(`${command} failed (${signal ?? `exit ${code}`}): ${stderr.slice(0, 2000)}`));
+      else if (code !== 0) reject(new Error(`${command} failed (${signal ?? `exit ${code}`}): ${stderr.slice(0, 2000)}${stdout ? `\n${stdout.slice(0, 2000)}` : ''}`));
       else resolve(Buffer.concat(out).toString('utf8'));
     };
     child.on('close', finish);

@@ -36,6 +36,11 @@ export interface PullRequestGateway {
  * Free plan). A definite refusal: nothing was created or changed.
  */
 export class DraftsUnsupported extends Error {}
+/**
+ * GitHub refused to open the PR with a validation error (HTTP 422: no commits between base and head, a PR already open
+ * for the branch, and so on). A definite refusal: GitHub created nothing, so the opening is not left in flight.
+ */
+export class PullRequestRefused extends Error {}
 const DRAFTS_UNSUPPORTED = /draft pull requests? (?:are|is) not supported/i;
 /** Runs a GitHub call that asks for a draft, turning GitHub's "not supported" refusal into DraftsUnsupported. */
 async function draftCall<T>(call: () => Promise<T>): Promise<T> {
@@ -111,7 +116,12 @@ export class GhPullRequestGateway implements PullRequestGateway {
     if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
     const post = () => this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
       { title: input.title, body: input.body, head: input.headBranch, base: input.base, draft: input.draft });
-    const response = input.draft ? await draftCall(post) : await post();
+    let response;
+    try { response = input.draft ? await draftCall(post) : await post(); }
+    catch (error) {
+      if (error instanceof DraftsUnsupported || signal.aborted || !(error instanceof Error) || !/\(HTTP 422\)/.test(error.message)) throw error;
+      throw new PullRequestRefused(`GitHub refused to open the pull request: ${error.message}`);
+    }
     const { body, ...pr } = this.#pull(response, input);
     if (markerOf(body) !== input.marker) throw new Error('GitHub returned a pull request without its marker.');
     // The PR exists, but not in the requested state: failing keeps the opening owned, and recovery turns it into a draft.
@@ -123,11 +133,15 @@ export class GhPullRequestGateway implements PullRequestGateway {
     signal = this.#bounded(signal);
     this.#validate(input);
     const owner = this.repository.split('/')[0]!;
-    const query = new URLSearchParams({ state: 'open', head: `${owner}:${input.headBranch}`, base: input.base, per_page: '100' });
+    // Not filtered by base: GitHub allows one open PR per head and base, so a PR that a person retargeted to another base
+    // would not be found, and a second PR would be opened from the same branch. It is refused instead.
+    const query = new URLSearchParams({ state: 'open', head: `${owner}:${input.headBranch}`, per_page: '100' });
     const response = await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls?${query}`], signal);
-    // GitHub allows one open PR per head and base, so more than one result is a malformed response.
-    if (!Array.isArray(response) || response.length > 1) throw new Error('GitHub returned an invalid pull request list.');
+    if (!Array.isArray(response)) throw new Error('GitHub returned an invalid pull request list.');
+    if (response.length > 1) throw new Error(`More than one open pull request comes from ${input.headBranch}.`);
     if (!response.length) return null;
+    const base = (response[0] as { base?: { ref?: unknown } } | null)?.base?.ref;
+    if (typeof base === 'string' && base !== input.base) throw new Error(`The open pull request from ${input.headBranch} targets ${base}, not ${input.base}; codeboost will not open a second one.`);
     const { body, ...pr } = this.#pull(response[0], input);
     const found = input.markers.filter(marker => markerOf(body) === marker);
     if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);

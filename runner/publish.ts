@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { pullRequestBody, pullRequestTitle } from '../core/pull-request-body.ts';
 import type { AlreadyFixedGateway, AlreadyFixedResult } from '../github/already-fixed.ts';
-import { DraftsUnsupported, type PullRequestGateway } from '../github/pull-requests.ts';
+import { DraftsUnsupported, PullRequestRefused, type PullRequestGateway } from '../github/pull-requests.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError } from './lifecycle.ts';
 import type { Store, TaskPullRequest } from './store.ts';
 
@@ -125,7 +125,8 @@ export class PullRequestPublisher {
     }
     const prs = this.#store.taskPullRequests(identity), branch = this.branch(identity);
     // The task's earlier PR (a needs-human draft, or an abandoned opening's PR that became visible later) is reused while
-    // it is still open: GitHub allows one open PR per branch. It is looked up before the check, because an abandoned
+    // it is still open: the branch has at most one open PR (GitHub allows one per base, and the lookup refuses one into
+    // another base). It is looked up before the check, because an abandoned
     // opening's PR links the issue too and has no recorded number; the marker proves it is the task's own.
     const candidates = this.#branchRows(prs, branch, this.#config.baseBranch).filter(pr => pr.state !== 'opening');
     // Always asked, even with no known markers: an open PR on this branch that codeboost did not open is refused here,
@@ -235,8 +236,9 @@ export class PullRequestPublisher {
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(opening.openingId), problems: input.problems }),
       }, signal);
     } catch (error) {
+      // Definite refusals: GitHub created nothing, so the opening is dropped rather than left to settle for 10 minutes.
+      if (error instanceof PullRequestRefused) { this.#store.abandonPullRequestOpening(identity, opening.openingId); throw error; }
       if (!(error instanceof DraftsUnsupported)) throw error;
-      // A definite refusal: GitHub created nothing, so the opening is dropped rather than left to settle.
       this.#store.abandonPullRequestOpening(identity, opening.openingId);
       return { kind: 'draft unsupported', number: null };
     }
@@ -301,7 +303,7 @@ export class PullRequestPublisher {
     signal?.throwIfAborted();
     if (pr && pr.marker !== marker(lost.openingId)) {
       // The branch's open PR belongs to another of the task's openings, so this opening's request created nothing
-      // (GitHub allows one open PR per branch). Drop it. If that other opening was abandoned, its PR is adopted here,
+      // (the branch has at most one open PR). Drop it. If that other opening was abandoned, its PR is adopted here,
       // not only on the main path, which a task that can no longer publish never reaches.
       this.#store.abandonPullRequestOpening(identity, lost.openingId);
       const owner = rows.find(row => marker(row.openingId) === pr.marker);
