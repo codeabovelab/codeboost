@@ -178,7 +178,7 @@ describe('item execution', () => {
   });
   it('removes task storage after the terminal write when preparation fails after allocating it', async () => {
     const { store, runner, executor, log } = setup({ snapshotError: new Error('declared link goes through a link') });
-    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Preparation failed: declared link goes through a link' });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Preparation failed: "declared link goes through a link"' });
     expect(log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after failed']);
     expect(runner.status(identity).unresolved).toBeNull();
     expect(store.getTask(identity).status).toBe('running');
@@ -674,5 +674,24 @@ describe('item execution', () => {
     const second = store.pauseForAmendment(identity, { revision: 1, snapshotId: later.id }, { item: 'P1', baseEntries: [], completedItems: ['P1'], outOfScopePaths: ['y'] }, { owed: true });
     expect(store.checkpointAtHead(identity, oid(500))?.id).toBe(second.id);
     expect(store.checkpointAtHead(identity, oid(100))?.id).toBe(first.checkpointId);
+  });
+  it('keeps needs amendment as a human gate for a safety finding', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs amendment'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/needs amendment; it moves to needs human/) });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+  });
+  it('picks the latest snapshot with a head', () => {
+    const { store } = setup();
+    const first = store.getSnapshot(identity);
+    const other = store.recordHistory(identity, { revision: 1, snapshotId: first.id }, first.base, oid(300), []);
+    const again = store.recordHistory(identity, { revision: 1, snapshotId: other.id }, first.base, first.head, []);
+    expect(store.snapshotWithHead(identity, first.head)).toBe(again.id);
+  });
+  it('sends a change report with an empty digest to needs human', async () => {
+    const { executor } = setup({ manifests: { P1: { ...manifest([change('a.ts')]), digest: '' } } });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: `${SAFETY_VIOLATION} The change report has no digest.` });
   });
 });

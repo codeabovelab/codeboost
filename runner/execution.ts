@@ -78,7 +78,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined };
       const prepared = { clone: ws.clone, vendor, approvedArgv: request.approvedArgv, private: data };
       try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredPaths, signal); }
-      catch (error) { throw new PreparationFailure(error, prepared); }
+      // D's text can name paths an earlier item's agent created: quote it (AGENTS.md).
+      catch (error) { throw new PreparationFailure(new Error(JSON.stringify(error instanceof Error ? error.message : String(error)), { cause: error }), prepared); }
       return prepared;
     },
     async cleanupPreparation() { /* host-side files belong to D's materialize; task storage waits for release */ },

@@ -88,6 +88,29 @@ describe('post-run audit', () => {
     for (const path of ['x\\.git\\hooks\\post-checkout', 'a/b\\.GIT'])
       expect(auditRun(item, manifest([file(path, { kind: 'add', oldType: undefined })]), exact), path).toMatchObject({ kind: 'violation' });
   });
+  it('refuses bad link targets: .git behind a backslash or cancelled by .., empty, or with a NUL', () => {
+    const link = (target: string) => manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]);
+    expect(auditRun(item, link('sub\\.git\\config'), exact)).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
+    expect(auditRun(item, link('.git/../src/retry.ts'), exact)).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
+    for (const target of ['', 'src/re\0try.ts'])
+      expect(auditRun(item, link(target), exact), JSON.stringify(target)).toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": empty or invalid target.'] });
+  });
+  it('refuses a NUL in a path, and a directory, other or gitlink old entry', () => {
+    expect(auditRun(item, manifest([file('src/re\0try.ts')]), exact)).toMatchObject({ kind: 'violation' });
+    expect(auditRun(item, manifest([file('build', { kind: 'delete', oldType: 'directory', newType: undefined })]), exact))
+      .toEqual({ kind: 'violation', violations: ['Unexpected directory entry: "build".'] });
+    expect(auditRun(item, manifest([file('fifo', { kind: 'delete', oldType: 'other', newType: undefined })]), exact))
+      .toEqual({ kind: 'violation', violations: ['Unexpected other entry: "fifo".'] });
+    expect(auditRun(item, manifest([file('vendor/lib', { kind: 'delete', oldType: 'gitlink', newType: undefined })]), exact))
+      .toEqual({ kind: 'violation', violations: ['Plan items cannot change gitlinks: "vendor/lib".'] });
+  });
+  it('covers the whole HFS ignorable ranges, and cuts a quoted path at 300 characters', () => {
+    for (const mark of ['\u200c', '\u200f', '\u202a', '\u202e', '\u206a', '\u206f', '\ufeff'])
+      expect(auditRun(item, manifest([file(`a/.gi${mark}t`, { kind: 'add', oldType: undefined })]), exact), JSON.stringify(mark)).toMatchObject({ kind: 'violation' });
+    const long = `${'x'.repeat(400)}/.git`;
+    const outcome = auditRun(item, manifest([file(long, { kind: 'add', oldType: undefined })]), exact) as { violations: string[] };
+    expect(outcome.violations[0]).toBe(`The agent changed ${JSON.stringify(`${long.slice(0, 300)}…`)} under .git.`);
+  });
   it('trusts D\'s underGit flag on its own', () => {
     expect(auditRun(item, manifest([file('src/retry.ts', { underGit: true })]), exact)).toEqual({ kind: 'violation', violations: ['The agent changed "src/retry.ts" under .git.'] });
   });

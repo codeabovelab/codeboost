@@ -86,6 +86,8 @@ function malformed(manifest: ChangeManifest): string | null {
 function unsafeLinkTarget(linkPath: string, target: string): string | null {
   if (!target || target.includes('\0')) return 'empty or invalid target';
   if (target.startsWith('/')) return 'absolute target';
+  // Checked as written too: a `.git` part that a later `..` cancels (`.git/../src`) still names the metadata on the way.
+  if (target.split(/[/\\]/).some(isDotGit)) return 'target enters .git';
   // A trailing slash names the same directory: `./` and `a/../` are the root, like `.`.
   const resolved = posix.normalize(posix.join(posix.dirname(linkPath), target)).replace(/\/+$/, '') || '.';
   if (resolved === '..' || resolved.startsWith('../')) return 'target leaves the repository';
