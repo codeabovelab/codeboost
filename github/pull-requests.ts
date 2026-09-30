@@ -1,5 +1,6 @@
 import { ghEnvironment } from './gh-env.ts';
 import { runWithInput } from './run-with-input.ts';
+import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 
 /** A `gh` runner that can also write a request body to stdin (`gh api --input -`). */
 export type RunGhWithInput = (args: readonly string[], options?: { signal?: AbortSignal; input?: string }) => Promise<string>;
@@ -26,11 +27,23 @@ export interface PullRequestGateway {
   /** Turns an open PR codeboost opened back into a draft; a no-op for a draft. */
   markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
+/**
+ * GitHub refused a draft because the repository does not support draft PRs (for example a private repository on the
+ * Free plan). A definite refusal: nothing was created or changed.
+ */
+export class DraftsUnsupported extends Error {}
+const DRAFTS_UNSUPPORTED = /draft pull requests? (?:are|is) not supported/i;
+/** Runs a GitHub call that asks for a draft, turning GitHub's "not supported" refusal into DraftsUnsupported. */
+async function draftCall<T>(call: () => Promise<T>): Promise<T> {
+  try { return await call(); }
+  catch (error) {
+    if (error instanceof Error && DRAFTS_UNSUPPORTED.test(error.message)) throw new DraftsUnsupported('This repository does not support draft pull requests.');
+    throw error;
+  }
+}
 /** GitHub updates a PR's head a moment after a push; the read-back waits up to this many polls for the pushed head. */
 export const HEAD_POLLS = 5, HEAD_POLL_MS = 500;
 
-const SHA = /^[a-f0-9]{40}$/;
-const BRANCH = /^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/;
 
 /**
  * GitHub CLI adapter for opening a task's PR. All arguments are literal argv; no shell is involved. The title and
@@ -40,7 +53,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
   readonly repository: string;
   readonly run: RunGhWithInput;
   constructor(config: { repository: string }, run?: RunGhWithInput) {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository)) throw new Error('A GitHub repository is required to open pull requests.');
+    if (!REPOSITORY.test(config.repository)) throw new Error('A GitHub repository is required to open pull requests.');
     this.repository = config.repository;
     this.run = run ?? ((args, options) => runWithInput('gh', args, { input: options?.input, timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
   }
@@ -73,8 +86,9 @@ export class GhPullRequestGateway implements PullRequestGateway {
   async open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
     if (!input.body.includes(input.marker)) throw new Error('The pull request description must carry its marker.');
-    const response = await this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
+    const post = () => this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
       { title: input.title, body: input.body, head: input.headBranch, base: input.base, draft: input.draft });
+    const response = input.draft ? await draftCall(post) : await post();
     const { body, ...pr } = this.#pull(response, input);
     if (!body.includes(input.marker)) throw new Error('GitHub returned a pull request without its marker.');
     return pr;
@@ -103,7 +117,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     if (patched.number !== number || !patched.body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
-    else if (input.draft && !patched.draft) await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
+    else if (input.draft && !patched.draft) await draftCall(() => this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal }));
     const wantDraft = input.ready ? false : input.draft ? true : undefined;
     const pr = await this.#readBack(number, input, found => (input.headSha === undefined || found.headSha === input.headSha) && (wantDraft === undefined || found.draft === wantDraft), signal);
     // A draft change GitHub has not applied fails the refresh, so it stays unconfirmed and the next publish repeats it.
@@ -111,14 +125,16 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return pr;
   }
 
+  /** The caller has just read the PR as ready, so this changes it straight away and reads the result back once. */
   async markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
-    const current = await this.#readBack(number, input, () => true, signal);
-    if (current.draft) return current;
-    await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
+    let refused: unknown = null;
+    try { await draftCall(() => this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal })); }
+    catch (error) { if (error instanceof DraftsUnsupported || signal?.aborted) throw error; refused = error; }
     const pr = await this.#readBack(number, input, found => found.draft, signal);
-    if (!pr.draft) throw new Error('GitHub did not turn the pull request into a draft.');
+    // A refusal because the PR had meanwhile become a draft is success; otherwise the change did not apply.
+    if (!pr.draft) throw refused ?? new Error('GitHub did not turn the pull request into a draft.');
     return pr;
   }
 

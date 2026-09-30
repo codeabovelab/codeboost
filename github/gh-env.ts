@@ -9,11 +9,14 @@ export const GH_ENV_ALLOWLIST = [
   // On Linux, gh reads a token kept in the system keyring over the D-Bus session bus.
   'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
   'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
+  // Windows: process creation, gh's config and credential store, and executable lookup.
+  'SYSTEMROOT', 'SystemRoot', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'PATHEXT', 'COMSPEC',
 ] as const;
 
-export function ghEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
+export function ghEnvironment(source: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
   for (const name of GH_ENV_ALLOWLIST) if (source[name] !== undefined) env[name] = source[name];
   // Never prompt, open a pager or check for updates inside a server.
-  return { ...env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_PAGER: 'cat', NO_COLOR: '1' };
+  // `cat` does not exist on Windows; there an empty GH_PAGER turns the pager off.
+  return { ...env, GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_PAGER: platform === 'win32' ? '' : 'cat', NO_COLOR: '1' };
 }

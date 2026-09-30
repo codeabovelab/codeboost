@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { pullRequestBody, pullRequestTitle } from '../core/pull-request-body.ts';
 import type { AlreadyFixedGateway, AlreadyFixedResult } from '../github/already-fixed.ts';
-import type { PullRequestGateway } from '../github/pull-requests.ts';
+import { DraftsUnsupported, type PullRequestGateway } from '../github/pull-requests.ts';
 import { GuardRefusal } from './lifecycle.ts';
 import type { Store, TaskPullRequest } from './store.ts';
 
@@ -24,9 +24,15 @@ export class OpeningUnsettled extends Error {}
 export const DEFAULT_SETTLE_MS = 10 * 60_000;
 export type PublishOutcome =
   | { kind: 'opened'; number: number; url: string; draft: boolean; status: string }
-  | { kind: 'possibly already fixed'; result: AlreadyFixedResult }
+  /** `leftReady`: the task's earlier PR could not be made a draft because the repository does not support drafts. */
+  | { kind: 'possibly already fixed'; result: AlreadyFixedResult; leftReady?: number }
   /** A needs-human task whose check matched: no draft PR is opened, and the task stays in needs human. */
-  | { kind: 'draft skipped'; result: AlreadyFixedResult }
+  | { kind: 'draft skipped'; result: AlreadyFixedResult; leftReady?: number }
+  /**
+   * The repository does not support draft PRs, so a needs-human task gets none (a ready PR would invite review of work
+   * that needs a person). `number` is the task's existing PR, left as it was, if there is one. Nothing is left in flight.
+   */
+  | { kind: 'draft unsupported'; number: number | null }
   /** The task head is its base: there is nothing to open a PR for. A running task moves to needs human. */
   | { kind: 'no changes' };
 
@@ -104,33 +110,56 @@ export class PullRequestPublisher {
     // means this publish is stale and must not touch the current generation's PR.
     const needsDraft = result.outcome !== 'clear' && earlier && live && !live.draft;
     if (needsDraft) this.#store.assertUnchangedSince(identity, { stateVersion: task.stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
-    const drafted = needsDraft
-      ? await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal) : null;
+    let drafted = null, leftReady: number | undefined;
+    if (needsDraft) {
+      try { drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal); }
+      catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
+    }
     signal?.throwIfAborted();
     const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });
     if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft);
-    if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result } : { kind: 'possibly already fixed', result };
-    // No await since recordAlreadyFixed, whose transaction re-read the task: the push follows it directly.
-    await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
-    signal?.throwIfAborted();
+    const ready = leftReady === undefined ? {} : { leftReady };
+    if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result, ...ready } : { kind: 'possibly already fixed', result, ...ready };
     if (earlier && live) {
+      // The push is a refresh's first GitHub write (it moves the open PR's head), so the refresh is recorded before it,
+      // with no await since recordAlreadyFixed. A task change during the push then cannot strand a half-updated PR.
       const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft,
         ...(earlier.state === 'abandoned' ? { adopt: { number: live.number, url: live.url } } : {}) });
-      const pr = await this.#pulls.refresh(live.number, {
-        base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
-        title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
-      }, signal);
-      const status = this.#store.recordPullRequestOpened(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
+      await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+      signal?.throwIfAborted();
+      let pr;
+      try {
+        pr = await this.#pulls.refresh(live.number, {
+          base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
+          title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
+        }, signal);
+      } catch (error) {
+        if (!(error instanceof DraftsUnsupported)) throw error;
+        this.#store.abandonRefresh(identity, earlier.openingId);
+        return { kind: 'draft unsupported', number: live.number };
+      }
+      const status = this.#store.recordRefreshConfirmed(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
       return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
     }
+    // No PR exists yet, so moving the branch changes nothing a reviewer sees.
+    await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+    signal?.throwIfAborted();
     // The last await before the irreversible call is behind us: beginPullRequest re-reads the task state in its transaction.
     const opening = this.#store.beginPullRequest(identity, {
       checkId: check.id, repository: this.#config.repository, base: this.#config.baseBranch, headBranch: branch, headSha: snapshot.head, draft,
     });
-    const pr = await this.#pulls.open({
-      base: opening.base, headBranch: branch, draft, marker: marker(opening.openingId),
-      title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(opening.openingId), problems: input.problems }),
-    }, signal);
+    let pr;
+    try {
+      pr = await this.#pulls.open({
+        base: opening.base, headBranch: branch, draft, marker: marker(opening.openingId),
+        title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(opening.openingId), problems: input.problems }),
+      }, signal);
+    } catch (error) {
+      if (!(error instanceof DraftsUnsupported)) throw error;
+      // A definite refusal: GitHub created nothing, so the opening is dropped rather than left to settle.
+      this.#store.abandonPullRequestOpening(identity, opening.openingId);
+      return { kind: 'draft unsupported', number: null };
+    }
     const status = this.#store.recordPullRequestOpened(identity, opening.openingId, pr);
     return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
   }

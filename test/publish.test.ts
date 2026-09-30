@@ -1,10 +1,10 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
 import { runWithInput } from '../github/run-with-input.ts';
-import { GhPullRequestGateway, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
+import { DraftsUnsupported, GhPullRequestGateway, type OpenPullRequestInput, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway, AlreadyFixedInput, AlreadyFixedResult } from '../github/already-fixed.ts';
 import { fenced, neutralizeReferences, pullRequestBody, pullRequestTitle, MAX_BODY } from '../core/pull-request-body.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -18,8 +18,11 @@ const config: PublishConfig = { repository: 'owner/repo', baseBranch: 'main' };
 const BRANCH = /^codeboost\/issue-12-task-42-[0-9a-f]{16}$/;
 
 /** A task whose last attempt settled while it runs, with head `oid(2)` over base `oid(1)` and one owned commit. */
+const stores: Store[] = [];
+afterEach(() => { for (const store of stores.splice(0)) store.close(); });
 function runningTask(options: { head?: string } = {}) {
   const store = new Store(':memory:');
+  stores.push(store);
   const head = options.head ?? oid(2);
   store.createPlan(JSON.stringify(plan), 'json', context, oid(1), head);
   if (head !== oid(1)) store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
@@ -34,7 +37,7 @@ function runningTask(options: { head?: string } = {}) {
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ? [...options.results] : [];
@@ -50,6 +53,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     async open(input) {
       log.push(`open ${input.draft ? 'draft' : 'ready'}`); opened.push(input);
       if (options.open) return options.open(input);
+      if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
       // Like GitHub: one open PR per branch.
       if ([...live].some(([, pr]) => !closed.has(pr.number))) throw new Error('HTTP 422: A pull request already exists.');
       const pr = { number: counter.value++, url: 'https://github.com/owner/repo/pull/1', headSha: store.getSnapshot(identity).head, draft: input.draft };
@@ -68,12 +72,14 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
+      if (options.draftsUnsupported) throw new DraftsUnsupported('no drafts');
       if (options.draftFails) throw new Error('timeout marking the PR a draft');
       const pr = { ...live.get(input.marker)!, draft: true }; live.set(input.marker, pr); return pr;
     },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
       if (options.refreshFails) throw new Error('timeout reading the PR back');
+      if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
       const pr = { ...live.get(input.marker)!, draft: options.draftAfterRefresh ?? input.draft, headSha: store.getSnapshot(identity).head };
       live.set(input.marker, pr); return pr;
     },
@@ -152,6 +158,15 @@ describe('opening the task PR', () => {
     expect(log).not.toContain('open ready');
     expect(store.getTask(identity).status).toBe('running');
   });
+  it('refuses to open the PR when a review note is added during the push', async () => {
+    const store = runningTask();
+    const { publisher, log } = harness(store, { push: async () => {
+      store.addReviewNote(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'P1', 'question', 'Why this file?');
+    } });
+    await expect(publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(log.some(line => line.startsWith('open'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toEqual([]);
+  });
   it('refuses to open when the head moved during the check', async () => {
     const store = runningTask();
     const gate: AlreadyFixedGateway = { async check() {
@@ -221,6 +236,35 @@ describe('PR records', () => {
     expect(() => store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: 'old', draft: false, result: { outcome: 'clear', baseHead: oid(9) } })).toThrow(/head changed/);
     store.beginPullRequest(identity, pr);
     expect(() => store.beginPullRequest(identity, pr)).toThrow(GuardRefusal);
+  });
+});
+
+describe('a repository without draft PRs', () => {
+  it('opens no PR for a needs-human task, drops the opening, and says why', async () => {
+    const store = runningTask();
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    const { publisher } = harness(store, { draftsUnsupported: true });
+    expect(await publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null });
+    expect(store.taskPullRequests(identity).map(pr => pr.state)).toEqual(['abandoned']);
+    expect(store.getTask(identity).status).toBe('needs human');
+    // Nothing is left in flight: the next publish does not wait for a settle time.
+    expect(await harness(store, { draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null });
+  });
+  it('leaves the existing ready PR as it is, and drops the unconfirmed refresh', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    rerun(store);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
+  });
+  it('reports a ready PR it could not make a draft when the check matches', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    rerun(store);
+    const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+    expect(await harness(store, { live, next, results: [found], draftsUnsupported: true }).publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed', leftReady: 100 });
+    expect(store.getTask(identity).status).toBe('possibly already fixed');
   });
 });
 
@@ -311,16 +355,20 @@ describe('recovering a lost opening', () => {
     expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
   });
-  it('does not update the PR when a review note is added during the push', async () => {
+  it('records the refresh before the push, so a task change during the push still completes the PR update without moving the task', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
     rerun(store);
+    let refreshRecordedAtPush: unknown = undefined;
     const again = harness(store, { live, next, push: async () => {
-      store.addReviewNote(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'P1', 'question', 'Why this file?');
+      refreshRecordedAtPush = store.taskPullRequests(identity)[0]!.refresh;
+      store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
     } });
-    await expect(again.publisher.publish(identity)).rejects.toThrow(/review changed/);
-    expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'running' });
+    expect(refreshRecordedAtPush).toMatchObject({ head: oid(3), draft: false });
+    expect(again.log.at(-1)).toBe('refresh 100 ready');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(3) }]);
   });
   it('runs one publish per task at a time, across publishers over the same Store', async () => {
     const store = runningTask();
@@ -539,6 +587,9 @@ describe('gh subprocess environment', () => {
     const env = ghEnvironment({ PATH: '/bin', GH_TOKEN: 't', AWS_SECRET_ACCESS_KEY: 'x', ANTHROPIC_API_KEY: 'y', HOME: '/h' });
     expect(env).toEqual({ PATH: '/bin', GH_TOKEN: 't', HOME: '/h', GH_PROMPT_DISABLED: '1', GH_NO_UPDATE_NOTIFIER: '1', GH_PAGER: 'cat', NO_COLOR: '1' });
     expect(GH_ENV_ALLOWLIST).not.toContain('ANTHROPIC_API_KEY' as never);
+    // Windows needs its system and profile directories, and has no `cat` for a pager.
+    expect(ghEnvironment({ SYSTEMROOT: 'C:\\Windows', APPDATA: 'A', LOCALAPPDATA: 'L', USERPROFILE: 'U', PATHEXT: '.EXE' }, 'win32'))
+      .toMatchObject({ SYSTEMROOT: 'C:\\Windows', APPDATA: 'A', LOCALAPPDATA: 'L', USERPROFILE: 'U', PATHEXT: '.EXE', GH_PAGER: '' });
     // Linux keyring sign-in needs the session bus.
     expect(ghEnvironment({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', XDG_RUNTIME_DIR: '/run/user/1' })).toMatchObject({ DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1/bus', XDG_RUNTIME_DIR: '/run/user/1' });
   });
@@ -613,9 +664,26 @@ describe('GitHub PR adapter', () => {
       calls.push([...args]); if (args[0] === 'pr') { draft = true; return ''; } return JSON.stringify(response({ draft }));
     });
     expect(await gh.markDraft(7, input)).toMatchObject({ draft: true });
-    expect(calls.filter(call => call[0] === 'pr')).toEqual([['pr', 'ready', '7', '--undo', '--repo', 'owner/repo']]);
-    await gh.markDraft(7, input);
-    expect(calls.filter(call => call[0] === 'pr')).toHaveLength(1);
+    // No read before the change: the caller has just read the PR as ready.
+    expect(calls.map(call => call[0] === 'pr' ? 'undo' : 'get')).toEqual(['undo', 'get']);
+    expect(calls[0]).toEqual(['pr', 'ready', '7', '--undo', '--repo', 'owner/repo']);
+    // A refusal because the PR already became a draft meanwhile is success.
+    const already = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { if (args[0] === 'pr') throw new Error('pull request #7 is already a draft'); return JSON.stringify(response({ draft: true })); });
+    expect(await already.markDraft(7, input)).toMatchObject({ draft: true });
+    // A real refusal is reported.
+    const refused = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { if (args[0] === 'pr') throw new Error('HTTP 403'); return JSON.stringify(response({ draft: false })); });
+    await expect(refused.markDraft(7, input)).rejects.toThrow('HTTP 403');
+  });
+  it('turns GitHub refusing drafts into DraftsUnsupported on open, refresh and markDraft', async () => {
+    const unsupported = new Error('gh: Draft pull requests are not supported in this repository. (HTTP 422)');
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => {
+      if (args[0] === 'pr' || args.includes('POST')) throw unsupported; return JSON.stringify(response({ draft: false }));
+    });
+    await expect(gh.open({ ...input, draft: true })).rejects.toBeInstanceOf(DraftsUnsupported);
+    await expect(gh.refresh(7, { ...input, draft: true, ready: false })).rejects.toBeInstanceOf(DraftsUnsupported);
+    await expect(gh.markDraft(7, input)).rejects.toBeInstanceOf(DraftsUnsupported);
+    // A ready PR is not a draft request, so the same text is not reinterpreted.
+    await expect(gh.open({ ...input, draft: false })).rejects.toBe(unsupported);
   });
   it('fails markDraft when GitHub never shows the PR as a draft', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })));

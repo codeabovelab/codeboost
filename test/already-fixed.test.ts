@@ -68,15 +68,28 @@ describe('the pre-PR already-fixed check', () => {
     const { gh } = gateway({ nodes: [cross(pr(7, 'OPEN', { repository: { nameWithOwner: 'fork/repo' } }))] });
     expect(await gh.check(input({ ownPullRequests: [7] }))).toMatchObject({ outcome: 'found', matches: [{ repository: 'fork/repo', number: 7 }] });
   });
-  it('reports an issue closed by someone else, and ignores one closed by an own PR or commit', async () => {
+  it("reports an issue closed by anything, including the task's own merged PR or its own commit on the default branch", async () => {
     expect(await gateway({ state: 'CLOSED', nodes: [closed(null)] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed' }] });
     expect(await gateway({ state: 'CLOSED', nodes: [closed(pr(9))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: `${repo}#9` }] });
-    expect(await gateway({ state: 'CLOSED', nodes: [closed(pr(9))] }).gh.check(input({ ownPullRequests: [9] }))).toMatchObject({ outcome: 'clear' });
-    expect(await gateway({ state: 'CLOSED', nodes: [closed({ __typename: 'Commit', oid: sha(3) })] }).gh.check(input({ ownCommits: new Set([sha(3)]) }))).toMatchObject({ outcome: 'clear' });
-    // Only the latest close counts: an earlier close by someone else was followed by a reopen and an own close.
-    expect(await gateway({ state: 'CLOSED', nodes: [closed(null), closed(pr(9))] }).gh.check(input({ ownPullRequests: [9] }))).toMatchObject({ outcome: 'clear' });
+    // A close by the task's own PR means that PR merged: the issue is fixed, so it is a match, labelled as own.
+    expect(await gateway({ state: 'CLOSED', nodes: [closed(pr(9))] }).gh.check(input({ ownPullRequests: [9] }))).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: `${repo}#9 (this task's own PR, already merged)` }] });
+    expect(await gateway({ state: 'CLOSED', nodes: [closed({ __typename: 'Commit', oid: sha(3) })] }).gh.check(input({ ownCommits: new Set([sha(3)]) }))).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: expect.stringContaining("this task's own commit") }] });
+    // Only the latest close counts.
+    expect(await gateway({ state: 'CLOSED', nodes: [closed(null), closed(pr(9))] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: `${repo}#9` }] });
     // A reopened issue does not count as closed.
     expect(await gateway({ state: 'OPEN', nodes: [closed(null)] }).gh.check(input())).toMatchObject({ outcome: 'clear' });
+  });
+  it("counts the task's own merged PR as a match, while its own open PR is still excluded", async () => {
+    expect(await gateway({ nodes: [cross(pr(7, 'MERGED'))] }).gh.check(input({ ownPullRequests: [7] }))).toMatchObject({ outcome: 'found', matches: [{ number: 7, state: 'MERGED' }] });
+    expect(await gateway({ nodes: [cross(pr(7, 'OPEN'))] }).gh.check(input({ ownPullRequests: [7] }))).toMatchObject({ outcome: 'clear' });
+  });
+  it('cuts a long commit subject without splitting a surrogate pair', async () => {
+    // The second emoji straddles unit 200 (units 199–200), so a plain slice would split it.
+    const subject = `Fix #12 ${'a'.repeat(191)}😀😀😀`;
+    const result = await gateway({ commits: [{ sha: sha(5), message: subject }] }).gh.check(input());
+    const cut = (result as { matches: { subject: string }[] }).matches[0]!.subject;
+    expect(cut.length).toBeLessThanOrEqual(200);
+    expect(cut).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])/);
   });
   it('treats an issue closed by a Projects workflow as closed by someone else, not as unreadable', async () => {
     expect(await gateway({ state: 'CLOSED', nodes: [closed({ __typename: 'ProjectV2', number: 3 })] }).gh.check(input())).toMatchObject({ outcome: 'found', matches: [{ kind: 'closed', by: 'a project workflow' }] });

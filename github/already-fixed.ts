@@ -1,6 +1,8 @@
 import type { RunGh } from './merge.ts';
 import { ghEnvironment } from './gh-env.ts';
 import { runWithInput } from './run-with-input.ts';
+import { BRANCH, REPOSITORY, SHA } from './validate.ts';
+import { cutText } from '../core/text.ts';
 
 /**
  * The pre-PR "already fixed" check (design, "Checking whether the issue is already fixed"). It reports a match when
@@ -60,7 +62,6 @@ const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
 }`;
 
 class Unknown extends Error {}
-const SHA = /^[a-f0-9]{40}$/;
 const object = (value: unknown, label: string): Record<string, unknown> => {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Unknown(`GitHub returned an invalid ${label}.`);
   return value as Record<string, unknown>;
@@ -71,7 +72,7 @@ const positive = (value: unknown, label: string): number => {
 };
 const repositoryName = (value: unknown): string => {
   const name = object(value, 'repository').nameWithOwner;
-  if (typeof name !== 'string' || !/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(name)) throw new Unknown('GitHub returned an invalid repository name.');
+  if (typeof name !== 'string' || !REPOSITORY.test(name)) throw new Unknown('GitHub returned an invalid repository name.');
   return name;
 };
 const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -96,7 +97,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
   readonly run: RunGh;
   readonly deadlineMs: number;
   constructor(config: GhAlreadyFixedConfig, run?: RunGh) {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository)) throw new Error('A GitHub repository is required for the already-fixed check.');
+    if (!REPOSITORY.test(config.repository)) throw new Error('A GitHub repository is required for the already-fixed check.');
     if (config.deadlineMs !== undefined && (!Number.isSafeInteger(config.deadlineMs) || config.deadlineMs < 1)) throw new Error('Invalid check deadline.');
     this.repository = config.repository;
     this.deadlineMs = config.deadlineMs ?? DEFAULT_CHECK_DEADLINE_MS;
@@ -113,7 +114,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
   async check(input: AlreadyFixedInput, signal?: AbortSignal): Promise<AlreadyFixedResult> {
     if (!Number.isSafeInteger(input.issue) || input.issue < 1) throw new Error('Invalid issue number.');
     if (!SHA.test(input.taskBase)) throw new Error('Invalid task base commit.');
-    if (!/^(?!-)(?!.*\.\.)(?!.*\/\/)[A-Za-z0-9._/-]+(?<![./])$/.test(input.baseBranch)) throw new Error('Invalid base branch name.');
+    if (!BRANCH.test(input.baseBranch)) throw new Error('Invalid base branch name.');
     if (input.ownPullRequests.some(number => !Number.isSafeInteger(number) || number < 1)) throw new Error('Invalid pull request number.');
     // Every stage shares one deadline; reaching it aborts the running `gh` call and makes the check unknown.
     // The two stages are independent and run together. The first failure stops the other, and the check still waits for
@@ -128,7 +129,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       const [matches, { baseHead, commits }] = settled.map(result => (result as PromiseFulfilledResult<unknown>).value) as [AlreadyFixedMatch[], { baseHead: string; commits: { sha: string; message: string }[] }];
       for (const commit of commits) {
         if (input.ownCommits.has(commit.sha) || !mentionsIssue(commit.message, this.repository, input.issue)) continue;
-        matches.push({ kind: 'commit', sha: commit.sha, subject: commit.message.split('\n', 1)[0]!.slice(0, 200) });
+        matches.push({ kind: 'commit', sha: commit.sha, subject: cutText(commit.message.split('\n', 1)[0]!, 200) });
       }
       return matches.length ? { outcome: 'found', baseHead, matches } : { outcome: 'clear', baseHead };
     } catch (error) {
@@ -164,11 +165,12 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
         if (node.closer === null) { lastCloser = 'a person, without a linked PR or commit'; continue; }
         const closer = object(node.closer, 'closer');
         if (closer.__typename === 'PullRequest') {
+          // A close always counts, even by this task's own PR or commit: that PR merged, so the issue is fixed.
           const repo = repositoryName(closer.repository), number = positive(closer.number, 'pull request number');
-          lastCloser = isOwn(repo, number) ? null : `${repo}#${number}`;
+          lastCloser = isOwn(repo, number) ? `${repo}#${number} (this task's own PR, already merged)` : `${repo}#${number}`;
         } else if (closer.__typename === 'Commit') {
           if (typeof closer.oid !== 'string' || !SHA.test(closer.oid)) throw new Unknown('GitHub returned an invalid closing commit.');
-          lastCloser = input.ownCommits.has(closer.oid) ? null : `commit ${closer.oid}`;
+          lastCloser = input.ownCommits.has(closer.oid) ? `commit ${closer.oid} (this task's own commit, already on the default branch)` : `commit ${closer.oid}`;
         } else if (closer.__typename === 'ProjectV2') lastCloser = 'a project workflow';
         else throw new Unknown('GitHub returned an unknown closer.');
         continue;
@@ -180,7 +182,8 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
       if (source.__typename !== 'PullRequest') throw new Unknown('GitHub returned an unknown linked item.');
       const repo = repositoryName(source.repository), number = positive(source.number, 'pull request number');
       if (!['OPEN', 'CLOSED', 'MERGED'].includes(source.state as string) || typeof source.isDraft !== 'boolean') throw new Unknown('GitHub returned an invalid pull request state.');
-      if (isOwn(repo, number)) continue;
+      // The task's own open PR is not a match; its own merged PR is: the fix is already in.
+      if (isOwn(repo, number) && source.state !== 'MERGED') continue;
       const key = `${repo.toLowerCase()}#${number}`;
       const match: AlreadyFixedMatch | null = source.state === 'CLOSED' ? null : { kind: 'pull request', repository: repo, number, state: source.state as 'OPEN' | 'MERGED', draft: source.isDraft };
       if (node.__typename === 'DisconnectedEvent') connected.set(key, null);

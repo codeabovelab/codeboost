@@ -29,8 +29,8 @@ The check matches when any of these is true:
 
 | Signal | Source | Not a match |
 |---|---|---|
-| Something other than this task closed the issue. | The issue state and its latest close event (GraphQL). The closer is a PR, a commit, or a Projects workflow (closed by the project, so a match). | Closed by an own PR or an own commit. A reopened issue. |
-| Another open or merged PR links to the issue. | Cross-reference events, and manual links: "connected" and "disconnected" events replayed in order. | Own PRs, matched by repository and number. Closed, unmerged PRs. A manual link whose latest event is a disconnect. |
+| The issue is closed. | The issue state and its latest close event (GraphQL). The closer is a PR, a commit, or a Projects workflow. A close by the task's own PR or own commit also counts: it means that PR merged, so the fix is already in. | A reopened issue. |
+| Another open or merged PR links to the issue. | Cross-reference events, and manual links: "connected" and "disconnected" events replayed in order. | The task's own open PRs, matched by repository and number (its own merged PR is a match). Closed, unmerged PRs. A manual link whose latest event is a disconnect. |
 | A new commit on the base branch mentions the issue. | The commits from the task's base to the current base branch head. | Own commits. `#123` when the issue is `#12`. `other/repo#12`. |
 
 A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue URL. A PR in another repository that links the issue counts as a match. It is not excluded by number, because its number belongs to another repository.
@@ -54,7 +54,7 @@ Only one publish runs per task at a time; a second one is refused. A publish who
 2. **Status and no changes.** Refuse unless the task is running (or in needs human, for a draft). If the task head is its base, open nothing. A running task moves to needs human.
 3. **Find the earlier PR.** If the task has an opened or abandoned opening on the same branch, ask GitHub for the branch's open PR and which opening's marker it carries. A PR with an opened record's marker but another number is refused here, before the push. This comes before the check: an abandoned opening's PR links the issue and has no recorded number, so only its marker shows it is the task's own, and its number is added to the own PRs for the check.
 4. **Check.** Run the check. Record the result, and any status change, in one transaction. That transaction refuses if the task changed during the check.
-5. **Push.** Push, straight after the check's transaction with no await in between, the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
+5. **Push.** When the task already has an open PR, the refresh is recorded first (the push moves that PR's head), then the push runs; otherwise the push runs straight after the check's transaction with no await in between. Push the task head to `codeboost/issue-<issue>-<task slug>-<hash>`. The slug is readable but can collide. The hash is 16 hex characters of SHA-256 over the exact task identity, so two tasks never share a branch.
 6. **Re-read.** Right before the GitHub call, the Store confirms that the latest check is clear and that nothing changed since that check: same task state version, same review version (approvals, choices and notes), same snapshot, same head.
 7. **Open or reuse.** Open a new PR, or update the open earlier PR (found in step 3 with the markers of every earlier opening, abandoned ones included; an abandoned opening's PR is adopted in the same transaction that records the update) and mark it ready (or a draft). An update is recorded before it starts. If its confirmation is lost, the next publish drops the record in step 1 and repeats the update after a new check; the update is idempotent. Record the result.
 
@@ -88,6 +88,16 @@ Fences do not protect commit messages. A squash or merge commit can carry the PR
 Titles and problems are cut by code point, never inside a surrogate pair. An empty summary becomes `codeboost plan`.
 
 The description stays under 60,000 characters. If the full plan is too long, only item IDs and titles are listed. At most 20 open problems are shown, each cut to 2,000 characters.
+
+## Repositories without draft PRs
+
+Some repositories do not support draft PRs (for example private repositories on GitHub Free). GitHub's refusal is a definite outcome, so nothing is left in flight:
+
+| Case | Result |
+|---|---|
+| A needs-human task has no PR yet | No PR is opened; the opening is marked `abandoned`; publish returns `draft unsupported`. A ready PR is never opened instead, because it would invite review of work that needs a person. |
+| A needs-human task has an open ready PR | The update is dropped; the PR is left as it was; publish returns `draft unsupported` with its number. |
+| The check matches and the earlier PR is ready | The result is recorded as usual; publish reports the PR it could not make a draft as `leftReady`. |
 
 ## What this slice does not do
 
