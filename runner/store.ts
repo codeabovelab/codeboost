@@ -949,6 +949,9 @@ export class Store {
     if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
     if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
     if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    // Interrupted work waiting to be requeued, or a rebase in progress, is not finished work to publish.
+    if (task.requeue_pending === 1) throw new GuardRefusal('The task has interrupted work waiting to be requeued.');
+    if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
   }
   /**
    * Records a pre-PR check. A match, or a check that could not be completed, moves a running task to possibly already
@@ -1009,14 +1012,39 @@ export class Store {
       return version;
     });
   }
-  /** An unconfirmed update is dropped; the next publish checks again and repeats it (the update is idempotent). */
-  abandonRefresh(identity: PlanIdentity, openingId: string): void {
+  /**
+   * Settles an update whose confirmation was lost. What GitHub shows now (`observed`, or null when the PR is no longer
+   * open) replaces the recorded draft flag and head, so a change that landed is not forgotten; then the in-flight record
+   * is cleared. The next publish checks again and repeats the update (it is idempotent).
+   */
+  settleUnconfirmedRefresh(identity: PlanIdentity, openingId: string, observed: { number: number; draft: boolean; headSha: string } | null): void {
     const key = identityKey(identity);
     this.#transaction(() => {
-      if (this.#run("UPDATE task_pull_requests SET refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL",
-        new Date().toISOString(), key, openingId).changes !== 1) throw new GuardRefusal('No update of this pull request is in flight.');
+      const row = this.#get("SELECT number FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL", key, openingId);
+      if (!row) throw new GuardRefusal('No update of this pull request is in flight.');
+      if (observed && observed.number === row.number)
+        this.#run('UPDATE task_pull_requests SET draft=?, head_sha=? WHERE opening_id=?', observed.draft ? 1 : 0, observed.headSha, openingId);
+      this.#run("UPDATE task_pull_requests SET refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE opening_id=?",
+        new Date().toISOString(), openingId);
       this.#touch(key);
     });
+  }
+  /**
+   * Right before an update's GitHub calls, after the push's await: the task and its review are still exactly as the
+   * update recorded them, and the task is still publishable. A change during the push leaves the update in flight.
+   */
+  assertRefreshCurrent(identity: PlanIdentity, openingId: string, draft: boolean): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const row = this.#get("SELECT refresh_version, refresh_review_version FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL", key, openingId);
+      if (!row) throw new GuardRefusal('No update of this pull request is in flight.');
+      this.#assertPublishable(key, this.#task(key), row.refresh_version as number, draft);
+      if (this.#current(key).review_version !== row.refresh_review_version) throw new GuardRefusal('The review changed after the check. Reload before writing.');
+    });
+  }
+  #assertVersions(key: string, expected: { stateVersion: number; reviewVersion: number }): void {
+    if (this.#task(key).state_version !== expected.stateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+    if (this.#current(key).review_version !== expected.reviewVersion) throw new GuardRefusal('The review changed. Reload before writing.');
   }
   #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
     const key = identityKey(identity), task = this.#task(key), check = this.latestAlreadyFixed(identity);
@@ -1052,15 +1080,19 @@ export class Store {
       const row = find();
       if (!row) throw new GuardRefusal(missing);
       const { head, owned, ownedReview } = expected(row);
+      // The record keeps the head GitHub reports, which may differ from the head that was pushed.
       this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE opening_id=?",
-        pr.number, pr.url, pr.draft ? 1 : 0, head, new Date().toISOString(), openingId);
+        pr.number, pr.url, pr.draft ? 1 : 0, pr.headSha, new Date().toISOString(), openingId);
       const task = this.#task(key);
       // Every status change and every admission increases the state version, so an unchanged version means the task is
       // still in the status the opening or refresh was guarded for with no attempt active. Review input advances only the
       // review version, so that must be unchanged too. A needs-human task stays there whatever the PR looks like; only a
-      // running task can move to in review.
-      if (task.state_version === owned && this.#current(key).review_version === ownedReview && task.status === 'running') {
-        this.#run('UPDATE tasks SET status=? WHERE plan_key=?', pr.headSha === head && !pr.draft ? 'in review' : 'needs human', key);
+      // running task can move to in review, and only with a ready PR at the head it pushed. A PR showing another head
+      // (GitHub has not caught up, or someone else pushed) leaves the task running; the publisher makes it a draft and
+      // the next publish reconciles it.
+      if (task.state_version === owned && this.#current(key).review_version === ownedReview && task.status === 'running'
+        && pr.headSha === head && !pr.draft) {
+        this.#run("UPDATE tasks SET status='in review' WHERE plan_key=?", key);
       }
       this.#touch(key);
       return this.#task(key).status as TaskStatus;
@@ -1071,11 +1103,11 @@ export class Store {
    * it can be reused, closed or cleaned up. The task status does not change. Guarded by the state version the caller
    * read; returns the new state version.
    */
-  adoptOpening(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; draft: boolean }, expectedStateVersion: number): number {
+  adoptOpening(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; draft: boolean }, expected: { stateVersion: number; reviewVersion: number }): number {
     if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
     const key = identityKey(identity);
     return this.#transaction(() => {
-      if (this.#task(key).state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      this.#assertVersions(key, expected);
       if (this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='abandoned'",
         pr.number, pr.url, pr.draft ? 1 : 0, new Date().toISOString(), key, openingId).changes !== 1) throw new GuardRefusal('No abandoned opening with this ID.');
       this.#touch(key);
@@ -1098,10 +1130,10 @@ export class Store {
    * GitHub but was never recorded (a crash or cancel right after the call). Guarded by the state version the caller
    * read, so a task change is still noticed; returns the new state version.
    */
-  recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean, expectedStateVersion: number): number {
+  recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean, expected: { stateVersion: number; reviewVersion: number }): number {
     const key = identityKey(identity);
     return this.#transaction(() => {
-      if (this.#task(key).state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      this.#assertVersions(key, expected);
       if (this.#run("UPDATE task_pull_requests SET draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='opened' AND number=?",
         draft ? 1 : 0, new Date().toISOString(), key, openingId, number).changes !== 1) throw new GuardRefusal('Unknown pull request.');
       this.#touch(key);

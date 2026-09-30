@@ -11,7 +11,7 @@ const disconnected = (subject: unknown) => ({ __typename: 'DisconnectedEvent', s
 const closed = (closer: unknown) => ({ __typename: 'ClosedEvent', closer });
 
 interface Fake { state?: string; nodes?: unknown[]; totalCount?: number; hasNextPage?: boolean; errors?: unknown; nameWithOwner?: string;
-  commits?: { sha: string; message: string }[]; status?: string; totalCommits?: number; baseRef?: string; fail?: RegExp }
+  commits?: { sha: string; message: string }[]; status?: string; totalCommits?: number; totalCommitsLater?: number; baseRef?: string; fail?: RegExp }
 function gateway(fake: Fake = {}) {
   const calls: string[][] = [];
   const nodes = fake.nodes ?? [];
@@ -27,7 +27,7 @@ function gateway(fake: Fake = {}) {
     });
     if (joined.includes('/git/ref/heads/')) return JSON.stringify({ ref: `refs/heads/${fake.baseRef ?? 'main'}`, object: { sha: sha(99) } });
     const page = Number(/[?&]page=(\d+)/.exec(joined)![1]);
-    return JSON.stringify({ status: fake.status ?? 'ahead', total_commits: fake.totalCommits ?? commits.length,
+    return JSON.stringify({ status: fake.status ?? 'ahead', total_commits: page > 1 && fake.totalCommitsLater !== undefined ? fake.totalCommitsLater : fake.totalCommits ?? commits.length,
       commits: commits.slice((page - 1) * 100, page * 100).map(c => ({ sha: c.sha, commit: { message: c.message } })) });
   };
   return { calls, gh: new GhAlreadyFixedGateway({ repository: repo }, run) };
@@ -120,6 +120,9 @@ describe('the pre-PR already-fixed check', () => {
       { totalCount: 101 }, { hasNextPage: true }, { nodes: [cross(pr(1))], totalCount: 2 },
       { commits: Array.from({ length: MAX_BASE_COMMITS + 1 }, (_, i) => ({ sha: sha(2000 + i), message: 'x' })) }, { status: 'diverged' }, { status: 'behind' },
       { commits: [{ sha: sha(5), message: 'x' }], totalCommits: 2 },
+      // The base branch moved between pages (the count changed), and a page longer than the reported total.
+      { commits: Array.from({ length: 150 }, (_, i) => ({ sha: sha(3000 + i), message: 'x' })), totalCommitsLater: 151 },
+      { commits: Array.from({ length: 160 }, (_, i) => ({ sha: sha(3000 + i), message: 'x' })), totalCommits: 120 },
       { commits: [{ sha: sha(5), message: 'x' }, { sha: sha(5), message: 'x' }] },
       { errors: [{ message: 'rate limited' }] }, { nameWithOwner: 'other/repo' }, { baseRef: 'other' },
       { state: 'CLOSED' }, { nodes: [cross(null)] }, { nodes: [cross({ __typename: 'Discussion' })] },

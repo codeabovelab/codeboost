@@ -143,7 +143,23 @@ describe('opening the task PR', () => {
     const store = runningTask({ head: oid(1) });
     const { publisher, log } = harness(store);
     expect(await publisher.publish(identity)).toEqual({ kind: 'no changes' });
-    expect(log).toEqual([]);
+    // The branch is looked up first (a foreign PR there would be refused); nothing is checked, pushed or opened.
+    expect(log).toEqual(['find ']);
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('turns the earlier ready PR into a draft when a rerun changes nothing', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    // The task is sent back, reruns, and its head goes back to its base.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
+    const again = harness(store, { live, next });
+    expect(await again.publisher.publish(identity)).toEqual({ kind: 'no changes' });
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
     expect(store.getTask(identity).status).toBe('needs human');
   });
   it('refuses to open when the task changed after the check (a cancel during the push)', async () => {
@@ -220,10 +236,17 @@ describe('opening the task PR', () => {
     expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 6, status: 'running' });
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 6 }]);
   });
-  it('moves to needs human when the branch head moved before GitHub read it', async () => {
-    const store = runningTask();
-    const { publisher } = harness(store, { open: async input => ({ number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(77), draft: input.draft }) });
-    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', status: 'needs human' });
+  it('keeps the task running and makes the PR a draft when GitHub shows another head than the one pushed', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher, log } = harness(store, { live, open: async input => {
+      const pr = { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(77), draft: input.draft };
+      live.set(input.marker, pr); return pr;
+    } });
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 5, draft: true, status: 'running' });
+    expect(log.at(-1)).toBe('draft 5');
+    // The record keeps the head GitHub reported, not the head that was pushed.
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5, draft: true, headSha: oid(77) }]);
+    expect(store.getTask(identity).status).toBe('running');
   });
 });
 
@@ -288,6 +311,92 @@ describe('review changes during GitHub calls', () => {
     // The recovered opening was recorded, then publishing continued: a new check and a refresh under current review state.
     expect(again.log).toContain('check');
     expect(again.log.at(-1)).toBe('refresh 100 ready');
+  });
+});
+
+describe('guards found by the independent review', () => {
+  const note = (store: Store) => store.addReviewNote(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'P1', 'question', 'Why this file?');
+  const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+  it('does not draft the PR when the review changed during the check', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    rerun(store);
+    const gate = harness(store, { live, next });
+    const publisher = new PullRequestPublisher(store, { checks: { async check() { note(store); return found; } }, pulls: gate.pulls, pusher: { async push() {} } }, config);
+    await expect(publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(gate.log.some(line => line.startsWith('draft'))).toBe(false);
+  });
+  it('does not update the PR when the review changed during the push', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    const again = harness(store, { live, next, push: async () => { note(store); } });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
+  });
+  it('does not adopt or repair records when the review changed during the lookup', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: true });
+    rerun(store);
+    await expect(harness(store, { live, next, onFind: () => note(store) }).publisher.publish(identity)).rejects.toThrow(/review changed/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
+  });
+  it('records what GitHub shows for an update whose confirmation was lost, then settles it', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    // The ready update lands on GitHub, but its read-back fails.
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false, headSha: oid(3) });
+    // Then the task is cancelled: the next publish refuses on status, but first records what GitHub shows.
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false, headSha: oid(3), refresh: null }]);
+  });
+  it('refuses to publish while an attempt is active', async () => {
+    const store = runningTask();
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    expect(attempt).toBeTruthy();
+    const { publisher, log } = harness(store);
+    await expect(publisher.publish(identity)).rejects.toThrow(/attempt is still active/);
+    expect(log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
+  });
+  it('refuses to publish a task with interrupted work waiting to be requeued, or with a rebase in progress', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs'), { tmpdir } = await import('node:os'), { join } = await import('node:path');
+    const { DatabaseSync } = await import('node:sqlite');
+    for (const column of ["requeue_pending=1", "rebase_in_progress='{}'"]) {
+      const dir = mkdtempSync(join(tmpdir(), 'codeboost-guard-')), path = join(dir, 'state.sqlite');
+      try {
+        const first = new Store(path);
+        first.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
+        first.recordHistory(identity, { revision: 1, snapshotId: first.getSnapshot(identity).id }, oid(1), oid(2), [{ sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null }]);
+        first.close();
+        const db = new DatabaseSync(path); db.exec(`UPDATE tasks SET status='running', ${column}`); db.close();
+        const store = new Store(path); stores.push(store);
+        const { publisher, log } = harness(store);
+        await expect(publisher.publish(identity)).rejects.toThrow(/requeued|rebase is in progress/);
+        expect(log.some(line => line.startsWith('push'))).toBe(false);
+      } finally { rmSync(dir, { recursive: true, force: true }); }
+    }
+  });
+  it('reports drafts unsupported when recovery cannot turn a lost draft opening back into a draft', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }]);
+  });
+  it('refuses to recover an opening recorded for another repository', async () => {
+    const store = runningTask();
+    const check = store.recordAlreadyFixed(identity, store.getTask(identity).stateVersion, { snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity), draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
+    store.beginPullRequest(identity, { checkId: check.id, repository: 'other/repo', base: 'main', headBranch: 'b', headSha: oid(2), draft: false });
+    const { publisher, log } = harness(store);
+    await expect(publisher.publish(identity)).rejects.toThrow(/another repository/);
+    expect(log).toEqual([]);
   });
 });
 
@@ -462,7 +571,7 @@ describe('recovering a lost opening', () => {
     expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'possibly already fixed' });
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
   });
-  it('records the refresh before the push, so a task change during the push still completes the PR update without moving the task', async () => {
+  it('records the refresh before the push, and changes nothing else about the PR when the task changed during the push', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
@@ -472,10 +581,11 @@ describe('recovering a lost opening', () => {
       refreshRecordedAtPush = store.taskPullRequests(identity)[0]!.refresh;
       store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
     } });
-    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'running' });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/Stale task state/);
     expect(refreshRecordedAtPush).toMatchObject({ head: oid(3), draft: false });
-    expect(again.log.at(-1)).toBe('refresh 100 ready');
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(3) }]);
+    // The draft is not marked ready and its description is not replaced; the update stays in flight for the next publish.
+    expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: { head: oid(3) } }]);
   });
   it('runs one publish per task at a time, across publishers over the same Store', async () => {
     const store = runningTask();

@@ -82,10 +82,6 @@ export class PullRequestPublisher {
     const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
     const reviewVersion = this.#store.reviewVersion(identity);
     if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
-    if (snapshot.head === snapshot.base) {
-      if (!draft) this.#store.transitionTask(identity, task.stateVersion, 'needs human');
-      return { kind: 'no changes' };
-    }
     const prs = this.#store.taskPullRequests(identity), branch = this.branch(identity);
     // The task's earlier PR (a needs-human draft, or an abandoned opening's PR that became visible later) is reused while
     // it is still open: GitHub allows one open PR per branch. It is looked up before the check, because an abandoned
@@ -101,11 +97,21 @@ export class PullRequestPublisher {
     // An abandoned opening's PR that is now visible is adopted at once, whatever the check says next, so the record
     // always names every PR the task has on GitHub (for reuse, cancel or cleanup). It does not change the task status.
     if (earlier && live && earlier.state === 'abandoned') {
-      stateVersion = this.#store.adoptOpening(identity, earlier.openingId, live, stateVersion);
+      stateVersion = this.#store.adoptOpening(identity, earlier.openingId, live, { stateVersion, reviewVersion });
       earlier = { ...earlier, state: 'opened', number: live.number, url: live.url, draft: live.draft };
     }
     if (earlier && live && earlier.state === 'opened' && earlier.number === live.number && earlier.draft !== live.draft)
-      stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, live.number, live.draft, stateVersion);
+      stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, live.number, live.draft, { stateVersion, reviewVersion });
+    // Nothing to publish: the task's PR, if it is open and ready, must not stay ready for review.
+    if (snapshot.head === snapshot.base) {
+      if (earlier && live && !live.draft) {
+        this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
+        const drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
+        stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, drafted.number, drafted.draft, { stateVersion, reviewVersion });
+      }
+      if (!draft) this.#store.transitionTask(identity, stateVersion, 'needs human');
+      return { kind: 'no changes' };
+    }
     const own = new Set(prs.filter(pr => pr.number !== null && pr.repository.toLowerCase() === this.#config.repository.toLowerCase()).map(pr => pr.number!));
     if (live) own.add(live.number);
     const result = await this.#checks.check({
@@ -129,7 +135,7 @@ export class PullRequestPublisher {
     }
     signal?.throwIfAborted();
     const check = this.#store.recordAlreadyFixed(identity, stateVersion, { snapshotId: snapshot.id, reviewVersion, draft, result });
-    if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft, check.stateVersion);
+    if (drafted && earlier!.state === 'opened') this.#store.recordPullRequestDraft(identity, earlier!.openingId, drafted.number, drafted.draft, { stateVersion: check.stateVersion, reviewVersion: check.reviewVersion });
     const ready = leftReady === undefined ? {} : { leftReady };
     if (result.outcome !== 'clear') return draft ? { kind: 'draft skipped', result, ...ready } : { kind: 'possibly already fixed', result, ...ready };
     if (earlier && live) {
@@ -145,14 +151,17 @@ export class PullRequestPublisher {
       const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
       await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
       signal?.throwIfAborted();
+      // Re-read after the push's await, before anything else about the PR changes (description, ready or draft): a
+      // cancel, reassignment or review during the push leaves the update in flight and the PR as it was.
+      this.#store.assertRefreshCurrent(identity, earlier.openingId, draft);
       // Any failure here, including a draft refusal after the PR was made ready again meanwhile, leaves the update
-      // recorded as in flight; the next publish drops it and starts again from the draft step above.
+      // recorded as in flight; the next publish settles it and starts again from the draft step above.
       const pr = await this.#pulls.refresh(live.number, {
         base: earlier.base, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
       const status = this.#store.recordRefreshConfirmed(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
-      return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+      return this.#settleHead(identity, earlier.openingId, pr, snapshot.head, draft, status, branch, signal);
     }
     // No PR exists yet, so moving the branch changes nothing a reviewer sees.
     await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
@@ -174,7 +183,21 @@ export class PullRequestPublisher {
       return { kind: 'draft unsupported', number: null };
     }
     const status = this.#store.recordPullRequestOpened(identity, opening.openingId, pr);
-    return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+    return this.#settleHead(identity, opening.openingId, pr, snapshot.head, draft, status, branch, signal);
+  }
+
+  /**
+   * A ready PR that GitHub shows at another head than the one pushed (GitHub has not caught up, or someone else pushed)
+   * is not ready for review: the task stays running and the PR becomes a draft until a later publish reconciles it.
+   */
+  async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
+    draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
+    if (draft || pr.draft || pr.headSha === head) return { kind: 'opened', number: pr.number, url: pr.url, draft: pr.draft, status };
+    const drafted = await this.#pulls.markDraft(pr.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(openingId) }, signal);
+    // A fact about the PR, recorded against the versions read right now (no await since).
+    this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
+      { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+    return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
   }
 
   /** Whether a lost opening is the current publish's own: neither the task nor its review changed since it began, and the mode matches. */
@@ -193,10 +216,14 @@ export class PullRequestPublisher {
    * the settle time has passed; only then is it abandoned. The caller retries after OpeningUnsettled.
    */
   async #recover(identity: PlanIdentity, draft: boolean, signal?: AbortSignal): Promise<PublishOutcome | null> {
-    // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed.
-    const refreshing = this.#store.taskPullRequests(identity).find(pr => pr.refresh !== null);
-    if (refreshing) this.#store.abandonRefresh(identity, refreshing.openingId);
-    // Read once: abandonRefresh above is the only write before this point.
+    // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed. What
+    // GitHub shows now (draft flag, head) is recorded first, so a change that did land is not forgotten.
+    for (const refreshing of this.#store.taskPullRequests(identity).filter(pr => pr.refresh !== null)) {
+      const observed = await this.#pulls.findOpened({ base: refreshing.base, headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
+      signal?.throwIfAborted();
+      this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, observed);
+    }
+    // Read once: the settlements above are the only writes before this point.
     const prs = this.#store.taskPullRequests(identity);
     const lost = prs.find((pr: TaskPullRequest) => pr.state === 'opening');
     if (!lost) return null;
@@ -235,6 +262,6 @@ export class PullRequestPublisher {
     // publish continues, so the main path pushes the current head and refreshes the PR into the current mode.
     const current = this.#isCurrent(identity, lost, draft);
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found);
-    return current ? { kind: 'opened', number: found.number, url: found.url, draft: found.draft, status } : null;
+    return current ? this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal) : null;
   }
 }
