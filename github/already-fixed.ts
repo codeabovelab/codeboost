@@ -30,7 +30,11 @@ export interface AlreadyFixedInput {
   /** This task's own commits (runner-owned ledger entries). */
   ownCommits: ReadonlySet<string>;
 }
-export interface AlreadyFixedGateway { check(input: AlreadyFixedInput, signal?: AbortSignal): Promise<AlreadyFixedResult> }
+export interface AlreadyFixedGateway {
+  /** The repository it checks, when fixed; the publisher refuses one that differs from its own. */
+  readonly repository?: string;
+  check(input: AlreadyFixedInput, signal?: AbortSignal): Promise<AlreadyFixedResult>;
+}
 
 export const MAX_TIMELINE_ITEMS = 100;
 export const MAX_BASE_COMMITS = 250;

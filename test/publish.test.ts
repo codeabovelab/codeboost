@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { GuardRefusal } from '../runner/lifecycle.ts';
+import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
 import { runWithInput } from '../github/run-with-input.ts';
@@ -37,7 +37,7 @@ function runningTask(options: { head?: string } = {}) {
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean } = {}) {
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   const results = options.results ? [...options.results] : [];
@@ -88,7 +88,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
   };
   const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
-  return { log, checks, opened, pulls, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher }, { ...config, ...options.config }) };
+  return { log, checks, opened, pulls, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher, closing: options.closing }, { ...config, ...options.config }) };
 }
 
 describe('opening the task PR', () => {
@@ -1298,5 +1298,193 @@ describe('GitHub PR adapter', () => {
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => '[]').findOpened({ ...input, markers: [marker] })).toBeNull();
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'someone else' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/did not open/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response(), response()])).findOpened({ ...input, markers: [marker] })).rejects.toThrow();
+  });
+});
+
+describe('shutdown and PRs left ready', () => {
+  /** A task that ran, got its PR, was sent back, reran and settled running again with the same head. */
+  async function rerun(store: Store, live: Map<string, OpenedPullRequest>, next: { value: number }) {
+    await harness(store, { live, next }).publisher.publish(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+  }
+  it("pushes and opens nothing once the coordinator is closing, even when it closes during the check", async () => {
+    const store = runningTask();
+    let closing = false;
+    const { publisher, log } = harness(store, { closing: () => closing, results: [], onFind: () => { closing = true; } });
+    await expect(publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+    expect(log).toEqual(['find ', 'check']);
+    expect(store.taskPullRequests(identity)).toEqual([]);
+    await expect(harness(store, { closing: () => true }).publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+  });
+  it('makes no ready change when the coordinator starts closing during the description update', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await rerun(store, live, next);
+    let closing = false;
+    const again = harness(store, { live, next, closing: () => closing, onRefresh: () => { closing = true; } });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+    expect(again.log.at(-1)).toBe('refresh 100 ready');
+    // The update stays in flight for the next publish to settle; the task has not moved.
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: expect.anything() }]);
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('close() aborts a publish in progress, awaits it, and refuses new ones', async () => {
+    const store = runningTask();
+    const { publisher, log } = harness(store, { push: (_id, _input, signal) => new Promise((_, reject) => signal!.addEventListener('abort', () => reject(signal!.reason), { once: true })) });
+    const first = publisher.publish(identity);
+    first.catch(() => {});
+    await new Promise(resolve => setTimeout(resolve, 0));
+    let settled = false;
+    first.finally(() => { settled = true; }).catch(() => {});
+    await publisher.close();
+    expect(settled).toBe(true);
+    await expect(first).rejects.toThrow(ShuttingDownError);
+    expect(log.some(line => line.startsWith('open'))).toBe(false);
+    await expect(publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+  });
+  it('repeats a failed draft change on the next publish of a task that cannot publish, so its PR does not stay ready', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    const { publisher } = harness(store, { live, draftFails: true, open: async input => {
+      store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+      const pr = { number: 9, url: 'https://github.com/owner/repo/pull/9', headSha: oid(2), draft: input.draft }; live.set(input.marker, pr); return pr;
+    } });
+    expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 9, status: 'cancelled', leftReady: 9 });
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 9, draft: false }]);
+    const again = harness(store, { live });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log).toEqual([expect.stringMatching(/^find /), 'draft 9']);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 9, draft: true }]);
+    // Nothing is owed any more: a further publish looks nothing up.
+    const third = harness(store, { live });
+    await expect(third.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(third.log).toEqual([]);
+  });
+  it('names a PR left ready because drafts are unsupported when it refuses a task that cannot publish', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    const again = harness(store, { live, draftsUnsupported: true });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled.*#100 stays ready for review/);
+    expect(again.log).toContain('draft 100');
+  });
+  it('records a draft flag GitHub already shows for a task that cannot publish, without changing the PR', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: true });
+    const again = harness(store, { live });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
+  it("adopts on the main path an abandoned opening's PR that becomes visible after recovery, and counts it as the task's own", async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    // The first opening is abandoned; the second POST is refused (the first PR exists), so the second opening stays owned.
+    await expect(harness(store, { live, next, hidden, config: later }).publisher.publish(identity)).rejects.toThrow(/already exists/);
+    // Recovery's lookup still sees nothing and abandons the second opening; the PR shows up for the main path's lookup.
+    const again = harness(store, { live, next, hidden, config: later, onFind: () => { if (again.log.length > 1) hidden.clear(); } });
+    expect(await again.publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
+    expect(again.checks[0]!.ownPullRequests).toEqual([100]);
+    expect(again.log).toContain('refresh 100 ready');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }, { state: 'abandoned' }]);
+  });
+  it('keeps a no-changes draft publish in needs human without writing a status change', async () => {
+    const store = runningTask({ head: oid(1) });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    const version = store.getTask(identity).stateVersion;
+    expect(await harness(store).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'no changes' });
+    expect(store.getTask(identity)).toMatchObject({ status: 'needs human', stateVersion: version });
+  });
+  it('moves no task on the no-changes path when the publish is aborted during a refused draft change', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await rerun(store, live, next);
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
+    const controller = new AbortController();
+    const again = harness(store, { live, next, draftsUnsupported: true, onDraft: () => controller.abort() });
+    await expect(again.publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
+    expect(again.log).toContain('draft 100');
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('records a draft change that landed but moves no task when the no-changes publish is aborted during it', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await rerun(store, live, next);
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
+    const controller = new AbortController();
+    const again = harness(store, { live, next, onDraft: () => controller.abort() });
+    await expect(again.publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('leaves the ready PR of an approved or in-review task alone, without asking GitHub', async () => {
+    for (const status of ['in review', 'approved but merge blocked'] as const) {
+      const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+      await harness(store, { live }).publisher.publish(identity);
+      if (status !== 'in review') store.transitionTask(identity, store.getTask(identity).stateVersion, status);
+      const again = harness(store, { live });
+      await expect(again.publisher.publish(identity)).rejects.toThrow(GuardRefusal);
+      expect(again.log).toEqual([]);
+      expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
+    }
+  });
+  it('keeps the status refusal when the draft change fails, notes the PR, and tries again next time', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    await expect(harness(store, { live, draftFails: true }).publisher.publish(identity)).rejects.toThrow(/cancelled.*#100 could not be made a draft.*timeout/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
+    const again = harness(store, { live });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
+  it('drafts nothing when the branch PR GitHub shows has another number than the ready record', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    for (const [m, pr] of live) live.set(m, { ...pr, number: 999 });
+    const again = harness(store, { live });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+  });
+  it('checks closing at entry, before the refresh push, before the description update and before the opening', async () => {
+    // At entry: nothing is asked.
+    const entry = harness(runningTask(), { closing: () => true });
+    await expect(entry.publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+    expect(entry.log).toEqual([]);
+    // Closing during the push of a new PR's branch: nothing is opened.
+    let closing = false;
+    const fresh = runningTask();
+    const opening = harness(fresh, { closing: () => closing, push: async () => { closing = true; } });
+    await expect(opening.publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+    expect(opening.log.some(line => line.startsWith('open'))).toBe(false);
+    expect(fresh.taskPullRequests(identity)).toEqual([]);
+    // Closing during the check before an update: nothing is pushed.
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await rerun(store, live, next);
+    closing = false;
+    const gate = harness(store, { live, next, closing: () => closing, onFind: () => { closing = true; } });
+    await expect(gate.publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+    expect(gate.log).toContain('check');
+    expect(gate.log.some(line => line.startsWith('push'))).toBe(false);
+    // Closing during the update's push: the description is not updated.
+    closing = false;
+    const pushed = harness(store, { live, next, closing: () => closing, push: async () => { closing = true; } });
+    await expect(pushed.publisher.publish(identity)).rejects.toThrow(ShuttingDownError);
+    expect(pushed.log.some(line => line.startsWith('push'))).toBe(true);
+    expect(pushed.log.some(line => line.startsWith('refresh'))).toBe(false);
+  });
+  it('refuses gateways configured for another repository', () => {
+    const store = runningTask();
+    const { pulls } = harness(store);
+    const pusher: BranchPusher = { async push() {} };
+    const checks: AlreadyFixedGateway = { repository: 'other/repo', async check() { return { outcome: 'clear', baseHead: oid(9) }; } };
+    expect(() => new PullRequestPublisher(store, { checks, pulls, pusher }, config)).toThrow(/same repository/);
+    expect(() => new PullRequestPublisher(store, { checks: { ...checks, repository: 'Owner/Repo' }, pulls: { ...pulls, repository: 'other/repo' }, pusher }, config)).toThrow(/same repository/);
+    expect(() => new PullRequestPublisher(store, { checks: { ...checks, repository: 'Owner/Repo' }, pulls: { ...pulls, repository: 'owner/repo' }, pusher }, config)).not.toThrow();
   });
 });

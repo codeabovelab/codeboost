@@ -10,7 +10,7 @@ export const GH_ENV_ALLOWLIST = [
   'DBUS_SESSION_BUS_ADDRESS', 'XDG_RUNTIME_DIR',
   'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY', 'https_proxy', 'http_proxy', 'no_proxy', 'SSL_CERT_FILE', 'SSL_CERT_DIR',
   // Windows: process creation, gh's config and credential store, and executable lookup.
-  'SYSTEMROOT', 'SystemRoot', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'PATHEXT', 'COMSPEC',
+  'SYSTEMROOT', 'SystemRoot', 'APPDATA', 'LOCALAPPDATA', 'USERPROFILE', 'PATHEXT', 'COMSPEC', 'TEMP', 'TMP',
 ] as const;
 
 export function ghEnvironment(source: NodeJS.ProcessEnv = process.env, platform: NodeJS.Platform = process.platform): NodeJS.ProcessEnv {

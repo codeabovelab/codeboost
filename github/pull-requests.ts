@@ -16,6 +16,8 @@ export interface OpenPullRequestInput {
 }
 export interface OpenedPullRequest { number: number; url: string; headSha: string; draft: boolean }
 export interface PullRequestGateway {
+  /** The repository it calls, when fixed; the publisher refuses one that differs from its own. */
+  readonly repository?: string;
   open(input: OpenPullRequestInput, signal?: AbortSignal): Promise<OpenedPullRequest>;
   /**
    * The open PR from `headBranch` into `base`, with the one of `markers` its description carries, or null when there is
