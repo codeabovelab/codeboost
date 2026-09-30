@@ -516,11 +516,19 @@ export class Store {
       const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
       if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
         throw new Error('Checkpoint must describe the executed plan prefix.');
+      // Only the executor's own running task pauses; a status someone set since (for example needs human) is kept.
+      if (this.#task(key).status !== 'running') throw new GuardRefusal('The task is no longer running, so it was not paused for amendment.');
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
       const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
       return checkpoint;
     });
+  }
+  /** Whether a scope checkpoint was recorded at this snapshot: its item's pause is already on record. */
+  hasCheckpointAt(identity: PlanIdentity, snapshotId: string): boolean {
+    for (const row of this.#db.prepare('SELECT data FROM checkpoints WHERE key=?').all(identityKey(identity)))
+      if (decode<Checkpoint>(row.data).snapshotId === snapshotId) return true;
+    return false;
   }
   /** The latest snapshot of this plan whose head is `head` (the one a runner commit created), or null. */
   snapshotWithHead(identity: PlanIdentity, head: string): string | null {

@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import { ItemExecutor, SAFETY_VIOLATION, SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
-import type { ShutdownCapability } from '../runner/lifecycle.ts';
+import { ShuttingDownError, type ShutdownCapability } from '../runner/lifecycle.ts';
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -28,10 +28,11 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest> = {})
 
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
   commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
-  inspect?: (item: string) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean } = {}) {
+  inspect?: (item: string, signal: AbortSignal) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean;
+  plan?: Plan; commitHead?: string; pathKeyError?: Error } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
-  store.createPlan(JSON.stringify(plan), 'json', context, oid(1), oid(2));
+  store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
   store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
   const log: string[] = [], commits: { item: string; baseHead: string; paths: readonly string[]; trailers: Record<string, string>; digest: string; message: string }[] = [];
   let next = 100;
@@ -39,13 +40,13 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const workspace: TaskWorkspace = {
     async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
     async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws) }; },
-    async inspectChanges(ws, input) {
-      log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws));
+    async inspectChanges(ws, input, signal) {
+      log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws), signal);
       return options.manifests?.[itemOf(ws)] ?? manifest([change(itemOf(ws) === 'P1' ? 'a.ts' : 'b.ts')]);
     },
     async commit(ws, input) {
       await options.commit?.(itemOf(ws));
-      const head = oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, paths: input.paths, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
+      const head = options.commitHead ?? oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, paths: input.paths, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
       log.push(`commit ${itemOf(ws)} -> ${head.slice(-3)}`); return head;
     },
     async release(ws) {
@@ -54,7 +55,8 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
       await options.release?.();
     },
   };
-  const sources: ExecutionSources = { planContext: () => context, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+  const auditContext: PlanContext = options.pathKeyError ? { ...context, pathKey: () => { throw options.pathKeyError; } } : context;
+  const sources: ExecutionSources = { planContext: () => auditContext, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
   const findings = new SafetyFindings(), capability = options.capability?.(store);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
@@ -235,14 +237,25 @@ describe('item execution', () => {
   });
   it('treats an inspection aborted by a stop as that stop, not a finding', async () => {
     let runner!: RunnerCoordinator, store!: Store;
-    const h = setup({ inspect: async () => {
+    const h = setup({ inspect: async (_item, signal) => {
       runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled');
-      throw new Error('inspection aborted');
+      throw signal.reason;
     } });
     runner = h.runner; store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
     expect(store.getTask(identity).status).toBe('running');
     expect(h.commits).toEqual([]);
+  });
+  it('keeps a real inspection refusal as a finding even when a stop is pending', async () => {
+    let runner!: RunnerCoordinator, store!: Store;
+    const h = setup({ inspect: async () => {
+      runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled');
+      throw new Error('metadata digest changed');
+    } });
+    runner = h.runner; store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
+      reason: `${SAFETY_VIOLATION} The change inspection refused: metadata digest changed` });
+    expect(store.getTask(identity).status).toBe('needs human');
   });
   it('makes no commit when a stop lands during an inspection that ignores the abort', async () => {
     let runner!: RunnerCoordinator, store!: Store;
@@ -263,5 +276,77 @@ describe('item execution', () => {
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'stale' });
     expect(h.commits).toEqual([]);
+  });
+  it('pauses first on the next run when a scope pause was never recorded, and never runs past it', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
+    const pause = h.store.pauseForAmendment.bind(h.store);
+    let fail = true;
+    h.store.pauseForAmendment = (...args) => { if (fail) { fail = false; throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); } return pause(...args); };
+    await expect(h.executor.runTask(identity)).rejects.toThrow(/disk full/);
+    expect(h.store.getTask(identity).status).toBe('running');
+    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
+    expect(h.store.getTask(identity).status).toBe('needs amendment');
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
+  });
+  it('does not take a closed write gate for a refused pause when it has no capability', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => { store.closeWrites(); } });
+    store = h.store;
+    await expect(h.executor.runTask(identity)).rejects.toBeInstanceOf(ShuttingDownError);
+  });
+  it('stops before the next item when the assignment changes during the run', async () => {
+    let store!: Store;
+    const h = setup({ release: async () => {
+      if (store.getTask(identity).currentAttemptId && store.getAttempts(identity).length === 1)
+        store.setAssignment(identity, store.getTask(identity).stateVersion, 'reassigned', 'hash-2');
+    } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'] });
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
+  });
+  it('stops before the next item, and binds a pause to the item\'s own commit, when HEAD is observed during the run', async () => {
+    let store!: Store;
+    const observe = () => { const snapshot = store.getSnapshot(identity); store.recordHistory(identity, { revision: 1, snapshotId: snapshot.id }, snapshot.base, oid(999), []); };
+    const clean = setup({ release: async () => { if (store.getAttempts(identity).length === 1) observe(); } });
+    store = clean.store;
+    expect(await clean.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started' });
+    const scoped = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => observe() });
+    store = scoped.store;
+    const outcome = await scoped.executor.runTask(identity);
+    expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P1' });
+    const checkpoint = store.getCheckpoint(identity, (outcome as { checkpointId: string }).checkpointId);
+    expect(checkpoint.snapshotId).toBe(store.snapshotWithHead(identity, oid(100)));
+    expect(checkpoint.snapshotId).not.toBe(store.getSnapshot(identity).id);
+  });
+  it('fails the attempt, instead of breaking the terminal write, when the workspace returns an invalid commit ID', async () => {
+    const { runner, executor, log } = setup({ commitHead: 'HEAD' });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'The workspace returned an invalid commit ID; nothing was published.' });
+    expect(runner.status(identity).unresolved).toBeNull();
+    expect(log).toContain('release P1 after failed');
+  });
+  it('keeps a status someone set during release instead of pausing or escalating over it', async () => {
+    let store!: Store;
+    const toApproval = async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); };
+    const scoped = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: toApproval });
+    store = scoped.store;
+    expect(await scoped.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs approval');
+    const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toApproval });
+    store = unsafe.store;
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    expect(store.getTask(identity).status).toBe('needs approval');
+  });
+  it('treats an audit that throws as a safety violation', async () => {
+    const { store, executor, commits } = setup({ pathKeyError: new Error('Non-ASCII case-insensitive paths require an adapter.') });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
+      reason: `${SAFETY_VIOLATION} The change report could not be audited: Non-ASCII case-insensitive paths require an adapter.` });
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(commits).toEqual([]);
+  });
+  it('snapshots both sides of a declared rename before launch', async () => {
+    const renamed: Plan = { ...plan, items: [{ ...plan.items[0]!, files: [{ path: 'c.ts', kind: 'rename', renamed_from: 'a.ts', change: 'move' }] }, plan.items[1]!] };
+    const h = setup({ plan: renamed, manifests: { P1: manifest([change('c.ts', { kind: 'rename', oldPath: 'a.ts' })]) } });
+    await h.executor.runTask(identity);
+    expect(h.log).toContain('snapshot P1 [c.ts,a.ts]');
   });
 });

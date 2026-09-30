@@ -33,6 +33,39 @@ export type AuditOutcome =
   | { kind: 'commit'; inScope: string[]; outOfScope: string[]; unchanged: boolean; needsAmendment: boolean };
 
 const MAX_CHANGES = 10_000;
+/** Every path in the report together; keeps the saved result (scope lists included) far below its 1 MiB limit. */
+const MAX_PATH_BYTES = 256 * 1024;
+const KINDS = new Set(['add', 'modify', 'delete', 'rename', 'mode']);
+const TYPES = new Set(['file', 'symlink', 'gitlink', 'directory', 'other']);
+
+/**
+ * Every field the audit reads, checked before it reads any (AGENTS.md: partial records fail closed). A missing boolean
+ * or entry type must never read as "clean". Returns the first problem, or null.
+ */
+function malformed(manifest: ChangeManifest): string | null {
+  if (!manifest || typeof manifest !== 'object') return 'The change report is missing.';
+  if (!Array.isArray(manifest.changes)) return 'The change report has no change list.';
+  for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
+    if (!Array.isArray(manifest[field]) || manifest[field].some(entry => typeof entry !== 'string')) return `The change report has no ${field} list.`;
+  if (typeof manifest.metadataChanged !== 'boolean') return 'The change report does not say whether Git metadata changed.';
+  let bytes = 0;
+  for (const change of manifest.changes) {
+    if (!change || typeof change !== 'object' || typeof change.path !== 'string' || !change.path) return 'A change has no path.';
+    if (change.oldPath !== undefined && (typeof change.oldPath !== 'string' || !change.oldPath)) return `The change at ${change.path} has an invalid old path.`;
+    if (!KINDS.has(change.kind)) return `The change at ${change.path} has an unknown kind.`;
+    if (typeof change.underGit !== 'boolean') return `The change at ${change.path} does not say whether it is under .git.`;
+    // add has only a new entry, delete only an old one, every other kind both.
+    const needsOld = change.kind !== 'add', needsNew = change.kind !== 'delete';
+    if ((needsOld && !TYPES.has(change.oldType as string)) || (!needsOld && change.oldType !== undefined)) return `The change at ${change.path} has an invalid old entry type.`;
+    if ((needsNew && !TYPES.has(change.newType as string)) || (!needsNew && change.newType !== undefined)) return `The change at ${change.path} has an invalid new entry type.`;
+    if (change.kind === 'rename' && !change.oldPath) return `The rename at ${change.path} has no old path.`;
+    if (change.newType === 'symlink' && typeof change.newLinkTarget !== 'string') return `The link at ${change.path} has no target.`;
+    if (change.linkTargetTraversesLink !== undefined && typeof change.linkTargetTraversesLink !== 'boolean') return `The link at ${change.path} has an invalid traversal flag.`;
+    bytes += Buffer.byteLength(change.path) + (change.oldPath ? Buffer.byteLength(change.oldPath) : 0);
+  }
+  if (bytes > MAX_PATH_BYTES) return 'The change report is too large to audit.';
+  return null;
+}
 
 /** A stored link target must stay inside the repo, outside `.git`, without an absolute path. */
 function unsafeLinkTarget(linkPath: string, target: string): string | null {
@@ -50,12 +83,11 @@ function unsafeLinkTarget(linkPath: string, target: string): string | null {
  */
 export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (path: string) => string): AuditOutcome {
   const violations: string[] = [];
-  if (!Array.isArray(manifest.changes) || manifest.changes.length > MAX_CHANGES) return { kind: 'violation', violations: ['The change report is missing or too large to audit.'] };
+  if (!Array.isArray(manifest?.changes) || manifest.changes.length > MAX_CHANGES) return { kind: 'violation', violations: ['The change report is missing or too large to audit.'] };
+  const problem = malformed(manifest);
+  if (problem) return { kind: 'violation', violations: [problem] };
   if (manifest.metadataChanged) violations.push('The agent changed Git metadata under .git.');
   // Agents never commit: the metadata volume is read-only to them, so any agent commit is a violation, never undone (#66).
-  // A malformed report fails closed like any other finding, never as an ordinary failed attempt.
-  for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
-    if (!Array.isArray(manifest[field])) return { kind: 'violation', violations: [`The change report has no ${field} list.`] };
   if (manifest.agentCommits.length) violations.push(`The agent made its own commits: ${manifest.agentCommits.slice(0, 5).join(', ')}.`);
   for (const path of manifest.linkTargetChanges) violations.push(`A declared symlink target changed: ${path}.`);
   for (const path of manifest.nestedGitlinkContent) violations.push(`Content appeared under a gitlink: ${path}.`);

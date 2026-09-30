@@ -93,8 +93,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       let manifest: ChangeManifest & { digest: string };
       try { manifest = await workspace.inspectChanges(data.workspace, { baseHead: data.baseHead, linkSnapshot: data.linkSnapshot }, signal); }
       catch (error) {
-        // A stop aborted the inspection; that is the stop, not a finding.
-        if (signal.aborted) throw error;
+        // Only the stop's own abort error is the stop. Any other refusal is a finding, even if a stop is also pending.
+        if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
         // Contract (Publishing step 2): an inspection that refuses sends the task to needs human.
         return violation(`The change inspection refused: ${error instanceof Error ? error.message : String(error)}`);
       }
@@ -112,6 +112,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         baseHead: data.baseHead, paths, digest: manifest.digest,
         message: `${item.id}: ${item.title}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
       }, signal);
+      // The ID goes into the ledger inside the terminal write; a malformed one must fail the attempt, not that write.
+      if (typeof head !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head)) throw new FinishFailure('The workspace returned an invalid commit ID; nothing was published.');
       const snapshot = store.getSnapshot(identity, attempt.context.snapshotId);
       return {
         value: { head, unchanged: false, inScope: outcome.inScope, outOfScope: outcome.outOfScope } satisfies ExecutionResult,
@@ -161,15 +163,23 @@ export class ItemExecutor {
     if (start < 0) throw new Error('Unknown plan item.');
     const done: string[] = [], unchanged: string[] = [];
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [...done] });
+    // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
+    const owed = this.#unpausedScopeFinding(identity);
+    if (owed) return this.#pause(identity, owed.row, owed.result, stopped, []);
+    /** Where the next item must start: the context the previous item left, or the current one for the first item. */
+    let expected: { snapshotId: string; assignmentId: string; referencedCodeHash: string } | null = null;
     for (const item of plan.items.slice(start)) {
-      // Admission reads the context in this same turn, so it cannot notice a revision saved during an earlier item.
+      // Admission reads the context in this same turn, so it cannot notice a change saved during an earlier item.
+      const current = this.#store.currentContext(identity);
       if (this.#store.getPlan(identity).revision !== plan.revision)
         return stopped(item.id, 'not started', `The plan changed to a new revision during the run; review it before running ${item.id}.`);
+      if (expected && (current.snapshotId !== expected.snapshotId || current.assignmentId !== expected.assignmentId || current.referencedCodeHash !== expected.referencedCodeHash))
+        return stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
       let attempt: AttemptRecord;
       try {
         attempt = this.#runner.start(identity, {
           expectedStateVersion: this.#store.getTask(identity).stateVersion, kind: 'execute', item: item.id,
-          expectedContext: this.#store.currentContext(identity), deadline: Date.now() + this.#deadlineMs,
+          expectedContext: current, deadline: Date.now() + this.#deadlineMs,
         });
       } catch (error) {
         if (!refusal(error)) throw error;
@@ -180,10 +190,13 @@ export class ItemExecutor {
       // Only the runner's own audit records a finding; it wins over any later stale or stop outcome.
       const violation = this.#findings.take(attempt.id);
       if (violation) {
-        try { this.#write(() => this.#store.transitionTask(identity, this.#store.getTask(identity).stateVersion, 'needs human')); }
+        const task = this.#store.getTask(identity);
+        // Only the executor's own running task moves; a status someone set since is kept (no await since this read).
+        if (task.status !== 'running') return stopped(item.id, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
+        try { this.#write(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
         catch (error) {
-          if (!refusal(error)) throw error;
-          return stopped(item.id, row.state, `${violation} The task could not be moved to needs human: ${error instanceof Error ? error.message : String(error)}`);
+          if (!(error instanceof GuardRefusal)) throw error;
+          return stopped(item.id, row.state, `${violation} The task could not be moved to needs human: ${error.message}`);
         }
         return { kind: 'needs human', item: item.id, reason: violation, completed: [...done] };
       }
@@ -196,26 +209,42 @@ export class ItemExecutor {
       const result = row.result as ExecutionResult;
       done.push(item.id);
       if (result.unchanged) unchanged.push(item.id);
-      if (result.outOfScope.length) {
-        // The checkpoint names the revision the item ran against and the snapshot its own commit created, so a revision
-        // or HEAD observation saved since cannot erase the finding: the task pauses either way.
-        const snapshotId = this.#store.snapshotWithHead(identity, result.head);
-        if (!snapshotId) throw new Error(`The snapshot of ${item.id}'s commit is missing.`);
-        const ranAt = { revision: row.context.planRevision, snapshotId };
-        let checkpointId: string;
-        try {
-          checkpointId = this.#write(() => this.#store.pauseForAmendment(identity, ranAt, {
-            item: item.id, baseEntries: this.#sources.planContext(identity).baseEntries,
-            completedItems: plan.items.slice(0, plan.items.indexOf(item) + 1).map(entry => entry.id), outOfScopePaths: result.outOfScope,
-          })).id;
-        } catch (error) {
-          // Only a refused status change (a closed task) ends here; anything else is a bug and is thrown.
-          if (!refusal(error)) throw error;
-          return stopped(item.id, row.state, `${item.id} changed files outside its plan item, but the task could not pause for amendment: ${error instanceof Error ? error.message : String(error)}`);
-        }
-        return { kind: 'needs amendment', item: item.id, outOfScope: result.outOfScope, checkpointId, completed: [...done] };
-      }
+      if (result.outOfScope.length) return this.#pause(identity, row, result, stopped, done);
+      const snapshotId = result.unchanged ? row.context.snapshotId : this.#store.snapshotWithHead(identity, result.head);
+      if (!snapshotId) throw new Error(`The snapshot of ${item.id}'s commit is missing.`);
+      expected = { snapshotId, assignmentId: row.context.assignmentId, referencedCodeHash: row.context.referencedCodeHash };
     }
     return { kind: 'executed', items: done, unchanged };
+  }
+  /** The latest completed execute attempt, if its out-of-scope files have no checkpoint yet (its pause was lost). */
+  #unpausedScopeFinding(identity: PlanIdentity): { row: AttemptRecord; result: ExecutionResult } | null {
+    const row = this.#store.getAttempts(identity).filter(entry => entry.kind === 'execute' && entry.state === 'completed').at(-1);
+    const result = row?.result as ExecutionResult | undefined;
+    if (!row || !result?.outOfScope?.length) return null;
+    const snapshotId = this.#store.snapshotWithHead(identity, result.head);
+    return snapshotId && this.#store.hasCheckpointAt(identity, snapshotId) ? null : { row, result };
+  }
+  /**
+   * The scope pause. The checkpoint names the revision the item ran against and the snapshot its own commit created, so
+   * a revision or HEAD observation saved since cannot erase the finding. Only a refused pause (the task is closed or no
+   * longer running) returns stopped; anything else is thrown, and the next run pauses first.
+   */
+  #pause(identity: PlanIdentity, row: AttemptRecord, result: ExecutionResult,
+    stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[]): ExecutionOutcome {
+    const item = row.item!;
+    const snapshotId = this.#store.snapshotWithHead(identity, result.head);
+    if (!snapshotId) throw new Error(`The snapshot of ${item}'s commit is missing.`);
+    const items = this.#store.getPlan(identity, row.context.planRevision).items;
+    let checkpointId: string;
+    try {
+      checkpointId = this.#write(() => this.#store.pauseForAmendment(identity, { revision: row.context.planRevision, snapshotId }, {
+        item, baseEntries: this.#sources.planContext(identity).baseEntries,
+        completedItems: items.slice(0, items.findIndex(entry => entry.id === item) + 1).map(entry => entry.id), outOfScopePaths: result.outOfScope,
+      })).id;
+    } catch (error) {
+      if (!(error instanceof GuardRefusal)) throw error;
+      return stopped(item, row.state, `${item} changed files outside its plan item, but the task could not pause for amendment: ${error.message}`);
+    }
+    return { kind: 'needs amendment', item, outOfScope: result.outOfScope, checkpointId, completed: [...done] };
   }
 }

@@ -31,6 +31,23 @@ describe('post-run audit', () => {
     for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
       expect(auditRun(item, manifest([file('src/retry.ts')], { [field]: undefined as unknown as string[] }), exact)).toEqual({ kind: 'violation', violations: [`The change report has no ${field} list.`] });
   });
+  it('fails closed on a partial record: every field the audit reads must be present and well-formed', () => {
+    const cases: [string, ChangeManifest, RegExp][] = [
+      ['no metadata flag', manifest([file('src/retry.ts')], { metadataChanged: undefined as unknown as boolean }), /whether Git metadata changed/],
+      ['no underGit', manifest([{ path: 'src/retry.ts', kind: 'modify', oldType: 'file', newType: 'file' } as ManifestChange]), /under \.git/],
+      ['add without a new type', manifest([{ path: 'src/new.ts', kind: 'add', underGit: false } as ManifestChange]), /invalid new entry type/],
+      ['modify without an old type', manifest([file('src/retry.ts', { oldType: undefined })]), /invalid old entry type/],
+      ['unknown kind', manifest([file('src/retry.ts', { kind: 'chmod' as ManifestChange['kind'] })]), /unknown kind/],
+      ['rename without an old path', manifest([file('docs/New.md', { kind: 'rename' })]), /no old path/],
+      ['link without a target', manifest([file('link', { oldType: 'symlink', newType: 'symlink' })]), /has no target/],
+      ['too many path bytes', manifest(Array.from({ length: 300 }, (_, i) => file(`${'x'.repeat(1000)}${i}`))), /too large/],
+    ];
+    for (const [label, report, reason] of cases) {
+      const outcome = auditRun(item, report, exact);
+      expect(outcome.kind, label).toBe('violation');
+      expect((outcome as { violations: string[] }).violations.join(' '), label).toMatch(reason);
+    }
+  });
   it('stops on every safety violation before any scope decision', () => {
     const cases: [string, ChangeManifest][] = [
       ['metadata', manifest([file('src/retry.ts')], { metadataChanged: true })],
