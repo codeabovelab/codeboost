@@ -341,6 +341,8 @@ describe('item execution', () => {
     store = unsafe.store;
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/needs approval; it moves to needs human when it next runs/) });
     expect(store.getTask(identity).status).toBe('needs approval');
+    // Still at the gate on the next run: the finding stays owed, reported as not started.
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/needs approval; it moves to needs human/) });
     // A person releases the gate; the owed finding goes to needs human before any item runs again.
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
@@ -575,7 +577,7 @@ describe('item execution', () => {
     const attemptId = store.getAttempts(identity)[0]!.id;
     expect(h.findings.get(attemptId)).toBeDefined();
     store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
-    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/is cancelled/) });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/is cancelled/) });
     expect(h.findings.get(attemptId)).toBeUndefined();
   });
   it('records completed and the ledger entry in one transaction: a failed history write leaves neither', async () => {
@@ -614,6 +616,8 @@ describe('item execution', () => {
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+    // Still at the gate: the owed pause is refused and reported as not started.
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/could not pause for amendment/) });
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs amendment');
@@ -651,7 +655,7 @@ describe('item execution', () => {
       .toThrow(/Unknown snapshot/);
   });
   it('writes a plan title with line breaks as one line in the runner commit message', async () => {
-    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\nPlan-Revision: r99' }, plan.items[1]!] };
+    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\u2028Plan-Revision: r99' }, plan.items[1]!] };
     const h = setup({ plan: forged });
     await h.executor.runTask(identity);
     expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99');
@@ -774,6 +778,8 @@ describe('item execution', () => {
     expect(outcome.kind).toBe('stopped');
     expect(outcome.reason).toMatch(/Needs restart: the last result could not be saved\./);
     expect(h.findings.get(h.store.getAttempts(identity)[0]!.id)).toBeDefined();
+    // The next run finds it owed, reports it for the earlier item, and starts nothing.
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/Needs restart/) });
   });
   it('ends as the stop, not a refused commit, when a stop lands and the commit then rejects', async () => {
     let runner!: RunnerCoordinator, store!: Store;
@@ -864,5 +870,15 @@ describe('item execution', () => {
       for (let i = 0; i < 50 && !second; i++) await null;
       expect((await second)?.kind, `after ${steps} steps`).toBe('stopped');
     }
+  });
+  it('does not start while a job started outside the executor is still releasing its storage', async () => {
+    let executor!: ItemExecutor, during: Promise<ExecutionOutcome> | undefined;
+    const h = setup({ release: async () => { during = executor.runTask(identity); await during; } });
+    executor = h.executor;
+    h.runner.start(identity, { expectedStateVersion: h.store.getTask(identity).stateVersion, kind: 'execute', item: 'P1',
+      expectedContext: h.store.currentContext(identity), deadline: Date.now() + 60_000 });
+    await h.runner.settled(identity);
+    expect(await during).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/still finishing/) });
+    expect(h.store.getAttempts(identity)).toHaveLength(1);
   });
 });
