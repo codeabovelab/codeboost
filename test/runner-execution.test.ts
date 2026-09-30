@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import { ItemExecutor, SAFETY_VIOLATION, SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace, type WorkspaceRef } from '../runner/execution.ts';
@@ -779,5 +779,50 @@ describe('item execution', () => {
     runner = h.runner; store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
     expect(store.getLedger(identity)).toEqual([]);
+  });
+  it('does not pay an owed scope pause through the shutdown capability once the write gate has closed', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, capability: s => s.shutdownCapability(),
+      release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    await h.executor.runTask(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    store.closeWrites();
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/could not pause for amendment: The review server is shutting down/) });
+    expect(store.getTask(identity).status).toBe('queued');
+    expect(store.latestCheckpoint(identity)).toBeNull();
+  });
+  it('records the snapshot\'s base, not the item\'s base head, in the ledger record', async () => {
+    const h = setup();
+    await h.executor.runTask(identity);
+    const snapshot = h.store.getSnapshot(identity);
+    expect(snapshot.head).toBe(oid(101));
+    expect(snapshot.base).toBe(oid(1));
+  });
+  it('quotes D\'s error text in the coordinator\'s log lines', async () => {
+    const lines: string[] = [];
+    const spy = vi.spyOn(console, 'error').mockImplementation((line: unknown) => { lines.push(String(line)); });
+    try {
+      const h = setup({ release: async () => { throw new Error('rm failed\nRunner job forged: ok'); } });
+      await h.executor.runTask(identity);
+    } finally { spy.mockRestore(); }
+    expect(lines.some(line => line.endsWith('could not remove its task storage: "rm failed\\nRunner job forged: ok"'))).toBe(true);
+    expect(lines.every(line => !line.includes('\n'))).toBe(true);
+  });
+  it('finds an owed scope pause even when a later clean item completed after it', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
+    const store = h.store;
+    // Record P1's out-of-scope result as if its pause had been lost, then let a clean P2 complete after it.
+    const pause = store.pauseForAmendment.bind(store);
+    store.pauseForAmendment = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+    await expect(h.executor.runTask(identity)).rejects.toThrow(/disk full/);
+    store.pauseForAmendment = pause;
+    const p2 = h.runner.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P2',
+      expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    await h.runner.settled(identity);
+    expect(store.getAttempt(identity, p2.id).state).toBe('completed');
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
+    // Paid from the durable result: no item ran again.
+    expect(store.getAttempts(identity)).toHaveLength(2);
   });
 });

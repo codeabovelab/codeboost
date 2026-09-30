@@ -280,12 +280,15 @@ export class ItemExecutor {
     this.#findings.settle(row.id);
     return { kind: 'needs human', item, reason: violation, completed: [...done] };
   }
-  /** The latest completed execute attempt, if its out-of-scope files have no checkpoint yet (its pause was lost). */
+  /** The earliest completed execute attempt whose out-of-scope files have no checkpoint yet (its pause was lost). */
   #unpausedScopeFinding(identity: PlanIdentity): { row: AttemptRecord; result: ExecutionResult } | null {
-    const row = this.#store.getAttempts(identity).filter(entry => entry.kind === 'execute' && entry.state === 'completed').at(-1);
-    const result = row?.result as ExecutionResult | undefined;
-    if (!row || !result?.outOfScope?.length) return null;
-    return this.#store.checkpointAtHead(identity, result.head) ? null : { row, result };
+    // Every completed execute attempt, not only the latest: a later clean one must not hide an earlier owed pause.
+    for (const row of this.#store.getAttempts(identity)) {
+      const result = row.result as ExecutionResult | undefined;
+      if (row.kind !== 'execute' || row.state !== 'completed' || !result?.outOfScope?.length) continue;
+      if (!this.#store.checkpointAtHead(identity, result.head)) return { row, result };
+    }
+    return null;
   }
   /**
    * The scope pause. The checkpoint names the revision the item ran against and the snapshot its own commit created, so
