@@ -49,9 +49,14 @@ function planText(plan: Plan, full: boolean): string {
 }
 const planTextSafe = (plan: Plan, full: boolean) => neutralizeReferences(planText(plan, full));
 
-/** Single line, no control characters, no issue references except its own, bounded in code points. */
+/** A title is not fenced, so an @-mention in it would notify: `@name` becomes `＠name`. */
+export function neutralizeMentions(text: string): string {
+  return text.replace(/@(?=[A-Za-z0-9])/g, '＠');
+}
+
+/** Single line, no control characters, no issue references except its own, no mentions, bounded in UTF-16 units. */
 export function pullRequestTitle(plan: Plan): string {
-  const summary = neutralizeReferences(plan.summary.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim()) || 'codeboost plan';
+  const summary = neutralizeMentions(neutralizeReferences(plan.summary.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim())) || 'codeboost plan';
   const suffix = ` (#${plan.issue})`;
   return cut(summary, MAX_TITLE - suffix.length) + suffix;
 }

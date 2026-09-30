@@ -74,6 +74,7 @@ export class PullRequestPublisher {
     const recovered = await this.#recover(identity, signal);
     if (recovered) return recovered;
     const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
+    const reviewVersion = this.#store.reviewVersion(identity);
     if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
     if (snapshot.head === snapshot.base) {
       if (!draft) this.#store.transitionTask(identity, task.stateVersion, 'needs human');
@@ -99,8 +100,11 @@ export class PullRequestPublisher {
     if (earlier && live && earlier.state === 'opened' && live.number !== earlier.number) throw new GuardRefusal('GitHub returned a different pull request for this branch.');
     // A task that is not published as ready never leaves its PR ready for review: on a match its earlier ready PR becomes
     // a draft. This comes before the result is recorded, so if it fails the task is still running and a retry repeats it.
-    // Making a PR a draft only lowers what it offers, so it needs no re-read of the task first.
-    const drafted = result.outcome !== 'clear' && earlier && live && !live.draft
+    // It is still a GitHub change for this task, so the task is re-read first: a reassignment or review during the check
+    // means this publish is stale and must not touch the current generation's PR.
+    const needsDraft = result.outcome !== 'clear' && earlier && live && !live.draft;
+    if (needsDraft) this.#store.assertUnchangedSince(identity, { stateVersion: task.stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
+    const drafted = needsDraft
       ? await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal) : null;
     signal?.throwIfAborted();
     const check = this.#store.recordAlreadyFixed(identity, task.stateVersion, { snapshotId: snapshot.id, draft, result });

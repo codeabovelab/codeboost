@@ -104,23 +104,30 @@ export class GhPullRequestGateway implements PullRequestGateway {
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
     else if (input.draft && !patched.draft) await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
-    return this.#readBack(number, input, input.headSha, signal);
+    const wantDraft = input.ready ? false : input.draft ? true : undefined;
+    const pr = await this.#readBack(number, input, found => (input.headSha === undefined || found.headSha === input.headSha) && (wantDraft === undefined || found.draft === wantDraft), signal);
+    // A draft change GitHub has not applied fails the refresh, so it stays unconfirmed and the next publish repeats it.
+    if (wantDraft !== undefined && pr.draft !== wantDraft) throw new Error(`GitHub did not ${wantDraft ? 'turn the pull request into a draft' : 'mark the pull request ready'}.`);
+    return pr;
   }
 
   async markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
-    const current = await this.#readBack(number, input, undefined, signal);
-    if (!current.draft) await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
-    return current.draft ? current : this.#readBack(number, input, undefined, signal);
+    const current = await this.#readBack(number, input, () => true, signal);
+    if (current.draft) return current;
+    await this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal });
+    const pr = await this.#readBack(number, input, found => found.draft, signal);
+    if (!pr.draft) throw new Error('GitHub did not turn the pull request into a draft.');
+    return pr;
   }
 
-  /** Reads the PR back; when `headSha` is given, polls briefly until GitHub shows it, then returns the last answer. */
-  async #readBack(number: number, input: { base: string; headBranch: string; marker: string }, headSha: string | undefined, signal?: AbortSignal): Promise<OpenedPullRequest> {
+  /** Reads the PR back, polling briefly until `done` holds (GitHub applies pushes and draft changes a moment later); returns the last answer. */
+  async #readBack(number: number, input: { base: string; headBranch: string; marker: string }, done: (pr: OpenedPullRequest) => boolean, signal?: AbortSignal): Promise<OpenedPullRequest> {
     for (let poll = 1; ; poll++) {
       const { body, ...pr } = this.#pull(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal), input);
       if (pr.number !== number || !body.includes(input.marker)) throw new Error('GitHub returned a different pull request.');
-      if (headSha === undefined || pr.headSha === headSha || poll >= HEAD_POLLS) return pr;
+      if (done(pr) || poll >= HEAD_POLLS) return pr;
       await new Promise<void>((resolve, reject) => {
         signal?.throwIfAborted();
         const onAbort = () => { clearTimeout(timer); reject(signal!.reason); };

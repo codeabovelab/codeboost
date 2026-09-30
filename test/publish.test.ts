@@ -79,7 +79,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
   };
   const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
-  return { log, checks, opened, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher }, { ...config, ...options.config }) };
+  return { log, checks, opened, pulls, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher }, { ...config, ...options.config }) };
 }
 
 describe('opening the task PR', () => {
@@ -356,6 +356,18 @@ describe('recovering a lost opening', () => {
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
     expect(store.getTask(identity).status).toBe('possibly already fixed');
   });
+  it('does not draft the PR when the task was reassigned during the check', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    rerun(store);
+    const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+    const gate = harness(store, { live, next, results: [found] });
+    const publisher = new PullRequestPublisher(store, { checks: { async check() {
+      store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code'); return found;
+    } }, pulls: { ...gate.pulls }, pusher: { async push() {} } }, config);
+    await expect(publisher.publish(identity)).rejects.toThrow(/Stale task state/);
+    expect(gate.log.some(line => line.startsWith('draft'))).toBe(false);
+  });
   it('keeps the task running when marking the earlier PR a draft fails, so a retry repeats it', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     await harness(store, { live, next }).publisher.publish(identity);
@@ -481,6 +493,9 @@ describe('the PR description', () => {
     const body = pullRequestBody({ plan, marker: 'm', problems: ['😀'.repeat(3000)] });
     expect(body).not.toMatch(/[\ud800-\udbff](?![\udc00-\udfff])|(?<![\ud800-\udbff])[\udc00-\udfff]/);
   });
+  it('neutralises @-mentions in the unfenced title', () => {
+    expect(pullRequestTitle({ ...plan, summary: 'Investigate @admin and @org/team, not a@b' })).toBe('Investigate ＠admin and ＠org/team, not a＠b (#12)');
+  });
   it('makes a one-line, bounded title', () => {
     expect(pullRequestTitle({ ...plan, summary: 'a\nb\u0007c' })).toBe('a b c (#12)');
     expect(pullRequestTitle({ ...plan, summary: 'w'.repeat(500) })).toHaveLength(200);
@@ -562,9 +577,13 @@ describe('GitHub PR adapter', () => {
     expect(calls.map(call => call.slice(0, 3))).toEqual([['api', '-X', 'PATCH'], ['pr', 'ready', '7'], ['api', '-H', 'Accept: application/vnd.github+json']]);
     expect(calls[1]).toEqual(['pr', 'ready', '7', '--repo', 'owner/repo']);
     const undo: string[][] = [];
-    await new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { undo.push([...args]); return args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })); })
+    let undone = false;
+    await new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { undo.push([...args]); if (args[0] === 'pr') { undone = true; return ''; } return JSON.stringify(response({ draft: undone })); })
       .refresh(7, { ...input, draft: true, ready: false });
     expect(undo[1]).toEqual(['pr', 'ready', '7', '--undo', '--repo', 'owner/repo']);
+    // GitHub never applying the draft change fails the refresh instead of reporting success.
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async args => args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })))
+      .refresh(7, { ...input, draft: true, ready: false })).rejects.toThrow(/did not turn the pull request into a draft/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ number: 8 }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/different/);
     // Closed between the lookup and the refresh: refused, so the task never moves to in review without an open PR.
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ state: 'closed' }))).refresh(7, { ...input, ready: false })).rejects.toThrow(/not open/);
@@ -597,6 +616,10 @@ describe('GitHub PR adapter', () => {
     expect(calls.filter(call => call[0] === 'pr')).toEqual([['pr', 'ready', '7', '--undo', '--repo', 'owner/repo']]);
     await gh.markDraft(7, input);
     expect(calls.filter(call => call[0] === 'pr')).toHaveLength(1);
+  });
+  it('fails markDraft when GitHub never shows the PR as a draft', async () => {
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => args[0] === 'pr' ? '' : JSON.stringify(response({ draft: false })));
+    await expect(gh.markDraft(7, input)).rejects.toThrow(/did not turn the pull request into a draft/);
   });
   it('finds a lost PR only by its marker, and refuses a PR on the branch that codeboost did not open', async () => {
     const calls: string[][] = [];

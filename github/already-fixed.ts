@@ -32,6 +32,11 @@ export const MAX_TIMELINE_ITEMS = 100;
 export const MAX_BASE_COMMITS = 250;
 /** One deadline for the whole check, below the 15-second serving request budget (`web/server.ts`). */
 export const DEFAULT_CHECK_DEADLINE_MS = 12_000;
+/**
+ * After the deadline aborts a `gh` call, the runner may wait this long for SIGTERM, then this long for inherited pipes.
+ * The deadline plus both stays below the 15-second serving request budget (12 + 1 + 0.5 = 13.5 s).
+ */
+export const CHECK_KILL_GRACE_MS = 1_000, CHECK_PIPE_GRACE_MS = 500;
 const PAGE = 100;
 
 const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {
@@ -96,7 +101,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     this.repository = config.repository;
     this.deadlineMs = config.deadlineMs ?? DEFAULT_CHECK_DEADLINE_MS;
     // runWithInput escalates to SIGKILL, so an aborted stage always settles and the check's single deadline holds.
-    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(), killGraceMs: CHECK_KILL_GRACE_MS, pipeGraceMs: CHECK_PIPE_GRACE_MS }));
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {

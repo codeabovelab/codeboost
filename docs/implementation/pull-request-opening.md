@@ -42,7 +42,7 @@ A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue U
 - a closed issue with no close event;
 - a linked item that is missing, of an unknown type, or in a malformed response;
 - a GitHub error or invalid JSON;
-- the whole check running past its single deadline (12 seconds by default, below the 15-second request budget). Reaching the deadline stops the running `gh` call.
+- the whole check running past its single deadline (12 seconds by default). For the check the runner waits 1 second after SIGTERM before SIGKILL, and half a second for inherited pipes, so the whole check settles within 13.5 seconds, below the 15-second request budget. Reaching the deadline stops the running `gh` call.
 
 A cancelled check throws. It does not return `unknown`.
 
@@ -69,7 +69,7 @@ Each opening or refresh owns the task state version at the moment it passed step
 
 After an update, the read-back polls up to 5 times, half a second apart, until GitHub shows the pushed head, because GitHub updates a PR's head a moment after a push.
 
-When the check matches (or is unknown) and the task's earlier PR is open and ready for review, publish turns it back into a draft. A task that is not being published as ready never leaves its PR ready for review. This happens before the check result is recorded: if it fails, the task is still running, and a retry checks again and repeats it. A PR-number mismatch is refused before any GitHub change.
+When the check matches (or is unknown) and the task's earlier PR is open and ready for review, publish turns it back into a draft. A task that is not being published as ready never leaves its PR ready for review. This happens before the check result is recorded, after re-reading the task, its review and its head: if the task changed during the check, nothing is drafted. If the draft change fails, or GitHub does not show the PR as a draft afterwards, the task is still running, and a retry checks again and repeats it. A refresh likewise fails when GitHub does not show the requested draft or ready state. A PR-number mismatch is refused before any GitHub change.
 
 The adapter refuses any answer for a PR that is not open. A PR closed between the lookup and the update is never recorded as the task's review PR.
 
@@ -83,7 +83,7 @@ The description starts with the marker and `Fixes #<issue>`. The plan follows, i
 
 GitHub ignores closing keywords and @-mentions inside code. So plan text or agent output cannot notify people from the description, and cannot end the block: the fence is longer than any run of backticks in the text.
 
-Fences do not protect commit messages. A squash or merge commit can carry the PR title and description, and GitHub acts on closing keywords in default-branch commit messages. So every issue reference in the title's summary, the plan and the problems is neutralised: `#7` becomes `＃7`, `GH-7` gets a non-breaking hyphen, and `/issues/7` or `/pull/7` gets a division slash. Only the task's own `Fixes #<issue>` line and the title's `(#<issue>)` remain real references.
+Fences do not protect commit messages. A squash or merge commit can carry the PR title and description, and GitHub acts on closing keywords in default-branch commit messages. So every issue reference in the title's summary, the plan and the problems is neutralised: `#7` becomes `＃7`, `GH-7` gets a non-breaking hyphen, and `/issues/7` or `/pull/7` gets a division slash. Only the task's own `Fixes #<issue>` line and the title's `(#<issue>)` remain real references. The title is not fenced, so an @-mention in it would notify: `@name` becomes `＠name` there.
 
 Titles and problems are cut by code point, never inside a surrogate pair. An empty summary becomes `codeboost plan`.
 

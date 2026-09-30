@@ -73,6 +73,8 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Check an operation's source-state preconditions before any shortcut or early return that writes state or reports success, not only on the main path.
 - Honour a cancellation signal that is already aborted before the first durable write, not only after awaits: a path with no await otherwise writes after the caller cancelled.
 - Batch and briefly cache read-only status probes, and give the combined operation an overall deadline below the serving request timeout.
+- Count the subprocess shutdown grace periods (SIGTERM-to-SIGKILL wait, pipe drain) inside that overall deadline: the operation ends when its processes have settled, not when the abort fires.
+- After an external state change (ready, draft, close), read the record back and require the new state before recording success; a command that exits 0 does not prove the change applied.
 - Budget a multi-stage validation across all sequential stages; giving each stage the full request allowance does not create an overall deadline.
 - Preserve the distinction between an explicit unbound identity and missing or malformed authorization metadata. Missing or malformed identities must fail closed.
 - Validate every field used to classify an external record as clear, including enum values and required nullable fields. Partial records and malformed policy objects must fail closed.
@@ -109,7 +111,7 @@ Every reproduced race requires a failing-before and passing-after regression. As
 
 - When a subprocess reports a problem only as a warning and carries on, decide pass or fail by what each message means for the result, not by whether anything was printed: fail on messages that mean it did less than it should (for example could not read a path), and let through messages about harmless input the agent controls. Test both a benign case and a failing case, and filter the output as it arrives so that no volume of benign messages can push a failure out of a bounded buffer.
 - Quote or escape agent-controlled text (file names, paths, branch names) wherever it lands in output that people or tools parse, such as diffs, notices, logs or reports, so it cannot forge that output's structure.
-- Neutralise issue references (`#N`, `GH-N`, `owner/repo#N`, issue URLs) in any text codeboost writes that can become a commit message, such as a PR title or description. Code fences do not protect commit messages, and GitHub closes issues from closing keywords in default-branch commits.
+- Neutralise issue references (`#N`, `GH-N`, `owner/repo#N`, issue URLs) in any text codeboost writes that can become a commit message, such as a PR title or description, and neutralise @-mentions in any of that text that is not fenced (a title). Code fences do not protect commit messages, and GitHub closes issues from closing keywords in default-branch commits.
 - Never spread a collection whose size follows unbounded input into function arguments (`Math.max(...runs)`); engines limit the argument count, so use a loop.
 - A hardened Git invocation must also keep Git out of nested repositories and populated submodules, whose own config and hooks are the agent's: pass `--ignore-submodules` on the command line (the config default does not bind plumbing or override `.gitmodules`), and never run Git with a nested repository as its working directory.
 

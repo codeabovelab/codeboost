@@ -1034,6 +1034,16 @@ export class Store {
       return this.#task(key).status as TaskStatus;
     });
   }
+  /** The task, its review and its head are exactly as a publish read them before its last await. */
+  assertUnchangedSince(identity: PlanIdentity, input: { stateVersion: number; reviewVersion: number; snapshotId: string; draft: boolean }): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      this.#assertPublishable(key, this.#task(key), input.stateVersion, input.draft);
+      const plan = this.#current(key);
+      if (plan.review_version !== input.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
+      if (plan.snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
+    });
+  }
   /** Records that the task's open PR is now a draft (after a check matched). The task status does not change. */
   recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean): void {
     const key = identityKey(identity);

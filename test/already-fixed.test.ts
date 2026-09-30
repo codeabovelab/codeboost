@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { DEFAULT_CHECK_DEADLINE_MS, GhAlreadyFixedGateway, MAX_BASE_COMMITS, mentionsIssue, type AlreadyFixedInput } from '../github/already-fixed.ts';
+import { CHECK_KILL_GRACE_MS, CHECK_PIPE_GRACE_MS, DEFAULT_CHECK_DEADLINE_MS, GhAlreadyFixedGateway, MAX_BASE_COMMITS, mentionsIssue, type AlreadyFixedInput } from '../github/already-fixed.ts';
 
 const sha = (n: number) => n.toString(16).padStart(40, '0');
 const repo = 'Owner/Repo';
@@ -123,7 +123,8 @@ describe('the pre-PR already-fixed check', () => {
     expect(aborted).toBe(true);
   });
   it('defaults to a deadline below the 15-second serving request budget', () => {
-    expect(DEFAULT_CHECK_DEADLINE_MS).toBeLessThan(15_000);
+    // The deadline plus the runner's SIGTERM and pipe grace periods stays below the budget.
+    expect(DEFAULT_CHECK_DEADLINE_MS + CHECK_KILL_GRACE_MS + CHECK_PIPE_GRACE_MS).toBeLessThan(15_000);
     expect(new GhAlreadyFixedGateway({ repository: repo }).deadlineMs).toBe(DEFAULT_CHECK_DEADLINE_MS);
   });
   it('returns only after the stopped stage has settled', async () => {
