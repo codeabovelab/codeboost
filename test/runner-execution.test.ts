@@ -120,7 +120,7 @@ describe('item execution', () => {
   });
   it('records no ledger entry when the commit is refused', async () => {
     const { store, executor } = setup({ commit: async () => { throw new Error('work tree changed after the audit'); } });
-    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Invalid output: work tree changed after the audit' });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'The runner commit was refused: "work tree changed after the audit"' });
     expect(store.getLedger(identity)).toEqual([]);
   });
   it('discards the commit when a stop lands while the commit runs', async () => {
@@ -324,7 +324,7 @@ describe('item execution', () => {
     expect(runner.status(identity).unresolved).toBeNull();
     expect(log).toContain('release P1 after failed');
   });
-  it('keeps a human gate set during release instead of pausing over it, but still escalates a safety violation', async () => {
+  it('keeps a human gate set during release, and escalates a safety violation owed from it when the task next runs', async () => {
     let store!: Store;
     const toApproval = async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); };
     const scoped = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: toApproval });
@@ -333,8 +333,13 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('needs approval');
     const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toApproval });
     store = unsafe.store;
+    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/needs approval; it moves to needs human when it next runs/) });
+    expect(store.getTask(identity).status).toBe('needs approval');
+    // A person releases the gate; the owed finding goes to needs human before any item runs again.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)).toHaveLength(1);
   });
   it('treats an audit that throws as a safety violation', async () => {
     const { store, executor, commits } = setup({ pathKeyError: new Error('Non-ASCII case-insensitive paths require an adapter.') });
@@ -481,5 +486,33 @@ describe('item execution', () => {
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
     expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after cancelled']);
     expect(store.getTask(identity).status).toBe('cancelled');
+  });
+  it('keeps a safety finding owed when moving to needs human fails, and escalates it before the next run launches anything', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
+    const transition = h.store.transitionTask.bind(h.store);
+    let fail = true;
+    h.store.transitionTask = (...args) => { if (fail && args[2] === 'needs human') { fail = false; throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); } return transition(...args); };
+    await expect(h.executor.runTask(identity)).rejects.toThrow(/disk full/);
+    expect(h.store.getTask(identity).status).toBe('running');
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.store.getAttempts(identity)).toHaveLength(1);
+  });
+  it('stops before the next item when someone changes the status during release', async () => {
+    let store!: Store;
+    const h = setup({ release: async () => { if (store.getAttempts(identity).length === 1) store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', reason: expect.stringMatching(/changed to queued/) });
+    expect(h.commits.map(c => c.item)).toEqual(['P1']);
+  });
+  it('refuses an owed pause from a human gate, and validates the prefix against the item\'s own revision', () => {
+    const { store } = setup();
+    const snapshotId = store.getSnapshot(identity).id;
+    // Revision 2 drops P2; the prefix [P1, P2] is still right for revision 1, where the item ran.
+    store.importRevision(JSON.stringify({ ...plan, revision: 2, items: [plan.items[0]!] }), 'json', context, 1);
+    const evidence = { item: 'P2', baseEntries: [], completedItems: ['P1', 'P2'], outOfScopePaths: ['x'] };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval');
+    expect(() => store.pauseForAmendment(identity, { revision: 1, snapshotId }, evidence, { owed: true })).toThrow(/is needs approval/);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect(store.pauseForAmendment(identity, { revision: 1, snapshotId }, evidence, { owed: true })).toMatchObject({ revision: 1, completedItems: ['P1', 'P2'] });
   });
 });

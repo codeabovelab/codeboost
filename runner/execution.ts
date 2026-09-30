@@ -47,7 +47,9 @@ export const SAFETY_VIOLATION = 'Safety violation:';
 export class SafetyFindings {
   #found = new Map<string, string>();
   record(attemptId: string, reason: string): void { this.#found.set(attemptId, reason); }
-  take(attemptId: string): string | undefined { const reason = this.#found.get(attemptId); this.#found.delete(attemptId); return reason; }
+  /** A finding stays owed until its task has been moved to needs human (or closed); only then is it settled. */
+  get(attemptId: string): string | undefined { return this.#found.get(attemptId); }
+  settle(attemptId: string): void { this.#found.delete(attemptId); }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: unknown }
@@ -108,10 +110,16 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       if (!sameContext(attempt.context, store.currentContext(identity))) throw new FinishFailure('The plan, snapshot or assignment changed during the audit; nothing was committed.');
       // Every change is in or out of scope here; a rename stages both its old and its new path.
       const paths = [...new Set(manifest.changes.flatMap(entry => [entry.path, ...(entry.oldPath ? [entry.oldPath] : [])]))];
-      const head = await workspace.commit(data.workspace, {
+      let head: string;
+      try { head = await workspace.commit(data.workspace, {
         baseHead: data.baseHead, paths, digest: manifest.digest,
         message: `${item.id}: ${item.title}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
-      }, signal);
+      }, signal); }
+      catch (error) {
+        if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
+        // D's refusal text can name agent-chosen paths: quote it (AGENTS.md).
+        throw new FinishFailure(`The runner commit was refused: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+      }
       // The ID goes into the ledger inside the terminal write; a malformed one must fail the attempt, not that write.
       if (typeof head !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(head)) throw new FinishFailure('The workspace returned an invalid commit ID; nothing was published.');
       if (head === data.baseHead) throw new FinishFailure('The workspace made no new commit for a changed item; nothing was published.');
@@ -164,6 +172,11 @@ export class ItemExecutor {
     if (start < 0) throw new Error('Unknown plan item.');
     const done: string[] = [], unchanged: string[] = [];
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [...done] });
+    // A safety finding not yet acted on (a failed write, a human gate at the time) goes to needs human first.
+    for (const earlier of this.#store.getAttempts(identity)) {
+      const finding = this.#findings.get(earlier.id);
+      if (finding) return this.#escalate(identity, earlier, finding, stopped, []);
+    }
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
     if (owed) return this.#pause(identity, owed.row, owed.result, stopped, [], true);
@@ -178,6 +191,9 @@ export class ItemExecutor {
     for (const item of plan.items.slice(start)) {
       // Admission reads the context in this same turn, so it cannot notice a change saved during an earlier item.
       const current = this.#store.currentContext(identity);
+      // After an item, the task is still running unless someone changed its status meanwhile: then the run stops.
+      if (expected && this.#store.getTask(identity).status !== 'running')
+        return stopped(item.id, 'not started', `The task's status changed to ${this.#store.getTask(identity).status} during the run; ${item.id} was not started.`);
       if (this.#store.getPlan(identity).revision !== plan.revision)
         return stopped(item.id, 'not started', `The plan changed to a new revision during the run; review it before running ${item.id}.`);
       if (expected && (current.snapshotId !== expected.snapshotId || current.assignmentId !== expected.assignmentId || current.referencedCodeHash !== expected.referencedCodeHash))
@@ -195,19 +211,8 @@ export class ItemExecutor {
       await this.#runner.settled(identity);
       const row = this.#store.getAttempt(identity, attempt.id);
       // Only the runner's own audit records a finding; it wins over any later stale or stop outcome.
-      const violation = this.#findings.take(attempt.id);
-      if (violation) {
-        const task = this.#store.getTask(identity);
-        // A safety violation goes to needs human over any status someone set since (queued, a human gate), because a
-        // run from that status would launch the item again; only a closed task is left as it is (no await since this read).
-        if (CLOSED_STATUSES.includes(task.status)) return stopped(item.id, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
-        try { this.#write(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
-        catch (error) {
-          if (!(error instanceof GuardRefusal)) throw error;
-          return stopped(item.id, row.state, `${violation} The task could not be moved to needs human: ${error.message}`);
-        }
-        return { kind: 'needs human', item: item.id, reason: violation, completed: [...done] };
-      }
+      const violation = this.#findings.get(attempt.id);
+      if (violation) return this.#escalate(identity, row, violation, stopped, done);
       if (row.state !== 'completed') {
         // Still pending or running: the terminal write failed and the slot is held until restart.
         const unresolved = this.#runner.status(identity).unresolved;
@@ -223,6 +228,29 @@ export class ItemExecutor {
       expected = { snapshotId, assignmentId: row.context.assignmentId, referencedCodeHash: row.context.referencedCodeHash };
     }
     return { kind: 'executed', items: done, unchanged };
+  }
+  /**
+   * A safety finding sends the task to needs human (plan-format.md, "After each run"). From running or queued it moves
+   * now. A human-gated or review status is kept, because leaving it needs its own user action (runner-lifecycle.md),
+   * and the finding stays owed: the task's next run escalates it before anything else. A closed task needs nothing.
+   * The finding is settled only once acted on, so a failed write leaves it owed too.
+   */
+  #escalate(identity: PlanIdentity, row: AttemptRecord, violation: string,
+    stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[]): ExecutionOutcome {
+    const item = row.item!, task = this.#store.getTask(identity);
+    if (CLOSED_STATUSES.includes(task.status)) {
+      this.#findings.settle(row.id);
+      return stopped(item, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
+    }
+    if (task.status !== 'running' && task.status !== 'queued')
+      return stopped(item, row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
+    try { this.#write(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
+    catch (error) {
+      if (!(error instanceof GuardRefusal)) throw error;
+      return stopped(item, row.state, `${violation} The task could not be moved to needs human yet: ${error.message}`);
+    }
+    this.#findings.settle(row.id);
+    return { kind: 'needs human', item, reason: violation, completed: [...done] };
   }
   /** The latest completed execute attempt, if its out-of-scope files have no checkpoint yet (its pause was lost). */
   #unpausedScopeFinding(identity: PlanIdentity): { row: AttemptRecord; result: ExecutionResult } | null {

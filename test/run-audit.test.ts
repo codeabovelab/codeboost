@@ -65,6 +65,15 @@ describe('post-run audit', () => {
       expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)
         .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target enters .git.'] });
   });
+  it('refuses removing or replacing a pre-existing symlink at an undeclared path, and allows it at a declared one', () => {
+    for (const change of [file('lnk', { kind: 'delete', oldType: 'symlink', newType: undefined }), file('lnk', { oldType: 'symlink', newType: 'file' })])
+      expect(auditRun(item, manifest([change]), exact)).toEqual({ kind: 'violation', violations: ['A pre-existing symlink was removed or replaced at an undeclared path: "lnk".'] });
+    expect(auditRun(item, manifest([file('link', { kind: 'delete', oldType: 'symlink', newType: undefined })]), exact)).toMatchObject({ kind: 'commit', inScope: ['link'] });
+  });
+  it('counts two spellings of one path under a case-folding identity as a duplicate', () => {
+    expect(auditRun(item, manifest([file('SRC/Retry.ts'), file('src/retry.ts')]), folded)).toMatchObject({ kind: 'violation' });
+    expect(auditRun(item, manifest([file('SRC/Retry.ts'), file('src/retry.ts')]), exact)).toMatchObject({ kind: 'commit' });
+  });
   it('quotes agent-controlled paths in findings and cuts long lists short', () => {
     const outcome = auditRun(item, manifest([file('src/retry.ts')], { nestedGitlinkContent: ['a', 'b', 'c', 'd', 'e', 'f', 'g"; rm -rf /'] }), exact);
     expect(outcome).toEqual({ kind: 'violation', violations: ['Content appeared under a gitlink: "a", "b", "c", "d", "e" and 2 more.'] });
@@ -74,12 +83,12 @@ describe('post-run audit', () => {
       expect(auditRun(item, manifest([file(path)]), exact), path).toMatchObject({ kind: 'violation' });
     expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: 'x/../.git/config' })]), exact)).toMatchObject({ kind: 'violation' });
   });
-  it('limits the saved paths as JSON, and does not count a rename\'s old path', () => {
+  it('limits the saved paths as JSON, a rename\'s old path included (an undeclared one is saved as the finding)', () => {
     // 100 paths of 4,000 control characters are under the raw byte cap but about 2.4 MB as JSON.
     expect(auditRun(item, manifest(Array.from({ length: 100 }, (_, i) => file(`${'\u0001'.repeat(4000)}${i}`, { kind: 'add', oldType: undefined }))), exact))
       .toEqual({ kind: 'violation', violations: ['The change report is too large to audit.'] });
-    // A long old path is not saved, so it does not count.
-    expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: `docs/${'o'.repeat(600_000)}.md` })]), exact)).toMatchObject({ kind: 'commit' });
+    expect(auditRun(item, manifest([file('docs/New.md', { kind: 'rename', oldPath: `docs/${'o'.repeat(600_000)}.md` })]), exact))
+      .toEqual({ kind: 'violation', violations: ['The change report is too large to audit.'] });
   });
   it('stops on every safety violation before any scope decision', () => {
     const cases: [string, ChangeManifest][] = [

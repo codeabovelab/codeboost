@@ -52,7 +52,6 @@ function malformed(manifest: ChangeManifest): string | null {
     if (!Array.isArray(manifest[field]) || manifest[field].some(entry => typeof entry !== 'string')) return `The change report has no ${field} list.`;
   if (typeof manifest.metadataChanged !== 'boolean') return 'The change report does not say whether Git metadata changed.';
   let bytes = 0;
-  const seen = new Set<string>();
   for (const change of manifest.changes) {
     if (!change || typeof change !== 'object' || typeof change.path !== 'string' || !change.path) return 'A change has no path.';
     // Only a rename has an old path; on any other kind it would be staged as if it were part of the change.
@@ -65,13 +64,8 @@ function malformed(manifest: ChangeManifest): string | null {
     if ((needsNew && !TYPES.has(change.newType as string)) || (!needsNew && change.newType !== undefined)) return `The change at ${q(change.path)} has an invalid new entry type.`;
     if (change.newType === 'symlink' && typeof change.newLinkTarget !== 'string') return `The link at ${q(change.path)} has no target.`;
     if (change.linkTargetTraversesLink !== undefined && typeof change.linkTargetTraversesLink !== 'boolean') return `The link at ${q(change.path)} has an invalid traversal flag.`;
-    // Each path appears once: two entries for one path (a modify and a delete, say) contradict each other.
-    for (const path of [change.path, ...(change.oldPath ? [change.oldPath] : [])]) {
-      if (seen.has(path)) return `The change report lists ${q(path)} more than once.`;
-      seen.add(path);
-    }
-    // Only `path` is saved (in the result's scope lists and a checkpoint), so only it counts, as the JSON that stores it.
-    bytes += Buffer.byteLength(JSON.stringify(change.path)) + 1;
+    // Both paths can be saved (an undeclared rename source is a scope finding), measured as the JSON that stores them.
+    for (const path of [change.path, ...(change.oldPath ? [change.oldPath] : [])]) bytes += Buffer.byteLength(JSON.stringify(path)) + 1;
   }
   if (bytes > MAX_PATH_BYTES) return 'The change report is too large to audit.';
   return null;
@@ -103,6 +97,13 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   if (manifest.linkTargetChanges.length) violations.push(`A declared symlink target changed: ${list(manifest.linkTargetChanges)}.`);
   if (manifest.nestedGitlinkContent.length) violations.push(`Content appeared under a gitlink: ${list(manifest.nestedGitlinkContent)}.`);
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
+  // Each path appears once, under the trusted path identity: two entries for one path contradict each other.
+  const seen = new Set<string>();
+  for (const change of manifest.changes) for (const path of [change.path, ...(change.oldPath ? [change.oldPath] : [])]) {
+    const key = pathKey(path);
+    if (seen.has(key)) return { kind: 'violation', violations: [`The change report lists ${q(path)} more than once.`] };
+    seen.add(key);
+  }
   for (const change of manifest.changes) {
     const paths = [change.path, ...(change.oldPath ? [change.oldPath] : [])];
     // A path must be in canonical form: another spelling (./, a/../, //, a trailing /) could reach .git or hide a match.
@@ -113,6 +114,9 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
     if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || ['.', '..'].includes(posix.normalize(path)) || path.includes('\0')))
       { violations.push(`Invalid path in the change report: ${q(change.path)}.`); continue; }
     if (change.oldType === 'gitlink' || change.newType === 'gitlink') { violations.push(`Plan items cannot change gitlinks: ${q(change.path)}.`); continue; }
+    // Only a declared pre-existing link may change at all: deleting one, or turning it into a file, is a link change too.
+    if (change.oldType === 'symlink' && change.newType !== 'symlink' && !declared.has(pathKey(change.oldPath ?? change.path)))
+      { violations.push(`A pre-existing symlink was removed or replaced at an undeclared path: ${q(change.oldPath ?? change.path)}.`); continue; }
     if (change.newType === 'symlink') {
       if (change.oldType !== 'symlink') { violations.push(`New symlink or file-to-symlink conversion: ${q(change.path)}.`); continue; }
       if (!declared.has(pathKey(change.path))) { violations.push(`A pre-existing symlink changed at an undeclared path: ${q(change.path)}.`); continue; }
