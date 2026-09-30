@@ -134,11 +134,11 @@ export class PullRequestPublisher {
     let live;
     try { live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal); }
     catch (error) {
-      if (!(error instanceof PullRequestMisplaced) || signal?.aborted) throw error;
+      if (!(error instanceof PullRequestMisplaced)) throw error;
       // The task's PRs are not where it can publish, and a person has to decide: none of them stays ready meanwhile,
       // although the task itself could otherwise be published as ready.
-      const notes = await this.#draftStranded(identity, signal, true);
-      throw new PullRequestMisplaced(notes.length ? `${error.message} ${notes.join(' ')}` : error.message);
+      const all = [...new Set([...notes, ...await this.#draftStranded(identity, signal, true)])];
+      throw new PullRequestMisplaced(all.length ? `${error.message} ${all.join(' ')}` : error.message);
     }
     signal?.throwIfAborted();
     let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
@@ -392,7 +392,8 @@ export class PullRequestPublisher {
     // A record's base is only where the PR was opened; the lookup finds the task's own PRs in any base.
     const branches = new Set<string>();
     for (const pr of prs) {
-      if (pr.repository.toLowerCase() === this.#config.repository.toLowerCase() && ((pr.state === 'opened' && !pr.draft) || pr.state === 'abandoned'))
+      // Misplaced PRs are all looked up: one recorded as a draft may have been made ready by the person who moved it.
+      if (pr.repository.toLowerCase() === this.#config.repository.toLowerCase() && ((pr.state === 'opened' && (!pr.draft || misplaced)) || pr.state === 'abandoned'))
         branches.add(pr.headBranch);
     }
     for (const headBranch of branches) {

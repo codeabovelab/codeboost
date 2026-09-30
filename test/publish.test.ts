@@ -1807,6 +1807,20 @@ describe('shutdown and PRs left ready', () => {
     expect(again.log).toContain('draft 100');
     expect(again.log.some(line => line.startsWith('push'))).toBe(false);
   });
+  it('drafts a misplaced PR recorded as a draft that a person made ready', async () => {
+    // A needs-human task has its draft PR; it is then sent back and runs again.
+    const task = runningTask(), pulls = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    task.transitionTask(identity, task.getTask(identity).stateVersion, 'needs human');
+    await harness(task, { live: pulls, next }).publisher.publish(identity, { problems: ['x'] });
+    expect(task.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+    requeue(task);
+    // A person marks it ready and moves it to develop.
+    for (const [m, pr] of pulls) { pulls.set(m, { ...pr, draft: false }); baseOf.get(pulls)!.set(m, 'develop'); }
+    const again = harness(task, { live: pulls, next });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(PullRequestMisplaced);
+    expect(again.log).toContain('draft 100');
+    expect(task.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
     const later = { now: () => Date.now() + 10 * 60_000 };
