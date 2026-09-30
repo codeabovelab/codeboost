@@ -346,7 +346,7 @@ export class PullRequestPublisher {
    * would draft it. Its record saying "ready" is what makes the draft owed, so an earlier draft change that failed
    * (`leftReady`) is repeated by the next publish, and a PR that recovery has just recorded is covered too. An abandoned
    * opening's PR that has appeared since is adopted here too (AGENTS.md: a late result is adopted), because the main path,
-   * which also adopts, is never reached. A draft flag GitHub already shows is only recorded. A GitHub failure does not
+   * which also adopts, may refuse first. A draft flag GitHub already shows is only recorded. A GitHub failure does not
    * replace the status refusal that follows: it is returned as a note for it, and the next publish tries again.
    */
   async #draftStranded(identity: PlanIdentity, signal?: AbortSignal): Promise<string[]> {

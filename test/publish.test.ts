@@ -1493,6 +1493,44 @@ describe('shutdown and PRs left ready', () => {
     expect(again.log).toContain('draft 100');
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
   });
+  /** A needs-human draft opening whose outcome was lost, then a cancel, then recovery abandoning it: its PR is hidden until `hidden` clears. */
+  async function abandonedDraft() {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    await expect(harness(store, { live, next, hidden, config: later }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'abandoned', draft: true }]);
+    hidden.clear();
+    return { store, live, next, later };
+  }
+  it("records a late draft PR by adoption alone, and drafts one a person has made ready since", async () => {
+    // Still a draft on GitHub: adoption is the only write.
+    let { store, live, next, later } = await abandonedDraft();
+    const version = store.getTask(identity).stateVersion;
+    const quiet = harness(store, { live, next, config: later });
+    await expect(quiet.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(quiet.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
+    expect(store.getTask(identity).stateVersion).toBe(version + 1);
+    // Made ready on GitHub meanwhile: adopted as ready, then drafted, and the record says so.
+    ({ store, live, next, later } = await abandonedDraft());
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    const readied = harness(store, { live, next, config: later });
+    await expect(readied.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(readied.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
+  });
+  it('adopts nothing when the draft step is aborted during a lookup that still answers', async () => {
+    const { store, live, next, later } = await abandonedDraft();
+    const controller = new AbortController();
+    const again = harness(store, { live, next, config: later, onFind: () => controller.abort() });
+    const error = await again.publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(error).not.toBeInstanceOf(GuardRefusal);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'abandoned' }]);
+  });
   it('leaves the PR ready when the task is approved during the draft step lookup', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>();
     await harness(store, { live }).publisher.publish(identity);
