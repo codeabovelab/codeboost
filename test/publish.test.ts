@@ -1478,6 +1478,70 @@ describe('shutdown and PRs left ready', () => {
     expect(pushed.log.some(line => line.startsWith('push'))).toBe(true);
     expect(pushed.log.some(line => line.startsWith('refresh'))).toBe(false);
   });
+  it("adopts and drafts an abandoned opening's PR that appears only after its task was cancelled", async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    // Recovery sees nothing after the settle time and abandons the opening; the status refusal follows.
+    await expect(harness(store, { live, next, hidden, config: later }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'abandoned' }]);
+    hidden.clear();
+    const again = harness(store, { live, next, config: later });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100, draft: true }]);
+  });
+  it('leaves the PR ready when the task is approved during the draft step lookup', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    const again = harness(store, { live, onFind: () => store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked') });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(GuardRefusal);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
+  });
+  it('rejects with the abort, not a note, when the draft step is aborted', async () => {
+    const cancelled = async () => {
+      const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+      await harness(store, { live }).publisher.publish(identity);
+      store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+      return { store, live };
+    };
+    // The lookup fails because of the abort.
+    let controller = new AbortController();
+    let { store, live } = await cancelled();
+    let error = await harness(store, { live, onFind: () => { controller.abort(); throw new Error('aborted lookup'); } }).publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(error).not.toBeInstanceOf(GuardRefusal);
+    // The draft change fails because of the abort.
+    controller = new AbortController();
+    ({ store, live } = await cancelled());
+    error = await harness(store, { live, draftFails: true, onDraft: () => controller.abort() }).publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(error).not.toBeInstanceOf(GuardRefusal);
+    // The draft change lands, then the abort: the change is recorded and the publish rejects.
+    controller = new AbortController();
+    ({ store, live } = await cancelled());
+    error = await harness(store, { live, onDraft: () => controller.abort() }).publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(error).not.toBeInstanceOf(GuardRefusal);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+  });
+  it('drafts nothing in another repository than its own', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    const other = harness(store, { live, config: { repository: 'owner/other' } });
+    await expect(other.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(other.log).toEqual([]);
+  });
+  it('rejects with the abort during the head-mismatch draft change instead of reporting leftReady', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), controller = new AbortController();
+    const { publisher } = harness(store, { live, draftFails: true, onDraft: () => controller.abort(), open: async input => {
+      const pr = { number: 5, url: 'https://github.com/owner/repo/pull/5', headSha: oid(77), draft: input.draft }; live.set(input.marker, pr); return pr;
+    } });
+    await expect(publisher.publish(identity, {}, controller.signal)).rejects.toThrow();
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5 }]);
+  });
   it('refuses gateways configured for another repository', () => {
     const store = runningTask();
     const { pulls } = harness(store);
