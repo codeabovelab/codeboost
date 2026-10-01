@@ -41,7 +41,7 @@ export type PublishOutcome =
   | { kind: 'no changes'; leftReady?: number };
 
 const marker = (openingId: string) => `<!-- codeboost:opening=${openingId} -->`;
-const ambiguous = (prs: readonly { number: number }[]) => `Pull requests ${prs.map(pr => `#${pr.number}`).join(', ')}`;
+const pullRequestList = (prs: readonly { number: number }[]) => `Pull requests ${prs.map(pr => `#${pr.number}`).join(' and ')}`;
 /**
  * Tasks with a publish in progress, per Store, shared by every publisher over that Store. One publish per task at a
  * time, so an update is never cleared or overtaken while its GitHub calls run. The runner lock rules out a second process.
@@ -350,14 +350,12 @@ export class PullRequestPublisher {
     for (const refreshing of this.#store.taskPullRequests(identity).filter(pr => pr.refresh !== null)) {
       if (refreshing.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request update is in flight in another repository.');
       // An observation in any base: recording what GitHub shows is safe wherever the PR is, and a refusal here would keep
-      // the update in flight and stop the draft step below from running.
+      // the update in flight and stop the draft step below from running. A marker is editable text, so another PR may
+      // carry it too (a copied description); the update's PR is the one with the recorded number, which cannot be edited,
+      // whatever order GitHub lists them in. A copy is left to the main path and the draft step.
       const found = await this.#pulls.findOwned({ headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
       signal?.throwIfAborted();
-      // A marker is editable text: another PR carrying it (a copied description) makes the observation ambiguous, so the
-      // update stays in flight and a person decides, rather than GitHub's list order picking which PR is recorded.
-      if (found.length > 1 || (found.length === 1 && found[0]!.number !== refreshing.number))
-        throw new PullRequestMisplaced(`${ambiguous(found)} carry the first line of the task's pull request #${refreshing.number}. Close the copies or restore their first lines.`);
-      this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, found[0] ?? null);
+      this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, found.find(pr => pr.number === refreshing.number) ?? null);
     }
     // Read once: the settlements above are the only writes before this point.
     const prs = this.#store.taskPullRequests(identity);
@@ -369,8 +367,9 @@ export class PullRequestPublisher {
     const owned = await this.#pulls.findOwned({ headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
     const mine = owned.filter(candidate => candidate.marker === marker(lost.openingId));
-    // Two PRs carrying the lost opening's marker (a copied description): which one it opened is unknown, so it stays owned.
-    if (mine.length > 1) throw new PullRequestMisplaced(`${ambiguous(mine)} carry the first line of a pull request the task was opening. Close the copies or restore their first lines.`);
+    // Two PRs carrying the lost opening's marker (a copied description): no number was recorded, so which one it opened is
+    // unknown, and it stays owned. Neither can be drafted safely, since one is someone else's.
+    if (mine.length > 1) throw new PullRequestMisplaced(`${pullRequestList(mine)} carry the first line of a pull request the task was opening, so codeboost cannot tell which is its own. Close the one that is not (compare their authors and creation times). The task's pull request may still be ready for review.`);
     const pr = mine[0];
     const blocking = pr ? undefined : owned.find(candidate => candidate.base === lost.base);
     if (blocking) {

@@ -45,6 +45,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
   let publishBranch = '';
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
+  // `copies`: PRs someone else opened from the task branch with a description starting with one of the task's markers.
+  // GitHub allows one open PR per branch and base, so a copy is into another base.
+  const copiesOf = (markers: readonly string[]) => (options.copies ?? [])
+    .filter(copy => markers.includes(copy.marker) && !(options.closed ?? new Set()).has(copy.number)).map(copy => ({ ...copy, base: 'copy-base' }));
   // Each PR's base, by marker (like GitHub, a PR opened into a base stays there); unset means the configured base.
   const bases = baseOf.get(live) ?? new Map<string, string>(); baseOf.set(live, bases);
   const results = options.results ? [...options.results] : [];
@@ -78,9 +82,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       const baseOfPr = (m: string) => bases.get(m) ?? publishConfig.baseBranch;
       // `unmarked`: a person removed the PR's first-line marker.
       const carries = (m: string, pr: OpenedPullRequest) => !options.unmarked?.has(pr.number) && input.markers.includes(m);
-      const own = visible.filter(([m, pr]) => carries(m, pr));
-      if (own.length > 1) throw new PullRequestMisplaced(`More than one of the task's pull requests is open (${own.map(([, pr]) => `#${pr.number}`).join(', ')}).`);
-      if (own.length === 1 && baseOfPr(own[0]![0]) !== input.base) throw new PullRequestMisplaced(`The task's pull request #${own[0]![1].number} now targets ${baseOfPr(own[0]![0])}, not ${input.base}.`);
+      const own = visible.filter(([m, pr]) => carries(m, pr)).map(([, pr]) => pr).concat(copiesOf(input.markers));
+      if (own.length > 1) throw new PullRequestMisplaced(`More than one of the task's pull requests is open (${own.map(pr => `#${pr.number}`).join(', ')}).`);
+      const ownTuple = visible.find(([m, pr]) => carries(m, pr));
+      if (own.length === 1 && ownTuple && baseOfPr(ownTuple[0]) !== input.base) throw new PullRequestMisplaced(`The task's pull request #${ownTuple[1].number} now targets ${baseOfPr(ownTuple[0])}, not ${input.base}.`);
       const open = visible.find(([m]) => baseOfPr(m) === input.base);
       if (!open) return null;
       if (!carries(open[0], open[1]) && input.numbers?.includes(open[1].number)) throw new PullRequestMisplaced(`The task's pull request #${open[1].number} no longer starts with its marker. It may still be ready for review.`);
@@ -99,10 +104,9 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     async findOwned(input) {
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
       if (options.found !== undefined) return options.found ? [{ ...options.found, marker: input.markers.at(-1)!, base: publishConfig.baseBranch }] : [];
-      return [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.moved?.has(pr.number) && !options.unmarked?.has(pr.number) && input.markers.includes(m))
-        .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch }))
-        // `copies`: other PRs whose description a person started with one of the task's markers.
-        .concat((options.copies ?? []).filter(copy => input.markers.includes(copy.marker)).map(copy => ({ ...copy, base: publishConfig.baseBranch })));
+      // Copies first: GitHub's order is not defined, and a copy listed first must not be taken for the task's PR.
+      return copiesOf(input.markers).concat([...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.moved?.has(pr.number) && !options.unmarked?.has(pr.number) && input.markers.includes(m))
+        .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch })));
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
@@ -488,16 +492,18 @@ describe('guards found by the independent review', () => {
     expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 5, draft: false, status: 'running', leftReady: 5 });
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5, headSha: oid(77) }]);
   });
-  it('does not take a different PR number as what GitHub shows for an unconfirmed update: it refuses and keeps it in flight', async () => {
+  it('does not take another PR carrying the marker as what GitHub shows for an unconfirmed update', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
     rerun(store);
     await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
-    for (const [m, pr] of live) live.set(m, { ...pr, number: 999, draft: false, headSha: oid(8) });
+    // The PR was closed and a person opened another with the same description: nothing about #100 is taken from it.
+    const [m, pr] = [...live][0]!;
+    const copy = { ...pr, number: 999, draft: false, headSha: oid(8), marker: m };
     store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
-    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/#999 carry the first line of the task's pull request #100/);
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: expect.anything() }]);
+    await expect(harness(store, { live, next, copies: [copy], closed: new Set([pr.number]) }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: null }]);
   });
   it('reports drafts unsupported when a lost draft opening cannot be turned back into a draft', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
@@ -2099,22 +2105,48 @@ describe('shutdown and PRs left ready', () => {
     expect(read.message).toBe('cancelled');
     expect(reading.log.some(line => line.startsWith('draft') || line.startsWith('push'))).toBe(false);
   });
-  it('fails closed when a copied marker makes recovery ambiguous, keeping the update or opening in flight', async () => {
-    const copy = (live: Map<string, OpenedPullRequest>) => { const [m, pr] = [...live][0]!; return { ...pr, number: 999, marker: m }; };
-    // A lost update, with a copy of its PR's first line on another PR: refused, the update stays in flight.
-    let store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+  /** A lost update of the task's PR #100, then a person cancels the task. */
+  async function lostUpdateThenCancel() {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     await harness(store, { live, next }).publisher.publish(identity);
     requeue(store);
     await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow(/timeout/);
-    await expect(harness(store, { live, next, copies: [copy(live)] }).publisher.publish(identity)).rejects.toThrow(/#100, #999 carry the first line of the task's pull request #100/);
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: expect.anything() }]);
-    // Only the copy is visible: its number is not the recorded PR's, so nothing is settled from it.
-    await expect(harness(store, { live, next, hidden: new Set(live.keys()), copies: [copy(live)] }).publisher.publish(identity)).rejects.toThrow(/#999 carry/);
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: expect.anything() }]);
-    // A lost opening with two PRs carrying its marker: it stays owned.
-    store = runningTask(); live = new Map(); next = { value: 100 };
+    store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+    const copy = { ...live.get([...live.keys()][0]!)!, number: 999, marker: [...live.keys()][0]! };
+    return { store, live, next, copy };
+  }
+  it('settles a lost update by its recorded number when a copy carries its marker, and still drafts the stopped task\'s PR', async () => {
+    const { store, live, next, copy } = await lostUpdateThenCancel();
+    const again = harness(store, { live, next, copies: [copy] });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log).toContain('draft 100');
+    expect(again.log).not.toContain('draft 999');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: null }]);
+  });
+  it('records what GitHub shows for the update\'s own PR even when a copy is listed first', async () => {
+    const { store, live, next, copy } = await lostUpdateThenCancel();
+    // A person made #100 a draft meanwhile; the copy is still ready.
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: true });
+    const again = harness(store, { live, next, copies: [{ ...copy, draft: false }] });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    // The draft flag GitHub shows for #100 is recorded, so no draft change is owed.
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: null }]);
+  });
+  it('records nothing from a copy when the update\'s own PR was closed', async () => {
+    const { store, live, next, copy } = await lostUpdateThenCancel();
+    const again = harness(store, { live, next, copies: [copy], closed: new Set([100]) });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/cancelled/);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false, refresh: null }]);
+  });
+  it('keeps a lost opening owned when two PRs carry its marker, and says its PR may still be ready', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
-    await expect(harness(store, { live, next, copies: [copy(live)] }).publisher.publish(identity)).rejects.toThrow(/#100, #999 carry the first line of a pull request the task was opening/);
+    const copy = { ...live.get([...live.keys()][0]!)!, number: 999, marker: [...live.keys()][0]! };
+    const again = harness(store, { live, next, copies: [copy] });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/#(100|999) and #(100|999) carry the first line .* cannot tell which is its own.*may still be ready/);
+    expect(again.log.some(line => line.startsWith('draft') || line.startsWith('push'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opening' }]);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
