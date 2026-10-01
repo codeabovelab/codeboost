@@ -1396,6 +1396,10 @@ describe('GitHub PR adapter', () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw echoed; });
     const error = await gh.open({ ...input, draft: true }).catch(e => e);
     expect(error).toBe(echoed);
+    // A body that is not JSON (a proxy's HTML error page, say) is not read either.
+    const page = new CommandFailed('gh failed (exit 1): gh: Bad Gateway (HTTP 502)', 'gh: Bad Gateway (HTTP 502)', '<html>Draft pull requests are not supported (HTTP 422)</html>');
+    const proxied = await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => { throw page; }).open({ ...input, draft: true }).catch(e => e);
+    expect(proxied).toBe(page);
   });
   it('turns a validation refusal of the opening into PullRequestRefused, with the reason GitHub gave', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => {
