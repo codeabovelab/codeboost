@@ -373,6 +373,19 @@ describe('real Docker agent isolation', () => {
     chmodSync(data.input, 0o755); rmSync(join(data.input, 'extra.json')); chmodSync(data.input, 0o555);
   }, 60_000);
 
+  it('creates a Claude planning profile only when its command carries the exact mounted schema', async () => {
+    const data = fixture(), mounted = '{"type":"object","description":"codeboost-schema-marker"}\n';
+    chmodSync(data.input, 0o755); chmodSync(join(data.input, 'schema.json'), 0o644);
+    writeFileSync(join(data.input, 'schema.json'), mounted);
+    chmodSync(join(data.input, 'schema.json'), 0o444); chmodSync(data.input, 0o555);
+    const options = { vendor: 'claude' as const, claudeToken: 'token' };
+    const valid = await profile(data, 'planning', policy => createClaudeCommand(policy, 'Plan.', mounted), options);
+    expect(valid.command[valid.command.indexOf('--json-schema') + 1]).toBe(mounted);
+    for (const other of [mounted.trim(), '{"type":"object","description":"other"}\n'])
+      await expect(profile(data, 'planning', policy => createClaudeCommand(policy, 'Plan.', other), options))
+        .rejects.toThrow('does not match the mounted schema');
+  }, 60_000);
+
   it('rejects extra security policies and environment paths that can escape bounded storage', async () => {
     const data = fixture(), valid = await profile(data, 'planning', 'noop');
     const imageIndex = valid.args.indexOf(imageId);
@@ -2202,7 +2215,8 @@ describe('real Docker agent isolation', () => {
     it('runs the authenticated Codex startup path with isolated writable state', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
-      const authProfile = await profile(data, 'planning', policy => createCodexCommand(policy,
+      // Codex is refused in planning and questions (#75); review is its read-only phase.
+      const authProfile = await profile(data, 'review', policy => createCodexCommand(policy,
         'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
       { authProbe: true, codexAuthFile: authFile, deadlineMs: 5 * 60_000 });
       // The production launch path: create, validate, start and remove. Raw stdout can carry more than the final
@@ -2214,7 +2228,8 @@ describe('real Docker agent isolation', () => {
     it('runs the authenticated Claude startup path with only its OAuth token', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
-      const authProfile = await profile(data, 'planning', policy => createClaudeCommand(policy,
+      // Questions answer in plain text; a planning command would also carry the schema as --json-schema.
+      const authProfile = await profile(data, 'questions', policy => createClaudeCommand(policy,
         'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
         { vendor: 'claude', authProbe: true, claudeToken: token, deadlineMs: 5 * 60_000 });
       // The production launch path, with the token passed only as the Claude profile's secret.

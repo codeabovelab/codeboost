@@ -142,7 +142,9 @@ export class Store {
     return value==='claude'||value==='codex'?value:null;
   }
   setQuestionProvider(value: unknown): void {
-    if(value!==null&&value!=='claude'&&value!=='codex') throw new Error('Choose Claude Code or Codex.');
+    // Codex cannot answer questions yet (#75). A database that already names it reads back as Codex, and Ask refuses it.
+    if(value==='codex') throw new Error('Codex cannot answer questions yet. Choose Claude Code.');
+    if(value!==null&&value!=='claude') throw new Error('Choose Claude Code.');
     this.#run("INSERT INTO app_settings VALUES ('question_provider',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",value??'');
   }
   close(): void { this.#db.close(); }

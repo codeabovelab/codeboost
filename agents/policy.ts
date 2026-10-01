@@ -12,14 +12,28 @@ export interface PhasePolicy {
 export interface AgentCommand { readonly argv: readonly string[] }
 interface PolicyIdentity { readonly invocation: InvocationInput }
 const identities = new WeakMap<PhasePolicy, PolicyIdentity>();
-const commands = new WeakMap<AgentCommand, { readonly policy: PhasePolicy; readonly vendor: InvocationInput['vendor'] }>();
+const commands = new WeakMap<AgentCommand,
+  { readonly policy: PhasePolicy; readonly vendor: InvocationInput['vendor']; readonly schema?: string }>();
 
-const command = (policy: PhasePolicy, argv: readonly string[]): AgentCommand => {
+const command = (policy: PhasePolicy, argv: readonly string[], schema?: string): AgentCommand => {
   assertPhasePolicy(policy);
   const value = Object.freeze({ argv: Object.freeze([...argv]) });
-  commands.set(value, Object.freeze({ policy, vendor: assertPhasePolicy(policy).vendor }));
+  commands.set(value, Object.freeze({ policy, vendor: assertPhasePolicy(policy).vendor, schema }));
   return value;
 };
+
+/** The largest answer schema a command carries in its argv. The v1 plan-edit schema is under 10 KiB. */
+export const MAX_COMMAND_SCHEMA_BYTES = 64 * 1024;
+
+/**
+ * A command that carries an answer schema in its argv must carry the exact schema the profile mounts, so the vendor
+ * validates against the same schema the runner validates against.
+ */
+export function assertCommandSchema(value: AgentCommand, mounted: Buffer): void {
+  const schema = commands.get(value)?.schema;
+  if (schema !== undefined && !Buffer.from(schema, 'utf8').equals(mounted))
+    throw new Error('Command answer schema does not match the mounted schema.');
+}
 
 export function assertAgentCommand(value: AgentCommand, policy: PhasePolicy,
   vendor?: InvocationInput['vendor']): readonly string[] {
@@ -62,16 +76,50 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
   return execute(Object.freeze([...argv]));
 }
 
-export function createClaudeCommand(policy: PhasePolicy, prompt: string): AgentCommand {
+/**
+ * Planning answers must match the request's schema, so the planning command carries it. Claude's `--json-schema` takes
+ * the schema text, not a path; the profile checks that text against the mounted file. Questions answer in plain text
+ * (their schema is `{"type":"string"}`), and the other phases return no JSON answer, so they carry no schema.
+ */
+export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Claude prompt must be nonempty and contain no NUL.');
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
+  if ((policy.phase === 'planning') !== (schema !== undefined))
+    throw new Error('Only the Claude planning command carries an answer schema, and it must.');
+  const schemaArguments = schema === undefined ? [] : ['--json-schema', assertPlanningSchema(schema)];
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
-  return command(policy, ['claude', '--print', '--output-format', 'json', '--restricted', '--strict-mcp-config',
-    '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome', '--permission-prompts', 'none',
-    '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed, '--allowedTools', allowed,
-    '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input', '--', prompt]);
+  return command(policy, ['claude', '--print', '--output-format', 'json', ...schemaArguments, '--restricted',
+    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome',
+    '--permission-prompts', 'none', '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed,
+    '--allowedTools', allowed, '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir',
+    '/run/codeboost-input', '--', prompt], schema);
+}
+
+/**
+ * A planning schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one command
+ * argument. Returns the schema unchanged.
+ */
+export function assertPlanningSchema(schema: string): string {
+  if (schema.includes('\0') || Buffer.byteLength(schema, 'utf8') > MAX_COMMAND_SCHEMA_BYTES)
+    throw new Error('Planning schema must contain no NUL and fit the command schema limit.');
+  let parsed: unknown;
+  try { parsed = JSON.parse(schema); } catch { throw new Error('Planning schema must be JSON.'); }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)
+    || (parsed as { type?: unknown }).type !== 'object')
+    throw new Error('Planning schema must be a JSON object schema with "type": "object".');
+  return schema;
+}
+
+/**
+ * Codex 0.153.4 reads files only through its shell, and planning and questions run no process. Codex would answer
+ * without seeing the code or the schema, so these phases are refused rather than weakened (#75; see
+ * docs/implementation/agent-isolation.md, "Codex in read-only phases").
+ */
+export function assertCodexPhase(phase: Phase): void {
+  if (phase === 'planning' || phase === 'questions')
+    throw new Error(`Codex cannot run the ${phase} phase: it has no file-reading tool that runs no process.`);
 }
 
 export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
@@ -82,9 +130,11 @@ export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
 
 export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Codex prompt must be nonempty and contain no NUL.');
+  const base = codexBaseArguments(policy);
+  assertCodexPhase(policy.phase);
   const sandbox = policy.worktree === 'read-write' ? 'workspace-write' : 'read-only';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
-  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check',
+  return command(policy, [...base, 'exec', '--sandbox', sandbox, '--skip-git-repo-check',
     '--output-last-message', '/run/codeboost-output/final.txt', '--', prompt]);
 }
 

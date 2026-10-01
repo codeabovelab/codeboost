@@ -9,7 +9,7 @@ import { assertTaskFilesystems, taskFilesystemOwner, type TaskFilesystems } from
 import { ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
   type VendorNetwork } from '../network/network.ts';
-import { assertAgentCommand, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
+import { assertAgentCommand, assertCommandSchema, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
 export interface ContainerProfile {
   readonly name: string;
   readonly args: readonly string[];
@@ -90,16 +90,20 @@ const removeOwnedDirectories = (directories: readonly string[]) => {
   if (failures.length) throw new AggregateError(failures, 'Profile snapshot cleanup did not settle.');
 };
 
-const readCapturedFile = (path: string, kind: string): { identity: FileIdentity; content: Buffer } => {
+/**
+ * Read a regular, unlinked file through one no-follow descriptor, so the path cannot be swapped between check and
+ * read. `O_NONBLOCK` makes a FIFO fail the regular-file check instead of blocking the open.
+ */
+export const readCapturedFile = (path: string, kind: string, maximum = 1024 * 1024):
+  { identity: FileIdentity; content: Buffer } => {
   let fd: number | undefined;
   try {
-    try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW); }
+    try { fd = openSync(path, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK); }
     catch (error) {
       if ((error as NodeJS.ErrnoException).code === 'ELOOP') throw new Error(`${kind} must be a direct regular file, not a link.`);
       throw error;
     }
     const before = fstatSync(fd);
-    const maximum = 1024 * 1024;
     if (!before.isFile() || before.nlink !== 1 || before.size > maximum)
       throw new Error(`${kind} must be a bounded, unlinked regular file.`);
     const bounded = Buffer.allocUnsafe(maximum + 1);
@@ -244,6 +248,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     assertPhasePolicy(options.policy, invocation);
     const command = assertAgentCommand(options.command, options.policy, invocation.vendor);
     const sourceInput = captureInput(options.inputDirectory);
+    assertCommandSchema(options.command, sourceInput.content);
     if (invocation.vendor === 'codex' && (!options.codexAuthFile || options.claudeToken))
       throw new Error('Codex requires only its auth file.');
     if (invocation.vendor === 'claude' && (!options.claudeToken || options.codexAuthFile))

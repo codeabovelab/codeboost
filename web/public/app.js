@@ -758,9 +758,10 @@ $("settings").onclick=async()=>{
   showDialog('<h2>Settings</h2><p>Loading…</p>');
   try {
     const settings=await api("/api/settings");
-    $("dialog-body").innerHTML=`<h2>Settings</h2><label for="question-provider">Question agent</label><select id="question-provider"><option value="">Not configured</option><option value="claude">Claude Code</option><option value="codex">Codex</option></select><p>Ask runs this agent in a locked-down Docker container. It gets a read-only copy of the reviewed code, cannot run commands, and can reach only its vendor. Claude Code needs <code>CLAUDE_CODE_OAUTH_TOKEN</code> (create it with <code>claude setup-token</code>); Codex needs its <code>auth.json</code>. Set these before starting codeboost. This choice is saved for this review database.</p><button id="save-settings">Save settings</button><p id="settings-status" role="status"></p>`;
-    $("question-provider").value=settings.questionProvider||"";
-    $("save-settings").onclick=async()=>{try{await api("/api/settings",{questionProvider:$("question-provider").value||null});$("settings-status").textContent="Settings saved.";}catch(error){$("settings-status").textContent=error.message;}};
+    $("dialog-body").innerHTML=`<h2>Settings</h2><label for="question-provider">Question agent</label><select id="question-provider"><option value="">Not configured</option><option value="claude">Claude Code</option></select><p>Ask runs this agent in a locked-down Docker container. It gets a read-only copy of the reviewed code, cannot run commands, and can reach only its vendor. Claude Code needs <code>CLAUDE_CODE_OAUTH_TOKEN</code> (create it with <code>claude setup-token</code>). Set it before starting codeboost. This choice is saved for this review database.</p><p>Codex cannot answer questions yet: it can read the code only by running commands.</p><button id="save-settings">Save settings</button><p id="settings-status" role="status"></p>`;
+    $("question-provider").value=settings.questionProvider==="claude"?"claude":"";
+    if(settings.questionProvider==="codex"){$("settings-status").className="warn";$("settings-status").textContent="! Unavailable: this review was set to Codex, which cannot answer questions yet. Choose Claude Code.";}
+    $("save-settings").onclick=async()=>{try{await api("/api/settings",{questionProvider:$("question-provider").value||null});$("settings-status").className="";$("settings-status").textContent="Settings saved.";}catch(error){$("settings-status").className="bad";$("settings-status").textContent=`✕ Could not save settings. ${error.message}`;}};
   } catch(error){$("dialog-body").textContent=error.message;}
 };
 

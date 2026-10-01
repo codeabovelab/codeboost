@@ -1,6 +1,5 @@
 import { parentPort, workerData } from 'node:worker_threads';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
-import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
@@ -30,7 +29,6 @@ const deps: ContainerDependencies = {
   measureRepository: measureGitRepository,
   capture: input => captureInvocation(input),
   startClaude: startClaudeInvocation,
-  startCodex: startCodexInvocation,
   env: credentials,
 };
 const image: { id?: string } = {};
