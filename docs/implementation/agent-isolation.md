@@ -67,7 +67,8 @@ Use only these entry points to run an agent:
    create are not atomic, so right after its first create D checks again that its object is the only one with the ID;
    if not, it removes what it made and refuses. Cleanup removes an object by the ID captured at its create, even if
    its labels are wrong; an object found only by name (including task storage) must carry all three owner labels. Call
-   `removeTaskFilesystems` when the task ends. It refuses a repository that has a
+   `removeTaskFilesystems` when the task ends (`removeTaskFilesystemsAsync` from a server, which does the same removal
+   without blocking the event loop). It refuses a repository that has a
    symbolic link with an absolute target or one that can lead outside the checkout (resolved in the container as its
    kernel would, even once the agent creates a missing directory on the way), or any link in its Git metadata; the
    seeder checks this and the allocation removes what it made, then throws an `UnusableRepositoryError`. Report
@@ -103,7 +104,10 @@ Use only these entry points to run an agent:
      IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
      directory that `base`'s own ignore rules ignore, with no tracked entry beneath it, is one entry (`ignored: true`). It also returns `agentCommits`,
      `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`. If the metadata changed, no Git
-     command runs: the manifest has `metadataChanged: true` and every other list empty.
+     command runs: the manifest has `metadataChanged: true` and every other list empty. Every change whose new entry
+     is a symlink carries `linkTargetTraversesLink`: whether its target, resolved one part at a time as the kernel
+     would in an agent container, passes through another link or is one. A target outside the work tree or in the
+     metadata counts as `true`.
    - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
      failed. Route it to needs human, as for link target changes and nested gitlink content.
    - **Refusals.** It refuses, and never returns part of the answer, when:
