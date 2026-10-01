@@ -1,6 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway } from './already-fixed.ts';
+import { CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
+import { REPOSITORY } from './validate.ts';
 
 const runFile = promisify(execFile);
 
@@ -20,6 +21,8 @@ export interface RemoteMergeState {
   mergeQueue: boolean;
   requiredChecks: RequiredCheck[];
   alreadyFixed: 'clear' | 'found' | 'unknown';
+  /** Why the check is `found` (its matches) or `unknown` (its reason), for display. */
+  alreadyFixedDetail?: string;
   /** The pull request's web URL, when GitHub reports a valid one. Display only; never used to decide readiness. */
   url?: string;
 }
@@ -58,6 +61,17 @@ export interface GhMergeConfig {
 type BranchRules = Pick<RemoteMergeState, 'rulesKnown' | 'atomicBaseGuard' | 'mergeQueue' | 'requiredChecks'>;
 export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
 
+/**
+ * The already-fixed matches as display text. Only validated fields are used (repository names, numbers, states, SHAs and
+ * the check's own close description), never a commit message, and at most five are named.
+ */
+function describeMatches(matches: readonly AlreadyFixedMatch[]): string {
+  const named = matches.slice(0, 5).map(match => match.kind === 'closed' ? `the issue was closed by ${match.by}`
+    : match.kind === 'pull request' ? `${match.repository}#${match.number} (${match.state.toLowerCase()}${match.draft ? ', draft' : ''})`
+    : `commit ${match.sha.slice(0, 12)} on the base branch`);
+  return named.join('; ') + (matches.length > 5 ? `; and ${matches.length - 5} more` : '');
+}
+
 function confirmedMergeRefusal(message: string): boolean {
   return /required (?:approving )?review|required status check|branch protection|merge conflict|not mergeable|head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|pull request.*(?:closed|draft)|merge method.*not allowed/i.test(message);
 }
@@ -87,7 +101,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   #inflight: { generation: number; promise: Promise<RemoteMergeState> } | null = null;
   /** `checks` defaults to the pre-PR check's GitHub adapter for the same repository, using `run` when one is given. */
   constructor(config: GhMergeConfig, run?: RunGh, checks?: AlreadyFixedGateway) {
-    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
+    if (!REPOSITORY.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
     if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
     if (checks && checks.repository?.toLowerCase() !== config.repository.toLowerCase()) throw new Error('The already-fixed check must name and read the merge repository.');
@@ -117,16 +131,18 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
    * The check stops early enough that its `gh` processes, which may need both grace periods after an abort, settle before
    * the inspection's deadline; stopped that way it is `unknown`.
    */
-  async #alreadyFixed(baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<RemoteMergeState['alreadyFixed']> {
+  async #alreadyFixed(baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), Math.max(0, deadlineAt - CHECK_SETTLE_MS - Date.now()));
     try {
       const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [this.config.pullRequest], ownCommits: new Set() },
         signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);
-      return result.outcome === 'clear' || result.outcome === 'found' ? result.outcome : 'unknown';
+      if (result.outcome === 'clear') return { alreadyFixed: 'clear' };
+      if (result.outcome === 'found' && Array.isArray(result.matches) && result.matches.length) return { alreadyFixed: 'found', alreadyFixedDetail: describeMatches(result.matches) };
+      return { alreadyFixed: 'unknown', alreadyFixedDetail: result.outcome === 'unknown' && typeof result.reason === 'string' ? result.reason.slice(0, 300) : 'The check returned an invalid result.' };
     } catch (error) {
       if (signal?.aborted) throw error;
-      return 'unknown';
+      return { alreadyFixed: 'unknown', alreadyFixedDetail: stop.signal.aborted ? 'The check did not finish in time.' : 'GitHub could not be read.' };
     } finally { clearTimeout(timer); }
   }
 
@@ -146,7 +162,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     return {
       base, head,
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
-      ...rules, alreadyFixed: await alreadyFixed,
+      ...rules, ...await alreadyFixed,
       ...(typeof pr.url === 'string' && pr.url.length <= 2048 && /^https:\/\//.test(pr.url) ? { url: pr.url } : {}),
     };
   }

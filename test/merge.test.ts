@@ -26,6 +26,15 @@ function alreadyFixedReads(args: readonly string[], fake: IssueFake = {}): strin
     commits: commits.map(commit => ({ sha: commit.sha, commit: { message: commit.message } })) });
   return null;
 }
+/** Answers the merge adapter's own reads: an open PR 7 into main with no rules or protection. */
+function mergeReads(args: readonly string[]): string {
+  const joined = args.join(' ');
+  if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+  if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
+  if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+  if (/\/branches\/[^/]+$/.test(joined)) return JSON.stringify({ protected: false });
+  throw new Error(`Unexpected gh call: ${joined}`);
+}
 function readyView(): ReviewView {
   return {
     items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [{ type: 'check', text: 'Works' }], checks: { tests: '– No tests defined' } }],
@@ -1348,7 +1357,7 @@ it('stops the merge check early enough for its processes to settle before the in
     expect(checkSignal?.aborted).toBe(true);
     await vi.advanceTimersByTimeAsync(CHECK_SETTLE_MS - 1);
     // The inspection resolves before its deadline, with the check unknown, instead of overrunning it.
-    expect(await Promise.race([settled, Promise.resolve('pending')])).toMatchObject({ state: { alreadyFixed: 'unknown' } });
+    expect(await Promise.race([settled, Promise.resolve('pending')])).toMatchObject({ state: { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' } });
   } finally { vi.useRealTimers(); }
 });
 
@@ -1382,6 +1391,28 @@ it('starts the merge check alongside the rule reads, and stops and awaits it whe
   await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks).inspect({ fresh: true })).rejects.toThrow(TypeError);
   expect(checkSignal?.aborted).toBe(true);
   expect(checkSettled).toBe(true);
+});
+
+it('reports why the merge check matched or could not finish, without commit messages', async () => {
+  const closer = { __typename: 'PullRequest', number: 9, repository: { nameWithOwner: 'owner/repo' } };
+  const found = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, {
+    state: 'CLOSED', nodes: [{ __typename: 'ClosedEvent', closer }, xref(8, true, { isDraft: true })], commits: [{ sha: sha('c'), message: 'Fix #21 <img src=x>' }],
+  }) ?? mergeReads(args)).inspect();
+  expect(found).toMatchObject({ alreadyFixed: 'found', alreadyFixedDetail: `the issue was closed by owner/repo#9; owner/repo#8 (open, draft); commit ${sha('c').slice(0, 12)} on the base branch` });
+  const unknown = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, { totalCount: 101 }) ?? mergeReads(args)).inspect();
+  expect(unknown).toMatchObject({ alreadyFixed: 'unknown', alreadyFixedDetail: expect.stringMatching(/more than 100 linking events/) });
+  // At most five matches are named.
+  const many = Array.from({ length: 7 }, (_, index) => xref(10 + index, true));
+  const capped = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, { nodes: many }) ?? mergeReads(args)).inspect();
+  expect(capped.alreadyFixedDetail).toBe('owner/repo#10 (open); owner/repo#11 (open); owner/repo#12 (open); owner/repo#13 (open); owner/repo#14 (open); and 2 more');
+});
+
+it('names the already-fixed detail in the merge blocker', async () => {
+  const view = readyView();
+  const found = await new MergeCoordinator(serviceFor(view), gateway([remote(view, { alreadyFixed: 'found', alreadyFixedDetail: 'owner/repo#8 (open)' })])).status(view);
+  expect(found.blockers).toEqual([{ code: 'already-fixed', message: 'The issue may already be fixed: owner/repo#8 (open).' }]);
+  const unknown = await new MergeCoordinator(serviceFor(view), gateway([remote(view, { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' })])).status(view);
+  expect(unknown.blockers).toEqual([{ code: 'already-fixed', message: 'The already-fixed check could not be completed: The check did not finish in time.' }]);
 });
 
 it('does not let an inspection started before merge repopulate the cache', async () => {
