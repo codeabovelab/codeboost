@@ -75,12 +75,15 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       // be the task's; anyone else's PR into another base is ignored.
       const visible = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m));
       const baseOfPr = (m: string) => bases.get(m) ?? publishConfig.baseBranch;
-      const own = visible.filter(([m]) => input.markers.includes(m));
+      // `unmarked`: a person removed the PR's first-line marker.
+      const carries = (m: string, pr: OpenedPullRequest) => !options.unmarked?.has(pr.number) && input.markers.includes(m);
+      const own = visible.filter(([m, pr]) => carries(m, pr));
       if (own.length > 1) throw new PullRequestMisplaced(`More than one of the task's pull requests is open (${own.map(([, pr]) => `#${pr.number}`).join(', ')}).`);
       if (own.length === 1 && baseOfPr(own[0]![0]) !== input.base) throw new PullRequestMisplaced(`The task's pull request #${own[0]![1].number} now targets ${baseOfPr(own[0]![0])}, not ${input.base}.`);
       const open = visible.find(([m]) => baseOfPr(m) === input.base);
       if (!open) return null;
-      if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
+      if (!carries(open[0], open[1]) && input.numbers?.includes(open[1].number)) throw new PullRequestMisplaced(`The task's pull request #${open[1].number} no longer starts with its marker.`);
+      if (!carries(open[0], open[1])) throw new Error('An open pull request exists that codeboost did not open.');
       return { ...open[1], marker: open[0] };
     },
     async readPull(number) {
@@ -1387,6 +1390,14 @@ describe('GitHub PR adapter', () => {
     await expect(read(response({ state: 'weird' }))).rejects.toThrow(/invalid pull request/);
     await expect(read({ ...response(), head: {} })).rejects.toThrow(/invalid pull request/);
   });
+  it('refuses the task\'s own PR without its marker as misplaced, not as a PR codeboost did not open', async () => {
+    const lookup = (numbers?: number[]) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'edited by a person' })]))
+      .findOpened({ ...input, markers: [marker], numbers });
+    const own = await lookup([7]).catch(e => e);
+    expect(own).toBeInstanceOf(PullRequestMisplaced);
+    expect(own.message).toMatch(/#7 no longer starts with its marker/);
+    await expect(lookup([8])).rejects.toThrow(/did not open/);
+  });
   it('validates every PR it reads: an https URL, and head and base in this repository', async () => {
     const lookup = (pr: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([pr])).findOpened({ ...input, markers: [marker] });
     await expect(lookup(response({ html_url: 'http://github.com/owner/repo/pull/7' }))).rejects.toThrow(/invalid pull request/);
@@ -1993,6 +2004,14 @@ describe('shutdown and PRs left ready', () => {
     // Once the list shows it, the update goes ahead.
     hidden.clear();
     expect(await harness(store, { live, next }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
+  });
+  it('refuses the task\'s own PR whose marker a person removed as misplaced, and pushes nothing', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    const again = harness(store, { live, next, unmarked: new Set([100]) });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/#100 no longer starts with its marker/);
+    expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();

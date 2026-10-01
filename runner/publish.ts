@@ -132,7 +132,10 @@ export class PullRequestPublisher {
     // Always asked, even with no known markers: an open PR on this branch that codeboost did not open is refused here,
     // before the push could move it.
     let live;
-    try { live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)) }, signal); }
+    try {
+      live = await this.#pulls.findOpened({ base: this.#config.baseBranch, headBranch: branch, markers: candidates.map(pr => marker(pr.openingId)),
+        numbers: candidates.flatMap(pr => pr.number === null ? [] : [pr.number]) }, signal);
+    }
     catch (error) {
       if (!(error instanceof PullRequestMisplaced)) throw error;
       // The task's PRs are not where it can publish, and a person has to decide: none of them stays ready meanwhile,

@@ -26,7 +26,7 @@ export interface PullRequestGateway {
    * another base (retargeted by a person, or left by a base change) is refused, and so are two of its own PRs. Anyone
    * else's PR from the branch into another base (a backport, say) is ignored. For the calls that change a PR's content.
    */
-  findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
+  findOpened(input: { base: string; headBranch: string; markers: readonly string[]; numbers?: readonly number[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null>;
   /**
    * Every open PR from `headBranch` that carries one of `markers`, in whatever base, with that base. Nothing is refused
    * for being in another base: for recording what GitHub shows and for making PRs drafts, both safe in any base.
@@ -208,7 +208,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return { open: pr.state === 'open', headBranch: pr.head.ref, base: pr.base.ref, marker: markerOf(pr.body ?? '') };
   }
 
-  async findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {
+  async findOpened(input: { base: string; headBranch: string; markers: readonly string[]; numbers?: readonly number[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {
     signal = this.#bounded(signal);
     this.#validate(input);
     const pulls = await this.#branchPulls(input.headBranch, signal);
@@ -221,6 +221,9 @@ export class GhPullRequestGateway implements PullRequestGateway {
     if (!here.length) return null;
     const { body, ...pr } = this.#pull(here[0], input);
     const found = input.markers.filter(marker => markerOf(body) === marker);
+    // `numbers`: the task's recorded PRs. One of them without its marker is the task's own PR, edited by a person.
+    if (found.length !== 1 && input.numbers?.includes(pr.number))
+      throw new PullRequestMisplaced(`The task's pull request #${pr.number} no longer starts with its marker. Restore its first line or close it.`);
     if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
     return { ...pr, marker: found[0]! };
   }
