@@ -349,7 +349,9 @@ export class RunnerCoordinator {
       }
       // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
       if (job.firstReason === 'stale') detail = job.staleCause;
-      const evidence = valid ? { detail } : await this.#keepEvidence(job, attempt, prepared, detail, true);
+      // A clean exit was audited by finish already; only a run that ended badly on its own is audited here.
+      const clean = !job.firstReason && result.exitCode === 0 && !result.stopReason;
+      const evidence = valid ? { detail } : await this.#keepEvidence(job, attempt, prepared, detail, !clean);
       const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, history, ...evidence });
       job.decided = true;
       // Task storage goes after the terminal write too; a failed removal holds the slot under a marker.

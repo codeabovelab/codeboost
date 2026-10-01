@@ -152,6 +152,14 @@ describe('item execution', () => {
     const refused = setup({ exit: { P1: { exitCode: 1 } }, inspect: async () => { throw new Error('docker run failed (exit 6): could not read x'); } });
     expect(await refused.executor.runTask(identity)).toMatchObject({ kind: 'needs human', reason: expect.stringContaining('The change inspection refused') });
   });
+  it('audits a clean run once: a failed finish is not inspected again', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.log.filter(line => line.startsWith('inspect'))).toHaveLength(1);
+    const refused = setup({ commit: async () => { throw new Error('work tree changed after the audit'); } });
+    await refused.executor.runTask(identity);
+    expect(refused.log.filter(line => line.startsWith('inspect'))).toHaveLength(1);
+  });
   it('does not audit a run a person stopped while it ran', async () => {
     let runner!: RunnerCoordinator;
     const h = setup({ exit: { P1: { exitCode: 1 } }, manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
