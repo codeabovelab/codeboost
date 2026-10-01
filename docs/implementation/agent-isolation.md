@@ -118,9 +118,30 @@ Use only these entry points to run an agent:
      Treat a refusal as needs human.
    - **Both calls** run in a read-only container with no network, take `signal`, `onProcessGroup` and `timeoutMs`
      (default 120 s), and settle only after their container is gone.
+   - **To commit what the audit approved**, call `commitTaskChanges(storage, { base, linkSnapshot, digest, message,
+     trailers, author, committer, imageId })`, with the approved manifest's `digest`. Identities are F's (`name`,
+     `email`, and `date` in Git's raw form, such as `1700000000 +0000`); nothing comes from the environment or the
+     repository, so the same inputs always give the same commit ID.
+     - It runs the inspection again in its own container and builds the commit from those same reads: `base` plus
+       exactly the manifest's changes, each file stored as the inspection hashed it. Ignored files the manifest lists
+       are committed. What the manifest does not list stays as `base` has it.
+     - Both volumes stay read-only. The objects go to a scratch store in the container's `/tmp`, and the commit comes
+       back as a `git bundle` (`bundle`) whose one ref, `refs/heads/codeboost` (`TASK_COMMIT_REF`), points at `head`,
+       with `base` as its prerequisite. Fetch it into a runner-owned repository and check that the ref is `head`.
+     - It refuses with `TaskCommitRefused` when the manifest's digest is not `digest` (the work tree changed after the
+       audit). It also refuses, whatever the audit said, any agent commit, metadata change, change to a declared link's
+       target (a `retargeted` entry is the item's own edit of the link, which the audit judges), gitlink content, and any change a tree cannot hold: a directory, a fifo or other special file, a path
+       under a `.git` part, or a symlink named `.gitmodules`.
+     - An empty change set makes no commit: `head` is `base`, `unchanged` is true and `bundle` is empty.
+     - It fails on whatever fails an inspection, on a bundle over `maxBundleBytes` (64 MiB at most), on new content
+       that does not fit the container's 512 MB `/tmp` (within its 1 GB of memory), and on any Git failure. Identities,
+       the message and trailer values must not hold Unicode noncharacters, which Git would re-encode, and a date's
+       offset of zero is written `+0000`. The default deadline is 300 s.
+     - Hooks, signing and the repository's commit encoding never apply. Calling it again with the same inputs on the
+       same storage gives the same `head`.
 7. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
-   token. It removes agent containers, egress proxies, seeders, export and inspection containers and networks, and
+   token. It removes agent containers, egress proxies, seeders, export, inspection and commit containers and networks, and
    resolves once they are gone. It keeps task storage whole (both volumes and the keeper) and returns one recovery
    handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without

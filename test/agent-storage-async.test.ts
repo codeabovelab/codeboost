@@ -1,5 +1,5 @@
 import { fixtureGit } from './fixtures/git.ts';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -34,8 +34,8 @@ vi.mock('../agents/container/image.ts', async importOriginal => ({
 const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTaskFilesystemsAsync,
   removeTaskFilesystems } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
-const { inspectTaskChanges, manifestDigest, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES } =
-  await import('../agents/container/changes.ts');
+const { commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_BUNDLE_BYTES, MAXIMUM_DECLARED_LINKS,
+  MAXIMUM_NAME_BYTES, TaskCommitRefused } = await import('../agents/container/changes.ts');
 
 // Every fake Docker call starts a Node process, so a loaded machine needs more than the default 5 s per test.
 vi.setConfig({ testTimeout: 60_000 });
@@ -64,8 +64,9 @@ if (a === 'create') {
   save(args[args.indexOf('--name') + 1], { kind: 'container', id, labels: labels() }); console.log(id); process.exit(0);
 }
 if (a === 'start' && fs.existsSync(path.join(state, 'hang-start'))) {
-  fs.writeFileSync(path.join(state, 'start-began'), String(process.pid));
+  // The handler first: an abort that lands right after the marker must still find SIGTERM ignored.
   process.on('SIGTERM', () => {});
+  fs.writeFileSync(path.join(state, 'start-began'), String(process.pid));
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
 }
 if (a === 'start') process.exit(0);
@@ -80,8 +81,9 @@ if (a === 'run' && args.includes('io.codeboost.task-storage=export')) {
     process.exit(4);
   }
   if (fs.existsSync(path.join(state, 'hang-export'))) {
-    fs.writeFileSync(path.join(state, 'export-began'), '');
+    // The handler first: an abort that lands right after the marker must still find SIGTERM ignored.
     process.on('SIGTERM', () => {});
+    fs.writeFileSync(path.join(state, 'export-began'), '');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
   }
   // Like the export script: the diff, cut to the limit it is given, base64-encoded; then --rm removes the container.
@@ -102,13 +104,30 @@ if (a === 'run' && args.includes('io.codeboost.task-storage=inspect')) {
   fs.writeFileSync(path.join(state, 'inspect-args.json'), JSON.stringify(args.filter(arg => arg.length < 200)));
   save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
   if (fs.existsSync(path.join(state, 'hang-inspect'))) {
-    fs.writeFileSync(path.join(state, 'inspect-began'), '');
+    // The handler first: an abort that lands right after the marker must still find SIGTERM ignored.
     process.on('SIGTERM', () => {});
+    fs.writeFileSync(path.join(state, 'inspect-began'), '');
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
   }
   fs.rmSync(path.join(state, name + '.json'));
   // Exit only once the write is done: exiting at once cuts a pipe write past 64 KiB.
   process.stdout.write(fs.readFileSync(path.join(state, 'inspect-output')), () => process.exit(0));
+  return;
+}
+// Like the runner commit: keeps what came on stdin and prints the canned result, then --rm removes the container.
+if (a === 'run' && args.includes('io.codeboost.task-storage=commit')) {
+  const name = args[args.indexOf('--name') + 1];
+  fs.writeFileSync(path.join(state, 'commit-args.json'), JSON.stringify(args.filter(arg => arg.length < 200)));
+  fs.writeFileSync(path.join(state, 'commit-input'), fs.readFileSync(0));
+  save(name, { kind: 'container', id: crypto.randomBytes(32).toString('hex'), labels: labels() });
+  if (fs.existsSync(path.join(state, 'hang-commit'))) {
+    // The handler first: an abort that lands right after the marker must still find SIGTERM ignored.
+    process.on('SIGTERM', () => {});
+    fs.writeFileSync(path.join(state, 'commit-began'), '');
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0);
+  }
+  fs.rmSync(path.join(state, name + '.json'));
+  process.stdout.write(fs.readFileSync(path.join(state, 'commit-output')), () => process.exit(0));
   return;
 }
 if (a === 'run') process.exit(0);
@@ -443,4 +462,129 @@ describe('task change inspection', () => {
     expect(calls.made).toEqual([]);
     removeTaskFilesystems(filesystems);
   });
+});
+
+describe('runner commit', () => {
+  const BASE = 'c'.repeat(40), BASELINE = 'b'.repeat(64), TREE = 'e'.repeat(40);
+  const commits = () => stored().filter(file => file.startsWith('codeboost-commit-'));
+  const runner = { name: 'codeboost', email: 'runner@codeboost.invalid', date: '1700000000 +0000' };
+  const inspection = { metadataDigest: BASELINE, head: BASE, agentCommits: [], nestedGitlinkContent: [], links: [], targets: {},
+    changes: [{ kind: 'add', path: 'new.txt', newType: 'file', newMode: '100644', newOid: 'd'.repeat(40), underGit: false,
+      ignored: false }] };
+  const noLinks = { links: [], targets: {} };
+  // The digest of the manifest the inspection above makes: what an audit would have approved.
+  const approved = manifestDigest({ base: BASE, changes: inspection.changes as never, agentCommits: [], metadataChanged: false,
+    linkTargetChanges: [], nestedGitlinkContent: [] });
+  const message = 'P1: Add things\n\nPlan-Item: P1\n';
+  const id = (tree: string) => {
+    const body = Buffer.from(`tree ${tree}\nparent ${BASE}\nauthor codeboost <runner@codeboost.invalid> 1700000000 +0000\n`
+      + `committer codeboost <runner@codeboost.invalid> 1700000000 +0000\n\n${message}`);
+    return createHash('sha1').update(`commit ${body.length}\0`).update(body).digest('hex');
+  };
+  const output = (built: object | undefined, bundle = '', first: object = inspection) =>
+    `${JSON.stringify(first)}\n${built ? `${JSON.stringify(built)}\n${bundle}` : ''}`;
+  const options = (extra: object = {}) => ({ base: BASE, imageId: IMAGE, linkSnapshot: noLinks, digest: approved,
+    message: 'P1: Add things\n\n', trailers: { 'Plan-Item': 'P1' }, author: runner, committer: runner, ...extra });
+
+  it('passes the request on stdin, and keeps the bundle only for the approved manifest and the commit its inputs describe', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: id(TREE) }, Buffer.from('bundle').toString('base64')));
+    const made = await commitTaskChanges(filesystems, options());
+    expect(made).toEqual({ head: id(TREE), unchanged: false, bundle: Buffer.from('bundle') });
+    expect(JSON.parse(readFileSync(join(state, 'commit-input'), 'utf8'))).toEqual({ message, author: runner, committer: runner });
+    const args = JSON.parse(readFileSync(join(state, 'commit-args.json'), 'utf8')) as string[];
+    expect(args.slice(0, 3)).toEqual(['run', '--rm', '-i']);
+    expect(args).toEqual(expect.arrayContaining(['--memory=1g', 'commit', BASELINE, BASE, String(MAXIMUM_BUNDLE_BYTES), '0']));
+    // Another manifest than the one approved: refused, whatever was built.
+    await expect(commitTaskChanges(filesystems, options({ digest: 'f'.repeat(64) }))).rejects.toThrow(TaskCommitRefused);
+    // A commit that is not the one the inputs describe (a signature, an encoding header, another parent).
+    writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: 'a'.repeat(40) }, Buffer.from('bundle').toString('base64')));
+    await expect(commitTaskChanges(filesystems, options())).rejects.toThrow('not the commit its inputs describe');
+    // No commit for changes, or a bundle that is not base64.
+    writeFileSync(join(state, 'commit-output'), output(undefined));
+    await expect(commitTaskChanges(filesystems, options())).rejects.toThrow(TaskCommitRefused);
+    writeFileSync(join(state, 'commit-output'), output({ tree: 'nope', head: id(TREE) }));
+    await expect(commitTaskChanges(filesystems, options())).rejects.toThrow('malformed commit');
+    for (const bundle of ['not base64!', 'AAA', `${Buffer.alloc(16).toString('base64')}\n`]) {
+      writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: id(TREE) }, bundle));
+      await expect(commitTaskChanges(filesystems, options())).rejects.toThrow('malformed bundle');
+    }
+    // Past the caller's limit, whatever the container did; a large valid one is decoded whole.
+    writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: id(TREE) }, Buffer.alloc(65).toString('base64')));
+    await expect(commitTaskChanges(filesystems, options({ maxBundleBytes: 64 }))).rejects.toThrow('malformed bundle');
+    const large = Buffer.alloc(8 * 1024 * 1024, 7);
+    writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: id(TREE) }, large.toString('base64')));
+    expect((await commitTaskChanges(filesystems, options())).bundle.equals(large)).toBe(true);
+    expect(commits()).toEqual([]);
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('returns base for no changes, and refuses what the runner never commits even when it was approved', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    const quiet = { ...inspection, changes: [] };
+    const none = manifestDigest({ base: BASE, changes: [], agentCommits: [], metadataChanged: false, linkTargetChanges: [], nestedGitlinkContent: [] });
+    writeFileSync(join(state, 'commit-output'), output(undefined, '', quiet));
+    expect(await commitTaskChanges(filesystems, options({ digest: none }))).toEqual({ head: BASE, unchanged: true, bundle: Buffer.alloc(0) });
+    writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: id(TREE) }, 'AAAA', quiet));
+    await expect(commitTaskChanges(filesystems, options({ digest: none }))).rejects.toThrow('for no changes');
+    const refused = async (first: Record<string, unknown>, reason: string) => {
+      const manifest = { base: BASE, changes: first.changes ?? [], agentCommits: first.agentCommits ?? [],
+        metadataChanged: first.metadataOnly === true, linkTargetChanges: [], nestedGitlinkContent: first.nestedGitlinkContent ?? [] };
+      writeFileSync(join(state, 'commit-output'), JSON.stringify(first));
+      await expect(commitTaskChanges(filesystems, options({ digest: manifestDigest(manifest as never) }))).rejects.toThrow(reason);
+    };
+    await refused({ metadataDigest: 'e'.repeat(64), metadataOnly: true }, 'metadata changed');
+    await refused({ ...inspection, agentCommits: ['a'.repeat(40)] }, 'the agent made commits');
+    // A write through a declared link is refused; the link's own retargeting is the item's edit and is committed.
+    const anchor = { path: '.', type: 'directory' as const, mode: '40755', size: 0, ino: 1, ctime: '0', mtime: '0' };
+    const linkSnapshot = { links: [{ link: 'l', linkTarget: 'a', status: 'absent' as const, target: 'a' }], targets: { a: { status: 'absent' as const, anchor } } };
+    const linked = (after: object, targetNow: object) => ({ ...inspection, links: [{ link: 'l', status: 'absent', ...after }], targets: { a: targetNow } });
+    const digestOf = (linkTargetChanges: object[]) => manifestDigest({ base: BASE, changes: inspection.changes as never, agentCommits: [],
+      metadataChanged: false, linkTargetChanges: linkTargetChanges as never, nestedGitlinkContent: [] });
+    writeFileSync(join(state, 'commit-output'), JSON.stringify(linked({ linkTarget: 'a', target: 'a' }, { status: 'present', entries: [] })));
+    await expect(commitTaskChanges(filesystems, options({ linkSnapshot, digest: digestOf([{ link: 'l', target: 'a', path: 'a', change: 'status' }]) })))
+      .rejects.toThrow('a declared link\'s target changed');
+    writeFileSync(join(state, 'commit-output'), output({ tree: TREE, head: id(TREE) }, 'AAAA', linked({ linkTarget: 'b', target: 'b' }, { status: 'absent', anchor })));
+    expect(await commitTaskChanges(filesystems, options({ linkSnapshot, digest: digestOf([{ link: 'l', target: 'a', path: 'l', change: 'retargeted' }]) })))
+      .toMatchObject({ head: id(TREE), unchanged: false });
+    await refused({ ...inspection, nestedGitlinkContent: ['sm'] }, 'gitlink directory has content');
+    await refused({ ...inspection, changes: [{ kind: 'add', path: 'fifo', newType: 'other', underGit: false, ignored: false }] }, 'special file');
+    await refused({ ...inspection, changes: [{ kind: 'add', path: 'a/.git/x', newType: 'file', newMode: '100644', newOid: 'd'.repeat(40),
+      underGit: true, ignored: false }] }, 'under a .git part');
+    await refused({ ...inspection, changes: [{ kind: 'add', path: 'd/.GitModules', newType: 'symlink', newMode: '120000',
+      newOid: 'd'.repeat(40), newLinkTarget: 'x', underGit: false, ignored: false }] }, 'a symlink named .gitmodules');
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('rejects a bad digest, message, trailer, identity or bundle limit before any Docker call', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    calls.made = [];
+    for (const [extra, reason] of [[{ digest: 'abc' }, 'digest'], [{ message: '\n\n' }, 'empty'], [{ message: 'a\0b' }, 'NUL'],
+      [{ message: 'x'.repeat(70_000) }, 'at most'], [{ trailers: { 'Plan Item': 'P1' } }, 'Trailer'], [{ trailers: { '1': 'P1' } }, 'Trailer'],
+      [{ trailers: { 'Plan-Item': 'P1\nForged: yes' } }, 'Trailer'], [{ author: { ...runner, name: 'a <b>' } }, 'author\'s name'],
+      [{ author: { ...runner, name: ' padded' } }, 'author\'s name'], [{ committer: { ...runner, email: 'a b@c' } }, 'committer\'s email'],
+      [{ committer: { ...runner, date: '2023-11-14' } }, 'committer\'s date'], [{ author: { ...runner, date: '1700000000 -0000' } }, 'author\'s date'],
+      [{ message: 'title \ufffe' }, 'noncharacters'], [{ trailers: { 'Plan-Item': 'P\ufdd0' } }, 'Trailer'],
+      [{ author: { ...runner, name: 'code\uffffboost' } }, 'author\'s name'], [{ maxBundleBytes: MAXIMUM_BUNDLE_BYTES + 1 }, 'maxBundleBytes'],
+      [{ base: 'HEAD' }, 'full commit ID']] as const)
+      await expect(commitTaskChanges(filesystems, options(extra))).rejects.toThrow(reason);
+    expect(calls.made).toEqual([]);
+    removeTaskFilesystems(filesystems);
+  });
+
+  it('on abort, kills a docker run that ignores SIGTERM and removes the commit container before settling', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    writeFileSync(join(state, 'hang-commit'), '');
+    const controller = new AbortController();
+    const waitForRun = setInterval(() => { if (existsSync(join(state, 'commit-began'))) controller.abort(); }, 20);
+    const began = performance.now();
+    try {
+      const error = await commitTaskChanges(filesystems, options({ signal: controller.signal })).then(() => undefined, caught => caught);
+      expect(error).toMatchObject({ name: 'AbortError', code: 'ABORT_ERR' });
+    } finally { clearInterval(waitForRun); }
+    expect(performance.now() - began).toBeGreaterThanOrEqual(5_000);
+    expect(commits()).toEqual([]);
+    rmSync(join(state, 'hang-commit'));
+    removeTaskFilesystems(filesystems);
+  }, 60_000);
 });

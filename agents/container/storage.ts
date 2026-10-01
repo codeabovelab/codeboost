@@ -85,14 +85,14 @@ const createDeadline = (timeoutMs: number) => {
 };
 /** One Docker call a storage step needs run, a wait, or a point where a long walk lets other work (and an abort) in. */
 type StorageStep = { readonly args: readonly string[]; readonly timeoutMs: number; readonly cancellable: boolean;
-  readonly maxBuffer?: number }
+  readonly maxBuffer?: number; readonly input?: Buffer }
   | { readonly sleepMs: number } | typeof PAUSE;
 type Steps<T> = Generator<StorageStep, T, DockerOutcome | undefined>;
 const PAUSE = Symbol('pause');
 /** Ask the driver to run one Docker call. Allocation calls are cancellable; cleanup calls never are. */
 function* run(args: readonly string[], timeoutMs: number, cancellable: boolean,
-  maxBuffer?: number): Steps<DockerOutcome> {
-  return (yield { args, timeoutMs, cancellable, maxBuffer })!;
+  maxBuffer?: number, input?: Buffer): Steps<DockerOutcome> {
+  return (yield { args, timeoutMs, cancellable, maxBuffer, input })!;
 }
 /** Run one Docker call that must succeed; its failure throws a `DockerError` that `createOutcomeUnknown` reads. */
 function* must(args: readonly string[], timeoutMs: number): Steps<string> {
@@ -111,7 +111,8 @@ function runSteps<T>(steps: Steps<T>): T {
     else if ('sleepMs' in step) { sleep(step.sleepMs); next = steps.next(); }
     else {
       const result = spawnSync('docker', [...step.args], { encoding: 'utf8', timeout: step.timeoutMs, killSignal: 'SIGKILL',
-        env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], maxBuffer: step.maxBuffer ?? 16 * 1024 * 1024 });
+        env: dockerEnvironment(), stdio: [step.input ? 'pipe' : 'ignore', 'pipe', 'pipe'], input: step.input,
+        maxBuffer: step.maxBuffer ?? 16 * 1024 * 1024 });
       const error = result.error ?? (result.status === null
         ? new Error(`docker ${step.args[0] ?? ''} was killed by ${result.signal}.`) : undefined);
       next = steps.next({ status: error ? null : result.status, stdout: String(result.stdout ?? ''),
@@ -145,7 +146,7 @@ async function runStepsAsync<T>(steps: Steps<T>, options: PreparationOptions): P
     } else {
       next = steps.next(await runInProcessGroup('docker', step.args, { env: dockerEnvironment(),
         timeoutMs: step.timeoutMs, signal: step.cancellable ? options.signal : undefined,
-        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer }));
+        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer, input: step.input }));
     }
   }
   return next.value;
@@ -223,8 +224,8 @@ export function taskMetadataBaseline(storage: TaskFilesystems | RecoveredTaskSto
 }
 /**
  * The baseline to check the metadata against: D's own for storage this process allocated (a given one must match it),
- * or the one F recorded, which a recovery handle needs. Nothing but a runner commit (#66 part 2) may change the
- * metadata after seeding, and that commit is the last step on a storage: no check runs after it.
+ * or the one F recorded, which a recovery handle needs. Nothing changes the metadata after seeding: agents mount it
+ * read-only, and so does every runner operation, the runner commit (#66 part 2) included.
  */
 export function resolveMetadataBaseline(storage: TaskFilesystems | RecoveredTaskStorage, given: string | undefined): string {
   const known = taskMetadataBaseline(storage);
@@ -729,7 +730,7 @@ export const EXPORT_SCRIPT = [
 /** A container run over both volumes of task storage, read-only, as the storage user, with no network. */
 interface StorageScript {
   /** The `io.codeboost.task-storage` kind the container carries; recovery removes a leftover one. */
-  readonly kind: 'export' | 'inspect';
+  readonly kind: 'export' | 'inspect' | 'commit';
   /** Names the operation in messages, for example "Task diff export". */
   readonly operation: string;
   /** Ends "Task work volume is missing; ..." when a volume is gone. */
@@ -742,6 +743,8 @@ interface StorageScript {
   readonly memory?: '256m' | '1g';
   /** The size of its /tmp. Default 64m. */
   readonly tmpBytes?: '64m' | '512m';
+  /** Written to the script's stdin (`docker run -i`), which is then closed; without it stdin is not connected. */
+  readonly input?: Buffer;
 }
 export interface StorageScriptOptions extends PreparationOptions {
   /** The immutable ID of the built agent image, whose tools run the script. */
@@ -765,14 +768,14 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
   const name = `codeboost-${script.kind}-${randomUUID()}`;
   let unsettled = false;
   try {
-    const args = ['run', '--rm', '--name', name, '--label', `io.codeboost.task-storage=${script.kind}`, ...ownerLabelArgs(owner),
+    const args = ['run', '--rm', ...script.input ? ['-i'] : [], '--name', name, '--label', `io.codeboost.task-storage=${script.kind}`, ...ownerLabelArgs(owner),
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', `--memory=${script.memory ?? '256m'}`, '--cpus=.5',
       '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${script.tmpBytes ?? '64m'}`,
       '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
       '--entrypoint', script.entrypoint, imageId, ...script.args];
-    const outcome = yield* run(args, remaining(), true, script.maxOutputBytes);
+    const outcome = yield* run(args, remaining(), true, script.maxOutputBytes, script.input);
     if (outcome.status !== 0) {
       const error = new DockerError(args, outcome);
       // A client stopped before the daemon answered may still have started the container.

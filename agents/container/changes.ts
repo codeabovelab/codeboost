@@ -1,10 +1,11 @@
+import { constants } from 'node:buffer';
 import { createHash } from 'node:crypto';
 import { resolveMetadataBaseline, runStorageScript, type RecoveredTaskStorage, type StorageScriptOptions,
   type TaskFilesystems } from './storage.ts';
 import { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES, MAXIMUM_TREE_OUTPUT,
-  TREE_SCRIPT } from './tree-script.ts';
+  TASK_COMMIT_REF, TREE_SCRIPT } from './tree-script.ts';
 
-export { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES };
+export { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES, TASK_COMMIT_REF };
 // Walking a large checkout holds every path in memory: more than an export needs.
 const INSPECTION_MEMORY = '1g';
 // The scratch index an inspection hashes into holds an entry for every file of base.
@@ -262,20 +263,8 @@ interface InspectOutput {
   readonly targets: Readonly<Record<string, TargetState>>;
 }
 
-/**
- * Compare the work tree with the tree of `base` after an invocation settled, without following links, and return the
- * change manifest F2a audits (#66). Content IDs are what a commit would store (see `TaskChange`). Entries Git would
- * skip are listed too: new ignored files, fifos, anything under a `.git` part, and anything in a gitlink directory
- * (reported in `nestedGitlinkContent`); a new directory that base's rules ignore is one entry. Each declared link is
- * resolved again and each target the snapshot recorded is compared with what is there now. Runs in a read-only
- * container over the storage with no network. It fails, rather than returns part of the answer, on: more than
- * `MAXIMUM_CHANGES` changes; a reported name or link target longer than `MAXIMUM_NAME_BYTES`, not strict UTF-8, or
- * holding a Unicode control, format, separator or unassigned character (Cc, Cf, Zl, Zp, Cn); more
- * than `MAXIMUM_TARGET_ENTRIES` entries beneath the recorded targets; anything it cannot read; a `base` that is not a
- * commit there; and any Git failure. F treats every refusal as needs human.
- */
-export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
-  options: InspectOptions): Promise<TaskChangeManifest> {
+// Checks an inspection's inputs and returns the script arguments after the mode: baseline, base, then the links.
+function inspectionInput(storage: TaskFilesystems | RecoveredTaskStorage, options: InspectOptions) {
   if (typeof options.base !== 'string' || !COMMIT_ID.test(options.base)) throw new Error('base must be a full commit ID.');
   const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
   const links = options.linkSnapshot?.links, recorded = options.linkSnapshot?.targets;
@@ -286,17 +275,18 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
   const targets = [...new Set(links.flatMap(link => link.target === undefined ? [] : [link.target]))];
   for (const target of targets) assertDeclaredPath(target);
   assertArguments([...links.map(link => link.link), ...targets]);
-  const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Task change inspection',
-    consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
-    memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
-    args: ['-e', TREE_SCRIPT, 'inspect', baseline, options.base, String(links.length), ...links.map(link => link.link), ...targets] },
-  { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
-  const output = JSON.parse(stdout) as InspectOutput & { readonly metadataOnly?: boolean };
+  return { baseline, links, recorded, linkArgs: [String(links.length), ...links.map(link => link.link), ...targets] };
+}
+
+// The manifest from what the script printed: the same for an inspection and for a commit, so the commit's digest is
+// the inspection's whenever the work tree is the same.
+function manifestOf(base: string, { baseline, links, recorded }: ReturnType<typeof inspectionInput>,
+  output: InspectOutput & { readonly metadataOnly?: boolean }): TaskChangeManifest {
   // The metadata changed: no Git command ran, so nothing else was read. That alone sends the task to needs human.
   if (output.metadataOnly === true) {
     if (!DIGEST.test(output.metadataDigest) || output.metadataDigest === baseline)
       throw new Error('The change inspection returned an unexpected result.');
-    const manifest = { base: options.base, changes: [], agentCommits: [], metadataChanged: true, linkTargetChanges: [],
+    const manifest = { base, changes: [], agentCommits: [], metadataChanged: true, linkTargetChanges: [],
       nestedGitlinkContent: [] };
     return deepFreeze({ ...manifest, digest: manifestDigest(manifest) });
   }
@@ -325,8 +315,190 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
     }
     return found;
   });
-  const manifest = { base: options.base, changes: output.changes, agentCommits: output.agentCommits,
+  const manifest = { base, changes: output.changes, agentCommits: output.agentCommits,
     metadataChanged: output.metadataDigest !== baseline, linkTargetChanges,
     nestedGitlinkContent: output.nestedGitlinkContent };
   return deepFreeze({ ...manifest, digest: manifestDigest(manifest) });
+}
+
+/**
+ * Compare the work tree with the tree of `base` after an invocation settled, without following links, and return the
+ * change manifest F2a audits (#66). Content IDs are what a commit would store (see `TaskChange`). Entries Git would
+ * skip are listed too: new ignored files, fifos, anything under a `.git` part, and anything in a gitlink directory
+ * (reported in `nestedGitlinkContent`); a new directory that base's rules ignore is one entry. Each declared link is
+ * resolved again and each target the snapshot recorded is compared with what is there now. Runs in a read-only
+ * container over the storage with no network. It fails, rather than returns part of the answer, on: more than
+ * `MAXIMUM_CHANGES` changes; a reported name or link target longer than `MAXIMUM_NAME_BYTES`, not strict UTF-8, or
+ * holding a Unicode control, format, separator or unassigned character (Cc, Cf, Zl, Zp, Cn); more
+ * than `MAXIMUM_TARGET_ENTRIES` entries beneath the recorded targets; anything it cannot read; a `base` that is not a
+ * commit there; and any Git failure. F treats every refusal as needs human.
+ */
+export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
+  options: InspectOptions): Promise<TaskChangeManifest> {
+  const input = inspectionInput(storage, options);
+  const stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Task change inspection',
+    consequence: 'changes cannot be inspected', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
+    memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
+    args: ['-e', TREE_SCRIPT, 'inspect', input.baseline, options.base, ...input.linkArgs] },
+  { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
+  return manifestOf(options.base, input, JSON.parse(stdout));
+}
+
+/** The most bundle bytes a runner commit returns; a larger one fails the commit. */
+export const MAXIMUM_BUNDLE_BYTES = 64 * 1024 * 1024;
+const MAXIMUM_MESSAGE_BYTES = 64 * 1024;
+// The script's JSON and the bundle in base64 come back as one string, which V8 caps.
+if (MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK + Math.ceil(MAXIMUM_BUNDLE_BYTES / 3) * 4 + 1 > constants.MAX_STRING_LENGTH)
+  throw new Error('The commit output limit is larger than one string can hold.');
+
+/**
+ * Who a runner commit is by, from F: D takes nothing from the environment or the repository, so the commit ID follows
+ * from these, the message, base and the changes alone. `date` is Git's raw form: seconds since the epoch, a space, and
+ * the offset (`1700000000 +0000`).
+ */
+export interface CommitIdentity {
+  readonly name: string;
+  readonly email: string;
+  readonly date: string;
+}
+export interface CommitOptions extends InspectOptions {
+  /** The `digest` of the manifest the audit approved. The commit refuses a work tree whose manifest differs. */
+  readonly digest: string;
+  /** The message. Trailing newlines are dropped; one ends it, and the trailers follow after a blank line. */
+  readonly message: string;
+  /** Trailer lines, in this order, as `Key: value` (for example `Plan-Item`, `Plan-Revision`). */
+  readonly trailers?: Readonly<Record<string, string>>;
+  readonly author: CommitIdentity;
+  readonly committer: CommitIdentity;
+  /** Default and maximum `MAXIMUM_BUNDLE_BYTES`. */
+  readonly maxBundleBytes?: number;
+}
+export interface TaskCommit {
+  /** The runner commit, or `base` when the manifest has no changes ("planned but unchanged"). */
+  readonly head: string;
+  readonly unchanged: boolean;
+  /**
+   * The commit as a `git bundle` whose one ref, `TASK_COMMIT_REF`, points at `head`, with `base` as its prerequisite.
+   * Empty when unchanged. F fetches it into a runner-owned repository and checks that the ref is `head`.
+   */
+  readonly bundle: Buffer;
+}
+/** The commit refused the work tree: it changed after the audit, or holds something the runner never commits. */
+export class TaskCommitRefused extends Error {}
+
+// Git drops these from either end of a name or email (ident.c, crud), which would change the commit.
+const CRUD = /^[\x00-\x20.,:;<>"\\']|[\x00-\x20.,:;<>"\\']$/;
+function assertIdentity(identity: CommitIdentity | undefined, role: string): void {
+  const { name, email, date } = identity ?? {} as Partial<CommitIdentity>;
+  for (const [field, value] of [['name', name], ['email', email]] as const) {
+    if (typeof value !== 'string' || !value || !value.isWellFormed() || Buffer.byteLength(value) > 256 || CRUD.test(value)
+      || /[<>\p{Cc}\p{Noncharacter_Code_Point}]/u.test(value) || (field === 'email' && /\s/.test(value)))
+      throw new Error(`The ${role}'s ${field} must be 1 to 256 bytes of text without <, >, control characters,`
+        + ' noncharacters, or punctuation or space at either end.');
+  }
+  // Git writes a zero offset as +0000, so -0000 would make another commit than the one checked here.
+  if (typeof date !== 'string' || !/^(?:0|[1-9][0-9]{0,11}) [+-](?:0[0-9]|1[0-4])[0-5][0-9]$/.test(date) || date.endsWith(' -0000'))
+    throw new Error(`The ${role}'s date must be Git's raw form: seconds since the epoch and an offset, such as "1700000000 +0000".`);
+}
+// Git re-encodes a message it does not take for UTF-8 (commit.c, verify_utf8), and it counts noncharacters as not UTF-8.
+function commitMessage(message: string, trailers: Readonly<Record<string, string>> = {}): string {
+  if (typeof message !== 'string' || !message.isWellFormed() || message.includes('\0')
+    || /\p{Noncharacter_Code_Point}/u.test(message))
+    throw new Error('The commit message must be text without NUL or Unicode noncharacters.');
+  const body = message.replace(/\n+$/, '');
+  if (!body.trim()) throw new Error('The commit message must not be empty.');
+  const lines = Object.entries(trailers ?? {}).map(([key, value]) => {
+    if (!/^[A-Za-z][A-Za-z0-9-]*$/.test(key) || typeof value !== 'string' || !value.trim() || value !== value.trim()
+      || !value.isWellFormed() || /[\p{Cc}\p{Noncharacter_Code_Point}]/u.test(value))
+      throw new Error(`Trailer ${JSON.stringify(key)} must be a token with a one-line value.`);
+    return `${key}: ${value}`;
+  });
+  const text = `${body}\n${lines.length ? `\n${lines.join('\n')}\n` : ''}`;
+  if (Buffer.byteLength(text) > MAXIMUM_MESSAGE_BYTES) throw new Error(`The commit message must be at most ${MAXIMUM_MESSAGE_BYTES} bytes.`);
+  return text;
+}
+// The ID Git gives the commit these inputs describe: nothing else (a signature, an encoding header) may be in it.
+function commitId(base: string, tree: string, author: CommitIdentity, committer: CommitIdentity, message: string): string {
+  const body = Buffer.from(`tree ${tree}\nparent ${base}\nauthor ${author.name} <${author.email}> ${author.date}\n`
+    + `committer ${committer.name} <${committer.email}> ${committer.date}\n\n${message}`);
+  return createHash(base.length === 64 ? 'sha256' : 'sha1').update(`commit ${body.length}\0`).update(body).digest('hex');
+}
+// Git refuses a symlink named .gitmodules, in any case, anywhere in a tree.
+const gitmodulesLink = (change: TaskChange) => change.newType === 'symlink'
+  && change.path.split('/').at(-1)!.toLowerCase() === '.gitmodules';
+// What the runner never commits, whatever the audit said: each is needs human (the same list the script will not build).
+function unstorable(manifest: TaskChangeManifest): string | undefined {
+  if (manifest.metadataChanged) return 'the Git metadata changed since the storage was seeded';
+  if (manifest.agentCommits.length) return 'the agent made commits';
+  // A retargeted declared link is the item's own edit of it, which the audit judges; every other kind is a write
+  // through the link.
+  if (manifest.linkTargetChanges.some(change => change.change !== 'retargeted')) return 'a declared link\'s target changed';
+  if (manifest.nestedGitlinkContent.length) return 'a gitlink directory has content';
+  const change = manifest.changes.find(entry => entry.underGit || gitmodulesLink(entry)
+    || [entry.oldType, entry.newType].some(type => type === 'directory' || type === 'other'));
+  if (change) return `${JSON.stringify(change.path)} is ${change.underGit ? 'under a .git part' : gitmodulesLink(change)
+    ? 'a symlink named .gitmodules' : 'a directory or special file'}, which a commit cannot hold`;
+  return undefined;
+}
+
+/**
+ * Make the runner's commit (#66): `base` plus exactly the changes of the manifest the audit approved, each file stored
+ * as the inspection hashed it, with the message, trailers and identities F passes. It runs the inspection again in its
+ * own container (read-only over the storage, no network), and from the same reads writes the commit's objects to a
+ * scratch store in the container's /tmp and returns them as a bounded bundle: neither volume is ever written. The
+ * bundle is kept only if the manifest's digest is `digest`; otherwise it refuses (`TaskCommitRefused`), as it does
+ * for a manifest with agent commits, a metadata change, a declared link target change other than `retargeted` (the
+ * item's own edit of the link, which the audit judges), gitlink content, or a change a tree cannot hold (a directory,
+ * a fifo or other special file, a path under `.git`, a symlink named `.gitmodules`). An empty change set makes no commit
+ * and returns `base`. Hooks, signing and the repository's commit encoding never apply, so the same inputs give the
+ * same ID, which is checked here against the ID they describe. It fails on whatever fails an inspection, on a bundle
+ * over `maxBundleBytes`, on new content that does not fit the container's /tmp (512 MB, within its 1 GB of memory),
+ * and on any Git failure.
+ * Takes `signal`, `onProcessGroup` and `timeoutMs` (default 300 s), and settles only after its container is gone.
+ */
+export async function commitTaskChanges(storage: TaskFilesystems | RecoveredTaskStorage,
+  options: CommitOptions): Promise<TaskCommit> {
+  const input = inspectionInput(storage, options);
+  if (typeof options.digest !== 'string' || !DIGEST.test(options.digest)) throw new Error('digest must be the manifest\'s SHA-256.');
+  const message = commitMessage(options.message, options.trailers);
+  assertIdentity(options.author, 'author');
+  assertIdentity(options.committer, 'committer');
+  const maxBundleBytes = options.maxBundleBytes ?? MAXIMUM_BUNDLE_BYTES;
+  if (!Number.isSafeInteger(maxBundleBytes) || maxBundleBytes < 1 || maxBundleBytes > MAXIMUM_BUNDLE_BYTES)
+    throw new Error(`maxBundleBytes must be a positive integer of at most ${MAXIMUM_BUNDLE_BYTES}.`);
+  const author = { name: options.author.name, email: options.author.email, date: options.author.date };
+  const committer = { name: options.committer.name, email: options.committer.email, date: options.committer.date };
+  const stdout = await runStorageScript(storage, { kind: 'commit', operation: 'Runner commit',
+    consequence: 'nothing can be committed', entrypoint: 'perl',
+    maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK + Math.ceil(maxBundleBytes / 3) * 4 + 1,
+    memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
+    input: Buffer.from(JSON.stringify({ message, author, committer })),
+    args: ['-e', TREE_SCRIPT, 'commit', input.baseline, options.base, String(maxBundleBytes), ...input.linkArgs] },
+  { ...options, timeoutMs: options.timeoutMs ?? 300_000 });
+  // The inspection's JSON (a metadata-only one has no newline after it), then the commit's, then the bundle.
+  const first = stdout.indexOf('\n'), second = first < 0 ? -1 : stdout.indexOf('\n', first + 1);
+  const manifest = manifestOf(options.base, input, JSON.parse(first < 0 ? stdout : stdout.slice(0, first)));
+  const built = second < 0 ? undefined : JSON.parse(stdout.slice(first + 1, second)) as { readonly tree?: unknown; readonly head?: unknown };
+  const encoded = second < 0 ? '' : stdout.slice(second + 1);
+  if (manifest.digest !== options.digest)
+    throw new TaskCommitRefused('The work tree no longer matches the manifest the audit approved; nothing was committed.');
+  const reason = unstorable(manifest);
+  if (reason) throw new TaskCommitRefused(`Nothing was committed: ${reason}.`);
+  if (!manifest.changes.length) {
+    if (built !== undefined || (first >= 0 && first !== stdout.length - 1)) throw new Error('The runner commit returned a commit for no changes.');
+    return Object.freeze({ head: options.base, unchanged: true, bundle: Buffer.alloc(0) });
+  }
+  const id = new RegExp(`^[0-9a-f]{${options.base.length}}$`), { tree, head } = built ?? {};
+  // The script builds nothing for what it cannot store; its list mirrors `unstorable`, and a case only it knows is a
+  // refusal too.
+  if (built === undefined) throw new TaskCommitRefused('Nothing was committed: the storage container made no commit for the changes.');
+  if (typeof tree !== 'string' || !id.test(tree) || typeof head !== 'string' || !id.test(head))
+    throw new Error('The runner commit returned a malformed commit.');
+  if (head !== commitId(options.base, tree, author, committer, message))
+    throw new Error('The runner commit is not the commit its inputs describe; nothing was committed.');
+  // Decoding skips what is not base64, so the bundle must encode back to exactly the text that came.
+  const bundle = Buffer.from(encoded, 'base64');
+  if (!bundle.length || bundle.length > maxBundleBytes || bundle.toString('base64') !== encoded)
+    throw new Error('The runner commit returned a malformed bundle.');
+  return Object.freeze({ head, unchanged: false, bundle });
 }

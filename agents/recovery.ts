@@ -25,8 +25,8 @@ export interface UnownedResource extends RecoveredResource {
 }
 export interface RecoveryReport {
   /**
-   * Agent containers, egress proxies, seeders, export and inspection containers and networks of this runner, now
-   * confirmed gone.
+   * Agent containers, egress proxies, seeders, export, inspection and commit containers and networks of this runner,
+   * now confirmed gone.
    */
   readonly removed: readonly RecoveredResource[];
   /** One handle per task-storage allocation of this runner, kept whole for export and `removeTaskFilesystems`. */
@@ -122,8 +122,8 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
 
 /**
  * Crash recovery for one database (#51 item 4). Acts only on objects whose `io.codeboost.runner` label is
- * `runnerOwner`: it removes agent containers, egress proxies, seeders, export and inspection containers and networks,
- * and resolves only once they are gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per
+ * `runnerOwner`: it removes agent containers, egress proxies, seeders, export, inspection and commit containers and
+ * networks, and resolves only once they are gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per
  * allocation. Objects from older builds without a runner label, and anything it does not recognise, are reported and
  * never touched.
  *
@@ -184,9 +184,10 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   for (const resource of owned.container) {
     const kind = kindOf(resource);
     if (kind === 'storage:keeper') keep(resource, 'keeper');
-    // Seeders, export and inspection containers are transient: a leftover one is removed, never kept with the storage.
-    else if (kind === 'storage:seeder' || kind === 'storage:export' || kind === 'storage:inspect' || kind === 'agent'
-      || kind === 'egress')
+    // Seeders, export, inspection and commit containers are transient: a leftover one is removed, never kept with the
+    // storage.
+    else if (kind === 'storage:seeder' || kind === 'storage:export' || kind === 'storage:inspect' || kind === 'storage:commit'
+      || kind === 'agent' || kind === 'egress')
       remove.push(resource);
     else unknown(resource);
   }

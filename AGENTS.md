@@ -124,6 +124,8 @@ Every reproduced race requires a failing-before and passing-after regression. As
 - Never infer that agent-written content is unchanged from timestamps, sizes or an index's stat cache: not every write moves them (tmpfs, for one). Compare the content itself.
 - Hand agent-chosen names to tools as literal data: disable or sidestep pathspec magic (a leading `:`), quote them in the tool's own input format (a leading `"` in `--stdin-paths`), pass them as bytes, and keep empty fields when splitting NUL-separated output. Check a name's safety only where it is reported, never refusing unchanged input for a name the report never carries.
 - Check a trust root before anything reads it. When a tool reads config or rules from storage an agent could have reached (Git and the metadata volume), compare that storage with its trusted baseline first, and run nothing if it changed.
+- When one run reports a result and then acts on the same data, serialize the report before the action reads it: a read that changes data (Perl autovivification, a lazy default) must not change what the caller checks.
+- When the runner predicts what an external tool will produce (a commit ID from its inputs), refuse up front any input the tool would normalize (Git writes a `-0000` offset as `+0000` and re-encodes Unicode noncharacters), so the prediction cannot fail later on valid-looking input.
 
 ## Blinded experiments
 

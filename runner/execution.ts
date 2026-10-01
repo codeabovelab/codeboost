@@ -2,6 +2,7 @@ import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import type { PlanContext } from '../core/plan.ts';
 import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
+import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-body.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
@@ -116,8 +117,9 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       try { head = await workspace.commit(data.workspace, {
         baseHead: data.baseHead, paths, digest: manifest.digest,
         // The title is plan text: on one line with no control or bidi/format characters, it cannot open a trailer block
-        // that forges Plan-Item or Plan-Revision, put terminal escapes into git log, or reorder how git log shows it.
-        message: `${item.id}: ${item.title.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, ' ').replace(/ {2,}/g, ' ').trim()}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
+        // that forges Plan-Item or Plan-Revision, put terminal escapes into git log, or reorder how git log shows it. Its
+        // issue references and mentions are neutralised (AGENTS.md): on the default branch, "Fixes #12" would close #12.
+        message: `${item.id}: ${neutralizeMentions(neutralizeReferences(item.title.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]+/g, ' ').replace(/ {2,}/g, ' ').trim()))}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
       }, signal); }
       catch (error) {
         // D's refusal text can name agent-chosen paths: quote it (AGENTS.md). A stop records its first reason before it

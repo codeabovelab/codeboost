@@ -120,7 +120,7 @@ Some repositories do not support draft PRs (for example private repositories on 
 
 - **Repository renames and transfers.** Every PR record is kept under the configured repository name. After a rename or transfer, publish fails closed (the task's PRs are refused or reported as unsettled) until the records are moved; nothing here moves them.
 
-- **Push.** `BranchPusher` is injected. The real push needs D's commit export (#66) and a runner-owned host repository.
+- **Push.** `BranchPusher` is injected. The real push needs the runner's commits in a runner-owned host repository, fetched from the bundles `commitTaskChanges` returns (#66, #87).
 - **Continue from possibly already fixed.** The Continue and Cancel actions are user actions for a later slice.
 - **Close the draft on cancel.** The design closes the draft PR when a person cancels a needs-human task. The PR record is kept for that.
 - **The pre-merge check.** `GhMergeGateway` keeps its own check for now. F6 moves it onto this module. The merge check treats a PR in another repository as `unknown`; this check treats it as a match.
