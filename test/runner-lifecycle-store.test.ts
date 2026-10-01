@@ -503,3 +503,31 @@ describe('user actions', () => {
     expect(store.feedbackEvents(identity).map(event => event.kind)).toEqual(['task-closed']);
   });
 });
+
+describe('runner commits and preparation groups (#87)', () => {
+  it('knows a task has a runner commit only from a completed writable attempt whose result made one', () => {
+    const { store } = queued();
+    expect(store.hasRunnerCommit(identity)).toBe(false);
+    const unchanged = admit(store); store.markRunning(identity, unchanged.id);
+    settle(store, unchanged.id, { result: { head: oid(2), unchanged: true, inScope: [], outOfScope: [] } });
+    expect(store.hasRunnerCommit(identity)).toBe(false);
+    const failed = admit(store); store.markRunning(identity, failed.id);
+    settle(store, failed.id, { exitCode: 1, valid: false });
+    expect(store.hasRunnerCommit(identity)).toBe(false);
+    const committed = admit(store); store.markRunning(identity, committed.id);
+    settle(store, committed.id, { result: { head: oid(3), unchanged: false, inScope: ['a'], outOfScope: [] },
+      history: { base: oid(1), head: oid(3), entries: [{ sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null }] } });
+    expect(store.hasRunnerCommit(identity)).toBe(true);
+  });
+
+  it('keeps each recorded preparation group paired with its own start time', () => {
+    const { store } = queued(); const attempt = admit(store);
+    store.markPreparationStarting(identity, attempt.id, 1_000);
+    store.recordPreparationGroup(identity, attempt.id, 4242, 41_000);
+    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4242, preparationStartedAt: 41_000 });
+    // Without a time, the marker's own stays.
+    store.recordPreparationGroup(identity, attempt.id, 4343);
+    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4343, preparationStartedAt: 41_000 });
+    expect(() => store.recordPreparationGroup(identity, attempt.id, 4444, 1.5)).toThrow('start time');
+  });
+});

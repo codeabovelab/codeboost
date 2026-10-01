@@ -25,6 +25,18 @@ export interface GitCallOptions {
   /** Deadline for each Git call. Default 120 s. */
   readonly timeoutMs?: number;
 }
+/**
+ * Create `path` (and its parents) as needed, then require it and its parent to be real directories owned by the current
+ * user that no one else can write: whoever can write a directory can replace what is in it.
+ */
+export function ownerOnlyDirectory(path: string): void {
+  mkdirSync(path, { recursive: true, mode: 0o700 });
+  for (const directory of [join(path, '..'), path]) {
+    const stat = lstatSync(directory);
+    if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0)
+      throw new Error(`${directory} must be a directory owned by you and not writable by group or others.`);
+  }
+}
 /** The ref that keeps one attempt's runner commit; deleted when the attempt does not complete. */
 export const attemptRef = (attemptId: string): string => {
   if (!isUuidV4(attemptId)) throw new Error('Attempt ID must be a UUID v4.');
@@ -60,10 +72,7 @@ export async function openRunnerRepository(o: { runnerRoot: string; runnerOwner:
   & GitCallOptions): Promise<RunnerRepository> {
   if (!/^[0-9a-f]{32}$/.test(o.runnerOwner)) throw new Error('Invalid runner owner token.');
   const parent = join(o.runnerRoot, o.runnerOwner, 'repositories');
-  mkdirSync(parent, { recursive: true, mode: 0o700 });
-  const parentStat = lstatSync(parent);
-  if (!parentStat.isDirectory() || (process.getuid && parentStat.uid !== process.getuid()) || (parentStat.mode & 0o022) !== 0)
-    throw new Error(`${parent} must be a directory owned by you and not writable by group or others.`);
+  ownerOnlyDirectory(parent);
   const path = join(parent, `${createHash('sha256').update(o.repositoryId).digest('hex').slice(0, 32)}.git`);
   if (!lstatSync(path, { throwIfNoEntry: false })) {
     const staging = mkdtempSync(join(parent, '.new-'));

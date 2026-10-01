@@ -8,7 +8,7 @@ import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import type { AlreadyFixedResult } from '../github/already-fixed.ts';
 import {
   ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
-  assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
+  WRITABLE_KINDS, assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
 
@@ -1241,6 +1241,14 @@ export class Store {
       return token;
     });
   }
+  /**
+   * Whether the runner has committed for this task (#87): a completed writable attempt whose result made a commit. Only
+   * then do the task's commits live in the runner-owned repository. One indexed lookup, for every review load.
+   */
+  hasRunnerCommit(identity: PlanIdentity): boolean {
+    return !!this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')}) AND state='completed'
+      AND json_valid(result) AND json_extract(result, '$.unchanged') = 0 LIMIT 1`, identityKey(identity), ...WRITABLE_KINDS);
+  }
   /** "Preparation starting": saved before any preparation subprocess is spawned. */
   markPreparationStarting(identity: PlanIdentity, id: string, startedAt: number): void {
     const key = identityKey(identity);
@@ -1251,10 +1259,16 @@ export class Store {
   cancelPreparationStart(identity: PlanIdentity, id: string): void {
     this.#run(`UPDATE attempts SET preparation_started_at=NULL WHERE plan_key=? AND id=? AND preparation_pgid IS NULL AND state='pending'`, identityKey(identity), id);
   }
-  /** Saved in the same synchronous turn as the spawn. */
-  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number): void {
+  /**
+   * Saved in the same synchronous turn as the spawn. Preparation can run several subprocesses in turn: each one replaces
+   * the last, with its own start time when given, so startup recovery's start-time check (which guards against PID reuse)
+   * matches the group it finds.
+   */
+  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number, startedAt?: number): void {
     if (!Number.isSafeInteger(pgid) || pgid < 2) throw new GuardRefusal('Invalid process group.');
-    if (this.#run(`UPDATE attempts SET preparation_pgid=? WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`, pgid, identityKey(identity), id).changes !== 1)
+    if (startedAt !== undefined && !Number.isSafeInteger(startedAt)) throw new GuardRefusal('Invalid process start time.');
+    if (this.#run(`UPDATE attempts SET preparation_pgid=?, preparation_started_at=COALESCE(?, preparation_started_at) WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`,
+      pgid, startedAt ?? null, identityKey(identity), id).changes !== 1)
       throw new GuardRefusal('Preparation was not marked as starting.');
   }
   /** F chooses the allocation ID and saves it before the asynchronous allocation starts. */

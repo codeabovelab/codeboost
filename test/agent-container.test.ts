@@ -995,13 +995,15 @@ describe('real Docker agent isolation', () => {
         writeFileSync(join(source, 't'), 't\n'); symlinkSync('d/e', join(source, 'via')); symlinkSync('t', join(source, 'old'));
       } });
       asAgent(data.filesystems, ['ln -sfn d/e/f old', 'ln -s via/f through', 'ln -s old chain', 'ln -s via/../t dotdot',
-        'ln -s missing/x dangling', 'ln -s ../outside out', 'ln -s .git/config meta', 'ln -s d plain-dir'].join(' && '));
+        'ln -s missing/x dangling', 'ln -s ../outside out', 'ln -s .git/config meta', 'ln -s d plain-dir',
+        // Each name fits the manifest, but the target joined to the link's directory is longer than any name it carries.
+        `mkdir -p ${'p'.repeat(250)}/${'q'.repeat(250)}/${'r'.repeat(250)} && ln -s ${'s'.repeat(250)}/${'t'.repeat(250)} ${'p'.repeat(250)}/${'q'.repeat(250)}/${'r'.repeat(250)}/deep`].join(' && '));
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
       const traverses = Object.fromEntries(manifest.changes.filter(change => change.newType === 'symlink')
         .map(change => [change.path, change.linkTargetTraversesLink]));
       // A ".." after a link climbs from where that link leads, so dotdot goes through via too.
       expect(traverses).toEqual({ old: false, through: true, chain: true, dotdot: true, dangling: false, out: true, meta: true,
-        'plain-dir': false });
+        'plain-dir': false, [`${'p'.repeat(250)}/${'q'.repeat(250)}/${'r'.repeat(250)}/deep`]: false });
       expect(manifest.changes.filter(change => change.newType !== 'symlink').every(change => !('linkTargetTraversesLink' in change))).toBe(true);
     }, 180_000);
 

@@ -12,6 +12,9 @@ on:
       - 'runner/runner-repository.ts'
       - 'runner/execution.ts'
       - 'core/run-audit.ts'
+      - 'runner/review.ts'
+      - 'runner/store.ts'
+      - 'git/history.ts'
       - 'test/runner-workspace.test.ts'
       - '.github/workflows/agent-isolation.yml'
   pull_request:
@@ -25,6 +28,9 @@ on:
       - 'runner/runner-repository.ts'
       - 'runner/execution.ts'
       - 'core/run-audit.ts'
+      - 'runner/review.ts'
+      - 'runner/store.ts'
+      - 'git/history.ts'
       - 'test/runner-workspace.test.ts'
       - '.github/workflows/agent-isolation.yml'
 permissions:

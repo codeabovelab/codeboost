@@ -2,13 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { commitTaskChanges, inspectTaskChanges, snapshotDeclaredLinks } from '../agents/container/changes.ts';
-import { prepareTaskFilesystemsAsync, removeTaskFilesystems, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
+import { prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
 import type { ProcessGroup } from '../agents/process-group.ts';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { createTaskCloneAsync } from '../git/clone.ts';
 import { findIdentity, type TaskWorkspace, type WorkspaceRef } from './execution.ts';
 import { isUuidV4 } from './lifecycle.ts';
-import { dropAttemptRef, ensureCommit, fetchTaskCommit, type RunnerRepository } from './runner-repository.ts';
+import { dropAttemptRef, ensureCommit, fetchTaskCommit, ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
 import type { AttemptRecord, Store } from './store.ts';
 
 export interface WorkspaceOptions {
@@ -44,20 +44,28 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
   return {
     async materialize(attempt, head, signal) {
       const identity = findIdentity(store, attempt), directory = attemptDirectory(attempt.id);
-      // Every preparation subprocess is recorded, so startup recovery can stop one a crash left running.
+      // Every preparation subprocess is recorded, with its own start time, so startup recovery can stop one a crash left
+      // running.
       store.markPreparationStarting(identity, attempt.id, Date.now());
-      const record = (group: ProcessGroup) => store.recordPreparationGroup(identity, attempt.id, group.pgid);
-      await ensureCommit(repository, head, { signal, onProcessGroup: record });
-      mkdirSync(join(options.runnerRoot, options.runnerOwner, 'attempts'), { recursive: true, mode: 0o700 });
-      mkdirSync(directory, { mode: 0o700 });
-      const clone = await createTaskCloneAsync({ source: repository.path, parent: directory, taskId: identityKey(identity), head,
-        timeoutMs: 120_000, signal, onProcessGroup: record });
-      // Saved before the allocation starts, so a crash during it still leaves a row that matches what D made.
-      const allocationId = randomUUID();
-      store.recordAllocation(identity, attempt.id, allocationId);
-      const filesystems = await prepareTaskFilesystemsAsync(clone, options.limits, imageId,
-        { runnerOwner: options.runnerOwner, attemptId: attempt.id, allocationId }, { signal, onProcessGroup: record, timeoutMs: 120_000 });
-      return { clone, storage: { filesystems, attemptId: attempt.id, identity } satisfies Held };
+      let recorded = false;
+      const record = (group: ProcessGroup) => { store.recordPreparationGroup(identity, attempt.id, group.pgid, group.startedAt); recorded = true; };
+      try {
+        await ensureCommit(repository, head, { signal, onProcessGroup: record });
+        ownerOnlyDirectory(join(options.runnerRoot, options.runnerOwner, 'attempts'));
+        mkdirSync(directory, { mode: 0o700 });
+        const clone = await createTaskCloneAsync({ source: repository.path, parent: directory, taskId: identityKey(identity), head,
+          timeoutMs: 120_000, signal, onProcessGroup: record });
+        // Saved before the allocation starts, so a crash during it still leaves a row that matches what D made.
+        const allocationId = randomUUID();
+        store.recordAllocation(identity, attempt.id, allocationId);
+        const filesystems = await prepareTaskFilesystemsAsync(clone, options.limits, imageId,
+          { runnerOwner: options.runnerOwner, attemptId: attempt.id, allocationId }, { signal, onProcessGroup: record, timeoutMs: 120_000 });
+        return { clone, storage: { filesystems, attemptId: attempt.id, identity } satisfies Held };
+      } catch (error) {
+        // No subprocess ever started (its spawn failed at once): the "starting" marker must not block the next startup.
+        if (!recorded) { try { store.cancelPreparationStart(identity, attempt.id); } catch { /* the marker stays; recovery asks a person */ } }
+        throw error;
+      }
     },
     async snapshotDeclaredLinks(workspace, paths, signal) {
       return snapshotDeclaredLinks(held(workspace).filesystems, paths, { imageId, signal });
@@ -79,7 +87,7 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
     async release(workspace) {
       const { filesystems, attemptId, identity } = held(workspace);
       // Storage first: a failure here holds the slot under a marker, and nothing below may stop the removal.
-      removeTaskFilesystems(filesystems);
+      await removeTaskFilesystemsAsync(filesystems);
       // Only a completed attempt's commit is published (its ledger entry is saved with `completed`); any other is dropped.
       // An unreadable row, or a drop that fails, keeps the ref: an unpublished commit in the runner's own repository is
       // never read, since nothing in the Store points at it.

@@ -2,7 +2,6 @@ import { createHash } from 'node:crypto';
 import { basename } from 'node:path';
 import { isDeepStrictEqual } from 'node:util';
 import { Store, type ReviewState, type SnippetReference } from './store.ts';
-import { WRITABLE_KINDS } from './lifecycle.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { execFileSync } from 'node:child_process';
@@ -32,9 +31,7 @@ export class ReviewService {
    * a reviewed branch in the user's repository (the demo, a planted experiment) carries them too.
    */
   reviewRepository(): { path: string; runnerOwned: boolean } {
-    const committed = this.store.getAttempts(this.config.identity).some(attempt => WRITABLE_KINDS.includes(attempt.kind)
-      && attempt.state === 'completed' && (attempt.result as { unchanged?: unknown } | null)?.unchanged === false);
-    if (!committed) return { path: this.config.repository, runnerOwned: false };
+    if (!this.store.hasRunnerCommit(this.config.identity)) return { path: this.config.repository, runnerOwned: false };
     if (!this.config.runnerRepository) throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
     return { path: this.config.runnerRepository, runnerOwned: true };
   }
