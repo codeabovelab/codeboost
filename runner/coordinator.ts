@@ -91,6 +91,11 @@ interface Job {
   decided?: boolean;
   /** A cancel task the Store recorded on a job that no longer takes stops; shown in status only. */
   cancelShown?: boolean;
+  /**
+   * A stop whose reason write is waiting for the caller's transaction (userAction) to commit. It already wins over a
+   * later stop, but the job's reason, its abort signal and D's handle change only on commit; a rollback drops it (#79).
+   */
+  pendingReason?: FirstReason;
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: UnresolvedReason }
@@ -171,34 +176,29 @@ export class RunnerCoordinator {
   stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale', cause?: string): boolean {
     const job = this.#jobs.get(identityKey(identity));
     if (!job || job.attemptId !== attemptId) return false;
-    const won = this.#requestStop(job, reason);
-    if (won && reason === 'stale' && cause !== undefined) job.staleCause = bounded(cause);
-    return won;
+    return this.#requestStop(job, reason, reason === 'stale' && cause !== undefined ? bounded(cause) : undefined);
   }
   /** Cancel task: the Store records the reason and the pending close; the coordinator stops the running work. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
     const job = this.#jobs.get(identityKey(identity));
     // The Store writes `cancelled` wherever the row has no reason yet, so save an earlier unsaved reason first. That write
     // bumps the state version, so it is made only when the caller's version is current, and the cancel then uses the new one.
+    // It counts as saved only once the caller's transaction commits.
     if (job?.firstReason && !job.reasonSaved) {
       try {
         if (this.#store.getTask(identity).stateVersion === expectedStateVersion
           && this.#store.recordFirstReason(job.identity, job.attemptId, job.firstReason)) {
-          job.reasonSaved = true; this.#confirmSaved(job);
+          this.#store.afterCommit(() => { job.reasonSaved = true; });
           expectedStateVersion = this.#store.getTask(identity).stateVersion;
         }
       } catch { /* still unsaved; the Store's own write below is likely to fail the same way */ }
     }
     const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
-    if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason) {
+    if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason && !job.pendingReason) {
       // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout).
-      // Status shows it, but it never becomes the job's reason: the write may roll back with the caller's transaction,
-      // and the terminal write reads the row's own reason anyway.
-      job.cancelShown = true;
-      queueMicrotask(() => {
-        try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== 'cancelled') job.cancelShown = false; }
-        catch { /* unreadable: keep showing what the Store reported */ }
-      });
+      // Status shows it once the write commits, but it never becomes the job's reason: the terminal write reads the
+      // row's own reason.
+      this.#store.afterCommit(() => { job.cancelShown = true; });
     }
     return outcome;
   }
@@ -225,33 +225,38 @@ export class RunnerCoordinator {
     await Promise.all(jobs.map(job => job.done));
   }
 
-  #requestStop(job: Job, reason: FirstReason): boolean {
+  /**
+   * Record the first reason, then set it on the job, abort preparation and cancel D. The write may be part of the
+   * caller's transaction (userAction), so the in-memory effect, which cannot be undone, waits for it to commit and is
+   * dropped if it rolls back, including when COMMIT fails (#79). A reason write that throws applies the stop at once,
+   * unsaved: the in-memory reason is then the source of truth ("Rules for the running state", rule 1).
+   */
+  #requestStop(job: Job, reason: FirstReason, staleCause?: string): boolean {
     // The attempt deadline passed before launch: it ends `failed` with no first reason, so a later stop cannot claim it.
     if (job.decided || (job.preparationTimedOut && !job.firstReason)) return false;
     if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
-    job.firstReason = reason;
-    try {
-      if (job.attemptId && !this.#write(() => this.#store.recordFirstReason(job.identity, job.attemptId, reason))) {
-        // Another writer (for example cancel task) recorded a reason first; adopt the durable one.
-        const durable = this.#store.getAttempt(job.identity, job.attemptId).firstReason;
-        if (durable) job.firstReason = durable;
-      }
-      job.reasonSaved = true; this.#confirmSaved(job);
-    } catch { job.reasonSaved = false; }
-    job.controller.abort(new Error(`Stopped: ${job.firstReason}`));
-    job.handle?.cancel(D_REASON[job.firstReason]);
+    // An earlier stop in the same transaction wins; its commit applies it.
+    if (job.pendingReason) return false;
+    const apply = (first: FirstReason, saved: boolean) => {
+      job.firstReason = first; job.reasonSaved = saved;
+      if (staleCause !== undefined) job.staleCause = staleCause;
+      job.controller.abort(new Error(`Stopped: ${first}`));
+      job.handle?.cancel(D_REASON[first]);
+    };
+    let changed: boolean;
+    try { changed = this.#write(() => this.#store.recordFirstReason(job.identity, job.attemptId, reason)); }
+    catch { apply(reason, false); return true; }
+    job.pendingReason = reason;
+    this.#store.afterCommit(() => {
+      job.pendingReason = undefined;
+      if (changed) return apply(reason, true);
+      // Another writer (for example cancel task) recorded a reason first; adopt the durable one. If it cannot be read,
+      // keep this stop's reason, shown as unsaved, as before #79.
+      let durable: FirstReason | null;
+      try { durable = this.#store.getAttempt(job.identity, job.attemptId).firstReason; } catch { return apply(reason, false); }
+      apply(durable ?? reason, true);
+    }, () => { job.pendingReason = undefined; });
     return true;
-  }
-  /**
-   * A reason write may be part of the caller's transaction (userAction) and roll back with it. Once that transaction
-   * has ended, check the row, so an undone write shows as unsaved and the next cancel task saves it again.
-   */
-  #confirmSaved(job: Job): void {
-    queueMicrotask(() => {
-      if (!job.firstReason || !job.reasonSaved) return;
-      try { if (this.#store.getAttempt(job.identity, job.attemptId).firstReason !== job.firstReason) job.reasonSaved = false; }
-      catch { /* unreadable: keep what the write reported */ }
-    });
   }
   /** Task budget and, before launch, the attempt deadline. D enforces the deadline once it runs. */
   #arm(job: Job, attempt: AttemptRecord): void {
