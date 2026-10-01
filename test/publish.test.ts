@@ -1,5 +1,5 @@
 import { existsSync } from 'node:fs';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
 import { OpeningUnsettled, PullRequestPublisher, type BranchPusher, type PublishConfig } from '../runner/publish.ts';
@@ -1403,6 +1403,10 @@ describe('GitHub PR adapter', () => {
     // Missing base or a non-string body: refused, not set aside as someone else's PR.
     await expect(list([{ ...response({ body: 'backport' }), base: {} }])).rejects.toThrow(/invalid pull request list/);
     await expect(list([response({ body: 7 })])).rejects.toThrow(/invalid pull request list/);
+    // A missing or impossible number, even on someone else's PR into another base.
+    const elsewhere = { ...response({ body: 'backport' }), base: { ...response().base, ref: 'release' } };
+    await expect(list([{ ...elsewhere, number: undefined }])).rejects.toThrow(/invalid pull request list/);
+    await expect(list([{ ...elsewhere, number: 0 }])).rejects.toThrow(/invalid pull request list/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([{ ...response(), base: {} }])).findOwned({ headBranch: input.headBranch, markers: [marker] })).rejects.toThrow(/invalid pull request list/);
   });
   it('reads a PR from the PR itself: state, branch, base and marker', async () => {
@@ -1593,11 +1597,13 @@ describe('shutdown and PRs left ready', () => {
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
     expect(store.getTask(identity).status).toBe('running');
   });
-  it('leaves the ready PR of an approved or in-review task alone, without asking GitHub', async () => {
-    for (const status of ['in review', 'approved but merge blocked'] as const) {
+  it('leaves the ready PR of an approved, in-review or merged task alone, without asking GitHub', async () => {
+    for (const status of ['in review', 'approved but merge blocked', 'merged'] as const) {
       const store = runningTask(), live = new Map<string, OpenedPullRequest>();
       await harness(store, { live }).publisher.publish(identity);
-      if (status !== 'in review') store.transitionTask(identity, store.getTask(identity).stateVersion, status);
+      // A real merge needs the whole merge flow; the publisher only reads the status, so it is reported as merged here.
+      if (status === 'merged') { const real = store.getTask.bind(store); vi.spyOn(store, 'getTask').mockImplementation(id => ({ ...real(id), status: 'merged' })); }
+      else if (status !== 'in review') store.transitionTask(identity, store.getTask(identity).stateVersion, status);
       const again = harness(store, { live });
       await expect(again.publisher.publish(identity)).rejects.toThrow(GuardRefusal);
       expect(again.log).toEqual([]);

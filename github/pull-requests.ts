@@ -180,11 +180,11 @@ export class GhPullRequestGateway implements PullRequestGateway {
     if (!Array.isArray(response)) throw new Error('GitHub returned an invalid pull request list.');
     // One page is read. A full page may hide more PRs from the branch on the next one, so it fails closed: this lookup
     // decides whether the branch is clear to push to.
-    if (response.length >= 100) throw new Error(`GitHub lists 100 or more open pull requests from ${headBranch}; codeboost cannot read them all.`);
+    if (response.length >= 100) throw new Error(`GitHub lists 100 or more open pull requests from ${headBranch}; codeboost cannot read them all. Close the ones that are not needed.`);
     // Every entry is validated before any is set aside as someone else's: a partial answer must not look like a clear branch.
     for (const entry of response) {
       const pr = entry as { number?: unknown; body?: unknown; base?: { ref?: unknown } } | null;
-      if (!pr || typeof pr !== 'object' || !Number.isSafeInteger(pr.number) || (pr.body !== null && typeof pr.body !== 'string') || typeof pr.base?.ref !== 'string')
+      if (!pr || typeof pr !== 'object' || !Number.isSafeInteger(pr.number) || (pr.number as number) < 1 || (pr.body !== null && typeof pr.body !== 'string') || typeof pr.base?.ref !== 'string')
         throw new Error('GitHub returned an invalid pull request list.');
     }
     return response;
