@@ -41,6 +41,7 @@ export type PublishOutcome =
   | { kind: 'no changes'; leftReady?: number };
 
 const marker = (openingId: string) => `<!-- codeboost:opening=${openingId} -->`;
+const ambiguous = (prs: readonly { number: number }[]) => `Pull requests ${prs.map(pr => `#${pr.number}`).join(', ')}`;
 /**
  * Tasks with a publish in progress, per Store, shared by every publisher over that Store. One publish per task at a
  * time, so an update is never cleared or overtaken while its GitHub calls run. The runner lock rules out a second process.
@@ -350,9 +351,13 @@ export class PullRequestPublisher {
       if (refreshing.repository.toLowerCase() !== this.#config.repository.toLowerCase()) throw new GuardRefusal('A pull request update is in flight in another repository.');
       // An observation in any base: recording what GitHub shows is safe wherever the PR is, and a refusal here would keep
       // the update in flight and stop the draft step below from running.
-      const [observed = null] = await this.#pulls.findOwned({ headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
+      const found = await this.#pulls.findOwned({ headBranch: refreshing.headBranch, markers: [marker(refreshing.openingId)] }, signal);
       signal?.throwIfAborted();
-      this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, observed);
+      // A marker is editable text: another PR carrying it (a copied description) makes the observation ambiguous, so the
+      // update stays in flight and a person decides, rather than GitHub's list order picking which PR is recorded.
+      if (found.length > 1 || (found.length === 1 && found[0]!.number !== refreshing.number))
+        throw new PullRequestMisplaced(`${ambiguous(found)} carry the first line of the task's pull request #${refreshing.number}. Close the copies or restore their first lines.`);
+      this.#store.settleUnconfirmedRefresh(identity, refreshing.openingId, found[0] ?? null);
     }
     // Read once: the settlements above are the only writes before this point.
     const prs = this.#store.taskPullRequests(identity);
@@ -363,7 +368,10 @@ export class PullRequestPublisher {
     // The task's own PRs in any base: the lost opening's PR is recorded wherever it is now (a person may have moved it).
     const owned = await this.#pulls.findOwned({ headBranch: lost.headBranch, markers: rows.map(row => marker(row.openingId)) }, signal);
     signal?.throwIfAborted();
-    const pr = owned.find(candidate => candidate.marker === marker(lost.openingId));
+    const mine = owned.filter(candidate => candidate.marker === marker(lost.openingId));
+    // Two PRs carrying the lost opening's marker (a copied description): which one it opened is unknown, so it stays owned.
+    if (mine.length > 1) throw new PullRequestMisplaced(`${ambiguous(mine)} carry the first line of a pull request the task was opening. Close the copies or restore their first lines.`);
+    const pr = mine[0];
     const blocking = pr ? undefined : owned.find(candidate => candidate.base === lost.base);
     if (blocking) {
       // Another of the task's openings has the open PR from this branch into the base this opening asked for, so this

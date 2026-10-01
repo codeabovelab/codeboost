@@ -39,7 +39,7 @@ const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>(
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number>; onRead?: () => void } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number>; onRead?: () => void; copies?: (OpenedPullRequest & { marker: string })[] } = {}) {
   const publishConfig = { ...config, ...options.config };
   // The task's branch, as the publisher names it (one task per harness).
   let publishBranch = '';
@@ -100,7 +100,9 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
       if (options.found !== undefined) return options.found ? [{ ...options.found, marker: input.markers.at(-1)!, base: publishConfig.baseBranch }] : [];
       return [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.moved?.has(pr.number) && !options.unmarked?.has(pr.number) && input.markers.includes(m))
-        .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch }));
+        .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch }))
+        // `copies`: other PRs whose description a person started with one of the task's markers.
+        .concat((options.copies ?? []).filter(copy => input.markers.includes(copy.marker)).map(copy => ({ ...copy, base: publishConfig.baseBranch })));
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
@@ -486,7 +488,7 @@ describe('guards found by the independent review', () => {
     expect(await publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 5, draft: false, status: 'running', leftReady: 5 });
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 5, headSha: oid(77) }]);
   });
-  it('does not take a different PR number as what GitHub shows for an unconfirmed update', async () => {
+  it('does not take a different PR number as what GitHub shows for an unconfirmed update: it refuses and keeps it in flight', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
@@ -494,8 +496,8 @@ describe('guards found by the independent review', () => {
     await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow('timeout');
     for (const [m, pr] of live) live.set(m, { ...pr, number: 999, draft: false, headSha: oid(8) });
     store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
-    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
-    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: null }]);
+    await expect(harness(store, { live, next }).publisher.publish(identity)).rejects.toThrow(/#999 carry the first line of the task's pull request #100/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: expect.anything() }]);
   });
   it('reports drafts unsupported when a lost draft opening cannot be turned back into a draft', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
@@ -2096,6 +2098,24 @@ describe('shutdown and PRs left ready', () => {
     const read = await reading.publisher.publish(identity, {}, controller.signal).catch(e => e);
     expect(read.message).toBe('cancelled');
     expect(reading.log.some(line => line.startsWith('draft') || line.startsWith('push'))).toBe(false);
+  });
+  it('fails closed when a copied marker makes recovery ambiguous, keeping the update or opening in flight', async () => {
+    const copy = (live: Map<string, OpenedPullRequest>) => { const [m, pr] = [...live][0]!; return { ...pr, number: 999, marker: m }; };
+    // A lost update, with a copy of its PR's first line on another PR: refused, the update stays in flight.
+    let store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    await expect(harness(store, { live, next, refreshFails: true }).publisher.publish(identity)).rejects.toThrow(/timeout/);
+    await expect(harness(store, { live, next, copies: [copy(live)] }).publisher.publish(identity)).rejects.toThrow(/#100, #999 carry the first line of the task's pull request #100/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: expect.anything() }]);
+    // Only the copy is visible: its number is not the recorded PR's, so nothing is settled from it.
+    await expect(harness(store, { live, next, hidden: new Set(live.keys()), copies: [copy(live)] }).publisher.publish(identity)).rejects.toThrow(/#999 carry/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: expect.anything() }]);
+    // A lost opening with two PRs carrying its marker: it stays owned.
+    store = runningTask(); live = new Map(); next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    await expect(harness(store, { live, next, copies: [copy(live)] }).publisher.publish(identity)).rejects.toThrow(/#100, #999 carry the first line of a pull request the task was opening/);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opening' }]);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
