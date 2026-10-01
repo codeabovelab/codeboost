@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store, mergeActionResponse } from '../runner/store.ts';
 import { ActionIdReused, GuardRefusal, classifySettlement, requestHash } from '../runner/lifecycle.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -13,7 +13,7 @@ const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a', ki
 const plan = (summary = 'Example'): Plan => ({ schema_version: 1, revision: 1, issue: 1, summary, questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 const dirs: string[] = [], stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function open(path: string) { const store = new Store(path); stores.push(store); return store; }
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-lifecycle-')); dirs.push(dir);
@@ -529,5 +529,93 @@ describe('runner commits and preparation groups (#87)', () => {
     store.recordPreparationGroup(identity, attempt.id, 4343);
     expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4343, preparationStartedAt: 41_000 });
     expect(() => store.recordPreparationGroup(identity, attempt.id, 4444, 1.5)).toThrow('start time');
+  });
+});
+
+describe('after commit (#79)', () => {
+  it('runs at once outside a transaction, after the outermost commit inside one, and drops the callback on rollback', () => {
+    const { store } = queued();
+    const calls: string[] = [];
+    store.afterCommit(() => calls.push('outside'));
+    expect(calls).toEqual(['outside']);
+    store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => {
+      store.afterCommit(() => calls.push('first'), () => calls.push('first rolled back'));
+      store.afterCommit(() => calls.push('second'));
+      expect(calls).toEqual(['outside']);
+    });
+    expect(calls).toEqual(['outside', 'first', 'second']);
+    expect(() => store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => {
+      store.afterCommit(() => calls.push('dropped'), () => calls.push('rolled back'));
+      throw new Error('commit failed');
+    })).toThrow(/commit failed/);
+    expect(calls).toEqual(['outside', 'first', 'second', 'rolled back']);
+  });
+  it('keeps a committed action committed when a callback throws, and still runs the later callbacks', () => {
+    const { store } = queued();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let ran = false;
+    const actionId = randomUUID();
+    const outcome = store.userAction(identity, { actionId, kind: 'note', request: {} }, () => {
+      store.afterCommit(() => { throw new Error('callback failed'); });
+      store.afterCommit(() => { ran = true; });
+      return 'done';
+    });
+    expect(outcome).toEqual({ response: 'done', replayed: false });
+    expect(ran).toBe(true);
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(store.savedAction(identity, { actionId, kind: 'note', request: {} })).toEqual({ response: 'done', replayed: true });
+  });
+  it('drops the callback and runs the rollback one when COMMIT itself fails', () => {
+    const { store } = queued();
+    const exec = DatabaseSync.prototype.exec;
+    vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql === 'COMMIT') throw Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR' });
+      return exec.call(this, sql);
+    });
+    const calls: string[] = [], actionId = randomUUID();
+    expect(() => store.userAction(identity, { actionId, kind: 'note', request: {} }, () => {
+      store.afterCommit(() => calls.push('committed'), () => calls.push('rolled back'));
+    })).toThrow(/disk I\/O error/);
+    expect(calls).toEqual(['rolled back']);
+    expect(store.savedAction(identity, { actionId, kind: 'note', request: {} })).toBeUndefined();
+  });
+  it('reports the COMMIT error, not a failed ROLLBACK, when SQLite already rolled back', () => {
+    const { store } = queued();
+    const exec = DatabaseSync.prototype.exec;
+    vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql !== 'COMMIT') return exec.call(this, sql);
+      exec.call(this, 'ROLLBACK');
+      throw Object.assign(new Error('database or disk is full'), { code: 'ERR_SQLITE_ERROR' });
+    });
+    expect(() => store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => 'done')).toThrow(/disk is full/);
+  });
+  it('refuses later writes once SQLite rolled back the transaction on its own, so nothing autocommits', () => {
+    const { store } = queued(); const attempt = admit(store);
+    const prepare = DatabaseSync.prototype.prepare;
+    let failed = false;
+    vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (failed || !sql.startsWith('UPDATE attempts SET first_reason')) return prepare.call(this, sql);
+      failed = true;
+      return { run: () => { this.exec('ROLLBACK'); throw Object.assign(new Error('database or disk is full'), { code: 'ERR_SQLITE_ERROR' }); } } as unknown as ReturnType<typeof prepare>;
+    });
+    const actionId = randomUUID(), committed: string[] = [];
+    expect(() => store.userAction(identity, { actionId, kind: 'cancel-task', request: {} }, () => {
+      try { store.recordFirstReason(identity, attempt.id, 'cancelled'); } catch { /* the caller carries on, as the coordinator does */ }
+      store.afterCommit(() => committed.push('stop'));
+      return store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    })).toThrow(/rolled back the transaction/);
+    expect(committed).toEqual([]);
+    expect(store.savedAction(identity, { actionId, kind: 'cancel-task', request: {} })).toBeUndefined();
+    expect(store.getAttempt(identity, attempt.id).firstReason).toBeNull();
+    expect(store.getTask(identity).cancelRequested).toBeNull();
+  });
+  it('lets a throw outside a transaction reach the caller, and runs a callback registered by a commit callback', () => {
+    const { store } = queued();
+    expect(() => store.afterCommit(() => { throw new Error('cancel failed'); })).toThrow(/cancel failed/);
+    const calls: string[] = [];
+    store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => {
+      store.afterCommit(() => { calls.push('outer'); store.afterCommit(() => calls.push('inner')); });
+    });
+    expect(calls).toEqual(['outer', 'inner']);
   });
 });
