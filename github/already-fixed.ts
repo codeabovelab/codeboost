@@ -92,9 +92,10 @@ const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 export function mentionsIssue(message: string, repository: string, issue: number): boolean {
   const n = String(issue), repo = escape(repository);
   return new RegExp(`(?<![\\w/.#-])#${n}(?!\\w)`).test(message)
-    || new RegExp(`(?<![\\w-])GH-${n}(?!\\w)`, 'i').test(message)
-    || new RegExp(`(?<![\\w.-])${repo}#${n}(?!\\w)`, 'i').test(message)
-    || new RegExp(`(?<![\\w.-])(?:https?://)?(?:www\\.)?github\\.com/${repo}/issues/${n}(?![\\w])`, 'i').test(message);
+    // No form may start inside a URL path or a longer path-like token (`example.com/GH-12`, `x.com/github.com/...`).
+    || new RegExp(`(?<![\\w/.-])GH-${n}(?!\\w)`, 'i').test(message)
+    || new RegExp(`(?<![\\w/.-])${repo}#${n}(?!\\w)`, 'i').test(message)
+    || new RegExp(`(?<![\\w/.-])(?:https?://)?(?:www\\.)?github\\.com/${repo}/issues/${n}(?![\\w])`, 'i').test(message);
 }
 
 export interface GhAlreadyFixedConfig { repository: string; deadlineMs?: number }
