@@ -1,6 +1,6 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { CHECK_KILL_GRACE_MS, CHECK_PIPE_GRACE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway } from './already-fixed.ts';
+import { CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway } from './already-fixed.ts';
 
 const runFile = promisify(execFile);
 
@@ -55,10 +55,8 @@ export interface GhMergeConfig {
   method?: 'merge' | 'squash' | 'rebase';
 }
 
+type BranchRules = Pick<RemoteMergeState, 'rulesKnown' | 'atomicBaseGuard' | 'mergeQueue' | 'requiredChecks'>;
 export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
-
-/** How long before an inspection's deadline the already-fixed check stops: both grace periods, plus a margin. */
-export const CHECK_SETTLE_MS = CHECK_KILL_GRACE_MS + CHECK_PIPE_GRACE_MS + 250;
 
 function confirmedMergeRefusal(message: string): boolean {
   return /required (?:approving )?review|required status check|branch protection|merge conflict|not mergeable|head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|pull request.*(?:closed|draft)|merge method.*not allowed/i.test(message);
@@ -92,7 +90,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
     if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
-    if (checks?.repository !== undefined && checks.repository.toLowerCase() !== config.repository.toLowerCase()) throw new Error('The already-fixed check must read the merge repository.');
+    if (checks && checks.repository?.toLowerCase() !== config.repository.toLowerCase()) throw new Error('The already-fixed check must name and read the merge repository.');
     this.config = config;
     this.checks = checks ?? new GhAlreadyFixedGateway({ repository: config.repository }, run);
     this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
@@ -136,7 +134,26 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url'], signal) as Record<string, unknown>;
     if (typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || !['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !['MERGEABLE','CONFLICTING','UNKNOWN'].includes(String(pr.mergeable)) || !Array.isArray(pr.statusCheckRollup))
       throw new Error('GitHub returned an incomplete pull request state.');
-    const branch = encodeURIComponent(pr.baseRefName);
+    const base = fullSha(pr.baseRefOid, 'base SHA'), head = fullSha(pr.headRefOid, 'head SHA');
+    // The already-fixed check needs only the PR's base, so it runs alongside the rule reads. If those fail, the check is
+    // stopped; it is awaited on every path, so no `gh` process it started outlives the inspection.
+    const failed = new AbortController();
+    const alreadyFixed = this.#alreadyFixed(pr.baseRefName, base, deadlineAt, signal ? AbortSignal.any([signal, failed.signal]) : failed.signal);
+    alreadyFixed.catch(() => {});
+    let rules: BranchRules;
+    try { rules = await this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, signal); }
+    catch (error) { failed.abort(error); await alreadyFixed.catch(() => {}); throw error; }
+    return {
+      base, head,
+      pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
+      ...rules, alreadyFixed: await alreadyFixed,
+      ...(typeof pr.url === 'string' && pr.url.length <= 2048 && /^https:\/\//.test(pr.url) ? { url: pr.url } : {}),
+    };
+  }
+
+  /** The effective branch rules and the state of each required check on the PR. */
+  async #rules(baseRefName: string, observed: Array<Record<string, unknown>>, signal?: AbortSignal): Promise<BranchRules> {
+    const branch = encodeURIComponent(baseRefName);
     let rulesKnown = true;
     let rules: unknown[] = [];
     let classic: unknown | null = null;
@@ -202,7 +219,6 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         }
       }
     }
-    const observed = pr.statusCheckRollup as Array<Record<string, unknown>>;
     const requiredChecks = [...requirements.values()].map(required => {
       const match = observed.find(check => {
         const context = typeof check.name === 'string' ? check.name : check.context;
@@ -223,13 +239,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       }
       return { ...required, state };
     });
-    const base = fullSha(pr.baseRefOid, 'base SHA');
-    return {
-      base, head: fullSha(pr.headRefOid, 'head SHA'),
-      pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
-      rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks, alreadyFixed: await this.#alreadyFixed(pr.baseRefName, base, deadlineAt, signal),
-      ...(typeof pr.url === 'string' && pr.url.length <= 2048 && /^https:\/\//.test(pr.url) ? { url: pr.url } : {}),
-    };
+    return { rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks };
   }
 
   async inspect(options: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RemoteMergeState> {

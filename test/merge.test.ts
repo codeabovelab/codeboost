@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
-import { CHECK_SETTLE_MS, GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
+import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
 import { Store, mergeActionResponse } from '../runner/store.ts';
-import { CHECK_KILL_GRACE_MS, CHECK_PIPE_GRACE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
+import { CHECK_KILL_GRACE_MS, CHECK_PIPE_GRACE_MS, CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -98,6 +98,18 @@ it.each([
   const view = readyView(), service = serviceFor(view);
   const status = await new MergeCoordinator(service, gateway([remote(view, change(view))])).status(view);
   expect(status.blockers.map(blocker => blocker.code)).toContain(code);
+});
+
+it('does not report the issue as already fixed by another change once this PR has merged', async () => {
+  const view = readyView();
+  for (const alreadyFixed of ['found', 'unknown'] as const) {
+    const merged = await new MergeCoordinator(serviceFor(view), gateway([remote(view, { pullRequestState: 'MERGED', alreadyFixed })])).status(view);
+    expect(merged.blockers.map(blocker => blocker.code)).toEqual(['pr-state']);
+    const open = await new MergeCoordinator(serviceFor(view), gateway([remote(view, { alreadyFixed })])).status(view);
+    expect(open.blockers.map(blocker => blocker.code)).toEqual(['already-fixed']);
+  }
+  const found = await new MergeCoordinator(serviceFor(view), gateway([remote(view, { alreadyFixed: 'found' })])).status(view);
+  expect(found.blockers[0]!.message).toMatch(/closed.*pull request refers to it.*commit mentions it/);
 });
 
 it('blocks command acceptance that has no current passing runner result', async () => {
@@ -1288,13 +1300,14 @@ it('gives an injected check the merge inputs and fails closed on an unknown outc
   expect((await client.inspect({ fresh: true })).alreadyFixed).toBe('unknown');
   expect((await client.inspect({ fresh: true })).alreadyFixed).toBe('unknown');
   expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, { ...checks, repository: 'other/repo' })).toThrow(/merge repository/);
+  expect(() => new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, { check: checks.check })).toThrow(/merge repository/);
 });
 
 it('keeps the caller cancellation when the merge check is aborted', async () => {
   const controller = new AbortController();
   let started!: () => void;
   const checking = new Promise<void>(resolve => { started = resolve; });
-  const checks: AlreadyFixedGateway = { check: (_input, signal) => new Promise((_resolve, reject) => {
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => new Promise((_resolve, reject) => {
     started(); signal?.addEventListener('abort', () => reject(new Error('generic runner abort')), { once: true });
   }) };
   const run = async (args: readonly string[]) => {
@@ -1316,7 +1329,7 @@ it('stops the merge check early enough for its processes to settle before the in
     let checkSignal: AbortSignal | undefined;
     const settle = CHECK_KILL_GRACE_MS + CHECK_PIPE_GRACE_MS;
     // Like the real runner, the check settles only after both grace periods once it is aborted.
-    const checks: AlreadyFixedGateway = { check: (_input, signal) => new Promise((_resolve, reject) => {
+    const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => new Promise((_resolve, reject) => {
       checkSignal = signal;
       signal?.addEventListener('abort', () => setTimeout(() => reject(new Error('aborted')), settle), { once: true });
     }) };
@@ -1346,6 +1359,29 @@ it('gives the default merge check its own hardened runner, or the injected one',
   expect((plain.checks as GhAlreadyFixedGateway).run).not.toBe(plain.run);
   const run = async () => '';
   expect((new GhMergeGateway(config, run).checks as GhAlreadyFixedGateway).run).toBe(run);
+});
+
+it('starts the merge check alongside the rule reads, and stops and awaits it when they fail', async () => {
+  let checkStarted!: () => void, checkSignal: AbortSignal | undefined, checkSettled = false;
+  const started = new Promise<void>(resolve => { checkStarted = resolve; });
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => new Promise((_resolve, reject) => {
+    checkSignal = signal; checkStarted();
+    signal?.addEventListener('abort', () => setTimeout(() => { checkSettled = true; reject(new Error('aborted')); }, 20), { once: true });
+  }) };
+  const rollup: unknown[] = [];
+  const run = async (args: readonly string[]) => {
+    const joined = args.join(' ');
+    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: rollup });
+    // The rule read answers only once the check has started: run one after the other, this inspection would hang.
+    if (joined.includes('/rules/branches/')) { await started; return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: null }] } }]]); }
+    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
+    return JSON.stringify({ protected: false });
+  };
+  // A null rollup entry makes the required-check matching throw after the rule reads.
+  rollup.push(null);
+  await expect(new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks).inspect({ fresh: true })).rejects.toThrow(TypeError);
+  expect(checkSignal?.aborted).toBe(true);
+  expect(checkSettled).toBe(true);
 });
 
 it('does not let an inspection started before merge repopulate the cache', async () => {
