@@ -2,7 +2,7 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
-import { GhMergeGateway, MERGE_KILL_GRACE_MS, MERGE_PIPE_GRACE_MS, type RunGh } from '../github/merge.ts';
+import { GhMergeGateway, MERGE_INSPECTION_TIMEOUT_MS, MERGE_KILL_GRACE_MS, MERGE_PIPE_GRACE_MS, type RunGh } from '../github/merge.ts';
 import { GhIssueGateway, ISSUE_KILL_GRACE_MS, ISSUE_PIPE_GRACE_MS } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
@@ -67,6 +67,8 @@ describe('gh stop waits', () => {
     // A merge click admitted just before shutdown must also settle inside the shutdown drain.
     expect(MERGE_OPERATION_TIMEOUT_MS + MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS).toBeLessThan(MAX_SHUTDOWN_DRAIN_MS);
     expect(MAX_SHUTDOWN_DRAIN_MS).toBeLessThan(15_000);
+    // A merge-state or queue inspection, including the polls a browser makes.
+    expect(MERGE_INSPECTION_TIMEOUT_MS + MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS).toBeLessThan(15_000);
     expect(REFRESH_TIMEOUT_MS + ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS).toBeLessThan(15_000);
   });
 });
