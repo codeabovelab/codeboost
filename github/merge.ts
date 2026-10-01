@@ -1,7 +1,7 @@
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import { CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
-import { REPOSITORY } from './validate.ts';
+import { REPOSITORY, SHA } from './validate.ts';
 
 const runFile = promisify(execFile);
 
@@ -143,8 +143,10 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       // An answer that arrives after the check was stopped is not used. (One after a caller's abort is refused by the
       // inspection itself, once the rule reads have ended.)
       if (stop.signal.aborted) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' };
-      if (result.outcome === 'clear') return { alreadyFixed: 'clear' };
-      if (result.outcome === 'found' && Array.isArray(result.matches) && result.matches.length) return { alreadyFixed: 'found', alreadyFixedDetail: describeMatches(result.matches) };
+      // `clear` removes this blocker, so a clear or found answer without its base head is malformed and counts as unknown.
+      const based = (result.outcome === 'clear' || result.outcome === 'found') && typeof result.baseHead === 'string' && SHA.test(result.baseHead);
+      if (based && result.outcome === 'clear') return { alreadyFixed: 'clear' };
+      if (based && result.outcome === 'found' && Array.isArray(result.matches) && result.matches.length) return { alreadyFixed: 'found', alreadyFixedDetail: describeMatches(result.matches) };
       return { alreadyFixed: 'unknown', alreadyFixedDetail: result.outcome === 'unknown' && typeof result.reason === 'string' ? result.reason.slice(0, 300) : 'The check returned an invalid result.' };
     } catch (error) {
       if (signal?.aborted) throw error;

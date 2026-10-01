@@ -1452,6 +1452,15 @@ it('does not start the merge check when no time is left for its processes to set
   } finally { vi.useRealTimers(); }
 });
 
+it('fails the merge check closed on a clear or found answer without a valid base head', async () => {
+  const answers: unknown[] = [{ outcome: 'clear' }, { outcome: 'clear', baseHead: 'main' }, { outcome: 'found', matches: [{ kind: 'commit', sha: sha('c'), subject: 'x' }] }, { outcome: 'clear', baseHead: sha('9') }];
+  const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: async () => answers.shift() as AlreadyFixedResult };
+  const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => mergeReads(args), checks);
+  for (let index = 0; index < 3; index++)
+    expect(await client.inspect({ fresh: true })).toMatchObject({ alreadyFixed: 'unknown', alreadyFixedDetail: 'The check returned an invalid result.' });
+  expect((await client.inspect({ fresh: true })).alreadyFixed).toBe('clear');
+});
+
 it('does not let an inspection started before merge repopulate the cache', async () => {
   let pullReads = 0, releaseTimeline!: (value: string) => void, markTimelineStarted!: () => void;
   const timelineStarted = new Promise<void>(resolve => { markTimelineStarted = resolve; });
