@@ -85,7 +85,9 @@ it('recovers its own owner once per process, before the first question, even wit
   } finally { await worker.close(); }
 });
 
-it('recovers only its own review when two reviews share one Docker daemon', async () => {
+// Wiring only: each review's own owner reaches its recovery and its questions. The real-Docker test in
+// agent-question.test.ts proves that recovery then touches only that owner's objects.
+it('gives each of two reviews on one daemon its own owner, for recovery and for questions', async () => {
   const other = 'b'.repeat(32);
   const first = stubWorker(new LeftoverLedger(ledgerPath()));
   const second = stubWorker(new LeftoverLedger(ledgerPath()), { owner: other });

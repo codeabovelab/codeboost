@@ -270,6 +270,22 @@ describe('recoverLeftovers', () => {
     expect(names()).not.toContain(mine.objects[4]!.name);
   });
 
+  it('with { unowned: false }, never lists or inspects objects of other runners, so they cannot fail it (#65)', async () => {
+    const mine = attempt(A, 'attempt-a'), theirs = attempt(B, 'attempt-b');
+    const legacy: FakeObject = { kind: 'container', id: id(), name: 'codeboost-agent-old', labels: { 'io.codeboost.invocation': 'old' } };
+    daemon.objects.push(legacy);
+    // Inspecting any of these would fail the recovery closed.
+    for (const object of [...theirs.objects, legacy]) daemon.brokenInspect.add(object.id || object.name);
+    const report = await recoverLeftovers(A, 120_000, { unowned: false });
+    expect(report.storage).toHaveLength(1);
+    expect(report.removed).toHaveLength(4);
+    expect(report.unowned).toEqual([]);
+    expect(names()).not.toContain(mine.objects[4]!.name);
+    for (const call of daemon.calls.filter(args => args[0] === 'ps' || args[1] === 'ls'))
+      expect(call[call.indexOf('--filter') + 1]).toBe(`label=io.codeboost.runner=${A}`);
+    await expect(recoverLeftovers(A)).rejects.toThrow();
+  });
+
   it('still fails closed when an inspect fails for a reason other than the object being gone', async () => {
     const theirs = attempt(B, 'attempt-b');
     daemon.brokenInspect.add(theirs.objects[3]!.id!);

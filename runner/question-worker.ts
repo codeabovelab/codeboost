@@ -17,7 +17,8 @@ export type WorkerReply = { id: string; attemptId: string; ok: true; text: strin
 export type ReleaseReply = { id: string; remaining: number };
 /** Reply to `recover`: `error` is the reason Ask stays off; without it, recovery finished. */
 export type RecoverReply = { id: string; recovery: 'done' | 'failed'; error?: string };
-// Bounds lane D's recovery, which otherwise allows two minutes; the first question waits for it.
+// Bounds lane D's recovery, which otherwise allows two minutes; the first question waits for it. Recovery skips
+// the daemon-wide search for objects without an owner, so other reviews' objects never reach it (#65).
 const RECOVERY_TIMEOUT_MS = 60_000;
 
 // This worker's environment is an allowlist without credentials; the credential variables arrive as data and go
@@ -28,7 +29,7 @@ const deps: ContainerDependencies = {
   createClone: createTaskClone,
   prepareFilesystems: prepareTaskFilesystems,
   removeFilesystems: removeTaskFilesystems,
-  recover: runnerOwner => recoverLeftovers(runnerOwner, RECOVERY_TIMEOUT_MS),
+  recover: runnerOwner => recoverLeftovers(runnerOwner, RECOVERY_TIMEOUT_MS, { unowned: false }),
   measureRepository: measureGitRepository,
   capture: input => captureInvocation(input),
   startClaude: startClaudeInvocation,

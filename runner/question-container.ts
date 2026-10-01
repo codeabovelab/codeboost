@@ -253,8 +253,9 @@ const MAX_LISTED = 20;
  * valid only in the thread that recovered them. Ask only reads, so recovered storage is removed, never exported;
  * storage whose removal is not confirmed is retained, which keeps Ask off until it is removed.
  *
- * Objects without an owner label come from builds before runner labels and may belong to any review on this daemon,
- * so they neither block Ask nor are touched. Objects carrying this owner that recovery cannot identify keep Ask off.
+ * Recovery is asked not to look for objects without an owner label: they come from builds before runner labels and
+ * may belong to any review on this daemon, so they neither block Ask nor are touched. Objects carrying this owner that
+ * recovery cannot identify keep Ask off.
  */
 export async function recoverQuestionStorage(runnerOwner: string, deps: Pick<ContainerDependencies, 'recover' | 'removeFilesystems'>,
   retained: RetainedStorage): Promise<void> {

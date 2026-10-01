@@ -230,9 +230,10 @@ Ask keeps the contract's identity and cleanup rules:
   worker runs recovery. Recovery runs even without a record, because a process killed early leaves no record.
   It is single-flight: concurrent first questions share it.
 - Recovery touches nothing that carries another owner. Another review on the same Docker daemon, with live
-  questions or with leftovers of its own, does not block Ask and is not changed by it. Objects without an owner
-  label come from builds before #51 item 3 and could belong to any review, so Ask neither removes them nor refuses
-  because of them. This differs from the runner, whose startup recovery refuses to admit work while any exist
+  questions or with leftovers of its own, does not block Ask and is not changed by it. Ask calls recovery with
+  `{ unowned: false }`, so D does not list or inspect other owners' objects at all, and their number or a failed
+  inspect of one cannot make Ask's recovery fail. Objects without an owner label come from builds before #51 item 3
+  and could belong to any review, so Ask neither removes them nor refuses because of them. This differs from the runner, whose startup recovery refuses to admit work while any exist
   (`runner-lifecycle.md`, "Unowned resources"): Ask only reads, and refusing would bring back the cross-review block
   that #65 removes.
 - Ask stays off when recovery rejects (Docker unreachable, a removal not confirmed, the 60-second limit), and when an

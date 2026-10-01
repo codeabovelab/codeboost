@@ -216,9 +216,9 @@ export class LeftoverLedger {
   static forDatabase(database: string): LeftoverLedger {
     const canonical = realpathSync(database);
     const ledger = new LeftoverLedger(`${canonical}.ask-leftovers.json`);
-    const identity = statSync(canonical);
-    const exact = statSync(canonical, { bigint: true });
-    ledger.identity = { dev: exact.dev, ino: exact.ino };
+    // One stat for the lock path, the hard-link check and the owner identity, so all three name the same file.
+    const identity = statSync(canonical, { bigint: true });
+    ledger.identity = { dev: identity.dev, ino: identity.ino };
     // The lock only excludes, so it may live in the temp directory; keyed by device and inode, every spelling and
     // every later name of this database file (including an atomic rename while a server runs) finds the same lock.
     ledger.lockPath = join(lockDirectoryPath(), `codeboost-asklock-${identity.dev}-${identity.ino}.sqlite`);

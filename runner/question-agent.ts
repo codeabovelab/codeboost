@@ -172,10 +172,11 @@ export class QuestionWorker {
     try { await Promise.race([scan, aborted]); }
     finally { signal.removeEventListener('abort', release); }
   }
-  /** Lane D's recovery for this owner, run in the worker that will own the recovered handles. */
+  /**
+   * Lane D's recovery for this owner, run in the worker that will own the recovered handles. Only the startup check
+   * calls it, before `scanned` admits any question: D's recovery removes every agent container of this owner.
+   */
   #recover(worker: Worker, runnerOwner: string) {
-    // Only before the first question: D's recovery removes every agent container of this owner.
-    if (this.pending.size) return Promise.reject(new Error('Recovery must run before any question starts.'));
     return new Promise<void>((resolve, reject) => {
       const id = randomUUID();
       this.recoveries.set(id, error => error ? reject(error) : resolve());
