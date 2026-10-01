@@ -33,6 +33,8 @@ The check matches when any of these is true:
 | Another open or merged PR links to the issue. | Cross-reference events that would close the issue (`willCloseTarget`: a closing keyword such as `Fixes #12`). GitHub closes issues only from PRs into the default branch, so `willCloseTarget` is false for every PR into another branch; when the task's base is not the default branch, a PR in this repository into that same base that references the issue counts too (decided 2026-09-30). Manual links: "connected" and "disconnected" events replayed in order. Both sides of a manual link are read, because which side GitHub reports as the subject depends on where the link was made; the linked PR is the side that is a PR, and a link between two PRs or to an unknown type makes the check `unknown`. | The task's own open PRs, matched by repository and number (its own merged PR is a match). Closed, unmerged PRs. A manual link whose latest event is a disconnect. A PR that only mentions the issue, in this repository or another (decided 2026-09-30: on cli/cli a third of open issues had such mentions, mostly merged PRs in unrelated repositories). |
 | A new commit on the base branch mentions the issue. | The commits from the task's base to the current base branch head. | Own commits. `#123` when the issue is `#12`. `other/repo#12`. A token inside a URL path or a longer path-like token (`https://example.com/GH-12`, `mirror/owner/repo#12`). |
 
+The pre-merge check (`GhMergeGateway`, see `guarded-merge.md`) runs this same check, with the task's PR as its only own PR and the PR's base commit as the task base.
+
 A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue URL. A PR in another repository that would close the issue, or is linked manually, counts as a match. It is not excluded by number, because its number belongs to another repository. GitHub turns `willCloseTarget` false once the issue is closed, so a merged PR that closed the issue is reported through the closed state instead.
 
 An abandoned opening's PR has no recorded number, so the check cannot exclude it by number. The main path looks the branch up first and adds a visible PR's number to the own PRs. If GitHub's PR list still does not show that PR after the 10-minute settle time but the issue timeline already does, the check counts the task's own PR as another PR, and the task moves to possibly already fixed. That fails closed: a person sees the PR and continues.
@@ -123,7 +125,6 @@ Some repositories do not support draft PRs (for example private repositories on 
 - **Push.** `BranchPusher` is injected. The real push needs the runner's commits in a runner-owned host repository, fetched from the bundles `commitTaskChanges` returns (#66, #87).
 - **Continue from possibly already fixed.** The Continue and Cancel actions are user actions for a later slice.
 - **Close the draft on cancel.** The design closes the draft PR when a person cancels a needs-human task. The PR record is kept for that.
-- **The pre-merge check.** `GhMergeGateway` keeps its own check for now. F6 moves it onto this module. The merge check treats a PR in another repository as `unknown`; this check treats it as a match.
 
 ## Tests
 
