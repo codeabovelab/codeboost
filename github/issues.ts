@@ -1,8 +1,6 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
 import { ghEnvironment } from './gh-env.ts';
+import { runWithInput } from './run-with-input.ts';
 
-const runFile = promisify(execFile);
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
@@ -154,11 +152,11 @@ export class GhIssueGateway implements IssueGateway {
   constructor(repository: string, run?: RunGh, now: () => Date = () => new Date()) {
     if (!repositoryName(repository)) throw new Error('A GitHub repository is required for issue retrieval.');
     this.repository = repository;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], {
+    this.run = run ?? ((args, options) => runWithInput('gh', args, {
       maxBuffer: ISSUE_PAGE_MAX_BYTES,
       signal: options?.signal,
       env: ghEnvironment(),
-    })).stdout);
+    }));
     this.now = now;
   }
 

@@ -1,4 +1,4 @@
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
@@ -51,4 +51,37 @@ describe('default gh runners', () => {
     for (const [name, value] of Object.entries(ghEnvironment({}))) expect(lines).toContain(`${name}=${value}`);
     expect(lines.some(line => line.startsWith('CODEBOOST_UNRELATED_SECRET='))).toBe(false);
   });
+});
+
+describe('default gh runners stop a gh that ignores SIGTERM', () => {
+  let dir = '';
+  const saved = process.env.PATH;
+  beforeAll(() => {
+    // A `gh` first on PATH that ignores SIGTERM and never exits on its own. Once SIGTERM is ignored it writes its
+    // process ID to `ready`, so the test does not abort before then (an early SIGTERM would still stop it).
+    dir = mkdtempSync(join(tmpdir(), 'codeboost-gh-stuck-'));
+    writeFileSync(join(dir, 'gh'), `#!/bin/sh\ntrap '' TERM\necho $$ > '${join(dir, 'ready.tmp')}'\nmv '${join(dir, 'ready.tmp')}' '${join(dir, 'ready')}'\nwhile :; do sleep 1; done\n`);
+    chmodSync(join(dir, 'gh'), 0o755);
+    process.env.PATH = `${dir}:${saved ?? ''}`;
+  });
+  afterAll(() => {
+    if (saved === undefined) delete process.env.PATH; else process.env.PATH = saved;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  // A cancelled `gh pr merge` must not go on to merge after the caller was told it stopped.
+  it.each(defaultRunners)('%s: an abort settles the call only after gh has exited', async (_name, runner) => {
+    rmSync(join(dir, 'ready'), { force: true });
+    const controller = new AbortController();
+    const call = runner()(['api', 'user'], { signal: controller.signal });
+    while (!existsSync(join(dir, 'ready'))) await new Promise(resolve => setTimeout(resolve, 10));
+    const pid = Number(readFileSync(join(dir, 'ready'), 'utf8'));
+    controller.abort(new Error('stop'));
+    try {
+      await expect(call).rejects.toThrow();
+      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    } finally {
+      try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+    }
+  }, 15_000);
 });
