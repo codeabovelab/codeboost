@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDemo } from '../scripts/demo.ts';
@@ -134,4 +134,11 @@ it('refuses a review database that already names Codex, recording a failed answe
  await vi.waitFor(()=>expect(service.store.getReviewNotes(service.config.identity).at(-1)?.answer?.status).toBe('failed'));
  expect(service.store.getReviewNotes(service.config.identity).at(-1)?.answer?.error).toBe(CODEX_QUESTIONS_REFUSED);
  expect(acquire).not.toHaveBeenCalled();
+});
+it('labels Ask objects with the database Ask owner, never the runner owner (#65)',()=>{
+ const service=fixture(),manager=new Questions(service,async()=>'Answer');managers.push(manager);
+ const file=statSync(realpathSync(service.config.database),{bigint:true});
+ const owner=(manager as unknown as {worker:{owner:()=>string}}).worker.owner();
+ expect(owner).toBe(service.store.askOwnerToken(file));
+ expect(owner).not.toBe(service.store.runnerOwnerToken(file));
 });

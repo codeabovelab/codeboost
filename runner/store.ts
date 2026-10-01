@@ -59,6 +59,11 @@ export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
   firstReason: FirstReason | null; stopReason: StopReason | null; exitCode: number | null; signal: string | null; result: unknown;
   diagnostic: string | null; diagnosticRef: string | null; createdAt: string; startedAt: string | null; settledAt: string | null;
+  /**
+   * The runner's own audit found a safety violation (#87 item 3): its text, kept whatever outcome the attempt settled
+   * with. The terminal write (or startup recovery) acted on it: the task went to needs human, unless it was closed.
+   */
+  safetyFinding: string | null;
 }
 export type FeedbackKind = 'reject' | 'change-request' | 'segment-accept' | 'segment-assign' | 'finding-accept' | 'needs-human-guidance' | 'task-closed';
 const FEEDBACK_KINDS: readonly FeedbackKind[] = ['reject', 'change-request', 'segment-accept', 'segment-assign', 'finding-accept', 'needs-human-guidance', 'task-closed'];
@@ -91,8 +96,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 7) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 8) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -122,6 +127,13 @@ export class Store {
           PRAGMA user_version=5;`);
         if (version < 6) this.#migrateV6();
         if (version < 7) this.#migrateV7();
+        // A safety finding outlives the process that found it (#87 item 3).
+        // Idempotent, like the v7 tables: a database moved back to an older version keeps the column.
+        if (version < 8) {
+          if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'safety_finding'))
+            this.#db.exec('ALTER TABLE attempts ADD COLUMN safety_finding TEXT');
+          this.#db.exec('PRAGMA user_version=8');
+        }
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -651,8 +663,33 @@ export class Store {
       result: row.result === null ? null : decode(row.result), diagnostic: row.diagnostic as string | null,
       diagnosticRef: row.diagnostic_ref as string | null, createdAt: row.created_at as string,
       startedAt: row.started_at as string | null, settledAt: row.settled_at as string | null,
+      safetyFinding: row.safety_finding as string | null,
     };
   }
+  /**
+   * A safety finding sends the task to needs human (plan-format.md, "After each run"), in the transaction that settles
+   * its attempt. A task cannot change status while it has an active attempt, so it is still running here: no human gate
+   * can hold the finding back.
+   */
+  #actOnFinding(key: string): void {
+    if (!this.#closed(this.#task(key).status as TaskStatus)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+  }
+  /**
+   * Record the runner's own safety finding on an active attempt (#87 item 3), before its terminal write, like the first
+   * reason. The first finding is kept. The terminal write acts on it: never only memory, so a crash, a failed write or
+   * a start through another caller cannot lose it.
+   */
+  recordSafetyFinding(identity: PlanIdentity, id: string, finding: string): boolean {
+    if (typeof finding !== 'string' || !finding.trim()) throw new GuardRefusal('A safety finding needs its reason.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const changed = this.#run(`UPDATE attempts SET safety_finding=? WHERE plan_key=? AND id=? AND state IN ('pending','running') AND safety_finding IS NULL`,
+        bounded(finding), key, id).changes === 1;
+      if (changed) this.#touch(key);
+      return changed;
+    });
+  }
+
   /** Every durable change to a task or its attempts increases the state version. */
   #touch(key: string): void {
     this.#run('UPDATE tasks SET state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
@@ -853,10 +890,13 @@ export class Store {
         const context = decode<InvocationContext>(row.context);
         this.recordHistory(identity, { revision: context.planRevision, snapshotId: context.snapshotId }, settlement.history.base, settlement.history.head, settlement.history.entries);
       }
-      // A pending cancel task wins over everything, including the time limit.
-      if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
-      else {
+      // A pending cancel task wins over everything, including the time limit and a safety finding.
+      if (task.cancel_requested !== null && !this.#closed(task.status)) {
+        this.#closeTask(key, 'cancelled', task.cancel_requested as string);
+      } else {
         if (outcome.timeLimit && !this.#closed(task.status)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+        // The runner's safety finding wins over the outcome: a stop or a stale context does not undo what the agent did.
+        if (row.safety_finding !== null) this.#actOnFinding(key);
         this.#touch(key);
       }
       return outcome;
@@ -1229,17 +1269,28 @@ export class Store {
    * A stored value that is malformed is refused; a copied database (different file identity) gets a new token.
    */
   runnerOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('runner_owner', 'Stored runner owner token is malformed. Refusing to start.', file);
+  }
+  /**
+   * The per-database owner token Ask writes as `io.codeboost.runner` (#65). It is separate from the runner's token, so
+   * Ask's recovery never removes the runner's live agents and the runner's recovery never sees Ask's storage. Same
+   * rules as `runnerOwnerToken`.
+   */
+  askOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('ask_owner', "Ask is off: the stored Ask owner token is malformed. Remove the 'ask_owner' row from app_settings in the review database, then retry.", file);
+  }
+  #ownerToken(key: string, malformed: string, file: { dev: number | bigint; ino: number | bigint }): string {
     const identity = { dev: String(file.dev), ino: String(file.ino) };
     return this.#transaction(() => {
-      const row = this.#get("SELECT value FROM app_settings WHERE key='runner_owner'");
+      const row = this.#get('SELECT value FROM app_settings WHERE key=?', key);
       if (row) {
         let stored: { token?: unknown; dev?: unknown; ino?: unknown };
-        try { stored = decode(row.value); } catch { throw new Error('Stored runner owner token is malformed. Refusing to start.'); }
-        if (typeof stored.token !== 'string' || !/^[0-9a-f]{32}$/.test(stored.token)) throw new Error('Stored runner owner token is malformed. Refusing to start.');
+        try { stored = decode(row.value); } catch { throw new Error(malformed); }
+        if (typeof stored.token !== 'string' || !/^[0-9a-f]{32}$/.test(stored.token)) throw new Error(malformed);
         if (stored.dev === identity.dev && stored.ino === identity.ino) return stored.token;
       }
       const token = randomUUID().replace(/-/g, '');
-      this.#run("INSERT INTO app_settings VALUES ('runner_owner',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", encode({ token, ...identity }));
+      this.#run('INSERT INTO app_settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', key, encode({ token, ...identity }));
       return token;
     });
   }
@@ -1250,6 +1301,24 @@ export class Store {
   hasRunnerCommit(identity: PlanIdentity): boolean {
     return !!this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')}) AND state='completed'
       AND json_valid(result) AND json_extract(result, '$.unchanged') = 0 LIMIT 1`, identityKey(identity), ...WRITABLE_KINDS);
+  }
+  /** Every partial-output file an attempt row references (`diagnostic_ref`). Retention never deletes one of these. */
+  referencedDiagnostics(): string[] {
+    return this.#db.prepare('SELECT diagnostic_ref FROM attempts WHERE diagnostic_ref IS NOT NULL').all().map(row => row.diagnostic_ref as string);
+  }
+  /**
+   * Retention, over its cap: stop referencing this file, in one transaction that also notes the removal in the row's
+   * diagnostic. Only after it commits may the file be deleted, so no row ever points at a missing file.
+   */
+  forgetDiagnostic(ref: string): boolean {
+    return this.#transaction(() => {
+      const rows = this.#db.prepare('SELECT id, plan_key FROM attempts WHERE diagnostic_ref=?').all(ref);
+      for (const row of rows) {
+        this.#run(`UPDATE attempts SET diagnostic_ref=NULL, diagnostic=TRIM(COALESCE(diagnostic,'') || ' (partial output removed by retention)') WHERE id=?`, row.id!);
+        this.#touch(row.plan_key as string);
+      }
+      return rows.length > 0;
+    });
   }
   /** "Preparation starting": saved before any preparation subprocess is spawned. */
   markPreparationStarting(identity: PlanIdentity, id: string, startedAt: number): void {
@@ -1308,9 +1377,12 @@ export class Store {
       this.#run(`UPDATE attempts SET state=?, first_reason=?, diagnostic=?, diagnostic_ref=COALESCE(?, diagnostic_ref), settled_at=? WHERE id=?`,
         outcome.state, firstReason, bounded(diagnostic ?? ''), exported?.diagnosticRef ?? null, new Date(now).toISOString(), row.id!);
       let requeued = false;
-      if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
-      else {
+      if (task.cancel_requested !== null && !this.#closed(task.status)) {
+        this.#closeTask(key, 'cancelled', task.cancel_requested as string);
+      } else {
         if (outcome.timeLimit && !this.#closed(task.status)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+        // A finding the process recorded before it stopped still sends the task to a person, and nothing requeues it.
+        if (row.safety_finding !== null) this.#actOnFinding(key);
         const status = this.#task(key).status as string;
         const interrupted = outcome.state === 'failed' && (outcome.reason ?? '').startsWith('Interrupted');
         const shutdown = outcome.state === 'cancelled' && firstReason === 'shutdown';

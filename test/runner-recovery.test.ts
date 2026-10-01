@@ -115,6 +115,19 @@ describe('runner owner token', () => {
     raw(`UPDATE app_settings SET value='{"token":"../x","dev":"1","ino":"3"}' WHERE key='runner_owner'`);
     expect(() => store.runnerOwnerToken({ dev: 1n, ino: 3n })).toThrow(/malformed/);
   });
+
+  it('gives Ask its own token, with the same rules, that never equals the runner token (#65)', () => {
+    const { store, raw } = fixture();
+    const runner = store.runnerOwnerToken({ dev: 1n, ino: 2n });
+    const ask = store.askOwnerToken({ dev: 1n, ino: 2n });
+    expect(ask).toMatch(/^[0-9a-f]{32}$/);
+    expect(ask).not.toBe(runner);
+    expect(store.askOwnerToken({ dev: 1n, ino: 2n })).toBe(ask);
+    expect(store.runnerOwnerToken({ dev: 1n, ino: 2n })).toBe(runner);
+    expect(store.askOwnerToken({ dev: 1n, ino: 3n })).not.toBe(ask);
+    raw(`UPDATE app_settings SET value='{"token":"../x","dev":"1","ino":"3"}' WHERE key='ask_owner'`);
+    expect(() => store.askOwnerToken({ dev: 1n, ino: 3n })).toThrow(/Ask is off: the stored Ask owner token is malformed/);
+  });
 });
 
 describe('finalizing interrupted attempts', () => {

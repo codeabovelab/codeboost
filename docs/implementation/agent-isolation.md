@@ -257,9 +257,9 @@ Ask keeps the contract's identity and cleanup rules:
   subprocess, including the image build, inherits only that, so no credential, home directory, Docker config or
   agent socket reaches it. The credential lookup's only variable, `CLAUDE_CODE_OAUTH_TOKEN`, reaches the worker as
   data and goes only to the Claude adapter. Ask refuses Codex before any Docker work (see
-  [Codex in read-only phases](#codex-in-read-only-phases)). The
-  leftover Docker queries use the same `PATH`/`DOCKER_HOST` environment as lane D. Missing sign-in is reported
-  before any Docker work.
+  [Codex in read-only phases](#codex-in-read-only-phases)).
+  Lane D's recovery runs in the worker, so it has the same environment. Missing sign-in is reported before any
+  Docker work.
 - Lane D's clone is a full host copy with no byte limit of its own. Before cloning, Ask measures the checkout at the
   reviewed head (`git ls-tree -r -t -l`) and the object store (`git count-objects -v`) and refuses a repository
   that would not fit the question's 512 MiB and 131,072-entry allocation. A bounded, D-owned clone would replace
@@ -267,20 +267,47 @@ Ask keeps the contract's identity and cleanup rules:
 - The stop reason (timeout, shutdown or cancellation) travels as a typed value (`StopError`) from `Questions`
   through the worker message to `handle.cancel()`, separate from the message shown to the user.
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
+- Every Docker object Ask creates carries the review's **Ask owner token** as `io.codeboost.runner` (#65). The token
+  is per review database: the Store keeps it as `ask_owner`, tied to the database file's device and inode, like the
+  runner's token. It is a separate token from the runner's (`runner_owner`), because D's recovery removes every agent
+  container of the owner it is given. With one token, Ask's recovery could remove the runner's live agents, and the
+  runner's recovery would find Ask's storage.
+- The first question of each process, under the review's Ask lock and before any question starts, asks the worker
+  to run D's `recoverLeftovers(askOwner)`. It removes the agent containers, proxies, seeders and networks of that
+  owner. It returns a handle for each task-storage allocation, and Ask removes that storage at once (Ask only reads,
+  so there is nothing to export). The handles are valid only in the thread that recovered them, which is why the
+  worker runs recovery. Recovery runs even without a record, because a process killed early leaves no record.
+  It is single-flight: concurrent first questions share it.
+- Recovery touches nothing that carries another owner. Another review on the same Docker daemon, with live
+  questions or with leftovers of its own, does not block Ask and is not changed by it. Ask calls recovery with
+  `{ unowned: false }`, so D does not list or inspect other owners' objects at all, and their number or a failed
+  inspect of one cannot make Ask's recovery fail. Objects without an owner label come from builds before #51 item 3
+  and could belong to any review, so Ask neither removes them nor refuses because of them. This differs from the runner, whose startup recovery refuses to admit work while any exist
+  (`runner-lifecycle.md`, "Unowned resources"): Ask only reads, and refusing would bring back the cross-review block
+  that #65 removes.
+- Ask stays off when recovery rejects (Docker unreachable, a removal not confirmed, the 60-second limit), and when an
+  object carries this review's owner but recovery cannot identify it. The refusal for an unidentified object lists a
+  `docker … rm` command for each one (at most 20). The next question retries the whole startup check, including a
+  check that failed before it reached Docker (a legacy record, an Ask root that could not be deleted). Recovered storage whose
+  removal Docker does not confirm is kept and retried before each question, like the worker's own storage.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.
-- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
-  anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
-  Ask stays off while any recorded container or volume still exists. The check is read-only label queries
-  (`docker ps`, `docker volume ls` and `docker network ls` for `io.codeboost.allocation`, `io.codeboost.invocation`
-  and `io.codeboost.egress`) with one 15-second limit, and the question can cancel it. The refusal shows
-  `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
-  they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
-  at shutdown keeps Ask off. Allocations beyond the record's cap of 100 count as unidentified, never dropped; Ask
-  roots are never dropped, and recording one past the cap is refused. Any labelled resource that is not part of a
-  still-listed allocation keeps the unidentified marker until none remain. D now has scoped recovery (#51 item 4),
-  but Ask cannot use it yet: it labels resources with a random per-session runner owner, so a later process does not
-  know the token to recover (#59).
+- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. Whatever is
+  left carries the review's owner label, so the next process's recovery removes it; nothing about Docker is written
+  to the record. A recovery still in flight at shutdown stops with the worker, and the next process runs it again.
+  The Docker clients it started may outlive the thread, so after that the review's Ask lock is kept until this
+  process exits, as after an abandonment.
+- `<database>.ask-leftovers.json` lists only Ask roots (below). A record from a build before #65 can also list agent
+  storage by name, or count failures it could not name. Those builds labelled Ask's objects with no owner or a random
+  one, so recovery cannot find them. While such a record exists, Ask stays off and shows the `docker rm` and
+  `docker volume rm` commands for the named storage. The user removes it, then deletes the record. An unreadable
+  record keeps Ask off. Ask roots are never dropped, and recording one past the cap of 100 is refused. Records
+  written by this build leave out the legacy fields, so an older build reads them as unreadable and keeps Ask off.
+- Known limits of owner scoping. Builds between #51 item 3 and #65 labelled Ask's objects with a random owner per
+  session; what such a process left after being killed is found by nobody, and has to be removed by hand
+  (`docker ps -a`, `docker volume ls` and `docker network ls` with `--filter label=io.codeboost.runner`, keeping
+  the owners of running reviews). The token is tied to the database file's device and inode, so a database moved to
+  another filesystem or restored from a backup gets a new token, and its earlier leftovers are not recovered.
 - Host copies are owned through one Ask root per worker, `<tmp>/codeboost-ask-XXXXXX`. The bridge creates it and
   records it before the worker starts, and runs the worker with it as `TMPDIR`. So the reviewed clone, lane D's
   input directory and its Codex auth copy all land inside it. The root is deleted, read-only directories included,
@@ -293,42 +320,36 @@ Ask keeps the contract's identity and cleanup rules:
   in the private lock directory and whose owner lock is free. It leaves folders whose owner is still running, and
   folders with a missing, malformed or foreign stamp, because Ask did not provably create those.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
-  resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
-  restart, Ask stays off while any container, volume or network labelled `io.codeboost.allocation`,
-  `io.codeboost.invocation` or `io.codeboost.egress` exists. Resources now carry caller-provided allocation IDs
-  and runner labels (#51 item 3), but Ask does not yet use them to name its resources.
+  resources were left. Ask stays off for the rest of the session. The resources carry the review's owner label, so
+  the first question after a restart removes them through recovery.
 - One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on a lock file keyed by
   the database file's identity (device and inode), in a private directory (`<tmp>/codeboost-asklocks-<uid>`, mode
   0700, checked to be owned by you). A lock path that is a symlink is refused, never followed. It is an OS file lock that the operating
   system releases when its process ends, so every spelling and every later name of the database, including an
-  atomic rename while a server runs, finds the same lock. It is taken before the scan and kept until the worker
-  and any startup scan still in flight have finished. Only the holder scans, starts a worker or writes the
-  record. The record itself is kept next to the database's canonical path (`realpath`), so relative,
-absolute and symlinked spellings share them. A database with other hard links is refused. Separating different
-  reviews that share one Docker daemon needs a per-database runner token: resources now carry runner labels
-  (#51 item 3), but Ask labels them with a random per-session owner until F1d's token exists (#59).
-- The first question of each process runs that scan even without a record, because a process killed before it
-  could write one leaves no record. Until Ask labels resources with a per-database runner token and filters its
-  scan by it, another codeboost process running Ask at the same moment also keeps this one off.
-- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off (it counts as untracked leftovers) until a restart finds no labelled resources. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
+  atomic rename while a server runs, finds the same lock. It is taken before the startup check and kept until the worker
+  and any startup check still in flight have finished. Only the holder recovers, starts a worker or writes the
+  record. The lock is what keeps recovery away from other processes' live questions: D's recovery cannot see other
+  processes, and it removes every agent container of the owner. It does not cover Docker clients that a killed
+  process left running, which can still create objects while the next process recovers; that needs lane D's
+  process groups (#51 item 5). The record itself is kept next to the database's canonical path (`realpath`), so relative,
+absolute and symlinked spellings share them. A database with other hard links is refused. A copy of the database
+  is a different file, so it gets its own Ask owner token and its own lock.
+- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off until codeboost restarts; recovery then removes what is left. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
   the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
-  records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
+  waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
   finishes first), then rejects the waiting questions, so shutdown cannot hang on D. A worker that does not answer
   the final release request at shutdown goes through the same bounded path. If the thread is still busy
-  after that wait, its ownership is already durable (unknown leftovers and the recorded root) and no new question is
+  after that wait, its ownership is already durable (the owner label and the recorded root) and no new question is
   admitted; the root is deleted as soon as the thread stops. After any abandonment the review lock is kept until the
   process exits: Docker CLI children the thread started can outlive it and cannot be awaited until lane D exposes
   process groups (#51 item 5).
-- If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
-  replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
-  while any container, volume or network labelled `io.codeboost.allocation`,
-  `io.codeboost.invocation` or `io.codeboost.egress` exists. Lane D's scoped recovery (#51 item 4) can reclaim
-  leftovers by runner token, but Ask's per-session token is lost with the process until F1d's per-database token
-  exists (#59).
+- If the worker itself crashes, its containers and storage may still exist, and its Docker CLI children may still be
+  changing them. The bridge does not start a replacement worker, so Ask stays off until codeboost restarts. The
+  first question after the restart removes them through recovery.
 
 `test/agent-question.test.ts` runs this path
-against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
+against real Docker, including two reviews with different Ask owners on one daemon; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
 `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Limits of this gate

@@ -6,8 +6,9 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, CODEX_QUESTIONS_REFUSED, credentialEnvironment, measureGitRepository, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
-import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
+import type { RecoveredTaskStorage } from '../agents/container/storage.ts';
+import type { RecoveryReport, UnownedResource } from '../agents/recovery.ts';
+import { askInContainer, CODEX_QUESTIONS_REFUSED, credentialEnvironment, measureGitRepository, recoverAskOwner, recoverQuestionStorage, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
 const roots: string[] = [];
@@ -41,6 +42,7 @@ function fakeDeps(result: Partial<InvocationResult> = {}, env: Record<string, st
     createClone: options => { events.push('clone'); return { id: 'clone', taskId: options.taskId, directory: options.parent, head: options.head }; },
     prepareFilesystems: () => { events.push('prepare'); return filesystems; },
     removeFilesystems: value => { expect(value).toBe(filesystems); events.push('remove'); },
+    recover: async () => { throw new Error('Questions never recover.'); },
     measureRepository: () => ({ checkoutBytes: 1_024, entries: 3, objectBytes: 2_048 }),
     capture: input => { captured.push(input); return Object.freeze(input); },
     startClaude: start('claude'), env,
@@ -274,7 +276,6 @@ it('keeps storage whose removal failed, refuses Ask until it is removed, then co
   first.deps.removeFilesystems = () => { throw new Error('Docker did not confirm removal.'); };
   await expect(askInContainer(question(), first.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
   expect(retained.size).toBe(1);
-  expect(retained.list().map(entry => entry.keeper)).toEqual(['keeper']);
 
   const blocked = fakeDeps();
   blocked.deps.removeFilesystems = () => { throw new Error('Docker is still down.'); };
@@ -297,7 +298,6 @@ it('gives the worker an allowlisted environment and passes only the credential v
     SSH_AUTH_SOCK: '/tmp/agent', AWS_ACCESS_KEY_ID: 'secret-2', DOCKER_CONFIG: '/home/me/.docker', CODEX_HOME: '/home/codex' };
   expect(workerEnvironment(env, '/tmp/codeboost-ask-abc123')).toEqual({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', TMPDIR: '/tmp/codeboost-ask-abc123' });
   expect(credentialEnvironment(env)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1' });
-  expect(Object.keys(dockerQueryEnvironment()).sort()).toEqual(['DOCKER_HOST', 'PATH']);
 });
 
 it('starts the real bridge worker with exactly the allowlisted environment', async () => {
@@ -376,3 +376,66 @@ it('closes the review store even when Ask cleanup fails at shutdown', async () =
   finally { Questions.prototype.close = closeQuestions; }
   expect(storeClosed).toBe(true);
 }, 30_000);
+
+const OWNER = '0123456789abcdef0123456789abcdef';
+const recovered = (n: number) => ({ runnerOwner: OWNER, attemptId: `attempt-${n}`, allocationId: `allocation-${n}`,
+  workVolume: `codeboost-work-${n}`, metadataVolume: `codeboost-meta-${n}` }) as RecoveredTaskStorage;
+const unowned = (name: string, reason: UnownedResource['reason'], labels: Record<string, string>): UnownedResource =>
+  ({ kind: 'container', name, id: `id-${name}`, labels, reason });
+const recovery = (report: Partial<RecoveryReport>, removeFilesystems: (value: unknown) => void = () => {}) => {
+  const owners: string[] = [];
+  return { owners, deps: { removeFilesystems, recover: async (owner: string) => { owners.push(owner); return { removed: [], storage: [], unowned: [], ...report }; } } };
+};
+
+it('recovers only its own owner and removes the storage it gets back, since Ask has nothing to export', async () => {
+  const removed: unknown[] = [];
+  const handles = [recovered(1), recovered(2)];
+  const fake = recovery({ storage: handles }, value => { removed.push(value); });
+  const retained = new RetainedStorage();
+  await recoverQuestionStorage(OWNER, fake.deps, retained);
+  expect(fake.owners).toEqual([OWNER]);
+  expect(removed).toEqual(handles);
+  expect(retained.size).toBe(0);
+});
+
+it('keeps recovered storage whose removal fails, which keeps Ask off until it is removed', async () => {
+  const handle = recovered(1);
+  const retained = new RetainedStorage();
+  await recoverQuestionStorage(OWNER, recovery({ storage: [handle] }, () => { throw new Error('Docker did not confirm removal.'); }).deps, retained);
+  expect(retained.size).toBe(1);
+  expect(() => retained.release(() => { throw new Error('still down'); })).toThrow('earlier question or session could not be removed');
+  const removed: unknown[] = [];
+  retained.release(value => { removed.push(value); });
+  expect(removed).toEqual([handle]);
+});
+
+it('is not blocked by objects without an owner, which may belong to another review on the same daemon', async () => {
+  const legacy = unowned('codeboost-keeper-legacy', 'no-runner-label', { 'io.codeboost.allocation': 'x' });
+  await expect(recoverQuestionStorage(OWNER, recovery({ unowned: [legacy] }).deps, new RetainedStorage())).resolves.toBeUndefined();
+});
+
+it('keeps Ask off, with removal commands, for objects of its own owner that recovery cannot identify', async () => {
+  const mine = unowned('codeboost-odd', 'unknown-kind', { 'io.codeboost.runner': OWNER });
+  const theirs = unowned('codeboost-theirs', 'unknown-kind', { 'io.codeboost.runner': 'f'.repeat(32) });
+  const removed: unknown[] = [];
+  const handle = recovered(1);
+  const error = await recoverQuestionStorage(OWNER, recovery({ storage: [handle], unowned: [mine, theirs] }, value => { removed.push(value); }).deps,
+    new RetainedStorage()).catch((caught: Error) => caught);
+  expect((error as Error).message.split('\n')).toEqual([expect.stringContaining("labelled with this review's Ask owner"), 'docker container rm -f id-codeboost-odd']);
+  // Storage it could identify is still removed.
+  expect(removed).toEqual([handle]);
+});
+
+it('keeps Ask off when recovery cannot finish', async () => {
+  const deps = { removeFilesystems: () => {}, recover: async () => { throw new Error('Cannot connect to the Docker daemon'); } };
+  await expect(recoverQuestionStorage(OWNER, deps, new RetainedStorage())).rejects.toThrow(/could not remove what an earlier session.*Cannot connect/);
+});
+
+it("calls lane D's recovery for this owner only, without the daemon-wide search for unowned objects (#65)", async () => {
+  const recovery = await import('../agents/recovery.ts');
+  const spy = vi.spyOn(recovery, 'recoverLeftovers').mockResolvedValue({ removed: [], storage: [], unowned: [] });
+  try {
+    await recoverAskOwner(OWNER);
+    expect(spy).toHaveBeenCalledWith(OWNER, 60_000, { unowned: false });
+  } finally { spy.mockRestore(); }
+});
