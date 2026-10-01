@@ -1267,17 +1267,28 @@ export class Store {
    * A stored value that is malformed is refused; a copied database (different file identity) gets a new token.
    */
   runnerOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('runner_owner', 'Stored runner owner token is malformed. Refusing to start.', file);
+  }
+  /**
+   * The per-database owner token Ask writes as `io.codeboost.runner` (#65). It is separate from the runner's token, so
+   * Ask's recovery never removes the runner's live agents and the runner's recovery never sees Ask's storage. Same
+   * rules as `runnerOwnerToken`.
+   */
+  askOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('ask_owner', "Ask is off: the stored Ask owner token is malformed. Remove the 'ask_owner' row from app_settings in the review database, then retry.", file);
+  }
+  #ownerToken(key: string, malformed: string, file: { dev: number | bigint; ino: number | bigint }): string {
     const identity = { dev: String(file.dev), ino: String(file.ino) };
     return this.#transaction(() => {
-      const row = this.#get("SELECT value FROM app_settings WHERE key='runner_owner'");
+      const row = this.#get('SELECT value FROM app_settings WHERE key=?', key);
       if (row) {
         let stored: { token?: unknown; dev?: unknown; ino?: unknown };
-        try { stored = decode(row.value); } catch { throw new Error('Stored runner owner token is malformed. Refusing to start.'); }
-        if (typeof stored.token !== 'string' || !/^[0-9a-f]{32}$/.test(stored.token)) throw new Error('Stored runner owner token is malformed. Refusing to start.');
+        try { stored = decode(row.value); } catch { throw new Error(malformed); }
+        if (typeof stored.token !== 'string' || !/^[0-9a-f]{32}$/.test(stored.token)) throw new Error(malformed);
         if (stored.dev === identity.dev && stored.ino === identity.ino) return stored.token;
       }
       const token = randomUUID().replace(/-/g, '');
-      this.#run("INSERT INTO app_settings VALUES ('runner_owner',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", encode({ token, ...identity }));
+      this.#run('INSERT INTO app_settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', key, encode({ token, ...identity }));
       return token;
     });
   }

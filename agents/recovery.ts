@@ -131,12 +131,17 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
  * container of this runner. It refuses to run while this process holds task storage of the runner, which every agent
  * mounts, but cannot see other processes; the lock is what excludes them.
  *
+ * With `{ unowned: false }` it skips the daemon-wide search for objects without a runner label, which lists and
+ * inspects every codeboost object of every runner. A caller that does not act on them (Ask, #65) uses this, so other
+ * runners' objects cannot make its recovery fail or run out of time. `unowned` then lists only objects of this runner.
+ *
  * Treat any rejection as "recovery did not finish": do not admit work, and run it again. It rejects with a
  * `RecoveryError` (message bounded to about 1 KB, plus `removed`) when a removal is not confirmed, and with a plain
  * `Error` when it refuses to run (a malformed token, or live storage of this runner here), when a list or inspect
  * fails, when a storage check cannot reach Docker, or when the deadline runs out. A rejection returns no handles.
  */
-export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000): Promise<RecoveryReport> {
+export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
+  options: { unowned?: boolean } = {}): Promise<RecoveryReport> {
   if (!isRunnerOwner(runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
   // Every agent mounts task storage, so a runner with live storage here may have live agents recovery would remove.
   if (hasLiveTaskStorage(runnerOwner))
@@ -147,6 +152,7 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   const unowned: UnownedResource[] = [];
   for (const kind of ['container', 'volume', 'network'] as const) {
     owned[kind] = await inspect(kind, await list(kind, `${RUNNER_LABEL}=${runnerOwner}`, remaining), remaining);
+    if (options.unowned === false) continue;
     // Docker cannot filter on a missing label, so list every codeboost object of this kind and keep those without one.
     const candidates = unique((await Promise.all(KIND_LABELS.map(label => list(kind, label, remaining)))).flat());
     for (const resource of await inspect(kind, candidates, remaining))

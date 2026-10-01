@@ -5,9 +5,10 @@ import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { InvocationContext, InvocationHandle, InvocationInput, InvocationResult, StopReason, TaskClone } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
-import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
-import type { ResourceOwner } from '../agents/labels.ts';
-import { removeStaging, type Leftover } from './question-leftovers.ts';
+import type { RecoveredTaskStorage, TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
+import { RUNNER_LABEL, type ResourceOwner } from '../agents/labels.ts';
+import { recoverLeftovers, type RecoveryReport } from '../agents/recovery.ts';
+import { removeStaging } from './question-leftovers.ts';
 
 export type Provider = 'claude' | 'codex';
 /** What the review knows about a question when it asks the agent. */
@@ -30,28 +31,27 @@ export interface ContainerQuestion extends QuestionScope {
   /** Written as `io.codeboost.runner` on every Docker object this question creates (#51 item 3). */
   readonly runnerOwner: string;
 }
+/** Task storage this worker allocated, or recovered from an earlier session of the same review. */
+export type QuestionStorage = TaskFilesystems | RecoveredTaskStorage;
 /**
  * Task storage whose removal Docker did not confirm. The only handle to a D allocation must not be dropped:
- * it is kept here, removal is retried before the next question, and Ask stays off while any remain.
+ * it is kept here, removal is retried before the next question, and Ask stays off while any remain. Whatever is
+ * still here when the process ends is removed by the next process's recovery, which finds it by the review's owner.
  */
 export class RetainedStorage {
-  readonly #retained = new Set<TaskFilesystems>();
+  readonly #retained = new Set<QuestionStorage>();
   readonly #paths = new Set<string>();
   #untracked = 0;
   get size() { return this.#retained.size; }
   /** Allocations whose setup failed and whose cleanup D could not confirm. D returns no handle for them. */
   get untracked() { return this.#untracked; }
-  retain(filesystems: TaskFilesystems) { this.#retained.add(filesystems); }
+  retain(filesystems: QuestionStorage) { this.#retained.add(filesystems); }
   markUntracked() { this.#untracked++; }
   /** A host staging directory (a copy of the reviewed code) that could not be deleted. */
   retainPath(path: string) { this.#paths.add(path); }
   paths(): string[] { return [...this.#paths]; }
-  /** Docker names of the retained allocations, for a durable record before this registry is dropped. */
-  list(): Leftover[] {
-    return [...this.#retained].map(({ keeper, workVolume, metadataVolume }) => ({ keeper, workVolume, metadataVolume }));
-  }
   /** Retry removal of every retained allocation. Throws while any removal is still unconfirmed. */
-  release(remove: (filesystems: TaskFilesystems) => void): void {
+  release(remove: (filesystems: QuestionStorage) => void): void {
     for (const path of [...this.#paths]) {
       try { removeStaging(path); this.#paths.delete(path); } catch { /* still owned; retried next time */ }
     }
@@ -59,8 +59,8 @@ export class RetainedStorage {
       try { remove(filesystems); this.#retained.delete(filesystems); } catch { /* still owned; retried next time */ }
     }
     if (this.#paths.size) throw new Error(`A copy of reviewed code from an earlier question could not be deleted (${[...this.#paths].join(', ')}). Ask stays off until it is deleted.`);
-    if (this.#untracked) throw new Error(`An agent's setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts and no containers, volumes or networks labelled \`io.codeboost.allocation\`, \`io.codeboost.invocation\` or \`io.codeboost.egress\` remain.`);
-    if (this.#retained.size) throw new Error(`Agent storage from an earlier question could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
+    if (this.#untracked) throw new Error(`An agent's setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts; the first question after the restart removes what this review's Ask left in Docker.`);
+    if (this.#retained.size) throw new Error(`Agent storage from an earlier question or session could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
   }
 }
 export interface RepositorySize { readonly checkoutBytes: number; readonly entries: number; readonly objectBytes: number }
@@ -106,7 +106,9 @@ export interface ContainerDependencies {
   createClone(options: { source: string; parent: string; taskId: string; head: string; timeoutMs: number }): TaskClone;
   prepareFilesystems(clone: TaskClone, limits: TaskStorageLimits, imageId: string, owner: ResourceOwner,
     timeoutMs: number): TaskFilesystems;
-  removeFilesystems(filesystems: TaskFilesystems): void;
+  removeFilesystems(filesystems: QuestionStorage): void;
+  /** Lane D's scoped recovery (`recoverLeftovers`): acts only on objects labelled with this owner. */
+  recover(runnerOwner: string): Promise<RecoveryReport>;
   /** Size of the checkout at `head` and of the object store, measured before anything is copied to the host. */
   measureRepository(source: string, head: string, timeoutMs: number): RepositorySize;
   capture(input: InvocationInput): InvocationInput;
@@ -227,10 +229,9 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     let result: InvocationResult;
     try { result = await handle.settled; }
     finally { signal.removeEventListener('abort', cancel); }
-    // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so the
-    // worker reports them at release and no new question starts until a restart finds none left.
-    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed. Docker
-    // leftovers are found again by their labels. Host leftovers (D's input and auth staging directories) are covered by
+    // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so no new
+    // question starts until a restart, whose recovery removes them by the review's owner label.
+    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed. Host leftovers (D's input and auth staging directories) are covered by
     // the Ask root: the worker's TMPDIR is that root, D stages under tmpdir(), and the root is recorded durably before
     // setup and deleted at startup before Ask is enabled again.
     if (result.unreleased !== undefined) retained.markUntracked();
@@ -241,4 +242,43 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     try { removeStaging(root); } catch (error) { retained.retainPath(root); failures.push(error); }
     if (failures.length) throw new AggregateError(failures, 'Question container cleanup did not settle.');
   }
+}
+
+// Bounds lane D's recovery, which otherwise allows two minutes; the first question waits for it.
+const RECOVERY_TIMEOUT_MS = 60_000;
+/**
+ * Ask's call into lane D's recovery. It skips the daemon-wide search for objects without an owner, so other reviews'
+ * objects are never listed or inspected and cannot make it fail (#65).
+ */
+export const recoverAskOwner = (runnerOwner: string): Promise<RecoveryReport> =>
+  recoverLeftovers(runnerOwner, RECOVERY_TIMEOUT_MS, { unowned: false });
+// Shown in a refusal at most this many objects; the rest are counted.
+const MAX_LISTED = 20;
+/**
+ * The Docker part of the first check of a process (#65): remove whatever an earlier session of this review left,
+ * found by the review's Ask owner label, and nothing else. Run it in the worker before its first question, while the
+ * review's Ask lock is held: recovery removes every agent container of that owner, and the handles it returns are
+ * valid only in the thread that recovered them. Ask only reads, so recovered storage is removed, never exported;
+ * storage whose removal is not confirmed is retained, which keeps Ask off until it is removed.
+ *
+ * Recovery is asked not to look for objects without an owner label: they come from builds before runner labels and
+ * may belong to any review on this daemon, so they neither block Ask nor are touched. Objects carrying this owner that
+ * recovery cannot identify keep Ask off.
+ */
+export async function recoverQuestionStorage(runnerOwner: string, deps: Pick<ContainerDependencies, 'recover' | 'removeFilesystems'>,
+  retained: RetainedStorage): Promise<void> {
+  let report: RecoveryReport;
+  try { report = await deps.recover(runnerOwner); }
+  catch (error) {
+    throw new Error(`Ask is off: codeboost could not remove what an earlier session of this review left in Docker (${error instanceof Error ? error.message.slice(0, 300) : 'unknown error'}). Check that Docker is running, then retry.`);
+  }
+  for (const handle of report.storage) {
+    try { deps.removeFilesystems(handle); } catch { retained.retain(handle); }
+  }
+  const ours = report.unowned.filter(resource => resource.labels[RUNNER_LABEL] === runnerOwner);
+  if (!ours.length) return;
+  const commands = ours.slice(0, MAX_LISTED).map(resource =>
+    `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${resource.id ?? resource.name}`);
+  if (ours.length > MAX_LISTED) commands.push(`… and ${ours.length - MAX_LISTED} more labelled ${RUNNER_LABEL}=${runnerOwner}`);
+  throw new Error(`Ask is off: Docker objects labelled with this review's Ask owner are not ones codeboost can identify, so it did not remove them. Remove them, then retry:\n${commands.join('\n')}`);
 }
