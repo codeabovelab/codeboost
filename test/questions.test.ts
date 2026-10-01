@@ -1,5 +1,5 @@
 import { afterEach, expect, it, vi } from 'vitest';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { createDemo } from '../scripts/demo.ts';
@@ -117,4 +117,11 @@ it('refuses new questions once admission has stopped, before close() runs',()=>{
  expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toBeUndefined();
  manager.markStopped(asked.createdNoteId!,service.load());
  expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toMatchObject({status:'failed',error:'Server stopped. Retry the question.'});
+});
+it('labels Ask objects with the database Ask owner, never the runner owner (#65)',()=>{
+ const service=fixture(),manager=new Questions(service,async()=>'Answer');managers.push(manager);
+ const file=statSync(realpathSync(service.config.database),{bigint:true});
+ const owner=(manager as unknown as {worker:{owner:()=>string}}).worker.owner();
+ expect(owner).toBe(service.store.askOwnerToken(file));
+ expect(owner).not.toBe(service.store.runnerOwnerToken(file));
 });
