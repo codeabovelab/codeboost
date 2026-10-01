@@ -118,6 +118,8 @@ Some repositories do not support draft PRs (for example private repositories on 
 
 ## What this slice does not do
 
+- **Repository renames and transfers.** Every PR record is kept under the configured repository name. After a rename or transfer, publish fails closed (the task's PRs are refused or reported as unsettled) until the records are moved; nothing here moves them.
+
 - **Push.** `BranchPusher` is injected. The real push needs D's commit export (#66) and a runner-owned host repository.
 - **Continue from possibly already fixed.** The Continue and Cancel actions are user actions for a later slice.
 - **Close the draft on cancel.** The design closes the draft PR when a person cancels a needs-human task. The PR record is kept for that.

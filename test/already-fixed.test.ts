@@ -56,7 +56,7 @@ describe('the timeline query', () => {
 
 describe('issue mentions in commit messages', () => {
   it('matches this issue by number, GH- form, qualified name or URL, and nothing else', () => {
-    for (const message of ['Fix #12', 'fixes #12.', '(#12)', 'Resolve GH-12', 'owner/repo#12', 'See https://github.com/Owner/Repo/issues/12 for context'])
+    for (const message of ['Fix #12', 'fixes #12.', '(#12)', 'Resolve GH-12', 'fixes gh-12', 'owner/repo#12', 'See https://github.com/Owner/Repo/issues/12 for context'])
       expect(mentionsIssue(message, repo, 12), message).toBe(true);
     for (const message of ['Fix #123', 'Fix #1', 'other/repo#12', 'x#12', 'issue 12', 'https://github.com/owner/repo/issues/120', 'https://github.com/other/repo/issues/12', 'GH-120', 'owner/repo2#12', 'https://example.com/#12', 'XGH-12', 'foo-GH-12', '##12'])
       expect(mentionsIssue(message, repo, 12), message).toBe(false);
@@ -178,7 +178,7 @@ describe('the pre-PR already-fixed check', () => {
       { commits: Array.from({ length: 150 }, (_, i) => ({ sha: sha(3000 + i), message: 'x' })), totalCommitsLater: 151 },
       { commits: Array.from({ length: 160 }, (_, i) => ({ sha: sha(3000 + i), message: 'x' })), totalCommits: 120 },
       { commits: [{ sha: sha(5), message: 'x' }, { sha: sha(5), message: 'x' }] },
-      { errors: [{ message: 'rate limited' }] }, { nameWithOwner: 'other/repo' }, { baseRef: 'other' },
+      { errors: [{ message: 'rate limited' }] }, { errors: { message: 'not a list' } }, { nameWithOwner: 'other/repo' }, { baseRef: 'other' },
       { state: 'CLOSED' }, { nodes: [cross(null)] }, { nodes: [cross({ __typename: 'Discussion' })] },
       { nodes: [cross(pr(1, 'OPEN', { repository: null }))] }, { nodes: [{ __typename: 'LabeledEvent' }] },
       { fail: /graphql/ }, { fail: /compare/ },

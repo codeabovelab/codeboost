@@ -2030,6 +2030,17 @@ describe('shutdown and PRs left ready', () => {
     expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
   });
+  it('records no match after an abort during the draft change a match makes', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, controller = new AbortController();
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    const found: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'closed', by: 'owner/repo#5' }] };
+    const again = harness(store, { live, next, results: [found], onDraft: () => controller.abort(new Error('cancelled')) });
+    const error = await again.publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(error.message).toBe('cancelled');
+    expect(again.log).toContain('draft 100');
+    expect(store.getTask(identity).status).toBe('running');
+  });
   it('writes nothing after an abort during recovery\'s lookup or the direct read of a PR the list does not show', async () => {
     // Recovery: the lost opening stays owned, nothing is recorded or abandoned.
     let store = runningTask(), controller = new AbortController();
