@@ -610,11 +610,10 @@ describe('container invocation supervisor', () => {
     }, 8 * 60_000);
 
     it('returns a schema-constrained Claude planning answer as bare JSON from the mounted schema', async () => {
-      // The marker is only in the schema. Claude can also read the mounted file, so the marker alone does not prove the
-      // flag: the strict structured_output decode does, since without --json-schema the envelope has none.
+      // `const` makes the schema itself enforce the marker. Claude can also read the mounted file, so the marker alone
+      // does not prove the flag: the strict structured_output decode does, since without --json-schema there is none.
       const schema = JSON.stringify({ type: 'object', additionalProperties: false, required: ['marker'],
-        description: 'Set marker to exactly: codeboost-structured-schema-marker',
-        properties: { marker: { type: 'string' } } }) + '\n';
+        properties: { marker: { type: 'string', const: 'codeboost-structured-schema-marker' } } }) + '\n';
       const data = fixture(schema), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
       const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude-schema', 6 * 60_000, 'claude'),

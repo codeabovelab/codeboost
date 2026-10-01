@@ -8,8 +8,9 @@ import { assertAdapterRequest, createAdapterInvocationBudget, type AgentAdapterO
 
 /**
  * Read Claude's `--output-format json` envelope. A result whose `subtype` is not `success`, or whose `is_error` is
- * true, is a provider failure; it can omit `result`. With `--json-schema` (planning), a successful answer is the
- * schema-validated `structured_output` object, returned as JSON text; `result` then holds only Claude's prose.
+ * true, is a provider failure; it can omit `result`. With `--json-schema` (planning), a successful answer needs
+ * `subtype: "success"` and is the schema-validated `structured_output` object, returned as JSON text; `result` then
+ * holds only Claude's prose. Plain-text envelopes without a `subtype` are still accepted.
  */
 export function parseClaudeOutput(raw: Buffer, structured = false): { text: string; providerFailed: boolean } {
   const envelope = JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(raw)) as
@@ -24,6 +25,8 @@ export function parseClaudeOutput(raw: Buffer, structured = false): { text: stri
     if (envelope.result === undefined) throw new Error('Claude returned a malformed output envelope.');
     return Object.freeze({ text: prose, providerFailed: false });
   }
+  // Claude always reports a subtype; a schema-constrained answer is accepted only from an explicit success.
+  if (envelope.subtype !== 'success') throw new Error('Claude returned a malformed output envelope.');
   const answer = envelope.structured_output;
   if (answer === null || typeof answer !== 'object' || Array.isArray(answer))
     throw new Error('Claude returned no structured output for a schema-constrained answer.');

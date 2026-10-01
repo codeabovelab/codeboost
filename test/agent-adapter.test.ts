@@ -42,11 +42,14 @@ describe('production agent adapters', () => {
     expect(parseClaudeOutput(Buffer.from(
       '{"type":"result","subtype":"error_max_structured_output_retries","is_error":true,"errors":["x"]}'), true))
       .toEqual({ text: '', providerFailed: true });
-    for (const missing of ['{"result":"{\\"title\\":\\"Plan\\"}","is_error":false}',
-      '{"result":"","is_error":false,"structured_output":null}',
-      '{"result":"","is_error":false,"structured_output":[1]}',
-      '{"result":"","is_error":false,"structured_output":"text"}'])
+    for (const missing of ['{"subtype":"success","result":"{\\"title\\":\\"Plan\\"}","is_error":false}',
+      '{"subtype":"success","result":"","is_error":false,"structured_output":null}',
+      '{"subtype":"success","result":"","is_error":false,"structured_output":[1]}',
+      '{"subtype":"success","result":"","is_error":false,"structured_output":"text"}'])
       expect(() => parseClaudeOutput(Buffer.from(missing), true)).toThrow('no structured output');
+    // A schema-constrained answer needs an explicit success subtype; plain text keeps accepting envelopes without one.
+    expect(() => parseClaudeOutput(Buffer.from('{"is_error":false,"structured_output":{}}'), true)).toThrow('malformed');
+    expect(parseClaudeOutput(Buffer.from('{"is_error":false,"result":"ok"}'))).toEqual({ text: 'ok', providerFailed: false });
     expect(() => parseClaudeOutput(Buffer.from('{"structured_output":{}}'), true)).toThrow('malformed');
   });
 
