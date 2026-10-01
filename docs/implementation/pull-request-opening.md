@@ -99,7 +99,7 @@ GitHub ignores closing keywords and @-mentions inside code. So plan text or agen
 
 Fences do not protect commit messages. A squash or merge commit can carry the PR title and description, and GitHub acts on closing keywords in default-branch commit messages. So every issue reference in the title's summary, the plan and the problems is neutralised: `#7` becomes `＃7`, `GH-7` gets a non-breaking hyphen, and `/issues/7` or `/pull/7` gets a division slash. Only the task's own `Fixes #<issue>` line and the title's `(#<issue>)` remain real references. The title is not fenced, so an @-mention in it would notify: `@name` becomes `＠name` there.
 
-Titles and problems are cut by UTF-16 length, never inside a surrogate pair. An empty summary becomes `codeboost plan`.
+Inside the fences, control characters other than newline and tab become U+FFFD, because GitHub may refuse them and that refusal would repeat on every publish. Titles and problems are cut by UTF-16 length, never inside a surrogate pair. An empty summary becomes `codeboost plan`.
 
 The description stays under 60,000 characters. If the full plan is too long, only item IDs and titles are listed. At most 20 open problems are shown, each cut to 2,000 characters.
 

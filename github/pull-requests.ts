@@ -83,7 +83,10 @@ async function draftCall<T>(call: () => Promise<T>): Promise<T> {
  * agent-controlled, so a marker-shaped string there never identifies a PR.
  */
 export const markerOf = (body: string): string => body.split('\n', 1)[0]!.trim();
-/** The longest one open, lookup, refresh or draft change may take in total, whatever the caller's signal. */
+/**
+ * One deadline for a whole open, lookup, refresh or draft change, whatever the caller's signal. Stopping `gh` at the
+ * deadline can take up to 6 seconds more (SIGTERM grace and pipe drain), so an operation settles within 66 seconds.
+ */
 export const PR_OPERATION_DEADLINE_MS = 60_000;
 /** GitHub updates a PR's head a moment after a push; the read-back waits up to this many polls for the pushed head. */
 export const HEAD_POLLS = 5, HEAD_POLL_MS = 500;

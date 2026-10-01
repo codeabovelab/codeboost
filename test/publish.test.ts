@@ -1068,6 +1068,9 @@ describe('the PR description', () => {
     expect(body).toContain('````text\nP1: Guard input\n  Intent: Closes ＃1 @admin ```\n# injected');
     expect(fenced('a ```` b')).toMatch(/^`````text\n/);
   });
+  it('keeps newlines and tabs in fenced text and replaces other control characters', () => {
+    expect(fenced('a\u0000b\u0007c\td\r\ne\u007f')).toBe('```text\na\ufffdb\ufffdc\td\ne\ufffd\n```');
+  });
   it('handles text with very many backtick runs without overflowing the stack', () => {
     expect(fenced('`a'.repeat(300_000)).startsWith('```text\n')).toBe(true);
   });
@@ -1903,6 +1906,21 @@ describe('shutdown and PRs left ready', () => {
     expect(drafts).toBe(2);
     expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null }]);
+  });
+  it('drops a lost opening at once when another of the task\'s PRs is open into the same base', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    const later = { now: () => Date.now() + 10 * 60_000 };
+    // Opening A into main is lost and its PR hidden; after the settle time it is abandoned.
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const m of live.keys()) hidden.add(m);
+    // Opening B into main is lost too (its POST is refused while A's PR exists, but GitHub's answer is lost).
+    await expect(harness(store, { live, next, hidden, config: later, open: async () => { throw new Error('timeout'); } }).publisher.publish(identity)).rejects.toThrow('timeout');
+    expect(store.taskPullRequests(identity).map(pr => pr.state)).toEqual(['abandoned', 'opening']);
+    // A's PR shows up in main: B created nothing, so it is dropped at once, well inside its settle time.
+    hidden.clear();
+    const again = harness(store, { live, next });
+    await again.publisher.publish(identity);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }, { state: 'abandoned' }]);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();

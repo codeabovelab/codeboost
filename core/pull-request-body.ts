@@ -9,14 +9,16 @@ const MAX_PROBLEMS = 20, MAX_PROBLEM = 2000;
 /**
  * Plan text and open problems go inside fenced code blocks. GitHub does not act on closing keywords ("Fixes #12") or
  * @-mentions inside code, so text from the plan or from agent output cannot close other issues or notify people.
- * The fence is longer than any backtick run in the text, so the text cannot end the block.
+ * The fence is longer than any backtick run in the text, so the text cannot end the block. Control characters other
+ * than newline and tab (a NUL from agent output, say) become U+FFFD: GitHub may refuse them, and a refusal would repeat
+ * on every publish.
  */
 export function fenced(text: string): string {
   // A loop, not Math.max(...runs): plan text is not length-bounded, and spreading every run can overflow the stack.
   let longest = 0;
   for (const match of text.matchAll(/`+/g)) longest = Math.max(longest, match[0].length);
   const fence = '`'.repeat(Math.max(3, longest + 1));
-  return `${fence}text\n${text.replace(/\r\n?/g, '\n')}\n${fence}`;
+  return `${fence}text\n${text.replace(/\r\n?/g, '\n').replace(/[\u0000-\u0008\u000b-\u001f\u007f]/g, '\ufffd')}\n${fence}`;
 }
 
 /**
