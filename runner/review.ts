@@ -12,7 +12,10 @@ import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, rev
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 
-export interface ReviewConfig { database: string; repository: string; identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
+export interface ReviewConfig { database: string; repository: string;
+  /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
+  runnerRepository?: string;
+  identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
 export class ReviewService {
   store: Store;
   config: ReviewConfig;
@@ -21,13 +24,27 @@ export class ReviewService {
     this.config = config; this.store = new Store(config.database);
   }
   close() { this.store.close(); }
+  /**
+   * Where the task's reviewed commits are. Once the runner has committed for the task (a completed writable attempt that
+   * made a commit, #87), its branch is the runner's: the head is the one the Store recorded with that commit, in the
+   * runner-owned repository. Before that, the user's repository and its HEAD. Owned ledger entries alone do not decide it:
+   * a reviewed branch in the user's repository (the demo, a planted experiment) carries them too.
+   */
+  reviewRepository(): { path: string; runnerOwned: boolean } {
+    if (!this.store.hasRunnerCommit(this.config.identity)) return { path: this.config.repository, runnerOwned: false };
+    if (!this.config.runnerRepository) throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
+    return { path: this.config.runnerRepository, runnerOwned: true };
+  }
   load() {
-    const { identity, repository, pathIdentity } = this.config;
+    const { identity, pathIdentity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
     let snapshot = this.store.getSnapshot(identity);
-    // HEAD changes are observed; no Git mutation is performed by the review service.
-    const history = readHistory(repository, snapshot.base, 'HEAD');
+    const reviewed = this.reviewRepository();
+    // HEAD changes in the user's repository are observed; no Git mutation is performed by the review service. Runner
+    // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
+    // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
+    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = (path: string) => {
       if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
@@ -112,7 +129,7 @@ export class ReviewService {
       };
     });
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
-    return { repository: basename(repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
+    return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
   /** The trusted plan context for import and Apply: base entries from the snapshot's base tree, and the configured path identity. */
   planContext(): PlanContext {

@@ -207,7 +207,7 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 ## Publishing a result
 
 1. Wait for `settled`.
-2. Validate the output (schema, size, file-scope audit for writable attempts). Do not await anything between the last check and the transaction. For a writable attempt, the audit reads D's change manifest (#66): F calls `snapshotDeclaredLinks` before launch and keeps the snapshot, and after `settled` calls `inspectTaskChanges` with it and the storage's `metadataBaseline`, which F recorded at allocation. Any agent commit, metadata change, change to a declared link's target, nested gitlink content, or an inspection that refuses, sends the task to needs human with no tests and no commit. A `retargeted` entry for a declared link the item itself edits is that edit, which plan-format.md permits at declared paths; F2a judges it by the plan's link rules, not as a target change. A declared link whose snapshot status is `through-link` is refused before launch.
+2. Validate the output (schema, size, file-scope audit for writable attempts). Do not await anything between the last check and the transaction. For a writable attempt, the audit reads D's change manifest (#66): F calls `snapshotDeclaredLinks` before launch and keeps the snapshot, and after `settled` calls `inspectTaskChanges` with it and the storage's `metadataBaseline`, which F recorded at allocation. Any agent commit, metadata change, change to a declared link's target, nested gitlink content, new file that base's own ignore rules ignore (#87 decision 2), or an inspection that refuses, sends the task to needs human with no tests and no commit. A `retargeted` entry for a declared link is that link's own edit when the manifest lists it, which plan-format.md permits at declared paths; F2a judges it by the plan's link rules, not as a target change. Without that edit in the manifest it is a target change. A declared link whose snapshot status is `through-link` is refused before launch.
 3. **If the job holds an in-memory first reason** (its earlier write failed), skip publication: settle the row through the first-reason mapping in rule 2, passing that reason. Otherwise, in one `Store` transaction: confirm that the attempt ID is the task's current attempt, the state is `running`, there is no first reason, the captured context is still current, the task's status is `running`, and `tasks.cancel_requested` is null (the same guard as the `running → completed` row). Do not compare the task's state version here; the attempt's own transitions have increased it. Then write `completed` and the result, and increase the state version.
 4. If step 3 refuses, reread durable state and settle the row by the rules above. Keep the original diagnostic.
 5. For a completed writable attempt, F2's result extraction is split in two:
@@ -217,6 +217,18 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
    If step 3 refuses, nothing reaches the `Store`. The unpublished commit is already in the runner-owned repository, so F deletes the ref it fetched it under; nothing else points at it. Then, for every writable attempt, call `removeTaskFilesystems` after the terminal write, whatever the outcome. Free the slot only after it succeeds. If it fails, keep an unresolved marker, and startup recovery removes the storage.
 
 **Irreversible actions.** Before each commit, push, PR open or merge, re-read the task's state version, the plan's `review_version` (which `saveReview` and `addReviewNote` advance) and the coordinator's `closing` flag **after the final await**. Stop if any of them changed. For a merge this means an approval or choice edit made during the final GitHub check blocks the merge. A check made before an await does not count. (This follows the AGENTS.md rules on guarded external actions.)
+
+## Runner-owned repository (#87)
+
+codeboost never writes the user's repository. The commits it makes live in a **runner-owned repository**: a bare repository per configured repository, at `<runnerRoot>/<runnerOwner>/repositories/<hash>.git` (`runner/runner-repository.ts`), in directories only the current user can write.
+
+| Step | What happens |
+|---|---|
+| Materialize | `ensureCommit` makes the recorded head available: a base commit is fetched from the user's repository by ID (no refs, tags or `FETCH_HEAD`); a runner commit is there already. The task clone is made from the runner-owned repository (`runner/workspace.ts`). |
+| Commit | `commitTaskChanges` returns a bundle. `fetchTaskCommit` takes it in under `refs/codeboost/attempts/<attemptId>` only if its one ref is the commit's ID and the commit is a single commit on its base; otherwise the ref is removed. |
+| Release | After the terminal write, task storage is removed, then the ref of an attempt that did not complete is dropped. A completed attempt's ref keeps its commit. |
+| Review | Once a task has runner commits (a completed execute or fix attempt that made a commit), the review screen and Ask read it from the runner-owned repository at the head the Store recorded. The user's HEAD is no longer observed for it: runner commits move the head only through the Store, with their ledger entries, and observing the user's older HEAD would roll the task back. A task without runner commits still observes the user's HEAD, owned ledger entries or not: a reviewed branch in the user's repository (the demo, a planted experiment) carries them too. |
+
 
 ## Shutdown
 

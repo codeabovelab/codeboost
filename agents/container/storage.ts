@@ -494,6 +494,27 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
   liveAllocations.delete(owner.allocationId);
 }
 
+/**
+ * `removeTaskFilesystems` without blocking the event loop: the same removal, each Docker call in its own process group.
+ * It is never cancelled: it runs to its own deadline, so nothing is dropped, and settles only after every call exited.
+ */
+export async function removeTaskFilesystemsAsync(filesystems: TaskFilesystems | RecoveredTaskStorage): Promise<void> {
+  const recovered = recoveredStorage.get(filesystems as RecoveredTaskStorage);
+  if (recovered) {
+    const handle = filesystems as RecoveredTaskStorage;
+    await runStepsAsync(cleanup(recovered.keeperId ? [recovered.keeperId] : [],
+      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner), {});
+    recoveredStorage.delete(handle);
+    return;
+  }
+  const allocated = filesystems as TaskFilesystems;
+  assertTaskFilesystems(allocated);
+  const owner = taskFilesystemOwner(allocated);
+  await runStepsAsync(cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner), {});
+  allocations.delete(allocated);
+  liveAllocations.delete(owner.allocationId);
+}
+
 /** At most this much diff is returned; the caller saves it as a stopped attempt's partial output. */
 export const MAXIMUM_EXPORT_BYTES = 1024 * 1024;
 export interface TaskDiff {

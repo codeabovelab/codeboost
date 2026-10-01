@@ -168,3 +168,10 @@ it('preserves removed-side snippets and marks their references outdated after HE
  fixtureGit(config.repository,'commit','--allow-empty','-m','new revision');
  view=service.load();expect(view.notes[0]!.outdated).toBe(true);expect(view.notes[0]!.reference).toEqual(ref);
 });
+it('keeps observing the user\'s HEAD for a task the runner has not committed to, owned ledger entries or not (#87)', () => {
+ // The demo's ledger already owns its commits (a reviewed branch in the user's repository), but no attempt made them.
+ const {service,config}=fixture();
+ expect(service.reviewRepository()).toEqual({path:config.repository,runnerOwned:false});
+ fixtureGit(config.repository,'commit','--allow-empty','-m','User work');
+ expect(service.load().snapshot.head).toBe(fixtureGit(config.repository,'rev-parse','HEAD'));
+});

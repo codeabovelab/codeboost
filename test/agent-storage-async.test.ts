@@ -32,7 +32,7 @@ vi.mock('../agents/container/image.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../agents/container/image.ts')>(), assertBuiltAgentImage: () => {},
 }));
 const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTaskFilesystemsAsync,
-  removeTaskFilesystems } = await import('../agents/container/storage.ts');
+  removeTaskFilesystems, removeTaskFilesystemsAsync } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
 const { commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_BUNDLE_BYTES, MAXIMUM_DECLARED_LINKS,
   MAXIMUM_NAME_BYTES, TaskCommitRefused } = await import('../agents/container/changes.ts');
@@ -587,4 +587,28 @@ describe('runner commit', () => {
     rmSync(join(state, 'hang-commit'));
     removeTaskFilesystems(filesystems);
   }, 60_000);
+});
+
+describe('asynchronous task storage removal', () => {
+  it('removes allocated storage and a recovery handle without blocking, each Docker call in its own process group', async () => {
+    const groups: ProcessGroup[] = [];
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner(), { onProcessGroup: group => groups.push(group) });
+    calls.made = [];
+    let ticks = 0;
+    const ticker = setInterval(() => { ticks += 1; }, 5);
+    try { await removeTaskFilesystemsAsync(filesystems); } finally { clearInterval(ticker); }
+    expect(stored()).toEqual([]);
+    expect(calls.made.length).toBeGreaterThan(0);
+    // The event loop ran while Docker did: timers fired in between.
+    expect(ticks).toBeGreaterThan(0);
+    // Removed for good: the value is no longer storage D knows.
+    await expect(removeTaskFilesystemsAsync(filesystems)).rejects.toThrow('trusted allocator');
+    const owned = owner(), labels = (kind: string) => ({ 'io.codeboost.runner': owned.runnerOwner,
+      'io.codeboost.attempt': owned.attemptId, 'io.codeboost.allocation': owned.allocationId, 'io.codeboost.task-storage': kind });
+    const work = `codeboost-work-${randomUUID()}`;
+    writeFileSync(join(state, `${work}.json`), JSON.stringify({ kind: 'volume', labels: labels('work') }));
+    const handle = await adoptRecoveredTaskStorage(owned, { workVolume: work });
+    await removeTaskFilesystemsAsync(handle);
+    expect(stored()).toEqual([]);
+  });
 });

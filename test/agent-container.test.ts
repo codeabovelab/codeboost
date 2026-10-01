@@ -985,8 +985,28 @@ describe('real Docker agent isolation', () => {
         expect.objectContaining({ kind: 'modify', path: 'd/t.txt' }), expect.objectContaining({ kind: 'add', path: 'd/new.txt' }),
         expect.objectContaining({ kind: 'add', path: 'gone', newType: 'file' }),
         { kind: 'add', path: 'newlink', newType: 'symlink', newMode: '120000', newOid: expect.stringMatching(/^[0-9a-f]{40}$/),
-          newLinkTarget: '/etc/passwd', underGit: false, ignored: false }]));
+          newLinkTarget: '/etc/passwd', linkTargetTraversesLink: true, underGit: false, ignored: false }]));
       expect(manifest.changes.map(change => change.path)).not.toContain('r.txt');
+    }, 180_000);
+
+    it('says whether each changed link\'s new target passes through another link, as the kernel resolves it', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'd', 'e'), { recursive: true }); writeFileSync(join(source, 'd', 'e', 'f'), 'f\n');
+        // A link the item does not change, whose target text no manifest could carry: never reported, so never checked.
+        symlinkSync('d\u0001', join(source, 'w'));
+        writeFileSync(join(source, 't'), 't\n'); symlinkSync('d/e', join(source, 'via')); symlinkSync('t', join(source, 'old'));
+      } });
+      asAgent(data.filesystems, ['ln -sfn d/e/f old', 'ln -s via/f through', 'ln -s old chain', 'ln -s via/../t dotdot',
+        'ln -s missing/x dangling', 'ln -s ../outside out', 'ln -s .git/config meta', 'ln -s d plain-dir', 'ln -s w/x via-odd',
+        // Each name fits the manifest, but the target joined to the link's directory is longer than any name it carries.
+        `mkdir -p ${'p'.repeat(250)}/${'q'.repeat(250)}/${'r'.repeat(250)} && ln -s ${'s'.repeat(250)}/${'t'.repeat(250)} ${'p'.repeat(250)}/${'q'.repeat(250)}/${'r'.repeat(250)}/deep`].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, imageId, linkSnapshot: { links: [], targets: {} } });
+      const traverses = Object.fromEntries(manifest.changes.filter(change => change.newType === 'symlink')
+        .map(change => [change.path, change.linkTargetTraversesLink]));
+      // A ".." after a link climbs from where that link leads, so dotdot goes through via too.
+      expect(traverses).toEqual({ old: false, through: true, chain: true, dotdot: true, dangling: false, out: true, meta: true,
+        'plain-dir': false, 'via-odd': true, [`${'p'.repeat(250)}/${'q'.repeat(250)}/${'r'.repeat(250)}/deep`]: false });
+      expect(manifest.changes.filter(change => change.newType !== 'symlink').every(change => !('linkTargetTraversesLink' in change))).toBe(true);
     }, 180_000);
 
     it('resolves a declared link one part at a time: a link before ".." stops it, as the kernel would', async () => {

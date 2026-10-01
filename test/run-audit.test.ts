@@ -9,7 +9,7 @@ const item: PlanItem = { id: 'P1', title: 'T', intent: 'I', depends_on: [], acce
 ] };
 const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest> = {}): ChangeManifest =>
   ({ changes, agentCommits: [], metadataChanged: false, linkTargetChanges: [], nestedGitlinkContent: [], ...over });
-const file = (path: string, over: Partial<ManifestChange> = {}): ManifestChange => ({ path, kind: 'modify', oldType: 'file', newType: 'file', underGit: false, ...over });
+const file = (path: string, over: Partial<ManifestChange> = {}): ManifestChange => ({ path, kind: 'modify', oldType: 'file', newType: 'file', underGit: false, ignored: false, ...over });
 const exact = (p: string) => p, folded = (p: string) => p.toLowerCase();
 
 describe('post-run audit', () => {
@@ -34,11 +34,32 @@ describe('post-run audit', () => {
     for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
       expect(auditRun(item, manifest([file('src/retry.ts')], { [field]: undefined as unknown as string[] }), exact)).toEqual({ kind: 'violation', violations: [`The change report has no ${field} list.`] });
   });
+  it('treats a file base ignores as a safety violation, never something to commit (#87)', () => {
+    expect(auditRun(item, manifest([file('src/retry.ts'), file('src/.env', { kind: 'add', oldType: undefined, ignored: true })]), exact))
+      .toEqual({ kind: 'violation', violations: ['The agent added "src/.env", which the repository ignores.'] });
+    // Declared or not: a declared path that base ignores is still never committed.
+    expect(auditRun(item, manifest([file('src/retry.ts', { ignored: true })]), exact)).toMatchObject({ kind: 'violation' });
+    expect(auditRun(item, manifest([file('src/retry.ts', { ignored: undefined as unknown as boolean })]), exact))
+      .toEqual({ kind: 'violation', violations: ['The change at "src/retry.ts" does not say whether base ignores it.'] });
+  });
+  it('lets a declared link be retargeted by its own edit, and refuses every write through it', () => {
+    const edit = file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: 'src/retry.ts', linkTargetTraversesLink: false });
+    const retargeted = { link: 'link', target: 'old.ts', path: 'link', change: 'retargeted' as const };
+    expect(auditRun(item, manifest([edit], { linkTargetChanges: [retargeted] }), exact)).toMatchObject({ kind: 'commit', inScope: ['link'] });
+    // Retargeted with no edit of the link in the manifest: something on the way to its target changed.
+    expect(auditRun(item, manifest([file('src/retry.ts')], { linkTargetChanges: [retargeted] }), exact)).toMatchObject({ kind: 'violation' });
+    // The edit does not excuse a write through the link to its old target.
+    expect(auditRun(item, manifest([edit], { linkTargetChanges: [retargeted, { ...retargeted, path: 'old.ts', change: 'content' }] }), exact))
+      .toEqual({ kind: 'violation', violations: ['A declared symlink target changed: "link -> old.ts (content)".'] });
+    for (const entry of ['old.ts', { ...retargeted, change: 'moved' }, { ...retargeted, path: undefined }])
+      expect(auditRun(item, manifest([edit], { linkTargetChanges: [entry as never] }), exact))
+        .toEqual({ kind: 'violation', violations: ['The change report has a malformed link target change.'] });
+  });
   it('fails closed on a partial record: every field the audit reads must be present and well-formed', () => {
     const cases: [string, ChangeManifest, RegExp][] = [
       ['no metadata flag', manifest([file('src/retry.ts')], { metadataChanged: undefined as unknown as boolean }), /whether Git metadata changed/],
       ['no underGit', manifest([{ path: 'src/retry.ts', kind: 'modify', oldType: 'file', newType: 'file' } as ManifestChange]), /under \.git/],
-      ['add without a new type', manifest([{ path: 'src/new.ts', kind: 'add', underGit: false } as ManifestChange]), /invalid new entry type/],
+      ['add without a new type', manifest([{ path: 'src/new.ts', kind: 'add', underGit: false, ignored: false } as ManifestChange]), /invalid new entry type/],
       ['modify without an old type', manifest([file('src/retry.ts', { oldType: undefined })]), /invalid old entry type/],
       ['unknown kind', manifest([file('src/retry.ts', { kind: 'chmod' as ManifestChange['kind'] })]), /unknown kind/],
       ['rename without an old path', manifest([file('docs/New.md', { kind: 'rename' })]), /invalid old path/],
@@ -176,7 +197,7 @@ describe('post-run audit', () => {
     const cases: [string, ChangeManifest][] = [
       ['metadata', manifest([file('src/retry.ts')], { metadataChanged: true })],
       ['under .git', manifest([file('.git/hooks/pre-commit', { underGit: true })])],
-      ['link target changed', manifest([], { linkTargetChanges: ['target/file'] })],
+      ['link target changed', manifest([], { linkTargetChanges: [{ link: 'link', target: 'target', path: 'target/file', change: 'content' }] })],
       ['gitlink content', manifest([], { nestedGitlinkContent: ['vendor/lib/x'] })],
       ['new gitlink', manifest([file('vendor/lib', { kind: 'add', oldType: undefined, newType: 'gitlink' })])],
       ['new symlink', manifest([file('src/retry.ts', { newType: 'symlink', newLinkTarget: 'other.ts', linkTargetTraversesLink: false })])],

@@ -304,8 +304,12 @@ sub anchored {
   }
   return { status => $status, anchor => target_entry($anchor eq "" ? "." : $anchor) };
 }
+# With $unchecked, names are kept as bytes and never checked: only the status is wanted.
 sub resolve {
-  my ($link, $walk) = @_; my %record = (link => text($link, "declared path"));
+  my ($link, $walk, $unchecked) = @_; my $name = $unchecked ? sub { $_[0] } : \&text;
+  # Unchecked, a link on the way is reported by status alone: its anchor entry would check the anchor's names.
+  my $through = sub { $unchecked ? { status => "through-link" } : anchored("through-link", $_[0]) };
+  my %record = (link => $name->($link, "declared path"));
   my @parents = split m{/}, $link; pop @parents; my $prefix = "";
   # A declared path that is not there, or not a link, is not-a-link whether or not its directory exists: adding or
   # deleting a declared file must not look like a change to a link. A directory on the way that is a link still makes
@@ -313,12 +317,12 @@ sub resolve {
   for my $part (@parents) {
     $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
     return { %record, status => "not-a-link" } unless @stat;
-    return { %record, %{ anchored("through-link", $prefix) } } if -l _;
+    return { %record, %{ $through->($prefix) } } if -l _;
     return { %record, status => "not-a-link" } unless -d _;
   }
   my @stat = lstat $link;
   return { %record, status => "not-a-link" } unless @stat && -l _;
-  my $raw = readlink $link; $record{linkTarget} = text($raw, "the link target of " . shown($link));
+  my $raw = readlink $link; $record{linkTarget} = $name->($raw, "the link target of " . shown($link));
   # From the filesystem root: ("work", ...) is inside the work tree.
   my @at = $raw =~ m{^/} ? () : ("work", @parents);
   my @parts = grep { $_ ne "" && $_ ne "." } split m{/}, $raw;
@@ -333,7 +337,7 @@ sub resolve {
     return { %record, status => "metadata" } if @at > 1 && $at[1] eq ".git";
     next if @at == 1;
     my $path = join "/", @at[1 .. $#at]; my @here = lstat $path;
-    return { %record, %{ anchored("through-link", $path) } } if @here && -l _;
+    return { %record, %{ $through->($path) } } if @here && -l _;
   }
   return { %record, status => "outside" } if @at < 2;
   my $target = join "/", @at[1 .. $#at];
@@ -341,7 +345,7 @@ sub resolve {
   # a change to it. The target's own state (its entries, or its anchor) is reported once per target, not per link.
   my @final = lstat $target; $resolved_targets{$target} = 1;
   my $status = $walk ? target_state($target)->{status} : @final ? "present" : "absent";
-  return { %record, target => text($target, "path"), status => $status };
+  return { %record, target => $name->($target, "path"), status => $status };
 }
 # Each distinct target is walked once per run, so two declared links to one target count its entries once.
 my %target_states;
@@ -622,6 +626,15 @@ for my $change (@changes) {
     if defined $change->{newLinkTarget};
   $change->{path} = text($change->{path}, "path");
   $change->{oldPath} = text($change->{oldPath}, "path") if defined $change->{oldPath};
+}
+# Where each changed link's new target leads, resolved one part at a time as the kernel would in an agent container:
+# whether a part on the way, or the target itself, is another link. One that leaves the work tree or enters the
+# metadata counts as traversing, since what is there cannot be checked from here.
+for my $i (0 .. $#changes) {
+  next unless ($changes[$i]{newType} // "") eq "symlink";
+  # The joined target can be longer than either name the manifest carries, so nothing here is checked as a name.
+  my $status = resolve($raw[$i]{path}, 0, 1)->{status};
+  $changes[$i]{linkTargetTraversesLink} = $status eq "present" || $status eq "absent" ? JSON::PP::false : JSON::PP::true;
 }
 
 my $head = git("rev-parse", "--verify", "HEAD"); chomp $head;
