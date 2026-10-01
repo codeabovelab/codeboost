@@ -5,6 +5,7 @@ import { prepareExecution } from '../core/execution-prompt.ts';
 import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-body.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import type { DeclaredLinkSnapshot } from '../agents/container/changes.ts';
+import type { IssueText } from '../github/issues.ts';
 import { saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
@@ -49,7 +50,8 @@ export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: 
 /** Trusted runner-side sources for a task. Issue text and lessons are untrusted data inside the prompt. */
 export interface ExecutionSources {
   planContext(identity: PlanIdentity): PlanContext;
-  issue(identity: PlanIdentity): { number: number; title: string; body: string; comments: readonly string[] };
+  /** The issue text the prompt carries; fetched per attempt, so it may await (and must stop on abort). */
+  issue(identity: PlanIdentity, signal: AbortSignal): IssueText | Promise<IssueText>;
   lessons(identity: PlanIdentity): readonly string[];
   vendor(identity: PlanIdentity): 'claude' | 'codex';
 }
@@ -127,14 +129,18 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
   };
   return {
     runnerOwner,
+    // Only execute attempts have deps yet; admission refuses the rest before any row is written (#91).
+    kinds: ['execute'],
     async prepare(attempt, signal) {
       if (attempt.kind !== 'execute' || !attempt.item) throw new Error('Execution deps run execute attempts for one plan item.');
       const identity = identityOf(attempt), plan = store.getPlan(identity, attempt.context.planRevision);
       const item = plan.items.find(entry => entry.id === attempt.item)!;
       const context = sources.planContext(identity);
       const baseHead = store.getSnapshot(identity, attempt.context.snapshotId).head;
+      const issue = await sources.issue(identity, signal);
+      signal.throwIfAborted();
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
-        issue: sources.issue(identity), approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
+        issue, approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
       const vendor = sources.vendor(identity);
       const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
@@ -257,16 +263,25 @@ export class ItemExecutor {
    * Tasks with a runTask in progress here, from its start to its return: a second one waits for none of its steps.
    * The guard is per instance, so the server must keep one ItemExecutor per Store (as it keeps one coordinator).
    */
-  #inFlight = new Set<string>();
+  #inFlight = new Map<string, Promise<unknown>>();
   async runTask(identity: PlanIdentity, options: { fromItem?: string } = {}): Promise<ExecutionOutcome> {
     const key = identityKey(identity);
     // Held for the whole run, so a second run can never pay this run's pause or finding, even in the microtasks between
     // the coordinator dropping the job and this run resuming.
     if (this.#inFlight.has(key)) return { kind: 'stopped', item: options.fromItem ?? this.#store.getPlan(identity).items[0]!.id, state: 'not started',
       reason: 'An earlier run of this task is still finishing; start it again when that run has ended.', completed: [] };
-    this.#inFlight.add(key);
-    try { return await this.#runTask(identity, options); }
+    const run = this.#runTask(identity, options);
+    this.#inFlight.set(key, run.catch(() => undefined));
+    try { return await run; }
     finally { this.#inFlight.delete(key); }
+  }
+  /**
+   * Shutdown, after the coordinator's close: await every run in progress. A run's pause or escalation after its last
+   * attempt settles is a settlement write, so the Store must stay open until each run has returned (#91). Admission is
+   * already closed, so no run starts another item.
+   */
+  async close(): Promise<void> {
+    while (this.#inFlight.size) await Promise.all([...this.#inFlight.values()]);
   }
   async #runTask(identity: PlanIdentity, options: { fromItem?: string }): Promise<ExecutionOutcome> {
     const plan = this.#store.getPlan(identity);

@@ -6,6 +6,8 @@ const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
 const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
+/** The most issue text (title, body and the collaborator comments kept) one execute prompt carries. */
+const MAX_ISSUE_TEXT = 512 * 1024;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
 /**
@@ -40,6 +42,9 @@ export interface IssueSnapshot {
   readonly retrievedAt: string;
   readonly issues: readonly RepositoryIssue[];
 }
+
+/** The issue text an execute prompt carries, as untrusted data. */
+export interface IssueText { readonly number: number; readonly title: string; readonly body: string; readonly comments: readonly string[] }
 
 export interface IssueGateway {
   readonly repository: string;
@@ -229,7 +234,52 @@ export class GhIssueGateway implements IssueGateway {
     }));
   }
 
-  async fetch(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueSnapshot> {
+  /**
+   * One issue's text for an execute prompt (#91): its title, body and the comments of repository collaborators only
+   * (design, "Which comments reach the agent"), oldest first. Everything stays untrusted data inside the prompt.
+   * Fails closed on anything malformed, on a pull request, and past the comment page limit.
+   */
+  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueText> {
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
+    return this.#bounded(options, async signal => {
+      let decoded: unknown;
+      const output = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/issues/${number}`], { signal });
+      try { decoded = JSON.parse(output); }
+      catch { throw new Error('GitHub returned invalid issue JSON.'); }
+      const issue = object(decoded, 'GitHub returned a malformed issue.');
+      if (issue.number !== number) throw new Error('GitHub returned a different issue.');
+      if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
+      const title = boundedString(issue.title, 'title', 4096), body = boundedString(issue.body, 'body', MAX_BODY_LENGTH, true);
+      const collaborators = await this.#loadCollaborators(signal);
+      const comments: string[] = [];
+      let total = title.length + body.length;
+      for (let page = 1; ; page++) {
+        if (page > MAX_PAGES) throw new Error(`Issue #${number} has more than ${MAX_ISSUES} comments; codeboost does not read past that limit.`);
+        const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
+          `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });
+        let values: unknown;
+        try { values = JSON.parse(listed); }
+        catch { throw new Error('GitHub returned invalid comment JSON.'); }
+        if (!Array.isArray(values) || values.length > PAGE_SIZE) throw new Error('GitHub returned an invalid comment page.');
+        for (const value of values) {
+          const comment = object(value, 'GitHub returned a malformed comment.');
+          const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
+          // A deleted ("ghost") author is nobody's collaborator.
+          if (comment.user === null) continue;
+          const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
+          if (!collaborators.has(author.toLocaleLowerCase('en-US'))) continue;
+          total += text.length;
+          if (total > MAX_ISSUE_TEXT) throw new Error(`Issue #${number}'s text and collaborator comments are longer than ${MAX_ISSUE_TEXT} characters; codeboost does not cut an issue to fit a prompt.`);
+          comments.push(text);
+        }
+        if (values.length < PAGE_SIZE) break;
+      }
+      return { number, title, body, comments };
+    });
+  }
+
+  /** Runs `load` under the caller's signal and an overall deadline, as `fetch` does. */
+  async #bounded<T>(options: { signal?: AbortSignal; timeoutMs?: number }, load: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const timeoutMs = options.timeoutMs ?? 12_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error('Invalid issue retrieval timeout.');
     options.signal?.throwIfAborted();
@@ -238,11 +288,9 @@ export class GhIssueGateway implements IssueGateway {
     options.signal?.addEventListener('abort', relay, { once: true });
     const timer = setTimeout(() => controller.abort(new Error('Issue retrieval timed out.')), timeoutMs);
     try {
-      const issues = await this.#load(controller.signal);
+      const value = await load(controller.signal);
       controller.signal.throwIfAborted();
-      const retrievedAt = this.now();
-      if (!Number.isFinite(retrievedAt.getTime())) throw new Error('Issue retrieval clock is invalid.');
-      return { repository: this.repository, retrievedAt: retrievedAt.toISOString(), issues };
+      return value;
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
       if (controller.signal.aborted) throw new Error('Issue retrieval timed out.');
@@ -251,5 +299,15 @@ export class GhIssueGateway implements IssueGateway {
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', relay);
     }
+  }
+
+  async fetch(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueSnapshot> {
+    return this.#bounded(options, async signal => {
+      const issues = await this.#load(signal);
+      signal.throwIfAborted();
+      const retrievedAt = this.now();
+      if (!Number.isFinite(retrievedAt.getTime())) throw new Error('Issue retrieval clock is invalid.');
+      return { repository: this.repository, retrievedAt: retrievedAt.toISOString(), issues };
+    });
   }
 }

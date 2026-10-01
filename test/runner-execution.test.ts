@@ -37,7 +37,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   /** Called by the fake launcher once the agent has started, before its result settles. */
   onLaunch?: (attemptId: string) => void;
   /** The fake agent's result names this attempt instead. */
-  foreignResult?: boolean } = {}) {
+  foreignResult?: boolean; issue?: ExecutionSources['issue'] } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
@@ -71,7 +71,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
     },
   };
   const auditContext: PlanContext = options.pathKeyError ? { ...context, pathKey: () => { throw options.pathKeyError; } } : context;
-  const sources: ExecutionSources = { planContext: () => auditContext, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+  const sources: ExecutionSources = { planContext: () => auditContext, issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
   const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
@@ -299,6 +299,37 @@ describe('item execution', () => {
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs amendment');
+  });
+  it('keeps the Store open at shutdown until a run\'s pause after its last attempt is written (#91)', async () => {
+    let releaseStarted!: () => void, finishRelease!: () => void;
+    const started = new Promise<void>(resolve => { releaseStarted = resolve; });
+    const gate = new Promise<void>(resolve => { finishRelease = resolve; });
+    const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) },
+      capability: s => s.shutdownCapability(), release: async () => { releaseStarted(); await gate; } });
+    // The run resumes some time after its job settles; nothing orders that before the coordinator's close returns.
+    const settled = h.runner.settled.bind(h.runner);
+    h.runner.settled = async target => { await settled(target); await new Promise(resolve => setTimeout(resolve, 30)); };
+    const run = h.executor.runTask(identity);
+    await started;
+    // Shutdown, server order: close the write gate, stop the coordinator, then await the executor.
+    h.store.closeWrites();
+    let closed = false;
+    const closing = h.runner.close().then(() => h.executor.close()).then(() => { closed = true; });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    expect(closed).toBe(false);
+    finishRelease();
+    await closing;
+    // The pause landed through the capability before close returned, so closing the Store now loses nothing.
+    expect(h.store.getTask(identity).status).toBe('needs amendment');
+    await expect(run).resolves.toMatchObject({ kind: 'needs amendment', item: 'P1' });
+  });
+  it('fetches the issue for each attempt, and fails it before any storage when the fetch fails', async () => {
+    const signals: AbortSignal[] = [];
+    const h = setup({ issue: (_identity, signal) => { signals.push(signal); return Promise.reject(new Error('Issue retrieval timed out.')); } });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed' });
+    expect(signals).toHaveLength(1);
+    expect(h.log).toEqual([]);
+    expect(h.store.getAttempts(identity)[0]!.diagnostic).toMatch(/Issue retrieval timed out/);
   });
   it('commits a rename as the manifest audited it', async () => {
     const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })], { digest: 'renamed' }) } });

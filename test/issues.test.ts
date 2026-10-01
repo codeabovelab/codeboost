@@ -231,3 +231,36 @@ describe('GitHub issue retrieval', () => {
     await expect(gateway.fetch({ signal: controller.signal })).rejects.toBe(cancelled);
   });
 });
+
+describe('issue text for an execute prompt (#91)', () => {
+  const comment = (login: string | null, body: string) => ({ body, user: login === null ? null : { login } });
+  const gateway = (pages: unknown[][], issue: Record<string, unknown> = rawIssue(), collaborators = ['member']) => {
+    const calls: string[][] = [];
+    return { calls, gateway: new GhIssueGateway('owner/repo', async args => {
+      calls.push([...args]);
+      if (isCollaboratorRequest(args)) return JSON.stringify(collaborators.map(login => ({ login })));
+      const path = args[5]!;
+      if (path.endsWith('/comments')) return JSON.stringify(pages[Number(args.at(-1)!.split('=')[1]) - 1] ?? []);
+      return JSON.stringify(issue);
+    }) };
+  };
+  it('keeps only collaborators\' comments, oldest first, across pages', async () => {
+    const full = Array.from({ length: 100 }, (_, n) => comment(n % 2 ? 'Member' : 'outsider', `c${n}`));
+    const { gateway: g, calls } = gateway([full, [comment('member', 'last'), comment(null, 'ghost')]]);
+    const text = await g.issueText(7);
+    expect(text).toMatchObject({ number: 7, title: 'Fix retries', body: 'Keep issue text as data.' });
+    expect(text.comments).toEqual([...full.filter((_, n) => n % 2).map(c => c.body), 'last']);
+    expect(calls.filter(args => args[5]!.endsWith('/comments')).map(args => args.at(-1))).toEqual(['page=1', 'page=2']);
+  });
+  it('refuses a pull request, a different issue, and text too long for a prompt', async () => {
+    await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
+    await expect(gateway([], rawIssue({ number: 8 })).gateway.issueText(7)).rejects.toThrow(/different issue/);
+    const long = Array.from({ length: 9 }, () => comment('member', 'x'.repeat(65_000)));
+    await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/longer than/);
+  });
+  it('stops on the caller\'s abort', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('stopped'));
+    await expect(gateway([]).gateway.issueText(7, { signal: controller.signal })).rejects.toThrow(/stopped/);
+  });
+});

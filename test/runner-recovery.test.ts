@@ -102,7 +102,14 @@ function fixture(count = 1) {
   const admit = (identity: PlanIdentity, extra: Record<string, unknown> = {}) => store.admitAttempt(identity, {
     expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000, ...extra,
   });
-  return { d, path, store, raw, admit };
+  /** What F saves at allocation (#91): the allocation ID first, then D's metadata baseline and the seeded commit. */
+  const allocate = (identity: PlanIdentity, attemptId: string, handle: unknown, saved: { baseline?: boolean } = {}) => {
+    const allocationId = randomUUID();
+    store.recordAllocation(identity, attemptId, allocationId);
+    if (saved.baseline !== false) store.recordAllocationBaseline(identity, attemptId, allocationId, 'b'.repeat(64), oid(2));
+    return { attemptId, allocationId, handle };
+  };
+  return { d, path, store, raw, admit, allocate };
 }
 
 describe('runner owner token', () => {
@@ -195,7 +202,7 @@ describe('startup recovery sequence', () => {
     const calls: string[] = [];
     const d: RecoveryDeps = {
       recoverLeftovers: async () => { calls.push('recover'); return { storage: [], unowned: [] }; },
-      exportTaskDiff: async () => { calls.push('export'); return Buffer.from('diff'); },
+      exportTaskDiff: async () => { calls.push('export'); return { diff: Buffer.from('diff'), truncated: false }; },
       removeTaskFilesystems: async handle => { calls.push(`remove:${String(handle)}`); },
       processes: { isAlive: () => true, terminate: async pgid => { calls.push(`terminate:${pgid}`); } },
       ...over,
@@ -203,36 +210,41 @@ describe('startup recovery sequence', () => {
     return { d, calls };
   }
   it('stops preparation first, then D recovery, export, finalization and removal, in that order', async () => {
-    const { d: root, store, admit } = fixture(2);
-    const writable = admit(id(1)); store.markRunning(id(1), writable.id);
+    const { d: root, store, admit, allocate } = fixture(2);
+    const writable = admit(id(1)); const w = allocate(id(1), writable.id, 'w'); store.markRunning(id(1), writable.id);
     const readOnly = admit(id(2), { kind: 'review' });
     store.markPreparationStarting(id(2), readOnly.id, Date.now()); store.recordPreparationGroup(id(2), readOnly.id, 4242);
+    const r = allocate(id(2), readOnly.id, 'r');
+    const inputs: unknown[] = [];
     const { d, calls } = deps({
-      recoverLeftovers: async () => { calls.push('recover'); return { storage: [{ attemptId: writable.id, allocationId: randomUUID(), handle: 'w' }, { attemptId: readOnly.id, allocationId: randomUUID(), handle: 'r' }], unowned: [] }; },
-      exportTaskDiff: async () => { calls.push(`export:${store.getAttempt(id(1), writable.id).state}`); return Buffer.from('partial'); },
+      recoverLeftovers: async () => { calls.push('recover'); return { storage: [w, r], unowned: [] }; },
+      exportTaskDiff: async (_h, input) => { inputs.push(input); calls.push(`export:${store.getAttempt(id(1), writable.id).state}`); return { diff: Buffer.from('partial'), truncated: false }; },
     });
     const report = await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'runner'), diagnosticsDir: join(root, 'diag'), deps: d });
     expect(calls).toEqual(['terminate:4242', 'recover', 'export:running', 'remove:w', 'remove:r']);
     const finalized = store.getAttempt(id(1), writable.id);
     expect(finalized).toMatchObject({ state: 'failed', diagnosticRef: join(root, 'diag', `${writable.id}.diff`) });
     expect(readFileSync(finalized.diagnosticRef!, 'utf8')).toBe('partial');
+    // D's export of a recovered handle gets the baseline and seeded commit saved at allocation.
+    expect(inputs).toEqual([{ base: oid(2), metadataBaseline: 'b'.repeat(64) }]);
+    expect(statSync(finalized.diagnosticRef!).mode & 0o777).toBe(0o600);
     expect(report.requeue).toContain(store.getTask(id(1)).planKey);
   });
   it('stops before finalizing anything when D recovery rejects or reports unowned resources', async () => {
     for (const recoverLeftovers of [async () => { throw new Error('docker down'); }, async () => ({ storage: [], unowned: ['container legacy'] })]) {
       const { d: root, store, admit } = fixture();
       const attempt = admit(id(1)); store.markRunning(id(1), attempt.id);
-      await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: deps({ recoverLeftovers }).d })).rejects.toThrow(/docker down|older build/);
+      await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: deps({ recoverLeftovers }).d })).rejects.toThrow(/docker down|cannot identify/);
       expect(store.getAttempt(id(1), attempt.id).state).toBe('running');
     }
   });
   it('records an export timeout as a diagnostic and still finalizes and removes the storage', async () => {
-    const { d: root, store, admit } = fixture();
-    const attempt = admit(id(1)); store.markRunning(id(1), attempt.id);
+    const { d: root, store, admit, allocate } = fixture();
+    const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h'); store.markRunning(id(1), attempt.id);
     const { d, calls } = deps({
-      recoverLeftovers: async () => ({ storage: [{ attemptId: attempt.id, allocationId: randomUUID(), handle: 'h' }], unowned: [] }),
+      recoverLeftovers: async () => ({ storage: [h], unowned: [] }),
       // D's export stops a moment after its signal aborts.
-      exportTaskDiff: (_h, _m, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => setTimeout(() => { calls.push('export-stopped'); reject(signal.reason); }, 40), { once: true })),
+      exportTaskDiff: (_h, _i, _m, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => setTimeout(() => { calls.push('export-stopped'); reject(signal.reason); }, 40), { once: true })),
     });
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d, exportDeadlineMs: 30 });
     expect(store.getAttempt(id(1), attempt.id)).toMatchObject({ state: 'failed', diagnosticRef: null });
@@ -242,10 +254,10 @@ describe('startup recovery sequence', () => {
     expect(calls.indexOf('remove:h')).toBeGreaterThan(calls.indexOf('export-stopped'));
   });
   it('stops startup, leaving storage and the attempt untouched, when a timed-out export does not stop', async () => {
-    const { d: root, store, admit } = fixture();
-    const attempt = admit(id(1)); store.markRunning(id(1), attempt.id);
+    const { d: root, store, admit, allocate } = fixture();
+    const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h'); store.markRunning(id(1), attempt.id);
     const { d, calls } = deps({
-      recoverLeftovers: async () => ({ storage: [{ attemptId: attempt.id, allocationId: randomUUID(), handle: 'h' }], unowned: [] }),
+      recoverLeftovers: async () => ({ storage: [h], unowned: [] }),
       exportTaskDiff: () => new Promise(() => undefined),
     });
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d, exportDeadlineMs: 30, graceMs: 30 }))
@@ -254,10 +266,10 @@ describe('startup recovery sequence', () => {
     expect(store.getAttempt(id(1), attempt.id).state).toBe('running');
   });
   it('removes nothing when the finalization transaction fails', async () => {
-    const { d: root, store, admit } = fixture();
-    const attempt = admit(id(1)); store.markRunning(id(1), attempt.id);
+    const { d: root, store, admit, allocate } = fixture();
+    const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h'); store.markRunning(id(1), attempt.id);
     vi.spyOn(store, 'recoverInterrupted').mockImplementation(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
-    const { d, calls } = deps({ recoverLeftovers: async () => ({ storage: [{ attemptId: attempt.id, allocationId: randomUUID(), handle: 'h' }], unowned: [] }) });
+    const { d, calls } = deps({ recoverLeftovers: async () => ({ storage: [h], unowned: [] }) });
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d })).rejects.toThrow(/disk/);
     expect(calls.some(c => c.startsWith('remove'))).toBe(false);
   });
@@ -273,6 +285,23 @@ describe('startup recovery sequence', () => {
     expect(existsSync(join(attempts, attempt.id))).toBe(false);
     expect(report.unknownEntries).toHaveLength(2);
     expect(existsSync(root)).toBe(true);
+  });
+  it('uses a handle only when its allocation ID matches the attempt row, and leaves any other for a person', async () => {
+    const { d: root, store, admit, allocate } = fixture();
+    const attempt = admit(id(1)); const saved = allocate(id(1), attempt.id, 'saved'); store.markRunning(id(1), attempt.id);
+    const other = { attemptId: attempt.id, allocationId: randomUUID(), handle: 'other' };
+    const { d, calls } = deps({ recoverLeftovers: async () => ({ storage: [other, saved], unowned: [] }) });
+    const report = await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d });
+    expect(calls).toEqual(['export', 'remove:saved']);
+    expect(report.unmatchedStorage).toEqual([attempt.id]);
+  });
+  it('records an export failure, without calling D, when the allocation baseline was never saved', async () => {
+    const { d: root, store, admit, allocate } = fixture();
+    const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h', { baseline: false }); store.markRunning(id(1), attempt.id);
+    const { d, calls } = deps({ recoverLeftovers: async () => ({ storage: [h], unowned: [] }) });
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d });
+    expect(calls).toEqual(['remove:h']);
+    expect(store.getAttempt(id(1), attempt.id).diagnostic).toMatch(/Partial output could not be exported: its storage baseline was never saved/);
   });
   it('fails closed on an unrecorded preparation until it is released, and refuses release while a process uses it', async () => {
     const { d: root, store, admit } = fixture();

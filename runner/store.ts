@@ -65,6 +65,12 @@ export interface AttemptRecord {
    */
   safetyFinding: string | null;
 }
+/** A non-terminal attempt at startup, with what recovery needs to stop its preparation and export its storage. */
+export interface InterruptedAttempt extends AttemptRecord {
+  planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; allocationId: string | null;
+  /** Saved after D's allocation returned (#91); null when it never did. */
+  metadataBaseline: string | null; storageBase: string | null;
+}
 export type FeedbackKind = 'reject' | 'change-request' | 'segment-accept' | 'segment-assign' | 'finding-accept' | 'needs-human-guidance' | 'task-closed';
 const FEEDBACK_KINDS: readonly FeedbackKind[] = ['reject', 'change-request', 'segment-accept', 'segment-assign', 'finding-accept', 'needs-human-guidance', 'task-closed'];
 export interface FeedbackEvent {
@@ -96,8 +102,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 8) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 9) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -133,6 +139,14 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'safety_finding'))
             this.#db.exec('ALTER TABLE attempts ADD COLUMN safety_finding TEXT');
           this.#db.exec('PRAGMA user_version=8');
+        }
+        // What startup recovery needs to export a recovered task storage (#91): D's metadata baseline and the commit the
+        // storage was seeded from. Idempotent, like v8.
+        if (version < 9) {
+          const columns = this.#db.prepare('PRAGMA table_info(attempts)').all().map(column => column.name);
+          if (!columns.includes('metadata_baseline')) this.#db.exec('ALTER TABLE attempts ADD COLUMN metadata_baseline TEXT');
+          if (!columns.includes('storage_base')) this.#db.exec('ALTER TABLE attempts ADD COLUMN storage_base TEXT');
+          this.#db.exec('PRAGMA user_version=9');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -1348,11 +1362,24 @@ export class Store {
     if (this.#run(`UPDATE attempts SET allocation_id=? WHERE plan_key=? AND id=? AND state='pending' AND allocation_id IS NULL`, allocationId, identityKey(identity), id).changes !== 1)
       throw new GuardRefusal('Allocation can be recorded once, for a pending attempt.');
   }
+  /**
+   * Saved once D's allocation returns, for the allocation recorded before it: startup recovery passes both to D's export
+   * of a recovered storage, which refuses without the baseline. A crash before this write leaves them null, and that
+   * export then fails closed.
+   */
+  recordAllocationBaseline(identity: PlanIdentity, id: string, allocationId: string, metadataBaseline: string, base: string): void {
+    if (!/^[0-9a-f]{64}$/.test(metadataBaseline)) throw new GuardRefusal('Invalid metadata baseline.');
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base)) throw new GuardRefusal('Invalid storage base commit.');
+    if (this.#run(`UPDATE attempts SET metadata_baseline=?, storage_base=? WHERE plan_key=? AND id=? AND state='pending' AND allocation_id=? AND metadata_baseline IS NULL`,
+      metadataBaseline, base, identityKey(identity), id, allocationId).changes !== 1)
+      throw new GuardRefusal('The allocation baseline can be recorded once, for the pending attempt\'s own allocation.');
+  }
   /** Every non-terminal attempt, across all plans, with the fields recovery needs. */
-  interruptedAttempts(): (AttemptRecord & { planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; allocationId: string | null })[] {
+  interruptedAttempts(): InterruptedAttempt[] {
     return this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => ({
       ...this.#attemptRecord(row), planKey: row.plan_key as string, preparationPgid: row.preparation_pgid as number | null,
       preparationStartedAt: row.preparation_started_at as number | null, allocationId: row.allocation_id as string | null,
+      metadataBaseline: row.metadata_baseline as string | null, storageBase: row.storage_base as string | null,
     }));
   }
   /**
@@ -1413,6 +1440,10 @@ export class Store {
   /** Which plan owns an attempt ID, across all plans; null if none. */
   attemptOwner(attemptId: string): string | null {
     return (this.#get('SELECT plan_key FROM attempts WHERE id=?', attemptId)?.plan_key as string | undefined) ?? null;
+  }
+  /** The allocation ID F saved for an attempt, across all plans; null if none (or no such attempt). */
+  attemptAllocation(attemptId: string): string | null {
+    return (this.#get('SELECT allocation_id FROM attempts WHERE id=?', attemptId)?.allocation_id as string | null | undefined) ?? null;
   }
   /** Interrupted rebases recorded by F3 (none exist before F3). */
   rebasesInProgress(): { planKey: string; marker: unknown }[] {

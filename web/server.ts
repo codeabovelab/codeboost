@@ -7,6 +7,9 @@ import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MERGE_OPERATION_TIMEOUT_MS, MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
+import { ItemExecutor } from '../runner/execution.ts';
+import type { RunnerAssembly } from '../runner/production.ts';
+import type { ShutdownCapability } from '../runner/lifecycle.ts';
 import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
@@ -22,10 +25,18 @@ export interface PlanningDeps {
 const publicRoot = new URL('./public/', import.meta.url);
 /** The longest shutdown waits for admitted requests to finish before aborting them; below the 15 s request timeout. */
 export const MAX_SHUTDOWN_DRAIN_MS = 14_500;
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planning?: PlanningDeps) {
+/**
+ * The production runner's startup (#91, `setUpRunner`): run after the Store opens and before the server listens, so
+ * startup recovery finishes before anything is admitted. A rejection stops startup.
+ */
+export type RunnerSetup = (service: ReviewService, capability: ShutdownCapability) => Promise<RunnerAssembly>;
+export const RUNNER_NOT_CONFIGURED = 'The runner is not configured. Add a runner block to the review configuration and restart codeboost.';
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planning?: PlanningDeps, runnerSetup?: RunnerSetup) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
+  /** Runs a task's plan items; one per Store, like the coordinator. Only the production runner has one. */
+  let executor: ItemExecutor | null = null;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
   const capability = service.store.shutdownCapability();
   try {
@@ -35,7 +46,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     issues = new IssueBoard(issueGateway ?? (config.demo ? demoIssueGateway() : config.github ? new GhIssueGateway(config.github.repository) : null),
       'Issue ranking needs a GitHub repository. Add a github block with a repository to the review configuration.');
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), MERGE_OPERATION_TIMEOUT_MS, capability) : null;
-    // The runner starts only with an injected D; until #51 lands, runner actions report that it is unavailable.
+    if (runnerDeps && runnerSetup) throw new Error('Pass runner deps or a runner setup, not both.');
+    // Without a runner (no runner block, or a demo), runner actions report that it is not configured.
     runner = runnerDeps ? new RunnerCoordinator(service.store, runnerDeps, undefined, capability) : null;
     // E3's settlement writes (completeSuggestions, settleSuggestion in close()) run with the shutdown capability.
     const store = service.store;
@@ -48,6 +60,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     };
     suggestions = planning ? new SuggestionCoordinator(suggestionStore, planning.provider) : null;
   } catch (error) { service.close(); throw error; }
+  if (runnerSetup) {
+    // Startup recovery runs here, before listen: nothing is admitted until it has finished.
+    try {
+      const assembly = await runnerSetup(service, capability);
+      runner = new RunnerCoordinator(service.store, assembly.deps, undefined, capability);
+      executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
+    } catch (error) { service.close(); throw error; }
+  }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
   const load=async(signal?:AbortSignal)=>{const view=loadReview();return {...view,merge:merges?await merges.displayStatus(view,signal):{available:false}};};
   const answerStatuses=()=>service.store.getReviewNotes(config.identity)
@@ -74,7 +94,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
-      if (!runner) throw new GuardRefusal('The runner is not available yet.');
+      if (!runner) throw new GuardRefusal(RUNNER_NOT_CONFIGURED);
       if (action === 'cancel-attempt') {
         if (!runner.stop(identity, attemptId as string, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
         return { outcome: 'stopping' };
@@ -237,7 +257,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   server.requestTimeout = 15000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Cannot determine local address.');
-  return { server, service, token, runner, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
+  return { server, service, token, runner, executor, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;
     // Same turn as the admission flag: a request already reading its body must not start a new Ask worker.
@@ -262,6 +282,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     try { await merges?.close(); } finally { await issuesClosed; }
     // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.
     await runner?.close();
+    // Then every plan run in progress: its pause or escalation after the last attempt is a settlement write (#91).
+    await executor?.close();
     await closing;
     // Close the store even if Ask's or planning's cleanup fails, then report that failure.
     try { await questions.close(); } finally { try { await suggestions?.close(); } finally { service.close(); } }
