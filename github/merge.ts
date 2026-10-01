@@ -1,7 +1,15 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { ghEnvironment } from './gh-env.ts';
+import { runWithInput } from './run-with-input.ts';
 
-const runFile = promisify(execFile);
+/**
+ * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
+ * it exits. Every gh call of this gateway settles only when gh has stopped, so a call aborted at a deadline settles up
+ * to 0.4 s later. That keeps a merge click (14 s deadline in runner/merge.ts) within 14.4 s, inside the 14.5 s shutdown
+ * drain and below the 15-second serving request budget, and an inspection (at most 12 s) within 12.4 s.
+ */
+export const MERGE_KILL_GRACE_MS = 250, MERGE_PIPE_GRACE_MS = 150;
+/** The longest deadline of any inspection, and the default for merge-state and queue-state inspections. */
+export const MERGE_INSPECTION_TIMEOUT_MS = 12_000;
 
 export interface RequiredCheck {
   context: string;
@@ -87,7 +95,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
     if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
     this.config = config;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(), killGraceMs: MERGE_KILL_GRACE_MS, pipeGraceMs: MERGE_PIPE_GRACE_MS }));
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
@@ -240,8 +248,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   }
 
   async inspect(options: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RemoteMergeState> {
-    const timeoutMs = options.timeoutMs ?? 12_000;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub inspection timeout.');
+    const timeoutMs = options.timeoutMs ?? MERGE_INSPECTION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub inspection timeout.');
     if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
     const generation = this.#generation;
     if (!options.fresh && this.#inflight?.generation === generation) return this.#inflight.promise;
@@ -263,7 +271,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   async queueWatermark(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string | null> {
     fullSha(expectedHead, 'expected head SHA');
     const timeoutMs = options.timeoutMs ?? 6_000;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue watermark timeout.');
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub queue watermark timeout.');
     const [owner, name] = this.config.repository.split('/') as [string, string];
     const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid timelineItems(last:1,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id}}}}}}`;
     const timeout = new AbortController();
@@ -298,8 +306,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
 
   async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null } = {}): Promise<MergeQueueObservation> {
     fullSha(expectedHead, 'expected head SHA');
-    const timeoutMs = options.timeoutMs ?? 12_000;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue inspection timeout.');
+    const timeoutMs = options.timeoutMs ?? MERGE_INSPECTION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub queue inspection timeout.');
     const correlated = Object.hasOwn(options, 'afterCursor');
     if (options.afterCursor !== undefined && options.afterCursor !== null && (typeof options.afterCursor !== 'string' || !options.afterCursor || options.afterCursor.length > 512))
       throw new Error('Invalid merge-queue event cursor.');

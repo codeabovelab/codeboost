@@ -1,11 +1,13 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
 import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
-import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
+import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
+/** The longest a merge click may run before it is aborted; its last gh call's stop wait comes on top (github/merge.ts). */
+export const MERGE_OPERATION_TIMEOUT_MS = 14_000;
 const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
 /** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
 export class MergeNotApplied extends Error {}
@@ -44,8 +46,8 @@ export class MergeCoordinator {
   readonly operationTimeoutMs: number;
   /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
   #settle: <T>(fn: () => T) => T;
-  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = 14_000, capability?: ShutdownCapability) {
-    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 14_000) throw new Error('Invalid merge operation deadline.');
+  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability) {
+    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > MERGE_OPERATION_TIMEOUT_MS) throw new Error('Invalid merge operation deadline.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs;
     this.#settle = settleWith(capability);
   }
@@ -361,7 +363,7 @@ export class MergeCoordinator {
 
   async #pollQueue(attempt: MergeAttempt, signal: AbortSignal): Promise<MergeQueueStatus | null> {
     try {
-      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, afterCursor: attempt.queueWatermark ?? null });
+      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: MERGE_INSPECTION_TIMEOUT_MS, afterCursor: attempt.queueWatermark ?? null });
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {
