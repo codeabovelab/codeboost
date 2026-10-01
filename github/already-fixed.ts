@@ -87,12 +87,14 @@ const escape = (text: string) => text.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
 /**
  * Whether a commit message refers to the issue: `#N`, `GH-N`, `owner/name#N`, or the issue URL. A reference qualified
- * with another repository (`other/repo#N`) is not this issue, and `#N` never matches a longer number.
+ * with another repository (`other/repo#N`) is not this issue, and `#N` never matches a longer number. No form may start
+ * inside a URL path or a longer path-like token (after a word character, `/`, `.` or `-`): `example.com/GH-12` and
+ * `x.com/github.com/owner/repo/issues/12` are not mentions. The rare real mentions this drops (`Done.GH-12`, an archive
+ * link to the issue URL) let a duplicate PR open; a person sees it in review.
  */
 export function mentionsIssue(message: string, repository: string, issue: number): boolean {
   const n = String(issue), repo = escape(repository);
   return new RegExp(`(?<![\\w/.#-])#${n}(?!\\w)`).test(message)
-    // No form may start inside a URL path or a longer path-like token (`example.com/GH-12`, `x.com/github.com/...`).
     || new RegExp(`(?<![\\w/.-])GH-${n}(?!\\w)`, 'i').test(message)
     || new RegExp(`(?<![\\w/.-])${repo}#${n}(?!\\w)`, 'i').test(message)
     || new RegExp(`(?<![\\w/.-])(?:https?://)?(?:www\\.)?github\\.com/${repo}/issues/${n}(?![\\w])`, 'i').test(message);
