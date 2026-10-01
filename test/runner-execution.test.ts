@@ -655,10 +655,11 @@ describe('item execution', () => {
       .toThrow(/Unknown snapshot/);
   });
   it('writes a plan title with line breaks as one line in the runner commit message', async () => {
-    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\u2028Plan-Revision: r99' }, plan.items[1]!] };
+    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\u2028Plan-Revision: r99 \u001b[31mred\u000b\u007f' }, plan.items[1]!] };
     const h = setup({ plan: forged });
     await h.executor.runTask(identity);
-    expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99');
+    // A NUL is refused earlier, by the prompt builder (plan data must be valid text); other controls reach here.
+    expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99 [31mred');
     expect(h.commits[0]!.trailers).toEqual({ 'Plan-Item': 'P1', 'Plan-Revision': 'r1' });
   });
   it('stops before the next item when only the assignment changes during the run', async () => {

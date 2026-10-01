@@ -117,6 +117,10 @@ describe('post-run audit', () => {
   it('trusts D\'s underGit flag on its own', () => {
     expect(auditRun(item, manifest([file('src/retry.ts', { underGit: true })]), exact)).toEqual({ kind: 'violation', violations: ['The agent changed "src/retry.ts" under .git.'] });
   });
+  it('refuses a declared link retargeted to the directory that holds the repository', () => {
+    expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: '..', linkTargetTraversesLink: false })]), exact))
+      .toEqual({ kind: 'violation', violations: ['Unsafe symlink target at "link": target leaves the repository.'] });
+  });
   it('refuses a declared link retargeted to the repository root', () => {
     for (const target of ['.', './', 'a/..'])
       expect(auditRun(item, manifest([file('link', { oldType: 'symlink', newType: 'symlink', newLinkTarget: target, linkTargetTraversesLink: false })]), exact), target)

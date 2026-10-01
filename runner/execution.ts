@@ -115,8 +115,9 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       let head: string;
       try { head = await workspace.commit(data.workspace, {
         baseHead: data.baseHead, paths, digest: manifest.digest,
-        // The title is plan text: on one line, it cannot open a trailer block that forges Plan-Item or Plan-Revision.
-        message: `${item.id}: ${item.title.replace(/[\r\n\u2028\u2029]+/g, ' ').trim()}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
+        // The title is plan text: on one line with no control characters, it cannot open a trailer block that forges
+        // Plan-Item or Plan-Revision, stop Git with a NUL, or put terminal escapes into git log.
+        message: `${item.id}: ${item.title.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').replace(/ {2,}/g, ' ').trim()}`, trailers: { 'Plan-Item': item.id, 'Plan-Revision': `r${plan.revision}` },
       }, signal); }
       catch (error) {
         // D's refusal text can name agent-chosen paths: quote it (AGENTS.md). A stop records its first reason before it
