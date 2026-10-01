@@ -21,7 +21,7 @@ import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
-import { createClaudeCommand, createCodexCommand, createIsolationProbeCommand, createPhasePolicy,
+import { createClaudeCommand, createIsolationProbeCommand, createPhasePolicy,
   assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
@@ -2412,19 +2412,6 @@ describe('real Docker agent isolation', () => {
   }, 60_000);
 
   if (process.env.CODEBOOST_RUN_AUTH_PROBES === '1') {
-    it('runs the authenticated Codex startup path with isolated writable state', async () => {
-      const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
-      if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
-      // Codex is refused in planning and questions (#75); review is its read-only phase.
-      const authProfile = await profile(data, 'review', policy => createCodexCommand(policy,
-        'Read /run/codeboost-input/schema.json and reply only with the exact value of its probe field, without quotes or Markdown formatting.'),
-      { authProbe: true, codexAuthFile: authFile, deadlineMs: 5 * 60_000 });
-      // The production launch path: create, validate, start and remove. Raw stdout can carry more than the final
-      // message, so the value must appear as a complete line; the adapter probe checks the exact file channel.
-      const output = await runContainer(authProfile, 5 * 60_000);
-      expect(output.split(/\r?\n/)).toContain('codeboost-schema-marker');
-    }, 6 * 60_000);
-
     it('runs the authenticated Claude startup path with only its OAuth token', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');

@@ -5,6 +5,7 @@ import { prepareExecution } from '../core/execution-prompt.ts';
 import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-body.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import { TaskTreeRefused, type DeclaredLinkSnapshot, type DeclaredOperation, type TaskTreeCheck } from '../agents/container/changes.ts';
+import { assertCodexPhase } from '../agents/policy.ts';
 import type { IssueText } from '../github/issues.ts';
 import { partialOutput, saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
@@ -149,6 +150,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
         issue, approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
       const vendor = sources.vendor(identity);
+      // D refuses Codex in phases it cannot work in (#93); refuse here too, before any task storage exists.
+      if (vendor === 'codex') assertCodexPhase('execute');
       const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
       // From here task storage exists: a failure hands it to the coordinator, which removes it after the terminal write.

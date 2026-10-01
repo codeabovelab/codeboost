@@ -45,15 +45,12 @@ describe('agent phase policy', () => {
     expect(dispatchApprovedCommand(policy, ['npm', 'test'], argv => argv)).toEqual(['npm', 'test']);
   });
 
-  it('keeps an option-like prompt after -- so neither CLI parses it as a flag', () => {
+  it('keeps an option-like prompt after -- so Claude does not parse it as a flag', () => {
     const prompt = '--dangerously-bypass-approvals-and-sandbox';
-    const claude = createClaudeCommand(createPhasePolicy(request('planning')), prompt, SCHEMA).argv;
-    const codex = createCodexCommand(createPhasePolicy(request('review', 'codex')), prompt).argv;
-    for (const argv of [claude, codex]) {
-      expect(argv.at(-1)).toBe(prompt);
-      expect(argv.at(-2)).toBe('--');
-      expect(argv.indexOf(prompt)).toBe(argv.length - 1);
-    }
+    const argv = createClaudeCommand(createPhasePolicy(request('planning')), prompt, SCHEMA).argv;
+    expect(argv.at(-1)).toBe(prompt);
+    expect(argv.at(-2)).toBe('--');
+    expect(argv.indexOf(prompt)).toBe(argv.length - 1);
   });
 
   it('builds Claude and Codex controls with web, MCP and direct shell disabled', () => {
@@ -68,10 +65,11 @@ describe('agent phase policy', () => {
     const codexPolicy = createPhasePolicy(request('review', 'codex'));
     expect(codexBaseArguments(codexPolicy)).toEqual(['codex', '--strict-config', '--config', 'web_search="disabled"',
       '--config', 'mcp_servers={}', '--config', 'features.shell_tool=false', '--ask-for-approval', 'never']);
-    const codex = createCodexCommand(codexPolicy, 'Inspect the schema.');
-    expect(codex.argv).toContain('features.shell_tool=false');
-    expect(() => assertAgentCommand({ argv: codex.argv }, codexPolicy)).toThrow('not generated');
-    expect(() => assertAgentCommand(codex, codexPolicy, 'claude')).toThrow('vendor');
+    const reviewPolicy = createPhasePolicy(request('review'));
+    const claudeCommand = createClaudeCommand(reviewPolicy, 'Inspect the code.');
+    expect(() => assertAgentCommand({ argv: claudeCommand.argv }, reviewPolicy)).toThrow('not generated');
+    expect(() => assertAgentCommand(claudeCommand, codexPolicy)).toThrow('not generated');
+    expect(() => assertAgentCommand(claudeCommand, reviewPolicy, 'codex')).toThrow('vendor');
     expect(() => createClaudeCommand(codexPolicy, 'Wrong vendor.')).toThrow('Claude invocation');
     expect(() => createCodexCommand(readonly, 'Wrong vendor.')).toThrow('Codex invocation');
   });
@@ -119,14 +117,9 @@ describe('agent phase policy', () => {
     expect(() => assertCommandSchema(review, Buffer.from('anything'))).not.toThrow();
   });
 
-  it.each(['planning', 'questions'] as const)('refuses Codex in %s, where it could not read the code', phase => {
-    expect(() => createCodexCommand(createPhasePolicy(request(phase, 'codex')), 'Plan.'))
-      .toThrow(`Codex cannot run the ${phase} phase`);
-  });
-
-  it.each(['review', 'execute', 'fix'] as const)('still builds Codex commands for %s', phase => {
-    const argv = createCodexCommand(createPhasePolicy(request(phase, 'codex')), 'Work.').argv;
-    expect(argv).not.toContain('--output-schema');
-    expect(argv.at(-1)).toBe('Work.');
-  });
+  it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(
+    'refuses Codex in %s, where its shell is off and it could not read the code (#93)', phase => {
+      expect(() => createCodexCommand(createPhasePolicy(request(phase, 'codex')), 'Work.'))
+        .toThrow(`Codex cannot run the ${phase} phase`);
+    });
 });

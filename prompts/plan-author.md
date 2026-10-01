@@ -1,7 +1,7 @@
 <!--
   codeboost prompt template: draft or revise a plan.
   Used for Claude. Codex is refused for planning until it can read files without
-  a shell (#75; see "Codex in read-only phases" in docs/implementation/agent-isolation.md).
+  a shell (#75, #93; see "Codex is refused in every phase" in docs/implementation/agent-isolation.md).
   codeboost fills every {{placeholder}}. Lane D launches the planning phase with
   `startClaudeInvocation` (agents/adapters/claude.ts): it passes the mounted
   /run/codeboost-input/schema.json text as `--json-schema`, with

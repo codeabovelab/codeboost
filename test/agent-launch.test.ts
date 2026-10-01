@@ -4,7 +4,6 @@ import { AdapterSetupCleanupError, CLEANUP_RETRY_WINDOW_MS, isInvocationActive,
   launchInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationHandle, type InvocationResult } from '../agents/contract.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
-import { startCodexInvocation } from '../agents/adapters/codex.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 // The start call returns its handle at once and runs setup inside it (#51 item 2). These run without Docker.
@@ -119,14 +118,11 @@ describe('asynchronous launch', () => {
     expect(box.result?.stopReason).toBe(reason);
   });
 
-  it.each(['codex', 'claude'] as const)('refuses an untrusted %s image synchronously, allocating nothing', vendor => {
-    const invocation = captured(`untrusted-image-${vendor}`, vendor);
+  it('refuses an untrusted image synchronously, allocating nothing', () => {
+    const invocation = captured('untrusted-image-claude', 'claude');
     const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
       imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() };
-    const start = () => vendor === 'codex'
-      ? startCodexInvocation(request, '/unused/auth.json')
-      : startClaudeInvocation(request, 'token');
-    expect(start).toThrow('trusted validated builder');
+    expect(() => startClaudeInvocation(request, 'token')).toThrow('trusted validated builder');
     expect(isInvocationActive(invocation.attemptId)).toBe(false);
   });
 });

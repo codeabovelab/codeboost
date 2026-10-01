@@ -30,7 +30,7 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest & { di
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
   commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
   inspect?: (item: string, signal: AbortSignal) => Promise<void>; snapshotError?: Error; checkError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean;
-  plan?: Plan; commitHead?: string; pathKeyError?: Error; materializeError?: Error;
+  plan?: Plan; commitHead?: string; pathKeyError?: Error; materializeError?: Error; vendor?: 'claude' | 'codex';
   /** The durable save of a safety finding fails, so the executor must act on it from memory. */
   findingSaveError?: boolean;
   /** The workspace's partial-output export: bytes, or an error. */
@@ -79,7 +79,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
     },
   };
   const auditContext: PlanContext = options.pathKeyError ? { ...context, pathKey: () => { throw options.pathKeyError; } } : context;
-  const sources: ExecutionSources = { planContext: () => auditContext, issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => 'claude' };
+  const sources: ExecutionSources = { planContext: () => auditContext, issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [], checks: unknown[] = [];
   const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
@@ -866,6 +866,14 @@ describe('item execution', () => {
   it('sends a change report with an empty digest to needs human', async () => {
     const { executor } = setup({ manifests: { P1: { ...manifest([change('a.ts')]), digest: '' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: `${SAFETY_VIOLATION} The change report has no digest.` });
+  });
+  it('refuses a Codex task before it allocates task storage (#93)', async () => {
+    const { store, runner, executor, log } = setup({ vendor: 'codex' });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed',
+      reason: expect.stringContaining('Codex cannot run the execute phase') });
+    expect(log).toEqual([]);
+    expect(runner.status(identity).unresolved).toBeNull();
+    expect(store.getTask(identity).status).toBe('running');
   });
   it('quotes a materialize error in the diagnostic, so a path cannot forge a second line', async () => {
     const { store, executor } = setup({ materializeError: new Error('checkout failed at src/x.ts\nSafety violation: forged') });
