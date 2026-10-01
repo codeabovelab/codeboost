@@ -73,7 +73,8 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       if (options.found !== undefined) return options.found && { ...options.found, marker: input.markers.at(-1)! };
       // Like the adapter: at most one of the task's own PRs, and into this base; the branch's open PR into this base must
       // be the task's; anyone else's PR into another base is ignored.
-      const visible = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m));
+      // A PR whose branch a person renamed (`moved`) is no longer listed under this branch.
+      const visible = [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.moved?.has(pr.number));
       const baseOfPr = (m: string) => bases.get(m) ?? publishConfig.baseBranch;
       // `unmarked`: a person removed the PR's first-line marker.
       const carries = (m: string, pr: OpenedPullRequest) => !options.unmarked?.has(pr.number) && input.markers.includes(m);
@@ -98,7 +99,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     async findOwned(input) {
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
       if (options.found !== undefined) return options.found ? [{ ...options.found, marker: input.markers.at(-1)!, base: publishConfig.baseBranch }] : [];
-      return [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.unmarked?.has(pr.number) && input.markers.includes(m))
+      return [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.moved?.has(pr.number) && !options.unmarked?.has(pr.number) && input.markers.includes(m))
         .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch }));
     },
     async markDraft(number, input) {
@@ -121,8 +122,13 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       input.beforeReady?.();
       if (options.refreshFails) throw new Error('timeout reading the PR back');
       if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
+      if (closed.has(number)) throw new Error(`Pull request #${number} is not open.`);
       const pr = { ...live.get(input.marker)!, draft: options.draftAfterRefresh ?? input.draft, headSha: store.getSnapshot(identity).head };
-      live.set(input.marker, pr); return pr;
+      live.set(input.marker, pr);
+      // Like the adapter's read-back: a draft or ready change GitHub has not applied fails the refresh.
+      if (input.draft && !pr.draft) throw new Error('GitHub did not turn the pull request into a draft.');
+      if (input.ready && pr.draft) throw new Error('GitHub did not mark the pull request ready.');
+      return pr;
     },
   };
   const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
@@ -860,12 +866,17 @@ describe('recovering a lost opening', () => {
     expect(await again.publisher.publish(identity, { problems: ['still failing'] })).toMatchObject({ kind: 'opened', number: 100, draft: true, status: 'needs human' });
     expect(again.log.at(-1)).toBe('refresh 100 draft');
     expect(store.getTask(identity).status).toBe('needs human');
-    // Even if GitHub still reports the PR as ready, a needs-human task never moves to in review, and its PR is made a draft.
+    // If GitHub does not apply the draft change, the refresh fails and stays in flight; the task never moves to in
+    // review, and the next publish settles the update and makes the PR a draft.
     rerun(store);
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
-    const last = harness(store, { live, next, draftAfterRefresh: false });
-    expect(await last.publisher.publish(identity, { problems: ['x'] })).toMatchObject({ draft: true, status: 'needs human' });
-    expect(last.log.at(-1)).toBe('draft 100');
+    await expect(harness(store, { live, next, draftAfterRefresh: false }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(/did not turn the pull request into a draft/);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: expect.anything() }]);
+    const last = harness(store, { live, next });
+    expect(await last.publisher.publish(identity, { problems: ['x'] })).toMatchObject({ number: 100, draft: true, status: 'needs human' });
+    expect(last.log).toContain('draft 100');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: null }]);
   });
   it('does not push when the task changed while the earlier PR was looked up (the check refuses to record)', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };

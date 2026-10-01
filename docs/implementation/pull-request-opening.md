@@ -35,6 +35,8 @@ The check matches when any of these is true:
 
 A commit mentions the issue with `#12`, `GH-12`, `owner/repo#12`, or the issue URL. A PR in another repository that would close the issue, or is linked manually, counts as a match. It is not excluded by number, because its number belongs to another repository. GitHub turns `willCloseTarget` false once the issue is closed, so a merged PR that closed the issue is reported through the closed state instead.
 
+An abandoned opening's PR has no recorded number, so the check cannot exclude it by number. The main path looks the branch up first and adds a visible PR's number to the own PRs. If GitHub's PR list still does not show that PR after the 10-minute settle time but the issue timeline already does, the check counts the task's own PR as another PR, and the task moves to possibly already fixed. That fails closed: a person sees the PR and continues.
+
 **The check fails closed.** It returns `unknown` in each of these cases, and `unknown` is handled like a match:
 
 - more than 100 timeline events, or more than 250 new base commits;
