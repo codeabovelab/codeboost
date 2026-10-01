@@ -50,8 +50,13 @@ describe('runner-owned repository', () => {
   it('refuses a repositories directory others can write', async () => {
     const s = setup();
     await open(s);
-    chmodSync(join(s.runnerRoot, OWNER, 'repositories'), 0o777);
-    await expect(open(s)).rejects.toThrow('not writable by group or others');
+    // Each level, from the runner root down.
+    for (const path of [s.runnerRoot, join(s.runnerRoot, OWNER), join(s.runnerRoot, OWNER, 'repositories')]) {
+      chmodSync(path, 0o777);
+      await expect(open(s)).rejects.toThrow(`${path} must be a directory owned by you`);
+      chmodSync(path, 0o700);
+    }
+    expect((await open(s)).path).toContain(join(s.runnerRoot, OWNER, 'repositories'));
   });
 
   it('takes in exactly the runner commit, under the attempt\'s ref, and drops it when asked', async () => {

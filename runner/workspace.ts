@@ -51,7 +51,7 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
       const record = (group: ProcessGroup) => { store.recordPreparationGroup(identity, attempt.id, group.pgid, group.startedAt); recorded = true; };
       try {
         await ensureCommit(repository, head, { signal, onProcessGroup: record });
-        ownerOnlyDirectory(join(options.runnerRoot, options.runnerOwner, 'attempts'));
+        ownerOnlyDirectory(options.runnerRoot, options.runnerOwner, 'attempts');
         mkdirSync(directory, { mode: 0o700 });
         const clone = await createTaskCloneAsync({ source: repository.path, parent: directory, taskId: identityKey(identity), head,
           timeoutMs: 120_000, signal, onProcessGroup: record });

@@ -26,16 +26,19 @@ export interface GitCallOptions {
   readonly timeoutMs?: number;
 }
 /**
- * Create `path` (and its parents) as needed, then require it and its parent to be real directories owned by the current
- * user that no one else can write: whoever can write a directory can replace what is in it.
+ * Create `<root>/<parts...>` as needed, then require the root and every directory below it on the way to be a real
+ * directory owned by the current user that no one else can write: whoever can write a directory can replace what is in it.
  */
-export function ownerOnlyDirectory(path: string): void {
+export function ownerOnlyDirectory(root: string, ...parts: string[]): string {
+  const path = join(root, ...parts);
   mkdirSync(path, { recursive: true, mode: 0o700 });
-  for (const directory of [join(path, '..'), path]) {
+  for (let depth = 0; depth <= parts.length; depth += 1) {
+    const directory = join(root, ...parts.slice(0, depth));
     const stat = lstatSync(directory);
     if (!stat.isDirectory() || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o022) !== 0)
       throw new Error(`${directory} must be a directory owned by you and not writable by group or others.`);
   }
+  return path;
 }
 /** The ref that keeps one attempt's runner commit; deleted when the attempt does not complete. */
 export const attemptRef = (attemptId: string): string => {
@@ -71,8 +74,7 @@ const exists = async (repository: string, object: string, options: GitCallOption
 export async function openRunnerRepository(o: { runnerRoot: string; runnerOwner: string; repositoryId: string; source: string }
   & GitCallOptions): Promise<RunnerRepository> {
   if (!/^[0-9a-f]{32}$/.test(o.runnerOwner)) throw new Error('Invalid runner owner token.');
-  const parent = join(o.runnerRoot, o.runnerOwner, 'repositories');
-  ownerOnlyDirectory(parent);
+  const parent = ownerOnlyDirectory(o.runnerRoot, o.runnerOwner, 'repositories');
   const path = join(parent, `${createHash('sha256').update(o.repositoryId).digest('hex').slice(0, 32)}.git`);
   if (!lstatSync(path, { throwIfNoEntry: false })) {
     const staging = mkdtempSync(join(parent, '.new-'));

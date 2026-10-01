@@ -307,6 +307,8 @@ sub anchored {
 # With $unchecked, names are kept as bytes and never checked: only the status is wanted.
 sub resolve {
   my ($link, $walk, $unchecked) = @_; my $name = $unchecked ? sub { $_[0] } : \&text;
+  # Unchecked, a link on the way is reported by status alone: its anchor entry would check the anchor's names.
+  my $through = sub { $unchecked ? { status => "through-link" } : anchored("through-link", $_[0]) };
   my %record = (link => $name->($link, "declared path"));
   my @parents = split m{/}, $link; pop @parents; my $prefix = "";
   # A declared path that is not there, or not a link, is not-a-link whether or not its directory exists: adding or
@@ -315,7 +317,7 @@ sub resolve {
   for my $part (@parents) {
     $prefix = join_path($prefix, $part); my @stat = lstat $prefix;
     return { %record, status => "not-a-link" } unless @stat;
-    return { %record, %{ anchored("through-link", $prefix) } } if -l _;
+    return { %record, %{ $through->($prefix) } } if -l _;
     return { %record, status => "not-a-link" } unless -d _;
   }
   my @stat = lstat $link;
@@ -335,7 +337,7 @@ sub resolve {
     return { %record, status => "metadata" } if @at > 1 && $at[1] eq ".git";
     next if @at == 1;
     my $path = join "/", @at[1 .. $#at]; my @here = lstat $path;
-    return { %record, %{ anchored("through-link", $path) } } if @here && -l _;
+    return { %record, %{ $through->($path) } } if @here && -l _;
   }
   return { %record, status => "outside" } if @at < 2;
   my $target = join "/", @at[1 .. $#at];
