@@ -112,7 +112,6 @@ Use only these entry points to run an agent:
        format, line or paragraph separator, or unassigned character (unchanged names are never checked);
      - the recorded targets hold more than 20,000 entries;
      - it cannot read something;
-     - for an inspection, a `.gitattributes` outside a `.git` part is over 100 MB, which Git does not read;
      - `base` is not a commit in the storage, or Git fails;
      - for a snapshot, the metadata changed since seeding (an export refuses then too).
 

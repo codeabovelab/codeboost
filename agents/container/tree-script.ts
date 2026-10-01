@@ -29,8 +29,7 @@
  * strict UTF-8, holds a control, format, separator or unassigned character, or is over MAXIMUM_NAME_BYTES cannot be
  * put in the manifest (exit 8); an unchanged one is never checked. More than MAXIMUM_CHANGES changes, more than
  * MAXIMUM_TARGET_ENTRIES target entries, or more output than the bound cannot be returned whole (exit 9). A directory
- * or file it cannot read fails it (exit 6), since what is inside is unknown. An inspection or a commit also fails (exit 6)
- * on a `.gitattributes` over 100 MB outside a `.git` part, which Git does not read. Exit 3 is a bad base, exit 4 a Git failure,
+ * or file it cannot read fails it (exit 6), since what is inside is unknown. Exit 3 is a bad base, exit 4 a Git failure,
  * exit 2 a bad argument, exit 5 an unexpected failure of the script itself. None of these returns part of the answer: a
  * commit may have printed some of its output first, but the runner discards all of it when the exit status is not 0.
  */
@@ -276,14 +275,7 @@ sub walk_entry {
   # The link target is checked as a name only if it is reported, like the path itself.
   if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => $target } }
   # Every file is hashed below; one that cannot be read fails the run here, with its name, rather than inside Git.
-  if (-f _) {
-    fail(6, "could not read " . shown($path) . ": permission denied") unless -r _;
-    # Git does not read an attributes file this large and falls back to the index, so what it stores would depend on
-    # the order it reaches paths in.
-    fail(6, "the attributes file " . shown($path) . " is larger than Git reads")
-      if $stat[7] > 100 * 1024 * 1024 && $path =~ m{(?:\A|/)\.gitattributes\z} && !under_git_path($path);
-    return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" };
-  }
+  if (-f _) { fail(6, "could not read " . shown($path) . ": permission denied") unless -r _; return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } }
   return { type => "directory" } if -d _;
   # Git opens every .gitattributes it meets while hashing; a fifo or device there would block it until the deadline.
   my @parts = split m{/}, $path;

@@ -1561,16 +1561,6 @@ describe('real Docker agent isolation', () => {
       expect(blob(data.source, committed.get(':/new')!.oid).toString()).toBe('n\n');
     }, 300_000);
 
-    it('refuses a .gitattributes too large for Git to read, except under a .git part, which Git never reads', async () => {
-      const data = fixture({ limits: { workBytes: 256 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 } });
-      asAgent(data.filesystems, 'mkdir -p x/.git && head -c 104857601 /dev/zero > x/.git/.gitattributes');
-      expect((await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId })).changes
-        .map(change => change.path)).toEqual(['x/.git/.gitattributes']);
-      asAgent(data.filesystems, 'mv x/.git/.gitattributes sub.gitattributes && mkdir d && mv sub.gitattributes d/.gitattributes');
-      await expect(inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId }))
-        .rejects.toThrow('is larger than Git reads');
-    }, 300_000);
-
     it('stores each file as the inspection hashed it: line endings, attribute rules, and a symlinked .gitattributes', async () => {
       const data = fixture({ hostile: source => {
         // Committed with CRLF before text=auto: git add keeps such a file's CRLF.
