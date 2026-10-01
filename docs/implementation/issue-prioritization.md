@@ -54,8 +54,11 @@ dedicated read-only gateway with these boundaries:
   `github/gh-env.ts`, plus fixed settings that turn off prompts, the pager,
   colour and update checks. Other variables from the server, such as
   unrelated credentials, are not passed on.
-- A timeout or abort sends `gh` SIGTERM, then SIGKILL after five seconds.
-  The fetch returns only after the process has exited.
+- When the fetch deadline passes or the fetch is cancelled, the `gh` process
+  gets SIGTERM, then SIGKILL after half a second. The fetch returns only after
+  that process has exited, or a quarter of a second after it exits if a process
+  it started keeps its output open. Both waits count inside the 12-second
+  deadline: 12.75 s stays below the 15-second request timeout.
 - The gateway fetches open issues and the repository's current collaborators,
   excludes pull requests, follows bounded pagination for both collections, and
   validates every field used for normalization, trust, or ranking. If the

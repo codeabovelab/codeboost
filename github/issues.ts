@@ -8,6 +8,12 @@ const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
+/**
+ * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
+ * it exits. A fetch settles only when gh has stopped, so both count inside the 12-second fetch deadline, which stays
+ * below the 15-second serving request budget (12 + 0.5 + 0.25 = 12.75 s).
+ */
+export const ISSUE_KILL_GRACE_MS = 500, ISSUE_PIPE_GRACE_MS = 250;
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
@@ -156,6 +162,8 @@ export class GhIssueGateway implements IssueGateway {
       maxBuffer: ISSUE_PAGE_MAX_BYTES,
       signal: options?.signal,
       env: ghEnvironment(),
+      killGraceMs: ISSUE_KILL_GRACE_MS,
+      pipeGraceMs: ISSUE_PIPE_GRACE_MS,
     }));
     this.now = now;
   }

@@ -1,6 +1,13 @@
 import { ghEnvironment } from './gh-env.ts';
 import { runWithInput } from './run-with-input.ts';
 
+/**
+ * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
+ * it exits. A merge call settles only when gh has stopped, so both count inside the coordinator's 14-second operation
+ * deadline, which stays below the 15-second serving request budget (14 + 0.5 + 0.25 = 14.75 s).
+ */
+export const MERGE_KILL_GRACE_MS = 500, MERGE_PIPE_GRACE_MS = 250;
+
 export interface RequiredCheck {
   context: string;
   appId: number | null;
@@ -85,7 +92,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
     if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
     this.config = config;
-    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(), killGraceMs: MERGE_KILL_GRACE_MS, pipeGraceMs: MERGE_PIPE_GRACE_MS }));
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {

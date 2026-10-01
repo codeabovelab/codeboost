@@ -2,8 +2,8 @@ import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
-import { GhMergeGateway, type RunGh } from '../github/merge.ts';
-import { GhIssueGateway } from '../github/issues.ts';
+import { GhMergeGateway, MERGE_KILL_GRACE_MS, MERGE_PIPE_GRACE_MS, type RunGh } from '../github/merge.ts';
+import { GhIssueGateway, ISSUE_KILL_GRACE_MS, ISSUE_PIPE_GRACE_MS } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
@@ -53,6 +53,12 @@ describe('default gh runners', () => {
   });
 });
 
+// The kill and pipe grace periods each gateway counts inside its deadline, plus 500 ms for a slow test machine.
+const settleBudgetMs: Record<string, number | undefined> = {
+  merge: MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS + 500,
+  issues: ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS + 500,
+};
+
 describe('default gh runners stop a gh that ignores SIGTERM', () => {
   let dir = '';
   const saved = process.env.PATH;
@@ -69,17 +75,25 @@ describe('default gh runners stop a gh that ignores SIGTERM', () => {
     rmSync(dir, { recursive: true, force: true });
   });
 
-  // A cancelled `gh pr merge` must not go on to merge after the caller was told it stopped.
-  it.each(defaultRunners)('%s: an abort settles the call only after gh has exited', async (_name, runner) => {
+  // A cancelled gh must not keep running after the caller was told the call stopped.
+  it.each(defaultRunners)('%s: an abort settles the call only after gh has exited', async (name, runner) => {
     rmSync(join(dir, 'ready'), { force: true });
     const controller = new AbortController();
     const call = runner()(['api', 'user'], { signal: controller.signal });
-    while (!existsSync(join(dir, 'ready'))) await new Promise(resolve => setTimeout(resolve, 10));
+    const started = Date.now();
+    while (!existsSync(join(dir, 'ready'))) {
+      if (Date.now() - started > 5_000) throw new Error('The fake gh did not start.');
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
     const pid = Number(readFileSync(join(dir, 'ready'), 'utf8'));
-    controller.abort(new Error('stop'));
     try {
-      await expect(call).rejects.toThrow();
+      const aborted = Date.now();
+      controller.abort(new Error('stop'));
+      await expect(call).rejects.toThrow('stop');
       expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+      // The wait after an abort counts inside the caller's deadline, so it must stay within the stated grace periods.
+      const budget = settleBudgetMs[name];
+      if (budget !== undefined) expect(Date.now() - aborted).toBeLessThan(budget);
     } finally {
       try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
     }
