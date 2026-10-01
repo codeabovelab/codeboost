@@ -180,7 +180,7 @@ describe('stops and settlement', () => {
     await runner.settled(A);
     expect(launches).toHaveLength(0);
     expect(cleaned()).toBe(1);
-    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Preparation failed: clone failed' });
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null, diagnostic: 'Preparation failed: "clone failed"' });
     expect(() => runner.start(B, request(store, B))).not.toThrow();
   });
   it('fails with the launch error when D start throws and no stop is recorded', async () => {
@@ -508,8 +508,8 @@ describe('copilot review', () => {
   it.each([
     ['another attempt', (input: InvocationInput) => ({ attemptId: randomUUID() })],
     ['another context', (input: InvocationInput) => ({ context: { ...input.context, stateVersion: input.context.stateVersion + 1 } })],
-  ] as const)('never validates or saves a result for %s', async (_label, foreign) => {
-    const { store, runner, launches, preparations, deps } = setup();
+  ] as const)('never validates or saves a result for %s, and still removes its preparation files', async (_label, foreign) => {
+    const { store, runner, launches, preparations, deps, cleaned } = setup();
     const validate = vi.spyOn(deps, 'validate');
     const attempt = runner.start(A, request(store, A));
     await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
@@ -519,7 +519,19 @@ describe('copilot review', () => {
     expect(validate).not.toHaveBeenCalled();
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', result: null,
       diagnostic: 'The agent returned a result for a different attempt; it was not saved.' });
+    expect(cleaned()).toBe(1);
     expect(() => runner.start(B, request(store, B))).not.toThrow();
+  });
+  it('keeps preparation files for startup recovery when a foreign result\'s terminal write fails', async () => {
+    const { store, runner, launches, preparations, cleaned } = setup();
+    vi.spyOn(store, 'settleAttempt').mockImplementation(() => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); });
+    runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle({ attemptId: randomUUID() });
+    await runner.settled(A);
+    expect(cleaned()).toBe(0);
+    expect(runner.status(A).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
   it('holds the slot when preparation files cannot be removed after D settles', async () => {
     const { store, runner, launches, preparations, deps } = setup();
@@ -544,7 +556,7 @@ describe('copilot review', () => {
     preparations[0]!.reject(new Error('clone failed'));
     await runner.settled(A);
     expect(launches).toHaveLength(0);
-    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: clone failed' });
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: "clone failed"' });
     expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'preparation-not-removed' });
     expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
   });

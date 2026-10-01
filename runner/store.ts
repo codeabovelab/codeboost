@@ -503,6 +503,53 @@ export class Store {
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint)); return checkpoint;
     });
   }
+  /**
+   * F2's scope pause. `ranAt` is where the item actually ran: its plan revision and the snapshot its own commit
+   * created, not whatever is current, so a revision or HEAD observation saved since cannot erase the scope finding
+   * (plan-format.md, "After each run"). The checkpoint and the move to needs amendment commit together, so a refused
+   * status change (a closed task, an active attempt or merge) records no checkpoint either.
+   */
+  pauseForAmendment(identity: PlanIdentity, ranAt: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>, options: { owed?: boolean } = {}): Checkpoint {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      if (!this.#get('SELECT 1 FROM snapshots WHERE key=? AND id=?', key, ranAt.snapshotId)) throw new Error('Unknown snapshot.');
+      const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
+      if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
+        throw new Error('Checkpoint must describe the executed plan prefix.');
+      // Only the executor's own task pauses. In the run that found it, that is a running task, or a review status someone
+      // set since (a merge must not go past the finding); a queued status set since is kept, and the next run pays the
+      // pause from there. A human gate is kept too. A pause owed from an earlier run is paid from queued as well.
+      const status = this.#task(key).status;
+      const pausable = status === 'running' || status === 'in review' || status === 'approved but merge blocked' || (options.owed === true && status === 'queued');
+      if (!pausable) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
+      this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
+      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
+      this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
+      return checkpoint;
+    });
+  }
+  /**
+   * The scope checkpoint recorded for a runner commit, found by the commit's head (not by the latest snapshot, which a
+   * later snapshot with the same head would shadow), or null if its pause was never recorded.
+   */
+  checkpointAtHead(identity: PlanIdentity, head: string): Checkpoint | null {
+    for (const row of this.#db.prepare('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC').all(identityKey(identity))) {
+      const checkpoint = decode<Checkpoint>(row.data);
+      if (this.getSnapshot(identity, checkpoint.snapshotId).head === head) return checkpoint;
+    }
+    return null;
+  }
+  /** The most recent scope checkpoint of this plan, or null. */
+  latestCheckpoint(identity: PlanIdentity): Checkpoint | null {
+    const row = this.#get('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
+    return row ? decode<Checkpoint>(row.data) : null;
+  }
+  /** The latest snapshot of this plan whose head is `head` (the one a runner commit created), or null. */
+  snapshotWithHead(identity: PlanIdentity, head: string): string | null {
+    for (const row of this.#db.prepare('SELECT id, data FROM snapshots WHERE key=? ORDER BY rowid DESC').all(identityKey(identity)))
+      if (decode<Snapshot>(row.data).head === head) return row.id as string;
+    return null;
+  }
   getCheckpoint(identity: PlanIdentity, id: string): Checkpoint {
     const row = this.#get('SELECT data FROM checkpoints WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown checkpoint.'); return decode<Checkpoint>(row.data);
@@ -761,6 +808,8 @@ export class Store {
    */
   settleAttempt(identity: PlanIdentity, id: string, settlement: Omit<Settlement, 'contextCurrent'> & {
     signal?: string | null; result?: unknown; diagnosticRef?: string | null;
+    /** Writable attempts: the runner's commit, recorded with `completed` in this same transaction. */
+    history?: { base: string; head: string; entries: readonly LedgerEntry[] };
   }): Classification {
     if (settlement.firstReason !== null && !FIRST_REASONS.includes(settlement.firstReason)) throw new GuardRefusal('Unknown stop reason.');
     const key = identityKey(identity);
@@ -783,6 +832,11 @@ export class Store {
       this.#run(`UPDATE attempts SET state=?, first_reason=?, stop_reason=?, exit_code=?, signal=?, result=?, diagnostic=?, diagnostic_ref=?, settled_at=? WHERE id=?`,
         outcome.state, firstReason, settlement.stopReason ?? null, settlement.exitCode, settlement.signal ?? null, result,
         outcome.reason, settlement.diagnosticRef ?? null, new Date().toISOString(), id);
+      // The guards above ran first; recording history now advances the context without invalidating this attempt.
+      if (outcome.state === 'completed' && settlement.history) {
+        const context = decode<InvocationContext>(row.context);
+        this.recordHistory(identity, { revision: context.planRevision, snapshotId: context.snapshotId }, settlement.history.base, settlement.history.head, settlement.history.entries);
+      }
       // A pending cancel task wins over everything, including the time limit.
       if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
       else {
