@@ -137,6 +137,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     try {
       const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [this.config.pullRequest], ownCommits: new Set() },
         signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);
+      // An answer that arrives after the check was stopped is not used. (One after a caller's abort is refused by the
+      // inspection itself, once the rule reads have ended.)
+      if (stop.signal.aborted) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' };
       if (result.outcome === 'clear') return { alreadyFixed: 'clear' };
       if (result.outcome === 'found' && Array.isArray(result.matches) && result.matches.length) return { alreadyFixed: 'found', alreadyFixedDetail: describeMatches(result.matches) };
       return { alreadyFixed: 'unknown', alreadyFixedDetail: result.outcome === 'unknown' && typeof result.reason === 'string' ? result.reason.slice(0, 300) : 'The check returned an invalid result.' };
@@ -159,10 +162,13 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     let rules: BranchRules;
     try { rules = await this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, signal); }
     catch (error) { failed.abort(error); await alreadyFixed.catch(() => {}); throw error; }
+    const fixed = await alreadyFixed;
+    // The rule reads turn a failed read into rulesKnown: false, so a read that ends after an abort must not yield a state.
+    signal?.throwIfAborted();
     return {
       base, head,
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
-      ...rules, ...await alreadyFixed,
+      ...rules, ...fixed,
       ...(typeof pr.url === 'string' && pr.url.length <= 2048 && /^https:\/\//.test(pr.url) ? { url: pr.url } : {}),
     };
   }

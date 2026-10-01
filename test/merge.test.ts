@@ -1389,6 +1389,43 @@ it('names the already-fixed detail in the merge blocker', async () => {
   expect(unknown.blockers).toEqual([{ code: 'already-fixed', message: 'The already-fixed check could not be completed: The check did not finish in time.' }]);
 });
 
+it('does not accept a check answer or rule reads that arrive after an abort', async () => {
+  vi.useFakeTimers();
+  try {
+    // A check that ignores its abort and answers clear after it.
+    const late: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => new Promise(resolve => {
+      signal?.addEventListener('abort', () => setTimeout(() => resolve({ outcome: 'clear', baseHead: sha('9') }), 10), { once: true });
+    }) };
+    const stopped = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => mergeReads(args), late).inspect({ fresh: true, timeoutMs: 6_000 });
+    const stoppedResult = stopped.then(state => ({ state }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(6_000 - CHECK_SETTLE_MS + 20);
+    expect(await stoppedResult).toMatchObject({ state: { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' } });
+
+    // A caller abort: the late clear answer must not turn into a resolved inspection.
+    const controller = new AbortController();
+    const cancelled = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => mergeReads(args), late).inspect({ fresh: true, signal: controller.signal });
+    const cancelledResult = cancelled.then(state => ({ state }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(100);
+    controller.abort(new Error('merge request deadline exceeded'));
+    await vi.advanceTimersByTimeAsync(20);
+    expect(await cancelledResult).toMatchObject({ error: { message: 'merge request deadline exceeded' } });
+
+    // Rule reads that answer after the caller aborted, with a check that has already answered.
+    const quick: AlreadyFixedGateway = { repository: 'owner/repo', check: async () => ({ outcome: 'clear', baseHead: sha('9') }) };
+    const rulesAbort = new AbortController();
+    const slowRules = async (args: readonly string[]) => {
+      if (args.join(' ').includes('/rules/branches/')) await new Promise(resolve => setTimeout(resolve, 1_000));
+      return mergeReads(args);
+    };
+    const afterRules = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, slowRules, quick).inspect({ fresh: true, signal: rulesAbort.signal });
+    const afterRulesResult = afterRules.then(state => ({ state }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(100);
+    rulesAbort.abort(new Error('merge request deadline exceeded'));
+    await vi.advanceTimersByTimeAsync(1_000);
+    expect(await afterRulesResult).toMatchObject({ error: { message: 'merge request deadline exceeded' } });
+  } finally { vi.useRealTimers(); }
+});
+
 it('does not let an inspection started before merge repopulate the cache', async () => {
   let pullReads = 0, releaseTimeline!: (value: string) => void, markTimelineStarted!: () => void;
   const timelineStarted = new Promise<void>(resolve => { markTimelineStarted = resolve; });
