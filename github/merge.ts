@@ -8,7 +8,7 @@ import { runWithInput } from './run-with-input.ts';
  * drain and below the 15-second serving request budget, and an inspection (at most 12 s) within 12.4 s.
  */
 export const MERGE_KILL_GRACE_MS = 250, MERGE_PIPE_GRACE_MS = 150;
-/** The default and the longest deadline of one inspection (merge state, queue watermark, queue state). */
+/** The longest deadline of any inspection, and the default for merge-state and queue-state inspections. */
 export const MERGE_INSPECTION_TIMEOUT_MS = 12_000;
 
 export interface RequiredCheck {
