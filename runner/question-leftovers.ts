@@ -270,15 +270,11 @@ export class LeftoverLedger {
 
   /**
    * The host part of the first check of a process: delete Ask roots of earlier sessions, recorded or found by their
-   * owner stamp, but never `active`. Throws, with the commands to finish by hand, while any remain. Also refuses while
+   * owner stamp, but never `active`. Throws, with the commands to finish by hand, while any remain. Then refuses while
    * the record still lists Docker storage from a build before #65, which recovery cannot find.
    */
   assertClear(options: { active?: string } = {}): void {
     const known = this.#read();
-    if (known.leftovers.length || known.untracked) {
-      const commands = known.leftovers.flatMap(entry => [`docker rm -f ${entry.keeper}`, `docker volume rm ${entry.workVolume} ${entry.metadataVolume}`]);
-      throw new Error(`Ask is off: an earlier codeboost build recorded agent storage it could not remove, and codeboost cannot find it by owner. Remove ${commands.length ? 'what is left of it (a command for an object that is already gone fails harmlessly)' : 'it'}, and any other container, volume or network labelled io.codeboost.allocation, io.codeboost.invocation or io.codeboost.egress that no running codeboost uses. Then delete ${this.path} and retry.${commands.length ? `\n${commands.join('\n')}` : ''}`);
-    }
     // Roots this record does not list (a renamed database, a lost record) are found by their owner stamp.
     const orphans = this.#reclaimOrphanRoots(new Set([...known.roots, ...(options.active ? [options.active] : [])]));
     if (orphans.length) throw new Error(`Ask is off: host copies of reviewed code or credentials from an earlier session could not be deleted. Delete them, then retry:\n${orphans.map(root => `rm -rf '${root}'`).join('\n')}`);
@@ -290,5 +286,10 @@ export class LeftoverLedger {
     if (roots.length !== known.roots.length) this.#write({ ...known, roots });
     const stuck = roots.filter(root => root !== options.active);
     if (stuck.length) throw new Error(`Ask is off: host copies of reviewed code or credentials from an earlier session could not be deleted. Delete them, then retry:\n${stuck.map(root => `rm -rf '${root}'`).join('\n')}`);
+    // Last, so host copies are deleted (and dropped from the record) before the user is told to delete the record.
+    if (known.leftovers.length || known.untracked) {
+      const commands = known.leftovers.flatMap(entry => [`docker rm -f ${entry.keeper}`, `docker volume rm ${entry.workVolume} ${entry.metadataVolume}`]);
+      throw new Error(`Ask is off: an earlier codeboost build recorded agent storage it could not remove, and codeboost cannot find it by owner. Remove ${commands.length ? 'what is left of it (a command for an object that is already gone fails harmlessly)' : 'it'}, and any other container, volume or network labelled io.codeboost.allocation, io.codeboost.invocation or io.codeboost.egress that no running codeboost uses. Then delete ${this.path} and retry.${commands.length ? `\n${commands.join('\n')}` : ''}`);
+    }
   }
 }

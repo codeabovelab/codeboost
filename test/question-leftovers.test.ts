@@ -31,6 +31,17 @@ it('refuses a record from a build before #65 that lists Docker storage, until th
   expect(() => ledger.assertClear()).not.toThrow();
 });
 
+it('deletes earlier Ask roots before refusing on a record from a build before #65', () => {
+  const path = ledgerPath();
+  const stale = mkdtempSync(join(tmpdir(), 'codeboost-ask-')); roots.push(stale);
+  writeFileSync(join(stale, 'auth.json'), 'secret');
+  writeFileSync(path, JSON.stringify({ leftovers: [], untracked: 1, roots: [stale] }));
+  expect(() => new LeftoverLedger(path).assertClear()).toThrow('earlier codeboost build');
+  // The host copy is gone and no longer recorded, so deleting the record as told loses nothing.
+  expect(existsSync(stale)).toBe(false);
+  expect(read(path)).toEqual({ roots: [], untracked: 1 });
+});
+
 it('fails closed on an unreadable or tampered record', () => {
   const path = ledgerPath();
   const ledger = new LeftoverLedger(path);

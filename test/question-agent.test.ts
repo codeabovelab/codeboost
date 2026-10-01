@@ -8,7 +8,7 @@ import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
 import type { RecoveredTaskStorage } from '../agents/container/storage.ts';
 import type { RecoveryReport, UnownedResource } from '../agents/recovery.ts';
-import { askInContainer, credentialEnvironment, measureGitRepository, recoverQuestionStorage, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, credentialEnvironment, measureGitRepository, recoverAskOwner, recoverQuestionStorage, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
 const roots: string[] = [];
@@ -429,4 +429,13 @@ it('keeps Ask off, with removal commands, for objects of its own owner that reco
 it('keeps Ask off when recovery cannot finish', async () => {
   const deps = { removeFilesystems: () => {}, recover: async () => { throw new Error('Cannot connect to the Docker daemon'); } };
   await expect(recoverQuestionStorage(OWNER, deps, new RetainedStorage())).rejects.toThrow(/could not remove what an earlier session.*Cannot connect/);
+});
+
+it("calls lane D's recovery for this owner only, without the daemon-wide search for unowned objects (#65)", async () => {
+  const recovery = await import('../agents/recovery.ts');
+  const spy = vi.spyOn(recovery, 'recoverLeftovers').mockResolvedValue({ removed: [], storage: [], unowned: [] });
+  try {
+    await recoverAskOwner(OWNER);
+    expect(spy).toHaveBeenCalledWith(OWNER, 60_000, { unowned: false });
+  } finally { spy.mockRestore(); }
 });

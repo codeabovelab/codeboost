@@ -4,9 +4,8 @@ import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
-import { recoverLeftovers } from '../agents/recovery.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { askInContainer, measureGitRepository, recoverQuestionStorage, RetainedStorage, StopError, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
+import { askInContainer, measureGitRepository, recoverAskOwner, recoverQuestionStorage, RetainedStorage, StopError, type ContainerDependencies, type ContainerQuestion } from './question-container.ts';
 
 // Lane D's image build, clone and storage allocation are synchronous (Docker and Git calls), so they run here instead of blocking the review server.
 // Its trust registries (built image, clones, allocations, captured invocations) live in this worker's modules.
@@ -17,9 +16,7 @@ export type WorkerReply = { id: string; attemptId: string; ok: true; text: strin
 export type ReleaseReply = { id: string; remaining: number };
 /** Reply to `recover`: `error` is the reason Ask stays off; without it, recovery finished. */
 export type RecoverReply = { id: string; recovery: 'done' | 'failed'; error?: string };
-// Bounds lane D's recovery, which otherwise allows two minutes; the first question waits for it. Recovery skips
-// the daemon-wide search for objects without an owner, so other reviews' objects never reach it (#65).
-const RECOVERY_TIMEOUT_MS = 60_000;
+
 
 // This worker's environment is an allowlist without credentials; the credential variables arrive as data and go
 // only to the adapters.
@@ -29,7 +26,7 @@ const deps: ContainerDependencies = {
   createClone: createTaskClone,
   prepareFilesystems: prepareTaskFilesystems,
   removeFilesystems: removeTaskFilesystems,
-  recover: runnerOwner => recoverLeftovers(runnerOwner, RECOVERY_TIMEOUT_MS, { unowned: false }),
+  recover: recoverAskOwner,
   measureRepository: measureGitRepository,
   capture: input => captureInvocation(input),
   startClaude: startClaudeInvocation,

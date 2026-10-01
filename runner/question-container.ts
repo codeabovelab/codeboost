@@ -7,7 +7,7 @@ import type { InvocationContext, InvocationHandle, InvocationInput, InvocationRe
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { RecoveredTaskStorage, TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
 import { RUNNER_LABEL, type ResourceOwner } from '../agents/labels.ts';
-import type { RecoveryReport } from '../agents/recovery.ts';
+import { recoverLeftovers, type RecoveryReport } from '../agents/recovery.ts';
 import { removeStaging } from './question-leftovers.ts';
 
 export type Provider = 'claude' | 'codex';
@@ -244,6 +244,14 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
   }
 }
 
+// Bounds lane D's recovery, which otherwise allows two minutes; the first question waits for it.
+const RECOVERY_TIMEOUT_MS = 60_000;
+/**
+ * Ask's call into lane D's recovery. It skips the daemon-wide search for objects without an owner, so other reviews'
+ * objects are never listed or inspected and cannot make it fail (#65).
+ */
+export const recoverAskOwner = (runnerOwner: string): Promise<RecoveryReport> =>
+  recoverLeftovers(runnerOwner, RECOVERY_TIMEOUT_MS, { unowned: false });
 // Shown in a refusal at most this many objects; the rest are counted.
 const MAX_LISTED = 20;
 /**
