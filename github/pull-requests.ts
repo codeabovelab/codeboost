@@ -56,7 +56,9 @@ export class DraftsUnsupported extends Error {}
 export class PullRequestRefused extends Error {}
 /**
  * The task's own PRs are not where the main path can publish: one is open into another base than the configured one,
- * or two are open. A person has to retarget or close them; nothing about them is changed.
+ * two are open, or a person moved one (renamed its branch, removed its first-line marker). A person has to retarget,
+ * restore or close them. The publisher makes them drafts first, where it can still identify them, and changes nothing
+ * else about them.
  */
 export class PullRequestMisplaced extends Error {}
 const DRAFTS_UNSUPPORTED = /draft pull requests? (?:are|is) not supported/i;

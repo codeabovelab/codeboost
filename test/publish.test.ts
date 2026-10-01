@@ -39,7 +39,7 @@ const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>(
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number> } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number> } = {}) {
   const publishConfig = { ...config, ...options.config };
   // The task's branch, as the publisher names it (one task per harness).
   let publishBranch = '';
@@ -90,7 +90,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       // A PR a test removed from `live` was closed (GitHub keeps every PR it ever had).
       const [m] = [...live].find(([, pr]) => pr.number === number) ?? [undefined];
       if (m === undefined) return { open: false, headBranch: publishBranch, base: publishConfig.baseBranch, marker: '' };
-      return { open: !closed.has(number), headBranch: options.moved?.has(number) ? 'renamed-by-a-person' : publishBranch, base: bases.get(m) ?? publishConfig.baseBranch, marker: m };
+      return { open: !closed.has(number), headBranch: options.moved?.has(number) ? 'renamed-by-a-person' : publishBranch, base: bases.get(m) ?? publishConfig.baseBranch, marker: options.unmarked?.has(number) ? '' : m };
     },
     async findOwned(input) {
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
@@ -1963,10 +1963,21 @@ describe('shutdown and PRs left ready', () => {
     await expect(lagging.publisher.publish(identity)).rejects.toThrow(/#100 is open, but GitHub's pull request list does not show it yet/);
     expect(lagging.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
     expect(store.taskPullRequests(identity)).toHaveLength(1);
-    // A PR whose branch a person renamed is not list lag: a retry would never see it, so the refusal says what to do.
+    // A PR a person moved is not list lag: a retry would never see it, so the refusal says what to do, and the PR is
+    // made a draft where it is while its marker still identifies it.
     const moved = harness(store, { live, next, hidden, moved: new Set([100]) });
-    await expect(moved.publisher.publish(identity)).rejects.toThrow(/#100 is open, but no longer from .* Close it, or restore/);
+    await expect(moved.publisher.publish(identity)).rejects.toThrow(/#100 is open, but no longer from .* Close it, or restore.*It is now a draft\./);
     expect(moved.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    // Retargeted while the list lags: also moved, not lag.
+    baseOf.get(live)!.set([...live.keys()][0]!, 'develop');
+    await expect(harness(store, { live, next, hidden }).publisher.publish(identity)).rejects.toThrow(PullRequestMisplaced);
+    baseOf.get(live)!.delete([...live.keys()][0]!);
+    // Its marker removed: refused, and said to be possibly still ready, since nothing identifies it any more.
+    const unmarked = harness(store, { live, next, hidden, unmarked: new Set([100]) });
+    await expect(unmarked.publisher.publish(identity)).rejects.toThrow(/first line no longer identifies it/);
+    expect(unmarked.log.some(line => line.startsWith('draft'))).toBe(false);
     // Once the list shows it, the update goes ahead.
     hidden.clear();
     expect(await harness(store, { live, next }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });

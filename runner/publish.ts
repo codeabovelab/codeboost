@@ -154,7 +154,22 @@ export class PullRequestPublisher {
         if (pr.headBranch === branch && pr.base === this.#config.baseBranch && pr.marker === marker(row.openingId))
           throw new OpeningUnsettled(`Pull request #${row.number} is open, but GitHub's pull request list does not show it yet. Try again later.`);
         // Moved by a person (branch renamed, marker removed, retargeted): a retry would never see it, so a person decides.
-        throw new PullRequestMisplaced(`The task's pull request #${row.number} is open, but no longer from ${branch} into ${this.#config.baseBranch} with its marker. Close it, or restore its branch, base and first line.`);
+        // Like every misplaced PR, it does not stay ready meanwhile: it is made a draft where it is, while its marker
+        // still identifies it.
+        let state = 'It may still be ready for review: its first line no longer identifies it.';
+        if (pr.marker === marker(row.openingId)) {
+          try {
+            const drafted = await this.#pulls.markDraft(row.number, { base: pr.base, headBranch: pr.headBranch, marker: pr.marker }, signal);
+            this.#store.recordPullRequestDraft(identity, row.openingId, drafted.number, drafted.draft,
+              { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+            state = 'It is now a draft.';
+          } catch (error) {
+            if (signal?.aborted) throw error;
+            state = error instanceof DraftsUnsupported ? 'It stays ready for review: this repository does not support draft pull requests.'
+              : `It could not be made a draft and may still be ready for review (${error instanceof Error ? error.message : String(error)}).`;
+          }
+        }
+        throw new PullRequestMisplaced(`The task's pull request #${row.number} is open, but no longer from ${branch} into ${this.#config.baseBranch} with its marker. Close it, or restore its branch, base and first line. ${state}`);
       }
     }
     let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
