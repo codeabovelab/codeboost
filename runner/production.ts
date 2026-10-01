@@ -68,10 +68,12 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
 /**
  * Lane D's recovery, export and removal for `recoverStartup`. Unlike Ask (#65), the runner looks for codeboost objects
  * without a runner label too, and every unowned object blocks startup (runner-lifecycle.md, "Unowned resources"): an
- * older build takes no lock this build can see, so one may still be running. Each is reported as the command that
- * removes it, for a person to run once every older codeboost process has stopped.
+ * older build takes no lock this build can see, so one may still be running. Each is reported as a shell line that
+ * removes it, with its reason as a comment, for a person to run once every older codeboost process has stopped.
+ * `image` builds the agent image when the first export needs it: after D's recovery has stopped every leftover agent,
+ * so none keeps writing to its storage during a long build.
  */
-export function dRecoveryDeps(imageId: string): RecoveryDeps {
+export function dRecoveryDeps(image: () => string): RecoveryDeps {
   return {
     async recoverLeftovers(runnerOwner) {
       const report = await recoverLeftovers(runnerOwner, 120_000);
@@ -79,11 +81,11 @@ export function dRecoveryDeps(imageId: string): RecoveryDeps {
         // D's handle object itself: its trust is keyed by identity, so a copy would be refused.
         storage: report.storage.map(handle => ({ attemptId: handle.attemptId, allocationId: handle.allocationId, handle })),
         unowned: report.unowned.map(resource =>
-          `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${resource.id ?? resource.name} (${resource.reason})`),
+          `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${resource.id ?? resource.name}  # ${resource.reason}`),
       };
     },
     exportTaskDiff: (handle, input, maxBytes, signal) =>
-      exportTaskDiff(handle as Parameters<typeof exportTaskDiff>[0], { base: input.base, metadataBaseline: input.metadataBaseline, imageId, maxBytes, signal }),
+      exportTaskDiff(handle as Parameters<typeof exportTaskDiff>[0], { base: input.base, metadataBaseline: input.metadataBaseline, imageId: image(), maxBytes, signal }),
     removeTaskFilesystems: handle => removeTaskFilesystemsAsync(handle as Parameters<typeof removeTaskFilesystemsAsync>[0]),
   };
 }
@@ -100,7 +102,10 @@ export function claudeLauncher(o: { imageId: string; runnerRoot: string; runnerO
     mkdirSync(directory, { mode: 0o755 });
     // The container user reads it; the directory stays writable by its owner, so cleanup can remove it.
     chmodSync(directory, 0o755);
-    writeFileSync(join(directory, 'schema.json'), EXECUTE_SCHEMA, { mode: 0o444, flag: 'wx' });
+    const schema = join(directory, 'schema.json');
+    writeFileSync(schema, EXECUTE_SCHEMA, { mode: 0o444, flag: 'wx' });
+    // The umask narrows a create mode (077 gives 0400), and D refuses a schema the container user cannot read.
+    chmodSync(schema, 0o444);
     return (o.start ?? startClaudeInvocation)({ invocation: input, filesystems: workspaceFilesystems(workspace), inputDirectory: directory,
       imageId: o.imageId, prompt, networkAllocationId: randomUUID() }, o.token);
   };
@@ -114,12 +119,12 @@ export interface RunnerAssembly {
 }
 /**
  * Startup with a runner, after the Store opened and before the server admits anything (runner-lifecycle.md, "Startup
- * recovery"): verify the lock still names the database, build the agent image, run recovery under the database's
- * runner token, then assemble the execution deps. Any failure stops startup; the caller closes the Store.
+ * recovery"): verify the lock still names the database, run recovery under the database's runner token, build the
+ * agent image (during recovery, if an export needs it), then assemble the execution deps. Any failure stops startup; the caller closes the Store.
  */
 export async function setUpRunner(o: { service: ReviewService; capability: ShutdownCapability; config: RunnerConfig; lock: Pick<RunnerLock, 'file' | 'verify'>;
-  env: Readonly<Record<string, string | undefined>>; buildImage?: () => string; recovery?: (imageId: string) => RecoveryDeps;
-  /** Told before the slow part (the image build and recovery) starts. */
+  env: Readonly<Record<string, string | undefined>>; buildImage?: () => string; recovery?: (image: () => string) => RecoveryDeps;
+  /** Told before the slow part (recovery and the image build) starts. */
   onSlowStart?: () => void }): Promise<RunnerAssembly> {
   const { service, config } = o, review = service.config;
   if (review.demo) throw new Error('Demos never run the runner.');
@@ -133,9 +138,11 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const diagnosticsDir = config.diagnosticsDir ?? join(config.root, 'diagnostics');
   ownerOnlyDirectory(diagnosticsDir);
   o.onSlowStart?.();
-  const imageId = (o.buildImage ?? buildAgentImage)();
+  let built: string | undefined;
+  const image = () => built ??= (o.buildImage ?? buildAgentImage)();
   const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
-    diagnosticsCapBytes: config.diagnosticsCapBytes, deps: (o.recovery ?? dRecoveryDeps)(imageId) });
+    diagnosticsCapBytes: config.diagnosticsCapBytes, deps: (o.recovery ?? dRecoveryDeps)(image) });
+  const imageId = image();
   const identity = review.identity;
   const repository = await openRunnerRepository({ runnerRoot: config.root, runnerOwner, repositoryId: identity.repositoryId, source: review.repository });
   // The review reads runner commits from the same repository the runner writes; a configured path must agree.

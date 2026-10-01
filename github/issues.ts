@@ -254,20 +254,22 @@ export class GhIssueGateway implements IssueGateway {
       const comments: string[] = [];
       let total = title.length + body.length;
       for (let page = 1; ; page++) {
-        if (page > MAX_PAGES) throw new Error(`Issue #${number} has more than ${MAX_ISSUES} comments; codeboost does not read past that limit.`);
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
           `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });
         let values: unknown;
         try { values = JSON.parse(listed); }
         catch { throw new Error('GitHub returned invalid comment JSON.'); }
         if (!Array.isArray(values) || values.length > PAGE_SIZE) throw new Error('GitHub returned an invalid comment page.');
+        // Only an empty page past the limit ends the read cleanly; anything on it is more than codeboost reads.
+        if (page > MAX_PAGES && values.length) throw new Error(`Issue #${number} has more than ${MAX_ISSUES} comments; codeboost does not read past that limit.`);
         for (const value of values) {
           const comment = object(value, 'GitHub returned a malformed comment.');
-          const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
-          // A deleted ("ghost") author is nobody's collaborator.
+          // A deleted ("ghost") author is nobody's collaborator. Other people's comments are dropped before their body is
+          // checked, so none of theirs can make the issue unreadable.
           if (comment.user === null) continue;
           const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
           if (!collaborators.has(author.toLocaleLowerCase('en-US'))) continue;
+          const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
           total += text.length;
           if (total > MAX_ISSUE_TEXT) throw new Error(`Issue #${number}'s text and collaborator comments are longer than ${MAX_ISSUE_TEXT} characters; codeboost does not cut an issue to fit a prompt.`);
           comments.push(text);

@@ -295,6 +295,25 @@ describe('startup recovery sequence', () => {
     expect(calls).toEqual(['export', 'remove:saved']);
     expect(report.unmatchedStorage).toEqual([attempt.id]);
   });
+  it('keeps every diff this recovery saved when retention runs, so no finalized row points at a deleted file', async () => {
+    const { d: root, store, admit, allocate } = fixture(2);
+    const first = admit(id(1)); const a = allocate(id(1), first.id, 'a'); store.markRunning(id(1), first.id);
+    const second = admit(id(2)); const b = allocate(id(2), second.id, 'b'); store.markRunning(id(2), second.id);
+    const { d } = deps({ recoverLeftovers: async () => ({ storage: [a, b], unowned: [] }),
+      exportTaskDiff: async () => ({ diff: Buffer.alloc(40, 1), truncated: false }) });
+    // A cap that holds one diff: retention runs on the second save, before finalization references the first.
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d, diagnosticsCapBytes: 50 });
+    for (const [identity, attempt] of [[id(1), first], [id(2), second]] as const) {
+      const ref = store.getAttempt(identity, attempt.id).diagnosticRef;
+      expect(ref && existsSync(ref)).toBe(true);
+    }
+  });
+  it('lists each unowned object on its own line', async () => {
+    const { d: root, store } = fixture();
+    const run = recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ recoverLeftovers: async () => ({ storage: [], unowned: ['docker volume rm a  # no-runner-label', 'docker network rm b  # unknown-kind'] }) }).d });
+    await expect(run).rejects.toThrow(/then start again:\ndocker volume rm a {2}# no-runner-label\ndocker network rm b {2}# unknown-kind$/);
+  });
   it('records an export failure, without calling D, when the allocation baseline was never saved', async () => {
     const { d: root, store, admit, allocate } = fixture();
     const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h', { baseline: false }); store.markRunning(id(1), attempt.id);

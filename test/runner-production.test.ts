@@ -11,8 +11,13 @@ import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { InvocationInput } from '../agents/contract.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
+import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/storage.ts';
+import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
+import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 
 vi.mock('../agents/recovery.ts', async original => ({ ...await original<typeof import('../agents/recovery.ts')>(), recoverLeftovers: vi.fn() }));
+vi.mock('../agents/container/storage.ts', async original => ({ ...await original<typeof import('../agents/container/storage.ts')>(),
+  exportTaskDiff: vi.fn(async () => ({ diff: Buffer.from('d'), truncated: false })), removeTaskFilesystemsAsync: vi.fn(async () => undefined) }));
 
 vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -58,8 +63,9 @@ describe('runner startup', () => {
   it('verifies the lock, builds the image, then recovers, before it assembles anything', async () => {
     const { root, service } = fixture(), calls: string[] = [];
     const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
-      buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: imageId => { calls.push(`deps ${imageId}`); return recovery(calls); } });
-    expect(calls).toEqual(['verify', 'image', 'deps sha256:x', 'recover']);
+      buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); } });
+    // D's recovery stops every leftover agent before the (possibly long) image build.
+    expect(calls).toEqual(['verify', 'deps', 'recover', 'image']);
     expect(assembly.deps.kinds).toEqual(['execute']);
     // The token is the database's own, kept for this file identity.
     expect(assembly.deps.runnerOwner).toBe(service.store.runnerOwnerToken({ dev: 1n, ino: 2n }));
@@ -109,6 +115,53 @@ describe('server with a runner setup', () => {
     expect(setup).toHaveBeenCalledOnce();
     expect(closed).toBe(true);
   });
+  /** A runner whose agent never runs: enough to drive the server's own wiring. */
+  const assembly = (service: ReviewService) => {
+    const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => { throw new Error('no agent here'); },
+      cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
+    const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+    return { deps, sources, findings: new SafetyFindings(service.store), recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
+  };
+  it('closes the Store only after the plan runs in progress, and after a failing step', async () => {
+    const { demo } = fixture();
+    const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => assembly(service));
+    const order: string[] = [];
+    const executorClose = app.executor!.close.bind(app.executor);
+    app.executor!.close = async () => { await new Promise(resolve => setTimeout(resolve, 20)); order.push('executor'); return executorClose(); };
+    const storeClose = app.service.store.close.bind(app.service.store);
+    app.service.store.close = () => { order.push('store'); storeClose(); };
+    vi.spyOn(app.runner as RunnerCoordinator, 'close').mockRejectedValueOnce(new Error('runner close failed'));
+    await expect(app.close()).rejects.toThrow(/runner close failed/);
+    expect(order).toEqual(['store']);
+    // Without the failure: executor first, then the Store.
+    const second = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => assembly(service));
+    const order2: string[] = [];
+    const close2 = second.executor!.close.bind(second.executor);
+    second.executor!.close = async () => { await new Promise(resolve => setTimeout(resolve, 20)); order2.push('executor'); return close2(); };
+    const store2 = second.service.store.close.bind(second.service.store);
+    second.service.store.close = () => { order2.push('store'); store2(); };
+    await second.close();
+    expect(order2).toEqual(['executor', 'store']);
+  });
+  it('refuses to retry a plan item outside the executor', async () => {
+    const { demo } = fixture();
+    const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+      const store = service.store, identity = demo.identity;
+      if (store.getTask(identity).status !== 'queued') store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+      const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: store.getPlan(identity).items[0]!.id,
+        expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+      store.markRunning(identity, attempt.id);
+      store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
+      return assembly(service);
+    });
+    cleanups.push(() => app.close());
+    const origin = new URL(app.url).origin, headers = { 'x-codeboost-token': app.token };
+    const view = await (await fetch(`${origin}/api/runner`, { headers })).json() as { stateVersion: number; attempts: { id: string }[] };
+    const response = await fetch(`${origin}/api/runner`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'retry', attemptId: view.attempts[0]!.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() }) });
+    expect(await response.json()).toEqual({ error: expect.stringMatching(/Retrying a plan item on its own is not supported/) });
+    expect(app.service.store.getAttempts(demo.identity)).toHaveLength(1);
+  });
   it('reports a missing runner block on a runner action', async () => {
     const { demo } = fixture();
     const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000);
@@ -128,11 +181,24 @@ describe('D adapters', () => {
       { kind: 'volume', name: 'legacy', labels: {}, reason: 'no-runner-label' },
       { kind: 'container', name: 'ours', id: 'abc', labels: { 'io.codeboost.runner': OWNER }, reason: 'unknown-kind' },
     ] });
-    const report = await dRecoveryDeps('sha256:x').recoverLeftovers(OWNER);
+    const report = await dRecoveryDeps(() => 'sha256:x').recoverLeftovers(OWNER);
     // The daemon-wide search for unlabelled objects stays on (runner-lifecycle.md, "Unowned resources").
     expect(spy).toHaveBeenCalledWith(OWNER, 120_000);
     expect(report.storage[0]!.handle).toBe(handle);
-    expect(report.unowned).toEqual(['docker volume rm legacy (no-runner-label)', 'docker container rm -f abc (unknown-kind)']);
+    // Each line runs as it is in a shell; the reason is a comment.
+    expect(report.unowned).toEqual(['docker volume rm legacy  # no-runner-label', 'docker container rm -f abc  # unknown-kind']);
+  });
+  it('exports with the row\'s base and baseline and the image built on first need, and removes D\'s own handle', async () => {
+    let builds = 0;
+    const deps = dRecoveryDeps(() => { builds++; return 'sha256:x'; }), handle = { recovered: true }, signal = new AbortController().signal;
+    vi.mocked(recoverLeftovers).mockResolvedValue({ removed: [], storage: [], unowned: [] });
+    await deps.recoverLeftovers(OWNER);
+    expect(builds).toBe(0);
+    await deps.exportTaskDiff(handle, { base: 'a'.repeat(40), metadataBaseline: 'b'.repeat(64) }, 1024, signal);
+    expect(vi.mocked(exportTaskDiff)).toHaveBeenCalledWith(handle, { base: 'a'.repeat(40), metadataBaseline: 'b'.repeat(64), imageId: 'sha256:x', maxBytes: 1024, signal });
+    expect(builds).toBe(1);
+    await deps.removeTaskFilesystems(handle);
+    expect(vi.mocked(removeTaskFilesystemsAsync).mock.calls[0]![0]).toBe(handle);
   });
   it('launches Claude with a schema-only input mount in the attempt directory and the workspace\'s storage', () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-launch-')); roots.push(root);
@@ -140,6 +206,9 @@ describe('D adapters', () => {
     mkdirSync(attemptDir, { recursive: true, mode: 0o700 });
     let seen: AgentAdapterRequest | undefined, token: string | undefined;
     const filesystems = { keeper: 'k' };
+    // The schema must stay readable by the container user under any umask.
+    const umask = process.umask(0o077);
+    cleanups.push(() => { process.umask(umask); });
     const launch = claudeLauncher({ imageId: 'sha256:x', runnerRoot: root, runnerOwner: OWNER, token: 'secret',
       start: (request, t) => { seen = request; token = t; return { attemptId, settled: new Promise(() => undefined), cancel: () => undefined }; } });
     launch({ attemptId } as InvocationInput, 'the prompt', { clone: {} as never, storage: { filesystems } });
@@ -148,6 +217,7 @@ describe('D adapters', () => {
     expect(readdirSync(join(attemptDir, 'input'))).toEqual(['schema.json']);
     expect(JSON.parse(readFileSync(join(attemptDir, 'input', 'schema.json'), 'utf8'))).toMatchObject({ type: 'string' });
     expect(lstatSync(join(attemptDir, 'input')).mode & 0o005).toBe(0o005);
+    expect(lstatSync(join(attemptDir, 'input', 'schema.json')).mode & 0o777).toBe(0o444);
     // The coordinator's preparation cleanup removes the attempt directory with it.
     rmSync(attemptDir, { recursive: true });
   });

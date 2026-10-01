@@ -258,6 +258,13 @@ describe('issue text for an execute prompt (#91)', () => {
     const long = Array.from({ length: 9 }, () => comment('member', 'x'.repeat(65_000)));
     await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/longer than/);
   });
+  it('ignores an oversized comment from someone else, and reads exactly the page limit', async () => {
+    const huge = comment('outsider', 'x'.repeat(70_000));
+    expect((await gateway([[huge, comment('member', 'kept')]]).gateway.issueText(7)).comments).toEqual(['kept']);
+    const pages = Array.from({ length: 10 }, () => Array.from({ length: 100 }, () => comment('outsider', 'spam')));
+    expect((await gateway(pages).gateway.issueText(7)).comments).toEqual([]);
+    await expect(gateway([...pages, [comment('outsider', 'one more')]]).gateway.issueText(7)).rejects.toThrow(/more than 1000 comments/);
+  });
   it('stops on the caller\'s abort', async () => {
     const controller = new AbortController();
     controller.abort(new Error('stopped'));

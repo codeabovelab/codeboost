@@ -100,6 +100,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         return { outcome: 'stopping' };
       }
       const last = service.store.getAttempt(identity, attemptId as string);
+      // A plan item runs only through the executor, which pauses or escalates after it; a bare retry would skip both.
+      if (executor && last.kind === 'execute') throw new GuardRefusal('Retrying a plan item on its own is not supported; it comes with resuming the task (#91 part 2).');
       const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
       return { outcome: 'started', attemptId: retry.id };
@@ -279,13 +281,20 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     server.closeIdleConnections();
     // Abort the issue refresh now; its close settles without rejecting, so it is always awaited.
     const issuesClosed=issues.close();
-    try { await merges?.close(); } finally { await issuesClosed; }
-    // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.
-    await runner?.close();
-    // Then every plan run in progress: its pause or escalation after the last attempt is a settlement write (#91).
-    await executor?.close();
-    await closing;
-    // Close the store even if Ask's or planning's cleanup fails, then report that failure.
-    try { await questions.close(); } finally { try { await suggestions?.close(); } finally { service.close(); } }
+    // A failure in one step is reported after the rest has run: agents are still stopped and the Store still closed.
+    try {
+      try { await merges?.close(); } finally { await issuesClosed; }
+    } finally {
+      try {
+        // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.
+        await runner?.close();
+        // Then every plan run in progress: its pause or escalation after the last attempt is a settlement write (#91).
+        await executor?.close();
+        await closing;
+      } finally {
+        // Close the store even if Ask's or planning's cleanup fails, then report that failure.
+        try { await questions.close(); } finally { try { await suggestions?.close(); } finally { service.close(); } }
+      }
+    }
   } };
 }

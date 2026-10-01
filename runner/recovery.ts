@@ -16,7 +16,7 @@ import { ownerOnlyDirectory } from './runner-repository.ts';
 export class LockHeld extends Error { constructor() { super('Another codeboost runner is using this database.'); } }
 export class RecoveryBlocked extends Error {
   readonly items: string[];
-  constructor(message: string, items: string[]) { super(`${message}: ${items.join(', ')}`); this.items = items; }
+  constructor(message: string, items: string[], separator = ', ') { super(`${message}:${separator === '\n' ? '\n' : ' '}${items.join(separator)}`); this.items = items; }
 }
 
 /** Linux statfs magic numbers for network filesystems, where POSIX locks are unreliable. */
@@ -157,7 +157,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     await processes.terminate(a.preparationPgid, o.graceMs ?? 5_000);
   // 2c/2d. D's recovery; a rejection propagates and stops startup.
   const recovered = await o.deps.recoverLeftovers(o.runnerOwner);
-  if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner cannot identify, possibly from an older build that may still be running. Stop every older codeboost process, remove them with these commands, then start again', recovered.unowned);
+  if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned, '\n');
   // A handle is used only if both its attempt ID and its allocation ID match one attempt row of this database
   // (runner-lifecycle.md, "Recovered storage handles"); any other is reported and left for a person.
   const matched = recovered.storage.filter(s => isUuidV4(s.attemptId) && isUuidV4(s.allocationId) && o.store.attemptAllocation(s.attemptId) === s.allocationId);
@@ -178,7 +178,9 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     try {
       const { diff } = await Promise.race([exporting,
         new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }))]);
-      exports[storage.attemptId] = { diagnosticRef: saveDiagnostic(o.store, o.diagnosticsDir, storage.attemptId, diff.subarray(0, EXPORT_LIMIT), o.diagnosticsCapBytes) };
+      // Earlier exports of this pass are not referenced until finalization, so retention must keep them too.
+      const saved = Object.values(exports).flatMap(entry => entry.diagnosticRef ? [entry.diagnosticRef] : []);
+      exports[storage.attemptId] = { diagnosticRef: saveDiagnostic(o.store, o.diagnosticsDir, storage.attemptId, diff.subarray(0, EXPORT_LIMIT), o.diagnosticsCapBytes, saved) };
     } catch (error) { exports[storage.attemptId] = { failure: error instanceof Error ? error.message : String(error) }; }
     finally { clearTimeout(timer); }
     // A timed-out export must stop before step 4 removes its storage. D stops on abort; if it does not, fail closed.

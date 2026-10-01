@@ -14,17 +14,19 @@ if (values.help || (!values.demo && !values.config)) {
   if (!values.config) throw new Error('--release-preparation needs --config.');
   const config = JSON.parse(readFileSync(resolve(values.config), 'utf8'));
   if (config.runner === undefined) throw new Error('This review has no runner block, so it has no preparations to release.');
-  const runnerConfig = parseRunnerConfig(config.runner);
-  // Under the runner lock, so no runner of this database is starting or running while the directory is checked.
-  const lock = acquireRunnerLock(config.database);
   try {
-    const store = new Store(config.database);
+    const runnerConfig = parseRunnerConfig(config.runner);
+    // Under the runner lock, so no runner of this database is starting or running while the directory is checked.
+    const lock = acquireRunnerLock(config.database);
     try {
-      lock.verify();
-      releasePreparation({ store, runnerRoot: runnerConfig.root, runnerOwner: store.runnerOwnerToken(lock.file), attemptId: values['release-preparation'] });
-      console.log('Released. Start codeboost again.');
-    } finally { store.close(); }
-  } finally { lock.release(); }
+      const store = new Store(config.database);
+      try {
+        lock.verify();
+        releasePreparation({ store, runnerRoot: runnerConfig.root, runnerOwner: store.runnerOwnerToken(lock.file), attemptId: values['release-preparation'] });
+        console.log('Released. Start codeboost again.');
+      } finally { store.close(); }
+    } finally { lock.release(); }
+  } catch (error) { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
 } else {
   const port = Number(values.port ?? '4318');
   if (!Number.isInteger(port) || port < 0 || port > 65535) throw new Error('Invalid port.');
