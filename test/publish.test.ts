@@ -98,7 +98,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     async findOwned(input) {
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
       if (options.found !== undefined) return options.found ? [{ ...options.found, marker: input.markers.at(-1)!, base: publishConfig.baseBranch }] : [];
-      return [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && input.markers.includes(m))
+      return [...live].filter(([m, pr]) => !closed.has(pr.number) && !options.hidden?.has(m) && !options.unmarked?.has(pr.number) && input.markers.includes(m))
         .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch }));
     },
     async markDraft(number, input) {
@@ -106,6 +106,8 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       // Like the adapter's read-back: the PR must be from the branch and into the base asked for.
       if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
       const current = live.get(input.marker);
+      // The read-back needs the marker on the first line: an unmarked PR fails it.
+      if (current && options.unmarked?.has(current.number)) throw new Error('GitHub returned a different pull request.');
       if (current && input.headBranch !== (options.moved?.has(current.number) ? 'renamed-by-a-person' : publishBranch)) throw new Error('GitHub returned a pull request for a different branch.');
       options.onDraft?.();
       if (options.draftsUnsupported) throw new DraftsUnsupported('no drafts');
@@ -1395,7 +1397,7 @@ describe('GitHub PR adapter', () => {
       .findOpened({ ...input, markers: [marker], numbers });
     const own = await lookup([7]).catch(e => e);
     expect(own).toBeInstanceOf(PullRequestMisplaced);
-    expect(own.message).toMatch(/#7 no longer starts with its marker/);
+    expect(own.message).toMatch(/#7 no longer starts with its marker.*may still be ready for review/);
     await expect(lookup([8])).rejects.toThrow(/did not open/);
   });
   it('validates every PR it reads: an https URL, and head and base in this repository', async () => {
@@ -2010,8 +2012,11 @@ describe('shutdown and PRs left ready', () => {
     await harness(store, { live, next }).publisher.publish(identity);
     requeue(store);
     const again = harness(store, { live, next, unmarked: new Set([100]) });
-    await expect(again.publisher.publish(identity)).rejects.toThrow(/#100 no longer starts with its marker/);
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/#100 no longer starts with its marker.*may still be ready for review/);
     expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
+    // Nothing identifies it any more, so it cannot be drafted: the record still says ready, as GitHub does.
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();

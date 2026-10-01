@@ -22,7 +22,8 @@ export interface PullRequestGateway {
   /**
    * The open PR from `headBranch` into `base`, with the one of `markers` its description carries, or null when there is
    * no open PR. An open PR that carries none of them (always the case with no markers) was not opened by codeboost, and
-   * is refused. The task's own PRs (those carrying one of `markers`) must be at most one, and into `base`: its own PR in
+   * is refused, unless its number is one of `numbers` (the task's recorded PRs): then a person removed its marker, and it
+   * is refused as PullRequestMisplaced. The task's own PRs (those carrying one of `markers`) must be at most one, and into `base`: its own PR in
    * another base (retargeted by a person, or left by a base change) is refused, and so are two of its own PRs. Anyone
    * else's PR from the branch into another base (a backport, say) is ignored. For the calls that change a PR's content.
    */
@@ -223,7 +224,7 @@ export class GhPullRequestGateway implements PullRequestGateway {
     const found = input.markers.filter(marker => markerOf(body) === marker);
     // `numbers`: the task's recorded PRs. One of them without its marker is the task's own PR, edited by a person.
     if (found.length !== 1 && input.numbers?.includes(pr.number))
-      throw new PullRequestMisplaced(`The task's pull request #${pr.number} no longer starts with its marker. Restore its first line or close it.`);
+      throw new PullRequestMisplaced(`The task's pull request #${pr.number} no longer starts with its marker. Restore its first line or close it. It may still be ready for review: its first line no longer identifies it.`);
     if (found.length !== 1) throw new Error(`An open pull request from ${input.headBranch} exists that codeboost did not open.`);
     return { ...pr, marker: found[0]! };
   }
