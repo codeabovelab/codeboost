@@ -32,6 +32,11 @@ export interface PullRequestGateway {
    * for being in another base: for recording what GitHub shows and for making PRs drafts, both safe in any base.
    */
   findOwned(input: { headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string; base: string })[]>;
+  /**
+   * Whether PR `number` is open, read from the PR itself: GitHub's PR list can lag behind it, so a recorded PR missing
+   * from the list is confirmed closed here before anything is pushed as if it were gone.
+   */
+  isOpen(number: number, signal?: AbortSignal): Promise<boolean>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
   /** `beforeReady` runs after the description update's await and before any ready or draft change; if it throws, no such change is made. */
   refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest>;
@@ -188,6 +193,14 @@ export class GhPullRequestGateway implements PullRequestGateway {
     signal = this.#bounded(signal);
     this.#validate(input);
     return this.#owned(await this.#branchPulls(input.headBranch, signal), input.headBranch, input.markers);
+  }
+
+  async isOpen(number: number, signal?: AbortSignal): Promise<boolean> {
+    signal = this.#bounded(signal);
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
+    const pr = await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal) as { number?: unknown; state?: unknown } | null;
+    if (!pr || pr.number !== number || (pr.state !== 'open' && pr.state !== 'closed')) throw new Error('GitHub returned an invalid pull request.');
+    return pr.state === 'open';
   }
 
   async findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {

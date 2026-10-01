@@ -81,6 +81,11 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
       return { ...open[1], marker: open[0] };
     },
+    async isOpen(number) {
+      // The PR itself: open unless closed, whatever the list shows (a hidden PR models a list that lags behind).
+      log.push(`is open ${number}`);
+      return [...live.values()].some(pr => pr.number === number) && !closed.has(number);
+    },
     async findOwned(input) {
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
       if (options.found !== undefined) return options.found ? [{ ...options.found, marker: input.markers.at(-1)!, base: publishConfig.baseBranch }] : [];
@@ -221,7 +226,7 @@ describe('opening the task PR', () => {
     } };
     const opened: string[] = [];
     const publisher = new PullRequestPublisher(store, { checks: gate, pusher: { async push() {} },
-      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async findOwned() { return []; }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); } } }, config);
+      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async findOwned() { return []; }, async isOpen() { return false; }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); } } }, config);
     await expect(publisher.publish(identity)).rejects.toThrow(GuardRefusal);
     expect(opened).toEqual([]);
   });
@@ -1068,8 +1073,10 @@ describe('the PR description', () => {
     expect(body).toContain('````text\nP1: Guard input\n  Intent: Closes ＃1 @admin ```\n# injected');
     expect(fenced('a ```` b')).toMatch(/^`````text\n/);
   });
-  it('keeps newlines and tabs in fenced text and replaces other control characters', () => {
+  it('keeps newlines and tabs in fenced text and replaces other control characters and lone surrogates', () => {
     expect(fenced('a\u0000b\u0007c\td\r\ne\u007f')).toBe('```text\na\ufffdb\ufffdc\td\ne\ufffd\n```');
+    expect(fenced('x\ud800y😀')).toBe('```text\nx\ufffdy😀\n```');
+    expect(pullRequestTitle({ ...plan, summary: 'Fix \udc00 crash' })).toBe('Fix \ufffd crash (#12)');
   });
   it('handles text with very many backtick runs without overflowing the stack', () => {
     expect(fenced('`a'.repeat(300_000)).startsWith('```text\n')).toBe(true);
@@ -1356,6 +1363,18 @@ describe('GitHub PR adapter', () => {
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'someone else' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/did not open/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response(), response()])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/More than one of the task's pull requests/);
     await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: 'a' }), response({ number: 8, body: 'b' })])).findOpened({ ...input, markers: [marker] })).rejects.toThrow(/invalid pull request list/);
+  });
+  it('recognises its marker in a description GitHub returns with CRLF line endings (an edit on github.com)', async () => {
+    const crlf = response({ body: `${marker}\r\nplan` });
+    expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([crlf])).findOpened({ ...input, markers: [marker] })).toMatchObject({ number: 7, marker });
+    expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([crlf])).findOwned({ headBranch: input.headBranch, markers: [marker] })).toMatchObject([{ number: 7 }]);
+  });
+  it('reads whether a PR is open from the PR itself', async () => {
+    const read = (value: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { expect(args.at(-1)).toBe('repos/owner/repo/pulls/7'); return JSON.stringify(value); }).isOpen(7);
+    expect(await read({ number: 7, state: 'open' })).toBe(true);
+    expect(await read({ number: 7, state: 'closed' })).toBe(false);
+    await expect(read({ number: 8, state: 'open' })).rejects.toThrow(/invalid pull request/);
+    await expect(read({ number: 7, state: 'weird' })).rejects.toThrow(/invalid pull request/);
   });
   it('validates every PR it reads: an https URL, and head and base in this repository', async () => {
     const lookup = (pr: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([pr])).findOpened({ ...input, markers: [marker] });
@@ -1925,6 +1944,19 @@ describe('shutdown and PRs left ready', () => {
     const again = harness(store, { live, next });
     await again.publisher.publish(identity);
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }, { state: 'abandoned' }]);
+  });
+  it('pushes nothing while GitHub\'s list does not show a PR that is still open', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    for (const m of live.keys()) hidden.add(m);
+    const lagging = harness(store, { live, next, hidden });
+    await expect(lagging.publisher.publish(identity)).rejects.toThrow(/#100 is open, but GitHub's pull request list does not show it yet/);
+    expect(lagging.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
+    expect(store.taskPullRequests(identity)).toHaveLength(1);
+    // Once the list shows it, the update goes ahead.
+    hidden.clear();
+    expect(await harness(store, { live, next }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();

@@ -142,6 +142,16 @@ export class PullRequestPublisher {
       throw new PullRequestMisplaced(latest.length ? `${error.message} ${latest.join(' ')}` : error.message);
     }
     signal?.throwIfAborted();
+    if (!live) {
+      // GitHub's PR list can lag behind a PR: a PR recorded as opened that the list does not show is read directly, so a
+      // push never moves an open PR's head with no update recorded as in flight.
+      for (const row of candidates) {
+        if (row.state !== 'opened' || row.number === null) continue;
+        const open = await this.#pulls.isOpen(row.number, signal);
+        signal?.throwIfAborted();
+        if (open) throw new OpeningUnsettled(`Pull request #${row.number} is open, but GitHub's pull request list does not show it yet. Try again later.`);
+      }
+    }
     let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
     // What GitHub shows is the truth for the draft flag: a draft change whose record was lost is repaired here.
     let stateVersion = task.stateVersion;
