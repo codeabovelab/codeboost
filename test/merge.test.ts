@@ -1371,6 +1371,10 @@ it('reports why the merge check matched or could not finish, without commit mess
   expect(found).toMatchObject({ alreadyFixed: 'found', alreadyFixedDetail: `the issue was closed by owner/repo#9; owner/repo#8 (open, draft); commit ${sha('c').slice(0, 12)} on the base branch` });
   const unknown = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, { totalCount: 101 }) ?? mergeReads(args)).inspect();
   expect(unknown).toMatchObject({ alreadyFixed: 'unknown', alreadyFixedDetail: expect.stringMatching(/more than 100 linking events/) });
+  // A closing commit is named by its short SHA too.
+  const byCommit = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, {
+    state: 'CLOSED', nodes: [{ __typename: 'ClosedEvent', closer: { __typename: 'Commit', oid: sha('d') } }] }) ?? mergeReads(args)).inspect();
+  expect(byCommit.alreadyFixedDetail).toBe(`the issue was closed by commit ${sha('d').slice(0, 12)}`);
   // At most five matches are named.
   const many = Array.from({ length: 7 }, (_, index) => xref(10 + index, true));
   const capped = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, { nodes: many }) ?? mergeReads(args)).inspect();

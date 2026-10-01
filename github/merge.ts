@@ -66,7 +66,7 @@ export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }
  * the check's own close description), never a commit message, and at most five are named.
  */
 function describeMatches(matches: readonly AlreadyFixedMatch[]): string {
-  const named = matches.slice(0, 5).map(match => match.kind === 'closed' ? `the issue was closed by ${match.by}`
+  const named = matches.slice(0, 5).map(match => match.kind === 'closed' ? `the issue was closed by ${match.by.replace(/\b([a-f0-9]{12})[a-f0-9]{28}\b/g, '$1')}`
     : match.kind === 'pull request' ? `${match.repository}#${match.number} (${match.state.toLowerCase()}${match.draft ? ', draft' : ''})`
     : `commit ${match.sha.slice(0, 12)} on the base branch`);
   return named.join('; ') + (matches.length > 5 ? `; and ${matches.length - 5} more` : '');
