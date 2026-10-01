@@ -623,6 +623,14 @@ for my $change (@changes) {
   $change->{path} = text($change->{path}, "path");
   $change->{oldPath} = text($change->{oldPath}, "path") if defined $change->{oldPath};
 }
+# Where each changed link's new target leads, resolved one part at a time as the kernel would in an agent container:
+# whether a part on the way, or the target itself, is another link. One that leaves the work tree or enters the
+# metadata counts as traversing, since what is there cannot be checked from here.
+for my $i (0 .. $#changes) {
+  next unless ($changes[$i]{newType} // "") eq "symlink";
+  my $status = resolve($raw[$i]{path}, 0)->{status};
+  $changes[$i]{linkTargetTraversesLink} = $status eq "present" || $status eq "absent" ? JSON::PP::false : JSON::PP::true;
+}
 
 my $head = git("rev-parse", "--verify", "HEAD"); chomp $head;
 my @agent_commits;

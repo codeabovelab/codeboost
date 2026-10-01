@@ -4,6 +4,7 @@ import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } 
 import { prepareExecution } from '../core/execution-prompt.ts';
 import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-body.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
+import type { DeclaredLinkSnapshot } from '../agents/container/changes.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
 import { CLOSED_STATUSES, GuardRefusal, ShuttingDownError, bounded, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
@@ -20,15 +21,21 @@ export interface TaskWorkspace {
    * No-follow snapshot, taken before launch, of every declared path that is a symlink in this workspace. F passes every
    * path the item declares: an earlier item may have renamed or added links, so only D sees the actual entries.
    */
-  snapshotDeclaredLinks(workspace: WorkspaceRef, paths: readonly string[], signal: AbortSignal): Promise<unknown>;
-  /** The change manifest after the agent settled, plus a digest the commit step must match. */
-  inspectChanges(workspace: WorkspaceRef, input: { baseHead: string; linkSnapshot: unknown }, signal: AbortSignal): Promise<ChangeManifest & { digest: string }>;
+  snapshotDeclaredLinks(workspace: WorkspaceRef, paths: readonly string[], signal: AbortSignal): Promise<DeclaredLinkSnapshot>;
+  /** D's change manifest after the agent settled (`TaskChangeManifest`), with the digest the commit step must match. */
+  inspectChanges(workspace: WorkspaceRef, input: { baseHead: string; linkSnapshot: DeclaredLinkSnapshot }, signal: AbortSignal): Promise<ChangeManifest & { digest: string }>;
   /**
-   * Commit exactly `paths` (both sides of every rename) on top of `baseHead` with hooks off; refuse if the tree no longer
-   * matches `digest`. Agent commits are never undone: a manifest with any is a safety violation and never gets here (#66).
+   * The runner's commit (#66, `commitTaskChanges`): `baseHead` plus exactly the changes of the manifest whose digest is
+   * `digest`, with hooks off, refused if the work tree no longer matches it. Returns the new head, which is then in the
+   * runner-owned repository (#87), so the next item's `materialize` and the push find it. Agent commits are never
+   * undone: a manifest with any is a safety violation and never gets here (#66).
    */
-  commit(workspace: WorkspaceRef, input: { baseHead: string; paths: readonly string[]; message: string; trailers: Readonly<Record<string, string>>; digest: string }, signal: AbortSignal): Promise<string>;
+  commit(workspace: WorkspaceRef, input: { baseHead: string; linkSnapshot: DeclaredLinkSnapshot; message: string;
+    trailers: Readonly<Record<string, string>>; digest: string }, signal: AbortSignal): Promise<string>;
+  /** After the terminal write: remove task storage, and drop the commit of an attempt that did not complete. */
   release(workspace: WorkspaceRef): Promise<void>;
+  /** Remove host-side preparation files (the staging clone). Called before the terminal write when D never ran, after it otherwise. */
+  cleanupPreparation?(attempt: AttemptRecord): Promise<void>;
 }
 /** D's start call for an execute/fix phase with this prompt; returns at once (see #51). */
 export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: WorkspaceRef) => InvocationHandle;
@@ -53,7 +60,7 @@ export class SafetyFindings {
   settle(attemptId: string): void { this.#found.delete(attemptId); }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
-interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: unknown }
+interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined }
 
 /**
  * RunnerDeps for execute attempts: fresh workspace, prompt, agent, then audit and the runner's own commit.
@@ -82,7 +89,8 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       catch (error) { throw new PreparationFailure(error, prepared); }
       return prepared;
     },
-    async cleanupPreparation() { /* host-side files belong to D's materialize; task storage waits for release */ },
+    // Host-side files only (the staging clone); task storage waits for release.
+    async cleanupPreparation(attempt) { await workspace.cleanupPreparation?.(attempt); },
     start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace); },
     validate() { throw new Error('Execute attempts publish through finish().'); },
     async finish(attempt, _result, prepared, signal) {
@@ -94,7 +102,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         throw new FinishFailure(text);
       };
       let manifest: ChangeManifest & { digest: string };
-      try { manifest = await workspace.inspectChanges(data.workspace, { baseHead: data.baseHead, linkSnapshot: data.linkSnapshot }, signal); }
+      try { manifest = await workspace.inspectChanges(data.workspace, { baseHead: data.baseHead, linkSnapshot: data.linkSnapshot! }, signal); }
       catch (error) {
         // Only the stop's own abort error is the stop. Any other refusal is a finding, even if a stop is also pending.
         if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
@@ -111,11 +119,10 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       // Last check before the commit, after the last await: a stop, shutdown or context change makes nothing.
       if (signal.aborted) throw signal.reason;
       if (!sameContext(attempt.context, store.currentContext(identity))) throw new FinishFailure('The plan, snapshot or assignment changed during the audit; nothing was committed.');
-      // Every change is in or out of scope here; a rename stages both its old and its new path.
-      const paths = [...new Set(manifest.changes.flatMap(entry => [entry.path, ...(entry.oldPath ? [entry.oldPath] : [])]))];
       let head: string;
       try { head = await workspace.commit(data.workspace, {
-        baseHead: data.baseHead, paths, digest: manifest.digest,
+        // Every change is in or out of scope here, and the commit holds all of them: exactly the manifest audited.
+        baseHead: data.baseHead, linkSnapshot: data.linkSnapshot!, digest: manifest.digest,
         // The title is plan text: on one line with no control or bidi/format characters, it cannot open a trailer block
         // that forges Plan-Item or Plan-Revision, put terminal escapes into git log, or reorder how git log shows it. Its
         // issue references and mentions are neutralised (AGENTS.md): on the default branch, "Fixes #12" would close #12.
@@ -142,7 +149,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
   };
 }
 /** The plan identity that owns an attempt; attempts are stored per plan key. */
-function findIdentity(store: Store, attempt: AttemptRecord): PlanIdentity {
+export function findIdentity(store: Store, attempt: AttemptRecord): PlanIdentity {
   const key = store.attemptOwner(attempt.id);
   if (!key) throw new Error('Unknown attempt.');
   const [repositoryId, taskId, planId] = JSON.parse(key) as string[];

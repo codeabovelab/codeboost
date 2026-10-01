@@ -218,6 +218,18 @@ The server computes `retryable` and sends it to the UI. The UI never works it ou
 
 **Irreversible actions.** Before each commit, push, PR open or merge, re-read the task's state version, the plan's `review_version` (which `saveReview` and `addReviewNote` advance) and the coordinator's `closing` flag **after the final await**. Stop if any of them changed. For a merge this means an approval or choice edit made during the final GitHub check blocks the merge. A check made before an await does not count. (This follows the AGENTS.md rules on guarded external actions.)
 
+## Runner-owned repository (#87)
+
+codeboost never writes the user's repository. The commits it makes live in a **runner-owned repository**: a bare repository per configured repository, at `<runnerRoot>/<runnerOwner>/repositories/<hash>.git` (`runner/runner-repository.ts`), in directories only the current user can write.
+
+| Step | What happens |
+|---|---|
+| Materialize | `ensureCommit` makes the recorded head available: a base commit is fetched from the user's repository by ID (no refs, tags or `FETCH_HEAD`); a runner commit is there already. The task clone is made from the runner-owned repository (`runner/workspace.ts`). |
+| Commit | `commitTaskChanges` returns a bundle. `fetchTaskCommit` takes it in under `refs/codeboost/attempts/<attemptId>` only if its one ref is the commit's ID and the commit is a single commit on its base; otherwise the ref is removed. |
+| Release | After the terminal write, task storage is removed, then the ref of an attempt that did not complete is dropped. A completed attempt's ref keeps its commit. |
+| Review | Once a task has runner commits (a completed execute or fix attempt that made a commit), the review screen and Ask read it from the runner-owned repository at the head the Store recorded. The user's HEAD is no longer observed for it: runner commits move the head only through the Store, with their ledger entries, and observing the user's older HEAD would roll the task back. A task without runner commits still observes the user's HEAD, owned ledger entries or not: a reviewed branch in the user's repository (the demo, a planted experiment) carries them too. |
+
+
 ## Shutdown
 
 `web/server.ts` `close()` and the runner coordinator follow this order. Part of step 1 and all of steps 2 and 3 already exist. F1 adds the coordinator barrier in step 1, steps 4 and 5, and step 8.

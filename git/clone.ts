@@ -33,10 +33,11 @@ const PAUSE = Symbol('pause');
 interface GitOutcome { readonly status: number | null; readonly stdout: string; readonly stderr: string; readonly error?: Error }
 // Entries walked between pauses, so the asynchronous variant never holds the event loop for a whole object store.
 const PAUSE_EVERY = 1_000;
-const GIT_OPTIONS = ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'init.templateDir=',
+/** The hardened Git invocation for repositories the runner owns: no hooks, templates, network, submodules or replacements. */
+export const GIT_OPTIONS = ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'init.templateDir=',
   '-c', 'protocol.allow=never', '-c', 'submodule.recurse=false'];
 // Deliberately do not inherit Git variables or credential/config environment.
-const gitEnvironment = () => ({ PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
+export const gitEnvironment = () => ({ PATH: process.env.PATH, GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null',
   GIT_TERMINAL_PROMPT: '0', GIT_NO_LAZY_FETCH: '1', GIT_GRAFT_FILE: '/dev/null' });
 
 export interface CloneOptions {

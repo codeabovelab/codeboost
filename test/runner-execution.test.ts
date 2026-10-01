@@ -22,8 +22,8 @@ const plan: Plan = { schema_version: 1, issue: 1, revision: 1, summary: 'Two ite
 const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.ts', kind: 'file' }, { path: 'b.ts', kind: 'file' }], pathKey: p => p, allowedCommands: [['npm', 'test']] };
 const dirs: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => { for (const c of cleanups.splice(0).reverse()) await c(); for (const d of dirs.splice(0)) rmSync(d, { recursive: true, force: true }); });
-const change = (path: string, over: Partial<ManifestChange> = {}): ManifestChange => ({ path, kind: 'modify', oldType: 'file', newType: 'file', underGit: false, ...over });
-const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest> = {}): ChangeManifest & { digest: string } =>
+const change = (path: string, over: Partial<ManifestChange> = {}): ManifestChange => ({ path, kind: 'modify', oldType: 'file', newType: 'file', underGit: false, ignored: false, ...over });
+const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest & { digest: string }> = {}): ChangeManifest & { digest: string } =>
   ({ changes, agentCommits: [], metadataChanged: false, linkTargetChanges: [], nestedGitlinkContent: [], digest: `digest-${changes.length}`, ...over });
 
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
@@ -34,19 +34,19 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
   store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
-  const log: string[] = [], commits: { item: string; baseHead: string; paths: readonly string[]; trailers: Record<string, string>; digest: string; message: string }[] = [];
+  const log: string[] = [], commits: { item: string; baseHead: string; linkSnapshot: unknown; trailers: Record<string, string>; digest: string; message: string }[] = [];
   let next = 100;
   const itemOf = (ws: WorkspaceRef) => (ws.storage as { item: string }).item;
   const workspace: TaskWorkspace = {
     async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); if (options.materializeError) throw options.materializeError; return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
-    async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws) }; },
+    async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws) } as never; },
     async inspectChanges(ws, input, signal) {
       log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws), signal);
       return options.manifests?.[itemOf(ws)] ?? manifest([change(itemOf(ws) === 'P1' ? 'a.ts' : 'b.ts')]);
     },
     async commit(ws, input) {
       await options.commit?.(itemOf(ws));
-      const head = options.commitHead ?? oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, paths: input.paths, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
+      const head = options.commitHead ?? oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, linkSnapshot: input.linkSnapshot, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
       log.push(`commit ${itemOf(ws)} -> ${head.slice(-3)}`); return head;
     },
     async release(ws) {
@@ -74,9 +74,10 @@ describe('item execution', () => {
   it('runs items in order, commits each with trailers, and records owned ledger entries', async () => {
     const { store, executor, log, commits, prompts, argv, owners } = setup();
     expect(await executor.runTask(identity)).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
-    expect(commits.map(c => [c.item, c.baseHead.slice(-3), c.trailers, c.paths, c.message])).toEqual([
-      ['P1', '002', { 'Plan-Item': 'P1', 'Plan-Revision': 'r1' }, ['a.ts'], 'P1: First'],
-      ['P2', '064', { 'Plan-Item': 'P2', 'Plan-Revision': 'r1' }, ['b.ts'], 'P2: Second']]);
+    // Each commit gets the link snapshot its own item took before launch.
+    expect(commits.map(c => [c.item, c.baseHead.slice(-3), c.trailers, c.linkSnapshot, c.message])).toEqual([
+      ['P1', '002', { 'Plan-Item': 'P1', 'Plan-Revision': 'r1' }, { item: 'P1' }, 'P1: First'],
+      ['P2', '064', { 'Plan-Item': 'P2', 'Plan-Revision': 'r1' }, { item: 'P2' }, 'P2: Second']]);
     expect(store.getLedger(identity)).toEqual(expect.arrayContaining([
       { sha: oid(100), owner: 'P1', origin: 'owned', sourceSha: null }, { sha: oid(101), owner: 'P2', origin: 'owned', sourceSha: null }]));
     expect(store.getSnapshot(identity).head).toBe(oid(101));
@@ -97,7 +98,8 @@ describe('item execution', () => {
     const { store, executor, commits, log } = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
     const outcome = await executor.runTask(identity);
     expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
-    expect(commits[0]!.paths).toEqual(['a.ts', 'extra.ts']);
+    // The commit is the whole audited manifest, the out-of-scope file included.
+    expect(commits[0]!.digest).toBe('digest-2');
     expect(store.getCheckpoint(identity, (outcome as { checkpointId: string }).checkpointId)).toMatchObject({ item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra.ts'] });
     expect(store.getTask(identity).status).toBe('needs amendment');
     expect(log.some(line => line.includes('P2'))).toBe(false);
@@ -234,10 +236,10 @@ describe('item execution', () => {
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs amendment', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs amendment');
   });
-  it('stages both paths of a rename in the runner commit', async () => {
-    const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })]) } });
+  it('commits a rename as the manifest audited it', async () => {
+    const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })], { digest: 'renamed' }) } });
     await executor.runTask(identity);
-    expect(commits[0]!.paths).toEqual(['a.ts', 'old.ts']);
+    expect(commits[0]!.digest).toBe('renamed');
   });
   it('treats an inspection aborted by a stop as that stop, not a finding', async () => {
     let runner!: RunnerCoordinator, store!: Store;
@@ -269,7 +271,7 @@ describe('item execution', () => {
     expect(h.commits).toEqual([]);
   });
   it('sends a malformed change report to needs human', async () => {
-    const { store, executor, commits } = setup({ manifests: { P1: manifest([change('a.ts')], { linkTargetChanges: undefined as unknown as string[] }) } });
+    const { store, executor, commits } = setup({ manifests: { P1: manifest([change('a.ts')], { linkTargetChanges: undefined as unknown as [] }) } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
     expect(commits).toEqual([]);

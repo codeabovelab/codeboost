@@ -39,6 +39,12 @@ export interface TaskChange {
   readonly oldOid?: string;
   readonly newOid?: string;
   readonly newLinkTarget?: string;
+  /**
+   * For a change whose new entry is a symlink: whether its target, resolved one part at a time as the kernel would in
+   * an agent container, passes through another link on the way or is a link itself. A target outside the work tree or
+   * in the metadata counts as `true`, since D cannot check it.
+   */
+  readonly linkTargetTraversesLink?: boolean;
   /** Whether a part of the path is named `.git` (in any case): Git will never commit it. */
   readonly underGit: boolean;
   /**

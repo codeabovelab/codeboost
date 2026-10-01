@@ -17,13 +17,24 @@ export interface ManifestChange {
   /** D reports whether resolving the new target would traverse another symlink. */
   linkTargetTraversesLink?: boolean;
   underGit: boolean;
+  /** Whether base's own ignore rules ignore this new path. Such a file is never committed (#87 decision 2). */
+  ignored: boolean;
 }
+/** A difference in a declared link's target since the pre-run snapshot (D's `LinkTargetChange`). */
+export interface LinkTargetChange {
+  link: string;
+  target: string;
+  path: string;
+  /** `retargeted`: the link now resolves elsewhere, which is an edit of the link itself; every other kind is a write through it. */
+  change: 'content' | 'mode' | 'type' | 'created' | 'deleted' | 'identity' | 'status' | 'retargeted';
+}
+/** D's `TaskChangeManifest`, as the audit reads it. */
 export interface ChangeManifest {
   changes: readonly ManifestChange[];
   agentCommits: readonly string[];
   metadataChanged: boolean;
   /** Differences from the pre-run snapshot of declared symlink targets. */
-  linkTargetChanges: readonly string[];
+  linkTargetChanges: readonly LinkTargetChange[];
   nestedGitlinkContent: readonly string[];
 }
 export type AuditOutcome =
@@ -51,6 +62,7 @@ export function isDotGit(part: string): boolean {
 const q = (text: string) => JSON.stringify(text.length > 300 ? `${text.slice(0, 300)}…` : text);
 const list = (items: readonly string[]) => items.slice(0, 5).map(q).join(', ') + (items.length > 5 ? ` and ${items.length - 5} more` : '');
 const TYPES = new Set(['file', 'symlink', 'gitlink', 'directory', 'other']);
+const LINK_CHANGES = new Set(['content', 'mode', 'type', 'created', 'deleted', 'identity', 'status', 'retargeted']);
 
 /**
  * Every field the audit reads, checked before it reads any (AGENTS.md: partial records fail closed). A missing boolean
@@ -59,8 +71,12 @@ const TYPES = new Set(['file', 'symlink', 'gitlink', 'directory', 'other']);
 function malformed(manifest: ChangeManifest): string | null {
   if (!manifest || typeof manifest !== 'object') return 'The change report is missing.';
   if (!Array.isArray(manifest.changes)) return 'The change report has no change list.';
-  for (const field of ['agentCommits', 'linkTargetChanges', 'nestedGitlinkContent'] as const)
+  for (const field of ['agentCommits', 'nestedGitlinkContent'] as const)
     if (!Array.isArray(manifest[field]) || manifest[field].some(entry => typeof entry !== 'string')) return `The change report has no ${field} list.`;
+  if (!Array.isArray(manifest.linkTargetChanges)) return 'The change report has no linkTargetChanges list.';
+  for (const entry of manifest.linkTargetChanges)
+    if (!entry || typeof entry !== 'object' || [entry.link, entry.target, entry.path].some(value => typeof value !== 'string')
+      || !LINK_CHANGES.has(entry.change)) return 'The change report has a malformed link target change.';
   if (typeof manifest.metadataChanged !== 'boolean') return 'The change report does not say whether Git metadata changed.';
   let bytes = 0;
   for (const change of manifest.changes) {
@@ -69,6 +85,7 @@ function malformed(manifest: ChangeManifest): string | null {
     if (change.kind === 'rename' ? typeof change.oldPath !== 'string' || !change.oldPath : change.oldPath !== undefined) return `The change at ${q(change.path)} has an invalid old path.`;
     if (!KINDS.has(change.kind)) return `The change at ${q(change.path)} has an unknown kind.`;
     if (typeof change.underGit !== 'boolean') return `The change at ${q(change.path)} does not say whether it is under .git.`;
+    if (typeof change.ignored !== 'boolean') return `The change at ${q(change.path)} does not say whether base ignores it.`;
     // add has only a new entry, delete only an old one, every other kind both.
     const needsOld = change.kind !== 'add', needsNew = change.kind !== 'delete';
     if ((needsOld && !TYPES.has(change.oldType as string)) || (!needsOld && change.oldType !== undefined)) return `The change at ${q(change.path)} has an invalid old entry type.`;
@@ -113,7 +130,11 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
   if (manifest.metadataChanged) violations.push('The agent changed Git metadata under .git.');
   // Agents never commit: the metadata volume is read-only to them, so any agent commit is a violation, never undone (#66).
   if (manifest.agentCommits.length) violations.push(`The agent made its own commits: ${list(manifest.agentCommits)}.`);
-  if (manifest.linkTargetChanges.length) violations.push(`A declared symlink target changed: ${list(manifest.linkTargetChanges)}.`);
+  // A write through a declared link changes what it points at. A retargeted link is an edit of the link itself, judged
+  // below by the link rules, so the manifest must list that edit; without one, the way to its target changed.
+  const changedPaths = new Set(manifest.changes.flatMap(change => [change.path, ...(change.oldPath ? [change.oldPath] : [])]).map(pathKey));
+  const targetChanges = manifest.linkTargetChanges.filter(entry => entry.change !== 'retargeted' || !changedPaths.has(pathKey(entry.link)));
+  if (targetChanges.length) violations.push(`A declared symlink target changed: ${list(targetChanges.map(entry => `${entry.link} -> ${entry.path} (${entry.change})`))}.`);
   if (manifest.nestedGitlinkContent.length) violations.push(`Content appeared under a gitlink: ${list(manifest.nestedGitlinkContent)}.`);
   const declared = new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
   // Each path appears once, under the trusted path identity: two entries for one path contradict each other.
@@ -142,6 +163,8 @@ export function auditRun(item: PlanItem, manifest: ChangeManifest, pathKey: (pat
     if (paths.some(path => path.startsWith('/') || posix.normalize(path).startsWith('../') || ['.', '..'].includes(posix.normalize(path)) || path.includes('\0')))
       { violations.push(`Invalid path in the change report: ${q(change.path)}.`); continue; }
     if (change.oldType === 'gitlink' || change.newType === 'gitlink') { violations.push(`Plan items cannot change gitlinks: ${q(change.path)}.`); continue; }
+    // A file base's own rules ignore (a build output, a .env) is never committed (#87 decision 2).
+    if (change.ignored) { violations.push(`The agent added ${q(change.path)}, which the repository ignores.`); continue; }
     // Only a declared pre-existing link may change at all: deleting it, turning it into a file, or renaming it from an
     // undeclared path is a link change too.
     if (change.oldType === 'symlink' && !declared.has(pathKey(change.oldPath ?? change.path)))
