@@ -206,7 +206,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
     },
     // A failed run's work is audited too (#87 item 2): what it found is saved, so the terminal write sends the task to a
     // person. Nothing is committed, and the attempt fails whatever this finds.
-    async auditFailed(attempt, _result, prepared, signal) {
+    async auditFailed(attempt, prepared, signal) {
       if ((prepared.private as Private).linkSnapshot === undefined) return;
       try { await audit(attempt, prepared, signal); }
       catch (error) { if (!(error instanceof FinishFailure)) throw error; }

@@ -33,7 +33,11 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   /** The durable save of a safety finding fails, so the executor must act on it from memory. */
   findingSaveError?: boolean;
   /** The workspace's partial-output export: bytes, or an error. */
-  partial?: Buffer | Error; diagnosticsCap?: number } = {}) {
+  partial?: Buffer | Error | 'hang'; diagnosticsCap?: number; exportDeadlineMs?: number;
+  /** Called by the fake launcher once the agent has started, before its result settles. */
+  onLaunch?: (attemptId: string) => void;
+  /** The fake agent's result names this attempt instead. */
+  foreignResult?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
@@ -53,9 +57,11 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
       const head = options.commitHead ?? oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, linkSnapshot: input.linkSnapshot, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
       log.push(`commit ${itemOf(ws)} -> ${head.slice(-3)}`); return head;
     },
-    ...options.partial ? { async exportPartial(ws: WorkspaceRef) {
+    ...options.partial ? { async exportPartial(ws: WorkspaceRef, _input: unknown, signal: AbortSignal) {
       log.push(`export ${itemOf(ws)}`);
       if (options.partial instanceof Error) throw options.partial;
+      // Like D's export: it stops when its signal aborts.
+      if (options.partial === 'hang') return new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
       return { diff: options.partial!, truncated: false };
     } } : {},
     async release(ws) {
@@ -73,8 +79,10 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const deps = executionDeps(store, workspace, (input, prompt, ws) => {
     if (options.startError) throw options.startError;
     log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
-    return { attemptId: input.attemptId, settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }), cancel: () => undefined };
-  }, sources, RUNNER_OWNER, findings, { diagnostics: { directory: join(dir, 'diagnostics'), capBytes: options.diagnosticsCap } });
+    const settled = Promise.resolve().then(() => options.onLaunch?.(input.attemptId)).then(() => ({ attemptId: options.foreignResult ? randomUUID() : input.attemptId,
+      context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }));
+    return { attemptId: input.attemptId, settled, cancel: () => undefined };
+  }, sources, RUNNER_OWNER, findings, { diagnostics: { directory: join(dir, 'diagnostics'), capBytes: options.diagnosticsCap }, exportDeadlineMs: options.exportDeadlineMs });
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
   return { store, path, workspace, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
@@ -144,15 +152,27 @@ describe('item execution', () => {
     const refused = setup({ exit: { P1: { exitCode: 1 } }, inspect: async () => { throw new Error('docker run failed (exit 6): could not read x'); } });
     expect(await refused.executor.runTask(identity)).toMatchObject({ kind: 'needs human', reason: expect.stringContaining('The change inspection refused') });
   });
-  it('does not audit a run a person stopped', async () => {
-    let runner!: RunnerCoordinator, store!: Store;
-    const h = setup({ exit: { P1: { exitCode: 1 } }, inspect: async () => { throw new Error('inspection must not run'); },
-      materializeError: undefined });
-    ({ runner, store } = h);
-    h.workspace.snapshotDeclaredLinks = async () => { runner.stop(identity, store.getTask(identity).currentAttemptId!, 'cancelled'); return { links: [], targets: {} }; };
-    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
+  it('does not audit a run a person stopped while it ran', async () => {
+    let runner!: RunnerCoordinator;
+    const h = setup({ exit: { P1: { exitCode: 1 } }, manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      onLaunch: attemptId => runner.stop(identity, attemptId, 'cancelled') });
+    runner = h.runner;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(h.log.some(line => line.startsWith('start P1'))).toBe(true);
     expect(h.log.some(line => line.startsWith('inspect'))).toBe(false);
-    expect(store.getTask(identity).status).not.toBe('needs human');
+    expect(h.store.getTask(identity).status).not.toBe('needs human');
+  });
+  it('audits and keeps what a run left when its result is not this attempt\'s', async () => {
+    const h = setup({ foreignResult: true, manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, partial: Buffer.from('d') });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.store.getAttempts(identity)[0]).toMatchObject({ state: 'failed', diagnosticRef: expect.stringMatching(/\.diff$/) });
+  });
+  it('gives up on an export at its own deadline and settles with that reason', async () => {
+    const h = setup({ exit: { P1: { exitCode: 1, stderr: 'crashed' } }, partial: 'hang', exportDeadlineMs: 50 });
+    const began = performance.now();
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'failed' });
+    expect(performance.now() - began).toBeLessThan(10_000);
+    expect(h.store.getAttempts(identity)[0]!.diagnostic).toBe('"crashed" Partial output could not be exported: "the export did not finish within its deadline"');
   });
   it('records no ledger entry when the commit is refused', async () => {
     const { store, executor } = setup({ commit: async () => { throw new Error('work tree changed after the audit'); } });
@@ -180,9 +200,11 @@ describe('item execution', () => {
     expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
   it('releases task storage after the terminal write when D settles with another attempt\'s result', async () => {
-    const { store, executor, log } = setup({ exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
+    const { store, executor, log, commits } = setup({ exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed' });
-    expect(log.some(line => line.startsWith('inspect'))).toBe(false);
+    // What the run left is audited, but a result that is not this attempt's is never committed.
+    expect(log.some(line => line.startsWith('inspect P1'))).toBe(true);
+    expect(commits).toEqual([]);
     expect(log).toContain('release P1 after failed');
     expect(store.getSnapshot(identity).head).toBe(oid(2));
   });
