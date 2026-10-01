@@ -39,7 +39,7 @@ const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>(
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number> } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number>; onRead?: () => void } = {}) {
   const publishConfig = { ...config, ...options.config };
   // The task's branch, as the publisher names it (one task per harness).
   let publishBranch = '';
@@ -90,7 +90,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     async readPull(number) {
       // The PR itself, whatever the list shows (a hidden PR models a list that lags behind); `moved` models a person
       // renaming its branch.
-      log.push(`read ${number}`);
+      log.push(`read ${number}`); options.onRead?.();
       // A PR a test removed from `live` was closed (GitHub keeps every PR it ever had).
       const [m] = [...live].find(([, pr]) => pr.number === number) ?? [undefined];
       if (m === undefined) return { open: false, headBranch: publishBranch, base: publishConfig.baseBranch, marker: '' };
@@ -2029,6 +2029,27 @@ describe('shutdown and PRs left ready', () => {
     // Nothing identifies it any more, so it cannot be drafted: the record still says ready, as GitHub does.
     expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: false }]);
+  });
+  it('writes nothing after an abort during recovery\'s lookup or the direct read of a PR the list does not show', async () => {
+    // Recovery: the lost opening stays owned, nothing is recorded or abandoned.
+    let store = runningTask(), controller = new AbortController();
+    let live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    const before = store.getTask(identity).stateVersion;
+    const recovering = await harness(store, { live, next, config: { now: () => Date.now() + 10 * 60_000 }, onFind: () => controller.abort(new Error('cancelled')) })
+      .publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(recovering.message).toBe('cancelled');
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opening' }]);
+    expect(store.getTask(identity).stateVersion).toBe(before);
+    // The direct read: the abort, not "try again later", and no draft change.
+    store = runningTask(); controller = new AbortController(); live = new Map(); next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    const hidden = new Set(live.keys());
+    const reading = harness(store, { live, next, hidden, onRead: () => controller.abort(new Error('cancelled')) });
+    const read = await reading.publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(read.message).toBe('cancelled');
+    expect(reading.log.some(line => line.startsWith('draft') || line.startsWith('push'))).toBe(false);
   });
   it('keeps a young lost opening owned when the task\'s only visible PR is in another base', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, hidden = new Set<string>();
