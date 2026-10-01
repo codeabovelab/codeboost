@@ -66,7 +66,7 @@ export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }
  * the check's own close description), never a commit message, and at most five are named.
  */
 function describeMatches(matches: readonly AlreadyFixedMatch[]): string {
-  const named = matches.slice(0, 5).map(match => match.kind === 'closed' ? `the issue was closed by ${match.by.replace(/\b([a-f0-9]{12})[a-f0-9]{28}\b/g, '$1')}`
+  const named = matches.slice(0, 5).map(match => match.kind === 'closed' ? `the issue was closed by ${match.by.replace(/^commit ([a-f0-9]{12})[a-f0-9]{28}\b/, 'commit $1')}`
     : match.kind === 'pull request' ? `${match.repository}#${match.number} (${match.state.toLowerCase()}${match.draft ? ', draft' : ''})`
     : `commit ${match.sha.slice(0, 12)} on the base branch`);
   return named.join('; ') + (matches.length > 5 ? `; and ${matches.length - 5} more` : '');
@@ -132,8 +132,11 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
    * the inspection's deadline; stopped that way it is `unknown`.
    */
   async #alreadyFixed(baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
+    // A check started with no settle time left could leave processes running past the inspection's deadline.
+    const runFor = deadlineAt - CHECK_SETTLE_MS - Date.now();
+    if (runFor <= 0) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' };
     const stop = new AbortController();
-    const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), Math.max(0, deadlineAt - CHECK_SETTLE_MS - Date.now()));
+    const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), runFor);
     try {
       const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [this.config.pullRequest], ownCommits: new Set() },
         signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);

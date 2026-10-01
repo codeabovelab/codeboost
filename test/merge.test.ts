@@ -1426,6 +1426,32 @@ it('does not accept a check answer or rule reads that arrive after an abort', as
   } finally { vi.useRealTimers(); }
 });
 
+it('shortens only a closing commit SHA, not a repository name that looks like one', async () => {
+  const hexRepo = `owner/${'a'.repeat(40)}`;
+  const closer = { __typename: 'PullRequest', number: 9, repository: { nameWithOwner: hexRepo } };
+  const state = await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => alreadyFixedReads(args, {
+    state: 'CLOSED', nodes: [{ __typename: 'ClosedEvent', closer }] }) ?? mergeReads(args)).inspect();
+  expect(state.alreadyFixedDetail).toBe(`the issue was closed by ${hexRepo}#9`);
+});
+
+it('does not start the merge check when no time is left for its processes to settle', async () => {
+  vi.useFakeTimers();
+  try {
+    let checks = 0;
+    const counted: AlreadyFixedGateway = { repository: 'owner/repo', check: async () => { checks++; return { outcome: 'clear', baseHead: sha('9') }; } };
+    // The PR read ends after the point where the check would have to stop.
+    const slowPull = async (args: readonly string[]) => {
+      if (args.join(' ').startsWith('pr view 7')) await new Promise(resolve => setTimeout(resolve, 6_000 - CHECK_SETTLE_MS + 10));
+      return mergeReads(args);
+    };
+    const inspection = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, slowPull, counted).inspect({ fresh: true, timeoutMs: 6_000 });
+    const result = inspection.then(state => ({ state }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(6_000 - CHECK_SETTLE_MS + 20);
+    expect(await result).toMatchObject({ state: { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' } });
+    expect(checks).toBe(0);
+  } finally { vi.useRealTimers(); }
+});
+
 it('does not let an inspection started before merge repopulate the cache', async () => {
   let pullReads = 0, releaseTimeline!: (value: string) => void, markTimelineStarted!: () => void;
   const timelineStarted = new Promise<void>(resolve => { markTimelineStarted = resolve; });
