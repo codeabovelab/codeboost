@@ -65,6 +65,8 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
     committer: Object.freeze({ name: committer.name as string, email: committer.email as string }), limits: Object.freeze(limits) });
 }
 
+/** One shell word, whatever Docker returned as a name. */
+const shellQuote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 /**
  * Lane D's recovery, export and removal for `recoverStartup`. Unlike Ask (#65), the runner looks for codeboost objects
  * without a runner label too, and every unowned object blocks startup (runner-lifecycle.md, "Unowned resources"): an
@@ -74,8 +76,6 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
  * storage during a long build, and before any export's deadline starts: the build blocks, and a timer armed before it
  * would fire as soon as it returned.
  */
-/** One shell word, whatever Docker returned as a name. */
-const shellQuote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 export function dRecoveryDeps(image: () => string): RecoveryDeps {
   return {
     async recoverLeftovers(runnerOwner) {
@@ -125,7 +125,8 @@ export interface RunnerAssembly {
 /**
  * Startup with a runner, after the Store opened and before the server admits anything (runner-lifecycle.md, "Startup
  * recovery"): verify the lock still names the database, run recovery under the database's runner token, build the
- * agent image (during recovery, if an export needs it), then assemble the execution deps. Any failure stops startup; the caller closes the Store.
+ * agent image (once D's recovery returns, if it found any storage; otherwise after recovery), then assemble the
+ * execution deps. Any failure stops startup; the caller closes the Store.
  */
 export async function setUpRunner(o: { service: ReviewService; capability: ShutdownCapability; config: RunnerConfig; lock: Pick<RunnerLock, 'file' | 'verify'>;
   env: Readonly<Record<string, string | undefined>>; buildImage?: () => string; recovery?: (image: () => string) => RecoveryDeps;

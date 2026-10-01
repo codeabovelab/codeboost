@@ -51,7 +51,7 @@ A configuration with a `github` block may also add a `runner` block. The runner 
 - `diagnosticsCapBytes`: the most that directory holds. The default is 256 MiB.
 - `limits`: task storage limits (`workBytes`, `workInodes`, `metadataBytes`, `metadataInodes`).
 
-The runner needs Docker and `CLAUDE_CODE_OAUTH_TOKEN`. At start, codeboost builds the agent image and recovers what an earlier run left before the server opens; a recovery it cannot finish safely stops startup with what to do. Nothing in the review screen starts a run yet (#91 part 2).
+The runner needs Docker and `CLAUDE_CODE_OAUTH_TOKEN`. At start, before the server opens, codeboost recovers what an earlier run left and builds the agent image; a recovery it cannot finish safely stops startup with what to do. Nothing in the review screen starts a run yet (#91 part 2).
 
 ## Library
 

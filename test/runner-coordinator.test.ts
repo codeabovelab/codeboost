@@ -79,6 +79,8 @@ describe('admission and slots', () => {
     expect(store.getTask(A).stateVersion).toBe(before);
     expect(store.getAttempts(A)).toEqual([]);
     expect(limited.isActive(A)).toBe(false);
+    // What the view uses to offer retry: the same answer admission gives.
+    expect([limited.runs('review'), limited.runs('execute')]).toEqual([false, true]);
   });
   it('runs an attempt to completion, removes its preparation files and frees its slot', async () => {
     const { store, runner, launches, preparations, cleaned } = setup();

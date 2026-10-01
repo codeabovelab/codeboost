@@ -81,7 +81,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const last = attempts.find(attempt => attempt.id === task.currentAttemptId);
     const retryable = !!runner && !!last && (last.state === 'failed' || last.state === 'cancelled')
       && (task.status === 'running' || task.status === 'queued') && !task.requeuePending && task.cancelRequested === null
-      && !status.active && !status.unresolved && sameContext(last.context, service.store.currentContext(identity))
+      && !status.active && !status.unresolved && !runner.unreleased && runner.runs(last.kind)
+      && sameContext(last.context, service.store.currentContext(identity))
       // A plan item is retried only by resuming its task (#91 part 2); the retry action refuses it.
       && !(executor && last.kind === 'execute');
     return { available: !!runner, task, attempts,
@@ -297,6 +298,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     await step(() => questions.close());
     await step(() => suggestions?.close());
     await step(() => service.close());
+    // Each later failure is still reported, so none is lost behind the first.
+    for (const later of failures.slice(1)) console.error(`Shutdown step also failed: ${later instanceof Error ? later.message : String(later)}`);
     if (failures.length) throw failures[0];
   } };
 }

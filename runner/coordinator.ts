@@ -135,6 +135,8 @@ export class RunnerCoordinator {
   get closing(): boolean { return this.#closing; }
   /** Resources D could not confirm removed; non-null keeps the runner closed to new work until restart. */
   get unreleased(): readonly UnreleasedResource[] | null { return this.#unreleased; }
+  /** Whether admission would take this kind (`RunnerDeps.kinds`); a view must not offer what admission refuses. */
+  runs(kind: AttemptKind): boolean { return !this.#deps.kinds || this.#deps.kinds.includes(kind); }
   #now(): number { return this.#deps.now?.() ?? Date.now(); }
   #used(group: Group): number {
     let used = 0;
