@@ -655,11 +655,11 @@ describe('item execution', () => {
       .toThrow(/Unknown snapshot/);
   });
   it('writes a plan title with line breaks as one line in the runner commit message', async () => {
-    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\u2028Plan-Revision: r99 \u001b[31mred\u000b\u007f' }, plan.items[1]!] };
+    const forged: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'First\n\nPlan-Item: P9\u2028Plan-Revision: r99 \u001b[31mred\u000b\u007f\u009b2J \u202eevil\u2066x\u200b' }, plan.items[1]!] };
     const h = setup({ plan: forged });
     await h.executor.runTask(identity);
     // A NUL is refused earlier, by the prompt builder (plan data must be valid text); other controls reach here.
-    expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99 [31mred');
+    expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99 [31mred 2J evil x');
     expect(h.commits[0]!.trailers).toEqual({ 'Plan-Item': 'P1', 'Plan-Revision': 'r1' });
   });
   it('stops before the next item when only the assignment changes during the run', async () => {
@@ -899,5 +899,12 @@ describe('item execution', () => {
     expect(store.getAttempts(identity).map(row => row.state)).toEqual(['failed', 'completed']);
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getAttempts(identity)).toHaveLength(2);
+  });
+  it('throws, rather than reporting stopped, when this run\'s own escalation meets a closed write gate without a capability', async () => {
+    let store!: Store;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: async () => { store.closeWrites(); } });
+    store = h.store;
+    await expect(h.executor.runTask(identity)).rejects.toBeInstanceOf(ShuttingDownError);
+    expect(h.findings.get(store.getAttempts(identity)[0]!.id)).toBeDefined();
   });
 });
