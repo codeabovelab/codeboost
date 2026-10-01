@@ -293,8 +293,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-state inspection timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     const attempt = this.#inspectNow(deadlineAt, signal).catch(error => {
-      if (timeout.signal.aborted) throw timeout.signal.reason;
-      if (options.signal?.aborted) throw options.signal.reason;
+      // The combined signal keeps the reason of whichever abort came first, the caller's or the deadline's; a stopped gh
+      // call can settle after both have fired.
+      if (signal.aborted) throw signal.reason;
       throw error;
     }).then(state => {
       if (this.#generation === generation) this.#cache = { expiresAt: Date.now() + 5_000, state };

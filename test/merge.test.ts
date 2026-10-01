@@ -1462,6 +1462,23 @@ it('fails the merge check closed on a clear or found answer without a valid base
   expect((await client.inspect({ fresh: true })).alreadyFixed).toBe('clear');
 });
 
+it('keeps the caller cancellation reason when the inspection deadline also passes before gh settles', async () => {
+  vi.useFakeTimers();
+  try {
+    const controller = new AbortController();
+    // Like the real runner, a stopped gh call settles only after its grace periods, here past the inspection deadline.
+    const run = async (_args: readonly string[], options?: { signal?: AbortSignal }) => new Promise<string>((_resolve, reject) => {
+      options?.signal?.addEventListener('abort', () => setTimeout(() => reject(new Error('generic runner abort')), 400), { once: true });
+    });
+    const inspection = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect({ fresh: true, timeoutMs: 1_000, signal: controller.signal });
+    const result = inspection.then(state => ({ state }), error => ({ error }));
+    await vi.advanceTimersByTimeAsync(900);
+    controller.abort(new Error('merge request deadline exceeded'));
+    await vi.advanceTimersByTimeAsync(500);
+    expect(await result).toMatchObject({ error: { message: 'merge request deadline exceeded' } });
+  } finally { vi.useRealTimers(); }
+});
+
 it('does not let an inspection started before merge repopulate the cache', async () => {
   let pullReads = 0, releaseTimeline!: (value: string) => void, markTimelineStarted!: () => void;
   const timelineStarted = new Promise<void>(resolve => { markTimelineStarted = resolve; });
