@@ -82,7 +82,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       if (own.length === 1 && baseOfPr(own[0]![0]) !== input.base) throw new PullRequestMisplaced(`The task's pull request #${own[0]![1].number} now targets ${baseOfPr(own[0]![0])}, not ${input.base}.`);
       const open = visible.find(([m]) => baseOfPr(m) === input.base);
       if (!open) return null;
-      if (!carries(open[0], open[1]) && input.numbers?.includes(open[1].number)) throw new PullRequestMisplaced(`The task's pull request #${open[1].number} no longer starts with its marker.`);
+      if (!carries(open[0], open[1]) && input.numbers?.includes(open[1].number)) throw new PullRequestMisplaced(`The task's pull request #${open[1].number} no longer starts with its marker. It may still be ready for review.`);
       if (!carries(open[0], open[1])) throw new Error('An open pull request exists that codeboost did not open.');
       return { ...open[1], marker: open[0] };
     },
@@ -2012,7 +2012,8 @@ describe('shutdown and PRs left ready', () => {
     await harness(store, { live, next }).publisher.publish(identity);
     requeue(store);
     const again = harness(store, { live, next, unmarked: new Set([100]) });
-    await expect(again.publisher.publish(identity)).rejects.toThrow(/#100 no longer starts with its marker.*may still be ready for review/);
+    // The gateway's message is tested at the gateway; here, the class and what the publisher does with it.
+    await expect(again.publisher.publish(identity)).rejects.toThrow(PullRequestMisplaced);
     expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
     // Nothing identifies it any more, so it cannot be drafted: the record still says ready, as GitHub does.
     expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
