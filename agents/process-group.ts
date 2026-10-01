@@ -20,6 +20,11 @@ export interface ProcessGroupOptions {
   readonly graceMs?: number;
   /** Bytes kept of each of stdout and stderr; more stops the group. Default 16 MiB. */
   readonly maxBuffer?: number;
+  /**
+   * Written to the leader's stdin, which is then closed; without it stdin is not connected. A leader that exits before
+   * reading it all is not an error: what it did is in its status and output.
+   */
+  readonly input?: Buffer;
 }
 
 const DEFAULT_GRACE_MS = 5_000;
@@ -75,7 +80,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn(file, [...args], { cwd: options.cwd, env: options.env, detached: true,
-        stdio: ['ignore', 'pipe', 'pipe'] });
+        stdio: [options.input ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
     } catch (error) {
       resolve({ status: null, stdout: '', stderr: '', error: error as Error });
       return;
@@ -85,6 +90,11 @@ export function runInProcessGroup(file: string, args: readonly string[],
       // The spawn itself failed (for example ENOENT); nothing started, and 'error' carries the cause.
       child.once('error', error => resolve({ status: null, stdout: '', stderr: '', error }));
       return;
+    }
+    if (options.input) {
+      // EPIPE when the leader exits without reading everything; the leader's exit decides the outcome.
+      child.stdin!.on('error', () => {});
+      child.stdin!.end(options.input);
     }
     const out: Buffer[] = [], err: Buffer[] = [];
     let outBytes = 0, errBytes = 0, stopped: 'cancelled' | 'timeout' | 'output-limit' | 'unrecorded' | undefined;
@@ -140,6 +150,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
         // Timers run before I/O in each event-loop turn: after a long block the timer can win while the rest of the
         // output is already waiting. One more turn lets that I/O (and the end of the pipes) be read first.
         if (!pipesClosed) await new Promise(resolveTurn => setImmediate(resolveTurn));
+        child.stdin?.destroy();
         child.stdout!.destroy();
         child.stderr!.destroy();
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');

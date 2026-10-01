@@ -1,5 +1,5 @@
 /**
- * The Perl program D runs inside task storage to read it without following links (#66). One program serves four modes,
+ * The Perl program D runs inside task storage to read it without following links (#66). One program serves five modes,
  * so the seeder's checks and a later inspection read storage the same way:
  *
  * - `links <work> <metadata>` (run by the seeder, as root, over what it copied) refuses, with exit 11, any link in the
@@ -13,16 +13,26 @@
  * - `inspect <baseline> <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of
  *   `base`, hashing every file as a commit would store it, resolves each declared link again (without walking its
  *   target), and reports the state now of each target the snapshot recorded, the metadata digest and HEAD.
+ * - `commit <baseline> <base> <bundle limit> <link count> <link>... <target>...` (in /work) runs the inspection, then,
+ *   from the same reads, builds the runner commit on top of `base` from base plus the changes it found. It reads the
+ *   message and identities as JSON on stdin and writes every object to a scratch object store in /tmp: both volumes
+ *   stay read-only. It prints the inspection's JSON on one line, encoded before the commit is built, then the commit's
+ *   tree and ID as JSON on the next, then the commit as a base64 `git bundle` of at most `bundle limit` bytes. It
+ *   builds nothing when there is nothing to commit, when HEAD is not `base`, a gitlink has content, or a change is one
+ *   a commit cannot hold (a directory, a fifo or other special file, a path under a `.git` part, or a symlink named
+ *   `.gitmodules`); the runner refuses those.
  *
- * Both first compare the metadata digest with `baseline`, before any Git command: if it differs, a snapshot refuses
+ * Snapshot, inspect and commit first compare the metadata digest with `baseline`, before any Git command: if it differs, a snapshot refuses
  * (exit 10) and an inspection prints only the digest and `metadataOnly`.
  *
- * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes. A reported path or link target that is not
+ * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes (a commit adds its own line and the bundle). A reported path or link target that is not
  * strict UTF-8, holds a control, format, separator or unassigned character, or is over MAXIMUM_NAME_BYTES cannot be
  * put in the manifest (exit 8); an unchanged one is never checked. More than MAXIMUM_CHANGES changes, more than
  * MAXIMUM_TARGET_ENTRIES target entries, or more output than the bound cannot be returned whole (exit 9). A directory
- * or file it cannot read fails it (exit 6), since what is inside is unknown. Exit 3 is a bad base, exit 4 a Git failure,
- * exit 2 a bad argument, exit 5 an unexpected failure of the script itself. None of these returns part of the answer.
+ * or file it cannot read fails it (exit 6), since what is inside is unknown. An inspection or a commit also fails (exit 6)
+ * on a `.gitattributes` over 100 MB outside a `.git` part, which Git does not read. Exit 3 is a bad base, exit 4 a Git failure,
+ * exit 2 a bad argument, exit 5 an unexpected failure of the script itself. None of these returns part of the answer: a
+ * commit may have printed some of its output first, but the runner discards all of it when the exit status is not 0.
  */
 export const MAXIMUM_CHANGES = 10_000;
 /** Entries recorded beneath all declared links' targets together, in one snapshot or inspection. */
@@ -31,6 +41,8 @@ export const MAXIMUM_TARGET_ENTRIES = 20_000;
 export const MAXIMUM_DECLARED_LINKS = 200;
 /** Bytes in one path or link target the manifest carries; a longer one fails the run (exit 8). */
 export const MAXIMUM_NAME_BYTES = 1_024;
+/** The one ref a runner commit's bundle carries, pointing at the commit. */
+export const TASK_COMMIT_REF = 'refs/heads/codeboost';
 // JSON at most doubles a name (a quote or backslash is escaped; control characters are refused). A change carries at
 // most three names (a populated gitlink, which counts as a change, one), a target entry or a link record at most five,
 // each with under 1 KiB of other fields.
@@ -43,7 +55,7 @@ export const MAXIMUM_TREE_OUTPUT = MAXIMUM_CHANGES * (3 * 2 * MAXIMUM_NAME_BYTES
 export const TREE_SCRIPT = String.raw`
 use strict; use warnings;
 use Time::HiRes qw(lstat); use Digest::SHA; use JSON::PP; use Encode (); use Fcntl qw(O_RDONLY O_NOFOLLOW);
-use IPC::Open2 qw(open2);
+use IPC::Open2 qw(open2); use MIME::Base64 ();
 $SIG{__WARN__} = sub { die @_ };
 my $mode = shift @ARGV // "";
 my ($MAXIMUM_CHANGES, $MAXIMUM_TARGET_ENTRIES, $MAXIMUM_NAME_BYTES, $MAXIMUM_OUTPUT) =
@@ -153,7 +165,7 @@ if ($mode eq "links") {
 chdir "/work" or fail(6, "could not enter the work tree: $!");
 # Before any Git command, the metadata must be as the seeder left it: Git reads its config, and config the agent could
 # have changed must never run (a filter driver, say). If it changed, no Git runs at all: a snapshot refuses, and an
-# inspection reports only that.
+# inspection or a commit reports only that.
 my $baseline = shift @ARGV // "";
 fail(2, "bad metadata baseline") unless $baseline =~ /^[0-9a-f]{64}\z/;
 my $metadata_digest = metadata_digest("/work/.git");
@@ -264,7 +276,14 @@ sub walk_entry {
   # The link target is checked as a name only if it is reported, like the path itself.
   if (-l _) { my $target = readlink $path; return { type => "symlink", gitMode => "120000", oid => blob_id($target), linkTarget => $target } }
   # Every file is hashed below; one that cannot be read fails the run here, with its name, rather than inside Git.
-  if (-f _) { fail(6, "could not read " . shown($path) . ": permission denied") unless -r _; return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" } }
+  if (-f _) {
+    fail(6, "could not read " . shown($path) . ": permission denied") unless -r _;
+    # Git does not read an attributes file this large and falls back to the index, so what it stores would depend on
+    # the order it reaches paths in.
+    fail(6, "the attributes file " . shown($path) . " is larger than Git reads")
+      if $stat[7] > 100 * 1024 * 1024 && $path =~ m{(?:\A|/)\.gitattributes\z} && !under_git_path($path);
+    return { type => "file", gitMode => ($stat[2] & 0100) ? "100755" : "100644" };
+  }
   return { type => "directory" } if -d _;
   # Git opens every .gitattributes it meets while hashing; a fifo or device there would block it until the deadline.
   my @parts = split m{/}, $path;
@@ -366,9 +385,11 @@ if ($mode eq "snapshot") {
   emit({ links => \@links, targets => { map { (text($_, "target") => target_state($_)) } keys %resolved_targets } });
 }
 
-fail(2, "unknown mode") unless $mode eq "inspect";
+fail(2, "unknown mode") unless $mode eq "inspect" || $mode eq "commit";
 my $base = shift @ARGV;
 fail(3, "base is not a full commit ID") unless $base =~ /^[0-9a-f]{40}([0-9a-f]{24})?$/;
+my $bundle_limit = $mode eq "commit" ? shift @ARGV : 0;
+fail(2, "bad bundle limit") unless $mode ne "commit" || (defined $bundle_limit && $bundle_limit =~ /^[1-9][0-9]{0,9}\z/);
 # --verify -q exits 1, silently, for a name that is not a commit here; anything else is Git failing.
 my $exists = do {
   my $pid = open(my $out, "-|", @GIT, "rev-parse", "--verify", "-q", "$base^{commit}") or fail(4, "could not run git: $!");
@@ -485,21 +506,24 @@ fail(4, "git check-ignore failed (status " . ($? >> 8) . ")") if ($? >> 8) > 1 |
 # commit step builds its tree from base plus the manifest's changes, storing each file as hashed here; what the
 # manifest does not list (an unchanged submodule, a symlinked .gitattributes) stays as base has it.
 my @commitable = grep { $work{$_}{type} eq "file" && !under_git_path($_) } sort keys %work;
+# What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
+# the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
+# applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
+# Every .gitattributes leaves it too, a symlink included: where Git will not read the work tree's own (a symlink, one
+# over 100 MB) it falls back to the index and parses what is there as rules, even a symlink's target text. So only
+# attribute files the work tree has, and Git reads, decide; a regular one is added back below like any file.
+my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} || m{(?:\A|/)\.gitattributes\z} } sort keys %base;
+# The index files are hashed against: base, without what is gone. The caller sets GIT_INDEX_FILE.
+sub hashing_index {
+  git("read-tree", $base);
+  return unless @gone;
+  open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
+  print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");
+  git_in("/tmp/removed-paths", 1, "update-index", "--force-remove", "-z", "--stdin");
+}
 if (@commitable) {
   local $ENV{GIT_INDEX_FILE} = "/tmp/scratch-index";
-  git("read-tree", $base);
-  # What is gone, or is no longer the same type, leaves the scratch index first: Git reads a deleted .gitattributes from
-  # the index, and nothing may be hashed with rules the work tree no longer has. (git add -A is not consistent here: it
-  # applies a deleted .gitattributes to paths it reaches before the deletion, so its result depends on path order.)
-  # Every .gitattributes leaves it too, a symlink included: where Git will not read the work tree's own (a symlink, one
-  # over 100 MB) it falls back to the index and parses what is there as rules, even a symlink's target text. So only
-  # attribute files the work tree has, and Git reads, decide; a regular one is added back below like any file.
-  my @gone = grep { !$work{$_} || $work{$_}{type} ne $base{$_}{type} || m{(?:\A|/)\.gitattributes\z} } sort keys %base;
-  if (@gone) {
-    open(my $removals, ">", "/tmp/removed-paths") or fail(4, "could not write the removed paths: $!");
-    print $removals map { "$_\0" } @gone; close $removals or fail(4, "could not write the removed paths: $!");
-    git_in("/tmp/removed-paths", 1, "update-index", "--force-remove", "-z", "--stdin");
-  }
+  hashing_index();
   open(my $list, ">", "/tmp/hash-paths") or fail(4, "could not write the paths to hash: $!");
   print $list map { "$_\0" } @commitable; close $list or fail(4, "could not write the paths to hash: $!");
   # A path that replaces a base file or directory (docs becoming docs/api/x) replaces its entries.
@@ -598,6 +622,8 @@ push @changes, grep { !$paired_add{$_->{path}} } @added;
 # A populated gitlink is reported too, one name each, so it counts against the same limit.
 fail(9, "more than $MAXIMUM_CHANGES changes; the change set is too large to inspect") if @changes + @nested > $MAXIMUM_CHANGES;
 @changes = sort { $a->{path} cmp $b->{path} } @changes;
+# The names as bytes, for the commit: the check below turns them into text for the JSON.
+my @raw = map { +{ path => $_->{path}, oldPath => $_->{oldPath}, newLinkTarget => $_->{newLinkTarget} } } @changes;
 # Names are checked only here, as they go into the manifest: an unchanged path with any name is never refused.
 for my $change (@changes) {
   $change->{newLinkTarget} = text($change->{newLinkTarget}, "the link target of " . shown($change->{path}))
@@ -614,6 +640,138 @@ if ($head ne $base) {
 }
 my @fresh = map { resolve($_, 0) } @links;
 my %targets = map { (text($_, "target") => target_state($_)) } @targets;
-emit({ metadataDigest => $metadata_digest, head => $head, agentCommits => \@agent_commits,
-  changes => \@changes, nestedGitlinkContent => [map { text($_, "path") } sort @nested], links => \@fresh, targets => \%targets });
+my %result = (metadataDigest => $metadata_digest, head => $head, agentCommits => \@agent_commits,
+  changes => \@changes, nestedGitlinkContent => [map { text($_, "path") } sort @nested], links => \@fresh, targets => \%targets);
+emit(\%result) if $mode eq "inspect";
+# A commit reports the inspection as encoded now, before anything below reads it: nothing that builds the commit can
+# change what the runner checks.
+# It goes out at once, on one line (JSON::PP escapes every newline inside a string), so the build below does not hold
+# it in memory beside its own work. A later failure still fails the whole run, and the runner then discards it all.
+{
+  my $line = $json->encode(\%result);
+  fail(9, "the result is larger than $MAXIMUM_OUTPUT bytes") if length $line > $MAXIMUM_OUTPUT;
+  binmode STDOUT; print $line, "\n"; STDOUT->flush;
+}
+%result = ();
+
+# The runner commit: base plus exactly the changes above, each stored as hashed above. Whatever they do not list stays
+# as base has it (an unchanged submodule, a symlinked .gitattributes, a file whose bytes are what checkout wrote).
+# Nothing is built when the runner would refuse it anyway, or when a change is not something a tree can hold.
+sub storable {
+  my $change = shift; return 0 if $change->{underGit};
+  # Git refuses a symlink named .gitmodules in any tree.
+  return 0 if ($change->{newType} // "") eq "symlink" && lc((split m{/}, $change->{path})[-1]) eq ".gitmodules";
+  for my $key (qw(oldType newType)) { my $type = $change->{$key}; return 0 if defined $type && ($type eq "directory" || $type eq "other") }
+  return 1;
+}
+my $built;
+if (@changes && $head eq $base && !@nested && !grep { !storable($_) } @changes) {
+  binmode STDIN; my $request = do { local $/; <STDIN> } // "";
+  $request = eval { $json->decode($request) };
+  my @identity = map { my $who = ref $request eq "HASH" ? $request->{$_} : undef; ref $who eq "HASH" ? @$who{qw(name email date)} : (undef) x 3 } qw(author committer);
+  # The runner checked these; a NUL cannot reach Git through the environment, nor a newline into an identity line.
+  fail(2, "bad commit request") if ref $request ne "HASH" || (grep { !defined $_ || ref $_ || /[\0\n]/ } @identity)
+    || !defined $request->{message} || ref $request->{message} || $request->{message} =~ /\0/;
+  # Every object goes to /tmp: the metadata stays read-only, and objects base already has are read from it.
+  mkdir "/tmp/objects" or fail(4, "could not create the scratch object store: $!");
+  local @ENV{qw(GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES)} = ("/tmp/objects", "/work/.git/objects");
+  my $null = "0" x length $base;
+  # New content is hashed again, writing this time, in an index built as the scratch index was: each file's rules (the
+  # work tree's attribute files, and base's own entry for it) are the same, so each must come out as the ID above. A
+  # rename or a mode change stores content base already has.
+  my @written = grep { $changes[$_]{kind} eq "add" || $changes[$_]{kind} eq "modify" } 0 .. $#changes;
+  my @files = grep { $changes[$_]{newType} eq "file" } @written;
+  if (@files) {
+    local $ENV{GIT_INDEX_FILE} = "/tmp/write-index";
+    hashing_index();
+    open(my $list, ">", "/tmp/write-paths") or fail(4, "could not write the paths to store: $!");
+    print $list map { "$raw[$_]{path}\0" } @files; close $list or fail(4, "could not write the paths to store: $!");
+    git_in("/tmp/write-paths", 1, "-c", "core.protectNTFS=false", "-c", "core.protectHFS=false",
+      "update-index", "--add", "--replace", "-z", "--stdin");
+    my %stored;
+    for my $record (split /\0/, git("ls-files", "-s", "-z")) { my ($meta, $path) = split /\t/, $record, 2; $stored{$path} = (split / /, $meta)[1] }
+    for (@files) { fail(4, "git stored " . shown($raw[$_]{path}) . " differently from how it was hashed") if ($stored{$raw[$_]{path}} // "") ne $changes[$_]{newOid} }
+  }
+  # A link stores its target text as it is.
+  my @links_written = grep { $changes[$_]{newType} eq "symlink" } @written;
+  if (@links_written) {
+    mkdir "/tmp/link-text" or fail(4, "could not write the link targets: $!");
+    open(my $list, ">", "/tmp/link-paths") or fail(4, "could not write the link targets: $!");
+    for my $i (@links_written) {
+      open(my $text, ">", "/tmp/link-text/$i") or fail(4, "could not write the link targets: $!");
+      binmode $text; print $text $raw[$i]{newLinkTarget}; close $text or fail(4, "could not write the link targets: $!");
+      print $list "/tmp/link-text/$i\n";
+    }
+    close $list or fail(4, "could not write the link targets: $!");
+    my @ids = split /\n/, git_in("/tmp/link-paths", 1, "hash-object", "-w", "--no-filters", "--stdin-paths");
+    for my $n (0 .. $#links_written) {
+      my $i = $links_written[$n];
+      fail(4, "git stored the link " . shown($raw[$i]{path}) . " differently from how it was hashed") if ($ids[$n] // "") ne $changes[$i]{newOid};
+    }
+  }
+  # The tree: base, without what was deleted or renamed away, with every other change set to its new entry.
+  my ($tree, $commit);
+  {
+    local $ENV{GIT_INDEX_FILE} = "/tmp/commit-index";
+    git("read-tree", $base);
+    open(my $info, ">", "/tmp/index-info") or fail(4, "could not write the tree entries: $!");
+    for my $i (0 .. $#changes) {
+      my $gone = $changes[$i]{kind} eq "delete" ? $raw[$i]{path} : $changes[$i]{kind} eq "rename" ? $raw[$i]{oldPath} : undef;
+      print $info "0 $null\t$gone\0" if defined $gone;
+    }
+    for my $i (grep { $changes[$_]{kind} ne "delete" } 0 .. $#changes) { print $info "$changes[$i]{newMode} $changes[$i]{newOid}\t$raw[$i]{path}\0" }
+    close $info or fail(4, "could not write the tree entries: $!");
+    git_in("/tmp/index-info", 1, "-c", "core.protectNTFS=false", "-c", "core.protectHFS=false",
+      "update-index", "--add", "--replace", "-z", "--index-info");
+    $tree = git("write-tree"); chomp $tree;
+  }
+  # Only what the runner passed decides the commit: identities and dates from the request, no signature, and UTF-8
+  # with no encoding header, so its ID follows from the request, the tree and base alone.
+  open(my $message, ">", "/tmp/commit-message") or fail(4, "could not write the commit message: $!");
+  binmode $message; print $message Encode::encode("UTF-8", $request->{message}); close $message or fail(4, "could not write the commit message: $!");
+  {
+    my @values = map { Encode::encode("UTF-8", $_) } @identity;
+    local @ENV{qw(GIT_AUTHOR_NAME GIT_AUTHOR_EMAIL GIT_AUTHOR_DATE GIT_COMMITTER_NAME GIT_COMMITTER_EMAIL GIT_COMMITTER_DATE)} =
+      (@values[0, 1], "\@$values[2]", @values[3, 4], "\@$values[5]");
+    $commit = git("-c", "commit.gpgSign=false", "-c", "i18n.commitEncoding=UTF-8", "commit-tree", "--no-gpg-sign", $tree,
+      "-p", $base, "-F", "/tmp/commit-message");
+    chomp $commit;
+  }
+  $built = { tree => $tree, head => $commit };
+}
+exit 0 unless $built;
+print $json->encode($built), "\n";
+# Then the commit as a bundle, from a scratch repository of the runner's own whose only ref is the commit, reading every
+# object from /tmp and the metadata. Its prerequisite is base, which the runner's host repository already has.
+{
+  local @ENV{qw(GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE)};
+  delete @ENV{qw(GIT_OBJECT_DIRECTORY GIT_ALTERNATE_OBJECT_DIRECTORIES GIT_INDEX_FILE)};
+  system(@GIT, "-c", "init.defaultBranch=codeboost", "init", "-q", "--bare", "--template=", $format eq "sha256" ? ("--object-format=sha256") : (), "/tmp/bundle.git") == 0
+    or fail(4, "git init failed (" . exit_reason($?) . ")");
+  open(my $alternates, ">", "/tmp/bundle.git/objects/info/alternates") or fail(4, "could not write the bundle's alternates: $!");
+  print $alternates "/tmp/objects\n/work/.git/objects\n"; close $alternates or fail(4, "could not write the bundle's alternates: $!");
+  system(@GIT, "--git-dir=/tmp/bundle.git", "update-ref", "${TASK_COMMIT_REF}", $built->{head}) == 0
+    or fail(4, "git update-ref failed (" . exit_reason($?) . ")");
+  my $pid = open(my $bundle, "-|"); fail(4, "could not run git: $!") unless defined $pid;
+  if (!$pid) {
+    open(STDERR, ">", $stderr_file) or die "could not capture git errors: $!";
+    # One thread: pack-objects otherwise starts one per host CPU, past the container's process limit.
+    exec(@GIT, "--git-dir=/tmp/bundle.git", "-c", "pack.threads=1", "bundle", "create", "-q", "-", "${TASK_COMMIT_REF}",
+      "^$base") or die "could not run git: $!";
+  }
+  # Encoded as it is read, three bytes to four, so nothing holds the whole bundle; past the limit it stops at once.
+  binmode $bundle; my ($size, $pending) = (0, "");
+  for (;;) {
+    my $read = sysread($bundle, my $chunk, 3 * 65536); fail(4, "could not read the bundle: $!") unless defined $read;
+    last unless $read;
+    $size += $read;
+    fail(9, "the commit's bundle is larger than $bundle_limit bytes") if $size > $bundle_limit;
+    $pending .= $chunk;
+    print MIME::Base64::encode_base64(substr($pending, 0, length($pending) - length($pending) % 3, ""), "");
+  }
+  print MIME::Base64::encode_base64($pending, "");
+  close $bundle;
+  fail(4, "git bundle failed (" . exit_reason($?) . ")") if $?;
+}
+exit 0;
 `;

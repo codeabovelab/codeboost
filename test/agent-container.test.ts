@@ -15,7 +15,8 @@ import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
   UnusableRepositoryError } from '../agents/container/storage.ts';
-import { inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks } from '../agents/container/changes.ts';
+import { commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
+  TASK_COMMIT_REF, TaskCommitRefused, type TaskChangeManifest } from '../agents/container/changes.ts';
 import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
@@ -37,11 +38,12 @@ const docker = (...args: string[]) => execFileSync('docker', args, {
 }).trim();
 
 function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1]; historyBytes?: number;
-  hostile?: (source: string, root: string) => void; beforeSeed?: (clone: string) => void } = {}) {
+  hostile?: (source: string, root: string) => void; beforeSeed?: (clone: string) => void; objectFormat?: 'sha256' } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'agent-container-')); roots.push(root);
   const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
-  git(source, 'init'); git(source, 'config', 'user.name', 'Test'); git(source, 'config', 'user.email', 'test@example.com');
+  git(source, 'init', ...options.objectFormat ? [`--object-format=${options.objectFormat}`] : []);
+  git(source, 'config', 'user.name', 'Test'); git(source, 'config', 'user.email', 'test@example.com');
   if (options.historyBytes) {
     // Incompressible history that no longer exists in the checked-out worktree.
     writeFileSync(join(source, 'history.bin'), randomBytes(options.historyBytes));
@@ -1454,6 +1456,202 @@ describe('real Docker agent isolation', () => {
       expect(Object.keys(linkSnapshot.targets)).toEqual(['big']);
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot, imageId });
       expect(manifest.linkTargetChanges).toEqual([]);
+    }, 300_000);
+  });
+
+  describe('runner commit (#66)', () => {
+    const noLinks = { links: [], targets: {} };
+    const runner = { name: 'codeboost', email: 'runner@codeboost.invalid', date: '1700000000 +0130' };
+    const commit = (data: ReturnType<typeof fixture>, manifest: TaskChangeManifest,
+      options: Partial<Parameters<typeof commitTaskChanges>[1]> = {}) => commitTaskChanges(data.filesystems, {
+      base: manifest.base, linkSnapshot: noLinks, imageId, digest: manifest.digest, message: 'P1: Add things',
+      trailers: { 'Plan-Item': 'P1', 'Plan-Revision': 'r1' }, author: runner, committer: runner, ...options });
+    // F's side: fetch the bundle into a runner-owned repository (the source stands in) and check its one ref.
+    const fetch = (data: ReturnType<typeof fixture>, bundle: Buffer) => {
+      const file = join(data.root, `${randomUUID()}.bundle`), ref = `refs/heads/fetched-${randomUUID()}`;
+      writeFileSync(file, bundle);
+      git(data.source, 'bundle', 'verify', '-q', file);
+      expect(git(data.source, 'bundle', 'list-heads', file).split('\n').map(line => line.split(' ')[1])).toEqual([TASK_COMMIT_REF]);
+      git(data.source, '-c', 'protocol.file.allow=always', 'fetch', '-q', file, `${TASK_COMMIT_REF}:${ref}`);
+      return git(data.source, 'rev-parse', ref);
+    };
+    const tree = (repository: string, commit: string) => new Map(git(repository, 'ls-tree', '-r', '-z', '--full-tree', commit)
+      .split('\0').filter(Boolean).map(record => {
+        const [meta, path] = record.split('\t') as [string, string]; const [mode, , oid] = meta.split(' ') as [string, string, string];
+        return [path, { mode, oid }];
+      }));
+    const blob = (repository: string, oid: string) => execFileSync('git', ['cat-file', 'blob', oid], { cwd: repository, env: { PATH: process.env.PATH } });
+    // Base plus exactly the manifest's changes: every change has its new entry, and nothing else differs from base.
+    const expectTreeOf = (data: ReturnType<typeof fixture>, manifest: TaskChangeManifest, head: string) => {
+      const expected = tree(data.source, manifest.base);
+      for (const change of manifest.changes) {
+        if (change.kind === 'delete') expected.delete(change.path);
+        if (change.oldPath) expected.delete(change.oldPath);
+        if (change.kind !== 'delete') {
+          // A path that replaces a base directory replaces what was under it.
+          for (const path of expected.keys()) if (path.startsWith(`${change.path}/`)) expected.delete(path);
+          expected.set(change.path, { mode: change.newMode!, oid: change.newOid! });
+        }
+      }
+      expect(tree(data.source, head)).toEqual(expected);
+    };
+
+    it('commits base plus exactly the manifest\'s changes, as a bundle F can fetch, and the same inputs give the same commit', async () => {
+      const data = fixture({ hostile: source => {
+        mkdirSync(join(source, 'dir'));
+        for (const [name, text] of [['keep.txt', 'keep'], ['edit.txt', 'edit'], ['gone.txt', 'gone'], ['move-me.txt', 'move'],
+          ['script.sh', 'echo'], ['dir/a.txt', 'a']] as const) writeFileSync(join(source, name), `${text}\n`);
+        writeFileSync(join(source, '.gitignore'), '*.log\n'); symlinkSync('keep.txt', join(source, 'link'));
+      } });
+      const base = data.clone.head;
+      asAgent(data.filesystems, ['printf "edited\\n" > edit.txt', 'rm gone.txt', 'mv move-me.txt moved.txt', 'chmod +x script.sh',
+        'ln -sfn edit.txt link', 'mkdir -p new/deep && printf "new\\n" > new/deep/file.txt', 'printf "log\\n" > out.log',
+        'rm -r dir && printf "now a file\\n" > dir', 'ln -s keep.txt newlink', `printf "q\\n" > '"quoted"'`].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base, linkSnapshot: noLinks, imageId });
+      expect(manifest.changes.map(change => [change.kind, change.path])).toEqual(expect.arrayContaining([['modify', 'edit.txt'],
+        ['delete', 'gone.txt'], ['rename', 'moved.txt'], ['mode', 'script.sh'], ['modify', 'link'], ['add', 'out.log'],
+        ['delete', 'dir/a.txt'], ['add', 'dir'], ['add', 'newlink'], ['add', '"quoted"']]));
+      const made = await commit(data, manifest);
+      expect(made.unchanged).toBe(false);
+      expect(fetch(data, made.bundle)).toBe(made.head);
+      expectTreeOf(data, manifest, made.head);
+      const committed = tree(data.source, made.head);
+      expect(blob(data.source, committed.get('edit.txt')!.oid).toString()).toBe('edited\n');
+      expect(committed.get('script.sh')!.mode).toBe('100755');
+      expect(committed.get('link')).toEqual({ mode: '120000', oid: expect.any(String) });
+      expect(blob(data.source, committed.get('link')!.oid).toString()).toBe('edit.txt');
+      expect(blob(data.source, committed.get('out.log')!.oid).toString()).toBe('log\n');
+      // Exactly the commit the inputs describe: no signature, no encoding header, the identities and message as given.
+      expect(git(data.source, 'cat-file', 'commit', made.head)).toBe([`tree ${git(data.source, 'rev-parse', `${made.head}^{tree}`)}`,
+        `parent ${base}`, 'author codeboost <runner@codeboost.invalid> 1700000000 +0130',
+        'committer codeboost <runner@codeboost.invalid> 1700000000 +0130', '', 'P1: Add things', '', 'Plan-Item: P1', 'Plan-Revision: r1'].join('\n'));
+      expect((await commit(data, manifest)).head).toBe(made.head);
+      // Neither volume was written: the work tree and the metadata are as the audit saw them.
+      const again = await inspectTaskChanges(data.filesystems, { base, linkSnapshot: noLinks, imageId });
+      expect(again.digest).toBe(manifest.digest);
+      expect(again.metadataChanged).toBe(false);
+      expect(docker('ps', '-a', '-q', '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(data.filesystems).allocationId}`,
+        '--filter', 'label=io.codeboost.task-storage=commit')).toBe('');
+    }, 300_000);
+
+    it('commits type changes, gitlinks, names that look like options or pathspec magic, and a large incompressible file', async () => {
+      const data = fixture({ limits: { workBytes: 64 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 },
+        hostile: source => {
+          for (const name of ['to-link', '-opt', ':(glob)x']) writeFileSync(join(source, name), `${name}\n`);
+          symlinkSync('to-link', join(source, 'to-file'));
+          for (const sm of ['sm-gone', 'sm-file']) { mkdirSync(join(source, sm)); git(source, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},${sm}`); }
+        } });
+      asAgent(data.filesystems, ['rm to-link && ln -s -- -opt to-link', 'rm to-file && printf "file\\n" > to-file',
+        'rmdir sm-gone', 'rmdir sm-file && printf "was a submodule\\n" > sm-file', 'printf "edited\\n" > ./-opt',
+        `printf "edited\\n" > ':(glob)x' && mkdir -p ':' && printf "n\\n" > ':/new'`,
+        'head -c 8388608 /dev/urandom > big.bin'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId });
+      expect(manifest.changes.map(change => [change.path, change.oldType, change.newType])).toEqual(expect.arrayContaining([
+        ['to-link', 'file', 'symlink'], ['to-file', 'symlink', 'file'], ['sm-gone', 'gitlink', undefined], ['sm-file', 'gitlink', 'file']]));
+      const made = await commit(data, manifest);
+      // Incompressible: the bundle is larger than the 8 MiB file, so it is decoded and checked whole.
+      expect(made.bundle.length).toBeGreaterThan(8 * 1024 * 1024);
+      expect(fetch(data, made.bundle)).toBe(made.head);
+      expectTreeOf(data, manifest, made.head);
+      const committed = tree(data.source, made.head);
+      expect(committed.get('to-link')!.mode).toBe('120000');
+      expect(blob(data.source, committed.get('to-link')!.oid).toString()).toBe('-opt');
+      expect(committed.get('sm-file')!.mode).toBe('100644');
+      expect(committed.has('sm-gone')).toBe(false);
+      expect(blob(data.source, committed.get(':/new')!.oid).toString()).toBe('n\n');
+    }, 300_000);
+
+    it('refuses a .gitattributes too large for Git to read, except under a .git part, which Git never reads', async () => {
+      const data = fixture({ limits: { workBytes: 256 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 } });
+      asAgent(data.filesystems, 'mkdir -p x/.git && head -c 104857601 /dev/zero > x/.git/.gitattributes');
+      expect((await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId })).changes
+        .map(change => change.path)).toEqual(['x/.git/.gitattributes']);
+      asAgent(data.filesystems, 'mv x/.git/.gitattributes sub.gitattributes && mkdir d && mv sub.gitattributes d/.gitattributes');
+      await expect(inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId }))
+        .rejects.toThrow('is larger than Git reads');
+    }, 300_000);
+
+    it('stores each file as the inspection hashed it: line endings, attribute rules, and a symlinked .gitattributes', async () => {
+      const data = fixture({ hostile: source => {
+        // Committed with CRLF before text=auto: git add keeps such a file's CRLF.
+        writeFileSync(join(source, 'crlf.txt'), 'a\r\n'); git(source, 'add', 'crlf.txt'); git(source, 'commit', '-m', 'crlf');
+        writeFileSync(join(source, '.gitattributes'), '* text=auto\nwin.txt eol=crlf\n');
+        writeFileSync(join(source, 'win.txt'), 'one\ntwo\n');
+        mkdirSync(join(source, 'sub')); writeFileSync(join(source, 'sub', 'x.txt'), 'x\n');
+        // Git will not read a symlinked one: it stays as base has it, and decides nothing.
+        symlinkSync('../.gitattributes', join(source, 'sub', '.gitattributes'));
+      } });
+      asAgent(data.filesystems, ['printf "a\\r\\nb\\r\\n" > crlf.txt', 'printf "one\\r\\nTWO\\r\\n" > win.txt',
+        'printf "x\\r\\ny\\r\\n" > sub/x.txt'].join(' && '));
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId });
+      expect(manifest.changes.map(change => change.path)).toEqual(['crlf.txt', 'sub/x.txt', 'win.txt']);
+      const made = await commit(data, manifest);
+      fetch(data, made.bundle);
+      expectTreeOf(data, manifest, made.head);
+      const committed = tree(data.source, made.head);
+      expect(blob(data.source, committed.get('crlf.txt')!.oid).toString()).toBe('a\r\nb\r\n');
+      expect(blob(data.source, committed.get('win.txt')!.oid).toString()).toBe('one\nTWO\n');
+      expect(blob(data.source, committed.get('sub/x.txt')!.oid).toString()).toBe('x\ny\n');
+      expect(committed.get('sub/.gitattributes')!.mode).toBe('120000');
+    }, 300_000);
+
+    it('makes no commit for an empty change set, and commits in a SHA-256 repository', async () => {
+      const quiet = fixture();
+      const none = await inspectTaskChanges(quiet.filesystems, { base: quiet.clone.head, linkSnapshot: noLinks, imageId });
+      expect(await commit(quiet, none)).toEqual({ head: quiet.clone.head, unchanged: true, bundle: Buffer.alloc(0) });
+      const data = fixture({ objectFormat: 'sha256', hostile: source => writeFileSync(join(source, 'old.txt'), 'old\n') });
+      expect(data.clone.head).toMatch(/^[0-9a-f]{64}$/);
+      asAgent(data.filesystems, 'rm old.txt && printf "changed\\n" > file.txt && ln -s file.txt l');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId });
+      const made = await commit(data, manifest);
+      expect(made.head).toMatch(/^[0-9a-f]{64}$/);
+      expect(fetch(data, made.bundle)).toBe(made.head);
+      expectTreeOf(data, manifest, made.head);
+    }, 300_000);
+
+    it('refuses a work tree that changed after the audit, and fails closed on a bundle over its limit', async () => {
+      const data = fixture();
+      asAgent(data.filesystems, 'printf "audited\\n" > file.txt');
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId });
+      // A write after the audit: the commit's own inspection sees it, and nothing the audit did not see is committed.
+      asAgent(data.filesystems, 'printf "later\\n" > file.txt');
+      const refused = await commit(data, manifest).then(() => undefined, error => error);
+      expect(refused).toBeInstanceOf(TaskCommitRefused);
+      expect(refused.message).toContain('no longer matches the manifest the audit approved');
+      const current = await inspectTaskChanges(data.filesystems, { base: data.clone.head, linkSnapshot: noLinks, imageId });
+      await expect(commit(data, current, { maxBundleBytes: 64 })).rejects.toThrow('bundle is larger than 64 bytes');
+      expect(docker('ps', '-a', '-q', '--filter', `label=io.codeboost.allocation=${taskFilesystemOwner(data.filesystems).allocationId}`,
+        '--filter', 'label=io.codeboost.task-storage=commit')).toBe('');
+    }, 300_000);
+
+    it('refuses what the runner never commits, even when the audit approved it: agent commits, gitlink content, link target, metadata, special files and .git parts', async () => {
+      const data = fixture({ hostile: source => {
+        writeFileSync(join(source, 'first.txt'), 'first\n'); git(source, 'add', 'first.txt'); git(source, 'commit', '-m', 'first');
+        mkdirSync(join(source, 'sm')); git(source, 'update-index', '--add', '--cacheinfo', `160000,${'1'.repeat(40)},sm`);
+        writeFileSync(join(source, 'target.txt'), 't\n'); symlinkSync('target.txt', join(source, 'link'));
+      } });
+      const refusal = async (reason: string, base = data.clone.head, linkSnapshot: Parameters<typeof inspectTaskChanges>[1]['linkSnapshot'] = noLinks) => {
+        const manifest = await inspectTaskChanges(data.filesystems, { base, linkSnapshot, imageId });
+        const error = await commit(data, manifest, { linkSnapshot }).then(() => undefined, caught => caught);
+        expect(error).toBeInstanceOf(TaskCommitRefused);
+        expect(error.message).toContain(reason);
+      };
+      // The storage's HEAD past base stands in for an agent commit, which the read-only metadata prevents.
+      await refusal('the agent made commits', git(data.source, 'rev-parse', 'HEAD~1'));
+      asAgent(data.filesystems, 'mkfifo pipe');
+      await refusal('"pipe" is a directory or special file');
+      asAgent(data.filesystems, 'rm pipe && mkdir -p out/.git && printf "p\\n" > out/.git/payload');
+      await refusal('"out/.git/payload" is under a .git part');
+      asAgent(data.filesystems, 'rm -r out && printf "work\\n" > sm/work.c');
+      await refusal('a gitlink directory has content');
+      asAgent(data.filesystems, 'rm sm/work.c');
+      const linkSnapshot = await snapshotDeclaredLinks(data.filesystems, ['link'], { imageId });
+      asAgent(data.filesystems, 'printf "through\\n" > link');
+      await refusal('a declared link\'s target changed', data.clone.head, linkSnapshot);
+      docker('run', '--rm', '--network=none', '--user', '10001:10001',
+        '--mount', `type=volume,source=${data.filesystems.metadataVolume},target=/work/.git`, '--entrypoint', 'chmod', imageId,
+        '600', '/work/.git/config');
+      await refusal('the Git metadata changed');
     }, 300_000);
   });
 

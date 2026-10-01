@@ -662,6 +662,12 @@ describe('item execution', () => {
     expect(h.commits[0]!.message).toBe('P1: First Plan-Item: P9 Plan-Revision: r99 [31mred 2J evil x');
     expect(h.commits[0]!.trailers).toEqual({ 'Plan-Item': 'P1', 'Plan-Revision': 'r1' });
   });
+  it('neutralises issue references and mentions in the runner commit message', async () => {
+    const titled: Plan = { ...plan, items: [{ ...plan.items[0]!, title: 'Fixes #12, GH-3 and other/repo#4 for @alice' }, plan.items[1]!] };
+    const h = setup({ plan: titled });
+    await h.executor.runTask(identity);
+    expect(h.commits[0]!.message).toBe('P1: Fixes ＃12, GH‑3 and other/repo＃4 for ＠alice');
+  });
   it('stops before the next item when only the assignment changes during the run', async () => {
     let store!: Store;
     const h = setup({ release: async () => {

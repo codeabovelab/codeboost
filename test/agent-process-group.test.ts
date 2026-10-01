@@ -24,6 +24,30 @@ describe('runInProcessGroup', () => {
     expect(groupAlive(reported!.pgid)).toBe(false);
   });
 
+  it('writes the input to the leader\'s stdin and closes it, and leaves stdin unconnected without one', async () => {
+    const input = Buffer.concat([Buffer.from('line\n\0'), Buffer.alloc(256 * 1024, 'x')]);
+    const read = await runInProcessGroup('sh', ['-c', 'wc -c'], { env, timeoutMs: 10_000, input });
+    expect(read).toMatchObject({ status: 0 });
+    expect(Number(read.stdout.trim())).toBe(input.length);
+    expect(await runInProcessGroup('sh', ['-c', 'wc -c'], { env, timeoutMs: 10_000 })).toMatchObject({ status: 0, stdout: expect.stringMatching(/^\s*0\n$/) });
+    // A leader that never reads its input: the broken pipe is not an error, and the outcome is its own.
+    const ignored = await runInProcessGroup('sh', ['-c', 'exec 0<&-; exit 4'], { env, timeoutMs: 10_000, input: Buffer.alloc(1024 * 1024) });
+    expect(ignored).toMatchObject({ status: 4 });
+    expect(ignored.error).toBeUndefined();
+  });
+
+  it('settles an abort while the input is still being written, with no error from the unread input', async () => {
+    const controller = new AbortController();
+    let group: ProcessGroup | undefined;
+    setTimeout(() => controller.abort(), 200);
+    // More than a pipe holds, to a leader that never reads it: the write is still pending at the abort.
+    const outcome = await runInProcessGroup('sleep', ['60'], { env, timeoutMs: 30_000, signal: controller.signal,
+      input: Buffer.alloc(4 * 1024 * 1024), onProcessGroup: reported => { group = reported; } });
+    expect(outcome.status).toBeNull();
+    expect((outcome.error as NodeJS.ErrnoException).code).toBe('ABORT_ERR');
+    expect(groupAlive(group!.pgid)).toBe(false);
+  });
+
   it('kills what the leader left in its group before settling, even after a normal exit', async () => {
     let group: ProcessGroup | undefined;
     const began = performance.now();
