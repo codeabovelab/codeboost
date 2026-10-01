@@ -179,7 +179,10 @@ export class ItemExecutor {
     this.#store = store; this.#runner = runner; this.#sources = sources; this.#findings = findings;
     this.#deadlineMs = options.deadlineMs ?? 10 * 60_000; this.#write = settleWith(options.capability);
   }
-  /** Tasks with a runTask in progress here, from its start to its return: a second one waits for none of its steps. */
+  /**
+   * Tasks with a runTask in progress here, from its start to its return: a second one waits for none of its steps.
+   * The guard is per instance, so the server must keep one ItemExecutor per Store (as it keeps one coordinator).
+   */
   #inFlight = new Set<string>();
   async runTask(identity: PlanIdentity, options: { fromItem?: string } = {}): Promise<ExecutionOutcome> {
     const key = identityKey(identity);

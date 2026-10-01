@@ -881,4 +881,22 @@ describe('item execution', () => {
     expect(await during).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/still finishing/) });
     expect(h.store.getAttempts(identity)).toHaveLength(1);
   });
+  it('pauses at a later item with the whole executed prefix', async () => {
+    const h = setup({ manifests: { P2: manifest([change('b.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
+    const outcome = await h.executor.runTask(identity) as { kind: string; item: string; checkpointId: string; completed: string[] };
+    expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P2', completed: ['P1', 'P2'] });
+    expect(h.store.getCheckpoint(identity, outcome.checkpointId)).toMatchObject({ item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['extra.ts'] });
+  });
+  it('escalates an older owed finding even when a later attempt completed cleanly', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
+    const store = h.store;
+    // Both attempts start outside the executor, so nothing acts on P1's finding yet.
+    h.runner.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    await h.runner.settled(identity);
+    h.runner.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P2', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    await h.runner.settled(identity);
+    expect(store.getAttempts(identity).map(row => row.state)).toEqual(['failed', 'completed']);
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(store.getAttempts(identity)).toHaveLength(2);
+  });
 });
