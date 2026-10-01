@@ -160,7 +160,9 @@ export class PullRequestPublisher {
         // Like every misplaced PR, it does not stay ready meanwhile: it is made a draft where it is, while its marker
         // still identifies it.
         let state = 'It may still be ready for review: its first line no longer identifies it.';
-        if (pr.marker === marker(row.openingId)) {
+        // Re-read after the direct read's await: a task approved meanwhile keeps its PR ready (GitHub merges no draft).
+        if (this.#mayKeepReady(identity)) state = 'It is left as it is: the task is now in review, approved or merged.';
+        else if (pr.marker === marker(row.openingId)) {
           let drafted;
           try { drafted = await this.#pulls.markDraft(row.number, { base: pr.base, headBranch: pr.headBranch, marker: pr.marker }, signal); }
           catch (error) {
@@ -317,6 +319,12 @@ export class PullRequestPublisher {
     return { kind: 'opened', number: drafted.number, url: drafted.url, draft: drafted.draft, status: this.#store.getTask(identity).status };
   }
 
+  /** The task may keep a ready PR: it is in review, approved (GitHub merges no draft) or merged. Read with no await since. */
+  #mayKeepReady(identity: PlanIdentity): boolean {
+    const status = this.#store.getTask(identity).status;
+    return MERGEABLE_STATUSES.includes(status) || status === 'merged';
+  }
+
   /** Whether a lost opening is the current publish's own: neither the task nor its review changed since it began, and the mode matches. */
   #isCurrent(identity: PlanIdentity, lost: TaskPullRequest, draft: boolean): boolean {
     return this.#store.getTask(identity).stateVersion === lost.ownerVersion && this.#store.reviewVersion(identity) === lost.ownerReviewVersion && lost.draft === draft;
@@ -375,7 +383,8 @@ export class PullRequestPublisher {
     // recorded as it is and reported.
     let found: { number: number; url: string; headSha: string; draft: boolean } = pr;
     // Only when this publish is itself a draft publish; a ready publish's main path marks the PR ready anyway.
-    if (lost.draft && draft && !pr.draft) {
+    // Re-read after the lookup's await, as before every other draft change: an approved task keeps its PR ready.
+    if (lost.draft && draft && !pr.draft && !this.#mayKeepReady(identity)) {
       try { found = await this.#pulls.markDraft(pr.number, { base: pr.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
@@ -410,11 +419,7 @@ export class PullRequestPublisher {
    */
   async #draftStranded(identity: PlanIdentity, signal?: AbortSignal, misplaced = false): Promise<string[]> {
     // `misplaced`: the main path found the task's PRs where it cannot publish, so being publishable keeps nothing ready.
-    const keepsReady = () => {
-      const status = this.#store.getTask(identity).status;
-      // An approved task's PR must stay ready: GitHub does not merge a draft.
-      return MERGEABLE_STATUSES.includes(status) || status === 'merged' || (!misplaced && this.#store.canPublish(identity, false));
-    };
+    const keepsReady = () => this.#mayKeepReady(identity) || (!misplaced && this.#store.canPublish(identity, false));
     if (keepsReady()) return [];
     const prs = this.#store.taskPullRequests(identity), notes: string[] = [];
     const reason = (error: unknown) => error instanceof Error ? error.message : String(error);

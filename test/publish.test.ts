@@ -1395,6 +1395,16 @@ describe('GitHub PR adapter', () => {
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([crlf])).findOpened({ ...input, markers: [marker] })).toMatchObject({ number: 7, marker });
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([crlf])).findOwned({ headBranch: input.headBranch, markers: [marker] })).toMatchObject([{ number: 7 }]);
   });
+  it('fails closed on a full page of PRs from the branch, and on any malformed entry', async () => {
+    const list = (entries: unknown[]) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(entries)).findOpened({ ...input, markers: [marker] });
+    const others = Array.from({ length: 100 }, (_, i) => ({ ...response({ number: 1000 + i, body: 'backport' }), base: { ...response().base, ref: `release-${i}` } }));
+    await expect(list(others)).rejects.toThrow(/100 or more open pull requests/);
+    expect(await list(others.slice(0, 99))).toBeNull();
+    // Missing base or a non-string body: refused, not set aside as someone else's PR.
+    await expect(list([{ ...response({ body: 'backport' }), base: {} }])).rejects.toThrow(/invalid pull request list/);
+    await expect(list([response({ body: 7 })])).rejects.toThrow(/invalid pull request list/);
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([{ ...response(), base: {} }])).findOwned({ headBranch: input.headBranch, markers: [marker] })).rejects.toThrow(/invalid pull request list/);
+  });
   it('reads a PR from the PR itself: state, branch, base and marker', async () => {
     const read = (value: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { expect(args.at(-1)).toBe('repos/owner/repo/pulls/7'); return JSON.stringify(value); }).readPull(7);
     expect(await read(response({ state: 'open' }))).toEqual({ open: true, headBranch: 'codeboost/issue-12-task', base: 'main', marker });
@@ -2040,6 +2050,25 @@ describe('shutdown and PRs left ready', () => {
     expect(error.message).toBe('cancelled');
     expect(again.log).toContain('draft 100');
     expect(store.getTask(identity).status).toBe('running');
+  });
+  it('leaves the PR ready when the task is approved during the direct read or recovery\'s lookup', async () => {
+    // The direct read of a moved PR.
+    let store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(store, { live, next }).publisher.publish(identity);
+    requeue(store);
+    const approve = (task: Store) => () => task.transitionTask(identity, task.getTask(identity).stateVersion, 'approved but merge blocked');
+    let again = harness(store, { live, next, hidden: new Set(live.keys()), moved: new Set([100]), onRead: approve(store) });
+    await expect(again.publisher.publish(identity)).rejects.toThrow(/left as it is: the task is now in review, approved or merged/);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    // Recovery of a lost draft opening made ready meanwhile.
+    store = runningTask(); live = new Map(); next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    again = harness(store, { live, next, onFind: approve(store) });
+    await expect(again.publisher.publish(identity, { problems: ['x'] })).rejects.toThrow(GuardRefusal);
+    expect(again.log.some(line => line.startsWith('draft'))).toBe(false);
+    expect(live.get([...live.keys()][0]!)).toMatchObject({ draft: false });
   });
   it('writes nothing after an abort during recovery\'s lookup or the direct read of a PR the list does not show', async () => {
     // Recovery: the lost opening stays owned, nothing is recorded or abandoned.
