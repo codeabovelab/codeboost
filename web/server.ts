@@ -81,7 +81,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const last = attempts.find(attempt => attempt.id === task.currentAttemptId);
     const retryable = !!runner && !!last && (last.state === 'failed' || last.state === 'cancelled')
       && (task.status === 'running' || task.status === 'queued') && !task.requeuePending && task.cancelRequested === null
-      && !status.active && !status.unresolved && sameContext(last.context, service.store.currentContext(identity));
+      && !status.active && !status.unresolved && sameContext(last.context, service.store.currentContext(identity))
+      // A plan item is retried only by resuming its task (#91 part 2); the retry action refuses it.
+      && !(executor && last.kind === 'execute');
     return { available: !!runner, task, attempts,
       stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved };
   };
@@ -281,20 +283,20 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     server.closeIdleConnections();
     // Abort the issue refresh now; its close settles without rejecting, so it is always awaited.
     const issuesClosed=issues.close();
-    // A failure in one step is reported after the rest has run: agents are still stopped and the Store still closed.
-    try {
-      try { await merges?.close(); } finally { await issuesClosed; }
-    } finally {
-      try {
-        // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.
-        await runner?.close();
-        // Then every plan run in progress: its pause or escalation after the last attempt is a settlement write (#91).
-        await executor?.close();
-        await closing;
-      } finally {
-        // Close the store even if Ask's or planning's cleanup fails, then report that failure.
-        try { await questions.close(); } finally { try { await suggestions?.close(); } finally { service.close(); } }
-      }
-    }
+    // Every step runs even when an earlier one fails: agents are still stopped, plan runs awaited and the Store closed
+    // last. The first failure is reported; a later one never hides it.
+    const failures: unknown[] = [];
+    const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
+    await step(() => merges?.close());
+    await step(() => issuesClosed);
+    // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.
+    await step(() => runner?.close());
+    // Then every plan run in progress: its pause or escalation after the last attempt is a settlement write (#91).
+    await step(() => executor?.close());
+    await step(() => closing);
+    await step(() => questions.close());
+    await step(() => suggestions?.close());
+    await step(() => service.close());
+    if (failures.length) throw failures[0];
   } };
 }

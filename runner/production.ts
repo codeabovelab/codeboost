@@ -70,18 +70,23 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
  * without a runner label too, and every unowned object blocks startup (runner-lifecycle.md, "Unowned resources"): an
  * older build takes no lock this build can see, so one may still be running. Each is reported as a shell line that
  * removes it, with its reason as a comment, for a person to run once every older codeboost process has stopped.
- * `image` builds the agent image when the first export needs it: after D's recovery has stopped every leftover agent,
- * so none keeps writing to its storage during a long build.
+ * `image` builds the agent image once D's recovery has stopped every leftover agent, so none keeps writing to its
+ * storage during a long build, and before any export's deadline starts: the build blocks, and a timer armed before it
+ * would fire as soon as it returned.
  */
+/** One shell word, whatever Docker returned as a name. */
+const shellQuote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 export function dRecoveryDeps(image: () => string): RecoveryDeps {
   return {
     async recoverLeftovers(runnerOwner) {
       const report = await recoverLeftovers(runnerOwner, 120_000);
+      // Any recovered storage may be exported, and every export needs the image.
+      if (report.storage.length) image();
       return {
         // D's handle object itself: its trust is keyed by identity, so a copy would be refused.
         storage: report.storage.map(handle => ({ attemptId: handle.attemptId, allocationId: handle.allocationId, handle })),
         unowned: report.unowned.map(resource =>
-          `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${resource.id ?? resource.name}  # ${resource.reason}`),
+          `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${shellQuote(resource.id ?? resource.name)}  # ${resource.reason}`),
       };
     },
     exportTaskDiff: (handle, input, maxBytes, signal) =>

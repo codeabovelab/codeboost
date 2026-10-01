@@ -60,7 +60,7 @@ describe('runner configuration', () => {
 });
 
 describe('runner startup', () => {
-  it('verifies the lock, builds the image, then recovers, before it assembles anything', async () => {
+  it('verifies the lock, recovers, then builds the image, before it assembles anything', async () => {
     const { root, service } = fixture(), calls: string[] = [];
     const assembly = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock(calls), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); } });
@@ -127,12 +127,14 @@ describe('server with a runner setup', () => {
     const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => assembly(service));
     const order: string[] = [];
     const executorClose = app.executor!.close.bind(app.executor);
-    app.executor!.close = async () => { await new Promise(resolve => setTimeout(resolve, 20)); order.push('executor'); return executorClose(); };
+    // A later failure must not hide the first one.
+    app.executor!.close = async () => { await new Promise(resolve => setTimeout(resolve, 20)); order.push('executor'); await executorClose(); throw new Error('executor close failed'); };
     const storeClose = app.service.store.close.bind(app.service.store);
     app.service.store.close = () => { order.push('store'); storeClose(); };
     vi.spyOn(app.runner as RunnerCoordinator, 'close').mockRejectedValueOnce(new Error('runner close failed'));
     await expect(app.close()).rejects.toThrow(/runner close failed/);
-    expect(order).toEqual(['store']);
+    // A failing step skips nothing after it: plan runs are still awaited before the Store closes.
+    expect(order).toEqual(['executor', 'store']);
     // Without the failure: executor first, then the Store.
     const second = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => assembly(service));
     const order2: string[] = [];
@@ -156,7 +158,9 @@ describe('server with a runner setup', () => {
     });
     cleanups.push(() => app.close());
     const origin = new URL(app.url).origin, headers = { 'x-codeboost-token': app.token };
-    const view = await (await fetch(`${origin}/api/runner`, { headers })).json() as { stateVersion: number; attempts: { id: string }[] };
+    const view = await (await fetch(`${origin}/api/runner`, { headers })).json() as { stateVersion: number; attempts: { id: string }[]; retryable: boolean };
+    // The view must not offer what the action refuses.
+    expect(view.retryable).toBe(false);
     const response = await fetch(`${origin}/api/runner`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ action: 'retry', attemptId: view.attempts[0]!.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() }) });
     expect(await response.json()).toEqual({ error: expect.stringMatching(/Retrying a plan item on its own is not supported/) });
@@ -186,14 +190,21 @@ describe('D adapters', () => {
     expect(spy).toHaveBeenCalledWith(OWNER, 120_000);
     expect(report.storage[0]!.handle).toBe(handle);
     // Each line runs as it is in a shell; the reason is a comment.
-    expect(report.unowned).toEqual(['docker volume rm legacy  # no-runner-label', 'docker container rm -f abc  # unknown-kind']);
+    expect(report.unowned).toEqual(["docker volume rm 'legacy'  # no-runner-label", "docker container rm -f 'abc'  # unknown-kind"]);
   });
-  it('exports with the row\'s base and baseline and the image built on first need, and removes D\'s own handle', async () => {
+  it('builds the image before exporting, exports with the row\'s base and baseline, and removes D\'s own handle', async () => {
     let builds = 0;
-    const deps = dRecoveryDeps(() => { builds++; return 'sha256:x'; }), handle = { recovered: true }, signal = new AbortController().signal;
+    // Memoized, as setUpRunner passes it.
+    let built: string | undefined;
+    const deps = dRecoveryDeps(() => built ??= (builds++, 'sha256:x')), handle = { recovered: true }, signal = new AbortController().signal;
     vi.mocked(recoverLeftovers).mockResolvedValue({ removed: [], storage: [], unowned: [] });
     await deps.recoverLeftovers(OWNER);
+    // Nothing to export: the build waits until recovery ends.
     expect(builds).toBe(0);
+    // Storage to export: built before recoverStartup arms any export deadline.
+    vi.mocked(recoverLeftovers).mockResolvedValue({ removed: [], storage: [Object.freeze({ runnerOwner: OWNER, attemptId: randomUUID(), allocationId: randomUUID() })], unowned: [] });
+    await deps.recoverLeftovers(OWNER);
+    expect(builds).toBe(1);
     await deps.exportTaskDiff(handle, { base: 'a'.repeat(40), metadataBaseline: 'b'.repeat(64) }, 1024, signal);
     expect(vi.mocked(exportTaskDiff)).toHaveBeenCalledWith(handle, { base: 'a'.repeat(40), metadataBaseline: 'b'.repeat(64), imageId: 'sha256:x', maxBytes: 1024, signal });
     expect(builds).toBe(1);
