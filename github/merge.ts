@@ -4,10 +4,10 @@ import { runWithInput } from './run-with-input.ts';
 /**
  * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
  * it exits. Every gh call of this gateway settles only when gh has stopped, so a call aborted at a deadline settles up
- * to 0.75 s later. That keeps the merge click (14 s deadline in runner/merge.ts) at 14.75 s and the 12 s inspections at
- * 12.75 s, below the 15-second serving request budget.
+ * to 0.4 s later. That keeps a merge click (14 s deadline in runner/merge.ts) within 14.4 s, inside the 14.5 s shutdown
+ * drain and below the 15-second serving request budget, and the 12 s inspections within 12.4 s.
  */
-export const MERGE_KILL_GRACE_MS = 500, MERGE_PIPE_GRACE_MS = 250;
+export const MERGE_KILL_GRACE_MS = 250, MERGE_PIPE_GRACE_MS = 150;
 
 export interface RequiredCheck {
   context: string;

@@ -1,7 +1,7 @@
 import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, onTestFinished } from 'vitest';
 import { GhMergeGateway, MERGE_KILL_GRACE_MS, MERGE_PIPE_GRACE_MS, type RunGh } from '../github/merge.ts';
 import { GhIssueGateway, ISSUE_KILL_GRACE_MS, ISSUE_PIPE_GRACE_MS } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
@@ -9,6 +9,7 @@ import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
 import { GH_ENV_ALLOWLIST, ghEnvironment } from '../github/gh-env.ts';
 import { MERGE_OPERATION_TIMEOUT_MS } from '../runner/merge.ts';
 import { REFRESH_TIMEOUT_MS } from '../web/issues.ts';
+import { MAX_SHUTDOWN_DRAIN_MS } from '../web/server.ts';
 
 // Every adapter's own runner, not an injected one: these are the runners the server uses.
 // Each adapter must send every `gh` call through `run`, or this test does not see it.
@@ -55,15 +56,17 @@ describe('default gh runners', () => {
   });
 });
 
-// The kill and pipe grace periods each gateway adds after its deadline, plus 400 ms for a slow test machine.
+// The kill and pipe grace periods each gateway adds after its deadline, plus 500 ms for a slow test machine.
 const settleBudgetMs: Record<string, number | undefined> = {
-  merge: MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS + 400,
-  issues: ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS + 400,
+  merge: MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS + 500,
+  issues: ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS + 500,
 };
 
 describe('gh stop waits', () => {
   it('keep each deadline plus its stop wait below the 15-second serving request budget', () => {
-    expect(MERGE_OPERATION_TIMEOUT_MS + MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS).toBeLessThan(15_000);
+    // A merge click admitted just before shutdown must also settle inside the shutdown drain.
+    expect(MERGE_OPERATION_TIMEOUT_MS + MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS).toBeLessThan(MAX_SHUTDOWN_DRAIN_MS);
+    expect(MAX_SHUTDOWN_DRAIN_MS).toBeLessThan(15_000);
     expect(REFRESH_TIMEOUT_MS + ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS).toBeLessThan(15_000);
   });
 });
@@ -80,6 +83,8 @@ describe('default gh runners stop a gh that ignores SIGTERM', () => {
     chmodSync(join(dir, 'gh'), 0o755);
     process.env.PATH = `${dir}:${saved ?? ''}`;
   });
+  // The fake gh's process ID, then the ID of the process that holds its pipes.
+  const readPids = () => readFileSync(join(dir, 'ready'), 'utf8').trim().split(' ').map(Number).filter(pid => pid > 0);
   afterAll(() => {
     if (saved === undefined) delete process.env.PATH; else process.env.PATH = saved;
     rmSync(dir, { recursive: true, force: true });
@@ -89,23 +94,26 @@ describe('default gh runners stop a gh that ignores SIGTERM', () => {
   it.each(defaultRunners)('%s: an abort settles the call only after gh has exited', async (name, runner) => {
     rmSync(join(dir, 'ready'), { force: true });
     const controller = new AbortController();
+    let pids: number[] = [];
+    // Also on a failure or a test timeout: stop the call and the fake gh, so neither keeps running.
+    onTestFinished(() => {
+      controller.abort(new Error('test finished'));
+      if (!pids.length && existsSync(join(dir, 'ready'))) pids = readPids();
+      for (const pid of pids) try { process.kill(pid, 'SIGKILL'); } catch { /* already exited */ }
+    });
     const call = runner()(['api', 'user'], { signal: controller.signal });
     const started = Date.now();
     while (!existsSync(join(dir, 'ready'))) {
       if (Date.now() - started > 5_000) throw new Error('The fake gh did not start.');
       await new Promise(resolve => setTimeout(resolve, 10));
     }
-    const [pid = 0, holder = 0] = readFileSync(join(dir, 'ready'), 'utf8').trim().split(' ').map(Number);
-    try {
-      const aborted = Date.now();
-      controller.abort(new Error('stop'));
-      await expect(call).rejects.toThrow('stop');
-      expect(() => process.kill(pid, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
-      // The wait after an abort comes on top of the caller's deadline, so it must stay within the stated grace periods.
-      const budget = settleBudgetMs[name];
-      if (budget !== undefined) expect(Date.now() - aborted).toBeLessThan(budget);
-    } finally {
-      for (const stray of [pid, holder]) try { if (stray > 0) process.kill(stray, 'SIGKILL'); } catch { /* already exited */ }
-    }
+    pids = readPids();
+    const aborted = Date.now();
+    controller.abort(new Error('stop'));
+    await expect(call).rejects.toThrow('stop');
+    expect(() => process.kill(pids[0]!, 0)).toThrow(expect.objectContaining({ code: 'ESRCH' }));
+    // The wait after an abort comes on top of the caller's deadline, so it must stay within the stated grace periods.
+    const budget = settleBudgetMs[name];
+    if (budget !== undefined) expect(Date.now() - aborted).toBeLessThan(budget);
   }, 15_000);
 });
