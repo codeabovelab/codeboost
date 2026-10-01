@@ -2,7 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
 import { commitTaskChanges, inspectTaskChanges, snapshotDeclaredLinks } from '../agents/container/changes.ts';
-import { prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
+import { exportTaskDiff, prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
 import type { ProcessGroup } from '../agents/process-group.ts';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { createTaskCloneAsync } from '../git/clone.ts';
@@ -83,6 +83,9 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
       if (made.unchanged) return input.baseHead;
       await fetchTaskCommit(repository, { bundle: made.bundle, base: input.baseHead, head: made.head, attemptId }, { signal });
       return made.head;
+    },
+    async exportPartial(workspace, input, signal) {
+      return exportTaskDiff(held(workspace).filesystems, { base: input.baseHead, imageId, signal, timeoutMs: 60_000 });
     },
     async release(workspace) {
       const { filesystems, attemptId, identity } = held(workspace);

@@ -49,6 +49,18 @@ export interface RunnerDeps {
    * saved with `completed` in one transaction. Throw FinishFailure with an actionable diagnostic to fail the attempt.
    */
   finish?(attempt: AttemptRecord, result: InvocationResult, prepared: PreparedAttempt, signal: AbortSignal): Promise<{ value: unknown; history?: HistoryRecord }>;
+  /**
+   * Optional, for writable attempts whose agent ended badly on its own (a non-zero exit, a D stop reason, or a result
+   * that is not this attempt's, with no first reason): check what it left before the terminal write, recording any safety finding durably, so a failed run that
+   * did something unsafe goes to a person instead of being retried (#87 item 2). It commits nothing and never throws
+   * past its own failures: the attempt fails either way.
+   */
+  auditFailed?(attempt: AttemptRecord, prepared: PreparedAttempt, signal: AbortSignal): Promise<void>;
+  /**
+   * Optional, for writable attempts that did not complete: save their partial output before the terminal write, which
+   * stores the reference (`diagnostic_ref`). It bounds itself and reports a failure instead of throwing.
+   */
+  exportPartial?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<{ diagnosticRef?: string; failure?: string }>;
   /** Optional: remove task storage after the terminal write and before the slot is freed. A failure keeps the slot under a marker. */
   release?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void>;
   now?(): number;
@@ -322,8 +334,9 @@ export class RunnerCoordinator {
       // Accept only the result of this exact invocation, as the question path does. Anything else is never validated
       // or saved: the attempt fails closed.
       if (result.attemptId !== attempt.id || !result.context || !sameContext(result.context, attempt.context)) {
-        const foreignSaved = this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false,
-          detail: job.firstReason === 'stale' ? job.staleCause : FOREIGN_RESULT });
+        // The result is not this attempt's, but the storage is: what the agent left is audited and kept all the same.
+        const evidence = await this.#keepEvidence(job, attempt, prepared, job.firstReason === 'stale' ? job.staleCause : FOREIGN_RESULT, true);
+        const foreignSaved = this.#settle(job, { stopReason: 'capture-failure', exitCode: null, signal: null, valid: false, ...evidence });
         job.decided = true;
         // Task storage and host-side preparation files wait for the terminal write, as on every other path.
         if (foreignSaved) await this.#release(job, attempt, prepared);
@@ -341,7 +354,10 @@ export class RunnerCoordinator {
       }
       // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
       if (job.firstReason === 'stale') detail = job.staleCause;
-      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail, history });
+      // A clean exit was audited by finish already; only a run that ended badly on its own is audited here.
+      const clean = !job.firstReason && result.exitCode === 0 && !result.stopReason;
+      const evidence = valid ? { detail } : await this.#keepEvidence(job, attempt, prepared, detail, !clean);
+      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, history, ...evidence });
       job.decided = true;
       // Task storage goes after the terminal write too; a failed removal holds the slot under a marker.
       if (saved) await this.#release(job, attempt, prepared);
@@ -354,6 +370,26 @@ export class RunnerCoordinator {
       for (const timer of job.timers) clearTimeout(timer);
       if (this.#jobs.get(job.key) === job) this.#jobs.delete(job.key);
     }
+  }
+  /**
+   * For an attempt that ran and did not complete, before its terminal write: audit what the agent left when it ended
+   * badly on its own (no first reason), recording any safety finding, and keep its partial output for diagnosis. Returns
+   * the terminal write's detail and `diagnosticRef`.
+   */
+  async #keepEvidence(job: Job, attempt: AttemptRecord, prepared: PreparedAttempt, detail: string | undefined, audit: boolean)
+    : Promise<{ detail?: string; diagnosticRef?: string }> {
+    if (audit && !job.firstReason && this.#deps.auditFailed) {
+      // The attempt fails whatever this finds.
+      try { await this.#deps.auditFailed(attempt, prepared, job.controller.signal); }
+      catch (error) { console.error(`Runner job ${job.attemptId} could not audit its failed run: ${JSON.stringify(message(error))}`); }
+    }
+    if (!this.#deps.exportPartial) return { detail };
+    let exported: { diagnosticRef?: string; failure?: string };
+    try { exported = await this.#deps.exportPartial(attempt, prepared); }
+    catch (error) { exported = { failure: message(error) }; }
+    // The reason can quote agent-chosen paths: quoted, like the agent's own text.
+    return { diagnosticRef: exported.diagnosticRef, detail: exported.failure
+      ? bounded(`${detail ?? ''} Partial output could not be exported: ${JSON.stringify(exported.failure)}`.trim()) : detail };
   }
   /** D gave up on cleanup (presence, not length, is the signal): fail closed until restart, as Ask does. */
   #noteUnreleased(result: InvocationResult): void {
@@ -401,7 +437,7 @@ export class RunnerCoordinator {
       if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'storage-not-removed' });
     }
   }
-  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord }): Classification | undefined {
+  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord; diagnosticRef?: string }): Classification | undefined {
     try {
       return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason }));
     } catch {

@@ -32,7 +32,9 @@ export class Questions {
   constructor(service: ReviewService, agent?: QuestionAgent, capability?: ShutdownCapability) {
     this.service=service; this.agent=agent; this.write = settleWith(capability);
     // Beside the review database's canonical path, so a restart of the same review finds what an earlier session left.
-    this.worker=new QuestionWorker(undefined,LeftoverLedger.forDatabase(service.config.database));
+    const ledger=LeftoverLedger.forDatabase(service.config.database);
+    // Ask's owner is per database, so its recovery acts only on this review's Docker objects (#65).
+    this.worker=new QuestionWorker(undefined,ledger,{runnerOwner:()=>service.store.askOwnerToken(ledger.identity!)});
   }
   isRunning(id: string) { return this.running.has(id); }
   get stopping() { return this.closing; }
@@ -87,8 +89,8 @@ export class Questions {
     this.closing = true;
     for(const job of this.running.values())job.controller.abort(new StopError('Server stopped. Retry the question.','shutdown'));
     const settled=Promise.all([...this.running.values()].map(job=>job.done));
-    // Lane D may never settle (#51 item 1). After the grace period the worker is abandoned, which records its
-    // allocations as unknown and rejects the waiting questions, so shutdown cannot hang here.
+    // Lane D may never settle (#51 item 1). After the grace period the worker is abandoned, which rejects the waiting
+    // questions, so shutdown cannot hang here. What it left is removed by the next process's recovery.
     let timer: ReturnType<typeof setTimeout> | undefined;
     const graceful=await Promise.race([settled.then(()=>true),new Promise<false>(resolve=>{timer=setTimeout(()=>resolve(false),SHUTDOWN_SETTLE_MS);})]);
     clearTimeout(timer);

@@ -619,3 +619,49 @@ describe('after commit (#79)', () => {
     expect(calls).toEqual(['outer', 'inner']);
   });
 });
+
+describe('durable safety findings (#87 item 3)', () => {
+  it('keeps the first finding of an active attempt, and acts on it in the terminal write, whatever the outcome', () => {
+    const { store } = queued(); const attempt = admit(store); store.markRunning(identity, attempt.id);
+    expect(store.recordSafetyFinding(identity, attempt.id, 'Safety violation: .git changed')).toBe(true);
+    expect(store.recordSafetyFinding(identity, attempt.id, 'a later one')).toBe(false);
+    // A stop wins the outcome; the finding still sends the task to a person, and its text stays on the row.
+    store.recordFirstReason(identity, attempt.id, 'cancelled');
+    expect(settle(store, attempt.id, { exitCode: null, valid: false }).state).toBe('cancelled');
+    expect(store.getAttempt(identity, attempt.id)).toMatchObject({ state: 'cancelled', safetyFinding: 'Safety violation: .git changed' });
+    expect(store.getTask(identity).status).toBe('needs human');
+    // Nothing more can be recorded once settled, and nothing new is admitted from needs human.
+    expect(store.recordSafetyFinding(identity, attempt.id, 'too late')).toBe(false);
+    expect(() => admit(store)).toThrow(/needs human/);
+  });
+
+  it('lets a pending cancel close the task, and leaves an attempt without a finding alone', () => {
+    const cancelled = queued(); const one = admit(cancelled.store); cancelled.store.markRunning(identity, one.id);
+    cancelled.store.recordSafetyFinding(identity, one.id, 'Safety violation: x');
+    cancelled.store.cancelTask(identity, cancelled.store.getTask(identity).stateVersion, randomUUID());
+    settle(cancelled.store, one.id, { exitCode: 1, valid: false });
+    expect(cancelled.store.getTask(identity).status).toBe('cancelled');
+    const clean = queued(); const two = admit(clean.store); clean.store.markRunning(identity, two.id);
+    settle(clean.store, two.id, { exitCode: 1, valid: false });
+    expect(clean.store.getTask(identity).status).toBe('running');
+    expect(clean.store.getAttempt(identity, two.id).safetyFinding).toBeNull();
+  });
+
+  it('acts on a finding a crash left unsettled, and does not requeue its task', () => {
+    const { store } = queued(); const attempt = admit(store); store.markRunning(identity, attempt.id);
+    store.recordSafetyFinding(identity, attempt.id, 'Safety violation: link target changed');
+    expect(store.recoverInterrupted(Date.now())).toEqual([expect.objectContaining({ attemptId: attempt.id, requeued: false })]);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempt(identity, attempt.id).safetyFinding).toBe('Safety violation: link target changed');
+  });
+
+  it('adds the finding column to a version 7 database', () => {
+    const { path, store } = queued(); const attempt = admit(store);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
+    const reopened = open(path);
+    expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
+  });
+});
