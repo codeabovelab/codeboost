@@ -5,9 +5,11 @@ import { prepareExecution } from '../core/execution-prompt.ts';
 import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-body.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import type { DeclaredLinkSnapshot } from '../agents/container/changes.ts';
+import { saveDiagnostic } from './diagnostics.ts';
+import { ownerOnlyDirectory } from './runner-repository.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
-import { CLOSED_STATUSES, GuardRefusal, ShuttingDownError, bounded, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { CLOSED_STATUSES, GuardRefusal, HUMAN_GATES, ShuttingDownError, bounded, sameContext, settleWith, type ShutdownCapability } from './lifecycle.ts';
 
 /**
  * F2b: per-item execution and the runner's commit step (design, "How codeboost runs a plan"; plan-format.md, "After
@@ -34,6 +36,11 @@ export interface TaskWorkspace {
     trailers: Readonly<Record<string, string>>; digest: string }, signal: AbortSignal): Promise<string>;
   /** After the terminal write: remove task storage, and drop the commit of an attempt that did not complete. */
   release(workspace: WorkspaceRef): Promise<void>;
+  /**
+   * A stopped attempt's partial output (#87 item 1): the diff of what the agent left against `baseHead`, bounded by D.
+   * Read before the terminal write, while the task storage is still there.
+   */
+  exportPartial?(workspace: WorkspaceRef, input: { baseHead: string }, signal: AbortSignal): Promise<{ diff: Buffer; truncated: boolean }>;
   /** Remove host-side preparation files (the staging clone). Called before the terminal write when D never ran, after it otherwise. */
   cleanupPreparation?(attempt: AttemptRecord): Promise<void>;
 }
@@ -51,13 +58,34 @@ export const SAFETY_VIOLATION = 'Safety violation:';
 /**
  * Safety violations the runner's own audit found, by attempt ID. executionDeps records them and ItemExecutor takes
  * them, so agent output (stderr) can never be mistaken for one, and a violation survives a later stale or stop outcome.
+ * They are durable (#87 item 3): each is saved on its attempt before the terminal write, which then sends the task to
+ * needs human in the same transaction, however the attempt was started; startup recovery does the same for an attempt
+ * a crash interrupted. Only a finding whose save failed is held here, in memory, owed until the executor acts on it.
  */
 export class SafetyFindings {
-  #found = new Map<string, string>();
-  record(attemptId: string, reason: string): void { this.#found.set(attemptId, reason); }
-  /** A finding stays owed until its task has been moved to needs human (or closed); only then is it settled. */
-  get(attemptId: string): string | undefined { return this.#found.get(attemptId); }
-  settle(attemptId: string): void { this.#found.delete(attemptId); }
+  #store: Store; #write: <T>(fn: () => T) => T;
+  #unsaved = new Map<string, string>();
+  /** `capability` is the coordinator's: the save is a settlement write, so it still lands after the write gate closes. */
+  constructor(store: Store, capability?: ShutdownCapability) { this.#store = store; this.#write = settleWith(capability); }
+  #row(attemptId: string): AttemptRecord | undefined {
+    const key = this.#store.attemptOwner(attemptId);
+    return key ? this.#store.getAttempt(findIdentity(this.#store, { id: attemptId } as AttemptRecord), attemptId) : undefined;
+  }
+  record(attemptId: string, reason: string): void {
+    try {
+      const identity = findIdentity(this.#store, { id: attemptId } as AttemptRecord);
+      // False only when the attempt already holds a finding (the first is kept) or is no longer active.
+      if (this.#write(() => this.#store.recordSafetyFinding(identity, attemptId, reason)) || this.#row(attemptId)?.safetyFinding) return;
+    } catch { /* not saved: held here instead */ }
+    this.#unsaved.set(attemptId, reason);
+  }
+  /** The finding still owed: one whose save failed, so nothing but the executor will act on it. */
+  get(attemptId: string): string | undefined { return this.#unsaved.get(attemptId); }
+  /** The attempt's finding, owed or already acted on by the terminal write. */
+  finding(attemptId: string): string | undefined { return this.#unsaved.get(attemptId) ?? this.#row(attemptId)?.safetyFinding ?? undefined; }
+  /** Whether the finding is only in memory: the Store knows nothing of it, so the executor must act on it itself. */
+  unsaved(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
+  settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined }
@@ -67,8 +95,36 @@ interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; l
  * `runnerOwner` is the database's runner token (`Store.runnerOwnerToken`); `workspace` must allocate task storage under it.
  */
 export function executionDeps(store: Store, workspace: TaskWorkspace, launch: AgentLauncher, sources: ExecutionSources, runnerOwner: string,
-  findings: SafetyFindings): RunnerDeps {
+  findings: SafetyFindings, options: { diagnostics?: { directory: string; capBytes?: number }; exportDeadlineMs?: number } = {}): RunnerDeps {
   const identityOf = (attempt: AttemptRecord): PlanIdentity => findIdentity(store, attempt);
+  /**
+   * Inspect what the agent left and audit it against the item: a violation, or an inspection or audit that refuses, is
+   * recorded as a safety finding and thrown as a FinishFailure. Only the stop's own abort comes back as itself.
+   */
+  const audit = async (attempt: AttemptRecord, prepared: PreparedAttempt, signal: AbortSignal) => {
+    const data = prepared.private as Private, identity = identityOf(attempt);
+    const item = store.getPlan(identity, attempt.context.planRevision).items.find(entry => entry.id === attempt.item)!;
+    const violation = (reason: string): never => {
+      const text = bounded(`${SAFETY_VIOLATION} ${reason}`);
+      findings.record(attempt.id, text);
+      throw new FinishFailure(text);
+    };
+    let manifest: ChangeManifest & { digest: string };
+    try { manifest = await workspace.inspectChanges(data.workspace, { baseHead: data.baseHead, linkSnapshot: data.linkSnapshot! }, signal); }
+    catch (error) {
+      // Only the stop's own abort error is the stop. Any other refusal is a finding, even if a stop is also pending.
+      if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
+      // Contract (Publishing step 2): an inspection that refuses sends the task to needs human.
+      return violation(`The change inspection refused: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
+    }
+    // The commit step refuses a tree that no longer matches this digest; without one that guard has nothing to check.
+    if (typeof manifest?.digest !== 'string' || !manifest.digest) return violation('The change report has no digest.');
+    let outcome: ReturnType<typeof auditRun>;
+    try { outcome = auditRun(item, manifest, sources.planContext(identity).pathKey); }
+    catch (error) { return violation(`The change report could not be audited: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
+    if (outcome.kind === 'violation') return violation(outcome.violations.join(' '));
+    return { manifest, outcome };
+  };
   return {
     runnerOwner,
     async prepare(attempt, signal) {
@@ -87,6 +143,15 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const prepared = { clone: ws.clone, vendor, approvedArgv: request.approvedArgv, private: data };
       try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredPaths, signal); }
       catch (error) { throw new PreparationFailure(error, prepared); }
+      // A declared link whose way, or target, goes through another link is never launched (plan-format.md: a target never
+      // goes through another link): a write through it would land somewhere its snapshot does not watch. It is a safety
+      // finding, so the task goes to a person rather than retrying.
+      const through = data.linkSnapshot.links.filter(link => link.status === 'through-link').map(link => JSON.stringify(link.link));
+      if (through.length) {
+        const text = bounded(`${SAFETY_VIOLATION} A declared link goes through another link, so a write through it would land outside its target: ${through.slice(0, 5).join(', ')}${through.length > 5 ? ` and ${through.length - 5} more` : ''}.`);
+        findings.record(attempt.id, text);
+        throw new PreparationFailure(new Error(text), prepared);
+      }
       return prepared;
     },
     // Host-side files only (the staging clone); task storage waits for release.
@@ -96,25 +161,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
     async finish(attempt, _result, prepared, signal) {
       const data = prepared.private as Private, identity = identityOf(attempt);
       const plan = store.getPlan(identity, attempt.context.planRevision), item = plan.items.find(entry => entry.id === attempt.item)!;
-      const violation = (reason: string): never => {
-        const text = bounded(`${SAFETY_VIOLATION} ${reason}`);
-        findings.record(attempt.id, text);
-        throw new FinishFailure(text);
-      };
-      let manifest: ChangeManifest & { digest: string };
-      try { manifest = await workspace.inspectChanges(data.workspace, { baseHead: data.baseHead, linkSnapshot: data.linkSnapshot! }, signal); }
-      catch (error) {
-        // Only the stop's own abort error is the stop. Any other refusal is a finding, even if a stop is also pending.
-        if (signal.aborted && (error === signal.reason || (error instanceof Error && error.name === 'AbortError'))) throw error;
-        // Contract (Publishing step 2): an inspection that refuses sends the task to needs human.
-        return violation(`The change inspection refused: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`);
-      }
-      // The commit step refuses a tree that no longer matches this digest; without one that guard has nothing to check.
-      if (typeof manifest?.digest !== 'string' || !manifest.digest) return violation('The change report has no digest.');
-      let outcome: ReturnType<typeof auditRun>;
-      try { outcome = auditRun(item, manifest, sources.planContext(identity).pathKey); }
-      catch (error) { return violation(`The change report could not be audited: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
-      if (outcome.kind === 'violation') return violation(outcome.violations.join(' '));
+      const { manifest, outcome } = await audit(attempt, prepared, signal);
       if (outcome.unchanged) return { value: { head: data.baseHead, unchanged: true, inScope: [], outOfScope: [] } satisfies ExecutionResult };
       // Last check before the commit, after the last await: a stop, shutdown or context change makes nothing.
       if (signal.aborted) throw signal.reason;
@@ -142,6 +189,28 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         history: { base: snapshot.base, head, entries: [{ sha: head, owner: item.id, origin: 'owned', sourceSha: null }] },
       };
     },
+    // The partial output of an attempt that did not complete (#87 item 1), saved where the attempt row will reference it.
+    // It has its own deadline: a stop must not cut it short, and nothing waits on it past that.
+    async exportPartial(attempt, prepared) {
+      const data = prepared.private as Private;
+      if (!workspace.exportPartial || !options.diagnostics) return {};
+      const signal = AbortSignal.timeout(options.exportDeadlineMs ?? 60_000);
+      try {
+        const { diff } = await workspace.exportPartial(data.workspace, { baseHead: data.baseHead }, signal);
+        // Only the current user may write where diagnostics are kept.
+        ownerOnlyDirectory(options.diagnostics.directory);
+        return { diagnosticRef: saveDiagnostic(store, options.diagnostics.directory, attempt.id, diff, options.diagnostics.capBytes) };
+      } catch (error) {
+        return { failure: signal.aborted ? 'the export did not finish within its deadline' : (error instanceof Error ? error.message : String(error)) };
+      }
+    },
+    // A failed run's work is audited too (#87 item 2): what it found is saved, so the terminal write sends the task to a
+    // person. Nothing is committed, and the attempt fails whatever this finds.
+    async auditFailed(attempt, prepared, signal) {
+      if ((prepared.private as Private).linkSnapshot === undefined) return;
+      try { await audit(attempt, prepared, signal); }
+      catch (error) { if (!(error instanceof FinishFailure)) throw error; }
+    },
     async release(_attempt, prepared) {
       const data = prepared.private as Private;
       await workspace.release(data.workspace);
@@ -168,11 +237,6 @@ export type ExecutionOutcome =
 const refusal = (error: unknown) => error instanceof GuardRefusal || error instanceof ShuttingDownError;
 /** A write outside settlement: no shutdown capability. */
 const direct = <T>(fn: () => T): T => fn();
-/**
- * Statuses that wait for a person; leaving one needs its own user action (runner-lifecycle.md), so a safety finding is
- * owed there instead. Review statuses are not gates: a finding moves them to needs human, so the task cannot be merged.
- */
-const HUMAN_GATES: readonly string[] = ['needs amendment', 'needs approval', 'possibly already fixed'];
 
 /**
  * Runs a task's plan items in order, one execute attempt each. Stops at the first item that does not complete cleanly:
@@ -253,8 +317,9 @@ export class ItemExecutor {
       }
       await this.#runner.settled(identity);
       const row = this.#store.getAttempt(identity, attempt.id);
-      // Only the runner's own audit records a finding; it wins over any later stale or stop outcome.
-      const violation = this.#findings.get(attempt.id);
+      // Only the runner's own audit records a finding; it wins over any later stale or stop outcome. The terminal write
+      // has usually acted on it already, so this reads it whether or not it is still owed.
+      const violation = this.#findings.finding(attempt.id);
       if (violation) return this.#escalate(identity, row, violation, stopped, done);
       if (row.state !== 'completed') {
         // Still pending or running: the terminal write failed and the slot is held until restart.
@@ -286,6 +351,12 @@ export class ItemExecutor {
     if (row.state === 'pending' || row.state === 'running') {
       const unresolved = this.#runner.status(identity).unresolved;
       return stopped(item, owed ? 'not started' : row.state, `${violation} ${unresolved ? NEEDS_RESTART[unresolved.reason] : 'Needs restart: the attempt\'s outcome could not be saved.'}`);
+    }
+    // A saved finding: the terminal write acted on it, so the task went to needs human then (or was closed by a pending
+    // cancel), and where it is now is a person's doing.
+    if (!this.#findings.unsaved(row.id)) {
+      return CLOSED_STATUSES.includes(task.status) ? stopped(item, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`)
+        : { kind: 'needs human', item, reason: violation, completed: [...done] };
     }
     if (CLOSED_STATUSES.includes(task.status)) {
       this.#findings.settle(row.id);

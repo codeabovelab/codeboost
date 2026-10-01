@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
@@ -29,7 +29,15 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest & { di
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
   commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
   inspect?: (item: string, signal: AbortSignal) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean;
-  plan?: Plan; commitHead?: string; pathKeyError?: Error; materializeError?: Error } = {}) {
+  plan?: Plan; commitHead?: string; pathKeyError?: Error; materializeError?: Error;
+  /** The durable save of a safety finding fails, so the executor must act on it from memory. */
+  findingSaveError?: boolean;
+  /** The workspace's partial-output export: bytes, or an error. */
+  partial?: Buffer | Error | 'hang'; diagnosticsCap?: number; exportDeadlineMs?: number;
+  /** Called by the fake launcher once the agent has started, before its result settles. */
+  onLaunch?: (attemptId: string) => void;
+  /** The fake agent's result names this attempt instead. */
+  foreignResult?: boolean } = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
@@ -39,7 +47,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const itemOf = (ws: WorkspaceRef) => (ws.storage as { item: string }).item;
   const workspace: TaskWorkspace = {
     async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); if (options.materializeError) throw options.materializeError; return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
-    async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws) } as never; },
+    async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws), links: [], targets: {} } as never; },
     async inspectChanges(ws, input, signal) {
       log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws), signal);
       return options.manifests?.[itemOf(ws)] ?? manifest([change(itemOf(ws) === 'P1' ? 'a.ts' : 'b.ts')]);
@@ -49,6 +57,13 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
       const head = options.commitHead ?? oid(next++); commits.push({ item: itemOf(ws), baseHead: input.baseHead, linkSnapshot: input.linkSnapshot, trailers: { ...input.trailers }, digest: input.digest, message: input.message });
       log.push(`commit ${itemOf(ws)} -> ${head.slice(-3)}`); return head;
     },
+    ...options.partial ? { async exportPartial(ws: WorkspaceRef, _input: unknown, signal: AbortSignal) {
+      log.push(`export ${itemOf(ws)}`);
+      if (options.partial instanceof Error) throw options.partial;
+      // Like D's export: it stops when its signal aborts.
+      if (options.partial === 'hang') return new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true }));
+      return { diff: options.partial!, truncated: false };
+    } } : {},
     async release(ws) {
       const attemptId = (ws.storage as { attemptId: string }).attemptId;
       log.push(`release ${itemOf(ws)} after ${store.getAttempt(identity, attemptId).state}`);
@@ -58,13 +73,16 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const auditContext: PlanContext = options.pathKeyError ? { ...context, pathKey: () => { throw options.pathKeyError; } } : context;
   const sources: ExecutionSources = { planContext: () => auditContext, issue: () => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] }), lessons: () => [], vendor: () => 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
-  const findings = new SafetyFindings(), capability = options.capability?.(store);
+  const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+  if (options.findingSaveError) store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
   const deps = executionDeps(store, workspace, (input, prompt, ws) => {
     if (options.startError) throw options.startError;
     log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
-    return { attemptId: input.attemptId, settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }), cancel: () => undefined };
-  }, sources, RUNNER_OWNER, findings);
+    const settled = Promise.resolve().then(() => options.onLaunch?.(input.attemptId)).then(() => ({ attemptId: options.foreignResult ? randomUUID() : input.attemptId,
+      context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }));
+    return { attemptId: input.attemptId, settled, cancel: () => undefined };
+  }, sources, RUNNER_OWNER, findings, { diagnostics: { directory: join(dir, 'diagnostics'), capBytes: options.diagnosticsCap }, exportDeadlineMs: options.exportDeadlineMs });
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
   return { store, path, workspace, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
@@ -76,8 +94,8 @@ describe('item execution', () => {
     expect(await executor.runTask(identity)).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
     // Each commit gets the link snapshot its own item took before launch.
     expect(commits.map(c => [c.item, c.baseHead.slice(-3), c.trailers, c.linkSnapshot, c.message])).toEqual([
-      ['P1', '002', { 'Plan-Item': 'P1', 'Plan-Revision': 'r1' }, { item: 'P1' }, 'P1: First'],
-      ['P2', '064', { 'Plan-Item': 'P2', 'Plan-Revision': 'r1' }, { item: 'P2' }, 'P2: Second']]);
+      ['P1', '002', { 'Plan-Item': 'P1', 'Plan-Revision': 'r1' }, { item: 'P1', links: [], targets: {} }, 'P1: First'],
+      ['P2', '064', { 'Plan-Item': 'P2', 'Plan-Revision': 'r1' }, { item: 'P2', links: [], targets: {} }, 'P2: Second']]);
     expect(store.getLedger(identity)).toEqual(expect.arrayContaining([
       { sha: oid(100), owner: 'P1', origin: 'owned', sourceSha: null }, { sha: oid(101), owner: 'P2', origin: 'owned', sourceSha: null }]));
     expect(store.getSnapshot(identity).head).toBe(oid(101));
@@ -114,11 +132,55 @@ describe('item execution', () => {
     expect(store.getLedger(identity).some(entry => entry.owner === 'P1')).toBe(false);
     expect(log).toContain('release P1 after failed');
   });
-  it('stops on an agent failure without inspecting or committing', async () => {
-    const { store, executor, log } = setup({ exit: { P1: { exitCode: 1, stderr: 'agent crashed' } } });
+  it('stops on an agent failure: what it left is inspected, never committed', async () => {
+    const { store, executor, log, commits } = setup({ exit: { P1: { exitCode: 1, stderr: 'agent crashed' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: '"agent crashed"' });
-    expect(log.some(line => line.startsWith('inspect'))).toBe(false);
+    expect(log.some(line => line.startsWith('inspect P1'))).toBe(true);
+    expect(commits).toEqual([]);
     expect(store.getSnapshot(identity).head).toBe(oid(2));
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('sends a failed run that left a safety violation to a person, so it is not retried (#87 item 2)', async () => {
+    for (const exit of [{ exitCode: 1, stderr: 'agent crashed' }, { exitCode: null, stopReason: 'timeout' as const }]) {
+      const { store, executor, commits } = setup({ exit: { P1: exit }, manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
+      expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: expect.stringContaining('Git metadata') });
+      expect(commits).toEqual([]);
+      expect(store.getTask(identity).status).toBe('needs human');
+      expect(store.getAttempts(identity)[0]).toMatchObject({ state: 'failed', safetyFinding: expect.stringContaining(SAFETY_VIOLATION) });
+    }
+    // An inspection that refuses on a failed run is a finding too.
+    const refused = setup({ exit: { P1: { exitCode: 1 } }, inspect: async () => { throw new Error('docker run failed (exit 6): could not read x'); } });
+    expect(await refused.executor.runTask(identity)).toMatchObject({ kind: 'needs human', reason: expect.stringContaining('The change inspection refused') });
+  });
+  it('audits a clean run once: a failed finish is not inspected again', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.log.filter(line => line.startsWith('inspect'))).toHaveLength(1);
+    const refused = setup({ commit: async () => { throw new Error('work tree changed after the audit'); } });
+    await refused.executor.runTask(identity);
+    expect(refused.log.filter(line => line.startsWith('inspect'))).toHaveLength(1);
+  });
+  it('does not audit a run a person stopped while it ran', async () => {
+    let runner!: RunnerCoordinator;
+    const h = setup({ exit: { P1: { exitCode: 1 } }, manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      onLaunch: attemptId => runner.stop(identity, attemptId, 'cancelled') });
+    runner = h.runner;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
+    expect(h.log.some(line => line.startsWith('start P1'))).toBe(true);
+    expect(h.log.some(line => line.startsWith('inspect'))).toBe(false);
+    expect(h.store.getTask(identity).status).not.toBe('needs human');
+  });
+  it('audits and keeps what a run left when its result is not this attempt\'s', async () => {
+    const h = setup({ foreignResult: true, manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, partial: Buffer.from('d') });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.store.getAttempts(identity)[0]).toMatchObject({ state: 'failed', diagnosticRef: expect.stringMatching(/\.diff$/) });
+  });
+  it('gives up on an export at its own deadline and settles with that reason', async () => {
+    const h = setup({ exit: { P1: { exitCode: 1, stderr: 'crashed' } }, partial: 'hang', exportDeadlineMs: 50 });
+    const began = performance.now();
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'failed' });
+    expect(performance.now() - began).toBeLessThan(10_000);
+    expect(h.store.getAttempts(identity)[0]!.diagnostic).toBe('"crashed" Partial output could not be exported: "the export did not finish within its deadline"');
   });
   it('records no ledger entry when the commit is refused', async () => {
     const { store, executor } = setup({ commit: async () => { throw new Error('work tree changed after the audit'); } });
@@ -146,9 +208,11 @@ describe('item execution', () => {
     expect(runner.status(identity).unresolved).toMatchObject({ reason: 'result-not-saved' });
   });
   it('releases task storage after the terminal write when D settles with another attempt\'s result', async () => {
-    const { store, executor, log } = setup({ exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
+    const { store, executor, log, commits } = setup({ exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed' });
-    expect(log.some(line => line.startsWith('inspect'))).toBe(false);
+    // What the run left is audited, but a result that is not this attempt's is never committed.
+    expect(log.some(line => line.startsWith('inspect P1'))).toBe(true);
+    expect(commits).toEqual([]);
     expect(log).toContain('release P1 after failed');
     expect(store.getSnapshot(identity).head).toBe(oid(2));
   });
@@ -339,17 +403,38 @@ describe('item execution', () => {
     store = scoped.store;
     expect(await scoped.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs approval');
-    const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toApproval });
+    // A finding the executor holds in memory (its save failed) waits at the gate and is escalated once it is left.
+    const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toApproval, findingSaveError: true });
     store = unsafe.store;
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/needs approval; it moves to needs human when it next runs/) });
     expect(store.getTask(identity).status).toBe('needs approval');
-    // Still at the gate on the next run: the finding stays owed, reported as not started.
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/needs approval; it moves to needs human/) });
-    // A person releases the gate; the owed finding goes to needs human before any item runs again.
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
     expect(store.getAttempts(identity)).toHaveLength(1);
+  });
+  it('never launches an item with a declared link that goes through another link, and sends the task to a person', async () => {
+    const h = setup();
+    h.workspace.snapshotDeclaredLinks = async () => ({ links: [{ link: 'a.ts', status: 'through-link' as const, anchor: { path: 'via', type: 'symlink' as const,
+      mode: '120777', size: 1, ino: 1, ctime: '0', mtime: '0' } }], targets: {} });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
+      reason: expect.stringContaining('A declared link goes through another link, so a write through it would land outside its target: "a.ts"') });
+    expect(h.log.some(line => line.startsWith('start '))).toBe(false);
+    expect(h.store.getTask(identity).status).toBe('needs human');
+    // The storage preparation allocated is still released after the terminal write.
+    expect(h.log.some(line => line.startsWith('release P1 after failed'))).toBe(true);
+  });
+  it('acts on a saved finding at the terminal write, before release can set a gate (#87)', async () => {
+    let store!: Store, atRelease: string | undefined;
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+      release: async () => { atRelease = store.getTask(identity).status; store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
+    store = h.store;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: expect.stringContaining(SAFETY_VIOLATION) });
+    // Already needs human when release ran, and nothing left owed: the gate after it is a person's doing.
+    expect(atRelease).toBe('needs human');
+    const row = store.getAttempts(identity)[0]!;
+    expect(row).toMatchObject({ state: 'failed', safetyFinding: expect.stringContaining('Git metadata') });
   });
   it('treats an audit that throws as a safety violation', async () => {
     const { store, executor, commits } = setup({ pathKeyError: new Error('Non-ASCII case-insensitive paths require an adapter.') });
@@ -431,7 +516,7 @@ describe('item execution', () => {
     store = scoped.store;
     expect(await scoped.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1' });
     expect(store.getTask(identity).status).toBe('queued');
-    const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: toQueued });
+    const unsafe = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true, release: toQueued });
     store = unsafe.store;
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
@@ -446,7 +531,7 @@ describe('item execution', () => {
   });
   it('leaves a safety violation\'s task alone when it was cancelled during release', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
       release: async () => { store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID()); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/is cancelled, so it was not moved/) });
@@ -499,7 +584,7 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('cancelled');
   });
   it('keeps a safety finding owed when moving to needs human fails, and escalates it before the next run launches anything', async () => {
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true });
     const transition = h.store.transitionTask.bind(h.store);
     let fail = true;
     h.store.transitionTask = (...args) => { if (fail && args[2] === 'needs human') { fail = false; throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); } return transition(...args); };
@@ -528,7 +613,7 @@ describe('item execution', () => {
   });
   it('escalates a safety violation over a review status, so the task cannot be merged past it', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review'); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
@@ -549,7 +634,7 @@ describe('item execution', () => {
   });
   it('keeps a finding owed when a merge in progress refuses the escalation, and escalates it on the next run', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true, release: async () => {
       store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
       const snapshot = store.getSnapshot(identity);
       store.beginMergeAttempt(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, snapshot.head, null, 'direct');
@@ -572,7 +657,7 @@ describe('item execution', () => {
   });
   it('settles an owed finding when the task was closed before its next run', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
     store = h.store;
     await h.executor.runTask(identity);
@@ -635,7 +720,7 @@ describe('item execution', () => {
   });
   it('keeps possibly already fixed as a human gate for a safety finding', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'possibly already fixed'); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/possibly already fixed; it moves to needs human/) });
@@ -703,7 +788,7 @@ describe('item execution', () => {
   });
   it('keeps needs amendment as a human gate for a safety finding', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs amendment'); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/needs amendment; it moves to needs human/) });
@@ -760,7 +845,7 @@ describe('item execution', () => {
   });
   it('does not pay an owed finding through the shutdown capability once the write gate has closed', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, capability: s => s.shutdownCapability(),
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true, capability: s => s.shutdownCapability(),
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
     store = h.store;
     await h.executor.runTask(identity);
@@ -786,8 +871,9 @@ describe('item execution', () => {
     const outcome = await h.executor.runTask(identity) as { kind: string; reason: string };
     expect(outcome.kind).toBe('stopped');
     expect(outcome.reason).toMatch(/Needs restart: the last result could not be saved\./);
-    expect(h.findings.get(h.store.getAttempts(identity)[0]!.id)).toBeDefined();
-    // The next run finds it owed, reports it for the earlier item, and starts nothing.
+    // Saved on the still-active attempt: startup recovery acts on it, whatever this process does next.
+    expect(h.store.getAttempts(identity)[0]).toMatchObject({ state: 'running', safetyFinding: expect.stringContaining('Git metadata') });
+    // The next run reports the held slot for the earlier item, and starts nothing.
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/Needs restart/) });
   });
   it('ends as the stop, not a refused commit, when a stop lands and the commit then rejects', async () => {
@@ -858,7 +944,7 @@ describe('item execution', () => {
   });
   it('pays nothing owed once shutdown began', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
       release: async () => { store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval'); } });
     store = h.store;
     await h.executor.runTask(identity);
@@ -896,23 +982,45 @@ describe('item execution', () => {
     expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P2', completed: ['P1', 'P2'] });
     expect(h.store.getCheckpoint(identity, outcome.checkpointId)).toMatchObject({ item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['extra.ts'] });
   });
-  it('escalates an older owed finding even when a later attempt completed cleanly', async () => {
+  it('acts on a finding of an attempt started outside the executor, and admits nothing after it (#87 item 4)', async () => {
     const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) } });
     const store = h.store;
-    // Both attempts start outside the executor, so nothing acts on P1's finding yet.
+    // Started through the coordinator directly, as /api/runner start or retry would.
     h.runner.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P1', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
     await h.runner.settled(identity);
-    h.runner.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P2', expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
-    await h.runner.settled(identity);
-    expect(store.getAttempts(identity).map(row => row.state)).toEqual(['failed', 'completed']);
-    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
-    expect(store.getAttempts(identity)).toHaveLength(2);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)[0]).toMatchObject({ state: 'failed', safetyFinding: expect.stringContaining(SAFETY_VIOLATION) });
+    expect(() => h.runner.start(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: 'P2',
+      expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 })).toThrow(/needs human/);
+    expect(store.getAttempts(identity)).toHaveLength(1);
   });
   it('throws, rather than reporting stopped, when this run\'s own escalation meets a closed write gate without a capability', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, release: async () => { store.closeWrites(); } });
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true, release: async () => { store.closeWrites(); } });
     store = h.store;
     await expect(h.executor.runTask(identity)).rejects.toBeInstanceOf(ShuttingDownError);
     expect(h.findings.get(store.getAttempts(identity)[0]!.id)).toBeDefined();
+  });
+  it('keeps the partial output of an attempt that did not complete, referenced from its row (#87 item 1)', async () => {
+    const failed = setup({ exit: { P1: { exitCode: 1, stderr: 'crashed' } }, partial: Buffer.from('diff --git a/a.ts b/a.ts\n') });
+    await failed.executor.runTask(identity);
+    const row = failed.store.getAttempts(identity)[0]!;
+    expect(row.diagnosticRef).toMatch(new RegExp(`diagnostics/${row.id}\\.diff$`));
+    expect(readFileSync(row.diagnosticRef!, 'utf8')).toBe('diff --git a/a.ts b/a.ts\n');
+    expect((statSync(row.diagnosticRef!).mode & 0o777)).toBe(0o600);
+    // Exported before the terminal write and before storage is released.
+    expect(failed.log.indexOf('export P1')).toBeLessThan(failed.log.findIndex(line => line.startsWith('release P1')));
+    // A completed attempt's work is in its commit: nothing is exported.
+    const completed = setup({ partial: Buffer.from('x') });
+    await completed.executor.runTask(identity);
+    expect(completed.log.some(line => line.startsWith('export'))).toBe(false);
+    expect(completed.store.getAttempts(identity).every(attempt => attempt.diagnosticRef === null)).toBe(true);
+  });
+  it('records why partial output could not be exported, quoting the reason, and still settles', async () => {
+    const h = setup({ exit: { P1: { exitCode: 1, stderr: 'crashed' } }, partial: new Error('the metadata changed\nRunner job forged') });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'failed' });
+    const row = h.store.getAttempts(identity)[0]!;
+    expect(row.diagnosticRef).toBeNull();
+    expect(row.diagnostic).toBe('"crashed" Partial output could not be exported: "the metadata changed\\nRunner job forged"');
   });
 });
