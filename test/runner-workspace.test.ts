@@ -50,7 +50,7 @@ async function setup(agent: Record<string, string>) {
     committer: { name: 'codeboost', email: 'runner@codeboost.invalid' }, now: () => 1_700_000_000_000 });
   const sources: ExecutionSources = { planContext: () => context, issue: () => ({ number: 1, title: 'Issue', body: 'Fix', comments: [] }),
     lessons: () => [], vendor: () => 'claude' };
-  const findings = new SafetyFindings();
+  const findings = new SafetyFindings(store);
   // The agent: a container that edits the work volume, mounted as an agent container mounts it (metadata read-only).
   const deps = executionDeps(store, workspace, (input, _prompt, ws) => {
     const { workVolume, metadataVolume } = (ws.storage as { filesystems: TaskFilesystems }).filesystems;
@@ -118,5 +118,24 @@ describe('real task workspace (#87)', () => {
     expect(s.store.getSnapshot(identity).head).toBe(s.head);
     expect(leftovers(s.store)).toEqual([]);
     expect(existsSync(join(s.runnerRoot, RUNNER_OWNER, 'attempts', s.store.getAttempts(identity)[0]!.id))).toBe(false);
+  }, 600_000);
+
+  it('keeps a scope pause approvable after the review loads it from the runner-owned repository', async () => {
+    const s = await setup({ P1: 'printf "a2\\n" > a.ts && printf "extra\\n" > extra.ts' });
+    const outcome = await s.executor.runTask(identity) as { kind: string; checkpointId: string };
+    expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
+    const checkpoint = s.store.getCheckpoint(identity, outcome.checkpointId);
+    // The review load reads the runner commit at the recorded head: it does not replace the checkpoint's snapshot.
+    const review = new ReviewService({ database: join(s.root, 'state.sqlite'), repository: s.source, runnerRepository: s.repository.path,
+      identity, pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
+    try { expect(review.load().snapshot.id).toBe(checkpoint.snapshotId); } finally { review.close(); }
+    // A person amends the plan to declare the extra file, then approves continuing from the audited checkpoint.
+    const amended = { ...plan, items: [{ ...plan.items[0]!, files: [...plan.items[0]!.files, { path: 'extra.ts', kind: 'add' as const, renamed_from: null, change: 'z' }] }, plan.items[1]!] };
+    s.store.importRevision(JSON.stringify(amended), 'json', { identity, issue: 1, pathKey: p => p, allowedCommands: [],
+      baseEntries: [{ path: 'a.ts', kind: 'file' }, { path: 'b.ts', kind: 'file' }] }, 1);
+    const revision = s.store.getPlan(identity).revision;
+    expect(() => s.store.approveContinuation(identity, outcome.checkpointId, { revision, snapshotId: checkpoint.snapshotId,
+      reviewVersion: s.store.reviewVersion(identity) })).not.toThrow();
+    expect(s.store.continuationRevision(identity, outcome.checkpointId)).toBe(revision);
   }, 600_000);
 });

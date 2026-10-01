@@ -11,6 +11,11 @@ export type TaskStatus = 'queued' | 'running' | 'needs human' | 'needs amendment
 export const TASK_STATUSES: readonly TaskStatus[] = ['queued', 'running', 'needs human', 'needs amendment', 'needs approval',
   'possibly already fixed', 'in review', 'approved but merge blocked', 'merged', 'cancelled'];
 export const CLOSED_STATUSES: readonly TaskStatus[] = ['merged', 'cancelled'];
+/**
+ * Statuses that wait for a person; leaving one needs its own user action (runner-lifecycle.md), so a safety finding is
+ * owed there instead. Review statuses are not gates: a finding moves them to needs human, so the task cannot be merged.
+ */
+export const HUMAN_GATES: readonly TaskStatus[] = ['needs amendment', 'needs approval', 'possibly already fixed'];
 /** A merge starts only from review; every other status is closed, running, queued or waiting for a person. */
 export const MERGEABLE_STATUSES: readonly TaskStatus[] = ['in review', 'approved but merge blocked'];
 export const TERMINAL_STATES: readonly AttemptState[] = ['completed', 'failed', 'cancelled', 'stale'];

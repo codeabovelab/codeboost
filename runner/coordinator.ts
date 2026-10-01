@@ -49,6 +49,18 @@ export interface RunnerDeps {
    * saved with `completed` in one transaction. Throw FinishFailure with an actionable diagnostic to fail the attempt.
    */
   finish?(attempt: AttemptRecord, result: InvocationResult, prepared: PreparedAttempt, signal: AbortSignal): Promise<{ value: unknown; history?: HistoryRecord }>;
+  /**
+   * Optional, for writable attempts whose agent ended badly on its own (a non-zero exit or a D stop reason, with no first
+   * reason): check what it left before the terminal write, recording any safety finding durably, so a failed run that
+   * did something unsafe goes to a person instead of being retried (#87 item 2). It commits nothing and never throws
+   * past its own failures: the attempt fails either way.
+   */
+  auditFailed?(attempt: AttemptRecord, result: InvocationResult, prepared: PreparedAttempt, signal: AbortSignal): Promise<void>;
+  /**
+   * Optional, for writable attempts that did not complete: save their partial output before the terminal write, which
+   * stores the reference (`diagnostic_ref`). It bounds itself and reports a failure instead of throwing.
+   */
+  exportPartial?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<{ diagnosticRef?: string; failure?: string }>;
   /** Optional: remove task storage after the terminal write and before the slot is freed. A failure keeps the slot under a marker. */
   release?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void>;
   now?(): number;
@@ -333,10 +345,24 @@ export class RunnerCoordinator {
           else value = this.#deps.validate(attempt, result);
           valid = true;
         } catch (error) { detail = error instanceof FinishFailure ? bounded(error.message) : `Invalid output: ${message(error)}`; }
+      } else if (!job.firstReason && this.#deps.auditFailed) {
+        // What a failed run left is checked too; the attempt fails whatever this finds.
+        try { await this.#deps.auditFailed(attempt, result, prepared, job.controller.signal); }
+        catch (error) { console.error(`Runner job ${job.attemptId} could not audit its failed run: ${JSON.stringify(message(error))}`); }
       }
       // A stale stop keeps its own cause; the agent's stderr is not a reason the attempt went stale.
       if (job.firstReason === 'stale') detail = job.staleCause;
-      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail, history });
+      // What an attempt that did not complete left is kept for diagnosis, referenced from its row by the terminal write.
+      let diagnosticRef: string | undefined;
+      if (!valid && this.#deps.exportPartial) {
+        let exported: { diagnosticRef?: string; failure?: string };
+        try { exported = await this.#deps.exportPartial(attempt, prepared); }
+        catch (error) { exported = { failure: message(error) }; }
+        diagnosticRef = exported.diagnosticRef;
+        // The reason can quote agent-chosen paths: quoted, like the agent's own text.
+        if (exported.failure) detail = bounded(`${detail ?? ''} Partial output could not be exported: ${JSON.stringify(exported.failure)}`.trim());
+      }
+      const saved = this.#settle(job, { stopReason: result.stopReason, exitCode: result.exitCode, signal: result.signal, valid, result: value, detail, history, diagnosticRef });
       job.decided = true;
       // Task storage goes after the terminal write too; a failed removal holds the slot under a marker.
       if (saved) await this.#release(job, attempt, prepared);
@@ -396,7 +422,7 @@ export class RunnerCoordinator {
       if (!this.#markers.has(job.key)) this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'storage-not-removed' });
     }
   }
-  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord }): Classification | undefined {
+  #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord; diagnosticRef?: string }): Classification | undefined {
     try {
       return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason }));
     } catch {

@@ -230,6 +230,19 @@ codeboost never writes the user's repository. The commits it makes live in a **r
 | Review | Once a task has runner commits (a completed execute or fix attempt that made a commit), the review screen and Ask read it from the runner-owned repository at the head the Store recorded. The user's HEAD is no longer observed for it: runner commits move the head only through the Store, with their ledger entries, and observing the user's older HEAD would roll the task back. A task without runner commits still observes the user's HEAD, owned ledger entries or not: a reviewed branch in the user's repository (the demo, a planted experiment) carries them too. |
 
 
+## Safety findings and partial output (#87 part 2)
+
+| What | How it works |
+|---|---|
+| A safety finding | The runner's own audit records it on the attempt (`recordSafetyFinding`), through the shutdown capability, before the terminal write. The terminal write then sends the task to needs human in the same transaction, whatever outcome wins: a stop or a stale context does not undo what the agent did. A pending cancel still closes the task. A task cannot change status while it has an active attempt, so no human gate can hold the finding back. The text stays on the row (`safetyFinding`). |
+| A finding a crash left | Startup recovery acts on it the same way, and does not requeue the task. |
+| Who started the attempt | It does not matter: the Store acts on the finding, so an attempt started through `/api/runner` start or retry goes to needs human too, and admission refuses new work from needs human. |
+| A finding whose save failed | Held in memory (`SafetyFindings`) and acted on by `ItemExecutor`, as before: owed at a human gate until the task leaves it. |
+| A failed run | When the agent ends badly on its own (a non-zero exit or a D stop reason, with no first reason), `auditFailed` inspects and audits what it left before the terminal write. A violation, or an inspection that refuses, is a finding. Nothing is committed. A run a person stopped, that went stale, hit the time limit or was shut down is not audited. |
+| A `through-link` declared link | Never launched: preparation records a finding and fails, so the task goes to needs human. |
+| Partial output | For a writable attempt that did not complete, `exportPartial` saves D's bounded diff (`exportTaskDiff`, 60 s deadline, never cut short by a stop) as `<diagnostics>/<attemptId>.diff`, owner-only, written through an exclusive temporary file. The terminal write stores it as `diagnostic_ref`. A failed export adds "Partial output could not be exported: <reason>" (quoted) to the diagnostic instead. |
+| Retention | Over the cap (256 MiB by default), unreferenced files go first, oldest first. Then the oldest referenced file: its row's `diagnostic_ref` is cleared and "(partial output removed by retention)" is appended, in one transaction, and only after that commit is the file deleted. No row ever points at a missing file. |
+
 ## Shutdown
 
 `web/server.ts` `close()` and the runner coordinator follow this order. Part of step 1 and all of steps 2 and 3 already exist. F1 adds the coordinator barrier in step 1, steps 4 and 5, and step 8.
