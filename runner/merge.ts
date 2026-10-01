@@ -109,7 +109,7 @@ export class MergeCoordinator {
     if (remote.mergeQueue && !queueGateway(this.gateway)) blockers.push({ code: 'merge-queue', message: 'This GitHub adapter cannot verify the merge-queue lifecycle.' });
     if (!remote.atomicBaseGuard) blockers.push({ code: 'base-guard', message: 'GitHub does not expose a server-enforced guard for the validated base.' });
     for (const check of remote.requiredChecks) if (check.state !== 'success') blockers.push({ code: 'check', message: `${check.context} is ${check.state}.` });
-    if (remote.alreadyFixed === 'found') blockers.push({ code: 'already-fixed', message: 'Another open or merged pull request references this issue.' });
+    if (remote.alreadyFixed === 'found') blockers.push({ code: 'already-fixed', message: 'The issue may already be fixed: it is closed, another open or merged pull request links to it, or a new base-branch commit mentions it.' });
     if (remote.alreadyFixed === 'unknown') blockers.push({ code: 'already-fixed', message: 'The already-fixed check could not be completed.' });
 
     let attempt = this.#attempt();
