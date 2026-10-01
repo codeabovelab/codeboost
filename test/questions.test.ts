@@ -5,6 +5,8 @@ import { join } from 'node:path';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { Questions } from '../runner/questions.ts';
+import { CODEX_QUESTIONS_REFUSED } from '../runner/question-container.ts';
+import { LeftoverLedger } from '../runner/question-leftovers.ts';
 import { choiceKeys } from '../core/approvals.ts';
 // Real-Git context reads can overlap the Docker-backed isolation suite in a full run.
 vi.setConfig({testTimeout:30000});
@@ -42,7 +44,7 @@ it('prevents duplicate invocations and records interruption when the server stop
  expect(service.store.getReviewNotes(service.config.identity)[0]!.answer?.error).toMatch(/Server stopped/);
 });
 it('persists provider selection and rejects anything but a known provider',()=>{
- const service=fixture();expect(service.store.questionProvider()).toBeNull();service.store.setQuestionProvider('codex');const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.store.questionProvider()).toBe('codex');expect(()=>service.store.setQuestionProvider('sh -c anything')).toThrow(/Choose/);
+ const service=fixture();expect(service.store.questionProvider()).toBeNull();service.store.setQuestionProvider('claude');const reopened=new ReviewService(service.config);services.push(reopened);expect(reopened.store.questionProvider()).toBe('claude');expect(()=>service.store.setQuestionProvider('codex')).toThrow(/Codex cannot answer questions/);expect(reopened.store.questionProvider()).toBe('claude');expect(()=>service.store.setQuestionProvider('sh -c anything')).toThrow(/Choose/);
 });
 it('times out an unresponsive agent and allows expired pending attempts to be recovered',async()=>{
  const service=fixture(),asked=question(service);const manager=new Questions(service,waitForAbort);managers.push(manager);
@@ -117,4 +119,19 @@ it('refuses new questions once admission has stopped, before close() runs',()=>{
  expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toBeUndefined();
  manager.markStopped(asked.createdNoteId!,service.load());
  expect(service.store.getReviewNotes(service.config.identity).find(note=>note.id===asked.createdNoteId)?.answer).toMatchObject({status:'failed',error:'Server stopped. Retry the question.'});
+});
+it('refuses a review database that already names Codex, recording a failed answer and starting no agent',async()=>{
+ const service=fixture();
+ // Before #75 the Store accepted Codex; write the old value directly, as such a database holds it.
+ const { DatabaseSync } = await import('node:sqlite');
+ const db=new DatabaseSync(service.config.database);
+ try { db.prepare("INSERT INTO app_settings VALUES ('question_provider','codex') ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(); }
+ finally { db.close(); }
+ expect(service.store.questionProvider()).toBe('codex');
+ // The review lock is taken before any worker, scan or Docker work, so an untaken lock means none of it started.
+ const acquire=vi.spyOn(LeftoverLedger.prototype,'acquire');
+ const asked=question(service);const manager=new Questions(service);managers.push(manager);manager.start(asked.createdNoteId!,asked);
+ await vi.waitFor(()=>expect(service.store.getReviewNotes(service.config.identity).at(-1)?.answer?.status).toBe('failed'));
+ expect(service.store.getReviewNotes(service.config.identity).at(-1)?.answer?.error).toBe(CODEX_QUESTIONS_REFUSED);
+ expect(acquire).not.toHaveBeenCalled();
 });

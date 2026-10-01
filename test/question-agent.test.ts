@@ -6,7 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, credentialEnvironment, measureGitRepository, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
+import { askInContainer, CODEX_QUESTIONS_REFUSED, credentialEnvironment, measureGitRepository, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
@@ -43,7 +43,7 @@ function fakeDeps(result: Partial<InvocationResult> = {}, env: Record<string, st
     removeFilesystems: value => { expect(value).toBe(filesystems); events.push('remove'); },
     measureRepository: () => ({ checkoutBytes: 1_024, entries: 3, objectBytes: 2_048 }),
     capture: input => { captured.push(input); return Object.freeze(input); },
-    startClaude: start('claude'), startCodex: start('codex'), env,
+    startClaude: start('claude'), env,
   };
   return { deps, events, captured, started, cancels, settle: (value: Partial<InvocationResult>) => settle({ attemptId: captured[0]!.attemptId,
     context: captured[0]!.context, exitCode: null, signal: null, stdout: '', stderr: '', ...value }) };
@@ -106,15 +106,14 @@ it('refuses to start without a Claude token, before any Docker or Git work', asy
   expect(fake.events).toEqual([]);
 });
 
-it('mounts the Codex auth file from CODEX_HOME and refuses when it is missing', async () => {
+it('refuses Codex before any Docker work, even with a Codex sign-in', async () => {
   const home = mkdtempSync(join(tmpdir(), 'codex-home-')); roots.push(home);
-  const missing = fakeDeps({}, { CODEX_HOME: home });
-  await expect(askInContainer(question({ provider: 'codex' }), missing.deps, new AbortController().signal)).rejects.toThrow('auth.json');
-  expect(missing.events).toEqual([]);
   writeFileSync(join(home, 'auth.json'), '{}');
-  const present = fakeDeps({}, { CODEX_HOME: home });
-  await askInContainer(question({ provider: 'codex' }), present.deps, new AbortController().signal);
-  expect(present.started[0]).toMatchObject({ vendor: 'codex', credential: join(home, 'auth.json') });
+  const fake = fakeDeps({}, { CODEX_HOME: home, CODEBOOST_CODEX_AUTH_FILE: join(home, 'auth.json') });
+  await expect(askInContainer(question({ provider: 'codex' }), fake.deps, new AbortController().signal))
+    .rejects.toThrow(CODEX_QUESTIONS_REFUSED);
+  expect(fake.events).toEqual([]);
+  expect(fake.started).toEqual([]);
 });
 
 it('releases storage when setup fails after allocation, and not before', async () => {
@@ -137,19 +136,20 @@ it('stops before starting the container once the deadline has passed', async () 
 let attempts = 0;
 const scope = () => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
   attemptId: `attempt-${++attempts}`, contextId: 'c'.repeat(64) });
-// The bridge checks sign-in before asking, so the stub needs both credentials (and must not depend on ~/.codex).
-const codexAuth = join(mkdtempSync(join(tmpdir(), 'codex-auth-')), 'auth.json');
-writeFileSync(codexAuth, '{}');
+// The bridge checks sign-in before asking, so the stub needs the Claude credential.
 const stubWorker = () => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), undefined,
-  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token', CODEBOOST_CODEX_AUTH_FILE: codexAuth } });
+  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' } });
 
 it('returns the worker answer and forwards cancellation, settling only when the worker replies', async () => {
   const worker = stubWorker();
   try {
     expect(await worker.agent('claude')('answer', new AbortController().signal, scope(), 60_000)).toBe('claude:answer:n');
+    // A review database that still names Codex is refused before the worker sees the question.
+    await expect(worker.agent('codex')('answer', new AbortController().signal, scope(), 60_000))
+      .rejects.toThrow(CODEX_QUESTIONS_REFUSED);
     const controller = new AbortController();
     let done = false;
-    const pending = worker.agent('codex')('wait', controller.signal, scope(), 60_000).catch((error: Error) => error).finally(() => { done = true; });
+    const pending = worker.agent('claude')('wait', controller.signal, scope(), 60_000).catch((error: Error) => error).finally(() => { done = true; });
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(done).toBe(false);
     controller.abort(new StopError('Agent timed out. Try again.', 'timeout'));
@@ -296,7 +296,7 @@ it('gives the worker an allowlisted environment and passes only the credential v
   const env = { PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', HOME: '/home/me', CLAUDE_CODE_OAUTH_TOKEN: 'secret-1',
     SSH_AUTH_SOCK: '/tmp/agent', AWS_ACCESS_KEY_ID: 'secret-2', DOCKER_CONFIG: '/home/me/.docker', CODEX_HOME: '/home/codex' };
   expect(workerEnvironment(env, '/tmp/codeboost-ask-abc123')).toEqual({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', TMPDIR: '/tmp/codeboost-ask-abc123' });
-  expect(credentialEnvironment(env)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1', CODEX_HOME: '/home/codex', HOME: '/home/me' });
+  expect(credentialEnvironment(env)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1' });
   expect(Object.keys(dockerQueryEnvironment()).sort()).toEqual(['DOCKER_HOST', 'PATH']);
 });
 
@@ -308,7 +308,7 @@ it('starts the real bridge worker with exactly the allowlisted environment', asy
     const seen = JSON.parse(await worker.agent('claude')('env', new AbortController().signal, scope(), 60_000));
     expect(seen.env.filter((name: string) => !['PATH', 'DOCKER_HOST', 'TMPDIR'].includes(name))).toEqual([]);
     expect(seen.env).toContain('TMPDIR');
-    expect(seen.credentials).toEqual(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEBOOST_CODEX_AUTH_FILE']);
+    expect(seen.credentials).toEqual(['CLAUDE_CODE_OAUTH_TOKEN']);
   } finally {
     await worker.close();
     for (const name of ['SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'DOCKER_CONFIG']) if (!(name in saved)) delete process.env[name];

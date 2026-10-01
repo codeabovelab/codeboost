@@ -9,9 +9,9 @@ const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 // The start call returns its handle at once and runs setup inside it (#51 item 2). These run without Docker.
 describe('asynchronous launch', () => {
-  const captured = (attemptId: string) => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
+  const captured = (attemptId: string, vendor: 'codex' | 'claude' = 'codex') => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
     clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-    phase: 'planning', vendor: 'codex', approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId,
+    phase: 'review', vendor, approvedArgv: [], deadline: Date.now() + 10 * 60_000, attemptId,
     context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
   });
   const budget = () => 5 * 60_000;
@@ -120,7 +120,7 @@ describe('asynchronous launch', () => {
   });
 
   it.each(['codex', 'claude'] as const)('refuses an untrusted %s image synchronously, allocating nothing', vendor => {
-    const invocation = captured(`untrusted-image-${vendor}`);
+    const invocation = captured(`untrusted-image-${vendor}`, vendor);
     const request = { invocation, filesystems: {} as never, inputDirectory: '/unused',
       imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() };
     const start = () => vendor === 'codex'

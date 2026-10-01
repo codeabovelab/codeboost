@@ -1,7 +1,7 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
-import { homedir, tmpdir } from 'node:os';
+import { chmodSync, mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { InvocationContext, InvocationHandle, InvocationInput, InvocationResult, StopReason, TaskClone } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
@@ -111,7 +111,6 @@ export interface ContainerDependencies {
   measureRepository(source: string, head: string, timeoutMs: number): RepositorySize;
   capture(input: InvocationInput): InvocationInput;
   startClaude(request: AgentAdapterRequest, token: string): InvocationHandle;
-  startCodex(request: AgentAdapterRequest, authFile: string): InvocationHandle;
   readonly env: Readonly<Record<string, string | undefined>>;
 }
 
@@ -123,7 +122,7 @@ export const QUESTION_STORAGE: TaskStorageLimits = Object.freeze({
 const ANSWER_SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost question answer","type":"string"}\n';
 
 /** The only variables the credential lookup reads. They reach the worker as data, never as its environment. */
-export const CREDENTIAL_VARIABLES = ['CLAUDE_CODE_OAUTH_TOKEN', 'CODEBOOST_CODEX_AUTH_FILE', 'CODEX_HOME', 'HOME'] as const;
+export const CREDENTIAL_VARIABLES = ['CLAUDE_CODE_OAUTH_TOKEN'] as const;
 export function credentialEnvironment(env: Readonly<Record<string, string | undefined>>): Record<string, string | undefined> {
   return Object.fromEntries(CREDENTIAL_VARIABLES.filter(name => env[name] !== undefined).map(name => [name, env[name]]));
 }
@@ -136,15 +135,15 @@ export function workerEnvironment(env: Readonly<Record<string, string | undefine
   return { ...(env.PATH ? { PATH: env.PATH } : {}), ...(env.DOCKER_HOST ? { DOCKER_HOST: env.DOCKER_HOST } : {}), TMPDIR: root };
 }
 
+/** Codex reads files only through its shell, and Ask runs no process, so Codex cannot answer questions (#75). */
+export const CODEX_QUESTIONS_REFUSED = 'Codex cannot answer questions yet: it can read the code only by running '
+  + 'commands, and Ask runs none. Choose Claude Code in Settings, then retry.';
+
 export function questionCredential(provider: Provider, env: ContainerDependencies['env']): string {
-  if (provider === 'claude') {
-    const token = env.CLAUDE_CODE_OAUTH_TOKEN;
-    if (!token) throw new Error('Ask with Claude Code needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`, set it, and restart codeboost.');
-    return token;
-  }
-  const authFile = env.CODEBOOST_CODEX_AUTH_FILE || join(env.CODEX_HOME || join(env.HOME || homedir(), '.codex'), 'auth.json');
-  if (!existsSync(authFile)) throw new Error(`Ask with Codex needs its auth.json (looked for ${authFile}). Sign in with \`codex login\` or set CODEBOOST_CODEX_AUTH_FILE, then restart codeboost.`);
-  return authFile;
+  if (provider === 'codex') throw new Error(CODEX_QUESTIONS_REFUSED);
+  const token = env.CLAUDE_CODE_OAUTH_TOKEN;
+  if (!token) throw new Error('Ask with Claude Code needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`, set it, and restart codeboost.');
+  return token;
 }
 
 /**
@@ -221,7 +220,7 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
         stateVersion: 0 } });
     const request = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: question.prompt,
       networkAllocationId: randomUUID() };
-    const handle = question.provider === 'claude' ? deps.startClaude(request, credential) : deps.startCodex(request, credential);
+    const handle = deps.startClaude(request, credential);
     const cancel = () => handle.cancel(stopOf(signal.reason));
     if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
     let result: InvocationResult;

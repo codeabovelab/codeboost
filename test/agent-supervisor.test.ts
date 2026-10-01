@@ -9,7 +9,7 @@ import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
 import { ACKNOWLEDGEMENT_SCRIPT, isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
   startProfileInvocation } from '../agents/adapters/supervisor.ts';
-import { captureInvocation, type InvocationInput, type InvocationResult } from '../agents/contract.ts';
+import { captureInvocation, type InvocationInput, type InvocationResult, type Phase } from '../agents/contract.ts';
 import { buildAgentImage } from '../agents/container/image.ts';
 import { createContainerProfile, disposeContainerProfile, isContainerProfileAuthentic,
   type ContainerProfile } from '../agents/container/profile.ts';
@@ -26,13 +26,13 @@ const allocations: ReturnType<typeof prepareTaskFilesystems>[] = [];
 let imageId = '';
 const git = fixtureGit;
 
-function fixture() {
+function fixture(schema = '{"probe":"codeboost-adapter-schema-marker"}\n') {
   const root = mkdtempSync(join(tmpdir(), 'agent-supervisor-')); roots.push(root);
   const source = join(root, 'source'), staging = join(root, 'staging'), input = join(root, 'input');
   mkdirSync(source); mkdirSync(staging); mkdirSync(input);
   git(source, 'init'); git(source, 'config', 'user.name', 'Test'); git(source, 'config', 'user.email', 'test@example.com');
   writeFileSync(join(source, 'file.txt'), 'trusted\n'); git(source, 'add', '.'); git(source, 'commit', '-m', 'baseline');
-  writeFileSync(join(input, 'schema.json'), '{"probe":"codeboost-adapter-schema-marker"}\n'); chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
+  writeFileSync(join(input, 'schema.json'), schema); chmodSync(join(input, 'schema.json'), 0o444); chmodSync(input, 0o555);
   const clone = createTaskClone({ source, parent: staging, taskId: 'supervisor', head: git(source, 'rev-parse', 'HEAD') });
   const filesystems = prepareTaskFilesystems(clone, {
     workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512,
@@ -41,8 +41,8 @@ function fixture() {
   return { root, input, clone, filesystems, auth };
 }
 function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlineMs = 2 * 60_000,
-  vendor: 'codex' | 'claude' = 'codex'): InvocationInput {
-  return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone: data.clone, phase: 'planning', vendor, approvedArgv: [],
+  vendor: 'codex' | 'claude' = 'codex', phase: Phase = 'planning'): InvocationInput {
+  return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone: data.clone, phase, vendor, approvedArgv: [],
     deadline: Date.now() + deadlineMs, attemptId,
     context: { snapshotId: 'snapshot', planId: 'plan', planRevision: 1, assignmentId: 'assignment',
       referencedCodeHash: 'code', stateVersion: 1 } });
@@ -267,7 +267,7 @@ describe('container invocation supervisor', () => {
   }, 2 * 60_000);
 
   it('returns the adapter handle at once and cancels it during network creation', async () => {
-    const data = fixture(), captured = invocation(data, 'adapter-setup-cancel');
+    const data = fixture(), captured = invocation(data, 'adapter-setup-cancel', 2 * 60_000, 'codex', 'review');
     const egress = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress'],
       { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort();
     const before = egress();
@@ -585,7 +585,8 @@ describe('container invocation supervisor', () => {
     it('runs the production Codex adapter and collects its bounded output file', async () => {
       const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
       if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
-      const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000),
+      // Codex is refused in planning and questions (#75), so the probe runs in review, its read-only phase.
+      const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000, 'codex', 'review'),
         filesystems: data.filesystems, inputDirectory: data.input, imageId, networkAllocationId: randomUUID(),
         prompt: schemaPrompt }, authFile).settled;
       expect(result.stopReason, result.stderr).toBeUndefined();
@@ -597,13 +598,32 @@ describe('container invocation supervisor', () => {
     it('runs the production Claude adapter and parses its bounded envelope', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
       if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
-      const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude', 6 * 60_000, 'claude'),
+      // Questions answer in plain text; planning answers are schema-constrained (the next probe).
+      const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude', 6 * 60_000, 'claude',
+        'questions'),
         filesystems: data.filesystems, inputDirectory: data.input, imageId, networkAllocationId: randomUUID(),
         prompt: schemaPrompt }, token).settled;
       expect(result.stopReason, result.stderr).toBeUndefined();
       expect(result.exitCode).toBe(0);
       // Claude returns through its bounded stdout envelope; the value can only come from the mounted schema.
       expect(schemaValue(result.stdout)).toBe('codeboost-adapter-schema-marker');
+    }, 8 * 60_000);
+
+    it('returns a schema-constrained Claude planning answer as bare JSON from the mounted schema', async () => {
+      // The marker is only in the schema. Claude can also read the mounted file, so the marker alone does not prove the
+      // flag: the strict structured_output decode does, since without --json-schema the envelope has none.
+      const schema = JSON.stringify({ type: 'object', additionalProperties: false, required: ['marker'],
+        description: 'Set marker to exactly: codeboost-structured-schema-marker',
+        properties: { marker: { type: 'string' } } }) + '\n';
+      const data = fixture(schema), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;
+      if (!token) throw new Error('CLAUDE_CODE_OAUTH_TOKEN is required.');
+      const result = await startClaudeInvocation({ invocation: invocation(data, 'live-claude-schema', 6 * 60_000, 'claude'),
+        filesystems: data.filesystems, inputDirectory: data.input, imageId, networkAllocationId: randomUUID(),
+        prompt: 'Answer with the object your output schema describes.' }, token).settled;
+      expect(result.stopReason, result.stderr).toBeUndefined();
+      expect(result.exitCode, result.stdout).toBe(0);
+      // Bare JSON, with no prose or Markdown fence around it.
+      expect(JSON.parse(result.stdout)).toEqual({ marker: 'codeboost-structured-schema-marker' });
     }, 8 * 60_000);
   }
 });
