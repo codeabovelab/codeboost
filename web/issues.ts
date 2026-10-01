@@ -15,7 +15,7 @@ function summarize(state: IssuePriorityState): IssueBoardState {
 }
 
 // Leaves headroom below the 15-second server request timeout for a request that joins an in-flight refresh.
-const REFRESH_TIMEOUT_MS = 12_000;
+export const REFRESH_TIMEOUT_MS = 12_000;
 
 /**
  * Server-owned issue list for the Issues screen. One refresh runs at a time; concurrent

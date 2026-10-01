@@ -10,8 +10,8 @@ const MAX_BODY_LENGTH = 65_536;
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
 /**
  * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
- * it exits. A fetch settles only when gh has stopped, so both count inside the 12-second fetch deadline, which stays
- * below the 15-second serving request budget (12 + 0.5 + 0.25 = 12.75 s).
+ * it exits. A fetch settles only when gh has stopped, so a fetch aborted at its 12 s deadline (web/issues.ts) settles up
+ * to 0.75 s later: 12.75 s, below the 15-second serving request budget.
  */
 export const ISSUE_KILL_GRACE_MS = 500, ISSUE_PIPE_GRACE_MS = 250;
 

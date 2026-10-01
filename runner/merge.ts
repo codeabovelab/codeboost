@@ -6,6 +6,8 @@ import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type M
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
+/** The longest a merge click may run before it is aborted; its last gh call's stop wait comes on top (github/merge.ts). */
+export const MERGE_OPERATION_TIMEOUT_MS = 14_000;
 const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
 /** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
 export class MergeNotApplied extends Error {}
@@ -44,8 +46,8 @@ export class MergeCoordinator {
   readonly operationTimeoutMs: number;
   /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
   #settle: <T>(fn: () => T) => T;
-  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = 14_000, capability?: ShutdownCapability) {
-    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 14_000) throw new Error('Invalid merge operation deadline.');
+  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability) {
+    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > MERGE_OPERATION_TIMEOUT_MS) throw new Error('Invalid merge operation deadline.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs;
     this.#settle = settleWith(capability);
   }

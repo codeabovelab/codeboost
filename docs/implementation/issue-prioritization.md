@@ -57,8 +57,8 @@ dedicated read-only gateway with these boundaries:
 - When the fetch deadline passes or the fetch is cancelled, the `gh` process
   gets SIGTERM, then SIGKILL after half a second. The fetch returns only after
   that process has exited, or a quarter of a second after it exits if a process
-  it started keeps its output open. Both waits count inside the 12-second
-  deadline: 12.75 s stays below the 15-second request timeout.
+  it started keeps its output open. So a fetch aborted at its 12-second
+  deadline settles by 12.75 s, below the 15-second request timeout.
 - The gateway fetches open issues and the repository's current collaborators,
   excludes pull requests, follows bounded pagination for both collections, and
   validates every field used for normalization, trust, or ranking. If the
