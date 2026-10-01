@@ -158,15 +158,19 @@ export class PullRequestPublisher {
         // still identifies it.
         let state = 'It may still be ready for review: its first line no longer identifies it.';
         if (pr.marker === marker(row.openingId)) {
-          try {
-            const drafted = await this.#pulls.markDraft(row.number, { base: pr.base, headBranch: pr.headBranch, marker: pr.marker }, signal);
-            this.#store.recordPullRequestDraft(identity, row.openingId, drafted.number, drafted.draft,
-              { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
-            state = 'It is now a draft.';
-          } catch (error) {
+          let drafted;
+          try { drafted = await this.#pulls.markDraft(row.number, { base: pr.base, headBranch: pr.headBranch, marker: pr.marker }, signal); }
+          catch (error) {
             if (signal?.aborted) throw error;
             state = error instanceof DraftsUnsupported ? 'It stays ready for review: this repository does not support draft pull requests.'
               : `It could not be made a draft and may still be ready for review (${error instanceof Error ? error.message : String(error)}).`;
+          }
+          // Only the GitHub call's failure is reported as "may still be ready"; a Store failure after a draft that landed
+          // propagates. The flag is recorded only where it differs, so a retry does not move the task's version.
+          if (drafted) {
+            if (drafted.draft !== row.draft) this.#store.recordPullRequestDraft(identity, row.openingId, drafted.number, drafted.draft,
+              { stateVersion: this.#store.getTask(identity).stateVersion, reviewVersion: this.#store.reviewVersion(identity) });
+            state = 'It is now a draft.';
           }
         }
         throw new PullRequestMisplaced(`The task's pull request #${row.number} is open, but no longer from ${branch} into ${this.#config.baseBranch} with its marker. Close it, or restore its branch, base and first line. ${state}`);

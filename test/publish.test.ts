@@ -100,8 +100,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
     async markDraft(number, input) {
       log.push(`draft ${number}`);
-      // Like the adapter's read-back: the PR must be into the base asked for.
+      // Like the adapter's read-back: the PR must be from the branch and into the base asked for.
       if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
+      const current = live.get(input.marker);
+      if (current && input.headBranch !== (options.moved?.has(current.number) ? 'renamed-by-a-person' : publishBranch)) throw new Error('GitHub returned a pull request for a different branch.');
       options.onDraft?.();
       if (options.draftsUnsupported) throw new DraftsUnsupported('no drafts');
       if (options.draftFails) throw new Error('timeout marking the PR a draft');
@@ -1970,10 +1972,20 @@ describe('shutdown and PRs left ready', () => {
     expect(moved.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
     for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
-    // Retargeted while the list lags: also moved, not lag.
+    // Moved again, the draft already recorded: a retry does not move the task's version.
+    const version = store.getTask(identity).stateVersion;
+    await expect(harness(store, { live, next, hidden, moved: new Set([100]) }).publisher.publish(identity)).rejects.toThrow(/It is now a draft\./);
+    expect(store.getTask(identity).stateVersion).toBe(version);
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
+    // An abort during that draft change rejects with the abort, not the refusal.
+    const controller = new AbortController();
+    const aborted = await harness(store, { live, next, hidden, moved: new Set([100]), draftFails: true, onDraft: () => controller.abort() }).publisher.publish(identity, {}, controller.signal).catch(e => e);
+    expect(aborted).not.toBeInstanceOf(PullRequestMisplaced);
+    // Retargeted while the list lags: also moved, not lag, and drafted in its new base.
     baseOf.get(live)!.set([...live.keys()][0]!, 'develop');
-    await expect(harness(store, { live, next, hidden }).publisher.publish(identity)).rejects.toThrow(PullRequestMisplaced);
+    await expect(harness(store, { live, next, hidden }).publisher.publish(identity)).rejects.toThrow(/It is now a draft\./);
     baseOf.get(live)!.delete([...live.keys()][0]!);
+    for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
     // Its marker removed: refused, and said to be possibly still ready, since nothing identifies it any more.
     const unmarked = harness(store, { live, next, hidden, unmarked: new Set([100]) });
     await expect(unmarked.publisher.publish(identity)).rejects.toThrow(/first line no longer identifies it/);
