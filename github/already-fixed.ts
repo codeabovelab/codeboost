@@ -45,8 +45,6 @@ export const DEFAULT_CHECK_DEADLINE_MS = 12_000;
  * The deadline plus both stays below the 15-second serving request budget (12 + 1 + 0.5 = 13.5 s).
  */
 export const CHECK_KILL_GRACE_MS = 1_000, CHECK_PIPE_GRACE_MS = 500;
-/** A caller that must settle by its own deadline stops the check this long before it: both grace periods, plus a margin. */
-export const CHECK_SETTLE_MS = CHECK_KILL_GRACE_MS + CHECK_PIPE_GRACE_MS + 250;
 const PAGE = 100;
 
 const TIMELINE_QUERY = `query($owner: String!, $name: String!, $number: Int!) {

@@ -2,9 +2,9 @@ import { randomUUID } from 'node:crypto';
 import { expect, it, vi } from 'vitest';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
-import { GhMergeGateway, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
+import { GhMergeGateway, MERGE_CHECK_SETTLE_MS, MERGE_KILL_GRACE_MS, MERGE_PIPE_GRACE_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type RemoteMergeState } from '../github/merge.ts';
 import { Store, mergeActionResponse } from '../runner/store.ts';
-import { CHECK_KILL_GRACE_MS, CHECK_PIPE_GRACE_MS, CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
+import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedInput, type AlreadyFixedResult } from '../github/already-fixed.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
@@ -1315,7 +1315,7 @@ it('stops the merge check early enough for its processes to settle before the in
   vi.useFakeTimers();
   try {
     let checkSignal: AbortSignal | undefined;
-    const settle = CHECK_KILL_GRACE_MS + CHECK_PIPE_GRACE_MS;
+    const settle = MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS;
     // Like the real runner, the check settles only after both grace periods once it is aborted.
     const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => new Promise((_resolve, reject) => {
       checkSignal = signal;
@@ -1324,21 +1324,22 @@ it('stops the merge check early enough for its processes to settle before the in
     const run = async (args: readonly string[]) => mergeReads(args);
     const inspection = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks).inspect({ fresh: true, timeoutMs: 6_000 });
     const settled = inspection.then(state => ({ state }), error => ({ error }));
-    await vi.advanceTimersByTimeAsync(6_000 - CHECK_SETTLE_MS - 1);
+    await vi.advanceTimersByTimeAsync(6_000 - MERGE_CHECK_SETTLE_MS - 1);
     expect(checkSignal?.aborted).toBe(false);
     await vi.advanceTimersByTimeAsync(1);
     expect(checkSignal?.aborted).toBe(true);
-    await vi.advanceTimersByTimeAsync(CHECK_SETTLE_MS - 1);
+    await vi.advanceTimersByTimeAsync(MERGE_CHECK_SETTLE_MS - 1);
     // The inspection resolves before its deadline, with the check unknown, instead of overrunning it.
     expect(await Promise.race([settled, Promise.resolve('pending')])).toMatchObject({ state: { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' } });
   } finally { vi.useRealTimers(); }
 });
 
-it('gives the default merge check its own hardened runner, or the injected one', () => {
+it('gives the default merge check the gateway runner, whose grace periods the early stop is built from', () => {
   const config = { repository: 'owner/repo', pullRequest: 7, issue: 21 };
   const plain = new GhMergeGateway(config);
   expect(plain.checks).toBeInstanceOf(GhAlreadyFixedGateway);
-  expect((plain.checks as GhAlreadyFixedGateway).run).not.toBe(plain.run);
+  // The check's own default runner waits 1.5 s after an abort; the merge's waits 0.4 s, and MERGE_CHECK_SETTLE_MS assumes it.
+  expect((plain.checks as GhAlreadyFixedGateway).run).toBe(plain.run);
   const run = async () => '';
   expect((new GhMergeGateway(config, run).checks as GhAlreadyFixedGateway).run).toBe(run);
 });
@@ -1398,7 +1399,7 @@ it('does not accept a check answer or rule reads that arrive after an abort', as
     }) };
     const stopped = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, async args => mergeReads(args), late).inspect({ fresh: true, timeoutMs: 6_000 });
     const stoppedResult = stopped.then(state => ({ state }), error => ({ error }));
-    await vi.advanceTimersByTimeAsync(6_000 - CHECK_SETTLE_MS + 20);
+    await vi.advanceTimersByTimeAsync(6_000 - MERGE_CHECK_SETTLE_MS + 20);
     expect(await stoppedResult).toMatchObject({ state: { alreadyFixed: 'unknown', alreadyFixedDetail: 'The check did not finish in time.' } });
 
     // A caller abort: the late clear answer must not turn into a resolved inspection.
@@ -1441,12 +1442,12 @@ it('does not start the merge check when no time is left for its processes to set
     const counted: AlreadyFixedGateway = { repository: 'owner/repo', check: async () => { checks++; return { outcome: 'clear', baseHead: sha('9') }; } };
     // The PR read ends after the point where the check would have to stop.
     const slowPull = async (args: readonly string[]) => {
-      if (args.join(' ').startsWith('pr view 7')) await new Promise(resolve => setTimeout(resolve, 6_000 - CHECK_SETTLE_MS + 10));
+      if (args.join(' ').startsWith('pr view 7')) await new Promise(resolve => setTimeout(resolve, 6_000 - MERGE_CHECK_SETTLE_MS + 10));
       return mergeReads(args);
     };
     const inspection = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, slowPull, counted).inspect({ fresh: true, timeoutMs: 6_000 });
     const result = inspection.then(state => ({ state }), error => ({ error }));
-    await vi.advanceTimersByTimeAsync(6_000 - CHECK_SETTLE_MS + 20);
+    await vi.advanceTimersByTimeAsync(6_000 - MERGE_CHECK_SETTLE_MS + 20);
     expect(await result).toMatchObject({ state: { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' } });
     expect(checks).toBe(0);
   } finally { vi.useRealTimers(); }

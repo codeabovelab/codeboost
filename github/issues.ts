@@ -1,7 +1,6 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { ghEnvironment } from './gh-env.ts';
+import { runWithInput } from './run-with-input.ts';
 
-const runFile = promisify(execFile);
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
@@ -9,6 +8,12 @@ const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
+/**
+ * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
+ * it exits. A fetch settles only when gh has stopped, so a fetch aborted at its 12 s deadline (web/issues.ts) settles up
+ * to 0.75 s later: 12.75 s, below the 15-second serving request budget.
+ */
+export const ISSUE_KILL_GRACE_MS = 500, ISSUE_PIPE_GRACE_MS = 250;
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
@@ -153,10 +158,13 @@ export class GhIssueGateway implements IssueGateway {
   constructor(repository: string, run?: RunGh, now: () => Date = () => new Date()) {
     if (!repositoryName(repository)) throw new Error('A GitHub repository is required for issue retrieval.');
     this.repository = repository;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], {
+    this.run = run ?? ((args, options) => runWithInput('gh', args, {
       maxBuffer: ISSUE_PAGE_MAX_BYTES,
       signal: options?.signal,
-    })).stdout);
+      env: ghEnvironment(),
+      killGraceMs: ISSUE_KILL_GRACE_MS,
+      pipeGraceMs: ISSUE_PIPE_GRACE_MS,
+    }));
     this.now = now;
   }
 

@@ -1,9 +1,22 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
-import { CHECK_SETTLE_MS, GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
+import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
+import { ghEnvironment } from './gh-env.ts';
+import { runWithInput } from './run-with-input.ts';
 import { REPOSITORY, SHA } from './validate.ts';
 
-const runFile = promisify(execFile);
+/**
+ * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
+ * it exits. Every gh call of this gateway settles only when gh has stopped, so a call aborted at a deadline settles up
+ * to 0.4 s later. That keeps a merge click (14 s deadline in runner/merge.ts) within 14.4 s, inside the 14.5 s shutdown
+ * drain and below the 15-second serving request budget, and an inspection (at most 12 s) within 12.4 s.
+ */
+export const MERGE_KILL_GRACE_MS = 250, MERGE_PIPE_GRACE_MS = 150;
+/**
+ * How long before an inspection's deadline the already-fixed check stops: both grace periods of this gateway's runner,
+ * which the check also uses, plus a margin. Its processes then settle before the deadline.
+ */
+export const MERGE_CHECK_SETTLE_MS = MERGE_KILL_GRACE_MS + MERGE_PIPE_GRACE_MS + 250;
+/** The longest deadline of any inspection, and the default for merge-state and queue-state inspections. */
+export const MERGE_INSPECTION_TIMEOUT_MS = 12_000;
 
 export interface RequiredCheck {
   context: string;
@@ -99,15 +112,16 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   #cache: { expiresAt: number; state: RemoteMergeState } | null = null;
   #generation = 0;
   #inflight: { generation: number; promise: Promise<RemoteMergeState> } | null = null;
-  /** `checks` defaults to the pre-PR check's GitHub adapter for the same repository, using `run` when one is given. */
+  /** `checks` defaults to the pre-PR check's GitHub adapter for the same repository, using this gateway's runner. */
   constructor(config: GhMergeConfig, run?: RunGh, checks?: AlreadyFixedGateway) {
     if (!REPOSITORY.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
       throw new Error('A GitHub repository, pull request, and issue are required for merging.');
     if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
     if (checks && checks.repository?.toLowerCase() !== config.repository.toLowerCase()) throw new Error('The already-fixed check must name and read the merge repository.');
     this.config = config;
-    this.checks = checks ?? new GhAlreadyFixedGateway({ repository: config.repository }, run);
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal })).stdout);
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(), killGraceMs: MERGE_KILL_GRACE_MS, pipeGraceMs: MERGE_PIPE_GRACE_MS }));
+    // The check uses this gateway's runner, so its stopped `gh` calls settle within the same grace periods as the merge's.
+    this.checks = checks ?? new GhAlreadyFixedGateway({ repository: config.repository }, this.run);
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
@@ -133,7 +147,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
    */
   async #alreadyFixed(baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
     // A check started with no settle time left could leave processes running past the inspection's deadline.
-    const runFor = deadlineAt - CHECK_SETTLE_MS - Date.now();
+    const runFor = deadlineAt - MERGE_CHECK_SETTLE_MS - Date.now();
     if (runFor <= 0) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' };
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), runFor);
@@ -270,8 +284,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   }
 
   async inspect(options: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RemoteMergeState> {
-    const timeoutMs = options.timeoutMs ?? 12_000;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub inspection timeout.');
+    const timeoutMs = options.timeoutMs ?? MERGE_INSPECTION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub inspection timeout.');
     if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
     const generation = this.#generation;
     if (!options.fresh && this.#inflight?.generation === generation) return this.#inflight.promise;
@@ -293,7 +307,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   async queueWatermark(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string | null> {
     fullSha(expectedHead, 'expected head SHA');
     const timeoutMs = options.timeoutMs ?? 6_000;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue watermark timeout.');
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub queue watermark timeout.');
     const [owner, name] = this.config.repository.split('/') as [string, string];
     const query = `query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){number headRefOid timelineItems(last:1,itemTypes:[ADDED_TO_MERGE_QUEUE_EVENT,REMOVED_FROM_MERGE_QUEUE_EVENT]){edges{cursor node{id}}}}}}`;
     const timeout = new AbortController();
@@ -328,8 +342,8 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
 
   async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null } = {}): Promise<MergeQueueObservation> {
     fullSha(expectedHead, 'expected head SHA');
-    const timeoutMs = options.timeoutMs ?? 12_000;
-    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 12_000) throw new Error('Invalid GitHub queue inspection timeout.');
+    const timeoutMs = options.timeoutMs ?? MERGE_INSPECTION_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub queue inspection timeout.');
     const correlated = Object.hasOwn(options, 'afterCursor');
     if (options.afterCursor !== undefined && options.afterCursor !== null && (typeof options.afterCursor !== 'string' || !options.afterCursor || options.afterCursor.length > 512))
       throw new Error('Invalid merge-queue event cursor.');

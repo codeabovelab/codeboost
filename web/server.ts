@@ -5,7 +5,7 @@ import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
-import { MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
+import { MERGE_OPERATION_TIMEOUT_MS, MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
@@ -20,8 +20,10 @@ export interface PlanningDeps {
   describe(): Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
 }
 const publicRoot = new URL('./public/', import.meta.url);
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = 14_500, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planning?: PlanningDeps) {
-  if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > 14_500) throw new Error('Invalid shutdown drain deadline.');
+/** The longest shutdown waits for admitted requests to finish before aborting them; below the 15 s request timeout. */
+export const MAX_SHUTDOWN_DRAIN_MS = 14_500;
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planning?: PlanningDeps) {
+  if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
@@ -32,7 +34,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // Issue retrieval is read-only, so demos may show it; they use a local fixture and never contact GitHub.
     issues = new IssueBoard(issueGateway ?? (config.demo ? demoIssueGateway() : config.github ? new GhIssueGateway(config.github.repository) : null),
       'Issue ranking needs a GitHub repository. Add a github block with a repository to the review configuration.');
-    merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), 14_000, capability) : null;
+    merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), MERGE_OPERATION_TIMEOUT_MS, capability) : null;
     // The runner starts only with an injected D; until #51 lands, runner actions report that it is unavailable.
     runner = runnerDeps ? new RunnerCoordinator(service.store, runnerDeps, undefined, capability) : null;
     // E3's settlement writes (completeSuggestions, settleSuggestion in close()) run with the shutdown capability.
