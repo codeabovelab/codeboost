@@ -33,10 +33,11 @@ export interface PullRequestGateway {
    */
   findOwned(input: { headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string; base: string })[]>;
   /**
-   * Whether PR `number` is open, read from the PR itself: GitHub's PR list can lag behind it, so a recorded PR missing
-   * from the list is confirmed closed here before anything is pushed as if it were gone.
+   * PR `number` read from the PR itself, not from the list: GitHub's PR list can lag behind it, so a recorded PR missing
+   * from the list is confirmed closed here before anything is pushed as if it were gone. Its branch, base and marker
+   * tell list lag apart from a PR a person moved (branch renamed, marker removed).
    */
-  isOpen(number: number, signal?: AbortSignal): Promise<boolean>;
+  readPull(number: number, signal?: AbortSignal): Promise<{ open: boolean; headBranch: string; base: string; marker: string }>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
   /** `beforeReady` runs after the description update's await and before any ready or draft change; if it throws, no such change is made. */
   refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest>;
@@ -195,12 +196,14 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return this.#owned(await this.#branchPulls(input.headBranch, signal), input.headBranch, input.markers);
   }
 
-  async isOpen(number: number, signal?: AbortSignal): Promise<boolean> {
+  async readPull(number: number, signal?: AbortSignal): Promise<{ open: boolean; headBranch: string; base: string; marker: string }> {
     signal = this.#bounded(signal);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
-    const pr = await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal) as { number?: unknown; state?: unknown } | null;
-    if (!pr || pr.number !== number || (pr.state !== 'open' && pr.state !== 'closed')) throw new Error('GitHub returned an invalid pull request.');
-    return pr.state === 'open';
+    const pr = await this.#json(['api', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal) as
+      { number?: unknown; state?: unknown; body?: unknown; head?: { ref?: unknown }; base?: { ref?: unknown } } | null;
+    if (!pr || pr.number !== number || (pr.state !== 'open' && pr.state !== 'closed') || typeof pr.head?.ref !== 'string' || typeof pr.base?.ref !== 'string'
+      || (pr.body !== null && typeof pr.body !== 'string')) throw new Error('GitHub returned an invalid pull request.');
+    return { open: pr.state === 'open', headBranch: pr.head.ref, base: pr.base.ref, marker: markerOf(pr.body ?? '') };
   }
 
   async findOpened(input: { base: string; headBranch: string; markers: readonly string[] }, signal?: AbortSignal): Promise<(OpenedPullRequest & { marker: string }) | null> {

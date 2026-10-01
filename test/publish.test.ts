@@ -39,8 +39,10 @@ const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>(
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number> } = {}) {
   const publishConfig = { ...config, ...options.config };
+  // The task's branch, as the publisher names it (one task per harness).
+  let publishBranch = '';
   const live = options.live ?? new Map<string, OpenedPullRequest>(), counter = options.next ?? { value: 100 }, closed = options.closed ?? new Set<number>();
   const log: string[] = [], checks: AlreadyFixedInput[] = [], opened: OpenPullRequestInput[] = [];
   // Each PR's base, by marker (like GitHub, a PR opened into a base stays there); unset means the configured base.
@@ -81,10 +83,14 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       if (!input.markers.includes(open[0])) throw new Error('An open pull request exists that codeboost did not open.');
       return { ...open[1], marker: open[0] };
     },
-    async isOpen(number) {
-      // The PR itself: open unless closed, whatever the list shows (a hidden PR models a list that lags behind).
-      log.push(`is open ${number}`);
-      return [...live.values()].some(pr => pr.number === number) && !closed.has(number);
+    async readPull(number) {
+      // The PR itself, whatever the list shows (a hidden PR models a list that lags behind); `moved` models a person
+      // renaming its branch.
+      log.push(`read ${number}`);
+      // A PR a test removed from `live` was closed (GitHub keeps every PR it ever had).
+      const [m] = [...live].find(([, pr]) => pr.number === number) ?? [undefined];
+      if (m === undefined) return { open: false, headBranch: publishBranch, base: publishConfig.baseBranch, marker: '' };
+      return { open: !closed.has(number), headBranch: options.moved?.has(number) ? 'renamed-by-a-person' : publishBranch, base: bases.get(m) ?? publishConfig.baseBranch, marker: m };
     },
     async findOwned(input) {
       log.push(`owned ${input.markers.join(' ')}`); options.onFind?.();
@@ -113,7 +119,9 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
   };
   const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
-  return { log, checks, opened, pulls, publisher: new PullRequestPublisher(store, { checks: gate, pulls, pusher, closing: options.closing }, publishConfig) };
+  const publisher = new PullRequestPublisher(store, { checks: gate, pulls, pusher, closing: options.closing }, publishConfig);
+  publishBranch = publisher.branch(identity);
+  return { log, checks, opened, pulls, publisher };
 }
 
 describe('opening the task PR', () => {
@@ -226,7 +234,7 @@ describe('opening the task PR', () => {
     } };
     const opened: string[] = [];
     const publisher = new PullRequestPublisher(store, { checks: gate, pusher: { async push() {} },
-      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async findOwned() { return []; }, async isOpen() { return false; }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); } } }, config);
+      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async findOwned() { return []; }, async readPull() { throw new Error('unreachable'); }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); } } }, config);
     await expect(publisher.publish(identity)).rejects.toThrow(GuardRefusal);
     expect(opened).toEqual([]);
   });
@@ -1369,12 +1377,13 @@ describe('GitHub PR adapter', () => {
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([crlf])).findOpened({ ...input, markers: [marker] })).toMatchObject({ number: 7, marker });
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([crlf])).findOwned({ headBranch: input.headBranch, markers: [marker] })).toMatchObject([{ number: 7 }]);
   });
-  it('reads whether a PR is open from the PR itself', async () => {
-    const read = (value: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { expect(args.at(-1)).toBe('repos/owner/repo/pulls/7'); return JSON.stringify(value); }).isOpen(7);
-    expect(await read({ number: 7, state: 'open' })).toBe(true);
-    expect(await read({ number: 7, state: 'closed' })).toBe(false);
-    await expect(read({ number: 8, state: 'open' })).rejects.toThrow(/invalid pull request/);
-    await expect(read({ number: 7, state: 'weird' })).rejects.toThrow(/invalid pull request/);
+  it('reads a PR from the PR itself: state, branch, base and marker', async () => {
+    const read = (value: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { expect(args.at(-1)).toBe('repos/owner/repo/pulls/7'); return JSON.stringify(value); }).readPull(7);
+    expect(await read(response({ state: 'open' }))).toEqual({ open: true, headBranch: 'codeboost/issue-12-task', base: 'main', marker });
+    expect(await read(response({ state: 'closed', body: null }))).toMatchObject({ open: false, marker: '' });
+    await expect(read(response({ number: 8 }))).rejects.toThrow(/invalid pull request/);
+    await expect(read(response({ state: 'weird' }))).rejects.toThrow(/invalid pull request/);
+    await expect(read({ ...response(), head: {} })).rejects.toThrow(/invalid pull request/);
   });
   it('validates every PR it reads: an https URL, and head and base in this repository', async () => {
     const lookup = (pr: unknown) => new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([pr])).findOpened({ ...input, markers: [marker] });
@@ -1954,6 +1963,10 @@ describe('shutdown and PRs left ready', () => {
     await expect(lagging.publisher.publish(identity)).rejects.toThrow(/#100 is open, but GitHub's pull request list does not show it yet/);
     expect(lagging.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
     expect(store.taskPullRequests(identity)).toHaveLength(1);
+    // A PR whose branch a person renamed is not list lag: a retry would never see it, so the refusal says what to do.
+    const moved = harness(store, { live, next, hidden, moved: new Set([100]) });
+    await expect(moved.publisher.publish(identity)).rejects.toThrow(/#100 is open, but no longer from .* Close it, or restore/);
+    expect(moved.log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
     // Once the list shows it, the update goes ahead.
     hidden.clear();
     expect(await harness(store, { live, next }).publisher.publish(identity)).toMatchObject({ kind: 'opened', number: 100, status: 'in review' });

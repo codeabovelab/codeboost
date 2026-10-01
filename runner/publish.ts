@@ -147,9 +147,14 @@ export class PullRequestPublisher {
       // push never moves an open PR's head with no update recorded as in flight.
       for (const row of candidates) {
         if (row.state !== 'opened' || row.number === null) continue;
-        const open = await this.#pulls.isOpen(row.number, signal);
+        const pr = await this.#pulls.readPull(row.number, signal);
         signal?.throwIfAborted();
-        if (open) throw new OpeningUnsettled(`Pull request #${row.number} is open, but GitHub's pull request list does not show it yet. Try again later.`);
+        if (!pr.open) continue;
+        // Still on the branch, into the configured base, with its marker: only the list is behind, so a retry will do.
+        if (pr.headBranch === branch && pr.base === this.#config.baseBranch && pr.marker === marker(row.openingId))
+          throw new OpeningUnsettled(`Pull request #${row.number} is open, but GitHub's pull request list does not show it yet. Try again later.`);
+        // Moved by a person (branch renamed, marker removed, retargeted): a retry would never see it, so a person decides.
+        throw new PullRequestMisplaced(`The task's pull request #${row.number} is open, but no longer from ${branch} into ${this.#config.baseBranch} with its marker. Close it, or restore its branch, base and first line.`);
       }
     }
     let earlier = live ? candidates.find(pr => marker(pr.openingId) === live.marker)! : undefined;
