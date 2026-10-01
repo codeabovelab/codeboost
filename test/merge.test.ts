@@ -27,9 +27,9 @@ function alreadyFixedReads(args: readonly string[], fake: IssueFake = {}): strin
   return null;
 }
 /** Answers the merge adapter's own reads: an open PR 7 into main with no rules or protection. */
-function mergeReads(args: readonly string[]): string {
+function mergeReads(args: readonly string[], pull: Record<string, unknown> = {}): string {
   const joined = args.join(' ');
-  if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+  if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], ...pull });
   if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
   if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
   if (/\/branches\/[^/]+$/.test(joined)) return JSON.stringify({ protected: false });
@@ -1220,16 +1220,7 @@ it('does not treat empty strict check policies as an atomic base guard', async (
 
 function mergeRun(fake: IssueFake = {}, pull: Record<string, unknown> = {}) {
   const calls: string[][] = [];
-  const run = async (args: readonly string[]) => {
-    calls.push([...args]); const joined = args.join(' ');
-    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], ...pull });
-    const fixed = alreadyFixedReads(args, fake);
-    if (fixed !== null) return fixed;
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
-    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    if (/\/branches\/[^/]+$/.test(joined)) return JSON.stringify({ protected: false });
-    throw new Error(`Unexpected gh call: ${joined}`);
-  };
+  const run = async (args: readonly string[]) => { calls.push([...args]); return alreadyFixedReads(args, fake) ?? mergeReads(args, pull); };
   return { calls, alreadyFixed: async () => (await new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run).inspect()).alreadyFixed };
 }
 
@@ -1296,13 +1287,7 @@ it('gives an injected check the merge inputs and fails closed on an unknown outc
   const inputs: AlreadyFixedInput[] = [];
   const answers: Array<() => AlreadyFixedResult> = [() => ({ outcome: 'clear', baseHead: sha('9') }), () => ({ outcome: 'bogus' } as unknown as AlreadyFixedResult), () => { throw new Error('HTTP 502'); }];
   const checks: AlreadyFixedGateway = { repository: 'Owner/Repo', check: async input => { inputs.push(input); return answers.shift()!(); } };
-  const run = async (args: readonly string[]) => {
-    const joined = args.join(' ');
-    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'release/1', baseRefOid: sha('c'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
-    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    return JSON.stringify({ protected: false });
-  };
+  const run = async (args: readonly string[]) => mergeReads(args, { baseRefName: 'release/1', baseRefOid: sha('c') });
   const client = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks);
   expect((await client.inspect({ fresh: true })).alreadyFixed).toBe('clear');
   expect(inputs[0]).toEqual({ issue: 21, taskBase: sha('c'), baseBranch: 'release/1', ownPullRequests: [7], ownCommits: new Set() });
@@ -1319,13 +1304,7 @@ it('keeps the caller cancellation when the merge check is aborted', async () => 
   const checks: AlreadyFixedGateway = { repository: 'owner/repo', check: (_input, signal) => new Promise((_resolve, reject) => {
     started(); signal?.addEventListener('abort', () => reject(new Error('generic runner abort')), { once: true });
   }) };
-  const run = async (args: readonly string[]) => {
-    const joined = args.join(' ');
-    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
-    if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
-    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    return JSON.stringify({ protected: false });
-  };
+  const run = async (args: readonly string[]) => mergeReads(args);
   const pending = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks).inspect({ fresh: true, signal: controller.signal });
   await checking;
   controller.abort(new Error('merge request deadline exceeded'));
@@ -1342,13 +1321,7 @@ it('stops the merge check early enough for its processes to settle before the in
       checkSignal = signal;
       signal?.addEventListener('abort', () => setTimeout(() => reject(new Error('aborted')), settle), { once: true });
     }) };
-    const run = async (args: readonly string[]) => {
-      const joined = args.join(' ');
-      if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
-      if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
-      if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-      return JSON.stringify({ protected: false });
-    };
+    const run = async (args: readonly string[]) => mergeReads(args);
     const inspection = new GhMergeGateway({ repository: 'owner/repo', pullRequest: 7, issue: 21 }, run, checks).inspect({ fresh: true, timeoutMs: 6_000 });
     const settled = inspection.then(state => ({ state }), error => ({ error }));
     await vi.advanceTimersByTimeAsync(6_000 - CHECK_SETTLE_MS - 1);
@@ -1379,12 +1352,9 @@ it('starts the merge check alongside the rule reads, and stops and awaits it whe
   }) };
   const rollup: unknown[] = [];
   const run = async (args: readonly string[]) => {
-    const joined = args.join(' ');
-    if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: rollup });
     // The rule read answers only once the check has started: run one after the other, this inspection would hang.
-    if (joined.includes('/rules/branches/')) { await started; return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: null }] } }]]); }
-    if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
-    return JSON.stringify({ protected: false });
+    if (args.join(' ').includes('/rules/branches/')) { await started; return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [{ context: 'test', integration_id: null }] } }]]); }
+    return mergeReads(args, { statusCheckRollup: rollup });
   };
   // A null rollup entry makes the required-check matching throw after the rule reads.
   rollup.push(null);
