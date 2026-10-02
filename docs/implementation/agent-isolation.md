@@ -36,7 +36,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
 | Mountpoint replacement fails | `agent-container`: metadata and metadata alias probes (`mv` and `rm -rf` of `.git`) |
 | Both vendor startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes (credentials required): Codex in review through its output file; Claude in questions through its stdout envelope; Claude in planning returns a schema-constrained answer as bare JSON. **Known failure:** the Codex probes (here and in `agent-container`) fail, because Codex cannot read files in any phase (see [Codex in read-only phases](#codex-in-read-only-phases)). |
-| Nothing can be written beneath a gitlink, and execute and fix launch only on a clean tree (#81) | `agent-container`: the gitlink probe (writes, `mkdir`, `rmdir` and `mv` at every gitlink fail; the rest of `/work` stays writable); a pre-populated nested checkout, a restart with an untracked symlink parent and a restart with an occupied add destination are refused; a gitlink name Docker cannot mount, more than 256 gitlinks and an unreadable tree are refused; each check serves one profile over its own storage and head; the validator rejects a gitlink mount that is missing, writable, or of another size or mode |
+| Nothing can be written beneath a gitlink, and execute and fix launch only on a clean tree (#81) | `agent-container`: the gitlink probe (writes, `mkdir`, `rmdir` and `mv` at every gitlink fail; the rest of `/work` stays writable); a pre-populated nested checkout, a restart with an untracked symlink parent and a restart with an occupied add destination are refused; a gitlink name Docker cannot mount, more than 256 gitlinks and an unreadable tree are refused; each check serves one profile over its own storage and head; the validator rejects a gitlink mount that is missing, writable, or of another size or mode; every directory above a nested gitlink is pinned, writable and `nosuid,nodev`, so renaming one fails (#99); the validator rejects a pin that is missing, read-only, at another subpath, from another volume, `volume-nocopy`, or not a volume |
 | Hostile input stays inside the boundary | `agent-container`: repositories with links that leave the checkout are refused, links inside the checkout still work, oversized repositories fail closed; `agent-policy`: option-like prompts; `agent-proxy`: hostile CONNECT traffic; `agent-supervisor`: hostile output |
 
 ## Why the gate can fail
@@ -126,7 +126,16 @@ Use only these entry points to run an agent:
      Pass the result as `treeCheck` in the start call's request. An execute or fix profile requires it; a read-only
      phase refuses one. The profile adds an empty read-only tmpfs (`--mount type=tmpfs,target=/work/<path>,readonly,
      tmpfs-mode=0555,tmpfs-size=4096`) at every gitlink the check listed, and the validator allows exactly those mounts,
-     each read-only with that size and mode. A check serves one profile, over the storage and head it was made for: a
+     each read-only with that size and mode. Every directory above a gitlink below the top level is pinned (#99): the
+     profile mounts the work volume again at that path (`--mount type=volume,source=<work volume>,target=/work/<dir>,
+     volume-subpath=<dir>`, which needs Docker 26 or later). A mountpoint cannot be renamed, so the gitlink's mount
+     cannot be moved away with its parent and the path refilled; what is inside stays writable and `nosuid,nodev`, on
+     the same volume and limits. A pin is a mount boundary: `rename(2)` and hard links across it fail with `EXDEV`, so
+     `mv` copies instead, and a tool that writes a temporary file elsewhere and renames it into a pinned directory
+     fails. Docker resolves the subpath when the container starts, following any link there, so nothing may write the
+     work volume between the check and the start (nothing does). More than 256 pinned directories, or more than
+     128 KiB of paths in these mounts, is refused. The validator allows exactly these mounts: the task's own
+     work volume, writable, at that subpath. A check serves one profile, over the storage and head it was made for: a
      copy, a second use, other storage or another head is refused, so check again before every invocation, retries
      included.
    - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
@@ -382,6 +391,3 @@ against real Docker, including two reviews with different Ask owners on one daem
   is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run
   as review. Running an item's `cmd` in a writable task filesystem is not built yet; when it is, each run must call
   `checkTaskTree` and get the same mounts before it starts.
-- The mount keeps a gitlink directory empty, but an agent can still rename a parent directory of a nested gitlink
-  (the mount moves with it) and create a new directory at the old path. The inspection after the run reports that
-  directory's content as nested gitlink content, so the task goes to needs human. #99 tracks enforcing this during the run.

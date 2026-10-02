@@ -1702,20 +1702,22 @@ describe('real Docker agent isolation', () => {
     };
 
     it('mounts every gitlink empty and read-only, so an agent\'s write beneath one is refused', async () => {
-      const data = withGitlinks(['sm', 'deps/inner']);
+      const data = withGitlinks(['sm', 'deps/inner', 'x/y/z']);
       const check = await checkTaskTree(data.filesystems, { base: data.clone.head, imageId,
         operations: [{ kind: 'edit', path: 'src/a.ts' }, { kind: 'add', path: 'src/b.ts' }] });
-      expect(check).toEqual({ base: data.clone.head, gitlinks: ['deps/inner', 'sm'] });
+      expect(check).toEqual({ base: data.clone.head, gitlinks: ['deps/inner', 'sm', 'x/y/z'] });
       const valid = await profile(data, 'execute', 'gitlink-write', { treeCheck: check });
-      expect(valid.gitlinks).toEqual(['deps/inner', 'sm']);
+      expect(valid.gitlinks).toEqual(['deps/inner', 'sm', 'x/y/z']);
+      // Every directory above a nested gitlink is pinned, so the probe's renames of deps, x and x/y all fail (#99).
+      expect(valid.gitlinkParents).toEqual(['deps', 'x', 'x/y']);
       expect(await runContainer(valid)).toBe('gitlink-protected');
       // What the agent could write is still inspected, and nothing reached a gitlink directory.
       const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head,
         linkSnapshot: await snapshotDeclaredLinks(data.filesystems, [], { imageId }), imageId });
       expect(manifest.nestedGitlinkContent).toEqual([]);
       expect(manifest.changes.map(change => change.path)).toEqual(['beside.txt']);
-      // Inspection only: content at a nested gitlink path, as an agent can leave by renaming a parent during the run
-      // (#99), is reported after it. This runs without the mounts, so it does not test the runtime gap itself.
+      // Inspection only, without the mounts: content at a nested gitlink path is still reported after a run, should any
+      // way around the pinned parents remain.
       asAgent(data.filesystems, 'mv deps deps2 && mkdir -p deps/inner && printf nested > deps/inner/x');
       const moved = await inspectTaskChanges(data.filesystems, { base: data.clone.head,
         linkSnapshot: await snapshotDeclaredLinks(data.filesystems, [], { imageId }), imageId });
@@ -1809,6 +1811,49 @@ describe('real Docker agent isolation', () => {
       });
       const elsewhere = await checkTaskTree(moved.filesystems, { base: later, operations: [], imageId });
       await expect(profile(moved, 'execute', 'noop', { treeCheck: elsewhere })).rejects.toThrow('another head');
+    }, 180_000);
+
+    it('refuses gitlinks below more directories than a profile pins', async () => {
+      const deep = withGitlinks(Array.from({ length: 130 }, (_, index) => `d${index}/e/g`), undefined, undefined,
+        { workBytes: 16 * 1024 * 1024, workInodes: 2048, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 });
+      expect(await refusal(checkTaskTree(deep.filesystems, { base: deep.clone.head, operations: [], imageId })))
+        .toEqual(['the head\'s gitlinks are below 260 directories, more than the 256 that can be pinned']);
+    }, 180_000);
+
+    it('refuses gitlink mounts that would name more paths than a launch passes', async () => {
+      const stem = ['a', 'b', 'c', 'd'].map(letter => letter.repeat(200)).join('/');
+      const paths = Array.from({ length: 200 }, (_, index) => `${stem}/g${index}`);
+      const parents = ['a', 'b', 'c', 'd'].map((_, index) => stem.split('/').slice(0, index + 1).join('/'));
+      const bytes = paths.reduce((total, path) => total + Buffer.byteLength(path), 0)
+        + parents.reduce((total, path) => total + 2 * Buffer.byteLength(path), 0);
+      expect(bytes).toBeGreaterThan(128 * 1024);
+      const long = withGitlinks(paths);
+      expect(await refusal(checkTaskTree(long.filesystems, { base: long.clone.head, operations: [], imageId })))
+        .toEqual([`the gitlink mounts would name ${bytes} bytes of paths, more than the ${128 * 1024} a launch passes`]);
+    }, 180_000);
+
+    it('rejects a container whose pin above a nested gitlink is missing, read-only or elsewhere', async () => {
+      const data = withGitlinks(['deps/inner']);
+      const pinned = (value: string) => value.startsWith('type=volume,') && value.endsWith(',target=/work/deps,volume-subpath=deps');
+      const notPinned = 'A directory above a gitlink is not pinned by its own work-volume mount.';
+      for (const [replace, refusal] of [
+        [(value: string) => `${value},readonly`, notPinned],
+        [(value: string) => value.replace('volume-subpath=deps', 'volume-subpath=src'), notPinned],
+        [(value: string) => value.replace(',target=/work/deps,', ',target=/work/src,'), 'unexpected external mount'],
+        [(value: string) => value.replace(`source=${data.filesystems.workVolume},`, `source=${data.filesystems.metadataVolume},`), notPinned],
+        [(value: string) => `${value},volume-nocopy`, notPinned],
+        [() => 'type=tmpfs,target=/work/deps', notPinned],
+        [() => undefined, notPinned]] as const) {
+        const valid = await profile(data, 'execute', 'must-not-run');
+        expect(valid.args.filter(pinned)).toHaveLength(1);
+        const args = valid.args.flatMap((value, index) => valid.args[index + 1] !== undefined && pinned(valid.args[index + 1]!)
+          && replace(valid.args[index + 1]!) === undefined ? [] : pinned(value)
+          ? [replace(value)].filter((item): item is string => item !== undefined) : [value]);
+        docker(...args);
+        containers.add(valid.name);
+        await expect(validateContainer(valid.name, valid)).rejects.toThrow(refusal);
+        docker('rm', '--force', valid.name); containers.delete(valid.name);
+      }
     }, 180_000);
 
     it('rejects a container whose gitlink mount is missing or writable after Docker resolves it', async () => {

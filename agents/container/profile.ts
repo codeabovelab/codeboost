@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { assertCapturedInvocation, type InvocationInput, type Phase, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, taskFilesystemOwner, type TaskFilesystems } from './storage.ts';
-import { useTaskTreeCheck, type TaskTreeCheck } from './changes.ts';
+import { gitlinkParents, useTaskTreeCheck, type TaskTreeCheck } from './changes.ts';
 import { ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
   type VendorNetwork } from '../network/network.ts';
@@ -27,6 +27,8 @@ export interface ContainerProfile {
   readonly deferredOutput: boolean;
   /** Execute and fix: every gitlink path, each covered by an empty read-only tmpfs. Empty in read-only phases. */
   readonly gitlinks: readonly string[];
+  /** Execute and fix: every directory above a gitlink below the top level, each remounted from the work volume (#99). */
+  readonly gitlinkParents: readonly string[];
 }
 export interface ProfileOptions {
   readonly invocation: InvocationInput;
@@ -292,6 +294,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     // up: the next profile needs a new check, made just before its own launch.
     if (readOnlyWork && options.treeCheck) throw new Error('Only an execute or fix profile takes a pre-launch tree check.');
     const gitlinks = readOnlyWork ? [] : useTaskTreeCheck(options.treeCheck, filesystems, invocation.clone.head);
+    const parents = gitlinkParents(gitlinks);
     const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=128', '--memory=512m', '--memory-swap=512m',
       '--cpus=1', '--shm-size=16m', '--ipc=private', '--cgroupns=private',
@@ -309,6 +312,12 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       '--mount', mount({ type: 'volume', source: filesystems.workVolume, target: '/work', readonly: readOnlyWork }),
       '--mount', mount({ type: 'volume', source: filesystems.metadataVolume, target: '/work/.git', readonly: true }),
       '--mount', mount({ type: 'bind', source: inputIdentity.inputDirectory, target: '/run/codeboost-input', readonly: true }),
+      // Each directory above a nested gitlink is a real directory: the check proved it, and nothing writes the work
+      // volume between the check and this container's start (Docker would follow a link it found there). Mounting it
+      // again from the work volume makes it a mountpoint, which cannot be renamed, so the gitlink's mount cannot be moved
+      // aside and its path refilled during the run (#99). Docker mounts parents before children whatever the order here.
+      ...parents.flatMap(path => ['--mount', mount({ type: 'volume', source: filesystems.workVolume, target: `/work/${path}`,
+        'volume-subpath': path })]),
       // Each gitlink is an empty directory (the check proved it): an empty read-only tmpfs over it keeps it empty.
       ...gitlinks.flatMap(path => ['--mount', mount({ type: 'tmpfs', target: `/work/${path}`, readonly: true,
         'tmpfs-mode': GITLINK_MOUNT_MODE, 'tmpfs-size': String(GITLINK_MOUNT_BYTES) })])];
@@ -329,7 +338,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       phase: invocation.phase, vendor: invocation.vendor,
       filesystems: capturedFilesystems, inputDirectory: inputIdentity.inputDirectory, codexAuthFile,
       command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy,
-      deferredOutput: options.deferredOutput === true, gitlinks: Object.freeze([...gitlinks]) });
+      deferredOutput: options.deferredOutput === true, gitlinks: Object.freeze([...gitlinks]), gitlinkParents: parents });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,

@@ -226,7 +226,16 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + 'n=$((n+1)); test "$(findmnt --noheadings --output TARGET --target "/work/$p")" = "/work/$p"; '
       + 'findmnt --noheadings --output OPTIONS --target "/work/$p" | tr , "\\n" | grep -Fxq ro; '
       + 'test -z "$(ls -A "/work/$p")"; deny touch "/work/$p/x"; deny mkdir "/work/$p/.git"; '
-      + 'deny rmdir "/work/$p"; deny mv "/work/$p" "/work/$p.moved"; done; test "$n" -gt 0; '
+      + 'deny rmdir "/work/$p"; deny mv "/work/$p" "/work/$p.moved"; '
+      // Each directory above it is pinned (#99): its own writable nosuid,nodev mountpoint, which cannot be moved aside,
+      // so the gitlink's mount cannot be carried off and its path refilled. What is inside stays writable.
+      + 'd=$(dirname "$p"); while [ "$d" != . ]; do '
+      + 'test "$(findmnt --noheadings --output TARGET --target "/work/$d")" = "/work/$d"; '
+      + 'o=$(findmnt --noheadings --output OPTIONS --target "/work/$d" | tr , "\\n"); '
+      + 'for x in rw nosuid nodev; do printf "%s\\n" "$o" | grep -Fxq "$x"; done; '
+      + 'deny mv "/work/$d" "/work/$d.moved"; test -d "/work/$p"; '
+      + 'touch "/work/$d/.pinned-write"; test -f "/work/$d/.pinned-write"; rm "/work/$d/.pinned-write"; '
+      + 'd=$(dirname "$d"); done; done; test "$n" -gt 0; '
       + 'printf ok > /work/beside.txt; printf gitlink-protected',
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);

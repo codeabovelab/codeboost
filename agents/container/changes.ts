@@ -371,7 +371,10 @@ export interface TreeCheckOptions extends StorageScriptOptions {
  */
 export interface TaskTreeCheck {
   readonly base: string;
-  /** Every gitlink of `base`, each an empty directory now; each gets an empty read-only mount. */
+  /**
+   * Every gitlink of `base`, each an empty directory now; each gets an empty read-only mount, and every directory above
+   * one (as `gitlinkParents(gitlinks)` lists them) is pinned with a mount of its own.
+   */
   readonly gitlinks: readonly string[];
 }
 /**
@@ -389,8 +392,26 @@ export class TaskTreeRefused extends Error {
     this.differences = Object.freeze([...differences]);
   }
 }
-/** The most gitlinks one profile mounts; a head with more refuses the launch. */
+/** The most gitlinks one profile mounts, and the most parent directories it pins; a head with more refuses the launch. */
 export const MAXIMUM_GITLINK_MOUNTS = 256;
+/**
+ * The most bytes of path the gitlink mounts add to the `docker create` arguments (each pin names its directory twice,
+ * each gitlink once), well inside what one exec can carry; a head that needs more refuses the launch.
+ */
+export const MAXIMUM_GITLINK_MOUNT_BYTES = 128 * 1024;
+/**
+ * Every directory above a gitlink below the top level, parents before children (#99). Each is mounted again at its own
+ * path from the same work volume, so it is a mountpoint: renaming or removing it fails (EBUSY), and the gitlink's own
+ * mount cannot be moved away with it. What is inside stays writable.
+ */
+export function gitlinkParents(gitlinks: readonly string[]): readonly string[] {
+  const parents = new Set<string>();
+  for (const path of gitlinks) {
+    const parts = path.split('/');
+    for (let index = 1; index < parts.length; index++) parents.add(parts.slice(0, index).join('/'));
+  }
+  return Object.freeze([...parents].sort((a, b) => a.split('/').length - b.split('/').length || (a < b ? -1 : a > b ? 1 : 0)));
+}
 // The storage each check was made over, and whether a profile has used it.
 const treeChecks = new WeakMap<TaskTreeCheck, { filesystems: TaskFilesystems; used: boolean }>();
 // Docker reads `--mount` as comma-separated fields that a double quote can open: a name with either cannot be mounted
@@ -488,6 +509,13 @@ export async function checkTaskTree(storage: TaskFilesystems, options: TreeCheck
   }
   if (gitlinks.length > MAXIMUM_GITLINK_MOUNTS)
     differences.push(`the head has ${gitlinks.length} gitlinks, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be mounted`);
+  const parents = gitlinkParents(gitlinks as string[]).length;
+  if (parents > MAXIMUM_GITLINK_MOUNTS)
+    differences.push(`the head's gitlinks are below ${parents} directories, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be pinned`);
+  const mountBytes = (gitlinks as string[]).reduce((total, path) => total + Buffer.byteLength(path), 0)
+    + gitlinkParents(gitlinks as string[]).reduce((total, path) => total + 2 * Buffer.byteLength(path), 0);
+  if (mountBytes > MAXIMUM_GITLINK_MOUNT_BYTES)
+    differences.push(`the gitlink mounts would name ${mountBytes} bytes of paths, more than the ${MAXIMUM_GITLINK_MOUNT_BYTES} a launch passes`);
   for (const path of gitlinks as string[]) if (unmountable(path)) differences.push(`gitlink ${q(path)} has a name Docker cannot mount`);
   if (differences.length) throw new TaskTreeRefused([...new Set(differences)]);
   const check = Object.freeze({ base: options.base, gitlinks: Object.freeze([...gitlinks as string[]]) });
