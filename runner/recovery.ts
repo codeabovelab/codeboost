@@ -6,7 +6,7 @@ import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
 import type { Store } from './store.ts';
 import { WRITABLE_KINDS, isUuidV4 } from './lifecycle.ts';
-import { saveDiagnostic } from './diagnostics.ts';
+import { partialOutput, saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
 
 /**
@@ -16,7 +16,13 @@ import { ownerOnlyDirectory } from './runner-repository.ts';
 export class LockHeld extends Error { constructor() { super('Another codeboost runner is using this database.'); } }
 export class RecoveryBlocked extends Error {
   readonly items: string[];
-  constructor(message: string, items: string[], separator = ', ') { super(`${message}:${separator === '\n' ? '\n' : ' '}${items.join(separator)}`); this.items = items; }
+  /** One item per line, so a list of commands can be copied as it is. */
+  constructor(message: string, items: string[]) { super(`${message}:\n${items.join('\n')}`); this.items = items; }
+}
+/** The shell line that removes a Docker object D reported, its name or ID quoted as one shell word. */
+export function removalCommand(resource: { kind: 'container' | 'network' | 'volume'; id?: string; name: string }): string {
+  const word = `'${(resource.id ?? resource.name).replaceAll("'", "'\\''")}'`;
+  return `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${word}`;
 }
 
 /** Linux statfs magic numbers for network filesystems, where POSIX locks are unreliable. */
@@ -157,7 +163,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     await processes.terminate(a.preparationPgid, o.graceMs ?? 5_000);
   // 2c/2d. D's recovery; a rejection propagates and stops startup.
   const recovered = await o.deps.recoverLeftovers(o.runnerOwner);
-  if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned, '\n');
+  if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned);
   // A handle is used only if both its attempt ID and its allocation ID match one attempt row of this database
   // (runner-lifecycle.md, "Recovered storage handles"); any other is reported and left for a person.
   const matched = recovered.storage.filter(s => isUuidV4(s.attemptId) && isUuidV4(s.allocationId) && o.store.attemptAllocation(s.attemptId) === s.allocationId);
@@ -176,11 +182,12 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     const controller = new AbortController(), timer = setTimeout(() => controller.abort(new Error('Export timed out.')), o.exportDeadlineMs ?? 60_000);
     const exporting = o.deps.exportTaskDiff(storage.handle, { base: attempt.storageBase, metadataBaseline: attempt.metadataBaseline }, EXPORT_LIMIT, controller.signal);
     try {
-      const { diff } = await Promise.race([exporting,
+      const { diff, truncated } = await Promise.race([exporting,
         new Promise<never>((_, reject) => controller.signal.addEventListener('abort', () => reject(controller.signal.reason), { once: true }))]);
       // Earlier exports of this pass are not referenced until finalization, so retention must keep them too.
       const saved = Object.values(exports).flatMap(entry => entry.diagnosticRef ? [entry.diagnosticRef] : []);
-      exports[storage.attemptId] = { diagnosticRef: saveDiagnostic(o.store, o.diagnosticsDir, storage.attemptId, diff.subarray(0, EXPORT_LIMIT), o.diagnosticsCapBytes, saved) };
+      exports[storage.attemptId] = { diagnosticRef: saveDiagnostic(o.store, o.diagnosticsDir, storage.attemptId,
+        partialOutput(diff.subarray(0, EXPORT_LIMIT), truncated || diff.length > EXPORT_LIMIT), o.diagnosticsCapBytes, saved) };
     } catch (error) { exports[storage.attemptId] = { failure: error instanceof Error ? error.message : String(error) }; }
     finally { clearTimeout(timer); }
     // A timed-out export must stop before step 4 removes its storage. D stops on abort; if it does not, fail closed.

@@ -6,7 +6,7 @@ import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-b
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
 import type { DeclaredLinkSnapshot } from '../agents/container/changes.ts';
 import type { IssueText } from '../github/issues.ts';
-import { saveDiagnostic } from './diagnostics.ts';
+import { partialOutput, saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
@@ -202,10 +202,10 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       if (!workspace.exportPartial || !options.diagnostics) return {};
       const signal = AbortSignal.timeout(options.exportDeadlineMs ?? 60_000);
       try {
-        const { diff } = await workspace.exportPartial(data.workspace, { baseHead: data.baseHead }, signal);
+        const { diff, truncated } = await workspace.exportPartial(data.workspace, { baseHead: data.baseHead }, signal);
         // Only the current user may write where diagnostics are kept.
         ownerOnlyDirectory(options.diagnostics.directory);
-        return { diagnosticRef: saveDiagnostic(store, options.diagnostics.directory, attempt.id, diff, options.diagnostics.capBytes) };
+        return { diagnosticRef: saveDiagnostic(store, options.diagnostics.directory, attempt.id, partialOutput(diff, truncated), options.diagnostics.capBytes) };
       } catch (error) {
         return { failure: signal.aborted ? 'the export did not finish within its deadline' : (error instanceof Error ? error.message : String(error)) };
       }

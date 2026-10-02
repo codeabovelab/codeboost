@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { RUNNER_NOT_CONFIGURED, startServer } from '../web/server.ts';
-import { claudeLauncher, dRecoveryDeps, parseRunnerConfig, RUNNER_CREDENTIAL_MISSING, setUpRunner } from '../runner/production.ts';
+import { claudeLauncher, dRecoveryDeps, ISSUE_REUSE_MS, parseRunnerConfig, RUNNER_CREDENTIAL_MISSING, setUpRunner } from '../runner/production.ts';
 import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { InvocationInput } from '../agents/contract.ts';
@@ -16,6 +16,13 @@ import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 
 vi.mock('../agents/recovery.ts', async original => ({ ...await original<typeof import('../agents/recovery.ts')>(), recoverLeftovers: vi.fn() }));
+const issueReads: number[] = [];
+vi.mock('../github/issues.ts', async original => {
+  const actual = await original<typeof import('../github/issues.ts')>();
+  return { ...actual, GhIssueGateway: class extends actual.GhIssueGateway {
+    override async issueText(number: number) { issueReads.push(number); return { number, title: 'T', body: 'B', comments: [] }; }
+  } };
+});
 vi.mock('../agents/container/storage.ts', async original => ({ ...await original<typeof import('../agents/container/storage.ts')>(),
   exportTaskDiff: vi.fn(async () => ({ diff: Buffer.from('d'), truncated: false })), removeTaskFilesystemsAsync: vi.fn(async () => undefined) }));
 
@@ -75,6 +82,19 @@ describe('runner startup', () => {
     expect(statSync(join(root, 'runner', 'diagnostics')).mode & 0o777).toBe(0o700);
     expect(await assembly.sources.vendor(service.config.identity)).toBe('claude');
     expect(() => assembly.sources.planContext({ ...service.config.identity, planId: 'other' })).toThrow(/only its configured plan/);
+  });
+  it('reads the issue once for a run of items, and again once the reuse window has passed', async () => {
+    const { root, service } = fixture();
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    issueReads.length = 0;
+    const signal = new AbortController().signal, identity = service.config.identity;
+    await sources.issue(identity, signal); await sources.issue(identity, signal);
+    expect(issueReads).toHaveLength(1);
+    const now = Date.now();
+    vi.spyOn(Date, 'now').mockReturnValue(now + ISSUE_REUSE_MS + 1);
+    await sources.issue(identity, signal);
+    expect(issueReads).toHaveLength(2);
   });
   it('refuses before touching anything without a github block, a token, or with a demo', async () => {
     for (const [patch, env, message] of [[{ github: undefined }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /github block/], [{}, {}, RUNNER_CREDENTIAL_MISSING], [{ demo: true }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /Demos never/]] as const) {

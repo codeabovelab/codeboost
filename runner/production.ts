@@ -5,13 +5,13 @@ import { buildAgentImage } from '../agents/container/image.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync, type TaskStorageLimits } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
-import { GhIssueGateway } from '../github/issues.ts';
+import { GhIssueGateway, type IssueText } from '../github/issues.ts';
 import { identityKey } from '../core/identity.ts';
 import type { RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
 import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources } from './execution.ts';
 import { isUuidV4, type ShutdownCapability } from './lifecycle.ts';
-import { recoverStartup, type RecoveryDeps, type RecoveryReport, type RunnerLock } from './recovery.ts';
+import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport, type RunnerLock } from './recovery.ts';
 import type { ReviewService } from './review.ts';
 import { openRunnerRepository, ownerOnlyDirectory } from './runner-repository.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
@@ -36,6 +36,8 @@ export const EXECUTE_STORAGE: TaskStorageLimits = Object.freeze({
 });
 /** The profile requires exactly one schema.json in the input mount; an execute answer is a plain-text summary. */
 const EXECUTE_SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost execute summary","type":"string"}\n';
+/** How long one read of the issue serves later plan items: the length of a short multi-item run. */
+export const ISSUE_REUSE_MS = 5 * 60_000;
 export const RUNNER_CREDENTIAL_MISSING = 'The runner runs Claude Code, which needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`, set it, and restart codeboost.';
 
 /** Check the `runner` block of a review configuration before anything is created. */
@@ -65,8 +67,6 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
     committer: Object.freeze({ name: committer.name as string, email: committer.email as string }), limits: Object.freeze(limits) });
 }
 
-/** One shell word, whatever Docker returned as a name. */
-const shellQuote = (text: string) => `'${text.replaceAll("'", "'\\''")}'`;
 /**
  * Lane D's recovery, export and removal for `recoverStartup`. Unlike Ask (#65), the runner looks for codeboost objects
  * without a runner label too, and every unowned object blocks startup (runner-lifecycle.md, "Unowned resources"): an
@@ -86,7 +86,7 @@ export function dRecoveryDeps(image: () => string): RecoveryDeps {
         // D's handle object itself: its trust is keyed by identity, so a copy would be refused.
         storage: report.storage.map(handle => ({ attemptId: handle.attemptId, allocationId: handle.allocationId, handle })),
         unowned: report.unowned.map(resource =>
-          `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${shellQuote(resource.id ?? resource.name)}  # ${resource.reason}`),
+          `${removalCommand(resource)}  # ${resource.reason}`),
       };
     },
     exportTaskDiff: (handle, input, maxBytes, signal) =>
@@ -158,12 +158,23 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,
     limits: { ...EXECUTE_STORAGE, ...config.limits }, committer: config.committer });
   const issues = new GhIssueGateway(review.github.repository);
+  /**
+   * The last issue text read, reused for ISSUE_REUSE_MS: a plan's items run one after another and would otherwise each
+   * read the issue, every collaborator page and every comment page again. Only a completed read is kept.
+   */
+  let lastRead: { number: number; at: number; text: IssueText } | null = null;
+  const issueText = async (number: number, signal: AbortSignal): Promise<IssueText> => {
+    if (lastRead && lastRead.number === number && Date.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
+    const at = Date.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000 });
+    lastRead = { number, at, text };
+    return text;
+  };
   const only = (requested: typeof identity) => {
     if (identityKey(requested) !== identityKey(identity)) throw new Error('This server runs only its configured plan.');
   };
   const sources: ExecutionSources = {
     planContext: requested => { only(requested); return service.planContext(); },
-    issue: (requested, signal) => { only(requested); return issues.issueText(service.store.getPlan(identity).issue, { signal, timeoutMs: 30_000 }); },
+    issue: (requested, signal) => { only(requested); return issueText(service.store.getPlan(identity).issue, signal); },
     // Learning (L1–L4) is not built: no lesson is approved yet.
     lessons: () => [],
     // Codex is refused in every phase (#93).

@@ -50,6 +50,14 @@ if (values.help || (!values.demo && !values.config)) {
     for (const entry of recovery.unknownEntries) console.error(`Unknown entry in the runner's attempt directory, left in place: ${entry}`);
     return assembly;
   } : undefined;
+  // Startup recovery must not be cut off part way (a half-saved diagnostic, a leftover export container): a stop asked for
+  // during startup takes effect once it has finished.
+  let stopping = false;
+  const duringStartup = () => {
+    if (stopping) { console.log('Still starting; codeboost stops once startup recovery has finished.'); return; }
+    stopping = true; console.log('Stopping once startup recovery has finished…');
+  };
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, duringStartup);
   let app: Awaited<ReturnType<typeof startServer>>;
   try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, undefined, runnerSetup); }
   catch (error) {
@@ -58,10 +66,13 @@ if (values.help || (!values.demo && !values.config)) {
     if (!runnerSetup) throw error;
     console.error(error instanceof Error ? error.message : String(error)); process.exit(1);
   }
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) process.removeListener(signal, duringStartup);
   try { lock.verify(); }
   catch (error) { await app.close(); lock.release(); throw error; }
-  console.log(`Review ready: ${app.url}\nRepository: ${config.repository}\nDatabase: ${config.database}\nSource files are read-only. Press Ctrl+C to stop.`);
-  let stopping=false;
+  const stop = () => void app.close().then(() => { lock.release(); process.exit(0); },
+    error => { lock.release(); console.error(error instanceof Error ? error.message : error); process.exit(1); });
   // A second Ctrl+C does not skip shutdown (runner-lifecycle.md): agents are still being stopped and awaited.
-  for(const signal of ['SIGINT','SIGTERM'] as const) process.on(signal,()=>{if(stopping){console.log('Still stopping agents…');return;}{stopping=true;void app.close().then(()=>{lock.release();process.exit(0);},error=>{lock.release();console.error(error instanceof Error?error.message:error);process.exit(1);});}});
+  for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, () => { if (stopping) { console.log('Still stopping agents…'); return; } stopping = true; stop(); });
+  if (stopping) stop();
+  else console.log(`Review ready: ${app.url}\nRepository: ${config.repository}\nDatabase: ${config.database}\nSource files are read-only. Press Ctrl+C to stop.`);
 }

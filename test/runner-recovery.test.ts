@@ -308,6 +308,14 @@ describe('startup recovery sequence', () => {
       expect(ref && existsSync(ref)).toBe(true);
     }
   });
+  it('marks a diff D cut at its limit, so it is never read as all the agent changed', async () => {
+    const { d: root, store, admit, allocate } = fixture();
+    const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h'); store.markRunning(id(1), attempt.id);
+    const { d } = deps({ recoverLeftovers: async () => ({ storage: [h], unowned: [] }),
+      exportTaskDiff: async () => ({ diff: Buffer.from('diff --git a/x b/x'), truncated: true }) });
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d });
+    expect(readFileSync(store.getAttempt(id(1), attempt.id).diagnosticRef!, 'utf8')).toMatch(/^diff --git a\/x b\/x\ncodeboost: the partial output was cut at 18 bytes; later changes are not shown\.\n$/);
+  });
   it('lists each unowned object on its own line', async () => {
     const { d: root, store } = fixture();
     const run = recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),

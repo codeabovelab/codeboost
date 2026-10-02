@@ -9,6 +9,13 @@ export const DEFAULT_DIAGNOSTICS_CAP_BYTES = 256 * 1024 * 1024;
 const NAME = /^([0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12})\.diff$/;
 
 /**
+ * D's export bytes as saved: a diff D cut at its byte limit ends with a `codeboost:` notice line (like D's own notices),
+ * so a reader never takes a cut diff for everything the agent changed.
+ */
+export function partialOutput(diff: Buffer, truncated: boolean): Buffer {
+  return truncated ? Buffer.concat([diff, Buffer.from(`\ncodeboost: the partial output was cut at ${diff.length} bytes; later changes are not shown.\n`)]) : diff;
+}
+/**
  * Save a stopped attempt's partial output as `<directory>/<attemptId>.diff` (runner-lifecycle.md, the task storage
  * row), then apply retention. The file is written through a unique temporary file opened exclusively, owner-only, and
  * renamed into place; a failed write leaves nothing. Returns the path the attempt row references as `diagnostic_ref`.

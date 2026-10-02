@@ -19,6 +19,11 @@ export interface ReviewConfig { database: string; repository: string;
 export class ReviewService {
   store: Store;
   config: ReviewConfig;
+  /**
+   * The base tree listing of the last base commit read. A commit's tree never changes, so a later call for the same
+   * base reuses it instead of running Git again on the server's thread (each runner item asks for it, #91).
+   */
+  #baseEntries: { base: string; entries: readonly BaseEntry[] } | null = null;
   constructor(config: ReviewConfig) {
     if (typeof config.pathIdentity?.caseSensitive !== 'boolean' || !['none', 'NFC'].includes(config.pathIdentity.unicodeNormalization)) throw new Error('Known checkout path identity is required.');
     this.config = config; this.store = new Store(config.database);
@@ -141,13 +146,18 @@ export class ReviewService {
     };
     // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
     const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], { cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer, stdio: ['ignore', 'pipe', 'pipe'] });
-    const listing = git(['ls-tree', '-rz', snapshot.base], 64 * 1024 * 1024);
-    const baseEntries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
-      const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
-      if (mode === '160000') return { path, kind: 'gitlink' };
-      if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!]) };
-      return { path, kind: 'file' };
-    });
+    if (this.#baseEntries?.base !== snapshot.base) {
+      const listing = git(['ls-tree', '-rz', snapshot.base], 64 * 1024 * 1024);
+      const entries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
+        const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
+        if (mode === '160000') return { path, kind: 'gitlink' };
+        if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!]) };
+        return { path, kind: 'file' };
+      });
+      this.#baseEntries = { base: snapshot.base, entries };
+    }
+    // Copies: callers own what they are given, and the cached listing stays as Git reported it.
+    const baseEntries = this.#baseEntries.entries.map(entry => ({ ...entry }));
     return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
   }
   /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
