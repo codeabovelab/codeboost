@@ -240,6 +240,11 @@ export type ExecutionOutcome =
   | { kind: 'needs amendment'; item: string; outOfScope: string[]; checkpointId: string; completed: string[] }
   | { kind: 'needs human'; item: string; reason: string; completed: string[] }
   | { kind: 'stopped'; item: string; state: string; reason: string | null; completed: string[] };
+/** A run in progress: its plan, the item it is on and that item's attempt, and what it finished. */
+interface Run {
+  plan: ReturnType<Store['getPlan']>; index: number; attempt: AttemptRecord; done: string[]; unchanged: string[];
+  stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome;
+}
 const refusal = (error: unknown) => error instanceof GuardRefusal || error instanceof ShuttingDownError;
 /** A write outside settlement: no shutdown capability. */
 const direct = <T>(fn: () => T): T => fn();
@@ -270,10 +275,38 @@ export class ItemExecutor {
     // the coordinator dropping the job and this run resuming.
     if (this.#inFlight.has(key)) return { kind: 'stopped', item: options.fromItem ?? this.#store.getPlan(identity).items[0]!.id, state: 'not started',
       reason: 'An earlier run of this task is still finishing; start it again when that run has ended.', completed: [] };
-    const run = this.#runTask(identity, options);
+    const begun = this.#begin(identity, options, false);
+    return this.#track(key, 'outcome' in begun ? Promise.resolve(begun.outcome) : this.#continue(identity, begun));
+  }
+  /**
+   * Start or resume a run from inside the caller's user action (#91 part 2). Everything up to the first item's admission
+   * is synchronous, so it all happens in the caller's transaction: anything that keeps the first item from being admitted
+   * throws (the refusal itself where admission refused), and the caller's own writes roll back with it. A finding or scope
+   * pause owed from an earlier run is acted on instead, as the run's whole outcome, and admits nothing (`attemptId` null).
+   */
+  begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean } = {}): { attemptId: string | null; outcome: Promise<ExecutionOutcome> } {
+    const key = identityKey(identity);
+    if (this.#inFlight.has(key)) throw new GuardRefusal('An earlier run of this task is still finishing; start it again when that run has ended.');
+    const begun = this.#begin(identity, options, true);
+    if ('outcome' in begun) return { attemptId: null, outcome: this.#track(key, Promise.resolve(begun.outcome)) };
+    return { attemptId: begun.attempt.id, outcome: this.#track(key, this.#continue(identity, begun)) };
+  }
+  /**
+   * Where a run of the task's current plan revision stands: whether any item was attempted at this revision, the items
+   * an execute attempt completed, and the first item none did (null when every item has run). What `start` and `resume`
+   * decide from (#91 part 2).
+   */
+  progress(identity: PlanIdentity): { begun: boolean; completed: string[]; next: string | null } {
+    const plan = this.#store.getPlan(identity);
+    const attempted = this.#store.getAttempts(identity).filter(row => row.kind === 'execute' && row.context.planRevision === plan.revision && row.item);
+    const finished = new Set(attempted.filter(row => row.state === 'completed').map(row => row.item!));
+    return { begun: attempted.length > 0, completed: plan.items.filter(item => finished.has(item.id)).map(item => item.id),
+      next: plan.items.find(item => !finished.has(item.id))?.id ?? null };
+  }
+  /** Held in #inFlight from its start to its return, so close() can await it. */
+  #track(key: string, run: Promise<ExecutionOutcome>): Promise<ExecutionOutcome> {
     this.#inFlight.set(key, run.catch(() => undefined));
-    try { return await run; }
-    finally { this.#inFlight.delete(key); }
+    return run.finally(() => this.#inFlight.delete(key));
   }
   /**
    * Shutdown, after the coordinator's close: await every run in progress. A run's pause or escalation after its last
@@ -283,53 +316,77 @@ export class ItemExecutor {
   async close(): Promise<void> {
     while (this.#inFlight.size) await Promise.all([...this.#inFlight.values()]);
   }
-  async #runTask(identity: PlanIdentity, options: { fromItem?: string }): Promise<ExecutionOutcome> {
+  /**
+   * The synchronous start of a run: owed work first, then the first item's admission. With `strict`, a run that cannot
+   * admit its first item throws instead of returning a stopped outcome.
+   */
+  #begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean }, strict: boolean): { outcome: ExecutionOutcome } | Run {
     const plan = this.#store.getPlan(identity);
     const start = options.fromItem ? plan.items.findIndex(item => item.id === options.fromItem) : 0;
     if (start < 0) throw new Error('Unknown plan item.');
-    const done: string[] = [], unchanged: string[] = [];
-    const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [...done] });
+    const run: Run = { plan, index: start, attempt: undefined!, done: [], unchanged: [], stopped: undefined! };
+    run.stopped = (item, state, reason) => ({ kind: 'stopped', item, state, reason, completed: [...run.done] });
+    const notStarted = (reason: string, error?: unknown): { outcome: ExecutionOutcome } => {
+      if (strict) throw error ?? new GuardRefusal(reason);
+      return { outcome: run.stopped(options.fromItem ?? plan.items[start]!.id, 'not started', reason) };
+    };
     // Shutdown began (admission is closed): pay nothing owed and start nothing; the next run after restart does.
-    if (this.#runner.closing) return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', 'The review server is shutting down.');
+    if (this.#runner.closing) return notStarted('The review server is shutting down.', new ShuttingDownError());
     // An earlier run of this task that is still finishing (its storage release) settles its own findings and pause.
-    if (this.#runner.isActive(identity))
-      return stopped(options.fromItem ?? plan.items[start]!.id, 'not started', 'An earlier run of this task is still finishing; start it again when that run has ended.');
+    if (this.#runner.isActive(identity)) return notStarted('An earlier run of this task is still finishing; start it again when that run has ended.');
     // A safety finding not yet acted on (a failed write, a human gate at the time) goes to needs human first.
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);
-      if (finding) return this.#escalate(identity, earlier, finding, stopped, [], true);
+      if (finding) return this.#settledOrRefused(this.#escalate(identity, earlier, finding, run.stopped, [], true), strict);
     }
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
-    if (owed) return this.#pause(identity, owed.row, owed.result, stopped, [], true);
+    if (owed) return this.#settledOrRefused(this.#pause(identity, owed.row, owed.result, run.stopped, [], true), strict);
     // Continuing after a scope pause (plan-format.md: reconcile the executed prefix with the audited head, validate the
     // remaining items from that checkpoint) is not built yet (#88), so a paused task runs no further items: fail closed.
     const checkpoint = this.#store.latestCheckpoint(identity);
     if (checkpoint)
-      return stopped(options.fromItem ?? plan.items[start]!.id, 'not started',
-        `${checkpoint.item} changed files outside its plan item. Continuing after a scope pause is not supported yet (#88), so this task runs no further items.`);
-    /** Where the next item must start: the context the previous item left, or the current one for the first item. */
-    let expected: InvocationContext | null = null;
-    for (const item of plan.items.slice(start)) {
-      // Admission reads the context in this same turn, so it cannot notice a change saved during an earlier item.
-      const current = this.#store.currentContext(identity);
-      // After an item, the task is still running unless someone changed its status meanwhile: then the run stops.
-      if (expected && this.#store.getTask(identity).status !== 'running')
-        return stopped(item.id, 'not started', `The task's status changed to ${this.#store.getTask(identity).status} during the run; ${item.id} was not started.`);
-      if (this.#store.getPlan(identity).revision !== plan.revision)
-        return stopped(item.id, 'not started', `The plan changed to a new revision during the run; review it before running ${item.id}.`);
-      if (expected && !sameContext(current, expected))
-        return stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
-      let attempt: AttemptRecord;
-      try {
-        attempt = this.#runner.start(identity, {
-          expectedStateVersion: this.#store.getTask(identity).stateVersion, kind: 'execute', item: item.id,
-          expectedContext: current, deadline: Date.now() + this.#deadlineMs,
-        });
-      } catch (error) {
-        if (!refusal(error)) throw error;
-        return stopped(item.id, 'not started', error instanceof Error ? error.message : String(error));
-      }
+      return notStarted(`${checkpoint.item} changed files outside its plan item. Continuing after a scope pause is not supported yet (#88), so this task runs no further items.`);
+    const admitted = this.#admit(identity, run, null, options.claimRequeue === true, strict);
+    if (!('id' in admitted)) return { outcome: admitted };
+    run.attempt = admitted;
+    return run;
+  }
+  /** An owed escalation or pause: its outcome stands; one that could not be written refuses a strict start. */
+  #settledOrRefused(outcome: ExecutionOutcome, strict: boolean): { outcome: ExecutionOutcome } {
+    if (strict && outcome.kind === 'stopped') throw new GuardRefusal(outcome.reason ?? 'The task cannot start.');
+    return { outcome };
+  }
+  /**
+   * Admit `run.plan.items[run.index]`. `expected` is the context the previous item left (null for the first). A refusal
+   * ends the run as not started, or, with `strict`, is thrown as it is (so a refusal's effect commits with the caller's).
+   */
+  #admit(identity: PlanIdentity, run: Run, expected: InvocationContext | null, claimRequeue: boolean, strict: boolean): AttemptRecord | ExecutionOutcome {
+    const item = run.plan.items[run.index]!;
+    // Admission reads the context in this same turn, so it cannot notice a change saved during an earlier item.
+    const current = this.#store.currentContext(identity);
+    // After an item, the task is still running unless someone changed its status meanwhile: then the run stops.
+    if (expected && this.#store.getTask(identity).status !== 'running')
+      return run.stopped(item.id, 'not started', `The task's status changed to ${this.#store.getTask(identity).status} during the run; ${item.id} was not started.`);
+    if (this.#store.getPlan(identity).revision !== run.plan.revision)
+      return run.stopped(item.id, 'not started', `The plan changed to a new revision during the run; review it before running ${item.id}.`);
+    if (expected && !sameContext(current, expected))
+      return run.stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
+    try {
+      return this.#runner.start(identity, {
+        expectedStateVersion: this.#store.getTask(identity).stateVersion, kind: 'execute', item: item.id,
+        expectedContext: current, deadline: Date.now() + this.#deadlineMs, ...(claimRequeue ? { claimRequeue } : {}),
+      });
+    } catch (error) {
+      if (!refusal(error) || strict) throw error;
+      return run.stopped(item.id, 'not started', error instanceof Error ? error.message : String(error));
+    }
+  }
+  /** The rest of a run once its first item is admitted: each item settles, then the next is admitted. */
+  async #continue(identity: PlanIdentity, run: Run): Promise<ExecutionOutcome> {
+    const { done, unchanged, stopped } = run;
+    for (;;) {
+      const item = run.plan.items[run.index]!, attempt = run.attempt;
       await this.#runner.settled(identity);
       const row = this.#store.getAttempt(identity, attempt.id);
       // Only the runner's own audit records a finding; it wins over any later stale or stop outcome. The terminal write
@@ -348,10 +405,13 @@ export class ItemExecutor {
       if (result.outOfScope.length) return this.#pause(identity, row, result, stopped, done);
       const snapshotId = result.unchanged ? row.context.snapshotId : this.#store.snapshotWithHead(identity, result.head);
       if (!snapshotId) throw new Error(`The snapshot of ${item.id}'s commit is missing.`);
+      if (++run.index >= run.plan.items.length) return { kind: 'executed', items: done, unchanged };
       // The item's own commit (recordHistory) raised the context generation by exactly one; any other change is not ours.
-      expected = { ...row.context, snapshotId, stateVersion: row.context.stateVersion + (result.unchanged ? 0 : 1) };
+      const expected = { ...row.context, snapshotId, stateVersion: row.context.stateVersion + (result.unchanged ? 0 : 1) };
+      const next = this.#admit(identity, run, expected, false, false);
+      if (!('id' in next)) return next;
+      run.attempt = next;
     }
-    return { kind: 'executed', items: done, unchanged };
   }
   /**
    * A safety finding sends the task to needs human (plan-format.md, "After each run"). From running, queued or a review

@@ -76,6 +76,29 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   const identity = config.identity;
+  /**
+   * What `start` or `resume` would run (#91 part 2), or the refusal. It writes nothing, so the view asks it too and never
+   * offers what the action would refuse. `start` runs a task that is in review or queued and has attempted no item of its
+   * plan revision; `resume` continues a task that has (or that recovery left to requeue) from its first unfinished item,
+   * whether its last item completed, failed or was stopped.
+   */
+  const runChoice = (action: 'start' | 'resume') => {
+    if (!executor) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
+    const task = service.store.getTask(identity), { begun, next } = executor.progress(identity);
+    if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
+    if (runner!.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
+    if (service.store.latestCheckpoint(identity)) throw new GuardRefusal('The task paused for a scope amendment; continuing after one is not supported yet (#88).');
+    if (action === 'start') {
+      if (begun || task.requeuePending) throw new GuardRefusal('This plan has already started running; resume the task instead.');
+      if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
+      return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
+    }
+    if (!begun && !task.requeuePending) throw new GuardRefusal('This plan has not started running yet; start the task instead.');
+    if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; resume continues a task that is running or queued.`);
+    if (!next) throw new GuardRefusal('Every item of this plan has run.');
+    return { fromItem: next, claimRequeue: task.requeuePending, queue: false };
+  };
+  const offered = (action: 'start' | 'resume') => { try { runChoice(action); return true; } catch { return false; } };
   /** Reads only task and attempt rows; never rebuilds history or the review. */
   const runnerView = () => {
     const task = service.store.getTask(identity), attempts = service.store.recentAttempts(identity, 20);
@@ -85,28 +108,39 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       && (task.status === 'running' || task.status === 'queued') && !task.requeuePending && task.cancelRequested === null
       && !status.active && !status.unresolved && !runner.unreleased && runner.runs(last.kind)
       && sameContext(last.context, service.store.currentContext(identity))
-      // A plan item is retried only by resuming its task (#91 part 2); the retry action refuses it.
+      // A plan item runs again only by resuming its task; the retry action refuses it.
       && !(executor && last.kind === 'execute');
-    return { available: !!runner, task, attempts,
+    const free = !!runner && !runner.closing && !status.unresolved && !runner.unreleased;
+    return { available: !!runner, task, attempts, startable: free && offered('start'), resumable: free && offered('resume'),
       stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved };
   };
   const runnerAction = (input: Record<string, unknown>) => {
     const { action, attemptId, expectedStateVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
-    if (!['cancel-attempt', 'retry', 'cancel-task'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
+    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
     if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
-    if (action !== 'cancel-task') assertUuidV4(attemptId, 'Attempt ID');
+    if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
     return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
+      if (action === 'start' || action === 'resume') {
+        const choice = runChoice(action);
+        // In this transaction with the admission: a refused admission rolls the move to queued back with it.
+        if (choice.queue) service.store.transitionTask(identity, expectedStateVersion as number, 'queued');
+        const begun = executor!.begin(identity, { fromItem: choice.fromItem, claimRequeue: choice.claimRequeue });
+        // The run goes on after this request; its outcome is in the task and attempt rows. A thrown storage error is the
+        // only thing not recorded there.
+        void begun.outcome.catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`));
+        return begun.attemptId ? { outcome: 'started', attemptId: begun.attemptId, item: choice.fromItem } : { outcome: 'settled' };
+      }
       if (action === 'cancel-attempt') {
         if (!runner.stop(identity, attemptId as string, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
         return { outcome: 'stopping' };
       }
       const last = service.store.getAttempt(identity, attemptId as string);
       // A plan item runs only through the executor, which pauses or escalates after it; a bare retry would skip both.
-      if (executor && last.kind === 'execute') throw new GuardRefusal('Retrying a plan item on its own is not supported; it comes with resuming the task (#91 part 2).');
+      if (executor && last.kind === 'execute') throw new GuardRefusal('A plan item is run again by resuming the task, not by retrying its attempt.');
       const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
       return { outcome: 'started', attemptId: retry.id };

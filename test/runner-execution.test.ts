@@ -1,3 +1,4 @@
+import { GuardRefusal } from '../runner/lifecycle.ts';
 import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
@@ -330,6 +331,27 @@ describe('item execution', () => {
     expect(signals).toHaveLength(1);
     expect(h.log).toEqual([]);
     expect(h.store.getAttempts(identity)[0]!.diagnostic).toMatch(/Issue retrieval timed out/);
+  });
+  it('begin admits the first item before it returns, and the rest of the run follows (#91 part 2)', async () => {
+    const h = setup();
+    const begun = h.executor.begin(identity);
+    // Admitted synchronously, inside whatever transaction the caller holds.
+    expect(h.store.getAttempts(identity).map(row => [row.id, row.item])).toEqual([[begun.attemptId, 'P1']]);
+    expect(await begun.outcome).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
+    expect(h.executor.progress(identity)).toEqual({ begun: true, completed: ['P1', 'P2'], next: null });
+  });
+  it('begin throws the admission refusal itself, where runTask reports it as not started', async () => {
+    const h = setup();
+    h.store.cancelTask(identity, h.store.getTask(identity).stateVersion, randomUUID());
+    expect(() => h.executor.begin(identity)).toThrow(GuardRefusal);
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started' });
+    expect(h.store.getAttempts(identity)).toEqual([]);
+  });
+  it('begin refuses a second run of a task while the first is still in progress', async () => {
+    const h = setup();
+    const first = h.executor.begin(identity);
+    expect(() => h.executor.begin(identity)).toThrow(/still finishing/);
+    await first.outcome;
   });
   it('commits a rename as the manifest audited it', async () => {
     const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })], { digest: 'renamed' }) } });
