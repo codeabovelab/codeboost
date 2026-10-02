@@ -1690,7 +1690,7 @@ describe('real Docker agent isolation', () => {
         mkdirSync(join(source, 'src')); writeFileSync(join(source, 'src', 'a.ts'), 'a\n');
         for (const [index, path] of paths.entries()) {
           mkdirSync(join(source, path), { recursive: true });
-          git(source, 'update-index', '--add', '--cacheinfo', `160000,${String(index + 1).repeat(40)},${path}`);
+          git(source, 'update-index', '--add', '--cacheinfo', `160000,${(index + 1).toString(16).padStart(40, '0')},${path}`);
         }
         extra?.(source);
       } });
