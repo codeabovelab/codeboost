@@ -73,7 +73,8 @@ export function gitFailure(command: string, status: number | null, output: strin
   Error & { staleLease: boolean; status: number | null } {
   // Redacted before it is cut, so a token across the cut cannot leave half of itself. The exact configured tokens go too:
   // an enterprise token need not have a known shape. A call that did not run to completion keeps its cause.
-  const detail = redact([output, status === null ? fallback : ''].filter(Boolean).join('\n'), secrets).slice(0, 400);
+  // The cause comes first, so Git's output, however long, cannot push it past the cut.
+  const detail = redact([status === null ? fallback : '', output].filter(Boolean).join('\n'), secrets).slice(0, 400);
   // GitHub's refusal of a push that changes a workflow without the workflow scope.
   const hint = command === 'push' && /refusing to allow [^\n]* to create or update workflow/i.test(output)
     ? ' The push changes .github/workflows, so the GitHub token needs the workflow scope.' : '';

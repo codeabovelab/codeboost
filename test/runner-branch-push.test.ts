@@ -267,5 +267,6 @@ describe('push invocation', () => {
     expect(redact(`a ${token} b secret-value-1 c`, ['secret-value-1', 'short'])).toBe('a [token] b [token] c');
     // A call that was killed keeps its cause beside Git's output.
     expect(gitFailure('push', null, 'partial output', 'git timed out after 120000 ms').message).toContain('timed out');
+    expect(gitFailure('push', null, 'y'.repeat(1000), 'git timed out after 120000 ms').message).toContain('timed out');
   });
 });
