@@ -37,7 +37,9 @@ const BRANCH = /^codeboost\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const REMOTE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const HOST = /^[A-Za-z0-9.-]+(?::[0-9]+)?$/;
 // GitHub token shapes, removed from any text that leaves this module in case a server or proxy echoed one back.
-const TOKEN = /\b(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})\b/g;
+const TOKEN_VARIABLES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'] as const;
+// No word boundaries: a token glued to other text (a URL, a path) is still removed.
+const TOKEN = /(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g;
 /** `gh` acts as Git's only credential helper. The empty value first clears any helper set before it. */
 export const CREDENTIAL_HELPER = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential'] as const;
 
@@ -54,13 +56,22 @@ export function pushUrl(remote: string, env: NodeJS.ProcessEnv = process.env): s
   return `https://${host}/${remote}.git`;
 }
 
+/** Remove every configured token value and every known token shape. */
+export function redact(text: string, secrets: readonly string[]): string {
+  // Longest first, so a token that contains another is removed whole.
+  for (const secret of [...secrets].filter(value => value.length >= 8).sort((a, b) => b.length - a.length)) text = text.split(secret).join('[token]');
+  return text.replace(TOKEN, '[token]');
+}
+
 /**
  * The error for a failed Git call: one line, at most 400 characters of Git's output, with any token removed. `staleLease`
  * is read from the whole output, so a long message cannot hide the push's verdict.
  */
-export function gitFailure(command: string, status: number | null, output: string, fallback = ''): Error & { staleLease: boolean; status: number | null } {
-  // A call that did not run to completion (timeout, kill) keeps its cause beside whatever Git printed.
-  const detail = [output.slice(0, 400), status === null ? fallback : ''].filter(Boolean).join('\n').replace(TOKEN, '[token]');
+export function gitFailure(command: string, status: number | null, output: string, fallback = '', secrets: readonly string[] = []):
+  Error & { staleLease: boolean; status: number | null } {
+  // Redacted before it is cut, so a token across the cut cannot leave half of itself. The exact configured tokens go too:
+  // an enterprise token need not have a known shape. A call that did not run to completion keeps its cause.
+  const detail = redact([output, status === null ? fallback : ''].filter(Boolean).join('\n'), secrets).slice(0, 400);
   // GitHub's refusal of a push that changes a workflow without the workflow scope.
   const hint = command === 'push' && /refusing to allow [^\n]* to create or update workflow/i.test(output)
     ? ' The push changes .github/workflows, so the GitHub token needs the workflow scope.' : '';
@@ -85,12 +96,10 @@ export class GitBranchPusher implements BranchPusher {
     if (!COMMIT_ID.test(input.head)) throw new Error('A full commit ID is required.');
     if (!BRANCH.test(input.branch) || input.branch.length > 255) throw new Error('Only a codeboost/ task branch can be pushed.');
     const ref = `refs/heads/${input.branch}`;
-    try { await this.#git(['cat-file', '-e', `${input.head}^{commit}`], signal); }
-    catch (error) {
-      // Only a check that ran to completion proves the commit is missing; a timeout or a kill keeps its own error.
-      if (typeof (error as { status?: unknown }).status !== 'number') throw error;
-      throw new Error(`The runner repository has no commit ${input.head}.`);
-    }
+    // Git answers "<id> missing" for an absent object; any other failure (no repository, permissions) keeps Git's error.
+    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`));
+    if (found === `${input.head} missing`) throw new Error(`The runner repository has no commit ${input.head}.`);
+    if (found !== `${input.head} commit`) throw new Error(`${input.head} is not a commit in the runner repository.`);
     const remote = await this.#read(ref, signal);
     // Already there: a push whose outcome was lost, or a retry. Nothing to do.
     if (remote === input.head) return;
@@ -122,16 +131,16 @@ export class GitBranchPusher implements BranchPusher {
     return matches[0]?.[0] ?? null;
   }
 
-  async #git(args: readonly string[], signal?: AbortSignal, remote = false): Promise<string> {
+  async #git(args: readonly string[], signal?: AbortSignal, remote = false, input?: Buffer): Promise<string> {
     const protocol = this.#url.startsWith('/') ? 'file' : 'https';
     const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false',
       ...remote ? ['-c', `protocol.${protocol}.allow=always`, ...CREDENTIAL_HELPER] : [], ...args],
     { cwd: this.#config.repository.path, env: pushEnvironment(this.#config.env), timeoutMs: this.#config.timeoutMs ?? 120_000,
-      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024 });
+      signal, onProcessGroup: this.#config.onProcessGroup, maxBuffer: 1024 * 1024, input });
     // Aborted before or while Git ran: the caller's reason (such as shutdown) is what leaves, not Git's failure.
     signal?.throwIfAborted();
     if (outcome.status !== 0) throw gitFailure(args[0]!, outcome.status, [outcome.stderr.trim(), outcome.stdout.trim()].filter(Boolean).join('\n'),
-      outcome.error?.message);
+      outcome.error?.message, TOKEN_VARIABLES.flatMap(name => (this.#config.env ?? process.env)[name] ?? []));
     return outcome.stdout.trim();
   }
 }

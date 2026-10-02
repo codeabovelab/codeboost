@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { GH_ENV_ALLOWLIST } from '../github/gh-env.ts';
-import { BranchPushRefused, CREDENTIAL_HELPER, GitBranchPusher, gitFailure, pushEnvironment, pushUrl } from '../runner/branch-push.ts';
+import { BranchPushRefused, CREDENTIAL_HELPER, GitBranchPusher, gitFailure, pushEnvironment, pushUrl, redact } from '../runner/branch-push.ts';
 import { ensureCommit, fetchTaskCommit, openRunnerRepository, type RunnerRepository } from '../runner/runner-repository.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
@@ -194,6 +194,26 @@ describe('GitBranchPusher', () => {
     await expect(p.instance.push(IDENTITY, { head, branch: BRANCH })).rejects.toThrow(`After the push, the branch ${BRANCH} is at nothing, not ${head}`);
   });
 
+  it('reports a broken runner repository as itself, not as a missing commit', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'one'), broken = join(s.root, 'not-a-repository');
+    mkdirSync(broken);
+    const error = await pusher(s, { repository: { path: broken, source: s.source } }).instance.push(IDENTITY, { head, branch: BRANCH })
+      .then(() => new Error('pushed'), (e: unknown) => e as Error);
+    expect(error.message).toContain('git cat-file failed');
+    expect(error.message).not.toContain('has no commit');
+    expect(remoteRefs(s)).toBe('');
+  });
+
+  it('removes a configured enterprise token of any shape from Git\'s error text', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'one'), token = 'enterprise-secret-0123456789';
+    const missing = new GitBranchPusher({ repository: s.repository, repositoryId: 'repo-1', remote: 'acme/app',
+      url: join(s.root, token), ownedCommits: () => [], env: { ...process.env, GH_ENTERPRISE_TOKEN: token } });
+    const error = await missing.push(IDENTITY, { head, branch: BRANCH }).then(() => new Error('pushed'), (e: unknown) => e as Error);
+    expect(error.message).toContain('git ls-remote failed');
+    expect(error.message).not.toContain(token);
+    expect(error.message).not.toContain('0123456789');
+  });
+
   it('removes a token from Git\'s error text', async () => {
     const s = await setup(), head = await runnerCommit(s, 'one'), token = `ghp_${'A'.repeat(36)}`;
     const missing = new GitBranchPusher({ repository: s.repository, repositoryId: 'repo-1', remote: 'acme/app',
@@ -239,6 +259,12 @@ describe('push invocation', () => {
     // A name that merely contains the word is not GitHub's refusal, and only a push can be refused for it.
     expect(gitFailure('ls-remote', 128, "fatal: unable to access 'https://github.com/acme/workflow-engine.git/'").message).not.toContain('workflow scope');
     expect(gitFailure('ls-remote', 128, 'refusing to allow an OAuth App to create or update workflow').message).not.toContain('workflow scope');
+    // A token across the 400-character cut leaves no part of itself.
+    const token = `ghp_${'C'.repeat(36)}`;
+    const cut = gitFailure('push', 1, `${'x'.repeat(390)}${token}`);
+    expect(cut.message).not.toContain('ghp_');
+    expect(cut.message).toContain('[token]');
+    expect(redact(`a ${token} b secret-value-1 c`, ['secret-value-1', 'short'])).toBe('a [token] b [token] c');
     // A call that was killed keeps its cause beside Git's output.
     expect(gitFailure('push', null, 'partial output', 'git timed out after 120000 ms').message).toContain('timed out');
   });
