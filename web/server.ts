@@ -31,6 +31,8 @@ export const MAX_SHUTDOWN_DRAIN_MS = 14_500;
  */
 export type RunnerSetup = (service: ReviewService, capability: ShutdownCapability) => Promise<RunnerAssembly>;
 export const RUNNER_NOT_CONFIGURED = 'The runner is not configured. Add a runner block to the review configuration and restart codeboost.';
+/** Demos never run the runner, whatever their configuration says. */
+export const RUNNER_NOT_IN_DEMO = 'Demos do not run the runner. Use a review configuration with a runner block.';
 export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planning?: PlanningDeps, runnerSetup?: RunnerSetup) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
@@ -97,7 +99,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
-      if (!runner) throw new GuardRefusal(RUNNER_NOT_CONFIGURED);
+      if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
       if (action === 'cancel-attempt') {
         if (!runner.stop(identity, attemptId as string, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
         return { outcome: 'stopping' };

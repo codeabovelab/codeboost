@@ -5,7 +5,7 @@ import { request as httpRequest } from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
-import { RUNNER_NOT_CONFIGURED, startServer } from '../web/server.ts';
+import { RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
 import { ReviewService } from '../runner/review.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
@@ -220,7 +220,7 @@ describe('/api/runner', () => {
     const view = (await api(app, 'GET', '/api/runner')).body;
     expect(view).toMatchObject({ available: false, retryable: false, stopRequested: null, unresolved: null, task: { status: 'in review' } });
     const refused = await api(app, 'POST', '/api/runner', { action: 'retry', attemptId: randomUUID(), expectedStateVersion: view.stateVersion, actionId: randomUUID() });
-    expect(refused).toMatchObject({ status: 409, body: { error: RUNNER_NOT_CONFIGURED } });
+    expect(refused).toMatchObject({ status: 409, body: { error: RUNNER_NOT_IN_DEMO } });
   });
   it('replays cancel task by action ID, refuses a reused ID, and answers 400 for a malformed ID', async () => {
     const { app } = await serve();

@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
-import { RUNNER_NOT_CONFIGURED, startServer } from '../web/server.ts';
+import { RUNNER_NOT_CONFIGURED, RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
 import { claudeLauncher, dRecoveryDeps, ISSUE_REUSE_MS, parseRunnerConfig, RUNNER_CREDENTIAL_MISSING, setUpRunner } from '../runner/production.ts';
 import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
@@ -190,15 +190,17 @@ describe('server with a runner setup', () => {
     expect(await response.json()).toEqual({ error: expect.stringMatching(/Retrying a plan item on its own is not supported/) });
     expect(app.service.store.getAttempts(demo.identity)).toHaveLength(1);
   });
-  it('reports a missing runner block on a runner action', async () => {
-    const { demo } = fixture();
-    const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000);
-    cleanups.push(() => app.close());
-    const task = await (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as { stateVersion: number; available: boolean };
-    expect(task.available).toBe(false);
-    const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
-      body: JSON.stringify({ action: 'retry', attemptId: randomUUID(), expectedStateVersion: task.stateVersion, actionId: randomUUID() }) });
-    expect(await response.json()).toEqual({ error: RUNNER_NOT_CONFIGURED });
+  it('tells a review without a runner block to add one, and a demo that it never runs the runner', async () => {
+    for (const [demoMode, message] of [[false, RUNNER_NOT_CONFIGURED], [true, RUNNER_NOT_IN_DEMO]] as const) {
+      const { demo } = fixture();
+      const app = await startServer({ ...demo, demo: demoMode }, 0, undefined, undefined, 2_000);
+      cleanups.push(() => app.close());
+      const task = await (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as { stateVersion: number; available: boolean };
+      expect(task.available).toBe(false);
+      const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'retry', attemptId: randomUUID(), expectedStateVersion: task.stateVersion, actionId: randomUUID() }) });
+      expect(await response.json()).toEqual({ error: message });
+    }
   });
 });
 
