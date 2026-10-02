@@ -1,0 +1,15 @@
+{
+  "schema_version": 1,
+  "issue": 412,
+  "revision": 3,
+  "summary": "Synthetic planning acceptance fixture, not recorded vendor output.",
+  "items": [{
+    "id": "P1",
+    "title": "Clarify example behavior",
+    "intent": "Make the example predictable.",
+    "files": [{ "path": "src/example.ts", "kind": "edit", "renamed_from": null, "change": "Clarify the example return value." }],
+    "acceptance": [{ "type": "cmd", "text": "npm test" }],
+    "depends_on": []
+  }],
+  "questions": []
+}
