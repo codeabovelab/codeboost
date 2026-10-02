@@ -1685,8 +1685,9 @@ describe('real Docker agent isolation', () => {
 
   describe('pre-launch tree check and gitlink mounts (#81)', () => {
     // A base commit with gitlinks, which the non-recursive task clone leaves as empty directories.
-    const withGitlinks = (paths: readonly string[], extra?: (source: string) => void, beforeSeed?: (clone: string) => void) =>
-      fixture({ beforeSeed, hostile: source => {
+    const withGitlinks = (paths: readonly string[], extra?: (source: string) => void, beforeSeed?: (clone: string) => void,
+      limits?: Parameters<typeof prepareTaskFilesystems>[1]) =>
+      fixture({ beforeSeed, limits, hostile: source => {
         mkdirSync(join(source, 'src')); writeFileSync(join(source, 'src', 'a.ts'), 'a\n');
         for (const [index, path] of paths.entries()) {
           mkdirSync(join(source, path), { recursive: true });
@@ -1713,8 +1714,8 @@ describe('real Docker agent isolation', () => {
         linkSnapshot: await snapshotDeclaredLinks(data.filesystems, [], { imageId }), imageId });
       expect(manifest.nestedGitlinkContent).toEqual([]);
       expect(manifest.changes.map(change => change.path)).toEqual(['beside.txt']);
-      // The mount cannot stop a parent of a nested gitlink being renamed (the mount moves with it) and a new directory
-      // made at the old path; the inspection after the run reports that content.
+      // Inspection only: content at a nested gitlink path, as an agent can leave by renaming a parent during the run
+      // (#99), is reported after it. This runs without the mounts, so it does not test the runtime gap itself.
       asAgent(data.filesystems, 'mv deps deps2 && mkdir -p deps/inner && printf nested > deps/inner/x');
       const moved = await inspectTaskChanges(data.filesystems, { base: data.clone.head,
         linkSnapshot: await snapshotDeclaredLinks(data.filesystems, [], { imageId }), imageId });
@@ -1776,6 +1777,20 @@ describe('real Docker agent isolation', () => {
       expect(await refusal(checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId })))
         .toEqual([expect.stringMatching(/^the tree cannot be checked whole \(".*bad\\\\x01name.*"\)$/)]);
     }, 180_000);
+
+    it('refuses an unreadable directory and more changes than it reports, as refusals too', async () => {
+      // Exit 6: a directory the check cannot list may hold anything.
+      const locked = withGitlinks([]);
+      asAgent(locked.filesystems, 'mkdir hidden && touch hidden/x && chmod 000 hidden');
+      expect(await refusal(checkTaskTree(locked.filesystems, { base: locked.clone.head, operations: [], imageId })))
+        .toEqual([expect.stringMatching(/^the tree cannot be checked whole \(".*could not read directory hidden.*"\)$/)]);
+      // Exit 9: more than MAXIMUM_CHANGES untracked entries cannot be listed whole.
+      const crowded = withGitlinks([], undefined, undefined,
+        { workBytes: 64 * 1024 * 1024, workInodes: MAXIMUM_CHANGES + 2048, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 });
+      asAgent(crowded.filesystems, `mkdir many && cd many && seq 0 ${MAXIMUM_CHANGES} | xargs touch`);
+      expect(await refusal(checkTaskTree(crowded.filesystems, { base: crowded.clone.head, operations: [], imageId })))
+        .toEqual([expect.stringMatching(/^the tree cannot be checked whole \(".*more than 10000 new entries.*"\)$/)]);
+    }, 300_000);
 
     it('uses each check for one profile only, over its own storage and head', async () => {
       const data = withGitlinks(['sm']), other = withGitlinks(['sm']);
