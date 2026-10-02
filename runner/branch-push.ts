@@ -36,9 +36,10 @@ const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const BRANCH = /^codeboost\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const REMOTE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const HOST = /^[A-Za-z0-9.-]+(?::[0-9]+)?$/;
-// GitHub token shapes, removed from any text that leaves this module in case a server or proxy echoed one back.
+// The variables whose values `gh` may authenticate with; their exact values are removed from error text.
 const TOKEN_VARIABLES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'] as const;
-// No word boundaries: a token glued to other text (a URL, a path) is still removed.
+// GitHub token shapes, removed from any text that leaves this module in case a server or proxy echoed one back. No word
+// boundaries: a token glued to other text (a URL, a path) is still removed.
 const TOKEN = /(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g;
 /** `gh` acts as Git's only credential helper. The empty value first clears any helper set before it. */
 export const CREDENTIAL_HELPER = ['-c', 'credential.helper=', '-c', 'credential.helper=!gh auth git-credential'] as const;
@@ -58,7 +59,8 @@ export function pushUrl(remote: string, env: NodeJS.ProcessEnv = process.env): s
 
 /** Remove every configured token value and every known token shape. */
 export function redact(text: string, secrets: readonly string[]): string {
-  // Longest first, so a token that contains another is removed whole.
+  // Longest first, so a token that contains another is removed whole. A value under 8 characters is not a real token,
+  // and removing it would garble ordinary words in the message.
   for (const secret of [...secrets].filter(value => value.length >= 8).sort((a, b) => b.length - a.length)) text = text.split(secret).join('[token]');
   return text.replace(TOKEN, '[token]');
 }
