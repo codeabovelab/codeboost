@@ -50,12 +50,13 @@ if (values.help || (!values.demo && !values.config)) {
     for (const entry of recovery.unknownEntries) console.error(`Unknown entry in the runner's attempt directory, left in place: ${entry}`);
     return assembly;
   } : undefined;
-  // Startup recovery must not be cut off part way (a half-saved diagnostic, a leftover export container): a stop asked for
-  // during startup takes effect once it has finished.
+  // A first stop during startup waits for startup recovery to finish, so it is not cut off part way. A second one stops at
+  // once: that is a crash to recovery, which the next start runs again. A terminal Ctrl+C also reaches an agent image
+  // build in progress (it shares the terminal), which then fails and ends startup.
   let stopping = false;
   const duringStartup = () => {
-    if (stopping) { console.log('Still starting; codeboost stops once startup recovery has finished.'); return; }
-    stopping = true; console.log('Stopping once startup recovery has finished…');
+    if (stopping) { console.error('Stopped during startup. The next start recovers what this one left.'); process.exit(130); }
+    stopping = true; console.log('Stopping once startup has finished. Press Ctrl+C again to stop now.');
   };
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, duringStartup);
   let app: Awaited<ReturnType<typeof startServer>>;

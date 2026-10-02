@@ -160,12 +160,13 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const issues = new GhIssueGateway(review.github.repository);
   /**
    * The last issue text read, reused for ISSUE_REUSE_MS: a plan's items run one after another and would otherwise each
-   * read the issue, every collaborator page and every comment page again. Only a completed read is kept.
+   * read the issue, every collaborator page and every comment page again. Only a completed read is kept. The window is
+   * measured on the monotonic clock, so a wall-clock step back cannot stretch it.
    */
   let lastRead: { number: number; at: number; text: IssueText } | null = null;
   const issueText = async (number: number, signal: AbortSignal): Promise<IssueText> => {
-    if (lastRead && lastRead.number === number && Date.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
-    const at = Date.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000 });
+    if (lastRead && lastRead.number === number && performance.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
+    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000 });
     lastRead = { number, at, text };
     return text;
   };

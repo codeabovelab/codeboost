@@ -91,8 +91,12 @@ describe('runner startup', () => {
     const signal = new AbortController().signal, identity = service.config.identity;
     await sources.issue(identity, signal); await sources.issue(identity, signal);
     expect(issueReads).toHaveLength(1);
-    const now = Date.now();
-    vi.spyOn(Date, 'now').mockReturnValue(now + ISSUE_REUSE_MS + 1);
+    // A wall-clock step back does not keep the old text.
+    vi.spyOn(Date, 'now').mockReturnValue(0);
+    await sources.issue(identity, signal);
+    expect(issueReads).toHaveLength(1);
+    const now = performance.now();
+    vi.spyOn(performance, 'now').mockReturnValue(now + ISSUE_REUSE_MS + 1);
     await sources.issue(identity, signal);
     expect(issueReads).toHaveLength(2);
   });
