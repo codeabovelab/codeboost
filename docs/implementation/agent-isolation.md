@@ -36,6 +36,7 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
 | Mountpoint replacement fails | `agent-container`: metadata and metadata alias probes (`mv` and `rm -rf` of `.git`) |
 | Both vendor startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes (credentials required): Codex in review through its output file; Claude in questions through its stdout envelope; Claude in planning returns a schema-constrained answer as bare JSON. **Known failure:** the Codex probes (here and in `agent-container`) fail, because Codex cannot read files in any phase (see [Codex in read-only phases](#codex-in-read-only-phases)). |
+| Nothing can be written beneath a gitlink, and execute and fix launch only on a clean tree (#81) | `agent-container`: the gitlink probe (writes, `mkdir`, `rmdir` and `mv` at every gitlink fail; the rest of `/work` stays writable); a pre-populated nested checkout, a restart with an untracked symlink parent and a restart with an occupied add destination are refused; a gitlink name Docker cannot mount, more than 256 gitlinks and an unreadable tree are refused; each check serves one profile over its own storage and head; the validator rejects a gitlink mount that is missing, writable, or of another size or mode |
 | Hostile input stays inside the boundary | `agent-container`: repositories with links that leave the checkout are refused, links inside the checkout still work, oversized repositories fail closed; `agent-policy`: option-like prompts; `agent-proxy`: hostile CONNECT traffic; `agent-supervisor`: hostile output |
 
 ## Why the gate can fail
@@ -110,6 +111,24 @@ Use only these entry points to run an agent:
      the target and everything beneath it. A link on the way, a target that is a link, or a link inside a directory
      target shows as `through-link`. Do not launch an item with a `through-link` declared link: a write through it
      lands somewhere its target does not cover. Keep the result.
+   - **Just before launch (execute and fix)**, call `checkTaskTree(storage, { base, operations, imageId })` with the
+     item's file operations (`{ kind, path, renamedFrom }`) and `base`, the clone's head (#81). It runs the inspection
+     below with no declared links, and refuses with `TaskTreeRefused` unless the work tree is exactly the tree of
+     `base`: no untracked or ignored entry, no changed content, mode or type (a directory replaced by a symlink shows
+     here), nothing in a gitlink directory, `HEAD` at `base`, and the metadata as seeded. It then checks each operation
+     against that tree: an add or rename destination is free, an edit, delete or rename source is a file or symlink
+     (never a gitlink), and no declared path lies beneath a file, symlink or gitlink. It also refuses when a gitlink
+     cannot get its mount: more than 256 gitlinks, or a name with a comma or a double quote, which Docker's `--mount`
+     cannot take. A tree it cannot read whole (an unreadable entry, a name the manifest cannot carry, more than
+     10,000 changes) is refused too. `differences` lists every reason, with paths quoted. A refusal gives the same
+     answer on retry, so a person must look. Any other error is the check failing to run.
+
+     Pass the result as `treeCheck` in the start call's request. An execute or fix profile requires it; a read-only
+     phase refuses one. The profile adds an empty read-only tmpfs (`--mount type=tmpfs,target=/work/<path>,readonly,
+     tmpfs-mode=0555,tmpfs-size=4096`) at every gitlink the check listed, and the validator allows exactly those mounts,
+     each read-only with that size and mode. A check serves one profile, over the storage and head it was made for: a
+     copy, a second use, other storage or another head is refused, so check again before every invocation, retries
+     included.
    - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
      change manifest: every difference between the work tree and `base`, read without following links, with content
      IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
@@ -359,3 +378,10 @@ against real Docker, including two reviews with different Ask owners on one daem
   fail until Codex can read files in its phases; that failure is expected, not a
   regression.
 - T9 as a whole is complete only when lane F runs every suite in required CI (F6).
+- Gitlink mounts and the pre-launch check apply to execute and fix only. In planning, questions and review, `/work`
+  is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run
+  as review. Running an item's `cmd` in a writable task filesystem is not built yet; when it is, each run must call
+  `checkTaskTree` and get the same mounts before it starts.
+- The mount keeps a gitlink directory empty, but an agent can still rename a parent directory of a nested gitlink
+  (the mount moves with it) and create a new directory at the old path. The inspection after the run reports that
+  directory's content as nested gitlink content, so the task goes to needs human. #99 tracks enforcing this during the run.

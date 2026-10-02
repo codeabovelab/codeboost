@@ -6,6 +6,7 @@ import { join } from 'node:path';
 import { assertCapturedInvocation, type InvocationInput, type Phase, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, taskFilesystemOwner, type TaskFilesystems } from './storage.ts';
+import { useTaskTreeCheck, type TaskTreeCheck } from './changes.ts';
 import { ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
   type VendorNetwork } from '../network/network.ts';
@@ -24,6 +25,8 @@ export interface ContainerProfile {
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
   readonly deferredOutput: boolean;
+  /** Execute and fix: every gitlink path, each covered by an empty read-only tmpfs. Empty in read-only phases. */
+  readonly gitlinks: readonly string[];
 }
 export interface ProfileOptions {
   readonly invocation: InvocationInput;
@@ -36,6 +39,11 @@ export interface ProfileOptions {
   readonly network: VendorNetwork;
   readonly policy: PhasePolicy;
   readonly deferredOutput?: boolean;
+  /**
+   * Execute and fix only, and required there: what `checkTaskTree` returned for these filesystems at the clone's head,
+   * just before this launch. Each check serves one profile.
+   */
+  readonly treeCheck?: TaskTreeCheck;
   /** Remaining invocation budget for Docker-backed profile validation. */
   readonly timeoutMs?: number;
   /** Cancels creation; whatever was staged is removed before the promise rejects. */
@@ -214,6 +222,9 @@ const safeName = (value: string) => {
   const prefix = value.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 24);
   return `${prefix}-${createHash('sha256').update(value).digest('hex').slice(0, 16)}`;
 };
+/** The size and mode of the empty read-only tmpfs at each gitlink path. */
+export const GITLINK_MOUNT_BYTES = 4096;
+export const GITLINK_MOUNT_MODE = '0555';
 const mount = (parts: Record<string, string | boolean>) => Object.entries(parts)
   .map(([key, value]) => value === true ? key : `${key}=${value}`).join(',');
 const mountSource = (path: string, kind: string) => {
@@ -277,6 +288,10 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     }
     const name = `codeboost-agent-${safeName(invocation.attemptId)}`, ownershipId = randomUUID();
     const readOnlyWork = ['planning', 'questions', 'review'].includes(invocation.phase);
+    // In a read-only phase nothing can be written beneath a gitlink, and no check is made. Execute and fix use theirs
+    // up: the next profile needs a new check, made just before its own launch.
+    if (readOnlyWork && options.treeCheck) throw new Error('Only an execute or fix profile takes a pre-launch tree check.');
+    const gitlinks = readOnlyWork ? [] : useTaskTreeCheck(options.treeCheck, filesystems, invocation.clone.head);
     const args = ['create', '--name', name, '--read-only', '--user', '10001:10001', '--cap-drop=ALL',
       '--security-opt=no-new-privileges', '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=128', '--memory=512m', '--memory-swap=512m',
       '--cpus=1', '--shm-size=16m', '--ipc=private', '--cgroupns=private',
@@ -293,7 +308,10 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       '--tmpfs', '/home/codeboost:rw,nosuid,nodev,size=1048576,nr_inodes=128,uid=10001,gid=10001,mode=0700',
       '--mount', mount({ type: 'volume', source: filesystems.workVolume, target: '/work', readonly: readOnlyWork }),
       '--mount', mount({ type: 'volume', source: filesystems.metadataVolume, target: '/work/.git', readonly: true }),
-      '--mount', mount({ type: 'bind', source: inputIdentity.inputDirectory, target: '/run/codeboost-input', readonly: true })];
+      '--mount', mount({ type: 'bind', source: inputIdentity.inputDirectory, target: '/run/codeboost-input', readonly: true }),
+      // Each gitlink is an empty directory (the check proved it): an empty read-only tmpfs over it keeps it empty.
+      ...gitlinks.flatMap(path => ['--mount', mount({ type: 'tmpfs', target: `/work/${path}`, readonly: true,
+        'tmpfs-mode': GITLINK_MOUNT_MODE, 'tmpfs-size': String(GITLINK_MOUNT_BYTES) })])];
     if (options.deferredOutput) {
       if (invocation.vendor !== 'codex') throw new Error('Deferred output is available only for Codex.');
       args.push('--env', 'CODEBOOST_DEFERRED_OUTPUT=1',
@@ -311,7 +329,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       phase: invocation.phase, vendor: invocation.vendor,
       filesystems: capturedFilesystems, inputDirectory: inputIdentity.inputDirectory, codexAuthFile,
       command: Object.freeze([...command]), ownershipId, network: options.network, policy: options.policy,
-      deferredOutput: options.deferredOutput === true });
+      deferredOutput: options.deferredOutput === true, gitlinks: Object.freeze([...gitlinks]) });
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,

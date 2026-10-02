@@ -1,5 +1,6 @@
 import { constants } from 'node:buffer';
 import { createHash } from 'node:crypto';
+import { DockerError } from '../docker.ts';
 import { resolveMetadataBaseline, runStorageScript, type RecoveredTaskStorage, type StorageScriptOptions,
   type TaskFilesystems } from './storage.ts';
 import { MAXIMUM_CHANGES, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, MAXIMUM_TARGET_ENTRIES, MAXIMUM_TREE_OUTPUT,
@@ -348,6 +349,164 @@ export async function inspectTaskChanges(storage: TaskFilesystems | RecoveredTas
     args: ['-e', TREE_SCRIPT, 'inspect', input.baseline, options.base, ...input.linkArgs] },
   { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
   return manifestOf(options.base, input, JSON.parse(stdout));
+}
+
+/** One file operation a plan item declares, as the plan names it (`renamedFrom` only for a rename). */
+export interface DeclaredOperation {
+  readonly kind: 'add' | 'edit' | 'delete' | 'rename';
+  readonly path: string;
+  readonly renamedFrom?: string | null;
+}
+export interface TreeCheckOptions extends StorageScriptOptions {
+  /** The recorded head the storage was seeded from: the clone's head. */
+  readonly base: string;
+  /** The item's file operations, checked against the tree of `base`. */
+  readonly operations: readonly DeclaredOperation[];
+  /** As for `inspectTaskChanges`. */
+  readonly metadataBaseline?: string;
+}
+/**
+ * What `checkTaskTree` found, for the execute or fix profile of the same storage. Each check is one-shot: one profile
+ * uses it, and the next invocation needs a new check.
+ */
+export interface TaskTreeCheck {
+  readonly base: string;
+  /** Every gitlink of `base`, each an empty directory now; each gets an empty read-only mount. */
+  readonly gitlinks: readonly string[];
+}
+/**
+ * The item must not launch on this storage: the tree is not a clean copy of the head, an operation does not fit the
+ * head, or a gitlink cannot be mounted. Each entry of `differences` says why. A person must look; retrying the same
+ * head and plan gives the same answer.
+ */
+export class TaskTreeRefused extends Error {
+  readonly differences: readonly string[];
+  constructor(differences: readonly string[]) {
+    const shown = differences.slice(0, 10).join('; ');
+    super(`The pre-launch tree check refused: ${shown}${differences.length > 10
+      ? `; and ${differences.length - 10} more` : ''}.`);
+    this.name = 'TaskTreeRefused';
+    this.differences = Object.freeze([...differences]);
+  }
+}
+/** The most gitlinks one profile mounts; a head with more refuses the launch. */
+export const MAXIMUM_GITLINK_MOUNTS = 256;
+// The storage each check was made over, and whether a profile has used it.
+const treeChecks = new WeakMap<TaskTreeCheck, { filesystems: TaskFilesystems; used: boolean }>();
+// Docker reads `--mount` as comma-separated fields that a double quote can open: a name with either cannot be mounted
+// exactly where it is.
+const unmountable = (path: string) => /[,"]/.test(path);
+const KINDS = new Set(['add', 'edit', 'delete', 'rename']);
+interface DeclaredFact { readonly path: string; readonly type: EntryType | 'absent'; readonly blockedBy?: string;
+  readonly blockedByType?: EntryType }
+
+// Why the storage is not a fresh copy of `base`: every change, nested content, commit or metadata difference.
+function treeDifferences(manifest: TaskChangeManifest): string[] {
+  if (manifest.metadataChanged) return ['the Git metadata differs from what the seeder recorded'];
+  const q = JSON.stringify, found: string[] = [];
+  if (manifest.agentCommits.length) found.push('HEAD is not the recorded head');
+  for (const change of manifest.changes) {
+    if (change.kind === 'add') found.push(`${q(change.path)} is a ${change.newType} the head does not have`);
+    else if (change.kind === 'delete') found.push(`${q(change.path)} is missing`);
+    else if (change.kind === 'rename') found.push(`${q(change.path)} is ${q(change.oldPath)} moved`);
+    else if (change.oldType !== change.newType) found.push(`${q(change.path)} is a ${change.newType} where the head has a ${change.oldType}`);
+    else found.push(`${q(change.path)} differs from the head`);
+  }
+  for (const path of manifest.nestedGitlinkContent) found.push(`gitlink ${q(path)} has content or cannot be read`);
+  return found;
+}
+
+/**
+ * Check task storage immediately before an execute or fix invocation (plan-format.md, "Clean invocation state" and
+ * "Submodules in version 1"): read without following links, the work tree must be exactly the tree of `base` (no
+ * untracked or ignored entry, no changed type or content, nothing in a gitlink directory, HEAD at `base`, metadata as
+ * seeded), and each declared operation must fit that tree: an add or rename destination is free, an edit, delete or
+ * rename source is a file or symlink, and no declared path lies beneath a file, symlink or gitlink. It refuses with
+ * `TaskTreeRefused` otherwise, and when a gitlink cannot be given its empty read-only mount (more than
+ * `MAXIMUM_GITLINK_MOUNTS`, or a name Docker cannot take). Runs the inspection's read-only, no-network container.
+ * The result is the capability `createContainerProfile` needs for an execute or fix profile over this storage.
+ */
+export async function checkTaskTree(storage: TaskFilesystems, options: TreeCheckOptions): Promise<TaskTreeCheck> {
+  if (typeof options.base !== 'string' || !COMMIT_ID.test(options.base)) throw new Error('base must be a full commit ID.');
+  const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
+  if (!Array.isArray(options.operations)) throw new Error('Declared operations must be a list.');
+  const operations = options.operations.map(operation => {
+    const { kind, path, renamedFrom } = operation ?? {} as DeclaredOperation;
+    if (!KINDS.has(kind)) throw new Error(`Declared operation kind ${JSON.stringify(kind)} is not add, edit, delete or rename.`);
+    assertDeclaredPath(path);
+    if (kind === 'rename') assertDeclaredPath(renamedFrom);
+    else if (renamedFrom !== undefined && renamedFrom !== null) throw new Error('Only a rename has renamedFrom.');
+    return { kind, path, renamedFrom: kind === 'rename' ? renamedFrom! : undefined };
+  });
+  const paths = [...new Set(operations.flatMap(operation => [operation.path, ...operation.renamedFrom ? [operation.renamedFrom] : []]))];
+  if (paths.length > MAXIMUM_DECLARED_LINKS) throw new Error(`At most ${MAXIMUM_DECLARED_LINKS} declared paths are checked.`);
+  assertArguments(paths);
+  let stdout: string;
+  try {
+    stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Pre-launch tree check',
+      consequence: 'the task tree cannot be checked', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
+      memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
+      args: ['-e', TREE_SCRIPT, 'prelaunch', baseline, options.base, ...paths] },
+    { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
+  } catch (error) {
+    // The script found the tree itself unfit: something it cannot read (6), a name the manifest cannot carry (8), or
+    // too many changes or too much output (9). A fresh copy of the head has none of these, so each is a refusal like
+    // any other difference, not a failure to run. Its message escapes every name it shows.
+    if (error instanceof DockerError && [6, 8, 9].includes(error.status ?? -1)) {
+      const reason = error.stderr.trim().split('\n').at(-1)!.slice(0, 512);
+      throw new TaskTreeRefused([`the tree cannot be checked whole (${JSON.stringify(reason)})`]);
+    }
+    throw error;
+  }
+  const output = JSON.parse(stdout) as InspectOutput & { metadataOnly?: boolean; gitlinks?: unknown; declared?: unknown };
+  const manifest = manifestOf(options.base, { baseline, links: [], recorded: {}, linkArgs: [] }, output);
+  const differences = treeDifferences(manifest);
+  if (manifest.metadataChanged) throw new TaskTreeRefused(differences);
+  const gitlinks = output.gitlinks, declared = output.declared as DeclaredFact[] | undefined;
+  if (!Array.isArray(gitlinks) || gitlinks.some(path => { try { assertDeclaredPath(path); return false; } catch { return true; } })
+    || !Array.isArray(declared)
+    || declared.length !== paths.length || declared.some((fact, index) => fact?.path !== paths[index]))
+    throw new Error('The pre-launch tree check returned an unexpected result.');
+  const facts = new Map(declared.map(fact => [fact.path, fact]));
+  const q = JSON.stringify;
+  for (const operation of operations) {
+    const sources = operation.kind === 'add' ? [] : [operation.renamedFrom ?? operation.path];
+    const destinations = operation.kind === 'add' || operation.kind === 'rename' ? [operation.path] : [];
+    for (const path of [...sources, ...destinations]) {
+      const fact = facts.get(path)!;
+      if (fact.blockedBy !== undefined) differences.push(`${q(path)} lies beneath the ${fact.blockedByType} ${q(fact.blockedBy)}`);
+    }
+    for (const path of sources) {
+      const type = facts.get(path)!.type;
+      if (type === 'gitlink') differences.push(`${q(path)} is a gitlink, which a plan item cannot change`);
+      else if (type !== 'file' && type !== 'symlink') differences.push(`${operation.kind} source ${q(path)} is ${type === 'absent' ? 'missing' : `a ${type}`}`);
+    }
+    for (const path of destinations) {
+      const type = facts.get(path)!.type;
+      if (type !== 'absent') differences.push(`${operation.kind} destination ${q(path)} is occupied by a ${type}`);
+    }
+  }
+  if (gitlinks.length > MAXIMUM_GITLINK_MOUNTS)
+    differences.push(`the head has ${gitlinks.length} gitlinks, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be mounted`);
+  for (const path of gitlinks as string[]) if (unmountable(path)) differences.push(`gitlink ${q(path)} has a name Docker cannot mount`);
+  if (differences.length) throw new TaskTreeRefused([...new Set(differences)]);
+  const check = Object.freeze({ base: options.base, gitlinks: Object.freeze([...gitlinks as string[]]) });
+  treeChecks.set(check, { filesystems: storage, used: false });
+  return check;
+}
+
+/**
+ * For the profile builder: the gitlinks of a check `checkTaskTree` made over these filesystems at `base`, marking it
+ * used. Refuses a copied, reused or mismatched check.
+ */
+export function useTaskTreeCheck(check: TaskTreeCheck | undefined, filesystems: TaskFilesystems, base: string): readonly string[] {
+  const record = check ? treeChecks.get(check) : undefined;
+  if (!record) throw new Error('An execute or fix profile requires a pre-launch tree check from checkTaskTree.');
+  if (record.filesystems !== filesystems || check!.base !== base)
+    throw new Error('The pre-launch tree check was made over other task storage or another head.');
+  if (record.used) throw new Error('The pre-launch tree check was already used; check the tree again before each invocation.');
+  record.used = true;
+  return check!.gitlinks;
 }
 
 /** The most bundle bytes a runner commit returns; a larger one fails the commit. */

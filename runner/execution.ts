@@ -4,7 +4,7 @@ import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } 
 import { prepareExecution } from '../core/execution-prompt.ts';
 import { neutralizeMentions, neutralizeReferences } from '../core/pull-request-body.ts';
 import { auditRun, type ChangeManifest } from '../core/run-audit.ts';
-import type { DeclaredLinkSnapshot } from '../agents/container/changes.ts';
+import { TaskTreeRefused, type DeclaredLinkSnapshot, type DeclaredOperation, type TaskTreeCheck } from '../agents/container/changes.ts';
 import { saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
 import { FinishFailure, NEEDS_RESTART, PreparationFailure, type PreparedAttempt, type RunnerCoordinator, type RunnerDeps } from './coordinator.ts';
@@ -24,6 +24,12 @@ export interface TaskWorkspace {
    * path the item declares: an earlier item may have renamed or added links, so only D sees the actual entries.
    */
   snapshotDeclaredLinks(workspace: WorkspaceRef, paths: readonly string[], signal: AbortSignal): Promise<DeclaredLinkSnapshot>;
+  /**
+   * D's pre-launch tree check (#81, `checkTaskTree`), the last step before launch: the work tree is exactly the tree of
+   * `baseHead` and the item's operations fit it. It rejects with `TaskTreeRefused` when they do not. The result is the
+   * capability the agent's profile needs to mount every gitlink empty and read-only; it serves one launch.
+   */
+  checkTree(workspace: WorkspaceRef, input: { baseHead: string; operations: readonly DeclaredOperation[] }, signal: AbortSignal): Promise<TaskTreeCheck>;
   /** D's change manifest after the agent settled (`TaskChangeManifest`), with the digest the commit step must match. */
   inspectChanges(workspace: WorkspaceRef, input: { baseHead: string; linkSnapshot: DeclaredLinkSnapshot }, signal: AbortSignal): Promise<ChangeManifest & { digest: string }>;
   /**
@@ -44,8 +50,8 @@ export interface TaskWorkspace {
   /** Remove host-side preparation files (the staging clone). Called before the terminal write when D never ran, after it otherwise. */
   cleanupPreparation?(attempt: AttemptRecord): Promise<void>;
 }
-/** D's start call for an execute/fix phase with this prompt; returns at once (see #51). */
-export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: WorkspaceRef) => InvocationHandle;
+/** D's start call for an execute/fix phase with this prompt and the tree check made for it; returns at once (see #51). */
+export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: WorkspaceRef, treeCheck: TaskTreeCheck) => InvocationHandle;
 /** Trusted runner-side sources for a task. Issue text and lessons are untrusted data inside the prompt. */
 export interface ExecutionSources {
   planContext(identity: PlanIdentity): PlanContext;
@@ -88,7 +94,8 @@ export class SafetyFindings {
   settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
-interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined }
+interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined;
+  treeCheck: TaskTreeCheck | undefined }
 
 /**
  * RunnerDeps for execute attempts: fresh workspace, prompt, agent, then audit and the runner's own commit.
@@ -139,7 +146,7 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
       // From here task storage exists: a failure hands it to the coordinator, which removes it after the terminal write.
-      const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined };
+      const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined, treeCheck: undefined };
       const prepared = { clone: ws.clone, vendor, approvedArgv: request.approvedArgv, private: data };
       try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredPaths, signal); }
       catch (error) { throw new PreparationFailure(error, prepared); }
@@ -152,11 +159,23 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
         findings.record(attempt.id, text);
         throw new PreparationFailure(new Error(text), prepared);
       }
+      // Last, just before launch (plan-format.md, "Clean invocation state"): no agent runs until the actual tree is the
+      // head's and the item's operations fit it. A refusal (a tree that is not a clean copy, an operation the head does
+      // not allow, a gitlink that cannot be mounted) gives the same answer on retry, so it goes to a person.
+      const operations = item.files.map(file => ({ kind: file.kind, path: file.path, renamedFrom: file.renamed_from }));
+      try { data.treeCheck = await workspace.checkTree(ws, { baseHead, operations }, signal); }
+      catch (error) {
+        if (!(error instanceof TaskTreeRefused)) throw new PreparationFailure(error, prepared);
+        // The differences name agent-reachable paths: D quotes each one.
+        const text = bounded(`${SAFETY_VIOLATION} ${error.message}`);
+        findings.record(attempt.id, text);
+        throw new PreparationFailure(new Error(text), prepared);
+      }
       return prepared;
     },
     // Host-side files only (the staging clone); task storage waits for release.
     async cleanupPreparation(attempt) { await workspace.cleanupPreparation?.(attempt); },
-    start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace); },
+    start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace, data.treeCheck!); },
     validate() { throw new Error('Execute attempts publish through finish().'); },
     async finish(attempt, _result, prepared, signal) {
       const data = prepared.private as Private, identity = identityOf(attempt);
