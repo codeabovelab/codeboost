@@ -163,7 +163,14 @@ export class Store {
   }
   close(): void { this.#db.close(); }
   #get(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).get(...args); }
-  #run(sql: string, ...args: SQLInputValue[]) { this.#checkWrite(); return this.#db.prepare(sql).run(...args); }
+  #run(sql: string, ...args: SQLInputValue[]) {
+    this.#checkWrite();
+    // Some errors (for example a full disk) make SQLite roll back on its own. If the caller caught one, a later write must
+    // not autocommit on its own while the rest of the transaction is lost.
+    if (this.#depth > 0 && !this.#db.isTransaction)
+      throw Object.assign(new Error('SQLite rolled back the transaction after an earlier error.'), { code: 'ERR_SQLITE_ERROR' });
+    return this.#db.prepare(sql).run(...args);
+  }
   // Shutdown write gate (runner-lifecycle.md, "Shutdown" step 1).
   #gateClosed = false; #privileged = 0; #capabilityIssued = false;
   #checkWrite(): void { if (this.#gateClosed && this.#privileged === 0) throw new ShuttingDownError(); }
@@ -179,14 +186,40 @@ export class Store {
   #depth = 0;
   /** The user action whose transaction is open, so its events can prove they belong to it. */
   #action: { key: string; actionId: string } | null = null;
+  /** Callbacks waiting for the outermost transaction to end, in the order they were registered. */
+  #pending: { commit: () => void; rollback?: () => void }[] = [];
   /** Nested calls join the outer transaction, so a user action can wrap existing Store methods atomically. */
   #transaction<T>(fn: () => T): T {
     if (this.#depth > 0) { this.#depth++; try { return fn(); } finally { this.#depth--; } }
     this.#checkWrite();
     this.#db.exec('BEGIN IMMEDIATE'); this.#depth = 1;
-    try { const result = fn(); this.#db.exec('COMMIT'); return result; }
-    catch (error) { this.#db.exec('ROLLBACK'); throw error; }
-    finally { this.#depth = 0; }
+    let result: T, committed = false;
+    try { result = fn(); this.#db.exec('COMMIT'); committed = true; }
+    // A failed COMMIT may already have rolled back (for example a full disk); ROLLBACK would then hide the real error.
+    catch (error) { if (this.#db.isTransaction) this.#db.exec('ROLLBACK'); throw error; }
+    finally {
+      this.#depth = 0;
+      if (this.#pending.length) {
+        const pending = this.#pending; this.#pending = [];
+        for (const entry of pending) Store.#callback(committed ? entry.commit : entry.rollback);
+      }
+    }
+    return result;
+  }
+  /** A callback runs after the transaction has ended; a throw must not make a committed write look failed. */
+  static #callback(fn: (() => void) | undefined): void {
+    if (!fn) return;
+    try { fn(); } catch (error) { console.error(`A transaction callback failed: ${JSON.stringify(bounded(error instanceof Error ? error.message : String(error)))}`); }
+  }
+  /**
+   * Run `commit` once the writes made so far are durable: at once outside a transaction (a throw then reaches the
+   * caller), otherwise after the outermost transaction commits (a throw is logged). If it rolls back instead, including
+   * when COMMIT itself fails, `commit` is dropped and `rollback` runs. Lets a caller apply an in-memory effect that cannot
+   * be undone only once the write that records it has committed (#79).
+   */
+  afterCommit(commit: () => void, rollback?: () => void): void {
+    if (this.#depth === 0) commit();
+    else this.#pending.push({ commit, rollback });
   }
   #current(key: string) {
     const row = this.#get('SELECT * FROM plans WHERE key=?', key);

@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator, type PreparedAttempt, type RunnerDeps, type StartRequest } from '../runner/coordinator.ts';
@@ -679,5 +680,125 @@ describe('cancel task, limits and shutdown', () => {
     launches[0]!.settle();
     await closing;
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
+  });
+});
+
+describe('stops inside the caller\'s transaction (#79)', () => {
+  async function running() {
+    const s = setup();
+    const attempt = s.runner.start(A, request(s.store, A));
+    await until(() => s.preparations.length === 1, 'preparation'); s.preparations[0]!.resolve();
+    await until(() => s.launches.length === 1, 'launch');
+    return { ...s, attempt };
+  }
+  const rolledBack = (store: Store, kind: string, fn: () => void) => expect(() => store.userAction(A, { actionId: randomUUID(), kind, request: {} }, () => {
+    fn(); throw new Error('commit failed');
+  })).toThrow(/commit failed/);
+
+  it('leaves D running and the task open when a cancel task rolls back', async () => {
+    const { store, runner, launches, attempt } = await running();
+    rolledBack(store, 'cancel-task', () => expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping'));
+    await tick();
+    expect(launches[0]!.cancels).toEqual([]);
+    expect(runner.status(A).stopRequested).toBeNull();
+    launches[0]!.settle();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'completed', firstReason: null, result: { text: 'done' } });
+    expect(store.getTask(A)).toMatchObject({ status: 'running', cancelRequested: null });
+  });
+  it('leaves D running when a plain stop rolls back, and a later stop still works', async () => {
+    const { store, runner, launches, attempt } = await running();
+    rolledBack(store, 'cancel-attempt', () => expect(runner.stop(A, attempt.id, 'stale', 'plan revision 2 replaced 1')).toBe(true));
+    await tick();
+    expect(launches[0]!.cancels).toEqual([]);
+    expect(runner.status(A).stopRequested).toBeNull();
+    expect(store.getAttempt(A, attempt.id).firstReason).toBeNull();
+    expect(runner.stop(A, attempt.id, 'cancelled')).toBe(true);
+    expect(launches[0]!.cancels).toEqual(['cancelled']);
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+  });
+  it('leaves D running when the cancel task\'s COMMIT fails', async () => {
+    const { store, runner, launches, attempt } = await running();
+    const exec = DatabaseSync.prototype.exec;
+    const spy = vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql === 'COMMIT') throw Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR' });
+      return exec.call(this, sql);
+    });
+    try {
+      expect(() => store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+        expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+      })).toThrow(/disk I\/O error/);
+    } finally { spy.mockRestore(); }
+    expect(launches[0]!.cancels).toEqual([]);
+    expect(runner.status(A).stopRequested).toBeNull();
+    launches[0]!.settle();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'completed', firstReason: null });
+    expect(store.getTask(A)).toMatchObject({ status: 'running', cancelRequested: null });
+  });
+  it('does not abort preparation when a stop during preparation rolls back', async () => {
+    const { store, runner, preparations, launches } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    rolledBack(store, 'cancel-task', () => runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID()));
+    expect(preparations[0]!.signal.aborted).toBe(false);
+    preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    launches[0]!.settle();
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id).state).toBe('completed');
+  });
+  it('cancels D only after a committed cancel task commits', async () => {
+    const { store, runner, launches, attempt } = await running();
+    store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+      expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+      expect(launches[0]!.cancels).toEqual([]);
+      expect(runner.status(A).stopRequested).toBeNull();
+    });
+    expect(launches[0]!.cancels).toEqual(['cancelled']);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'cancelled', saved: true });
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+    expect(store.getTask(A).status).toBe('cancelled');
+  });
+  it('lets the first stop in a transaction win while its commit is pending', async () => {
+    const { store, runner, launches, attempt } = await running();
+    store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+      expect(runner.stop(A, attempt.id, 'stale', 'plan revision 2 replaced 1')).toBe(true);
+      expect(runner.stop(A, attempt.id, 'cancelled')).toBe(false);
+      expect(runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID())).toBe('stopping');
+      expect(launches[0]!.cancels).toEqual([]);
+    });
+    expect(launches[0]!.cancels).toEqual(['cancelled']);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'stale', saved: true });
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale', diagnostic: 'plan revision 2 replaced 1' });
+    expect(store.getTask(A).status).toBe('cancelled');
+  });
+  it('shows the stop as unsaved when the durable reason cannot be read after the commit', async () => {
+    const { store, runner, launches, attempt } = await running();
+    store.userAction(A, { actionId: randomUUID(), kind: 'cancel-task', request: {} }, () => {
+      runner.cancelTask(A, store.getTask(A).stateVersion, randomUUID());
+      vi.spyOn(store, 'getAttempt').mockImplementationOnce(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    });
+    expect(launches[0]!.cancels).toEqual(['cancelled']);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'cancelled', saved: false });
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+  });
+  it('still stops D at once when the reason write fails with a storage error, even if the action then rolls back', async () => {
+    const { store, runner, launches, attempt } = await running();
+    vi.spyOn(store, 'recordFirstReason').mockImplementationOnce(() => { throw Object.assign(new Error('disk'), { code: 'ERR_SQLITE_ERROR' }); });
+    rolledBack(store, 'cancel-attempt', () => expect(runner.stop(A, attempt.id, 'cancelled')).toBe(true));
+    expect(launches[0]!.cancels).toEqual(['cancelled']);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'cancelled', saved: false });
+    launches[0]!.settle({ exitCode: 1, stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
   });
 });
