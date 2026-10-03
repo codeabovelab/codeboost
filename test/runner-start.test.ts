@@ -221,6 +221,11 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume')).body.error).toMatch(/time budget has run out/);
     expect(store.getTask(identity).status).toBe('needs human');
   });
+  it('points start to resume for a running task whose only attempts were at an earlier revision', async () => {
+    const { app } = await serve({ before: service => { failedFirstItem(service); revise(service); } });
+    expect(await view(app)).toMatchObject({ startable: false, resumable: true });
+    expect((await act(app, 'start')).body.error).toMatch(/resume the task instead/);
+  });
   it('names the status, not resume, when start is refused for a task resume cannot run either', async () => {
     const { app } = await serve({ before: service => {
       failedFirstItem(service);
@@ -270,7 +275,10 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       findings.record(earlier, 'Safety violation: test');
       service.store.recordSafetyFinding = save;
     } });
+    const before = store.getTask(identity).stateVersion, moves = vi.spyOn(store, 'transitionTask');
     expect((await act(app, 'start')).body.result).toEqual({ outcome: 'settled' });
+    // Queued first, then escalated from queued, both in the one action.
+    expect(moves.mock.calls.map(call => [call[1], call[2]])).toEqual([[before, 'queued'], [before + 1, 'needs human']]);
     expect(store.getTask(identity).status).toBe('needs human');
     expect(store.getAttempts(identity)).toHaveLength(1);
   });

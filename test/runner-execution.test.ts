@@ -376,6 +376,21 @@ describe('item execution', () => {
     expect(() => h.executor.begin(identity)).toThrow(ShuttingDownError);
     expect(h.store.getAttempts(identity)).toEqual([]);
   });
+  it('begin pays nothing owed once the runner stopped admission, and the finding stays owed', () => {
+    const h = setup();
+    const attempt = h.store.admitAttempt(identity, { expectedStateVersion: h.store.getTask(identity).stateVersion, kind: 'execute', item: 'P1',
+      expectedContext: h.store.currentContext(identity), deadline: Date.now() + 60_000 });
+    h.store.markRunning(identity, attempt.id);
+    h.store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
+    const save = h.store.recordSafetyFinding;
+    h.store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+    h.findings.record(attempt.id, 'Safety violation: test');
+    h.store.recordSafetyFinding = save;
+    h.runner.rejectAdmission();
+    expect(() => h.executor.begin(identity)).toThrow(ShuttingDownError);
+    expect(h.store.getTask(identity).status).toBe('running');
+    expect(h.findings.get(attempt.id)).toBe('Safety violation: test');
+  });
   it('begin refuses a second run of a task while the first is still in progress', async () => {
     const h = setup();
     const first = h.executor.begin(identity);

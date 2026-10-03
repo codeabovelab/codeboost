@@ -796,7 +796,8 @@ export class Store {
     const key = identityKey(identity), rev = "json_extract(context,'$.planRevision')";
     const row = this.#get(`SELECT COUNT(*) > 0 AS started, COALESCE(SUM(${rev} = ?), 0) > 0 AS begun
       FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL`, revision, key)!;
-    // Any writable kind's commit counts, as for hasRunnerCommit; a result that is not valid JSON counts as a commit (fail closed).
+    // Any writable kind's commit counts, as for hasRunnerCommit. Unlike it, a completed result that does not say it is unchanged
+    // (not valid JSON, or no `unchanged` field) counts as a commit: this check refuses a run, so it fails closed.
     const earlier = this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')})
       AND state='completed' AND ${rev} != ? AND (NOT json_valid(result) OR COALESCE(json_extract(result,'$.unchanged'), 0) = 0) LIMIT 1`,
       key, ...WRITABLE_KINDS, revision);
