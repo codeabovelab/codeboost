@@ -74,6 +74,8 @@ export interface SlotLimits { readonly writable: number; readonly readOnly: numb
 export interface StartRequest {
   expectedStateVersion: number; kind: AttemptKind; item?: string | null; deadline: number; budgetMs?: number; retryOf?: string;
   expectedContext: AttemptRecord['context'];
+  /** Clears the task's requeue claim in the admitting transaction: the user's Resume of an interrupted task. */
+  claimRequeue?: boolean;
 }
 export interface RunnerStatus {
   active: boolean;

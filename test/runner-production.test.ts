@@ -192,7 +192,7 @@ describe('server with a runner setup', () => {
     expect(view.retryable).toBe(false);
     const response = await fetch(`${origin}/api/runner`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ action: 'retry', attemptId: view.attempts[0]!.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() }) });
-    expect(await response.json()).toEqual({ error: expect.stringMatching(/Retrying a plan item on its own is not supported/) });
+    expect(await response.json()).toEqual({ error: expect.stringMatching(/run again by resuming the task/) });
     expect(app.service.store.getAttempts(demo.identity)).toHaveLength(1);
   });
   it('tells a review without a runner block to add one, and a demo that it never runs the runner', async () => {
