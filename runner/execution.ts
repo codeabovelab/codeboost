@@ -374,8 +374,12 @@ export class ItemExecutor {
     // After an item, the task is still running unless someone changed its status meanwhile: then the run stops.
     if (expected && this.#store.getTask(identity).status !== 'running')
       return run.stopped(item.id, 'not started', `The task's status changed to ${this.#store.getTask(identity).status} during the run; ${item.id} was not started.`);
-    if (this.#store.getPlan(identity).revision !== run.plan.revision)
-      return run.stopped(item.id, 'not started', `The plan changed to a new revision during the run; review it before running ${item.id}.`);
+    if (this.#store.getPlan(identity).revision !== run.plan.revision) {
+      const reason = `The plan changed to a new revision during the run; review it before running ${item.id}.`;
+      // A strict begin reads the plan in this same turn, so this cannot fire there; if it ever did, it must refuse, not settle.
+      if (strict) throw new GuardRefusal(reason);
+      return run.stopped(item.id, 'not started', reason);
+    }
     if (expected && !sameContext(current, expected))
       return run.stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
     try {

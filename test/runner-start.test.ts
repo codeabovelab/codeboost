@@ -57,14 +57,16 @@ function failedFirstItem(service: ReviewService, budgetMs?: number) {
 }
 
 /** Before the runner exists: as failedFirstItem, but the first item completed and made a runner commit. */
-function committedFirstItem(service: ReviewService) {
+function committedFirstItem(service: ReviewService, unchanged = false) {
   const s = service.store, id = service.config.identity;
   s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
   const item = s.getPlan(id).items[0]!.id, snapshot = s.getSnapshot(id), head = 'f'.repeat(40);
   const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item,
     expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
   s.markRunning(id, attempt.id);
-  s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head, unchanged: false, inScope: [], outOfScope: [] },
+  // As finish() returns it: an unchanged item makes no commit, so it has no history.
+  if (unchanged) s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+  else s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head, unchanged: false, inScope: [], outOfScope: [] },
     history: { base: snapshot.base, head, entries: [{ sha: head, owner: item, origin: 'owned', sourceSha: null }] } });
 }
 /** Save a new plan revision, as a person editing the plan does. */
@@ -152,6 +154,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[0] });
     expect(store.getAttempts(identity).at(-1)!.context.planRevision).toBe(store.getPlan(identity).revision);
   });
+  it('does not count an earlier item that completed unchanged as a commit, and reruns it at the new revision', async () => {
+    const { app, items } = await serve({ before: service => { committedFirstItem(service, true); revise(service); } });
+    expect(await view(app)).toMatchObject({ resumable: true });
+    // Completed at the earlier revision only: the new revision still starts at its first item.
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[0] });
+  });
   it('refuses both, in the view and the action alike, once an earlier revision left commits (#88)', async () => {
     const { app } = await serve({ before: service => { committedFirstItem(service); revise(service); } });
     expect(await view(app)).toMatchObject({ startable: false, resumable: false });
@@ -199,9 +207,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     const { app, identity, store } = await serve();
     // Shutdown step 1 for the runner, with the HTTP server still open: the request reaches the action itself.
     app.runner!.rejectAdmission();
-    const refused = await act(app, 'start');
+    const actionId = randomUUID();
+    const refused = await act(app, 'start', { actionId });
     expect(refused.status).toBe(503);
     expect(store.getTask(identity).status).toBe('in review');
     expect(store.getAttempts(identity)).toEqual([]);
+    // Not recorded: the same action ID is refused afresh (503 again), never replayed as a saved refusal.
+    expect((await act(app, 'start', { actionId })).status).toBe(503);
   });
 });

@@ -79,8 +79,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   /**
    * What `start` or `resume` would run (#91 part 2), or the refusal. It writes nothing, so the view asks it too and never
    * offers what the action would refuse. `start` runs a task that is in review or queued and has attempted no item of its
-   * plan revision; `resume` continues a task that has (or that recovery left to requeue) from its first unfinished item,
-   * whether its last item completed, failed or was stopped.
+   * current plan revision; `resume` continues a running or queued task that attempted an item at any revision (or that
+   * recovery left to requeue), from the first item the current revision has not completed, whether its last item
+   * completed, failed or was stopped. A queued task with only earlier-revision attempts may take either; both run the
+   * same items.
    */
   const runChoice = (action: 'start' | 'resume', forView = false) => {
     if (!executor) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
@@ -101,7 +103,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // attempts that committed nothing (failed, stopped, stale or unchanged) leave nothing to reconcile.
     if (!begun && earlierCommits) throw new GuardRefusal('The plan was revised after items of it were committed; running a revised plan on top of those commits is not supported yet (#88).');
     if (action === 'start') {
-      if (started || task.requeuePending) throw new GuardRefusal('This plan has already started running; resume the task instead.');
+      if (begun || task.requeuePending) throw new GuardRefusal('This plan revision has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
       return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
     }
