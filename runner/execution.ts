@@ -292,15 +292,16 @@ export class ItemExecutor {
     return { attemptId: begun.attempt.id, outcome: this.#track(key, this.#continue(identity, begun)) };
   }
   /**
-   * Where a run of the task's current plan revision stands: whether any item was attempted at this revision, the items
+   * Where a run of the task's current plan revision stands: whether any item was attempted at this revision (and at an
+   * earlier one, which leaves commits a revised plan must be reconciled with, #88), the items
    * an execute attempt completed, and the first item none did (null when every item has run). What `start` and `resume`
    * decide from (#91 part 2).
    */
-  progress(identity: PlanIdentity): { begun: boolean; completed: string[]; next: string | null } {
-    const plan = this.#store.getPlan(identity);
-    const attempted = this.#store.getAttempts(identity).filter(row => row.kind === 'execute' && row.context.planRevision === plan.revision && row.item);
+  progress(identity: PlanIdentity): { begun: boolean; earlierRevision: boolean; completed: string[]; next: string | null } {
+    const plan = this.#store.getPlan(identity), executed = this.#store.getAttempts(identity).filter(row => row.kind === 'execute' && row.item);
+    const attempted = executed.filter(row => row.context.planRevision === plan.revision);
     const finished = new Set(attempted.filter(row => row.state === 'completed').map(row => row.item!));
-    return { begun: attempted.length > 0, completed: plan.items.filter(item => finished.has(item.id)).map(item => item.id),
+    return { begun: attempted.length > 0, earlierRevision: executed.some(row => row.context.planRevision !== plan.revision), completed: plan.items.filter(item => finished.has(item.id)).map(item => item.id),
       next: plan.items.find(item => !finished.has(item.id))?.id ?? null };
   }
   /** Held in #inFlight from its start to its return, so close() can await it. */
@@ -359,7 +360,7 @@ export class ItemExecutor {
   }
   /**
    * Admit `run.plan.items[run.index]`. `expected` is the context the previous item left (null for the first). A refusal
-   * ends the run as not started, or, with `strict`, is thrown as it is (so a refusal's effect commits with the caller's).
+   * ends the run as not started, or, with `strict`, is thrown as it is, for the caller's user action to record.
    */
   #admit(identity: PlanIdentity, run: Run, expected: InvocationContext | null, claimRequeue: boolean, strict: boolean): AttemptRecord | ExecutionOutcome {
     const item = run.plan.items[run.index]!;
@@ -451,7 +452,8 @@ export class ItemExecutor {
       if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);
     }
-    this.#findings.settle(row.id);
+    // Inside a caller's transaction (begin, #91 part 2) the move can still roll back; the finding stays owed until it commits.
+    this.#store.afterCommit(() => this.#findings.settle(row.id));
     return { kind: 'needs human', item, reason: violation, completed: [...done] };
   }
   /** The earliest completed execute attempt whose out-of-scope files have no checkpoint yet (its pause was lost). */

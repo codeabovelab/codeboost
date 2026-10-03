@@ -338,13 +338,34 @@ describe('item execution', () => {
     // Admitted synchronously, inside whatever transaction the caller holds.
     expect(h.store.getAttempts(identity).map(row => [row.id, row.item])).toEqual([[begun.attemptId, 'P1']]);
     expect(await begun.outcome).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
-    expect(h.executor.progress(identity)).toEqual({ begun: true, completed: ['P1', 'P2'], next: null });
+    expect(h.executor.progress(identity)).toEqual({ begun: true, earlierRevision: false, completed: ['P1', 'P2'], next: null });
   });
   it('begin throws the admission refusal itself, where runTask reports it as not started', async () => {
     const h = setup();
     h.store.cancelTask(identity, h.store.getTask(identity).stateVersion, randomUUID());
     expect(() => h.executor.begin(identity)).toThrow(GuardRefusal);
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started' });
+    expect(h.store.getAttempts(identity)).toEqual([]);
+  });
+  it('keeps a safety finding owed when the user action around begin rolls back after the escalation', () => {
+    const h = setup();
+    const attempt = h.store.admitAttempt(identity, { expectedStateVersion: h.store.getTask(identity).stateVersion, kind: 'execute', item: 'P1',
+      expectedContext: h.store.currentContext(identity), deadline: Date.now() + 60_000 });
+    h.store.markRunning(identity, attempt.id);
+    h.store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
+    const save = h.store.recordSafetyFinding;
+    h.store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+    h.findings.record(attempt.id, 'Safety violation: test');
+    h.store.recordSafetyFinding = save;
+    // The escalation's write rolls back with the action, so the finding must still be owed afterwards.
+    expect(() => h.store.userAction(identity, { actionId: randomUUID(), kind: 'resume', request: {} }, () => { h.executor.begin(identity); throw new Error('commit failed'); })).toThrow(/commit failed/);
+    expect(h.store.getTask(identity).status).toBe('running');
+    expect(h.findings.get(attempt.id)).toBe('Safety violation: test');
+  });
+  it('begin throws ShuttingDownError once the runner stopped admission', () => {
+    const h = setup();
+    h.runner.rejectAdmission();
+    expect(() => h.executor.begin(identity)).toThrow(ShuttingDownError);
     expect(h.store.getAttempts(identity)).toEqual([]);
   });
   it('begin refuses a second run of a task while the first is still in progress', async () => {

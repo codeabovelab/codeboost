@@ -84,10 +84,19 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
    */
   const runChoice = (action: 'start' | 'resume') => {
     if (!executor) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
-    const task = service.store.getTask(identity), { begun, next } = executor.progress(identity);
+    const task = service.store.getTask(identity), { begun, earlierRevision, next } = executor.progress(identity);
+    // Checked in the order a person can act on: a closed task first, then what admission would refuse.
+    if (task.status === 'merged' || task.status === 'cancelled') throw new GuardRefusal(`The task is ${task.status}.`);
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
+    if (!runner!.runs('execute')) throw new GuardRefusal('The runner cannot run execute attempts yet.');
     if (runner!.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
+    const merge = service.store.getMergeAttempt(identity);
+    if (merge && (merge.state === 'submitting' || merge.state === 'queued')) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) throw new GuardRefusal('The task time budget has run out; it needs a person.');
     if (service.store.latestCheckpoint(identity)) throw new GuardRefusal('The task paused for a scope amendment; continuing after one is not supported yet (#88).');
+    // Items an earlier revision ran are commits the revised plan has not been reconciled with (plan-format.md): rerunning
+    // the plan on top of them could redo or contradict that work, so it waits for #88 rather than guessing.
+    if (!begun && earlierRevision) throw new GuardRefusal('The plan was revised after it started running; running a revised plan on top of the earlier items is not supported yet (#88).');
     if (action === 'start') {
       if (begun || task.requeuePending) throw new GuardRefusal('This plan has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
@@ -129,8 +138,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         // In this transaction with the admission: a refused admission rolls the move to queued back with it.
         if (choice.queue) service.store.transitionTask(identity, expectedStateVersion as number, 'queued');
         const begun = executor!.begin(identity, { fromItem: choice.fromItem, claimRequeue: choice.claimRequeue });
-        // The run goes on after this request; its outcome is in the task and attempt rows. A thrown storage error is the
-        // only thing not recorded there.
+        // The run goes on after this request; its outcome is in the task and attempt rows. An error the run throws (storage,
+        // a missing snapshot) is only logged, and the next start or resume derives what is owed again.
         void begun.outcome.catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`));
         return begun.attemptId ? { outcome: 'started', attemptId: begun.attemptId, item: choice.fromItem } : { outcome: 'settled' };
       }
