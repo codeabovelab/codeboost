@@ -1,4 +1,5 @@
 import { ghEnvironment } from './gh-env.ts';
+import { dataJSON, MAX_PROMPT_BYTES } from '../core/planning-author.ts';
 import { runWithInput } from './run-with-input.ts';
 
 const PAGE_SIZE = 100;
@@ -6,8 +7,6 @@ const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
 const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
-/** The most issue text (title, body and the collaborator comments kept) one execute prompt carries. */
-const MAX_ISSUE_TEXT = 512 * 1024;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
 /**
@@ -252,7 +251,11 @@ export class GhIssueGateway implements IssueGateway {
       const title = boundedString(issue.title, 'title', 4096), body = boundedString(issue.body, 'body', MAX_BODY_LENGTH, true);
       const collaborators = await this.#loadCollaborators(signal);
       const comments: string[] = [];
-      let total = title.length + body.length;
+      // The execute prompt carries the issue as one JSON data block of at most MAX_PROMPT_BYTES (dataJSON). A running byte
+      // count stops reading early; the exact check below uses the prompt's own serializer, so an issue accepted here is
+      // one the prompt can carry.
+      const tooLong = () => new Error(`Issue #${number}'s title, body and collaborator comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
+      let total = Buffer.byteLength(title) + Buffer.byteLength(body);
       for (let page = 1; ; page++) {
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
           `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });
@@ -270,13 +273,16 @@ export class GhIssueGateway implements IssueGateway {
           const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
           if (!collaborators.has(author.toLocaleLowerCase('en-US'))) continue;
           const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
-          total += text.length;
-          if (total > MAX_ISSUE_TEXT) throw new Error(`Issue #${number}'s text and collaborator comments are longer than ${MAX_ISSUE_TEXT} characters; codeboost does not cut an issue to fit a prompt.`);
+          total += Buffer.byteLength(text);
+          if (total > MAX_PROMPT_BYTES) throw tooLong();
           comments.push(text);
         }
         if (values.length < PAGE_SIZE) break;
       }
-      return { number, title, body, comments };
+      const text = { number, title, body, comments };
+      // Only the size refusal is reworded; any other (text with a NUL, for one) keeps its own reason.
+      try { dataJSON(text, 'Issue data'); } catch (error) { throw /exceeds/.test((error as Error).message) ? tooLong() : error; }
+      return text;
     });
   }
 
