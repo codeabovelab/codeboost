@@ -155,10 +155,32 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity).at(-1)!.context.planRevision).toBe(store.getPlan(identity).revision);
   });
   it('does not count an earlier item that completed unchanged as a commit, and reruns it at the new revision', async () => {
-    const { app, items } = await serve({ before: service => { committedFirstItem(service, true); revise(service); } });
-    expect(await view(app)).toMatchObject({ resumable: true });
+    const { app, identity, store, items } = await serve({ before: service => { committedFirstItem(service, true); revise(service); } });
+    expect(await view(app)).toMatchObject({ resumable: true, startable: false });
     // Completed at the earlier revision only: the new revision still starts at its first item.
     expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[0] });
+    expect(store.getAttempts(identity).at(-1)!.context.planRevision).toBe(store.getPlan(identity).revision);
+  });
+  it('lets a task whose only attempts were at an earlier, uncommitted revision start again from review', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      failedFirstItem(service); revise(service);
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'in review');
+    } });
+    expect(await view(app)).toMatchObject({ startable: true, resumable: false });
+    expect((await act(app, 'start')).body.result).toMatchObject({ outcome: 'started', item: items[0] });
+    expect(store.getAttempts(identity).at(-1)!.context.planRevision).toBe(store.getPlan(identity).revision);
+  });
+  it('offers a queued task with only earlier-revision attempts both actions, which run the same item', async () => {
+    for (const action of ['start', 'resume']) {
+      const { app, items } = await serve({ before: service => {
+        failedFirstItem(service); revise(service);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      } });
+      expect(await view(app)).toMatchObject({ startable: true, resumable: true });
+      expect((await act(app, action)).body.result).toMatchObject({ outcome: 'started', item: items[0] });
+    }
   });
   it('refuses both, in the view and the action alike, once an earlier revision left commits (#88)', async () => {
     const { app } = await serve({ before: service => { committedFirstItem(service); revise(service); } });
