@@ -103,8 +103,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // attempts that committed nothing (failed, stopped, stale or unchanged) leave nothing to reconcile.
     if (!begun && earlierCommits) throw new GuardRefusal('The plan was revised after items of it were committed; running a revised plan on top of those commits is not supported yet (#88).');
     if (action === 'start') {
-      if (begun || task.requeuePending) throw new GuardRefusal('This plan revision has already started running; resume the task instead.');
+      // Point to resume only where resume could run; any other status is named as it is.
+      const ran = begun || task.requeuePending;
+      if (ran && (task.status === 'running' || task.status === 'queued')) throw new GuardRefusal('This plan revision has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
+      if (ran) throw new GuardRefusal('This plan revision has already run; it is in review.');
       return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
     }
     if (!started && !task.requeuePending) throw new GuardRefusal('This plan has not started running yet; start the task instead.');

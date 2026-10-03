@@ -794,12 +794,15 @@ export class Store {
    */
   executeProgress(identity: PlanIdentity, revision: number): { started: boolean; begun: boolean; earlierCommits: boolean; finished: string[] } {
     const key = identityKey(identity), rev = "json_extract(context,'$.planRevision')";
-    const row = this.#get(`SELECT COUNT(*) > 0 AS started, COALESCE(SUM(${rev} = ?), 0) > 0 AS begun,
-      COALESCE(SUM(${rev} != ? AND state='completed' AND json_extract(result,'$.unchanged') = 0), 0) > 0 AS earlier_commits
-      FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL`, revision, revision, key)!;
+    const row = this.#get(`SELECT COUNT(*) > 0 AS started, COALESCE(SUM(${rev} = ?), 0) > 0 AS begun
+      FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL`, revision, key)!;
+    // Any writable kind's commit counts, as for hasRunnerCommit; a result that is not valid JSON counts as a commit (fail closed).
+    const earlier = this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')})
+      AND state='completed' AND ${rev} != ? AND (NOT json_valid(result) OR COALESCE(json_extract(result,'$.unchanged'), 0) = 0) LIMIT 1`,
+      key, ...WRITABLE_KINDS, revision);
     const finished = this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
       AND state='completed' AND ${rev} = ?`).all(key, revision).map(entry => entry.item as string);
-    return { started: row.started === 1, begun: row.begun === 1, earlierCommits: row.earlier_commits === 1, finished };
+    return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier, finished };
   }
   getAttempts(identity: PlanIdentity): AttemptRecord[] {
     return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));

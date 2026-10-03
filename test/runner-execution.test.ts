@@ -382,6 +382,21 @@ describe('item execution', () => {
     expect(() => h.executor.begin(identity)).toThrow(/still finishing/);
     await first.outcome;
   });
+  it('begin refuses a second run between the first run\'s items, when no attempt is active', async () => {
+    const h = setup();
+    const settled = h.runner.settled.bind(h.runner);
+    let between: unknown = null;
+    h.runner.settled = async id => {
+      await settled(id);
+      // P1's job is gone and P2 is not admitted yet: only the executor knows the run is still going.
+      if (between === null) { expect(h.runner.isActive(identity)).toBe(false); try { h.executor.begin(identity); between = 'admitted'; } catch (error) { between = error; } }
+    };
+    const first = h.executor.begin(identity);
+    expect(await first.outcome).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
+    expect(between).toBeInstanceOf(GuardRefusal);
+    expect((between as Error).message).toMatch(/still finishing/);
+    expect(h.store.getAttempts(identity).map(row => row.item)).toEqual(['P1', 'P2']);
+  });
   it('commits a rename as the manifest audited it', async () => {
     const { executor, commits } = setup({ manifests: { P1: manifest([change('a.ts', { kind: 'rename', oldPath: 'old.ts' })], { digest: 'renamed' }) } });
     await executor.runTask(identity);
