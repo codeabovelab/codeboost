@@ -293,7 +293,7 @@ export class ItemExecutor {
     // Held for the whole run, so a second run can never pay this run's pause or finding, even in the microtasks between
     // the coordinator dropping the job and this run resuming.
     if (this.#inFlight.has(key)) return { kind: 'stopped', item: options.fromItem ?? this.#store.getPlan(identity).items[0]!.id, state: 'not started',
-      reason: 'An earlier run of this task is still finishing; start it again when that run has ended.', completed: [] };
+      reason: 'An earlier run of this task is still finishing; try again when that run has ended.', completed: [] };
     const begun = this.#begin(identity, options, false);
     return this.#track(key, 'outcome' in begun ? Promise.resolve(begun.outcome) : this.#continue(identity, begun));
   }
@@ -305,7 +305,7 @@ export class ItemExecutor {
    */
   begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean } = {}): { attemptId: string | null; outcome: Promise<ExecutionOutcome> } {
     const key = identityKey(identity);
-    if (this.#inFlight.has(key)) throw new GuardRefusal('An earlier run of this task is still finishing; start it again when that run has ended.');
+    if (this.#inFlight.has(key)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     const begun = this.#begin(identity, options, true);
     if ('outcome' in begun) return { attemptId: null, outcome: this.#track(key, Promise.resolve(begun.outcome)) };
     return { attemptId: begun.attempt.id, outcome: this.#track(key, this.#continue(identity, begun)) };
@@ -354,7 +354,7 @@ export class ItemExecutor {
     // Shutdown began (admission is closed): pay nothing owed and start nothing; the next run after restart does.
     if (this.#runner.closing) return notStarted('The review server is shutting down.', new ShuttingDownError());
     // An earlier run of this task that is still finishing (its storage release) settles its own findings and pause.
-    if (this.#runner.isActive(identity)) return notStarted('An earlier run of this task is still finishing; start it again when that run has ended.');
+    if (this.#runner.isActive(identity)) return notStarted('An earlier run of this task is still finishing; try again when that run has ended.');
     // A safety finding not yet acted on (a failed write, a human gate at the time) goes to needs human first.
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);

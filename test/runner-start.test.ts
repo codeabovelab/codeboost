@@ -253,6 +253,24 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'start')).body.error).toMatch(/The task is running; start runs a task that is in review or queued/);
     expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
   });
+  it('neither offers nor admits start or resume while a run of the task is still finishing between items', async () => {
+    const { app, identity, store } = await serve({ before: service => { failedFirstItem(service); } });
+    expect(await view(app)).toMatchObject({ resumable: true });
+    // Between two items no attempt is active; only the executor knows its run is still going.
+    vi.spyOn(app.executor!, 'busy').mockReturnValue(true);
+    expect(app.runner!.isActive(identity)).toBe(false);
+    expect(await view(app)).toMatchObject({ startable: false, resumable: false });
+    expect((await act(app, 'resume')).body.error).toMatch(/still finishing; try again when that run has ended/);
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
+  it('points resume to start for a task in review whose only attempts were at an earlier, uncommitted revision', async () => {
+    const { app } = await serve({ before: service => {
+      failedFirstItem(service); revise(service);
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'in review');
+    } });
+    expect((await act(app, 'resume')).body.error).toMatch(/start the task instead/);
+  });
   it('names the status, not resume, when start is refused for a task resume cannot run either', async () => {
     const { app } = await serve({ before: service => {
       failedFirstItem(service);
@@ -345,7 +363,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity)).toEqual([]);
     expect(store.savedAction(identity, { actionId, kind: 'start', request: { attemptId: undefined, expectedStateVersion: stateVersion } })).toBeUndefined();
   });
-  it('answers 503 to a start admitted after the runner stopped admission, and rolls the queue move back', async () => {
+  it('answers 503 to a start once the runner stopped admission, and leaves the task in review', async () => {
     const { app, identity, store } = await serve();
     // Shutdown step 1 for the runner, with the HTTP server still open: the request reaches the action itself.
     app.runner!.rejectAdmission();
