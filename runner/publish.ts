@@ -147,7 +147,13 @@ export class PullRequestPublisher {
         closed.push(number);
       } catch (error) { keep(error); }
     };
-    const prs = this.#store.taskPullRequests(identity).filter(pr => pr.repository.toLowerCase() === this.#config.repository.toLowerCase());
+    const all = this.#store.taskPullRequests(identity), here = (pr: TaskPullRequest) => pr.repository.toLowerCase() === this.#config.repository.toLowerCase();
+    // A record in another repository (a rename, a transfer, a changed configuration) cannot be closed from here. It is
+    // reported, so the close is not recorded as done and stays owed; the records in this repository are still closed.
+    // A lost opening there is already refused by the recovery above.
+    for (const pr of all) if (!here(pr) && pr.state !== 'opening')
+      keep(new PullRequestMisplaced(`${pr.number === null ? 'A pull request the task was opening' : `Pull request #${pr.number}`} was opened in ${pr.repository}, not ${this.#config.repository}, so codeboost cannot close it from here. Close it on GitHub, then close the task's pull requests again.`));
+    const prs = all.filter(here);
     // An opened record is closed by its number, which nobody can edit: GitHub's list can lag behind a PR, and the gateway
     // closes it only while it is still from the task branch with its marker, wherever its base is now.
     for (const row of prs) if (row.state === 'opened' && row.number !== null) await close(row.number, row.headBranch, marker(row.openingId));

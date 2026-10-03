@@ -1266,6 +1266,16 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     await expect(publisher.closeAll(identity)).rejects.toThrow(PullRequestMisplaced);
     expect(closed.size).toBe(0);
   });
+  it('reports a PR recorded in another repository instead of recording the close as done', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    cancel(store);
+    // The configuration now names another repository (a rename or a transfer).
+    const { publisher, log } = harness(store, { live, config: { repository: 'owner/renamed' } });
+    await expect(publisher.closeAll(identity)).rejects.toThrow(PullRequestMisplaced);
+    await expect(publisher.closeAll(identity)).rejects.toThrow('Pull request #100 was opened in owner/repo, not owner/renamed');
+    expect(log).toEqual([]);
+  });
   it('closes nothing when shutdown begins between the read and the close', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>();
     await harness(store, { live }).publisher.publish(identity);
