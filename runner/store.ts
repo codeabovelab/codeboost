@@ -57,10 +57,12 @@ export function mergeActionResponse(attempt: MergeAttempt) {
  */
 export interface PublishRecord {
   outcome: string; draft: boolean; message: string; stateVersion: number; at: string; number?: number; url?: string;
+  /** `close`: the record is a cancelled task's PR close (#111), whose settled outcome is `closed`. Absent: a publish. */
+  action?: 'close';
 }
 /** What the publish action replays once its publish has settled: the outcome, as `publish.last` shows it. */
 export function publishActionResponse(record: PublishRecord) {
-  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.number === undefined ? {} : { number: record.number }),
+  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.action ? { action: record.action } : {}), ...(record.number === undefined ? {} : { number: record.number }),
     ...(record.url === undefined ? {} : { url: record.url }) };
 }
 export interface TaskRecord {
@@ -1315,7 +1317,7 @@ export class Store {
       const saved: PublishRecord = { ...record, message: record.message.slice(0, 2000), stateVersion: this.#task(key).state_version as number, at: new Date().toISOString() };
       this.#run('INSERT INTO publish_outcomes (plan_key,data) VALUES (?,?) ON CONFLICT(plan_key) DO UPDATE SET data=excluded.data', key, encode(saved));
       // The same transaction refreshes the publish action's replay, as for a merge, so a resent click reports this outcome.
-      if (actionId !== undefined) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='publish' AND json_extract(response,'$.ok')=1`,
+      if (actionId !== undefined) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1`,
         encode({ ok: true, value: publishActionResponse(saved) }), key, actionId);
       return saved;
     });

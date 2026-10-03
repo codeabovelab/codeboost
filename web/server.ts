@@ -156,19 +156,22 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   };
   /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
   const publishView = (progress?: ReturnType<ItemExecutor['progress']>) => {
-    if (!publishing) return { available: false, active: false, publishable: false, draft: false, last: null };
-    let mode: { draft: boolean } | null = null;
-    try { mode = publishing.mode(identity, progress); } catch (error) { if (!(error instanceof GuardRefusal) && !(error instanceof ShuttingDownError)) throw error; }
-    return { available: true, active: publishing.busy(identity), publishable: mode !== null, draft: mode?.draft ?? false, last: publishing.lastOutcome(identity) };
+    if (!publishing) return { available: false, active: false, publishable: false, closable: false, draft: false, last: null };
+    let job: ReturnType<TaskPublishing['mode']> | null = null;
+    try { job = publishing.mode(identity, progress); } catch (error) { if (!(error instanceof GuardRefusal) && !(error instanceof ShuttingDownError)) throw error; }
+    // `closable`: the task is cancelled and a close of its PRs is owed (#111): not after one that closed them.
+    const last = publishing.lastOutcome(identity);
+    return { available: true, active: publishing.busy(identity), publishable: job?.kind === 'publish', closable: job?.kind === 'close' && last?.outcome !== 'closed',
+      draft: job?.kind === 'publish' && job.draft, last };
   };
   /** A run's outcome is in the task and attempt rows; once it ends, the task's status decides whether a publish is owed. */
   const afterRun = (outcome: Promise<unknown>) => void outcome
     .catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`))
-    .finally(() => publishing?.publishIfOwed(identity));
+    .finally(() => publishing?.actIfOwed(identity));
   const runnerAction = (input: Record<string, unknown>) => {
     const { action, attemptId, expectedStateVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
-    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'publish'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
+    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'publish', 'close-pull-requests'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
     if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
     if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
     // A refused start or resume can still move the task to needs human (an expired budget is committed with the refusal),
@@ -176,7 +179,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // task already in needs human asked for no publish.
     if (action === 'start' || action === 'resume') {
       const before = service.store.getTask(identity).status;
-      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.publishIfOwed(identity); }
+      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.actIfOwed(identity); }
+    }
+    // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
+    // stopping an attempt closes the task when the attempt settles; the run's end then closes them (afterRun).
+    // Only this action's own cancel: a replayed or refused one (the task already closed) starts nothing.
+    if (action === 'cancel-task') {
+      const before = service.store.getTask(identity).status;
+      try { return act(); } finally { if (before !== 'cancelled' && service.store.getTask(identity).status === 'cancelled') publishing?.taskCancelled(identity); }
     }
     return act();
     function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
@@ -198,7 +208,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         // Retries a publish that failed or was refused (#103); it runs after this action commits, in the background.
         if (!publishing) throw new GuardRefusal(config.demo ? 'Demos never publish pull requests.' : 'This runner does not publish pull requests.');
         // Replaced by the publish's outcome once it settles (recordPublish), so a replay reports that.
-        return { outcome: 'publishing', draft: publishing.request(identity, actionId as string).draft };
+        const job = publishing.request(identity, 'publish', actionId as string);
+        return { outcome: 'publishing', draft: job.kind === 'publish' && job.draft };
+      }
+      if (action === 'close-pull-requests') {
+        // Retries closing a cancelled task's PRs (#111) after a failure, a refusal or a stop; in the background, like publish.
+        if (!publishing) throw new GuardRefusal(config.demo ? 'Demos never publish pull requests.' : 'This runner does not publish pull requests.');
+        publishing.request(identity, 'close', actionId as string);
+        return { outcome: 'closing' };
       }
       if (action === 'cancel-attempt') {
         if (!runner.stop(identity, attemptId as string, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
@@ -209,6 +226,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (executor && last.kind === 'execute') throw new GuardRefusal('A plan item is run again by resuming the task, not by retrying its attempt.');
       const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
+      // A cancel that stops this attempt closes the task when it settles; its PRs are closed then (#111), as after a run.
+      // Only then: any other settlement asked for no publish, so an owed (refused) one is not started again here.
+      void runner.settled(identity).then(() => { if (service.store.getTask(identity).status === 'cancelled') publishing?.actIfOwed(identity); })
+        .catch(error => console.error(`Could not start closing pull requests: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`));
       return { outcome: 'started', attemptId: retry.id };
     }).response; }
   };
@@ -370,7 +391,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
      * runs once, in the background; recovery finds a lost opening by its marker. The caller runs it once it has checked
      * that the runner lock still names the database, since a publish pushes.
      */
-    publishOwed: () => publishing?.publishIfOwed(identity),
+    publishOwed: () => publishing?.actIfOwed(identity),
     url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;

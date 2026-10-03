@@ -42,6 +42,13 @@ export interface PullRequestGateway {
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
   /** `beforeReady` runs after the description update's await and before any ready or draft change; if it throws, no such change is made. */
   refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest>;
+  /**
+   * Closes a PR codeboost opened (#111), read by its number (GitHub's list may lag behind it). An open PR must still be from
+   * `headBranch` in this repository with `marker` on its first line, or it is refused (`PullRequestMisplaced`) and left
+   * open. Already closed is success. `beforeClose` runs after the read and right before the close; if it throws, nothing
+   * is closed. The branch is kept. Settles only once GitHub shows the PR closed.
+   */
+  close(number: number, input: { headBranch: string; marker: string; beforeClose?: () => void }, signal?: AbortSignal): Promise<{ number: number; url: string }>;
   /** Turns an open PR codeboost opened back into a draft; a no-op for a draft. */
   markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
@@ -256,6 +263,33 @@ export class GhPullRequestGateway implements PullRequestGateway {
     // A draft change GitHub has not applied fails the refresh, so it stays unconfirmed and the next publish repeats it.
     if (wantDraft !== undefined && pr.draft !== wantDraft) throw new Error(`GitHub did not ${wantDraft ? 'turn the pull request into a draft' : 'mark the pull request ready'}.`);
     return pr;
+  }
+
+  async close(number: number, input: { headBranch: string; marker: string; beforeClose?: () => void }, signal?: AbortSignal): Promise<{ number: number; url: string }> {
+    signal = this.#bounded(signal);
+    this.#validate(input);
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
+    const read = (value: unknown) => {
+      const pr = value as { number?: unknown; html_url?: unknown; state?: unknown; body?: unknown; head?: { ref?: unknown; repo?: { full_name?: unknown } | null } } | null;
+      if (!pr || pr.number !== number || typeof pr.html_url !== 'string' || !pr.html_url.startsWith('https://') || (pr.state !== 'open' && pr.state !== 'closed')
+        || (pr.body !== null && typeof pr.body !== 'string') || typeof pr.head?.ref !== 'string') throw new Error('GitHub returned an invalid pull request.');
+      const repo = pr.head.repo?.full_name;
+      const ours = pr.head.ref === input.headBranch && typeof repo === 'string' && repo.toLowerCase() === this.repository.toLowerCase() && markerOf(pr.body ?? '') === input.marker;
+      return { number, url: pr.html_url, open: pr.state === 'open', ours };
+    };
+    const url = `repos/${this.repository}/pulls/${number}`;
+    const before = read(await this.#json(['api', '-H', 'Accept: application/vnd.github+json', url], signal));
+    // Closed already, by anyone: nothing is left to do, whatever its description says now.
+    if (!before.open) return { number, url: before.url };
+    // Never someone else's PR: an open one must still be from the task branch in this repository, with the task's marker.
+    if (!before.ours) throw new PullRequestMisplaced(`Pull request #${number} is open but no longer from ${input.headBranch} with its first line, so codeboost did not close it. Close it, or restore its branch and first line.`);
+    // The caller's re-check (shutdown, task state) right before the irreversible change, with no await since.
+    input.beforeClose?.();
+    const after = read(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', url], signal, { state: 'closed' }));
+    // A command that exits 0 does not prove the change applied: the answer must show the PR closed. Only its state is
+    // checked now: the close has happened, so a description edited meanwhile must not turn it into a failure.
+    if (after.open) throw new Error(`GitHub did not close pull request #${number}.`);
+    return { number, url: after.url };
   }
 
   /** The caller has just read the PR as ready, so this changes it straight away and reads the result back once. */
