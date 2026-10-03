@@ -8,7 +8,7 @@ import type { Store, TaskPullRequest } from './store.ts';
 
 /**
  * F2d: the pre-PR "already fixed" check and PR opening (design, "Checking whether the issue is already fixed" and
- * "Needs human"). Pushing the task head to its branch is D's export plus a runner push; until that exists it is injected.
+ * "Needs human"). The push of the task head to its branch is injected; `GitBranchPusher` (`branch-push.ts`) is the real one.
  */
 export interface BranchPusher {
   /** Makes `refs/heads/<branch>` on GitHub point at `head`. Settles only when the push finished or failed. */

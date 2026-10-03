@@ -1,5 +1,6 @@
 import type { InvocationInput } from '../contract.ts';
 import type { TaskFilesystems } from '../container/storage.ts';
+import type { TaskTreeCheck } from '../container/changes.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { assertResourceOwner } from '../labels.ts';
 import type { CaptureLimits } from './supervisor.ts';
@@ -15,6 +16,8 @@ export interface AgentAdapterRequest {
    * call so recovery can match them to the attempt (#51 item 3).
    */
   readonly networkAllocationId: string;
+  /** Execute and fix only, and required there: `checkTaskTree`'s result for `filesystems`, made just before this start. */
+  readonly treeCheck?: TaskTreeCheck;
 }
 /** Check a start call's synchronous input, so invalid input throws before a handle exists. */
 export function assertAdapterRequest(request: AgentAdapterRequest): void {
