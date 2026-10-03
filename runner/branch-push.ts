@@ -37,7 +37,7 @@ const BRANCH = /^codeboost\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const REMOTE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const HOST = /^[A-Za-z0-9.-]+(?::[0-9]+)?$/;
 // The variables whose values `gh` may authenticate with; their exact values are removed from error text.
-const TOKEN_VARIABLES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'] as const;
+export const TOKEN_VARIABLES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'] as const;
 // GitHub token shapes, removed from any text that leaves this module in case a server or proxy echoed one back. No word
 // boundaries: a token glued to other text (a URL, a path) is still removed.
 const TOKEN = /(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g;

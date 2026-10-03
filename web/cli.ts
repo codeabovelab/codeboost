@@ -5,14 +5,14 @@ import { startServer, type RunnerSetup } from './server.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import { acquireRunnerLock, releasePreparation } from '../runner/recovery.ts';
-import { parseRunnerConfig, recoveryWarnings, setUpRunner } from '../runner/production.ts';
+import { baseBranch, parseRunnerConfig, recoveryWarnings, setUpRunner } from '../runner/production.ts';
 requireSupportedNode();
 /** A refusal the person acts on (bad input, a held lock, a blocked recovery): its message and exit 1, not a stack. */
 function refuse(error: unknown): never { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
 const checked = <T>(fn: () => T): T => { try { return fn(); } catch (error) { return refuse(error); } };
 const { values } = parseArgs({ options: { demo: { type:'boolean' }, directory:{type:'string'}, config:{type:'string'}, port:{type:'string'}, help:{type:'boolean'}, 'release-preparation':{type:'string'} } });
 if (values.help || (!values.demo && !values.config && values['release-preparation'] === undefined)) {
-  console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate; demos never merge. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).');
+  console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate; demos never merge. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block with a baseBranch for its pull requests, and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).');
 } else if (values['release-preparation'] !== undefined) {
   const attemptId = values['release-preparation'];
   checked(() => {
@@ -36,7 +36,12 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   if (!Number.isInteger(port) || port < 0 || port > 65535) refuse(new Error('Invalid port.'));
   const config = checked(() => values.demo ? createDemo(values.directory ?? '.codeboost-local/demo') : JSON.parse(readFileSync(resolve(values.config!), 'utf8')));
   // Checked before the lock, so a malformed block changes nothing. Demos never run the runner, however they were opened.
-  const runnerConfig = checked(() => config.demo !== true && config.runner !== undefined ? parseRunnerConfig(config.runner) : null);
+  const runnerConfig = checked(() => {
+    if (config.demo === true || config.runner === undefined) return null;
+    // The PR's base branch too (#103); a missing github block is refused by the runner's setup, with its own message.
+    if (config.github) baseBranch(config.github);
+    return parseRunnerConfig(config.runner);
+  });
   // Decision 1: one runner per database, held as an OS lock keyed by the database file's device and inode.
   const lock = checked(() => acquireRunnerLock(config.database));
   const runnerSetup: RunnerSetup | undefined = runnerConfig ? async (service, capability) => {
@@ -73,6 +78,8 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
     // The database path changed: a refusal the person acts on, so its message, not a stack.
     refuse(error);
   }
+  // Only now, under a lock verified to name the database: a publish an earlier process owed (#103).
+  if (!stopping) app.publishOwed();
   const stop = () => void app.close().then(() => { lock.release(); process.exit(0); },
     error => { lock.release(); console.error(error instanceof Error ? error.message : error); process.exit(1); });
   // A second Ctrl+C does not skip shutdown (runner-lifecycle.md): agents are still being stopped and awaited.

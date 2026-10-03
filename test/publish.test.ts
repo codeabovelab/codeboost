@@ -324,7 +324,7 @@ describe('schema v7', () => {
       expect(upgraded.taskPullRequests(identity)).toEqual([]);
       expect(upgraded.latestAlreadyFixed(identity)).toBeNull();
       const db = new DatabaseSync(path, { readOnly: true });
-      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
       const names = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND (name LIKE '%pull_requests%' OR name LIKE 'already_fixed_checks%') AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name").all().map(row => row.name);
       expect(names).toEqual(['already_fixed_checks', 'already_fixed_checks_task', 'task_pull_requests', 'task_pull_requests_number', 'task_pull_requests_opening', 'task_pull_requests_task']);
       db.close();

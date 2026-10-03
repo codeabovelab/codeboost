@@ -662,7 +662,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
     const reopened = open(path);
     expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
   });
 });
 
@@ -686,6 +686,32 @@ describe('allocation baseline (#91)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
     const reopened = open(path);
     expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+  });
+});
+describe('publish outcomes (#103)', () => {
+  it('adds the outcome table to a version 9 database, and records an outcome without moving the task', () => {
+    const { path, store } = queued();
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('DROP TABLE publish_outcomes; PRAGMA user_version=9;'); db.close();
+    const reopened = open(path), before = reopened.getTask(identity);
+    expect(reopened.lastPublish(identity)).toBeNull();
+    expect(reopened.recordPublish(identity, { outcome: 'refused', draft: false, message: 'x'.repeat(3000) }))
+      .toMatchObject({ outcome: 'refused', stateVersion: before.stateVersion, message: 'x'.repeat(2000) });
+    reopened.recordPublish(identity, { outcome: 'opened', draft: false, message: 'Pull request #1 is open.', number: 1, url: 'https://github.com/o/r/pull/1' });
+    expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 1 });
+    expect(reopened.getTask(identity)).toEqual(before);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
+  });
+  it('records a task already running at the upgrade as not published, so the first start publishes nothing for it', () => {
+    const { path, store } = queued(); admit(store);
+    expect(store.getTask(identity).status).toBe('running');
+    const version = store.getTask(identity).stateVersion;
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('DROP TABLE publish_outcomes; PRAGMA user_version=9;'); db.close();
+    expect(open(path).lastPublish(identity)).toMatchObject({ outcome: 'not published', draft: false, stateVersion: version,
+      message: expect.stringMatching(/Use the publish action/) });
   });
 });

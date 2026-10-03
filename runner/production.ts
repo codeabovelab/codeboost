@@ -5,13 +5,17 @@ import { buildAgentImage } from '../agents/container/image.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync, type TaskStorageLimits } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
 import { GhIssueGateway, type IssueText } from '../github/issues.ts';
+import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { identityKey } from '../core/identity.ts';
 import type { RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
 import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources } from './execution.ts';
 import { isUuidV4, quoteForTerminal, type ShutdownCapability } from './lifecycle.ts';
 import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport, type RunnerLock } from './recovery.ts';
+import { GitBranchPusher, pushUrl } from './branch-push.ts';
+import { PullRequestPublisher } from './publish.ts';
 import type { ReviewService } from './review.ts';
 import { openRunnerRepository, ownerOnlyDirectory } from './runner-repository.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
@@ -132,8 +136,26 @@ export function recoveryWarnings(report: Pick<RecoveryReport, 'unmatchedStorage'
     ...report.unknownEntries.map(entry => `Unknown entry in the runner's attempt directory, left in place: ${quoteForTerminal(entry)}`)];
 }
 
+/**
+ * The branch a task's PR targets: `github.baseBranch`, required with a runner block (#103). Checked before anything is
+ * created; Git's own refusal would come only after a run, at the push or the opening.
+ */
+export function baseBranch(github: { baseBranch?: unknown } | undefined): string {
+  const name = github?.baseBranch;
+  // A short branch name, as GitHub's pull request API takes it: not a full ref (`refs/heads/main`) and not HEAD.
+  if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(name) || /\.\.|\/\/|\/\.|@\{|\.lock(?:\/|$)|[./]$/.test(name)
+    || name === 'HEAD' || name.startsWith('refs/'))
+    throw new Error('The runner publishes pull requests: add github.baseBranch, the branch they target (for example "main"), to the review configuration.');
+  return name;
+}
+
 export interface RunnerAssembly {
   readonly deps: RunnerDeps;
+  /**
+   * Builds the task's PR publisher (#103) once the coordinator exists: `closing` is its admission flag, read before each
+   * irreversible GitHub change. Absent: nothing is published (tests that only run items).
+   */
+  readonly publisher?: (closing: () => boolean) => PullRequestPublisher;
   readonly sources: ExecutionSources;
   readonly findings: SafetyFindings;
   readonly recovery: RecoveryReport;
@@ -151,6 +173,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const { service, config } = o, review = service.config;
   if (review.demo) throw new Error('Demos never run the runner.');
   if (!review.github) throw new Error('The runner reads the plan\'s issue from GitHub: add a github block to the review configuration.');
+  const base = baseBranch(review.github);
+  // The push URL too (the repository's shape, GH_HOST), before recovery and the image build rather than after them.
+  pushUrl(review.github.repository, o.env as NodeJS.ProcessEnv);
   const token = o.env.CLAUDE_CODE_OAUTH_TOKEN;
   if (!token) throw new Error(RUNNER_CREDENTIAL_MISSING);
   // Decision 1, step 4: the database path still names the locked file, now that the Store has opened it.
@@ -201,5 +226,13 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const findings = new SafetyFindings(service.store, o.capability);
   const deps = executionDeps(service.store, workspace, claudeLauncher({ imageId, runnerRoot: config.root, runnerOwner, token }), sources, runnerOwner, findings,
     { diagnostics: { directory: diagnosticsDir, capBytes: config.diagnosticsCapBytes ?? DEFAULT_DIAGNOSTICS_CAP_BYTES } });
-  return { deps, sources, findings, recovery };
+  const github = review.github;
+  // Never a `url` here (#101 review, finding 6): the push goes to the configured repository on GH_HOST, from the runner's
+  // own repository. Only commits the ledger records as codeboost's may be overwritten; before #22 adds rebasing, the
+  // ledger has no other kind of commit codeboost pushes (only recordRebase writes foreign entries).
+  const pusher = new GitBranchPusher({ repository, repositoryId: identity.repositoryId, remote: github.repository, env: o.env as NodeJS.ProcessEnv,
+    ownedCommits: requested => service.store.getLedger(requested).filter(entry => entry.origin === 'owned').map(entry => entry.sha) });
+  const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: new GhAlreadyFixedGateway({ repository: github.repository }),
+    pulls: new GhPullRequestGateway({ repository: github.repository }), pusher, closing }, { repository: github.repository, baseBranch: base });
+  return { deps, sources, findings, recovery, publisher };
 }
