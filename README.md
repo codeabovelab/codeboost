@@ -47,7 +47,7 @@ A configuration with a `github` block may also add a `runner` block. The runner 
 ```
 
 `root` must be a directory only you can write. Optional fields:
-- `diagnosticsDir`: where partial output of stopped attempts is kept. The default is `<root>/diagnostics`.
+- `diagnosticsDir`: where partial output of stopped attempts is kept, in a folder per database (`<diagnosticsDir>/<runner token>/diagnostics`), so databases sharing it never delete each other's files. The default is the runner root.
 - `diagnosticsCapBytes`: the size retention trims that directory back to. It is a target, not a hard limit: the file just saved is always kept, even when it alone passes the cap. The default is 256 MiB.
 - `limits`: task storage limits (`workBytes`, `workInodes`, `metadataBytes`, `metadataInodes`).
 

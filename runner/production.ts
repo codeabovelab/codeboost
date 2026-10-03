@@ -23,7 +23,10 @@ import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
 export interface RunnerConfig {
   /** Absolute; owner-only. Attempt directories and the runner-owned repository live under `<root>/<runnerOwner>/`. */
   readonly root: string;
-  /** Absolute; owner-only. Partial output of stopped attempts. Default `<root>/diagnostics`. */
+  /**
+   * Absolute; owner-only. Partial output of stopped attempts is kept in `<diagnosticsDir>/<runnerOwner>`, one folder per
+   * database, so runners of several databases sharing it never retain (delete) each other's files. Default `<root>`.
+   */
   readonly diagnosticsDir?: string;
   readonly diagnosticsCapBytes?: number;
   /** Who runner commits are by. */
@@ -145,8 +148,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   o.lock.verify();
   const runnerOwner = service.store.runnerOwnerToken(o.lock.file);
   ownerOnlyDirectory(config.root);
-  const diagnosticsDir = config.diagnosticsDir ?? join(config.root, 'diagnostics');
-  ownerOnlyDirectory(diagnosticsDir);
+  // Per database (its runner token): retention reads references from this Store only, so it must never see another
+  // database's files. The lock is per database, so two runners can share a root or a configured directory.
+  const diagnosticsDir = ownerOnlyDirectory(config.diagnosticsDir ?? config.root, runnerOwner, 'diagnostics');
   o.onSlowStart?.();
   let built: string | undefined;
   const image = () => built ??= (o.buildImage ?? buildAgentImage)();
