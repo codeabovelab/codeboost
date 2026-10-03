@@ -17,7 +17,7 @@ import { captureInvocation } from '../agents/contract.ts';
 import { AGENT_IMAGE, buildAgentImage, CLAUDE_VERSION } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { createPlanningProvider, planningCredential, planningLeftovers, type PlanningDependencies } from '../runner/planning-provider.ts';
+import { createPlanningProvider, planningCredential, PlanningStorage, type PlanningDependencies } from '../runner/planning-provider.ts';
 import { credentialEnvironment, measureGitRepository } from '../runner/question-container.ts';
 import { planningCommandSha256, prepareRecording, RECORDING_FILES, RECORDING_KIND, recordingFilesSha256, sha256,
   type PlanningRecording } from '../test/fixtures/planning/recording-inputs.ts';
@@ -49,7 +49,7 @@ const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core
   { cwd, env: gitEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 const root = mkdtempSync(join(tmpdir(), 'codeboost-recording-'));
-const retained = planningLeftovers(), runnerOwner = randomBytes(16).toString('hex');
+const retained = new PlanningStorage(), runnerOwner = randomBytes(16).toString('hex');
 let failed = false;
 try {
   const repository = join(root, 'repository');

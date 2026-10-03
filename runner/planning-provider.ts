@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { basename, dirname, join } from 'node:path';
 import type { InvocationContext, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
@@ -26,8 +26,8 @@ export interface PlanningProviderOptions {
   readonly deps: PlanningDependencies;
   /** Shared across providers in one process, so the image is built once. */
   readonly image?: { id?: string };
-  /** What earlier requests left behind, from `planningLeftovers()`. Invocations stay refused while any remains. */
-  readonly retained?: RetainedStorage;
+  /** What earlier requests left behind. Invocations stay refused while any of it remains. */
+  readonly retained?: PlanningStorage;
 }
 
 /**
@@ -35,12 +35,28 @@ export interface PlanningProviderOptions {
  * code. Use one instance for planning and never share it with Ask, so a planning failure never turns Ask off.
  */
 export const PLANNING_LEFTOVERS: LeftoverPolicy = Object.freeze({
-  removePath: (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }),
+  removePath: removePlanningRoot,
   paths: (paths: readonly string[]) => `A copy of the planned code from an earlier request could not be deleted (${paths.join(', ')}). Planning stays off until it is deleted.`,
   untracked: () => 'A planning agent\'s setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Planning is off until codeboost restarts.',
   retained: (count: number) => `Planning storage from an earlier request could not be removed (${allocations(count)}). Planning stays off until Docker removes it. Check that Docker is running, then retry.`,
 });
-export const planningLeftovers = () => new RetainedStorage(PLANNING_LEFTOVERS);
+/** Planning's own leftovers. Typed apart from Ask's, so an instance with Ask's wording and removal cannot be passed in. */
+export class PlanningStorage extends RetainedStorage {
+  readonly feature = 'planning';
+  constructor() { super(PLANNING_LEFTOVERS); }
+}
+
+const ROOT_PREFIX = 'codeboost-planning-';
+/**
+ * Delete a planning root: a direct child of the temporary directory named with planning's prefix, and nothing else.
+ * Its input directory is made writable first, since the request left it read-only.
+ */
+export function removePlanningRoot(root: string): void {
+  if (dirname(root) !== tmpdir() || !basename(root).startsWith(ROOT_PREFIX))
+    throw new Error(`Refusing to remove a path that is not a planning root (${root}).`);
+  try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
+  rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+}
 
 // Planning reads the code; it needs no room to write. The same ceilings as Ask.
 export const PLANNING_STORAGE: TaskStorageLimits = Object.freeze({
@@ -93,7 +109,7 @@ export interface PlanningProvider extends AuthorProvider {
   invoke(request: AuthorRequest, signal: AbortSignal): Promise<string>;
 }
 export function createPlanningProvider(options: PlanningProviderOptions): PlanningProvider {
-  const { vendor, deps } = options, image = options.image ?? {}, retained = options.retained ?? planningLeftovers();
+  const { vendor, deps } = options, image = options.image ?? {}, retained = options.retained ?? new PlanningStorage();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Planning timeout must be a positive integer.');
   return { async invoke(request: AuthorRequest, signal: AbortSignal): Promise<string> {
@@ -109,9 +125,9 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
     const credential = planningCredential(vendor, deps.env);
     retained.release(deps.removeFilesystems);
     image.id ??= deps.buildImage(remaining());
-    const root = mkdtempSync(join(tmpdir(), 'codeboost-planning-'));
+    const root = mkdtempSync(join(tmpdir(), ROOT_PREFIX));
     const staging = join(root, 'staging'), input = join(root, 'input');
-    let filesystems: TaskFilesystems | undefined, failed = false;
+    let filesystems: TaskFilesystems | undefined, failure: { error: unknown } | undefined;
     try {
       mkdirSync(staging); mkdirSync(input);
       writeFileSync(join(input, 'schema.json'), request.schemaText, { mode: 0o444 });
@@ -147,20 +163,24 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
       if (result.unreleased !== undefined) retained.markUntracked();
       return planningOutput(result, invocation);
     } catch (error) {
-      failed = true;
+      failure = { error };
       throw error;
     } finally {
       const failures: unknown[] = [];
       if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.retain(filesystems); failures.push(error); }
-      try { chmodSync(input, 0o700); } catch { /* input was never created */ }
-      try { PLANNING_LEFTOVERS.removePath(root); }
+      try { removePlanningRoot(root); }
       catch (error) {
         retained.retainPath(root);
         failures.push(new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }));
       }
-      // A failed request keeps its own error: what cleanup left is retained above, and the next request names it. A
-      // successful one is refused rather than returned, as Ask does, so a plan is never kept from an unsettled run.
-      if (failures.length && !failed) throw new AggregateError(failures, 'Planning container cleanup did not settle.');
+      // What cleanup left is retained above, and the next request names it. A successful request is refused rather than
+      // returned, as Ask does, so a plan is never kept from an unsettled run. A failed one keeps its own message first.
+      if (failures.length) {
+        const text = (error: unknown) => error instanceof Error ? error.message : String(error);
+        throw failure
+          ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
+          : new AggregateError(failures, 'Planning container cleanup did not settle.');
+      }
     }
   } };
 }

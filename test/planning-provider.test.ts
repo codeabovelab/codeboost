@@ -1,4 +1,4 @@
-import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
+import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
@@ -6,7 +6,7 @@ import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } 
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
 import { SuggestionCoordinator } from '../core/planning-suggestions.ts';
-import { CODEX_PLANNING_REFUSED, createPlanningProvider, planningLeftovers, type PlanningDependencies } from '../runner/planning-provider.ts';
+import { CODEX_PLANNING_REFUSED, createPlanningProvider, PlanningStorage, removePlanningRoot, type PlanningDependencies } from '../runner/planning-provider.ts';
 import { RetainedStorage, StopError } from '../runner/question-container.ts';
 import { Store } from '../runner/store.ts';
 import { prepareRecording, recordingContext, recordingInput, recordingPreviousPlan } from './fixtures/planning/recording-inputs.ts';
@@ -47,7 +47,7 @@ function fakeDeps(result: Partial<InvocationResult> | 'hold' = {}, env: Record<s
   };
   return { deps, events, captured, started, cancels, settle: (value: Partial<InvocationResult>) => settle(value) };
 }
-const provider = (deps: PlanningDependencies, extra: { vendor?: 'claude' | 'codex'; retained?: RetainedStorage } = {}) =>
+const provider = (deps: PlanningDependencies, extra: { vendor?: 'claude' | 'codex'; retained?: PlanningStorage } = {}) =>
   createPlanningProvider({ vendor: extra.vendor ?? 'claude', repository: '/repo', head: HEAD, snapshotId: 'snapshot-1',
     runnerOwner: OWNER, deps, retained: extra.retained });
 const draftRequest = (requestId = 'b3c1f3b2-6a55-4d7e-9a47-0c7c8f6f1a01') => prepareRecording('draft', HEAD, requestId).request;
@@ -127,7 +127,7 @@ it.each([
 });
 
 it('refuses later requests after lane D reports resources it could not release', async () => {
-  const retained = planningLeftovers(), fake = fakeDeps({ unreleased: [], stopReason: 'capture-failure', exitCode: null });
+  const retained = new PlanningStorage(), fake = fakeDeps({ unreleased: [], stopReason: 'capture-failure', exitCode: null });
   await expect(provider(fake.deps, { retained }).invoke(draftRequest(), new AbortController().signal)).rejects.toThrow();
   const next = fakeDeps();
   await expect(provider(next.deps, { retained }).invoke(draftRequest('c4d2e4c3-7b66-4e8f-8b58-1d8d907f2b12'), new AbortController().signal))
@@ -136,7 +136,7 @@ it('refuses later requests after lane D reports resources it could not release',
 });
 
 it('marks an allocation lane D could not clean up as untracked, and refuses later requests', async () => {
-  const retained = planningLeftovers(), fake = fakeDeps();
+  const retained = new PlanningStorage(), fake = fakeDeps();
   fake.deps.prepareFilesystems = () => { throw new AggregateError([new Error('docker rm failed')], 'setup cleanup'); };
   await expect(provider(fake.deps, { retained }).invoke(draftRequest(), new AbortController().signal)).rejects.toThrow('setup cleanup');
   expect(retained.untracked).toBe(1);
@@ -146,14 +146,14 @@ it('marks an allocation lane D could not clean up as untracked, and refuses late
 });
 
 it('does not mark an ordinary setup failure as untracked', async () => {
-  const retained = planningLeftovers(), fake = fakeDeps();
+  const retained = new PlanningStorage(), fake = fakeDeps();
   fake.deps.prepareFilesystems = () => { throw new Error('no space'); };
   await expect(provider(fake.deps, { retained }).invoke(draftRequest(), new AbortController().signal)).rejects.toThrow('no space');
   expect(retained.untracked).toBe(0);
 });
 
 it('keeps storage Docker did not remove, refuses until it is removed, then runs again', async () => {
-  const retained = planningLeftovers(), fake = fakeDeps({ stdout: '{"plan":true}' });
+  const retained = new PlanningStorage(), fake = fakeDeps({ stdout: '{"plan":true}' });
   let removable = false;
   fake.deps.removeFilesystems = () => { if (!removable) throw new Error('docker volume rm failed'); };
   await expect(provider(fake.deps, { retained }).invoke(draftRequest(), new AbortController().signal))
@@ -168,15 +168,22 @@ it('keeps storage Docker did not remove, refuses until it is removed, then runs 
 });
 
 it('keeps a failed request\'s own error when its cleanup also fails, and refuses the next request', async () => {
-  const retained = planningLeftovers(), fake = fakeDeps({ exitCode: 1, stdout: 'Invalid API key' });
+  const retained = new PlanningStorage(), fake = fakeDeps({ exitCode: 1, stdout: 'Invalid API key' });
   fake.deps.removeFilesystems = () => { throw new Error('docker volume rm failed'); };
   await expect(provider(fake.deps, { retained }).invoke(draftRequest(), new AbortController().signal))
-    .rejects.toThrow('Claude could not write the plan.');
+    .rejects.toThrow(/^Claude could not write the plan\..* Cleanup also did not settle: docker volume rm failed$/);
   expect(retained.size).toBe(1);
   await expect(provider(fake.deps, { retained }).invoke(draftRequest('a8b6c8a7-bfaa-4c23-8f9c-5bc1d4b26f56'), new AbortController().signal))
     .rejects.toThrow(/Planning storage from an earlier request could not be removed/);
 });
 
+/** A real planning root that rmSync cannot empty: its child directory sits in a read-only parent. */
+function lockedPlanningRoot(): string {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-planning-'));
+  mkdirSync(join(root, 'staging', 'child'), { recursive: true }); chmodSync(join(root, 'staging'), 0o500);
+  cleanups.push(() => chmodSync(join(root, 'staging'), 0o700)); roots.push(root);
+  return root;
+}
 const refusal = (retained: RetainedStorage) => {
   try { retained.release(() => { throw new Error('still there'); }); } catch (error) { return (error as Error).message; }
   throw new Error('release did not refuse');
@@ -184,15 +191,29 @@ const refusal = (retained: RetainedStorage) => {
 it.each([
   ['an allocation Docker did not remove', (r: RetainedStorage) => r.retain({} as TaskFilesystems), /^Planning storage from an earlier request could not be removed \(1 allocation\)/],
   ['an allocation lane D returned no handle for', (r: RetainedStorage) => r.markUntracked(), /^A planning agent's setup or cleanup failed.*Planning is off until codeboost restarts\.$/],
-  ['a host copy that cannot be deleted', (r: RetainedStorage) => {
-    const parent = mkdtempSync(join(tmpdir(), 'planning-locked-')), root = join(parent, 'root');
-    mkdirSync(join(root, 'child'), { recursive: true }); chmodSync(root, 0o500);
-    roots.push(parent); cleanups.push(() => chmodSync(root, 0o700));
-    r.retainPath(join(root, 'child'));
-  }, /^A copy of the planned code from an earlier request could not be deleted \(.*child\)\. Planning stays off/],
+  ['a host copy that cannot be deleted', (r: RetainedStorage) => r.retainPath(lockedPlanningRoot()),
+    /^A copy of the planned code from an earlier request could not be deleted \(.*codeboost-planning-.*\)\. Planning stays off/],
 ] as const)('words the refusal for %s as planning, never as Ask', (_, leave, message) => {
-  const retained = planningLeftovers(); leave(retained);
+  const retained = new PlanningStorage(); leave(retained);
   const text = refusal(retained);
   expect(text).toMatch(message);
   expect(text).not.toMatch(/Ask|question/);
+});
+
+it('removes only planning roots, and makes a read-only input directory writable first', () => {
+  const foreign = mkdtempSync(join(tmpdir(), 'not-planning-')); roots.push(foreign);
+  expect(() => removePlanningRoot(foreign)).toThrow(/not a planning root/);
+  expect(existsSync(foreign)).toBe(true);
+  const nested = mkdtempSync(join(foreign, 'codeboost-planning-'));
+  expect(() => removePlanningRoot(nested)).toThrow(/not a planning root/);
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-planning-')); roots.push(root);
+  mkdirSync(join(root, 'input')); writeFileSync(join(root, 'input', 'schema.json'), '{}'); chmodSync(join(root, 'input'), 0o555);
+  removePlanningRoot(root);
+  expect(existsSync(root)).toBe(false);
+});
+
+it('accepts only planning storage, never Ask\'s', () => {
+  const fake = fakeDeps();
+  // @ts-expect-error Ask's RetainedStorage words refusals for Ask and cannot remove planning roots.
+  createPlanningProvider({ vendor: 'claude', repository: '/repo', head: HEAD, snapshotId: 's', runnerOwner: OWNER, deps: fake.deps, retained: new RetainedStorage() });
 });
