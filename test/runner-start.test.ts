@@ -2,9 +2,11 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { request as httpRequest } from 'node:http';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
+import { Store } from '../runner/store.ts';
 import type { ReviewService } from '../runner/review.ts';
 import type { RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
@@ -34,8 +36,10 @@ async function serve(options: { kinds?: AttemptKind[]; before?: (service: Review
     options.findings?.(findings, service);
     return { deps, sources, findings, recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   });
-  cleanups.push(() => app.close());
-  return { app, identity: demo.identity, store: app.service.store, items: app.service.store.getPlan(demo.identity).items.map(item => item.id) };
+  let closed = false;
+  const close = async () => { if (!closed) { closed = true; await app.close(); } };
+  cleanups.push(close);
+  return { app, close, database: demo.database, identity: demo.identity, store: app.service.store, items: app.service.store.getPlan(demo.identity).items.map(item => item.id) };
 }
 const view = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
 async function act(app: App, action: string, request: { expectedStateVersion?: number; actionId?: string } = {}) {
@@ -226,6 +230,29 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(await view(app)).toMatchObject({ startable: false, resumable: true });
     expect((await act(app, 'start')).body.error).toMatch(/resume the task instead/);
   });
+  it('names the status when a task that never ran is not running or queued, rather than pointing to start', async () => {
+    const { app } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+    } });
+    expect((await act(app, 'resume')).body.error).toMatch(/The task is needs human; resume continues a task that is running or queued/);
+    expect((await act(app, 'start')).body.error).toMatch(/The task is needs human; start runs a task that is in review or queued/);
+  });
+  it('does not point start to resume once every item has run', async () => {
+    const { app } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      for (const { id: item } of s.getPlan(id).items) {
+        const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item,
+          expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+        s.markRunning(id, attempt.id);
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head: s.getSnapshot(id).head, unchanged: true, inScope: [], outOfScope: [] } });
+      }
+    } });
+    expect(await view(app)).toMatchObject({ startable: false, resumable: false });
+    expect((await act(app, 'start')).body.error).toMatch(/The task is running; start runs a task that is in review or queued/);
+    expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
+  });
   it('names the status, not resume, when start is refused for a task resume cannot run either', async () => {
     const { app } = await serve({ before: service => {
       failedFirstItem(service);
@@ -290,6 +317,33 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume', { expectedStateVersion: stateVersion, actionId })).body.result).toEqual(first.body.result);
     expect((await act(app, 'resume', { expectedStateVersion: stateVersion })).body.error).toMatch(/Stale task state/);
     expect(store.getAttempts(identity)).toHaveLength(2);
+  });
+  it('answers 503 to a start whose body finishes arriving after shutdown began, before any refusal, and records nothing', async () => {
+    // A task start would refuse: during shutdown the 503 still comes first, so no refusal is saved under the action ID.
+    const { app, close, database, identity } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+    } });
+    const { stateVersion } = await view(app), actionId = randomUUID(), url = new URL(app.url);
+    const text = JSON.stringify({ action: 'start', expectedStateVersion: stateVersion, actionId });
+    let finish!: () => void;
+    const response = new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)); });
+      req.on('error', reject);
+      req.write(text.slice(0, 5));
+      finish = () => req.end(text.slice(5));
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    finish();
+    expect(await response).toBe(503);
+    await closing;
+    const store = new Store(database); cleanups.push(() => store.close());
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)).toEqual([]);
+    expect(store.savedAction(identity, { actionId, kind: 'start', request: { attemptId: undefined, expectedStateVersion: stateVersion } })).toBeUndefined();
   });
   it('answers 503 to a start admitted after the runner stopped admission, and rolls the queue move back', async () => {
     const { app, identity, store } = await serve();

@@ -86,12 +86,16 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
    */
   const runChoice = (action: 'start' | 'resume', forView = false, progress = executor?.progress(identity)) => {
     if (!executor || !progress) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
+    // Shutdown began: answer 503 before any refusal, so nothing is recorded under the action ID and the UI may resend.
+    if (!forView && runner!.closing) throw new ShuttingDownError();
     const task = service.store.getTask(identity), { started, begun, earlierCommits, next } = progress;
     // Checked in the order a person can act on: a closed task first, then what admission would refuse.
     if (task.status === 'merged' || task.status === 'cancelled') throw new GuardRefusal(`The task is ${task.status}.`);
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
     if (!runner!.runs('execute')) throw new GuardRefusal('The runner cannot run execute attempts yet.');
-    if (runner!.isActive(identity) || executor.busy(identity)) throw new GuardRefusal('An attempt is already active for this task.');
+    if (runner!.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
+    // Between two items no attempt is active, but the run that admits the next one is still going.
+    if (executor.busy(identity)) throw new GuardRefusal('An earlier run of this task is still finishing; start it again when that run has ended.');
     const merge = service.store.getMergeAttempt(identity);
     if (merge && (merge.state === 'submitting' || merge.state === 'queued')) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
     // Only the view stops here: the action lets admission refuse, because its refusal also moves the idle task to needs
@@ -105,14 +109,19 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (action === 'start') {
       // Point to resume wherever resume could run (a running task that ran any revision too); any other status is named as it is.
       const ran = begun || task.requeuePending;
-      if ((ran && task.status === 'queued') || (task.status === 'running' && (started || task.requeuePending)))
+      if (next !== null && ((ran && task.status === 'queued') || (task.status === 'running' && (started || task.requeuePending))))
         throw new GuardRefusal('This plan has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
       if (ran) throw new GuardRefusal('This plan revision has already run; it is in review.');
       return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
     }
-    if (!started && !task.requeuePending) throw new GuardRefusal('This plan has not started running yet; start the task instead.');
-    if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; resume continues a task that is running or queued.`);
+    // As for start: point to start only where start could run.
+    const fresh = !started && !task.requeuePending;
+    if (task.status !== 'running' && task.status !== 'queued') {
+      if (fresh && task.status === 'in review') throw new GuardRefusal('This plan has not started running yet; start the task instead.');
+      throw new GuardRefusal(`The task is ${task.status}; resume continues a task that is running or queued.`);
+    }
+    if (fresh) throw new GuardRefusal('This plan has not started running yet; start the task instead.');
     if (!next) throw new GuardRefusal('Every item of this plan has run.');
     return { fromItem: next, claimRequeue: task.requeuePending, queue: false };
   };
