@@ -9,6 +9,7 @@ import { RUNNER_NOT_CONFIGURED, RUNNER_NOT_IN_DEMO, startServer } from '../web/s
 import { claudeLauncher, dRecoveryDeps, ISSUE_REUSE_MS, parseRunnerConfig, RUNNER_CREDENTIAL_MISSING, setUpRunner } from '../runner/production.ts';
 import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
+import { readCapturedFile } from '../agents/container/profile.ts';
 import type { InvocationInput } from '../agents/contract.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/storage.ts';
@@ -58,6 +59,8 @@ describe('runner configuration', () => {
   it('accepts a complete block and refuses relative paths, bad committers and unknown limits', () => {
     expect(parseRunnerConfig({ root: '/r', committer, limits: { workBytes: 1024 } })).toMatchObject({ root: '/r', committer, limits: { workBytes: 1024 } });
     expect(() => parseRunnerConfig({ root: 'r', committer })).toThrow(/runner.root must be an absolute path/);
+    expect(() => parseRunnerConfig({ root: '/work,old/runner', committer })).toThrow(/runner.root cannot contain a comma/);
+    expect(() => parseRunnerConfig({ root: '/r', diagnosticsDir: '/d\nx', committer })).toThrow(/runner.diagnosticsDir cannot contain/);
     expect(() => parseRunnerConfig({ root: '/r', diagnosticsDir: 'd', committer })).toThrow(/diagnosticsDir/);
     expect(() => parseRunnerConfig({ root: '/r', committer: { name: 'x', email: 'a<b>' } })).toThrow(/committer/);
     expect(() => parseRunnerConfig({ root: '/r', committer, limits: { bytes: 1 } })).toThrow(/runner.limits.bytes/);
@@ -258,6 +261,8 @@ describe('D adapters', () => {
     expect(JSON.parse(readFileSync(join(attemptDir, 'input', 'schema.json'), 'utf8'))).toMatchObject({ type: 'string' });
     expect(lstatSync(join(attemptDir, 'input')).mode & 0o005).toBe(0o005);
     expect(lstatSync(join(attemptDir, 'input', 'schema.json')).mode & 0o777).toBe(0o444);
+    // D's own reader accepts it (a regular, unlinked, bounded file), not only these copied rules.
+    expect(new TextDecoder().decode(readCapturedFile(join(attemptDir, 'input', 'schema.json'), 'Schema input').content)).toContain('"type":"string"');
     // The coordinator's preparation cleanup removes the attempt directory with it.
     rmSync(attemptDir, { recursive: true });
   });

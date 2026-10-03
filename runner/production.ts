@@ -45,7 +45,10 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
   if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('The runner block must be an object.');
   const v = value as Record<string, unknown>;
   const path = (field: string, text: unknown) => {
-    if (typeof text !== 'string' || !isAbsolute(text) || text.includes('\0')) throw new Error(`runner.${field} must be an absolute path.`);
+    if (typeof text !== 'string' || !isAbsolute(text)) throw new Error(`runner.${field} must be an absolute path.`);
+    // D mounts paths under the root into containers, and a Docker mount cannot hold a comma or a line break: refused here,
+    // before anything is created, instead of at every launch.
+    if (/[\0\n\r,]/.test(text)) throw new Error(`runner.${field} cannot contain a comma or a line break: Docker cannot mount such a path.`);
     return text;
   };
   const committer = v.committer as Record<string, unknown> | undefined;
