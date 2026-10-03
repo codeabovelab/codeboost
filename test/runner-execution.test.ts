@@ -867,8 +867,8 @@ describe('item execution', () => {
     const { executor } = setup({ manifests: { P1: { ...manifest([change('a.ts')]), digest: '' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1', reason: `${SAFETY_VIOLATION} The change report has no digest.` });
   });
-  it('refuses a Codex task before it allocates task storage (#93)', async () => {
-    const { store, runner, executor, log } = setup({ vendor: 'codex' });
+  it('refuses a Codex task before it fetches the issue or allocates task storage (#93)', async () => {
+    const { store, runner, executor, log } = setup({ vendor: 'codex', issue: () => { throw new Error('issue fetched'); } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed',
       reason: expect.stringContaining('Codex cannot run the execute phase') });
     expect(log).toEqual([]);

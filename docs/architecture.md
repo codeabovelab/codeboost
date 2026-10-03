@@ -86,7 +86,7 @@ flowchart LR
     cb -- "issues, checks, merge" --> gh
   end
   gh --> github[(GitHub)]
-  docker --> agent["Agent container<br/>(claude or codex)"]
+  docker --> agent["Agent container<br/>(Claude; Codex is refused, #93)"]
   agent -- "vendor API hosts only,<br/>through a proxy" --> vendor[(Anthropic / OpenAI API)]
 ```
 

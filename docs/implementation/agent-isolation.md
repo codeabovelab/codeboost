@@ -265,9 +265,12 @@ The shell cannot simply be turned on (design, "Phase enforcement"):
 **What this changes.**
 
 - `createCodexCommand` and `startCodexInvocation` refuse every phase. The start call
-  refuses before it allocates anything. The phases Codex may run are one set in
-  `agents/policy.ts` (`CODEX_PHASES`), and it is empty.
-- The execute runner refuses a Codex task before it allocates task storage.
+  refuses before it allocates anything. The phases the Codex adapter may run are one
+  set in `agents/policy.ts` (`CODEX_PHASES`), and it is empty. Ask and the runner
+  also refuse Codex on their own (below), so adding a phase to the set does not by
+  itself turn Codex on there.
+- The execute runner refuses a Codex task before it fetches the issue or allocates
+  task storage.
 - Ask offers only Claude Code. The Store refuses Codex as the question agent. A review
   database that already names Codex reads back as Codex, and Ask refuses it with a
   message that tells the user to choose Claude Code.

@@ -1,6 +1,6 @@
 <!--
   codeboost prompt template: carry out one plan item, or fix one problem in it.
-  Used for both Claude and Codex in the "execute" or "fix" phase. codeboost fills every
+  Used in the "execute" or "fix" phase (Claude only; Codex is refused, #93). codeboost fills every
   {{placeholder}} once, from trusted runner data; values are escaped JSON data blocks and
   are never interpreted again. Permissions come from the phase profile and the approved
   argv list passed separately to D's dispatcher, never from text in this prompt.
