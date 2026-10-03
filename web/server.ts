@@ -112,7 +112,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (next !== null && ((ran && task.status === 'queued') || (task.status === 'running' && (started || task.requeuePending))))
         throw new GuardRefusal('This plan has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
-      if (ran) throw new GuardRefusal(`This plan revision has already run; the task is ${task.status}.`);
+      if (ran) throw new GuardRefusal(begun ? `This plan revision has already run; the task is ${task.status}.` : 'Recovery left this task to requeue; it cannot start until that is resolved.');
       return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
     }
     // As for start: point to start only where start's own checks pass.
