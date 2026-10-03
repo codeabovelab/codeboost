@@ -84,9 +84,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
    * completed, failed or was stopped. A queued task with only earlier-revision attempts may take either; both run the
    * same items.
    */
-  const runChoice = (action: 'start' | 'resume', forView = false) => {
-    if (!executor) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
-    const task = service.store.getTask(identity), { started, begun, earlierCommits, next } = executor.progress(identity);
+  const runChoice = (action: 'start' | 'resume', forView = false, progress = executor?.progress(identity)) => {
+    if (!executor || !progress) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
+    const task = service.store.getTask(identity), { started, begun, earlierCommits, next } = progress;
     // Checked in the order a person can act on: a closed task first, then what admission would refuse.
     if (task.status === 'merged' || task.status === 'cancelled') throw new GuardRefusal(`The task is ${task.status}.`);
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
@@ -112,8 +112,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (!next) throw new GuardRefusal('Every item of this plan has run.');
     return { fromItem: next, claimRequeue: task.requeuePending, queue: false };
   };
-  const offered = (action: 'start' | 'resume') => {
-    try { runChoice(action, true); return true; }
+  const offered = (action: 'start' | 'resume', progress: ReturnType<ItemExecutor['progress']>) => {
+    try { runChoice(action, true, progress); return true; }
     catch (error) { if (error instanceof GuardRefusal) return false; throw error; }
   };
   /** Reads only task and attempt rows; never rebuilds history or the review. */
@@ -128,7 +128,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       // A plan item runs again only by resuming its task; the retry action refuses it.
       && !(executor && last.kind === 'execute');
     const free = !!runner && !runner.closing && !status.unresolved && !runner.unreleased;
-    return { available: !!runner, task, attempts, startable: free && offered('start'), resumable: free && offered('resume'),
+    // One progress read per poll, shared by both flags.
+    const progress = free && executor ? executor.progress(identity) : undefined;
+    return { available: !!runner, task, attempts, startable: !!progress && offered('start', progress), resumable: !!progress && offered('resume', progress),
       stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved };
   };
   const runnerAction = (input: Record<string, unknown>) => {

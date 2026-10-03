@@ -317,14 +317,10 @@ export class ItemExecutor {
    * (null when every item has run).
    */
   progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; next: string | null } {
-    const plan = this.#store.getPlan(identity), executed = this.#store.getAttempts(identity).filter(row => row.kind === 'execute' && row.item);
-    const attempted = executed.filter(row => row.context.planRevision === plan.revision);
-    const finished = new Set(attempted.filter(row => row.state === 'completed').map(row => row.item!));
-    const committed = (row: AttemptRecord) => row.state === 'completed' && (row.result as ExecutionResult | null)?.unchanged === false;
-    return { started: executed.length > 0, begun: attempted.length > 0,
-      earlierCommits: executed.some(row => row.context.planRevision !== plan.revision && committed(row)),
-      completed: plan.items.filter(item => finished.has(item.id)).map(item => item.id),
-      next: plan.items.find(item => !finished.has(item.id))?.id ?? null };
+    const plan = this.#store.getPlan(identity), { started, begun, earlierCommits, finished } = this.#store.executeProgress(identity, plan.revision);
+    const done = new Set(finished);
+    return { started, begun, earlierCommits, completed: plan.items.filter(item => done.has(item.id)).map(item => item.id),
+      next: plan.items.find(item => !done.has(item.id))?.id ?? null };
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }

@@ -107,6 +107,16 @@ describe('start (#91 part 2)', () => {
   });
 });
 
+describe('status polling (#91 part 2)', () => {
+  it('reads progress once per poll with a targeted query, never the full attempt history', async () => {
+    const { app, store } = await serve({ before: service => { failedFirstItem(service); } });
+    const history = vi.spyOn(store, 'getAttempts'), progress = vi.spyOn(store, 'executeProgress');
+    expect(await view(app)).toMatchObject({ resumable: true });
+    expect(history).not.toHaveBeenCalled();
+    expect(progress).toHaveBeenCalledTimes(1);
+  });
+});
+
 describe('resume (#91 part 2)', () => {
   it('claims the requeue recovery left and continues from the first unfinished item', async () => {
     let interrupted = '';
