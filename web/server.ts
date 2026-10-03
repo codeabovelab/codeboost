@@ -82,32 +82,38 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
    * plan revision; `resume` continues a task that has (or that recovery left to requeue) from its first unfinished item,
    * whether its last item completed, failed or was stopped.
    */
-  const runChoice = (action: 'start' | 'resume') => {
+  const runChoice = (action: 'start' | 'resume', forView = false) => {
     if (!executor) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
-    const task = service.store.getTask(identity), { begun, earlierRevision, next } = executor.progress(identity);
+    const task = service.store.getTask(identity), { started, begun, earlierCommits, next } = executor.progress(identity);
     // Checked in the order a person can act on: a closed task first, then what admission would refuse.
     if (task.status === 'merged' || task.status === 'cancelled') throw new GuardRefusal(`The task is ${task.status}.`);
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
     if (!runner!.runs('execute')) throw new GuardRefusal('The runner cannot run execute attempts yet.');
-    if (runner!.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
+    if (runner!.isActive(identity) || executor.busy(identity)) throw new GuardRefusal('An attempt is already active for this task.');
     const merge = service.store.getMergeAttempt(identity);
     if (merge && (merge.state === 'submitting' || merge.state === 'queued')) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-    if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) throw new GuardRefusal('The task time budget has run out; it needs a person.');
+    // Only the view stops here: the action lets admission refuse, because its refusal also moves the idle task to needs
+    // human (the time-limit mapping), and nothing else would.
+    if (forView && task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) throw new GuardRefusal('The task time budget has run out; it needs a person.');
     if (service.store.latestCheckpoint(identity)) throw new GuardRefusal('The task paused for a scope amendment; continuing after one is not supported yet (#88).');
-    // Items an earlier revision ran are commits the revised plan has not been reconciled with (plan-format.md): rerunning
-    // the plan on top of them could redo or contradict that work, so it waits for #88 rather than guessing.
-    if (!begun && earlierRevision) throw new GuardRefusal('The plan was revised after it started running; running a revised plan on top of the earlier items is not supported yet (#88).');
+    // Commits an earlier revision's items made have not been reconciled with the revised plan (plan-format.md): rerunning
+    // the plan on top of them could redo or contradict that work, so it waits for #88 rather than guessing. Earlier
+    // attempts that committed nothing (failed, stopped, stale or unchanged) leave nothing to reconcile.
+    if (!begun && earlierCommits) throw new GuardRefusal('The plan was revised after items of it were committed; running a revised plan on top of those commits is not supported yet (#88).');
     if (action === 'start') {
-      if (begun || task.requeuePending) throw new GuardRefusal('This plan has already started running; resume the task instead.');
+      if (started || task.requeuePending) throw new GuardRefusal('This plan has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
       return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
     }
-    if (!begun && !task.requeuePending) throw new GuardRefusal('This plan has not started running yet; start the task instead.');
+    if (!started && !task.requeuePending) throw new GuardRefusal('This plan has not started running yet; start the task instead.');
     if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; resume continues a task that is running or queued.`);
     if (!next) throw new GuardRefusal('Every item of this plan has run.');
     return { fromItem: next, claimRequeue: task.requeuePending, queue: false };
   };
-  const offered = (action: 'start' | 'resume') => { try { runChoice(action); return true; } catch { return false; } };
+  const offered = (action: 'start' | 'resume') => {
+    try { runChoice(action, true); return true; }
+    catch (error) { if (error instanceof GuardRefusal) return false; throw error; }
+  };
   /** Reads only task and attempt rows; never rebuilds history or the review. */
   const runnerView = () => {
     const task = service.store.getTask(identity), attempts = service.store.recentAttempts(identity, 20);

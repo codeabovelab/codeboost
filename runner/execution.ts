@@ -292,18 +292,23 @@ export class ItemExecutor {
     return { attemptId: begun.attempt.id, outcome: this.#track(key, this.#continue(identity, begun)) };
   }
   /**
-   * Where a run of the task's current plan revision stands: whether any item was attempted at this revision (and at an
-   * earlier one, which leaves commits a revised plan must be reconciled with, #88), the items
-   * an execute attempt completed, and the first item none did (null when every item has run). What `start` and `resume`
-   * decide from (#91 part 2).
+   * Where a run of the task stands (#91 part 2): whether any item was ever attempted (`started`, at any revision) or was
+   * attempted at the current revision (`begun`), whether an earlier revision left runner commits a revised plan must be
+   * reconciled with (#88), the items an execute attempt completed at the current revision, and the first item none did
+   * (null when every item has run).
    */
-  progress(identity: PlanIdentity): { begun: boolean; earlierRevision: boolean; completed: string[]; next: string | null } {
+  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; next: string | null } {
     const plan = this.#store.getPlan(identity), executed = this.#store.getAttempts(identity).filter(row => row.kind === 'execute' && row.item);
     const attempted = executed.filter(row => row.context.planRevision === plan.revision);
     const finished = new Set(attempted.filter(row => row.state === 'completed').map(row => row.item!));
-    return { begun: attempted.length > 0, earlierRevision: executed.some(row => row.context.planRevision !== plan.revision), completed: plan.items.filter(item => finished.has(item.id)).map(item => item.id),
+    const committed = (row: AttemptRecord) => row.state === 'completed' && (row.result as ExecutionResult | null)?.unchanged === false;
+    return { started: executed.length > 0, begun: attempted.length > 0,
+      earlierCommits: executed.some(row => row.context.planRevision !== plan.revision && committed(row)),
+      completed: plan.items.filter(item => finished.has(item.id)).map(item => item.id),
       next: plan.items.find(item => !finished.has(item.id))?.id ?? null };
   }
+  /** Whether a run of this task is still in progress here (its last write may still be to come). */
+  busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }
   /** Held in #inFlight from its start to its return, so close() can await it. */
   #track(key: string, run: Promise<ExecutionOutcome>): Promise<ExecutionOutcome> {
     this.#inFlight.set(key, run.catch(() => undefined));

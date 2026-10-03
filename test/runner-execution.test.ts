@@ -338,7 +338,7 @@ describe('item execution', () => {
     // Admitted synchronously, inside whatever transaction the caller holds.
     expect(h.store.getAttempts(identity).map(row => [row.id, row.item])).toEqual([[begun.attemptId, 'P1']]);
     expect(await begun.outcome).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
-    expect(h.executor.progress(identity)).toEqual({ begun: true, earlierRevision: false, completed: ['P1', 'P2'], next: null });
+    expect(h.executor.progress(identity)).toEqual({ started: true, begun: true, earlierCommits: false, completed: ['P1', 'P2'], next: null });
   });
   it('begin throws the admission refusal itself, where runTask reports it as not started', async () => {
     const h = setup();
