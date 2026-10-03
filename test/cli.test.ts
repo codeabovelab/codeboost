@@ -1,7 +1,9 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
+import { chmodSync, existsSync, unlinkSync } from 'node:fs';
+import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from '../agents/container/image.ts';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -21,11 +23,36 @@ function review() {
   const config = join(root, 'review.json');
   writeFileSync(config, JSON.stringify({ ...demo, demo: false, github: { repository: 'owner/repo', pullRequest: 1, issue },
     runner: { root: join(root, 'runner'), committer: { name: 'codeboost', email: 'runner@codeboost.invalid' } } }));
+  /**
+   * A `docker` that answers every call with nothing (no leftovers, an image that matches the pinned profile) once the hold
+   * file is gone: startup recovery waits on it, as on a slow daemon, for as long as the test keeps the file.
+   */
+  const fakeDocker = () => {
+    const bin = join(root, 'bin'), hold = join(bin, 'hold'), image = JSON.stringify([{ Id: `sha256:${'a'.repeat(64)}`, Config: { User: '10001:10001',
+      Labels: { 'org.opencontainers.image.base.name': BASE_IMAGE, 'io.codeboost.codex.version': CODEX_VERSION, 'io.codeboost.claude.version': CLAUDE_VERSION, 'io.codeboost.profile.version': '1' } } }]);
+    mkdirSync(bin, { mode: 0o700 }); writeFileSync(hold, '');
+    writeFileSync(join(bin, 'docker'), `#!/bin/sh\nwhile [ -e '${hold}' ]; do sleep 0.05; done\nif [ "$1 $2" = "image inspect" ]; then printf '%s' '${image}'; fi\nexit 0\n`);
+    chmodSync(join(bin, 'docker'), 0o755);
+    return { path: `${bin}:${process.env.PATH}`, release: () => { if (existsSync(hold)) unlinkSync(hold); } };
+  };
+  /** The CLI as a child process with a token and the fake docker, its output collected. */
+  const start = (docker: { path: string }) => {
+    const child = spawn(process.execPath, [cli, '--config', config, '--port', '0'],
+      { env: { ...process.env, HOME: join(root, 'home'), PATH: docker.path, CLAUDE_CODE_OAUTH_TOKEN: 'test-token' }, stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '', stderr = '';
+    child.stdout!.on('data', chunk => { stdout += chunk; }); child.stderr!.on('data', chunk => { stderr += chunk; });
+    const until = async (check: () => boolean, what: string) => {
+      for (let n = 0; n < 400 && !check(); n++) await new Promise(resolve => setTimeout(resolve, 50));
+      if (!check()) throw new Error(`Timed out waiting for ${what}. stdout: ${stdout} stderr: ${stderr}`);
+    };
+    const exited = new Promise<number | null>(resolve => child.once('exit', code => resolve(code)));
+    return { child, until, exited, out: () => stdout, err: () => stderr };
+  };
   const run = (...args: string[]) => {
     const { CLAUDE_CODE_OAUTH_TOKEN: _token, ...env } = process.env;
     return spawnSync(process.execPath, [cli, '--config', config, ...args], { encoding: 'utf8', env: { ...env, HOME: join(root, 'home') }, timeout: 20_000 });
   };
-  return { run };
+  return { run, fakeDocker, start };
 }
 
 it('refuses a runner startup without a token with its message, exit 1 and the lock released', () => {
@@ -45,4 +72,32 @@ it('refuses a bad port and an unknown preparation with a message, never a stack'
     const release = run('--release-preparation', randomUUID());
     expect([release.status, release.stderr.trim()]).toEqual([1, 'Unknown attempt.']);
   }
+});
+
+it('waits for startup recovery on a first Ctrl+C, then stops cleanly once startup has finished', async () => {
+  const { fakeDocker, start } = review(), docker = fakeDocker();
+  const cli = start(docker);
+  try {
+    await cli.until(() => cli.out().includes('recovering what an earlier run left'), 'startup recovery to begin');
+    cli.child.kill('SIGINT');
+    await cli.until(() => cli.out().includes('Stopping once startup has finished'), 'the first-signal message');
+    // Recovery is still waiting on Docker: the process has not stopped.
+    await new Promise(resolve => setTimeout(resolve, 300));
+    expect(cli.child.exitCode).toBeNull();
+    docker.release();
+    expect(await cli.exited).toBe(0);
+    expect(cli.out()).not.toContain('Review ready');
+  } finally { docker.release(); cli.child.kill('SIGKILL'); }
+});
+it('stops at once with exit 130 on a second Ctrl+C during startup', async () => {
+  const { fakeDocker, start } = review(), docker = fakeDocker();
+  const cli = start(docker);
+  try {
+    await cli.until(() => cli.out().includes('recovering what an earlier run left'), 'startup recovery to begin');
+    cli.child.kill('SIGINT');
+    await cli.until(() => cli.out().includes('Stopping once startup has finished'), 'the first-signal message');
+    cli.child.kill('SIGINT');
+    expect(await cli.exited).toBe(130);
+    expect(cli.err()).toContain('Stopped during startup. The next start recovers what this one left.');
+  } finally { docker.release(); cli.child.kill('SIGKILL'); }
 });

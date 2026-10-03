@@ -59,7 +59,7 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
   if (v.limits !== undefined) {
     if (!v.limits || typeof v.limits !== 'object' || Array.isArray(v.limits)) throw new Error('runner.limits must be an object.');
     for (const [key, n] of Object.entries(v.limits)) {
-      if (!(key in EXECUTE_STORAGE) || !Number.isSafeInteger(n) || (n as number) < 1) throw new Error(`runner.limits.${key} is not a positive storage limit.`);
+      if (!Object.hasOwn(EXECUTE_STORAGE, key) || !Number.isSafeInteger(n) || (n as number) < 1) throw new Error(`runner.limits.${key} is not a positive storage limit.`);
       (limits as Record<string, number>)[key] = n as number;
     }
   }

@@ -64,6 +64,8 @@ describe('runner configuration', () => {
     expect(() => parseRunnerConfig({ root: '/r', diagnosticsDir: 'd', committer })).toThrow(/diagnosticsDir/);
     expect(() => parseRunnerConfig({ root: '/r', committer: { name: 'x', email: 'a<b>' } })).toThrow(/committer/);
     expect(() => parseRunnerConfig({ root: '/r', committer, limits: { bytes: 1 } })).toThrow(/runner.limits.bytes/);
+    // Inherited names are not limits either.
+    for (const key of ['toString', 'constructor', '__proto__']) expect(() => parseRunnerConfig({ root: '/r', committer, limits: JSON.parse(`{"${key}": 1}`) })).toThrow(/runner.limits/);
     expect(() => parseRunnerConfig({ root: '/r', committer, limits: { workBytes: 0 } })).toThrow(/runner.limits.workBytes/);
     expect(() => parseRunnerConfig([])).toThrow(/must be an object/);
   });

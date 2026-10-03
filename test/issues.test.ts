@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES } from '../github/issues.ts';
+import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES, type IssueText } from '../github/issues.ts';
+import { prepareExecution } from '../core/execution-prompt.ts';
 
 const rawIssue = (overrides: Record<string, unknown> = {}) => ({
   number: 7,
@@ -256,7 +257,20 @@ describe('issue text for an execute prompt (#91)', () => {
     await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
     await expect(gateway([], rawIssue({ number: 8 })).gateway.issueText(7)).rejects.toThrow(/different issue/);
     const long = Array.from({ length: 9 }, () => comment('member', 'x'.repeat(65_000)));
-    await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/longer than/);
+    await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB an execute prompt carries/);
+  });
+  it('accepts exactly what an execute prompt can carry, end to end, and refuses the rest at the fetch (#91)', async () => {
+    const promptOf = (issue: IssueText) => prepareExecution({ identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, attemptId: 'attempt-1',
+      mode: 'execute', itemId: 'P1', approvedLessons: [], allowedCommands: [], issue,
+      plan: { schema_version: 1, issue: 7, revision: 1, summary: 'S', questions: [], items: [{ id: 'P1', title: 'T', intent: 'I',
+        files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'x' }], acceptance: [], depends_on: [] }] } });
+    // Under the budget: what the fetch returns, the prompt carries.
+    const fits = await gateway([[comment('member', 'x'.repeat(30_000))]]).gateway.issueText(7);
+    expect(promptOf(fits).prompt).toContain('x'.repeat(30_000));
+    // Small in characters, over the budget once escaped as the prompt escapes it ('<' becomes \u003c): refused at the
+    // fetch, with the reason, instead of at every attempt's preparation.
+    await expect(gateway([[comment('member', '<'.repeat(6_000))]]).gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB/);
+    expect(() => promptOf({ number: 7, title: 'Fix retries', body: 'Keep issue text as data.', comments: ['<'.repeat(6_000)] })).toThrow(/exceeds 32 KiB/);
   });
   it('ignores an oversized comment from someone else, and reads exactly the page limit', async () => {
     const huge = comment('outsider', 'x'.repeat(70_000));
