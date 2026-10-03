@@ -15,8 +15,8 @@ import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
 import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
   UnusableRepositoryError } from '../agents/container/storage.ts';
-import { commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
-  TASK_COMMIT_REF, TaskCommitRefused, type TaskChangeManifest } from '../agents/container/changes.ts';
+import { checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
+  TASK_COMMIT_REF, TaskCommitRefused, TaskTreeRefused, type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
 import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
@@ -81,14 +81,18 @@ const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop
 async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
   vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
+  treeCheck?: TaskTreeCheck;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
   const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId, randomUUID());
   vendorNetworks.push(network);
   const trustedCommand = typeof command === 'string' ? createIsolationProbeCommand(policy, command) : command(policy);
+  // Execute and fix launch only on a tree checked just before (#81).
+  const treeCheck = phase === 'execute' || phase === 'fix'
+    ? options.treeCheck ?? await checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId }) : undefined;
   const base = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
-    inputDirectory: data.input, command: trustedCommand, imageId,
+    inputDirectory: data.input, command: trustedCommand, imageId, treeCheck,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
   profiles.push(base);
@@ -276,7 +280,8 @@ describe('real Docker agent isolation', () => {
   it('persists execution changes while replacing HOME and scratch for each invocation', async () => {
     const data = fixture();
     expect(await runContainer(await profile(data, 'execute', 'persist-write'))).toBe('first');
-    const output = await runContainer(await profile(data, 'execute', 'persist-read'));
+    // Read back by a read-only phase: an execute or fix launch needs a clean tree (#81).
+    const output = await runContainer(await profile(data, 'review', 'persist-read'));
     expect(output).toContain('?? generated.txt');
   }, 60_000);
 
@@ -1676,6 +1681,201 @@ describe('real Docker agent isolation', () => {
         '600', '/work/.git/config');
       await refusal('the Git metadata changed');
     }, 300_000);
+  });
+
+  describe('pre-launch tree check and gitlink mounts (#81)', () => {
+    // A base commit with gitlinks, which the non-recursive task clone leaves as empty directories.
+    const withGitlinks = (paths: readonly string[], extra?: (source: string) => void, beforeSeed?: (clone: string) => void,
+      limits?: Parameters<typeof prepareTaskFilesystems>[1]) =>
+      fixture({ beforeSeed, limits, hostile: source => {
+        mkdirSync(join(source, 'src')); writeFileSync(join(source, 'src', 'a.ts'), 'a\n');
+        for (const [index, path] of paths.entries()) {
+          mkdirSync(join(source, path), { recursive: true });
+          git(source, 'update-index', '--add', '--cacheinfo', `160000,${(index + 1).toString(16).padStart(40, '0')},${path}`);
+        }
+        extra?.(source);
+      } });
+    const refusal = async (promise: Promise<unknown>) => {
+      const error = await promise.then(() => undefined, (caught: unknown) => caught);
+      expect(error).toBeInstanceOf(TaskTreeRefused);
+      return (error as TaskTreeRefused).differences;
+    };
+
+    it('mounts every gitlink empty and read-only, so an agent\'s write beneath one is refused', async () => {
+      const data = withGitlinks(['sm', 'deps/inner', 'x/y/z']);
+      const check = await checkTaskTree(data.filesystems, { base: data.clone.head, imageId,
+        operations: [{ kind: 'edit', path: 'src/a.ts' }, { kind: 'add', path: 'src/b.ts' }] });
+      expect(check).toEqual({ base: data.clone.head, gitlinks: ['deps/inner', 'sm', 'x/y/z'] });
+      const valid = await profile(data, 'execute', 'gitlink-write', { treeCheck: check });
+      expect(valid.gitlinks).toEqual(['deps/inner', 'sm', 'x/y/z']);
+      // Every directory above a nested gitlink is pinned, so the probe's renames of deps, x and x/y all fail (#99).
+      expect(valid.gitlinkParents).toEqual(['deps', 'x', 'x/y']);
+      expect(await runContainer(valid)).toBe('gitlink-protected');
+      // What the agent could write is still inspected, and nothing reached a gitlink directory.
+      const manifest = await inspectTaskChanges(data.filesystems, { base: data.clone.head,
+        linkSnapshot: await snapshotDeclaredLinks(data.filesystems, [], { imageId }), imageId });
+      expect(manifest.nestedGitlinkContent).toEqual([]);
+      expect(manifest.changes.map(change => change.path)).toEqual(['beside.txt']);
+      // Inspection only, without the mounts: content at a nested gitlink path is still reported after a run, should any
+      // way around the pinned parents remain.
+      asAgent(data.filesystems, 'mv deps deps2 && mkdir -p deps/inner && printf nested > deps/inner/x');
+      const moved = await inspectTaskChanges(data.filesystems, { base: data.clone.head,
+        linkSnapshot: await snapshotDeclaredLinks(data.filesystems, [], { imageId }), imageId });
+      expect(moved.nestedGitlinkContent).toEqual(['deps/inner']);
+    }, 180_000);
+
+    it('refuses a pre-populated nested checkout before any profile exists', async () => {
+      const data = withGitlinks(['sm'], undefined, clone => {
+        mkdirSync(join(clone, 'sm', '.git'), { recursive: true }); writeFileSync(join(clone, 'sm', 'lib.c'), 'nested\n');
+      });
+      expect(await refusal(checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId })))
+        .toContain('gitlink "sm" has content or cannot be read');
+      // Without a check, no execute or fix profile is built.
+      await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'execute')), filesystems: data.filesystems,
+        inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId })).rejects.toThrow('requires a pre-launch tree check');
+    }, 180_000);
+
+    it('refuses a restart with an untracked symlink parent, and a declared path beneath a tracked symlink', async () => {
+      const data = withGitlinks([], source => { mkdirSync(join(source, 'd')); symlinkSync('d', join(source, 'link')); });
+      // An earlier attempt left src replaced by a link to a directory of its own.
+      asAgent(data.filesystems, 'mv src src-real && ln -s src-real src');
+      const differences = await refusal(checkTaskTree(data.filesystems, { base: data.clone.head, imageId,
+        operations: [{ kind: 'edit', path: 'src/a.ts' }] }));
+      expect(differences).toContain('"src" is a symlink the head does not have');
+      expect(differences).toContain('"src-real/a.ts" is "src/a.ts" moved');
+      // On a clean tree, a declared path the head puts beneath a link is refused all the same.
+      const clean = withGitlinks([], source => { mkdirSync(join(source, 'd')); symlinkSync('d', join(source, 'link')); });
+      expect(await refusal(checkTaskTree(clean.filesystems, { base: clean.clone.head, imageId,
+        operations: [{ kind: 'add', path: 'link/new.ts' }, { kind: 'rename', path: 'n.ts', renamedFrom: 'link' }] })))
+        .toEqual(['"link/new.ts" lies beneath the symlink "link"']);
+    }, 180_000);
+
+    it('refuses a restart with an occupied add destination, untracked or in the head', async () => {
+      const data = withGitlinks(['sm']);
+      asAgent(data.filesystems, 'printf left > src/b.ts');
+      expect(await refusal(checkTaskTree(data.filesystems, { base: data.clone.head, imageId,
+        operations: [{ kind: 'add', path: 'src/b.ts' }] }))).toEqual(['"src/b.ts" is a file the head does not have']);
+      const clean = withGitlinks(['sm']);
+      expect(await refusal(checkTaskTree(clean.filesystems, { base: clean.clone.head, imageId, operations: [
+        { kind: 'add', path: 'file.txt' }, { kind: 'rename', path: 'src', renamedFrom: 'file.txt' },
+        { kind: 'edit', path: 'sm' }, { kind: 'delete', path: 'gone.ts' }, { kind: 'add', path: 'sm/x' }] }))).toEqual([
+        'add destination "file.txt" is occupied by a file', 'rename destination "src" is occupied by a directory',
+        '"sm" is a gitlink, which a plan item cannot change', 'delete source "gone.ts" is missing',
+        '"sm/x" lies beneath the gitlink "sm"']);
+    }, 180_000);
+
+    it('refuses a gitlink Docker cannot mount where it is, and more gitlinks than a profile mounts', async () => {
+      const data = withGitlinks(['a,b', 'q"x']);
+      expect(await refusal(checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId })))
+        .toEqual(['gitlink "a,b" has a name Docker cannot mount', 'gitlink "q\\"x" has a name Docker cannot mount']);
+      const many = withGitlinks(Array.from({ length: 257 }, (_, index) => `m/${index}`));
+      expect(await refusal(checkTaskTree(many.filesystems, { base: many.clone.head, operations: [], imageId })))
+        .toEqual(['the head has 257 gitlinks, more than the 256 that can be mounted']);
+    }, 180_000);
+
+    it('refuses a tree it cannot read whole as a refusal, not a failure to run', async () => {
+      const data = withGitlinks([]);
+      asAgent(data.filesystems, 'touch "$(printf \'bad\\001name\')"');
+      expect(await refusal(checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId })))
+        .toEqual([expect.stringMatching(/^the tree cannot be checked whole \(".*bad\\\\x01name.*"\)$/)]);
+    }, 180_000);
+
+    it('refuses an unreadable directory and more changes than it reports, as refusals too', async () => {
+      // Exit 6: a directory the check cannot list may hold anything.
+      const locked = withGitlinks([]);
+      asAgent(locked.filesystems, 'mkdir hidden && touch hidden/x && chmod 000 hidden');
+      expect(await refusal(checkTaskTree(locked.filesystems, { base: locked.clone.head, operations: [], imageId })))
+        .toEqual([expect.stringMatching(/^the tree cannot be checked whole \(".*could not read directory hidden.*"\)$/)]);
+      // Exit 9: more than MAXIMUM_CHANGES untracked entries cannot be listed whole.
+      const crowded = withGitlinks([], undefined, undefined,
+        { workBytes: 64 * 1024 * 1024, workInodes: MAXIMUM_CHANGES + 2048, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 });
+      asAgent(crowded.filesystems, `mkdir many && cd many && seq 0 ${MAXIMUM_CHANGES} | xargs touch`);
+      expect(await refusal(checkTaskTree(crowded.filesystems, { base: crowded.clone.head, operations: [], imageId })))
+        .toEqual([expect.stringMatching(/^the tree cannot be checked whole \(".*more than 10000 new entries.*"\)$/)]);
+    }, 300_000);
+
+    it('uses each check for one profile only, over its own storage and head', async () => {
+      const data = withGitlinks(['sm']), other = withGitlinks(['sm']);
+      const check = await checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId });
+      await expect(profile(other, 'execute', 'noop', { treeCheck: check })).rejects.toThrow('other task storage');
+      await expect(createContainerProfile({ ...await governed(invocation(data.clone, 'review')), filesystems: data.filesystems,
+        inputDirectory: data.input, codexAuthFile: data.fakeAuth, imageId, treeCheck: check })).rejects.toThrow('Only an execute or fix profile');
+      await expect(profile(data, 'execute', 'noop', { treeCheck: { ...check } })).rejects.toThrow('requires a pre-launch tree check');
+      await profile(data, 'execute', 'noop', { treeCheck: check });
+      await expect(profile(data, 'execute', 'noop', { treeCheck: check })).rejects.toThrow('already used');
+      // A check made at another head (a commit with the same tree, on top of the recorded one) is refused too.
+      let later = '';
+      const moved = withGitlinks(['sm'], undefined, clone => {
+        git(clone, '-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '--allow-empty', '-qm', 'later');
+        later = git(clone, 'rev-parse', 'HEAD');
+      });
+      const elsewhere = await checkTaskTree(moved.filesystems, { base: later, operations: [], imageId });
+      await expect(profile(moved, 'execute', 'noop', { treeCheck: elsewhere })).rejects.toThrow('another head');
+    }, 180_000);
+
+    it('refuses gitlinks below more directories than a profile pins', async () => {
+      const deep = withGitlinks(Array.from({ length: 130 }, (_, index) => `d${index}/e/g`), undefined, undefined,
+        { workBytes: 16 * 1024 * 1024, workInodes: 2048, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 });
+      expect(await refusal(checkTaskTree(deep.filesystems, { base: deep.clone.head, operations: [], imageId })))
+        .toEqual(['the head\'s gitlinks are below 260 directories, more than the 256 that can be pinned']);
+    }, 180_000);
+
+    it('refuses gitlink mounts that would name more paths than a launch passes', async () => {
+      const stem = ['a', 'b', 'c', 'd'].map(letter => letter.repeat(200)).join('/');
+      const paths = Array.from({ length: 200 }, (_, index) => `${stem}/g${index}`);
+      const parents = ['a', 'b', 'c', 'd'].map((_, index) => stem.split('/').slice(0, index + 1).join('/'));
+      const bytes = paths.reduce((total, path) => total + Buffer.byteLength(path), 0)
+        + parents.reduce((total, path) => total + 2 * Buffer.byteLength(path), 0);
+      expect(bytes).toBeGreaterThan(128 * 1024);
+      const long = withGitlinks(paths);
+      expect(await refusal(checkTaskTree(long.filesystems, { base: long.clone.head, operations: [], imageId })))
+        .toEqual([`the gitlink mounts would name ${bytes} bytes of paths, more than the ${128 * 1024} a launch passes`]);
+    }, 180_000);
+
+    it('rejects a container whose pin above a nested gitlink is missing, read-only or elsewhere', async () => {
+      const data = withGitlinks(['deps/inner']);
+      const pinned = (value: string) => value.startsWith('type=volume,') && value.endsWith(',target=/work/deps,volume-subpath=deps');
+      const notPinned = 'A directory above a gitlink is not pinned by its own work-volume mount.';
+      for (const [replace, refusal] of [
+        [(value: string) => `${value},readonly`, notPinned],
+        [(value: string) => value.replace('volume-subpath=deps', 'volume-subpath=src'), notPinned],
+        [(value: string) => value.replace(',target=/work/deps,', ',target=/work/src,'), 'unexpected external mount'],
+        [(value: string) => value.replace(`source=${data.filesystems.workVolume},`, `source=${data.filesystems.metadataVolume},`), notPinned],
+        [(value: string) => `${value},volume-nocopy`, notPinned],
+        [() => 'type=tmpfs,target=/work/deps', notPinned],
+        [() => undefined, notPinned]] as const) {
+        const valid = await profile(data, 'execute', 'must-not-run');
+        expect(valid.args.filter(pinned)).toHaveLength(1);
+        const args = valid.args.flatMap((value, index) => valid.args[index + 1] !== undefined && pinned(valid.args[index + 1]!)
+          && replace(valid.args[index + 1]!) === undefined ? [] : pinned(value)
+          ? [replace(value)].filter((item): item is string => item !== undefined) : [value]);
+        docker(...args);
+        containers.add(valid.name);
+        await expect(validateContainer(valid.name, valid)).rejects.toThrow(refusal);
+        docker('rm', '--force', valid.name); containers.delete(valid.name);
+      }
+    }, 180_000);
+
+    it('rejects a container whose gitlink mount is missing or writable after Docker resolves it', async () => {
+      const data = withGitlinks(['sm']);
+      const notCovered = 'A gitlink path is not covered by its empty read-only mount.';
+      for (const [replace, refusal] of [
+        [(value: string) => value.replace(',readonly,tmpfs-mode', ',tmpfs-mode'), notCovered],
+        [(value: string) => value.replace('tmpfs-mode=0555', 'tmpfs-mode=0777'), notCovered],
+        [(value: string) => value.replace('tmpfs-size=4096', 'tmpfs-size=8192'), notCovered],
+        [(value: string) => value.replace('target=/work/sm,', 'target=/work/elsewhere,'), 'unexpected external mount'],
+        // Dropped altogether: the mount and its --mount flag go.
+        [() => undefined, notCovered]] as const) {
+        const valid = await profile(data, 'execute', 'must-not-run');
+        const args = valid.args.flatMap((value, index) => valid.args[index + 1]?.startsWith('type=tmpfs,target=/work/sm,')
+          && replace(valid.args[index + 1]!) === undefined ? [] : value.startsWith('type=tmpfs,target=/work/sm,')
+          ? [replace(value)].filter((item): item is string => item !== undefined) : [value]);
+        docker(...args);
+        containers.add(valid.name);
+        await expect(validateContainer(valid.name, valid)).rejects.toThrow(refusal);
+        docker('rm', '--force', valid.name); containers.delete(valid.name);
+      }
+    }, 180_000);
   });
 
   it('names what the diff cannot show: a submodule directory with content, and attributes that rewrite bytes', async () => {

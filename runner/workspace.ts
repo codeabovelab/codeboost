@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdirSync, rmSync } from 'node:fs';
 import { join } from 'node:path';
-import { commitTaskChanges, inspectTaskChanges, snapshotDeclaredLinks } from '../agents/container/changes.ts';
+import { checkTaskTree, commitTaskChanges, inspectTaskChanges, snapshotDeclaredLinks } from '../agents/container/changes.ts';
 import { exportTaskDiff, prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
 import type { ProcessGroup } from '../agents/process-group.ts';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
@@ -69,6 +69,9 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
     },
     async snapshotDeclaredLinks(workspace, paths, signal) {
       return snapshotDeclaredLinks(held(workspace).filesystems, paths, { imageId, signal });
+    },
+    async checkTree(workspace, input, signal) {
+      return checkTaskTree(held(workspace).filesystems, { base: input.baseHead, operations: input.operations, imageId, signal });
     },
     async inspectChanges(workspace, input, signal) {
       return inspectTaskChanges(held(workspace).filesystems, { base: input.baseHead, linkSnapshot: input.linkSnapshot, imageId, signal });

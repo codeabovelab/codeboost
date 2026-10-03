@@ -3,10 +3,11 @@ import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import type { UnreleasedResource } from '../contract.ts';
 import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { agentContainerOwner, assertContainerProfile, assertContainerProfileAuthenticity, disposeContainerProfile,
-  isContainerProfileAuthentic, profileTimeout,
+  GITLINK_MOUNT_BYTES, GITLINK_MOUNT_MODE, isContainerProfileAuthentic, profileTimeout,
   type ContainerProfile } from './profile.ts';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from './image.ts';
 import { taskFilesystemOwner } from './storage.ts';
+import { gitlinkParents } from './changes.ts';
 import { hasOwnerLabels, ownerLabels } from '../labels.ts';
 import { assertPhasePolicy } from '../policy.ts';
 export { prepareTaskFilesystems, removeTaskFilesystems, UnusableRepositoryError } from './storage.ts';
@@ -179,7 +180,9 @@ type Inspect = {
     StorageOpt?: Record<string, string> | null; CgroupParent: string;
     RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null; Runtime: string;
     Devices: unknown[] | null; DeviceRequests: unknown[] | null; Tmpfs: Record<string, string> | null;
-    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean }> | null; Dns: string[];
+    Mounts: Array<{ Type: string; Source: string; Target: string; ReadOnly: boolean;
+      TmpfsOptions?: { SizeBytes?: number; Mode?: number; Options?: unknown };
+      VolumeOptions?: { Subpath?: string; NoCopy?: boolean; DriverConfig?: unknown; Labels?: unknown } }> | null; Dns: string[];
     DnsOptions: string[]; DnsSearch: string[]; ExtraHosts: string[] | null;
     PortBindings: Record<string, unknown> | null; PublishAllPorts: boolean };
   Mounts: Array<{ Type: string; Name?: string; Source: string; Destination: string; RW: boolean }>;
@@ -254,15 +257,47 @@ export async function validateContainer(container: string, profile: ContainerPro
     if (!hasExactOptions(tmpfs[path], expected)) throw new Error(`Container tmpfs ${path} options changed.`);
   }
   const mounts = new Map(inspect.Mounts.map(item => [item.Destination, item]));
-  const allowedMounts = new Set(['/work', '/work/.git', '/run/codeboost-input',
+  const gitlinkMounts = profile.gitlinks.map(path => `/work/${path}`);
+  // Derived again from the gitlinks, so the pins checked are exactly the ones those gitlinks need.
+  const pins = gitlinkParents(profile.gitlinks);
+  if (JSON.stringify(pins) !== JSON.stringify(profile.gitlinkParents))
+    throw new Error('A directory above a gitlink is not pinned by its own work-volume mount.');
+  const parentMounts = pins.map(path => `/work/${path}`);
+  const allowedMounts = new Set(['/work', '/work/.git', '/run/codeboost-input', ...gitlinkMounts, ...parentMounts,
     ...(profile.vendor === 'codex' ? ['/run/codeboost-auth/codex/auth.json'] : [])]);
   if (inspect.Mounts.some(item => !allowedMounts.has(item.Destination)))
     throw new Error('Container includes an unexpected external mount.');
+  // Every gitlink is covered by its own empty, read-only, bounded tmpfs, exactly as the profile asked.
+  for (const target of gitlinkMounts) {
+    const actual = inspect.Mounts.filter(item => item.Destination === target);
+    const requested = (host.Mounts ?? []).filter(item => item.Target === target);
+    if (actual.length !== 1 || actual[0]!.Type !== 'tmpfs' || actual[0]!.RW || requested.length !== 1
+      || requested[0]!.Type !== 'tmpfs' || !requested[0]!.ReadOnly
+      || requested[0]!.TmpfsOptions?.SizeBytes !== GITLINK_MOUNT_BYTES
+      || requested[0]!.TmpfsOptions?.Mode !== Number.parseInt(GITLINK_MOUNT_MODE, 8)
+      || ![undefined, null].includes(requested[0]!.TmpfsOptions?.Options as null | undefined)
+        && !(Array.isArray(requested[0]!.TmpfsOptions?.Options) && (requested[0]!.TmpfsOptions!.Options as unknown[]).length === 0))
+      throw new Error('A gitlink path is not covered by its empty read-only mount.');
+  }
+  // Every directory above a nested gitlink is the task's own work volume again, writable, at exactly its own subpath.
+  for (const path of pins) {
+    const target = `/work/${path}`;
+    const actual = inspect.Mounts.filter(item => item.Destination === target);
+    const requested = (host.Mounts ?? []).filter(item => item.Target === target);
+    const options = requested[0]?.VolumeOptions;
+    if (actual.length !== 1 || actual[0]!.Type !== 'volume' || actual[0]!.Name !== profile.filesystems.workVolume
+      || !actual[0]!.RW || requested.length !== 1 || requested[0]!.Type !== 'volume'
+      || requested[0]!.Source !== profile.filesystems.workVolume || requested[0]!.ReadOnly || options?.Subpath !== path
+      || options.NoCopy)
+      throw new Error('A directory above a gitlink is not pinned by its own work-volume mount.');
+  }
   const work = mounts.get('/work'), metadata = mounts.get('/work/.git'), input = mounts.get('/run/codeboost-input');
   if (work?.Type !== 'volume' || work.RW !== ['execute', 'fix'].includes(profile.phase)
     || metadata?.Type !== 'volume' || metadata.RW || input?.Type !== 'bind' || input.RW)
     throw new Error('Container mounts do not match the phase isolation profile.');
   const requestedMounts = new Map((host.Mounts ?? []).map(item => [item.Target, item]));
+  // /work is the whole work volume: a subpath there would put another directory's content at the root.
+  if (requestedMounts.get('/work')?.VolumeOptions?.Subpath) throw new Error('Container mounts do not match the phase isolation profile.');
   const requestedInput = requestedMounts.get('/run/codeboost-input');
   if (requestedInput?.Type !== 'bind' || canonicalDockerBindSource(requestedInput.Source) !== profile.inputDirectory
     || canonicalDockerBindSource(input.Source) !== profile.inputDirectory

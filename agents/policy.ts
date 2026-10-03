@@ -144,7 +144,7 @@ export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' |
   | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'truncated-utf8-stderr'
   | 'replace-output-directory'
   | 'nonzero-output' | 'duplicate-protocol' | 'newline-free-deferred-output' | 'scratch-capacity' | 'metadata-alias'
-  | 'hostile-repo';
+  | 'hostile-repo' | 'gitlink-write';
 
 // `set -e` ignores a failing `! command`, so a negated check could never fail a probe. `deny` exits instead when a
 // forbidden action succeeds, and names the breach. Both streams of the attempted command are discarded, so a breach
@@ -220,6 +220,23 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + 'case "$resolved" in /work|/work/*) ;; '
       + '*) echo "isolation breach: link leaves the checkout $link" >&2; exit 1;; esac; done\' sh {} +; '
       + 'deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; printf hostile-repo-contained',
+    // Every gitlink in the index (the head's, in a fresh copy) is its own empty read-only mount: nothing can be written beneath it, and it cannot be
+    // removed or moved aside. The rest of the work tree stays writable.
+    'gitlink-write': `${deny}set -eu; n=0; for p in $(git ls-files --stage | awk '$1 == "160000" { print $4 }'); do `
+      + 'n=$((n+1)); test "$(findmnt --noheadings --output TARGET --target "/work/$p")" = "/work/$p"; '
+      + 'findmnt --noheadings --output OPTIONS --target "/work/$p" | tr , "\\n" | grep -Fxq ro; '
+      + 'test -z "$(ls -A "/work/$p")"; deny touch "/work/$p/x"; deny mkdir "/work/$p/.git"; '
+      + 'deny rmdir "/work/$p"; deny mv "/work/$p" "/work/$p.moved"; '
+      // Each directory above it is pinned (#99): its own writable nosuid,nodev mountpoint, which cannot be moved aside,
+      // so the gitlink's mount cannot be carried off and its path refilled. What is inside stays writable.
+      + 'd=$(dirname "$p"); while [ "$d" != . ]; do '
+      + 'test "$(findmnt --noheadings --output TARGET --target "/work/$d")" = "/work/$d"; '
+      + 'o=$(findmnt --noheadings --output OPTIONS --target "/work/$d" | tr , "\\n"); '
+      + 'for x in rw nosuid nodev; do printf "%s\\n" "$o" | grep -Fxq "$x"; done; '
+      + 'deny mv "/work/$d" "/work/$d.moved"; test -d "/work/$p"; '
+      + 'touch "/work/$d/.pinned-write"; test -f "/work/$d/.pinned-write"; rm "/work/$d/.pinned-write"; '
+      + 'd=$(dirname "$d"); done; done; test "$n" -gt 0; '
+      + 'printf ok > /work/beside.txt; printf gitlink-protected',
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }
