@@ -84,7 +84,9 @@ describe('runner startup', () => {
     // The review now reads runner commits from the repository the runner writes.
     const repositories = join(root, 'runner', assembly.deps.runnerOwner, 'repositories');
     expect(service.config.runnerRepository).toBe(join(repositories, readdirSync(repositories)[0]!));
-    expect(statSync(join(root, 'runner', 'diagnostics')).mode & 0o777).toBe(0o700);
+    // Per database, under its runner token: another database sharing the root keeps its own folder.
+    expect(statSync(join(root, 'runner', assembly.deps.runnerOwner, 'diagnostics')).mode & 0o777).toBe(0o700);
+    expect(existsSync(join(root, 'runner', 'diagnostics'))).toBe(false);
     expect(await assembly.sources.vendor(service.config.identity)).toBe('claude');
     expect(() => assembly.sources.planContext({ ...service.config.identity, planId: 'other' })).toThrow(/only its configured plan/);
   });

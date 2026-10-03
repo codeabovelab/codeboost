@@ -11,7 +11,7 @@ requireSupportedNode();
 function refuse(error: unknown): never { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
 const checked = <T>(fn: () => T): T => { try { return fn(); } catch (error) { return refuse(error); } };
 const { values } = parseArgs({ options: { demo: { type:'boolean' }, directory:{type:'string'}, config:{type:'string'}, port:{type:'string'}, help:{type:'boolean'}, 'release-preparation':{type:'string'} } });
-if (values.help || (!values.demo && !values.config)) {
+if (values.help || (!values.demo && !values.config && values['release-preparation'] === undefined)) {
   console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate; demos never merge. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).');
 } else if (values['release-preparation'] !== undefined) {
   const attemptId = values['release-preparation'];
@@ -35,8 +35,8 @@ if (values.help || (!values.demo && !values.config)) {
   const port = Number(values.port ?? '4318');
   if (!Number.isInteger(port) || port < 0 || port > 65535) refuse(new Error('Invalid port.'));
   const config = checked(() => values.demo ? createDemo(values.directory ?? '.codeboost-local/demo') : JSON.parse(readFileSync(resolve(values.config!), 'utf8')));
-  // Checked before the lock, so a malformed block changes nothing. Demos never run the runner.
-  const runnerConfig = checked(() => !values.demo && config.runner !== undefined ? parseRunnerConfig(config.runner) : null);
+  // Checked before the lock, so a malformed block changes nothing. Demos never run the runner, however they were opened.
+  const runnerConfig = checked(() => config.demo !== true && config.runner !== undefined ? parseRunnerConfig(config.runner) : null);
   // Decision 1: one runner per database, held as an OS lock keyed by the database file's device and inode.
   const lock = checked(() => acquireRunnerLock(config.database));
   const runnerSetup: RunnerSetup | undefined = runnerConfig ? async (service, capability) => {

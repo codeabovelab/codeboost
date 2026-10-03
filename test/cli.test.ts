@@ -101,3 +101,27 @@ it('stops at once with exit 130 on a second Ctrl+C during startup', async () => 
     expect(cli.err()).toContain('Stopped during startup. The next start recovers what this one left.');
   } finally { docker.release(); cli.child.kill('SIGKILL'); }
 });
+
+it('reports that --release-preparation needs --config, instead of printing help and exiting 0', () => {
+  const result = spawnSync(process.execPath, [cli, '--release-preparation', randomUUID()], { encoding: 'utf8', timeout: 20_000 });
+  expect([result.status, result.stderr.trim()]).toEqual([1, '--release-preparation needs --config.']);
+});
+it('ignores a runner block in a demo configuration opened with --config, and serves the demo', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-cli-')); roots.push(root);
+  const demo = createDemo(join(root, 'demo'));
+  mkdirSync(join(root, 'home'), { mode: 0o700 });
+  const config = join(root, 'demo-with-runner.json');
+  writeFileSync(config, JSON.stringify({ ...demo, runner: { root: join(root, 'runner'), committer: { name: 'codeboost', email: 'runner@codeboost.invalid' } } }));
+  const child = spawn(process.execPath, [cli, '--config', config, '--port', '0'], { env: { ...process.env, HOME: join(root, 'home') }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '', stderr = '';
+  child.stdout!.on('data', chunk => { stdout += chunk; }); child.stderr!.on('data', chunk => { stderr += chunk; });
+  const exited = new Promise<number | null>(resolve => child.once('exit', code => resolve(code)));
+  try {
+    for (let n = 0; n < 400 && !stdout.includes('Review ready') && child.exitCode === null; n++) await new Promise(resolve => setTimeout(resolve, 50));
+    expect(stderr).toBe('');
+    expect(stdout).toContain('Review ready');
+    expect(stdout).not.toContain('recovering what an earlier run left');
+    child.kill('SIGINT');
+    expect(await exited).toBe(0);
+  } finally { child.kill('SIGKILL'); }
+});
