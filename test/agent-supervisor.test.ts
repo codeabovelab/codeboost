@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
-import { readCodexOutput, startCodexInvocation } from '../agents/adapters/codex.ts';
+import { readCodexOutput } from '../agents/adapters/codex.ts';
 import { ACKNOWLEDGEMENT_SCRIPT, isInvocationActive, readBoundedContainerFile, retainSetupCleanup,
   startProfileInvocation } from '../agents/adapters/supervisor.ts';
 import { captureInvocation, type InvocationInput, type InvocationResult, type Phase } from '../agents/contract.ts';
@@ -267,14 +267,14 @@ describe('container invocation supervisor', () => {
   }, 2 * 60_000);
 
   it('returns the adapter handle at once and cancels it during network creation', async () => {
-    const data = fixture(), captured = invocation(data, 'adapter-setup-cancel', 2 * 60_000, 'codex', 'review');
+    const data = fixture(), captured = invocation(data, 'adapter-setup-cancel', 2 * 60_000, 'claude', 'review');
     const egress = () => spawnSync('docker', ['network', 'ls', '--quiet', '--filter', 'label=io.codeboost.egress'],
       { encoding: 'utf8' }).stdout.trim().split('\n').filter(Boolean).sort();
     const before = egress();
     const result = await withEnvironment('PATH', hangingDocker('network\\ create*'), async () => {
       const started = performance.now();
-      const handle = startCodexInvocation({ invocation: captured, filesystems: data.filesystems,
-        inputDirectory: data.input, imageId, prompt: 'unused', networkAllocationId: randomUUID() }, data.auth, { timeoutMs: 2 * 60_000 });
+      const handle = startClaudeInvocation({ invocation: captured, filesystems: data.filesystems,
+        inputDirectory: data.input, imageId, prompt: 'unused', networkAllocationId: randomUUID() }, 'unused', { timeoutMs: 2 * 60_000 });
       expect(performance.now() - started).toBeLessThan(250);
       expect(isInvocationActive('adapter-setup-cancel')).toBe(true);
       await new Promise(resolve => setTimeout(resolve, 1_000));
@@ -581,19 +581,6 @@ describe('container invocation supervisor', () => {
     // Exact value only, allowing just the single trailing newline a CLI adds; any other surrounding whitespace or
     // formatting fails the probe.
     const schemaValue = (output: string) => output.replace(/\r?\n$/, '');
-
-    it('runs the production Codex adapter and collects its bounded output file', async () => {
-      const data = fixture(), authFile = process.env.CODEBOOST_CODEX_AUTH_FILE;
-      if (!authFile) throw new Error('CODEBOOST_CODEX_AUTH_FILE is required.');
-      // Codex is refused in planning and questions (#75), so the probe runs in review, its read-only phase.
-      const result = await startCodexInvocation({ invocation: invocation(data, 'live-codex', 6 * 60_000, 'codex', 'review'),
-        filesystems: data.filesystems, inputDirectory: data.input, imageId, networkAllocationId: randomUUID(),
-        prompt: schemaPrompt }, authFile).settled;
-      expect(result.stopReason, result.stderr).toBeUndefined();
-      expect(result.exitCode).toBe(0);
-      // Codex returns through its bounded output file; the value can only come from the mounted schema.
-      expect(schemaValue(result.stdout)).toBe('codeboost-adapter-schema-marker');
-    }, 8 * 60_000);
 
     it('runs the production Claude adapter and parses its bounded envelope', async () => {
       const data = fixture(), token = process.env.CLAUDE_CODE_OAUTH_TOKEN;

@@ -113,13 +113,16 @@ export function assertPlanningSchema(schema: string): string {
 }
 
 /**
- * Codex 0.153.4 reads files only through its shell, and planning and questions run no process. Codex would answer
- * without seeing the code or the schema, so these phases are refused rather than weakened (#75; see
- * docs/implementation/agent-isolation.md, "Codex in read-only phases").
+ * Phases Codex may run: none (#93). Codex 0.153.4 reads files only through its shell, and the shell is off in every
+ * phase, so Codex would plan, review or edit code it cannot see. Planning and questions run no process (#75); review
+ * and execute/fix may run only exact approved argv through the runner, which a free shell would bypass. Each phase is
+ * refused rather than weakened (see docs/implementation/agent-isolation.md, "Codex is refused in every phase").
  */
+const CODEX_PHASES: ReadonlySet<Phase> = new Set();
+
 export function assertCodexPhase(phase: Phase): void {
-  if (phase === 'planning' || phase === 'questions')
-    throw new Error(`Codex cannot run the ${phase} phase: it has no file-reading tool that runs no process.`);
+  if (!CODEX_PHASES.has(phase))
+    throw new Error(`Codex cannot run the ${phase} phase: it cannot read files without a shell, and its shell is off.`);
 }
 
 export function codexBaseArguments(policy: PhasePolicy): readonly string[] {

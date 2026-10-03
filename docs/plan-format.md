@@ -6,7 +6,7 @@
 
 - A plan is a list of **plan items** for one GitHub issue. Each item says which files it will change, what changes in each file, and how to check the result.
 - One schema, [`schema/plan.schema.json`](../schema/plan.schema.json), defines the structure. It is the contract for three things:
-  1. **Generating.** codeboost gives the schema to Claude (`claude -p --json-schema`), so the agent's answer always has the right shape. Codex does not draft plans for now, because it cannot read the code without running commands ([why](implementation/agent-isolation.md#codex-in-read-only-phases)).
+  1. **Generating.** codeboost gives the schema to Claude (`claude -p --json-schema`), so the agent's answer always has the right shape. Codex does not draft plans for now, because it cannot read the code without running commands ([why](implementation/agent-isolation.md#codex-is-refused-in-every-phase)).
   2. **Importing.** A plan in a YAML or JSON file, written by a person or another tool, is checked against the same schema.
   3. **Suggesting.** The plan assistant's suggested edits follow a second schema, [`schema/plan-edit.schema.json`](../schema/plan-edit.schema.json).
 - YAML and JSON have exactly the same structure. YAML is for people; JSON is what the agents return.

@@ -5,11 +5,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, expect, it, vi } from 'vitest';
 import { parseClaudeOutput, readPlanningSchema, startClaudeInvocation } from '../agents/adapters/claude.ts';
-import { CODEX_OUTPUT_FILE, startCodexInvocation } from '../agents/adapters/codex.ts';
+import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
 import { createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
-import { createCodexCommand, createPhasePolicy } from '../agents/policy.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
 describe('production agent adapters', () => {
@@ -110,7 +109,8 @@ describe('production agent adapters', () => {
     expect(() => startClaudeInvocation({ ...missing, invocation: questions }, 'token')).toThrow('Agent image');
   });
 
-  it.each(['planning', 'questions'] as const)('refuses a Codex %s invocation synchronously, allocating nothing',
+  it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(
+    'refuses a Codex %s invocation synchronously, allocating nothing (#93)',
     phase => {
       const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
         clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
@@ -122,17 +122,6 @@ describe('production agent adapters', () => {
         .toThrow(`Codex cannot run the ${phase} phase`);
       expect(isInvocationActive(invocation.attemptId)).toBe(false);
     });
-
-  it('routes Codex final output to the bounded scratch directory', () => {
-    const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
-      clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
-      phase: 'review', vendor: 'codex', approvedArgv: [], deadline: 2_000, attemptId: 'adapter-command',
-      context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
-    }, 1_000);
-    const argv = createCodexCommand(createPhasePolicy(invocation), 'Review this.').argv;
-    expect(argv.slice(argv.indexOf('--output-last-message'), argv.indexOf('--output-last-message') + 2))
-      .toEqual(['--output-last-message', CODEX_OUTPUT_FILE]);
-  });
 
   it('publishes immutable production output ceilings', () => {
     expect(OUTPUT_LIMITS).toEqual({ stdoutBytes: 16 * 1024 * 1024, stderrBytes: 4 * 1024 * 1024,

@@ -17,9 +17,9 @@ The `Agent isolation` workflow runs the same command. The main `CI` workflow ski
 the Docker suites so that they never run in parallel.
 
 The live vendor probes need real credentials, so CI does not run them. To run them,
-set `CODEBOOST_RUN_AUTH_PROBES=1`, `CODEBOOST_CODEX_AUTH_FILE` (a Codex `auth.json`
-path) and `CLAUDE_CODE_OAUTH_TOKEN`. Do not put credentials in an issue, a pull
-request or chat.
+set `CODEBOOST_RUN_AUTH_PROBES=1` and `CLAUDE_CODE_OAUTH_TOKEN`. Codex has no live
+probe while it is refused (#93). Do not put credentials in an issue, a pull request
+or chat.
 
 ## What the gate proves
 
@@ -30,12 +30,12 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | Isolation holds: non-root, no capabilities, read-only root, no host paths or secrets, vendor-only egress | `agent-container`: read-only isolation, lockdown and mount validation; `agent-network`: egress and DNS |
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
 | Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
-| Codex does not run planning or questions, because it cannot read code there (see [Codex in read-only phases](#codex-in-read-only-phases)) | `agent-policy`: the Codex command refuses these phases; `agent-adapter`: the Codex start call refuses them and allocates nothing |
+| Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
 | A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
 | Mountpoint replacement fails | `agent-container`: metadata and metadata alias probes (`mv` and `rm -rf` of `.git`) |
-| Both vendor startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes (credentials required): Codex in review through its output file; Claude in questions through its stdout envelope; Claude in planning returns a schema-constrained answer as bare JSON. **Known failure:** the Codex probes (here and in `agent-container`) fail, because Codex cannot read files in any phase (see [Codex in read-only phases](#codex-in-read-only-phases)). |
+| The Claude startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes (credentials required): Claude in questions through its stdout envelope; Claude in planning returns a schema-constrained answer as bare JSON; `agent-container`: the authenticated Claude startup path. Codex has no live probe while it is refused (#93). |
 | Nothing can be written beneath a gitlink, and execute and fix launch only on a clean tree (#81) | `agent-container`: the gitlink probe (writes, `mkdir`, `rmdir` and `mv` at every gitlink fail; the rest of `/work` stays writable); a pre-populated nested checkout, a restart with an untracked symlink parent and a restart with an occupied add destination are refused; a gitlink name Docker cannot mount, more than 256 gitlinks and an unreadable tree are refused; each check serves one profile over its own storage and head; the validator rejects a gitlink mount that is missing, writable, or of another size or mode; every directory above a nested gitlink is pinned, writable and `nosuid,nodev`, so renaming one fails (#99); the validator rejects a pin that is missing, read-only, at another subpath, from another volume, `volume-nocopy`, or not a volume |
 | Hostile input stays inside the boundary | `agent-container`: repositories with links that leave the checkout are refused, links inside the checkout still work, oversized repositories fail closed; `agent-policy`: option-like prompts; `agent-proxy`: hostile CONNECT traffic; `agent-supervisor`: hostile output |
 
@@ -78,7 +78,7 @@ Use only these entry points to run an agent:
    this to the user as a repository the agent cannot run on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
-4. `startCodexInvocation` or `startClaudeInvocation` returns a handle at once and runs
+4. `startClaudeInvocation` returns a handle at once and runs
    the Docker setup and the agent inside it. It throws only when it allocated nothing
    (invalid input, an expired budget, or an attempt ID that is still owned); every
    later failure settles the handle. `cancel()` during setup kills the in-flight Docker
@@ -91,8 +91,8 @@ Use only these entry points to run an agent:
      Questions answer in plain text and carry no schema flag. The schema file must be a regular file with one link,
      at most 64 KiB of UTF-8, and a JSON object with `"type": "object"`; otherwise the start call throws. Leave out a
      draft 2020-12 `$schema` line: Claude's `--json-schema` rejects it (see [plan format](../plan-format.md)).
-   - **Codex.** `startCodexInvocation` throws for planning and questions, and allocates nothing. See
-     [Codex in read-only phases](#codex-in-read-only-phases).
+   - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
+     [Codex is refused in every phase](#codex-is-refused-in-every-phase).
 5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before
    `removeTaskFilesystems`. `base` is the full ID of the commit the storage was seeded from (the clone's head). For a
    recovery handle, also pass the `metadataBaseline` you recorded (step 6). It returns at most 1 MiB of diff
@@ -231,41 +231,64 @@ The caller must do the following:
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
 
-## Codex in read-only phases
+## Codex is refused in every phase
 
-Decision for #75, recorded 2026-10-01.
+Decisions for #75 (planning and questions) and #93 (review, execute and fix), both
+recorded 2026-10-01.
 
 **Problem.** Codex 0.153.4 reads files only through its shell. D turns the shell off
-(`features.shell_tool=false`), because planning and questions must not run a process
-(design, "Phase enforcement"). So in these phases Codex cannot see `/work` or the
-mounted schema. E4's recordings showed this: Codex planned without the code and asked
-for the schema.
+(`features.shell_tool=false`) in every phase. So Codex cannot see `/work` or the
+mounted input in any phase. E4's recordings showed this in planning: Codex planned
+without the code and asked for the schema. The live Codex probe in review answered:
+"I can't read that local file with the available tools." In execute and fix, Codex
+would change files it cannot see.
 
-**Options considered.**
+The shell cannot simply be turned on (design, "Phase enforcement"):
+
+- Planning and questions must run no process.
+- Review and execute/fix may run only an exact approved argv, through a
+  runner-controlled dispatcher. The Codex shell runs any process, and the runner
+  never sees it. No vendor has the runner-controlled command tool yet
+  (`dispatchApprovedCommand` has no agent-facing caller).
+- If an adapter cannot enforce a phase profile, the phase is refused.
+
+**Options considered.** #93 lists every option for each phase.
 
 | Option | Result |
 | --- | --- |
-| a. Turn the shell on for Codex in read-only phases | Rejected. It breaks the rule that planning and questions run no process, and the design says to refuse a phase that an adapter cannot enforce. |
-| b. Keep the shell off and put the schema and chosen files in the prompt | Rejected. The 32 KiB prompt limit caps how much code Codex sees, and E2 would have to choose the files. |
-| c. Use Claude only for planning and questions | **Chosen.** |
+| a. Turn the shell on for Codex in planning and questions | Rejected (#75). It breaks the rule that these phases run no process. |
+| b. Turn the shell on for Codex in execute and fix | Not now (#93). It needs a design change, or a Codex setting that enforces exact argv. |
+| c. Keep the shell off and put the schema and chosen files in the prompt | Rejected. The 32 KiB prompt limit caps how much code Codex sees, and E2 would have to choose the files. |
+| d. Wait for a Codex tool that reads files without a process | Not chosen: the Codex probes would keep failing, and T9 would stay open. |
+| e. Use Claude only, in every phase | **Chosen.** |
 
 **What this changes.**
 
-- `createCodexCommand` and `startCodexInvocation` refuse the `planning` and `questions`
-  phases. The start call refuses before it allocates anything.
+- `createCodexCommand` and `startCodexInvocation` refuse every phase. The start call
+  refuses before it allocates anything. The phases the Codex adapter may run are one
+  set in `agents/policy.ts` (`CODEX_PHASES`), and it is empty. Ask and the runner
+  also refuse Codex on their own (below), so adding a phase to the set does not by
+  itself turn Codex on there.
+- The execute runner refuses a Codex task before it fetches the issue or allocates
+  task storage.
 - Ask offers only Claude Code. The Store refuses Codex as the question agent. A review
   database that already names Codex reads back as Codex, and Ask refuses it with a
   message that tells the user to choose Claude Code.
 - The Ask worker receives only `CLAUDE_CODE_OAUTH_TOKEN` as credential data.
 - E4 records Claude only: one draft and one suggestion.
+- The live Codex probes are removed. The T9 row for startup probes covers Claude only.
+  The Codex adapter's output-file decoding stays, and the isolation probes still
+  exercise it with a Codex container profile.
 
-**Codex in other phases.** The same shell setting applies to review, execute and fix.
-On 2026-10-01 the live Codex probe in review answered that it could not read the file.
-So Codex cannot read code in any phase. That is a separate decision from this one.
+**When to revisit.**
 
-**When to revisit.** Allow Codex in these phases again when a pinned Codex version has
-a file-reading tool that runs no process. Then pass the mounted schema to it with
-`--output-schema /run/codeboost-input/schema.json` and add a Codex planning probe.
+- Planning, questions and review: when a pinned Codex version has a file-reading tool
+  that runs no process. Then pass the mounted schema with
+  `--output-schema /run/codeboost-input/schema.json`, and add live Codex probes for
+  those phases. Also restore a test that `createCodexCommand` writes its final message
+  to `CODEX_OUTPUT_FILE`, the file the adapter reads.
+- Execute and fix: when the design accepts the container as the only process boundary
+  in those phases, or when Codex can enforce exact approved argv (#93, option 1).
 
 ## First consumer: Ask
 
@@ -285,7 +308,7 @@ Ask keeps the contract's identity and cleanup rules:
   subprocess, including the image build, inherits only that, so no credential, home directory, Docker config or
   agent socket reaches it. The credential lookup's only variable, `CLAUDE_CODE_OAUTH_TOKEN`, reaches the worker as
   data and goes only to the Claude adapter. Ask refuses Codex before any Docker work (see
-  [Codex in read-only phases](#codex-in-read-only-phases)).
+  [Codex is refused in every phase](#codex-is-refused-in-every-phase)).
   Lane D's recovery runs in the worker, so it has the same environment. Missing sign-in is reported before any
   Docker work.
 - Lane D's clone is a full host copy with no byte limit of its own. Before cloning, Ask measures the checkout at the
@@ -383,9 +406,8 @@ against real Docker, including two reviews with different Ask owners on one daem
 ## Limits of this gate
 
 - CI does not run the live vendor probes. Run them locally with credentials before
-  a release that changes the image, the adapters or the prompts. The two Codex probes
-  fail until Codex can read files in its phases; that failure is expected, not a
-  regression.
+  a release that changes the image, the adapters or the prompts. Codex has no live
+  probe while it is refused in every phase (#93).
 - T9 as a whole is complete only when lane F runs every suite in required CI (F6).
 - Gitlink mounts and the pre-launch check apply to execute and fix only. In planning, questions and review, `/work`
   is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run

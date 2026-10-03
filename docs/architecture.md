@@ -29,7 +29,7 @@ Writing standard: plain language, ISO 24495-1:2023
 
 ## Summary
 
-- **What codeboost does.** It turns a GitHub issue into a plan, has an AI agent (Claude or Codex) carry out the plan, and lets you review the resulting pull request one plan item at a time. Then it merges the pull request, but only when every guard passes.
+- **What codeboost does.** It turns a GitHub issue into a plan, has an AI agent (Claude) carry out the plan, and lets you review the resulting pull request one plan item at a time. Then it merges the pull request, but only when every guard passes.
 - **Shape of the system.** One local Node.js process. It serves a browser screen on `127.0.0.1`, keeps all state in one SQLite file, reads Git directly, talks to GitHub only through the `gh` command, and runs every agent inside a locked-down Docker container.
 - **Five layers.**
   1. `web/` — the local HTTP server and browser screen.
@@ -86,7 +86,7 @@ flowchart LR
     cb -- "issues, checks, merge" --> gh
   end
   gh --> github[(GitHub)]
-  docker --> agent["Agent container<br/>(claude or codex)"]
+  docker --> agent["Agent container<br/>(Claude; Codex is refused, #93)"]
   agent -- "vendor API hosts only,<br/>through a proxy" --> vendor[(Anthropic / OpenAI API)]
 ```
 
@@ -96,7 +96,7 @@ flowchart LR
 | Git repository | Read-only history and file reads. codeboost never writes your checkout. | None. |
 | GitHub | Issues, pull request state, branch rules, required checks, merge. Always through `gh`. | Your `gh` sign-in. Only the runner uses it. |
 | Docker | Runs agent containers, the internal network and the egress proxy. | Local Docker socket. Never mounted into a container. |
-| Claude or Codex API | The agent inside the container calls its own vendor. | `CLAUDE_CODE_OAUTH_TOKEN` or the Codex `auth.json`, passed only into that container. |
+| Claude or Codex API | The agent inside the container calls its own vendor. | `CLAUDE_CODE_OAUTH_TOKEN`, passed only into that container. Codex is refused in every phase for now ([why](implementation/agent-isolation.md#codex-is-refused-in-every-phase)); its `auth.json` would be passed the same way. |
 
 ## Building blocks
 
