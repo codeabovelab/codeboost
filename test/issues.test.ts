@@ -279,6 +279,11 @@ describe('issue text for an execute prompt (#91)', () => {
     expect((await gateway(pages).gateway.issueText(7)).comments).toEqual([]);
     await expect(gateway([...pages, [comment('outsider', 'one more')]]).gateway.issueText(7)).rejects.toThrow(/more than 1000 comments/);
   });
+  it('refuses a title and body already over the prompt budget before reading any collaborator or comment page', async () => {
+    const { gateway: g, calls } = gateway([[comment('member', 'never read')]], rawIssue({ body: 'x'.repeat(40_000) }));
+    await expect(g.issueText(7)).rejects.toThrow(/larger than the 32 KiB/);
+    expect(calls.map(args => args[5])).toEqual(['repos/owner/repo/issues/7']);
+  });
   it('stops on the caller\'s abort', async () => {
     const controller = new AbortController();
     controller.abort(new Error('stopped'));

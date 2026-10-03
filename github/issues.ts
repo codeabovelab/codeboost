@@ -249,13 +249,14 @@ export class GhIssueGateway implements IssueGateway {
       if (issue.number !== number) throw new Error('GitHub returned a different issue.');
       if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
       const title = boundedString(issue.title, 'title', 4096), body = boundedString(issue.body, 'body', MAX_BODY_LENGTH, true);
-      const collaborators = await this.#loadCollaborators(signal);
-      const comments: string[] = [];
       // The execute prompt carries the issue as one JSON data block of at most MAX_PROMPT_BYTES (dataJSON). A running byte
-      // count stops reading early; the exact check below uses the prompt's own serializer, so an issue accepted here is
-      // one the prompt can carry.
+      // count stops reading early (a title and body already over it read no collaborator or comment page); the exact check
+      // below uses the prompt's own serializer, so an issue accepted here is one the prompt can carry.
       const tooLong = () => new Error(`Issue #${number}'s title, body and collaborator comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
       let total = Buffer.byteLength(title) + Buffer.byteLength(body);
+      if (total > MAX_PROMPT_BYTES) throw tooLong();
+      const collaborators = await this.#loadCollaborators(signal);
+      const comments: string[] = [];
       for (let page = 1; ; page++) {
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
           `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });

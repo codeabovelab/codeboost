@@ -123,6 +123,15 @@ export function claudeLauncher(o: { imageId: string; runnerRoot: string; runnerO
   };
 }
 
+/**
+ * What startup recovery left for a person (runner-lifecycle.md: never removed automatically), one line each. Docker
+ * labels and file names are not codeboost's, so each is quoted: a newline or control character in one cannot forge a line.
+ */
+export function recoveryWarnings(report: Pick<RecoveryReport, 'unmatchedStorage' | 'unknownEntries'>): string[] {
+  return [...report.unmatchedStorage.map(attemptId => `Task storage labelled with attempt ${JSON.stringify(attemptId)} matches no attempt of this database; it was left in place.`),
+    ...report.unknownEntries.map(entry => `Unknown entry in the runner's attempt directory, left in place: ${JSON.stringify(entry)}`)];
+}
+
 export interface RunnerAssembly {
   readonly deps: RunnerDeps;
   readonly sources: ExecutionSources;
