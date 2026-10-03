@@ -1,5 +1,5 @@
 /**
- * The Perl program D runs inside task storage to read it without following links (#66). One program serves five modes,
+ * The Perl program D runs inside task storage to read it without following links (#66). One program serves six modes,
  * so the seeder's checks and a later inspection read storage the same way:
  *
  * - `links <work> <metadata>` (run by the seeder, as root, over what it copied) refuses, with exit 11, any link in the
@@ -13,6 +13,8 @@
  * - `inspect <baseline> <base> <link count> <link>... <target>...` (in /work) compares the work tree with the tree of
  *   `base`, hashing every file as a commit would store it, resolves each declared link again (without walking its
  *   target), and reports the state now of each target the snapshot recorded, the metadata digest and HEAD.
+ * - `prelaunch <baseline> <base> <path>...` (in /work) runs the inspection with no declared links, and also reports
+ *   every gitlink of `base` and, for each declared path, what `base` has there and any leaf of `base` on its way.
  * - `commit <baseline> <base> <bundle limit> <link count> <link>... <target>...` (in /work) runs the inspection, then,
  *   from the same reads, builds the runner commit on top of `base` from base plus the changes it found. It reads the
  *   message and identities as JSON on stdin and writes every object to a scratch object store in /tmp: both volumes
@@ -22,7 +24,7 @@
  *   a commit cannot hold (a directory, a fifo or other special file, a path under a `.git` part, or a symlink named
  *   `.gitmodules`); the runner refuses those.
  *
- * Snapshot, inspect and commit first compare the metadata digest with `baseline`, before any Git command: if it differs, a snapshot refuses
+ * Snapshot, inspect, prelaunch and commit first compare the metadata digest with `baseline`, before any Git command: if it differs, a snapshot refuses
  * (exit 10) and an inspection prints only the digest and `metadataOnly`.
  *
  * Output is one JSON document on stdout, at most MAXIMUM_TREE_OUTPUT bytes (a commit adds its own line and the bundle). A reported path or link target that is not
@@ -381,7 +383,7 @@ if ($mode eq "snapshot") {
   emit({ links => \@links, targets => { map { (text($_, "target") => target_state($_)) } keys %resolved_targets } });
 }
 
-fail(2, "unknown mode") unless $mode eq "inspect" || $mode eq "commit";
+fail(2, "unknown mode") unless $mode eq "inspect" || $mode eq "commit" || $mode eq "prelaunch";
 my $base = shift @ARGV;
 fail(3, "base is not a full commit ID") unless $base =~ /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 my $bundle_limit = $mode eq "commit" ? shift @ARGV : 0;
@@ -393,7 +395,9 @@ my $exists = do {
 };
 fail(4, "git rev-parse failed (" . exit_reason($?) . ")") if $? == -1 || ($? & 127) || ($? >> 8) > 1;
 fail(3, "base $base is not a commit in this task storage") if $exists != 0;
-my $link_count = shift @ARGV;
+# A pre-launch check passes no links: everything after base is a path the item declares.
+my @declared = $mode eq "prelaunch" ? splice(@ARGV, 0) : ();
+my $link_count = $mode eq "prelaunch" ? 0 : shift @ARGV;
 fail(2, "bad link count") unless defined $link_count && $link_count =~ /^\d+$/ && $link_count <= @ARGV;
 my @links = splice @ARGV, 0, $link_count; my @targets = @ARGV;
 
@@ -648,6 +652,20 @@ my %targets = map { (text($_, "target") => target_state($_)) } @targets;
 my %result = (metadataDigest => $metadata_digest, head => $head, agentCommits => \@agent_commits,
   changes => \@changes, nestedGitlinkContent => [map { text($_, "path") } sort @nested], links => \@fresh, targets => \%targets);
 emit(\%result) if $mode eq "inspect";
+# Before launch, also every gitlink of base (each gets an empty read-only mount), and for each declared path what base
+# has there and the first part on the way that base holds as a leaf (a file, symlink or gitlink), if any. The work tree
+# was just compared with base, so where it matches, these are what the agent will find.
+if ($mode eq "prelaunch") {
+  $result{gitlinks} = [map { text($_, "gitlink path") } sort grep { $base{$_}{type} eq "gitlink" } keys %base];
+  $result{declared} = [map {
+    my $path = $_; my @parts = split m{/}, $path; pop @parts; my ($at, $blocked) = ("");
+    for my $part (@parts) { $at = join_path($at, $part); if ($base{$at}) { $blocked = $at; last } }
+    my $type = $base{$path} ? $base{$path}{type} : $base_directory{$path} ? "directory" : "absent";
+    +{ path => text($path, "declared path"), type => $type,
+      defined $blocked ? (blockedBy => text($blocked, "path"), blockedByType => $base{$blocked}{type}) : () };
+  } @declared];
+  emit(\%result);
+}
 # A commit reports the inspection as encoded now, before anything below reads it: nothing that builds the commit can
 # change what the runner checks.
 # It goes out at once, on one line (JSON::PP escapes every newline inside a string), so the build below does not hold

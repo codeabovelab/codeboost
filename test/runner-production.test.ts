@@ -237,7 +237,7 @@ describe('D adapters', () => {
     await deps.removeTaskFilesystems(handle);
     expect(vi.mocked(removeTaskFilesystemsAsync).mock.calls[0]![0]).toBe(handle);
   });
-  it('launches Claude with a schema-only input mount in the attempt directory and the workspace\'s storage', () => {
+  it('launches Claude with a schema-only input mount, the workspace\'s storage and its pre-launch tree check', () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-launch-')); roots.push(root);
     const attemptId = randomUUID(), attemptDir = join(root, OWNER, 'attempts', attemptId);
     mkdirSync(attemptDir, { recursive: true, mode: 0o700 });
@@ -248,8 +248,11 @@ describe('D adapters', () => {
     cleanups.push(() => { process.umask(umask); });
     const launch = claudeLauncher({ imageId: 'sha256:x', runnerRoot: root, runnerOwner: OWNER, token: 'secret',
       start: (request, t) => { seen = request; token = t; return { attemptId, settled: new Promise(() => undefined), cancel: () => undefined }; } });
-    launch({ attemptId } as InvocationInput, 'the prompt', { clone: {} as never, storage: { filesystems } });
+    const treeCheck = { checked: true } as never;
+    launch({ attemptId } as InvocationInput, 'the prompt', { clone: {} as never, storage: { filesystems } }, treeCheck);
     expect(seen).toMatchObject({ prompt: 'the prompt', imageId: 'sha256:x', inputDirectory: join(attemptDir, 'input'), filesystems });
+    // D refuses an execute start without the pre-launch tree check made for this storage (#81): it is passed on as it is.
+    expect(seen!.treeCheck).toBe(treeCheck);
     expect(token).toBe('secret');
     expect(readdirSync(join(attemptDir, 'input'))).toEqual(['schema.json']);
     expect(JSON.parse(readFileSync(join(attemptDir, 'input', 'schema.json'), 'utf8'))).toMatchObject({ type: 'string' });

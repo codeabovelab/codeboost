@@ -11,6 +11,7 @@ import { MAX_REASON, ShuttingDownError, type ShutdownCapability } from '../runne
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
+import { TaskTreeRefused } from '../agents/container/changes.ts';
 
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 const RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
@@ -28,7 +29,7 @@ const manifest = (changes: ManifestChange[], over: Partial<ChangeManifest & { di
 
 function setup(options: { manifests?: Record<string, ChangeManifest & { digest: string }>; exit?: Record<string, Partial<InvocationResult>>;
   commit?: (item: string) => Promise<void>; release?: () => Promise<void>; startError?: Error;
-  inspect?: (item: string, signal: AbortSignal) => Promise<void>; snapshotError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean;
+  inspect?: (item: string, signal: AbortSignal) => Promise<void>; snapshotError?: Error; checkError?: Error; capability?: (store: Store) => ShutdownCapability; settleError?: boolean;
   plan?: Plan; commitHead?: string; pathKeyError?: Error; materializeError?: Error;
   /** The durable save of a safety finding fails, so the executor must act on it from memory. */
   findingSaveError?: boolean;
@@ -48,6 +49,13 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   const workspace: TaskWorkspace = {
     async materialize(attempt, head) { log.push(`materialize ${attempt.item} @${head.slice(-3)}`); if (options.materializeError) throw options.materializeError; return { clone: { id: `c-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: { item: attempt.item, attemptId: attempt.id } }; },
     async snapshotDeclaredLinks(ws, paths) { log.push(`snapshot ${itemOf(ws)} [${paths.join(',')}]`); if (options.snapshotError) throw options.snapshotError; return { item: itemOf(ws), links: [], targets: {} } as never; },
+    async checkTree(ws, input, signal) {
+      // Like D's check: a signal already aborted stops it before its container starts.
+      signal.throwIfAborted();
+      log.push(`check ${itemOf(ws)} @${input.baseHead.slice(-3)} [${input.operations.map(o => `${o.kind} ${o.path}`).join(',')}]`);
+      if (options.checkError) throw options.checkError;
+      return { item: itemOf(ws), base: input.baseHead, gitlinks: [] } as never;
+    },
     async inspectChanges(ws, input, signal) {
       log.push(`inspect ${itemOf(ws)} @${input.baseHead.slice(-3)}`); await options.inspect?.(itemOf(ws), signal);
       return options.manifests?.[itemOf(ws)] ?? manifest([change(itemOf(ws) === 'P1' ? 'a.ts' : 'b.ts')]);
@@ -72,20 +80,20 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   };
   const auditContext: PlanContext = options.pathKeyError ? { ...context, pathKey: () => { throw options.pathKeyError; } } : context;
   const sources: ExecutionSources = { planContext: () => auditContext, issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => 'claude' };
-  const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [];
+  const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [], checks: unknown[] = [];
   const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
   if (options.findingSaveError) store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
-  const deps = executionDeps(store, workspace, (input, prompt, ws) => {
+  const deps = executionDeps(store, workspace, (input, prompt, ws, treeCheck) => {
     if (options.startError) throw options.startError;
-    log.push(`start ${itemOf(ws)}`); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
+    log.push(`start ${itemOf(ws)}`); checks.push(treeCheck); prompts.push(prompt); argv.push(input.approvedArgv); owners.push(input.runnerOwner);
     const settled = Promise.resolve().then(() => options.onLaunch?.(input.attemptId)).then(() => ({ attemptId: options.foreignResult ? randomUUID() : input.attemptId,
       context: input.context, exitCode: 0, signal: null, stdout: 'done', stderr: '', ...options.exit?.[itemOf(ws)] }));
     return { attemptId: input.attemptId, settled, cancel: () => undefined };
   }, sources, RUNNER_OWNER, findings, { diagnostics: { directory: join(dir, 'diagnostics'), capBytes: options.diagnosticsCap }, exportDeadlineMs: options.exportDeadlineMs });
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, path, workspace, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners };
+  return { store, path, workspace, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners, checks };
 }
 
 describe('item execution', () => {
@@ -100,8 +108,8 @@ describe('item execution', () => {
       { sha: oid(100), owner: 'P1', origin: 'owned', sourceSha: null }, { sha: oid(101), owner: 'P2', origin: 'owned', sourceSha: null }]));
     expect(store.getSnapshot(identity).head).toBe(oid(101));
     expect(log).toEqual([
-      'materialize P1 @002', 'snapshot P1 [a.ts]', 'start P1', 'inspect P1 @002', 'commit P1 -> 064', 'release P1 after completed',
-      'materialize P2 @064', 'snapshot P2 [b.ts]', 'start P2', 'inspect P2 @064', 'commit P2 -> 065', 'release P2 after completed']);
+      'materialize P1 @002', 'snapshot P1 [a.ts]', 'check P1 @002 [edit a.ts]', 'start P1', 'inspect P1 @002', 'commit P1 -> 064', 'release P1 after completed',
+      'materialize P2 @064', 'snapshot P2 [b.ts]', 'check P2 @064 [edit b.ts]', 'start P2', 'inspect P2 @064', 'commit P2 -> 065', 'release P2 after completed']);
     expect(prompts[0]).toContain('<plan_item_data>');
     expect(argv[0]).toEqual([['npm', 'test']]);
     expect(owners[0]).toBe(RUNNER_OWNER);
@@ -456,6 +464,29 @@ describe('item execution', () => {
     // The storage preparation allocated is still released after the terminal write.
     expect(h.log.some(line => line.startsWith('release P1 after failed'))).toBe(true);
   });
+  it('never launches an item on a tree the pre-launch check refused, and sends the task to a person (#81)', async () => {
+    const h = setup({ checkError: new TaskTreeRefused(['"a.ts" lies beneath the symlink "via"', 'add destination "n.ts" is occupied by a file']) });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1',
+      reason: expect.stringContaining('The pre-launch tree check refused: "a.ts" lies beneath the symlink "via"; add destination "n.ts" is occupied by a file.') });
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'check P1 @002 [edit a.ts]', 'release P1 after failed']);
+    expect(h.store.getTask(identity).status).toBe('needs human');
+    expect(h.store.getAttempts(identity)[0]!.safetyFinding).toContain(SAFETY_VIOLATION);
+  });
+  it('fails the attempt without a finding when the pre-launch check itself fails (#81)', async () => {
+    const { store, executor, log } = setup({ checkError: new Error('docker run failed') });
+    expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Preparation failed: "docker run failed"' });
+    expect(log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'check P1 @002 [edit a.ts]', 'release P1 after failed']);
+    expect(store.getAttempts(identity)[0]!.safetyFinding ?? null).toBeNull();
+    expect(store.getTask(identity).status).toBe('running');
+  });
+  it('checks every declared operation, rename sources included, and launches with that item\'s check (#81)', async () => {
+    const renaming: Plan = { ...plan, items: [{ ...plan.items[0]!, files: [
+      { path: 'n.ts', kind: 'rename', renamed_from: 'a.ts', change: 'move' }, { path: 'c.ts', kind: 'add', renamed_from: null, change: 'new' }] }] };
+    const h = setup({ plan: renaming });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'executed', items: ['P1'] });
+    expect(h.log.slice(0, 4)).toEqual(['materialize P1 @002', 'snapshot P1 [n.ts,a.ts,c.ts]', 'check P1 @002 [rename n.ts,add c.ts]', 'start P1']);
+    expect(h.checks).toEqual([{ item: 'P1', base: oid(2), gitlinks: [] }]);
+  });
   it('acts on a saved finding at the terminal write, before release can set a gate (#87)', async () => {
     let store!: Store, atRelease: string | undefined;
     const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) },
@@ -586,7 +617,7 @@ describe('item execution', () => {
       store.setAssignment(identity, store.getTask(identity).stateVersion, 'reassigned', 'hash-2'); return snapshot(ws, paths, signal);
     };
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'stale' });
-    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after stale']);
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'check P1 @002 [edit a.ts]', 'release P1 after stale']);
   });
   it('refuses a scope pause whose executed prefix does not match the plan at the item\'s revision', () => {
     const { store } = setup();
@@ -611,7 +642,7 @@ describe('item execution', () => {
       store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID()); return snapshot(ws, paths, signal);
     };
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
-    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after cancelled']);
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'check P1 @002 [edit a.ts]', 'release P1 after cancelled']);
     expect(store.getTask(identity).status).toBe('cancelled');
   });
   it('keeps a safety finding owed when moving to needs human fails, and escalates it before the next run launches anything', async () => {
@@ -804,7 +835,7 @@ describe('item execution', () => {
       return snapshot(ws, paths, signal);
     };
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'cancelled' });
-    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after cancelled']);
+    expect(h.log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'check P1 @002 [edit a.ts]', 'release P1 after cancelled']);
   });
   it('finds an older checkpoint by its head after a newer one', async () => {
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });

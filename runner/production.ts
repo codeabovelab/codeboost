@@ -101,7 +101,7 @@ export function dRecoveryDeps(image: () => string): RecoveryDeps {
  */
 export function claudeLauncher(o: { imageId: string; runnerRoot: string; runnerOwner: string; token: string;
   start?: typeof startClaudeInvocation }): AgentLauncher {
-  return (input, prompt, workspace) => {
+  return (input, prompt, workspace, treeCheck) => {
     if (!isUuidV4(input.attemptId)) throw new Error('Attempt ID must be a UUID v4.');
     const directory = join(o.runnerRoot, o.runnerOwner, 'attempts', input.attemptId, 'input');
     mkdirSync(directory, { mode: 0o755 });
@@ -111,8 +111,9 @@ export function claudeLauncher(o: { imageId: string; runnerRoot: string; runnerO
     writeFileSync(schema, EXECUTE_SCHEMA, { mode: 0o444, flag: 'wx' });
     // The umask narrows a create mode (077 gives 0400), and D refuses a schema the container user cannot read.
     chmodSync(schema, 0o444);
+    // D requires the pre-launch tree check made for this storage (#81): it mounts the head's gitlinks from it.
     return (o.start ?? startClaudeInvocation)({ invocation: input, filesystems: workspaceFilesystems(workspace), inputDirectory: directory,
-      imageId: o.imageId, prompt, networkAllocationId: randomUUID() }, o.token);
+      imageId: o.imageId, prompt, networkAllocationId: randomUUID(), treeCheck }, o.token);
   };
 }
 
