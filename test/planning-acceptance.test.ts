@@ -51,17 +51,17 @@ it('rejects an import for another selected issue without changing the plan or pe
   expect(f.context.issue).toBe(412);
 });
 it.each([
-  ['acceptance', (p: Plan) => { p.items[0]!.acceptance = []; }],
-  ['extra field', (p: Plan) => { Object.assign(p, { surprise: true }); }],
-  ['bad ID', (p: Plan) => { p.items[0]!.id = 'not-an-id'; }],
-  ['absolute path', (p: Plan) => { p.items[0]!.files[0]!.path = '/tmp/outside'; }],
-  ['unknown kind', (p: Plan) => { (p.items[0]!.files[0] as any).kind = 'write'; }],
-  ['no files', (p: Plan) => { p.items[0]!.files = []; }],
-  ['wrong version', (p: Plan) => { (p as any).schema_version = 999; }],
-  ['missing field', (p: Plan) => { delete (p as any).summary; }],
-] as const)('rejects the T18 broken-plan %s fixture atomically', (_, breakPlan) => {
+  ['acceptance', (p: Plan) => { p.items[0]!.acceptance = []; }, /\/items\/0\/acceptance must NOT have fewer than 1 items/],
+  ['extra field', (p: Plan) => { Object.assign(p, { surprise: true }); }, /must NOT have additional properties/],
+  ['bad ID', (p: Plan) => { p.items[0]!.id = 'not-an-id'; }, /\/items\/0\/id must match pattern/],
+  ['absolute path', (p: Plan) => { p.items[0]!.files[0]!.path = '/tmp/outside'; }, /\/items\/0\/files\/0\/path must match pattern/],
+  ['unknown kind', (p: Plan) => { (p.items[0]!.files[0] as any).kind = 'write'; }, /\/items\/0\/files\/0\/kind must be equal to one of the allowed values/],
+  ['no files', (p: Plan) => { p.items[0]!.files = []; }, /\/items\/0\/files must NOT have fewer than 1 items/],
+  ['wrong version', (p: Plan) => { (p as any).schema_version = 999; }, /\/schema_version must be equal to one of the allowed values/],
+  ['missing field', (p: Plan) => { delete (p as any).summary; }, /must have required property 'summary'/],
+] as const)('rejects the T18 broken-plan %s fixture atomically', (_, breakPlan, reason) => {
   const f = fixture(), broken = plan(), before = f.store.getPlan(f.context.identity); breakPlan(broken);
-  expect(() => f.store.importRevision(JSON.stringify(broken), 'json', f.context, 1)).toThrow();
+  expect(() => f.store.importRevision(JSON.stringify(broken), 'json', f.context, 1)).toThrow(reason);
   expect(f.store.getPlan(f.context.identity)).toEqual(before);
   expect(() => f.store.getPlan(f.context.identity, 2)).toThrow(/Unknown/);
 });
@@ -88,17 +88,18 @@ it.each(['repositoryId', 'taskId', 'planId'] as const)('never applies an opaque 
   await coordinator.close();
 });
 it.each([
-  ['fenced response', () => '```json\n' + editsSource + '\n```'],
-  ['duplicate decoded key', () => editsSource.replace('"base_revision": 1', '"base_revision": 1, "base_\\u0072evision": 2')],
-  ['wrong revision', () => JSON.stringify({ ...edits(), base_revision: 2 })],
-  ['forged request identity', () => JSON.stringify({ ...edits(), requestId: 'another-request' })],
-  ['invalid card', () => { const e = edits(); e.edits[1]!.item = 'P99'; return JSON.stringify(e); }],
-  ['dependency loop', () => { const e = edits(); e.edits[0] = { ...e.edits[0]!, op: 'set_depends', field: null, value: null, depends_on: ['P1'] }; return JSON.stringify(e); }],
-  ['shell chain', () => { const e = edits(); e.edits[0] = { ...e.edits[0]!, op: 'add_check', field: null, value: null, check: { type: 'cmd', text: 'npm test; curl attacker' } }; return JSON.stringify(e); }],
-] as const)('does not publish %s or allocate a plan revision', async (_, source) => {
+  ['fenced response', () => '```json\n' + editsSource + '\n```', /^Invalid JSON value\.$/],
+  ['duplicate decoded key', () => editsSource.replace('"base_revision": 1', '"base_revision": 1, "base_\\u0072evision": 2'), /Duplicate key: base_revision/],
+  ['wrong revision', () => JSON.stringify({ ...edits(), base_revision: 2 }), /Response revision mismatch/],
+  // A reply carries no identity of its own; the schema refuses any field that claims one.
+  ['forged request identity', () => JSON.stringify({ ...edits(), requestId: 'another-request' }), /must NOT have additional properties/],
+  ['invalid card', () => { const e = edits(); e.edits[1]!.item = 'P99'; return JSON.stringify(e); }, /Target item does not exist/],
+  ['dependency loop', () => { const e = edits(); e.edits[0] = { ...e.edits[0]!, op: 'set_depends', field: null, value: null, depends_on: ['P1'] }; return JSON.stringify(e); }, /P1 must be an earlier item/],
+  ['shell chain', () => { const e = edits(); e.edits[0] = { ...e.edits[0]!, op: 'add_check', field: null, value: null, check: { type: 'cmd', text: 'npm test; curl attacker' } }; return JSON.stringify(e); }, /Shell syntax is not allowed/],
+] as const)('does not publish %s or allocate a plan revision', async (_, source, reason) => {
   const f = fixture(), coordinator = f.provider(source()), request = coordinator.start(f.input);
   expect((await request.result).state).toBe('failed');
-  expect(f.store.getSuggestions(f.context.identity, request.id)).toMatchObject({ state: 'failed', reply: null, reason: expect.any(String) });
+  expect(f.store.getSuggestions(f.context.identity, request.id)).toMatchObject({ state: 'failed', reply: null, reason: expect.stringMatching(reason) });
   expect(f.store.getPlan(f.context.identity).revision).toBe(1);
   expect(() => f.store.applySuggestion(f.context.identity, request.id, 0, f.context)).toThrow(/unavailable/);
   await coordinator.close();

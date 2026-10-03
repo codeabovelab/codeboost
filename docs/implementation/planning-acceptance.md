@@ -68,7 +68,11 @@ and at 1 MiB + 1 byte the size limit. If a real output fails validation, fix the
 prompt or schema and record again. Do not edit the recording.
 
 Left for F's wiring: the provider's image build, clone and storage calls are
-synchronous, so a server must run it off its request thread, as Ask does. E3's
+synchronous, so a server must run it off its request thread, as Ask does. That
+worker should also set TMPDIR to a planning root, as Ask's does, so the input and
+auth staging that lane D leaves when it gives up on cleanup is covered. At that
+point the provider and `askInContainer` should share one container runner; they
+are separate copies today. E3's
 default 120-second suggestion timeout is shorter than the provider's ten-minute
 budget. Startup recovery does not yet remove planning's Docker resources after a
 crash, because they are not attempt allocations in the Store. The recording

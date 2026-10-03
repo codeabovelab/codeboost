@@ -1,6 +1,7 @@
 import { existsSync, mkdtempSync, readdirSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import { AGENT_IMAGE, CLAUDE_VERSION } from '../agents/container/image.ts';
 import type { AuthorRequest } from '../core/planning-author.ts';
@@ -12,7 +13,7 @@ import { planningCommandSha256, prepareRecording, RECORDING_KIND, recordingConte
 
 // Real vendor output, captured by scripts/record-planning.ts through lane D's planning container. These tests replay
 // it through E2 validation and E3/Store. They never edit the output: a rejected recording is a prompt or schema finding.
-const directory = new URL('./fixtures/planning/recorded/', import.meta.url).pathname;
+const directory = fileURLToPath(new URL('./fixtures/planning/recorded/', import.meta.url));
 // Codex is refused in every phase (#93), so only Claude is recorded.
 const expected = ['claude-draft', 'claude-suggest'];
 const names = existsSync(directory) ? readdirSync(directory).filter(name => name.endsWith('.json')).map(name => name.slice(0, -5)).sort() : [];

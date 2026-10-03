@@ -34,34 +34,53 @@ export interface ContainerQuestion extends QuestionScope {
 }
 /** Task storage this worker allocated, or recovered from an earlier session of the same review. */
 export type QuestionStorage = TaskFilesystems | RecoveredTaskStorage;
+/** How a feature that keeps leftovers words its refusals, and how it deletes its own host copies. */
+export interface LeftoverPolicy {
+  /** Deletes a retained host copy of the code. Throws while it is still on disk. */
+  removePath(path: string): void;
+  paths(paths: readonly string[]): string;
+  untracked(): string;
+  retained(count: number): string;
+}
+export const allocations = (count: number) => `${count} allocation${count === 1 ? '' : 's'}`;
+/** Ask's refusals. Its host copies are removed only under Ask's own staging prefix. */
+export const ASK_LEFTOVERS: LeftoverPolicy = Object.freeze({
+  removePath: removeStaging,
+  paths: (paths: readonly string[]) => `A copy of reviewed code from an earlier question could not be deleted (${paths.join(', ')}). Ask stays off until it is deleted.`,
+  untracked: () => 'An agent\'s setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts; the first question after the restart removes what this review\'s Ask left in Docker.',
+  retained: (count: number) => `Agent storage from an earlier question or session could not be removed (${allocations(count)}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`,
+});
 /**
  * Task storage whose removal Docker did not confirm. The only handle to a D allocation must not be dropped:
- * it is kept here, removal is retried before the next question, and Ask stays off while any remain. Whatever is
- * still here when the process ends is removed by the next process's recovery, which finds it by the review's owner.
+ * it is kept here, removal is retried before the next invocation, and the feature stays off while any remain. For Ask,
+ * whatever is still here when the process ends is removed by the next process's recovery, which finds it by the
+ * review's owner. Each feature keeps its own instance, so one feature's leftovers never turn another off.
  */
 export class RetainedStorage {
   readonly #retained = new Set<QuestionStorage>();
   readonly #paths = new Set<string>();
+  readonly #policy: LeftoverPolicy;
   #untracked = 0;
+  constructor(policy: LeftoverPolicy = ASK_LEFTOVERS) { this.#policy = policy; }
   get size() { return this.#retained.size; }
   /** Allocations whose setup failed and whose cleanup D could not confirm. D returns no handle for them. */
   get untracked() { return this.#untracked; }
   retain(filesystems: QuestionStorage) { this.#retained.add(filesystems); }
   markUntracked() { this.#untracked++; }
-  /** A host staging directory (a copy of the reviewed code) that could not be deleted. */
+  /** A host staging directory (a copy of the code) that could not be deleted. */
   retainPath(path: string) { this.#paths.add(path); }
   paths(): string[] { return [...this.#paths]; }
   /** Retry removal of every retained allocation. Throws while any removal is still unconfirmed. */
   release(remove: (filesystems: QuestionStorage) => void): void {
     for (const path of [...this.#paths]) {
-      try { removeStaging(path); this.#paths.delete(path); } catch { /* still owned; retried next time */ }
+      try { this.#policy.removePath(path); this.#paths.delete(path); } catch { /* still owned; retried next time */ }
     }
     for (const filesystems of [...this.#retained]) {
       try { remove(filesystems); this.#retained.delete(filesystems); } catch { /* still owned; retried next time */ }
     }
-    if (this.#paths.size) throw new Error(`A copy of reviewed code from an earlier question could not be deleted (${[...this.#paths].join(', ')}). Ask stays off until it is deleted.`);
-    if (this.#untracked) throw new Error(`An agent's setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Ask is off until codeboost restarts; the first question after the restart removes what this review's Ask left in Docker.`);
-    if (this.#retained.size) throw new Error(`Agent storage from an earlier question or session could not be removed (${this.#retained.size} allocation${this.#retained.size === 1 ? '' : 's'}). Ask stays off until Docker removes it. Check that Docker is running, then retry.`);
+    if (this.#paths.size) throw new Error(this.#policy.paths([...this.#paths]));
+    if (this.#untracked) throw new Error(this.#policy.untracked());
+    if (this.#retained.size) throw new Error(this.#policy.retained(this.#retained.size));
   }
 }
 export interface RepositorySize { readonly checkoutBytes: number; readonly entries: number; readonly objectBytes: number }

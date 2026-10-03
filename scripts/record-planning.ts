@@ -11,12 +11,13 @@ import { randomBytes, randomUUID } from 'node:crypto';
 import { mkdirSync, mkdtempSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { captureInvocation } from '../agents/contract.ts';
 import { AGENT_IMAGE, buildAgentImage, CLAUDE_VERSION } from '../agents/container/image.ts';
 import { prepareTaskFilesystems, removeTaskFilesystems } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
-import { createPlanningProvider, planningCredential, PlanningLeftovers, type PlanningDependencies } from '../runner/planning-provider.ts';
+import { createPlanningProvider, planningCredential, planningLeftovers, type PlanningDependencies } from '../runner/planning-provider.ts';
 import { credentialEnvironment, measureGitRepository } from '../runner/question-container.ts';
 import { planningCommandSha256, prepareRecording, RECORDING_FILES, RECORDING_KIND, recordingFilesSha256, sha256,
   type PlanningRecording } from '../test/fixtures/planning/recording-inputs.ts';
@@ -25,7 +26,7 @@ if (process.env.CODEBOOST_RUN_AUTH_PROBES !== '1') {
   console.error('Set CODEBOOST_RUN_AUTH_PROBES=1 to call the real vendors. See the header of this file.');
   process.exit(2);
 }
-const outputDirectory = new URL('../test/fixtures/planning/recorded/', import.meta.url).pathname;
+const outputDirectory = fileURLToPath(new URL('../test/fixtures/planning/recorded/', import.meta.url));
 const env = credentialEnvironment(process.env);
 // Lane D's Docker and Git calls inherit this process's environment. The token reaches Claude only through the
 // adapter's secret channel, so it is removed here, as Ask's worker never receives it.
@@ -48,7 +49,7 @@ const git = (cwd: string, ...args: string[]) => execFileSync('git', ['-c', 'core
   { cwd, env: gitEnv, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] }).trim();
 
 const root = mkdtempSync(join(tmpdir(), 'codeboost-recording-'));
-const retained = new PlanningLeftovers(), runnerOwner = randomBytes(16).toString('hex');
+const retained = planningLeftovers(), runnerOwner = randomBytes(16).toString('hex');
 let failed = false;
 try {
   const repository = join(root, 'repository');
@@ -106,10 +107,10 @@ try {
 } finally {
   rmSync(root, { recursive: true, force: true });
   // Nothing recovers a recording run's leftovers on its own; name them so a person can remove them.
-  if (retained.storage.size || retained.storage.untracked || retained.roots().length) {
+  if (retained.size || retained.untracked || retained.paths().length) {
     failed = true;
     console.log(`Docker resources may be left behind. Remove those labelled io.codeboost.runner=${runnerOwner}`
-      + `${retained.roots().length ? `, and delete ${retained.roots().join(', ')}` : ''}.`);
+      + `${retained.paths().length ? `, and delete ${retained.paths().join(', ')}` : ''}.`);
   }
 }
 console.log(`Recordings are in ${outputDirectory}. Read each one before committing it.`);

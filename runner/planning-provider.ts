@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import type { InvocationContext, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
-import { RetainedStorage, stopOf, type ContainerDependencies, type Provider } from './question-container.ts';
+import { allocations, RetainedStorage, stopOf, type ContainerDependencies, type LeftoverPolicy, type Provider } from './question-container.ts';
 
 /** Ask's lane D dependencies, less startup recovery, which the runner owns for planning. */
 export type PlanningDependencies = Omit<ContainerDependencies, 'recover'>;
@@ -26,34 +26,21 @@ export interface PlanningProviderOptions {
   readonly deps: PlanningDependencies;
   /** Shared across providers in one process, so the image is built once. */
   readonly image?: { id?: string };
-  /** What earlier requests left behind. Invocations stay refused while any of it remains. Never shared with Ask. */
-  readonly retained?: PlanningLeftovers;
+  /** What earlier requests left behind, from `planningLeftovers()`. Invocations stay refused while any remains. */
+  readonly retained?: RetainedStorage;
 }
 
 /**
- * Planning's own record of what Docker or the host did not confirm removed: lane D allocations, allocations lane D
- * returned no handle for, and host copies of the planned code. Kept apart from Ask's, so a planning failure never turns
- * Ask off, and its refusals name planning.
+ * Planning's leftovers: lane D allocations, allocations lane D returned no handle for, and host copies of the planned
+ * code. Use one instance for planning and never share it with Ask, so a planning failure never turns Ask off.
  */
-export class PlanningLeftovers {
-  readonly storage = new RetainedStorage();
-  readonly #roots = new Set<string>();
-  /** A host directory holding a copy of the planned code that could not be deleted. */
-  retainRoot(root: string) { this.#roots.add(root); }
-  roots(): string[] { return [...this.#roots]; }
-  /** Retry every removal. Throws while anything is still unconfirmed. */
-  release(remove: PlanningDependencies['removeFilesystems']): void {
-    for (const root of [...this.#roots]) {
-      try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); this.#roots.delete(root); }
-      catch { /* still on disk; retried next time */ }
-    }
-    // RetainedStorage words its refusals for Ask; planning words its own below from the same counts.
-    try { this.storage.release(remove); } catch { /* reported below */ }
-    if (this.#roots.size) throw new Error(`A copy of the planned code from an earlier request could not be deleted (${[...this.#roots].join(', ')}). Planning stays off until it is deleted.`);
-    if (this.storage.untracked) throw new Error('A planning agent\'s setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Planning is off until codeboost restarts.');
-    if (this.storage.size) throw new Error(`Planning storage from an earlier request could not be removed (${this.storage.size} allocation${this.storage.size === 1 ? '' : 's'}). Planning stays off until Docker removes it. Check that Docker is running, then retry.`);
-  }
-}
+export const PLANNING_LEFTOVERS: LeftoverPolicy = Object.freeze({
+  removePath: (path: string) => rmSync(path, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }),
+  paths: (paths: readonly string[]) => `A copy of the planned code from an earlier request could not be deleted (${paths.join(', ')}). Planning stays off until it is deleted.`,
+  untracked: () => 'A planning agent\'s setup or cleanup failed and was not confirmed, so codeboost cannot tell which Docker resources were left. Planning is off until codeboost restarts.',
+  retained: (count: number) => `Planning storage from an earlier request could not be removed (${allocations(count)}). Planning stays off until Docker removes it. Check that Docker is running, then retry.`,
+});
+export const planningLeftovers = () => new RetainedStorage(PLANNING_LEFTOVERS);
 
 // Planning reads the code; it needs no room to write. The same ceilings as Ask.
 export const PLANNING_STORAGE: TaskStorageLimits = Object.freeze({
@@ -106,7 +93,7 @@ export interface PlanningProvider extends AuthorProvider {
   invoke(request: AuthorRequest, signal: AbortSignal): Promise<string>;
 }
 export function createPlanningProvider(options: PlanningProviderOptions): PlanningProvider {
-  const { vendor, deps } = options, image = options.image ?? {}, retained = options.retained ?? new PlanningLeftovers();
+  const { vendor, deps } = options, image = options.image ?? {}, retained = options.retained ?? planningLeftovers();
   const timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Planning timeout must be a positive integer.');
   return { async invoke(request: AuthorRequest, signal: AbortSignal): Promise<string> {
@@ -124,7 +111,7 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
     image.id ??= deps.buildImage(remaining());
     const root = mkdtempSync(join(tmpdir(), 'codeboost-planning-'));
     const staging = join(root, 'staging'), input = join(root, 'input');
-    let filesystems: TaskFilesystems | undefined;
+    let filesystems: TaskFilesystems | undefined, failed = false;
     try {
       mkdirSync(staging); mkdirSync(input);
       writeFileSync(join(input, 'schema.json'), request.schemaText, { mode: 0o444 });
@@ -140,7 +127,7 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
       try { filesystems = deps.prepareFilesystems(clone, PLANNING_STORAGE, image.id, owner, Math.min(60_000, remaining())); }
       catch (error) {
         // D throws an AggregateError only when a failed allocation's own cleanup did not settle; it returns no handle.
-        if (error instanceof AggregateError) retained.storage.markUntracked();
+        if (error instanceof AggregateError) retained.markUntracked();
         throw error;
       }
       remaining();
@@ -157,18 +144,23 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
       try { result = await handle.settled; }
       finally { signal.removeEventListener('abort', cancel); }
       // D stopped before confirming cleanup; the resources are found again by their labels after a restart.
-      if (result.unreleased !== undefined) retained.storage.markUntracked();
+      if (result.unreleased !== undefined) retained.markUntracked();
       return planningOutput(result, invocation);
+    } catch (error) {
+      failed = true;
+      throw error;
     } finally {
       const failures: unknown[] = [];
-      if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.storage.retain(filesystems); failures.push(error); }
+      if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.retain(filesystems); failures.push(error); }
       try { chmodSync(input, 0o700); } catch { /* input was never created */ }
-      try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+      try { PLANNING_LEFTOVERS.removePath(root); }
       catch (error) {
-        retained.retainRoot(root);
+        retained.retainPath(root);
         failures.push(new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }));
       }
-      if (failures.length) throw new AggregateError(failures, 'Planning container cleanup did not settle.');
+      // A failed request keeps its own error: what cleanup left is retained above, and the next request names it. A
+      // successful one is refused rather than returned, as Ask does, so a plan is never kept from an unsettled run.
+      if (failures.length && !failed) throw new AggregateError(failures, 'Planning container cleanup did not settle.');
     }
   } };
 }

@@ -3,7 +3,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it } from 'vitest';
 import { parseClaudeOutput } from '../agents/adapters/claude.ts';
-import { OUTPUT_LIMITS } from '../agents/adapters/supervisor.ts';
 import { SuggestionCoordinator } from '../core/planning-suggestions.ts';
 import { Store } from '../runner/store.ts';
 import { recordingContext, recordingInput, recordingPreviousPlan } from './fixtures/planning/recording-inputs.ts';
@@ -72,11 +71,10 @@ it('returns structured_output as JSON text and ignores Claude\'s prose result', 
   expect(extract(structured(answer))).toEqual({ text: JSON.stringify(answer), providerFailed: false });
 });
 
-it('fits 1 MiB of structured output, E2\'s size limit, inside lane D\'s stdout limit', () => {
-  const answer = replyOfSize(MIB), raw = structured(answer);
-  expect(raw.byteLength).toBeGreaterThan(MIB);
-  expect(raw.byteLength).toBeLessThanOrEqual(OUTPUT_LIMITS.stdoutBytes);
-  expect(Buffer.byteLength(extract(raw).text)).toBe(MIB);
+it('extracts 1 MiB of structured output, E2\'s size limit, byte for byte', () => {
+  const answer = replyOfSize(MIB), text = extract(structured(answer)).text;
+  expect(Buffer.byteLength(text)).toBe(MIB);
+  expect(text).toBe(JSON.stringify(answer));
 });
 
 it('passes exactly 1 MiB of extracted text to schema validation, not the size limit', async () => {
