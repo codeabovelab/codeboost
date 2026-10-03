@@ -5,7 +5,7 @@ import { startServer, type RunnerSetup } from './server.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import { acquireRunnerLock, releasePreparation } from '../runner/recovery.ts';
-import { parseRunnerConfig, setUpRunner } from '../runner/production.ts';
+import { parseRunnerConfig, recoveryWarnings, setUpRunner } from '../runner/production.ts';
 requireSupportedNode();
 /** A refusal the person acts on (bad input, a held lock, a blocked recovery): its message and exit 1, not a stack. */
 function refuse(error: unknown): never { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
@@ -46,8 +46,7 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
     if (recovery.finalized.length) console.log(`Recovered ${recovery.finalized.length} interrupted attempt(s).`);
     if (recovery.requeue.length) console.log(`Interrupted tasks waiting to resume: ${recovery.requeue.length}.`);
     // Left for a person (runner-lifecycle.md): never removed automatically.
-    for (const attemptId of recovery.unmatchedStorage) console.error(`Task storage labelled with attempt ${attemptId} matches no attempt of this database; it was left in place.`);
-    for (const entry of recovery.unknownEntries) console.error(`Unknown entry in the runner's attempt directory, left in place: ${entry}`);
+    for (const line of recoveryWarnings(recovery)) console.error(line);
     return assembly;
   } : undefined;
   // A first stop during startup waits for startup recovery to finish, so it is not cut off part way. A second one stops at
@@ -69,7 +68,11 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   }
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.removeListener(signal, duringStartup);
   try { lock.verify(); }
-  catch (error) { await app.close(); lock.release(); throw error; }
+  catch (error) {
+    await app.close(); lock.release();
+    // The database path changed: a refusal the person acts on, so its message, not a stack.
+    refuse(error);
+  }
   const stop = () => void app.close().then(() => { lock.release(); process.exit(0); },
     error => { lock.release(); console.error(error instanceof Error ? error.message : error); process.exit(1); });
   // A second Ctrl+C does not skip shutdown (runner-lifecycle.md): agents are still being stopped and awaited.

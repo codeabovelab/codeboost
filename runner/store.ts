@@ -788,6 +788,23 @@ export class Store {
       FROM attempts WHERE plan_key=? ORDER BY rowid DESC LIMIT ?) ORDER BY row_order`).all(identityKey(identity), limit)
       .map(row => { const { result: _result, ...attempt } = this.#attemptRecord(row); return { ...attempt, hasResult: row.has_result === 1 }; });
   }
+  /**
+   * What `ItemExecutor.progress` needs about a task's execute attempts, without loading or decoding any attempt's result
+   * (up to 1 MiB each): a status poll asks for it (#91 part 2). `finished` lists each item completed at `revision` once.
+   */
+  executeProgress(identity: PlanIdentity, revision: number): { started: boolean; begun: boolean; earlierCommits: boolean; finished: string[] } {
+    const key = identityKey(identity), rev = "json_extract(context,'$.planRevision')";
+    const row = this.#get(`SELECT COUNT(*) > 0 AS started, COALESCE(SUM(${rev} = ?), 0) > 0 AS begun
+      FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL`, revision, key)!;
+    // Any writable kind's commit counts, as for hasRunnerCommit. Unlike it, a completed result that does not say it is unchanged
+    // (not valid JSON, or no `unchanged` field) counts as a commit: this check refuses a run, so it fails closed.
+    const earlier = this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')})
+      AND state='completed' AND ${rev} != ? AND (NOT json_valid(result) OR COALESCE(json_extract(result,'$.unchanged'), 0) = 0) LIMIT 1`,
+      key, ...WRITABLE_KINDS, revision);
+    const finished = this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
+      AND state='completed' AND ${rev} = ?`).all(key, revision).map(entry => entry.item as string);
+    return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier, finished };
+  }
   getAttempts(identity: PlanIdentity): AttemptRecord[] {
     return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));
   }

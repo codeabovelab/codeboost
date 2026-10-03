@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
-import { chmodSync, existsSync, unlinkSync } from 'node:fs';
+import { chmodSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from '../agents/container/image.ts';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
@@ -52,7 +52,7 @@ function review() {
     const { CLAUDE_CODE_OAUTH_TOKEN: _token, ...env } = process.env;
     return spawnSync(process.execPath, [cli, '--config', config, ...args], { encoding: 'utf8', env: { ...env, HOME: join(root, 'home') }, timeout: 20_000 });
   };
-  return { run, fakeDocker, start };
+  return { run, fakeDocker, start, database: demo.database };
 }
 
 it('refuses a runner startup without a token with its message, exit 1 and the lock released', () => {
@@ -124,4 +124,17 @@ it('ignores a runner block in a demo configuration opened with --config, and ser
     child.kill('SIGINT');
     expect(await exited).toBe(0);
   } finally { child.kill('SIGKILL'); }
+});
+
+it('refuses with a message, not a stack, when the database path changes during a runner startup', async () => {
+  const { fakeDocker, start, database } = review(), docker = fakeDocker();
+  const cli = start(docker);
+  try {
+    await cli.until(() => cli.out().includes('recovering what an earlier run left'), 'startup recovery to begin');
+    // The locked file moves away and another takes its name while startup is still running.
+    renameSync(database, `${database}.moved`); writeFileSync(database, '');
+    docker.release();
+    expect(await cli.exited).toBe(1);
+    expect(cli.err().trim()).toBe('The database path changed while opening. Refusing to start.');
+  } finally { docker.release(); cli.child.kill('SIGKILL'); }
 });

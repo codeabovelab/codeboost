@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { RUNNER_NOT_CONFIGURED, RUNNER_NOT_IN_DEMO, startServer } from '../web/server.ts';
-import { claudeLauncher, dRecoveryDeps, ISSUE_REUSE_MS, parseRunnerConfig, RUNNER_CREDENTIAL_MISSING, setUpRunner } from '../runner/production.ts';
+import { claudeLauncher, dRecoveryDeps, ISSUE_REUSE_MS, parseRunnerConfig, recoveryWarnings, RUNNER_CREDENTIAL_MISSING, setUpRunner } from '../runner/production.ts';
 import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import { readCapturedFile } from '../agents/container/profile.ts';
@@ -194,7 +194,7 @@ describe('server with a runner setup', () => {
     expect(view.retryable).toBe(false);
     const response = await fetch(`${origin}/api/runner`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ action: 'retry', attemptId: view.attempts[0]!.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() }) });
-    expect(await response.json()).toEqual({ error: expect.stringMatching(/Retrying a plan item on its own is not supported/) });
+    expect(await response.json()).toEqual({ error: expect.stringMatching(/run again by resuming the task/) });
     expect(app.service.store.getAttempts(demo.identity)).toHaveLength(1);
   });
   it('tells a review without a runner block to add one, and a demo that it never runs the runner', async () => {
@@ -208,6 +208,19 @@ describe('server with a runner setup', () => {
         body: JSON.stringify({ action: 'retry', attemptId: randomUUID(), expectedStateVersion: task.stateVersion, actionId: randomUUID() }) });
       expect(await response.json()).toEqual({ error: message });
     }
+  });
+});
+
+describe('recovery warnings', () => {
+  it('quotes names that are not codeboost\'s, so a newline cannot forge a line of output', () => {
+    const lines = recoveryWarnings({ unmatchedStorage: ['x\nRecovered 0 interrupted attempt(s).'], unknownEntries: ['/root/attempts/evil\nReview ready: http://x', '/root/attempts/\u001b[2Jx'] });
+    expect(lines).toHaveLength(3);
+    for (const line of lines) expect(line).not.toMatch(/[\n\u001b]/);
+    expect(lines[1]).toContain('"/root/attempts/evil\\nReview ready: http://x"');
+    // What JSON quoting leaves literal and a terminal still acts on: NEL (C1), the line and paragraph separators, bidi.
+    const unicode = recoveryWarnings({ unmatchedStorage: [], unknownEntries: ['a\u0085b\u2028c\u2029d\u202ee\u009bf'] });
+    expect(unicode[0]).not.toMatch(/[\u0080-\u009f\u2028\u2029\u202e]/u);
+    expect(unicode[0]).toContain('"a\\u0085b\\u2028c\\u2029d\\u202ee\\u009bf"');
   });
 });
 

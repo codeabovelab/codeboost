@@ -60,6 +60,16 @@ export function settleWith(capability?: ShutdownCapability): <T>(fn: () => T) =>
   return capability ? fn => capability.run(fn) : fn => fn();
 }
 
+/**
+ * Quote text that is not codeboost's (a Docker label, a file name) for one line of terminal output. JSON quoting escapes
+ * C0 controls; this also escapes what it leaves literal and a terminal may still act on: C1 controls (U+0080-U+009F, NEL
+ * among them), the Unicode line and paragraph separators, and invisible format and bidi characters that reorder text.
+ */
+export function quoteForTerminal(text: string): string {
+  return JSON.stringify(text).replace(/[\u0080-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu,
+    char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
+}
+
 export function bounded(reason: string): string {
   const text = reason.trim() || 'No reason given.';
   return text.length > MAX_REASON ? `${text.slice(0, MAX_REASON - 1)}…` : text;
