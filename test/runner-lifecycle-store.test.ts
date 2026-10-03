@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store, mergeActionResponse } from '../runner/store.ts';
 import { ActionIdReused, GuardRefusal, classifySettlement, requestHash } from '../runner/lifecycle.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -13,7 +13,7 @@ const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a', ki
 const plan = (summary = 'Example'): Plan => ({ schema_version: 1, revision: 1, issue: 1, summary, questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 const dirs: string[] = [], stores: Store[] = [];
-afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function open(path: string) { const store = new Store(path); stores.push(store); return store; }
 function fixture() {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-lifecycle-')); dirs.push(dir);
@@ -501,5 +501,191 @@ describe('user actions', () => {
     })).toThrow(/Refused after/);
     store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
     expect(store.feedbackEvents(identity).map(event => event.kind)).toEqual(['task-closed']);
+  });
+});
+
+describe('runner commits and preparation groups (#87)', () => {
+  it('knows a task has a runner commit only from a completed writable attempt whose result made one', () => {
+    const { store } = queued();
+    expect(store.hasRunnerCommit(identity)).toBe(false);
+    const unchanged = admit(store); store.markRunning(identity, unchanged.id);
+    settle(store, unchanged.id, { result: { head: oid(2), unchanged: true, inScope: [], outOfScope: [] } });
+    expect(store.hasRunnerCommit(identity)).toBe(false);
+    const failed = admit(store); store.markRunning(identity, failed.id);
+    settle(store, failed.id, { exitCode: 1, valid: false });
+    expect(store.hasRunnerCommit(identity)).toBe(false);
+    const committed = admit(store); store.markRunning(identity, committed.id);
+    settle(store, committed.id, { result: { head: oid(3), unchanged: false, inScope: ['a'], outOfScope: [] },
+      history: { base: oid(1), head: oid(3), entries: [{ sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null }] } });
+    expect(store.hasRunnerCommit(identity)).toBe(true);
+  });
+
+  it('keeps each recorded preparation group paired with its own start time', () => {
+    const { store } = queued(); const attempt = admit(store);
+    store.markPreparationStarting(identity, attempt.id, 1_000);
+    store.recordPreparationGroup(identity, attempt.id, 4242, 41_000);
+    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4242, preparationStartedAt: 41_000 });
+    // Without a time, the marker's own stays.
+    store.recordPreparationGroup(identity, attempt.id, 4343);
+    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4343, preparationStartedAt: 41_000 });
+    expect(() => store.recordPreparationGroup(identity, attempt.id, 4444, 1.5)).toThrow('start time');
+  });
+});
+
+describe('after commit (#79)', () => {
+  it('runs at once outside a transaction, after the outermost commit inside one, and drops the callback on rollback', () => {
+    const { store } = queued();
+    const calls: string[] = [];
+    store.afterCommit(() => calls.push('outside'));
+    expect(calls).toEqual(['outside']);
+    store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => {
+      store.afterCommit(() => calls.push('first'), () => calls.push('first rolled back'));
+      store.afterCommit(() => calls.push('second'));
+      expect(calls).toEqual(['outside']);
+    });
+    expect(calls).toEqual(['outside', 'first', 'second']);
+    expect(() => store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => {
+      store.afterCommit(() => calls.push('dropped'), () => calls.push('rolled back'));
+      throw new Error('commit failed');
+    })).toThrow(/commit failed/);
+    expect(calls).toEqual(['outside', 'first', 'second', 'rolled back']);
+  });
+  it('keeps a committed action committed when a callback throws, and still runs the later callbacks', () => {
+    const { store } = queued();
+    const errors = vi.spyOn(console, 'error').mockImplementation(() => undefined);
+    let ran = false;
+    const actionId = randomUUID();
+    const outcome = store.userAction(identity, { actionId, kind: 'note', request: {} }, () => {
+      store.afterCommit(() => { throw new Error('callback failed'); });
+      store.afterCommit(() => { ran = true; });
+      return 'done';
+    });
+    expect(outcome).toEqual({ response: 'done', replayed: false });
+    expect(ran).toBe(true);
+    expect(errors).toHaveBeenCalledTimes(1);
+    expect(store.savedAction(identity, { actionId, kind: 'note', request: {} })).toEqual({ response: 'done', replayed: true });
+  });
+  it('drops the callback and runs the rollback one when COMMIT itself fails', () => {
+    const { store } = queued();
+    const exec = DatabaseSync.prototype.exec;
+    vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql === 'COMMIT') throw Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR' });
+      return exec.call(this, sql);
+    });
+    const calls: string[] = [], actionId = randomUUID();
+    expect(() => store.userAction(identity, { actionId, kind: 'note', request: {} }, () => {
+      store.afterCommit(() => calls.push('committed'), () => calls.push('rolled back'));
+    })).toThrow(/disk I\/O error/);
+    expect(calls).toEqual(['rolled back']);
+    expect(store.savedAction(identity, { actionId, kind: 'note', request: {} })).toBeUndefined();
+  });
+  it('reports the COMMIT error, not a failed ROLLBACK, when SQLite already rolled back', () => {
+    const { store } = queued();
+    const exec = DatabaseSync.prototype.exec;
+    vi.spyOn(DatabaseSync.prototype, 'exec').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (sql !== 'COMMIT') return exec.call(this, sql);
+      exec.call(this, 'ROLLBACK');
+      throw Object.assign(new Error('database or disk is full'), { code: 'ERR_SQLITE_ERROR' });
+    });
+    expect(() => store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => 'done')).toThrow(/disk is full/);
+  });
+  it('refuses later writes once SQLite rolled back the transaction on its own, so nothing autocommits', () => {
+    const { store } = queued(); const attempt = admit(store);
+    const prepare = DatabaseSync.prototype.prepare;
+    let failed = false;
+    vi.spyOn(DatabaseSync.prototype, 'prepare').mockImplementation(function (this: DatabaseSync, sql: string) {
+      if (failed || !sql.startsWith('UPDATE attempts SET first_reason')) return prepare.call(this, sql);
+      failed = true;
+      return { run: () => { this.exec('ROLLBACK'); throw Object.assign(new Error('database or disk is full'), { code: 'ERR_SQLITE_ERROR' }); } } as unknown as ReturnType<typeof prepare>;
+    });
+    const actionId = randomUUID(), committed: string[] = [];
+    expect(() => store.userAction(identity, { actionId, kind: 'cancel-task', request: {} }, () => {
+      try { store.recordFirstReason(identity, attempt.id, 'cancelled'); } catch { /* the caller carries on, as the coordinator does */ }
+      store.afterCommit(() => committed.push('stop'));
+      return store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID());
+    })).toThrow(/rolled back the transaction/);
+    expect(committed).toEqual([]);
+    expect(store.savedAction(identity, { actionId, kind: 'cancel-task', request: {} })).toBeUndefined();
+    expect(store.getAttempt(identity, attempt.id).firstReason).toBeNull();
+    expect(store.getTask(identity).cancelRequested).toBeNull();
+  });
+  it('lets a throw outside a transaction reach the caller, and runs a callback registered by a commit callback', () => {
+    const { store } = queued();
+    expect(() => store.afterCommit(() => { throw new Error('cancel failed'); })).toThrow(/cancel failed/);
+    const calls: string[] = [];
+    store.userAction(identity, { actionId: randomUUID(), kind: 'note', request: {} }, () => {
+      store.afterCommit(() => { calls.push('outer'); store.afterCommit(() => calls.push('inner')); });
+    });
+    expect(calls).toEqual(['outer', 'inner']);
+  });
+});
+
+describe('durable safety findings (#87 item 3)', () => {
+  it('keeps the first finding of an active attempt, and acts on it in the terminal write, whatever the outcome', () => {
+    const { store } = queued(); const attempt = admit(store); store.markRunning(identity, attempt.id);
+    expect(store.recordSafetyFinding(identity, attempt.id, 'Safety violation: .git changed')).toBe(true);
+    expect(store.recordSafetyFinding(identity, attempt.id, 'a later one')).toBe(false);
+    // A stop wins the outcome; the finding still sends the task to a person, and its text stays on the row.
+    store.recordFirstReason(identity, attempt.id, 'cancelled');
+    expect(settle(store, attempt.id, { exitCode: null, valid: false }).state).toBe('cancelled');
+    expect(store.getAttempt(identity, attempt.id)).toMatchObject({ state: 'cancelled', safetyFinding: 'Safety violation: .git changed' });
+    expect(store.getTask(identity).status).toBe('needs human');
+    // Nothing more can be recorded once settled, and nothing new is admitted from needs human.
+    expect(store.recordSafetyFinding(identity, attempt.id, 'too late')).toBe(false);
+    expect(() => admit(store)).toThrow(/needs human/);
+  });
+
+  it('lets a pending cancel close the task, and leaves an attempt without a finding alone', () => {
+    const cancelled = queued(); const one = admit(cancelled.store); cancelled.store.markRunning(identity, one.id);
+    cancelled.store.recordSafetyFinding(identity, one.id, 'Safety violation: x');
+    cancelled.store.cancelTask(identity, cancelled.store.getTask(identity).stateVersion, randomUUID());
+    settle(cancelled.store, one.id, { exitCode: 1, valid: false });
+    expect(cancelled.store.getTask(identity).status).toBe('cancelled');
+    const clean = queued(); const two = admit(clean.store); clean.store.markRunning(identity, two.id);
+    settle(clean.store, two.id, { exitCode: 1, valid: false });
+    expect(clean.store.getTask(identity).status).toBe('running');
+    expect(clean.store.getAttempt(identity, two.id).safetyFinding).toBeNull();
+  });
+
+  it('acts on a finding a crash left unsettled, and does not requeue its task', () => {
+    const { store } = queued(); const attempt = admit(store); store.markRunning(identity, attempt.id);
+    store.recordSafetyFinding(identity, attempt.id, 'Safety violation: link target changed');
+    expect(store.recoverInterrupted(Date.now())).toEqual([expect.objectContaining({ attemptId: attempt.id, requeued: false })]);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempt(identity, attempt.id).safetyFinding).toBe('Safety violation: link target changed');
+  });
+
+  it('adds the finding column to a version 7 database', () => {
+    const { path, store } = queued(); const attempt = admit(store);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
+    const reopened = open(path);
+    expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+  });
+});
+
+describe('allocation baseline (#91)', () => {
+  it('saves the baseline once, for the pending attempt\'s own allocation, and hands it to recovery', () => {
+    const { store } = queued(); const attempt = admit(store), allocationId = randomUUID();
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'b'.repeat(64), oid(2))).toThrow(GuardRefusal);
+    store.recordAllocation(identity, attempt.id, allocationId);
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, randomUUID(), 'b'.repeat(64), oid(2))).toThrow(GuardRefusal);
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'short', oid(2))).toThrow(/baseline/);
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'b'.repeat(64), 'HEAD')).toThrow(/base commit/);
+    store.recordAllocationBaseline(identity, attempt.id, allocationId, 'b'.repeat(64), oid(2));
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'c'.repeat(64), oid(2))).toThrow(GuardRefusal);
+    expect(store.attemptAllocation(attempt.id)).toBe(allocationId);
+    expect(store.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, allocationId, metadataBaseline: 'b'.repeat(64), storageBase: oid(2) })]);
+  });
+  it('adds the baseline columns to a version 8 database', () => {
+    const { path, store } = queued(); const attempt = admit(store);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
+    const reopened = open(path);
+    expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
   });
 });

@@ -2,7 +2,7 @@
 
 Review agent-made Git changes one plan item at a time. The approved plan lists each item's files and acceptance checks; the review engine shows which item produced each change and flags foreign or overlapping work.
 
-**Status:** the plan/linking library, SQLite store, and local review screen are implemented. Run `npm run demo` and open its private local URL. Ask runs Claude Code or Codex inside the locked-down agent container for read-only answers; choose the provider in Settings. Ask needs Docker, plus `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) for Claude or a Codex `auth.json` (`CODEBOOST_CODEX_AUTH_FILE`, default `~/.codex/auth.json`). The first question builds the agent image, which can take a few minutes. A configured GitHub review can merge only after the guarded exact-head gate passes. The agent container, vendor-only network and Claude/Codex adapters are implemented ([agent isolation](docs/implementation/agent-isolation.md)); only Ask uses them so far. Automated rebasing, plan command execution, and code-writing agents are not implemented. The paired human review experiment was cancelled before results were recorded and no longer blocks roadmap work; optional future validation is tracked in [#19](https://github.com/codeabovelab/codeboost/issues/19).
+**Status:** the plan/linking library, SQLite store, and local review screen are implemented. Run `npm run demo` and open its private local URL. Ask runs Claude Code inside the locked-down agent container for read-only answers; choose it in Settings. Codex is refused in every phase for now, including Ask, because it reads code only by running commands ([why](docs/implementation/agent-isolation.md#codex-is-refused-in-every-phase)). Ask needs Docker, plus `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`). The first question builds the agent image, which can take a few minutes. A configured GitHub review can merge only after the guarded exact-head gate passes. The agent container, vendor-only network and Claude/Codex adapters are implemented ([agent isolation](docs/implementation/agent-isolation.md)); only Ask uses them so far. Automated rebasing, plan command execution, and code-writing agents are not implemented. The paired human review experiment was cancelled before results were recorded and no longer blocks roadmap work; optional future validation is tracked in [#19](https://github.com/codeabovelab/codeboost/issues/19).
 
 ## Development
 
@@ -32,6 +32,26 @@ An existing-store configuration may add a trusted GitHub binding:
 ```
 
 The issue must match the stored plan. The authenticated `gh` account must be able to read the pull request, issue timeline, applicable rulesets, and classic branch protection, and to merge the PR. Codeboost unions required checks from both rule sources, requires strict server-enforced current-base checks, rechecks the base and head immediately before merging, and passes the reviewed head to `gh pr merge --match-head-commit`. Missing permissions and ambiguous rule responses block the merge. When the branch uses a merge queue, codeboost adds the exact reviewed head to the queue and treats the merge as done only when GitHub confirms it merged; a queued pull request is not merged. If GitHub removes it from the queue while the plan, snapshot, review and head are unchanged, Merge offers a retry after the status refresh; if the head changed, it goes back to review first. A moved base and any unexecuted `cmd:` acceptance check remain blocked until [#22](https://github.com/codeabovelab/codeboost/issues/22) adds the runner path.
+
+## Runner (opt-in)
+
+A configuration with a `github` block may also add a `runner` block. The runner carries out plan items with Claude Code in the agent container and commits each item in its own repository, never in yours:
+
+```json
+{
+  "runner": {
+    "root": "/absolute/path/owned/by/you",
+    "committer": { "name": "codeboost", "email": "runner@example.invalid" }
+  }
+}
+```
+
+`root` must be a directory only you can write. Optional fields:
+- `diagnosticsDir`: where partial output of stopped attempts is kept, in a folder per database (`<diagnosticsDir>/<runner token>/diagnostics`), so databases sharing it never delete each other's files. The default is the runner root.
+- `diagnosticsCapBytes`: the size retention trims that directory back to. It is a target, not a hard limit: the file just saved is always kept, even when it alone passes the cap. The default is 256 MiB.
+- `limits`: task storage limits (`workBytes`, `workInodes`, `metadataBytes`, `metadataInodes`).
+
+The runner needs Docker and `CLAUDE_CODE_OAUTH_TOKEN`. At start, before the server opens, codeboost recovers what an earlier run left and builds the agent image; a recovery it cannot finish safely stops startup with what to do. `POST /api/runner` with `start` or `resume` runs the plan; the review screen has no buttons for them yet.
 
 ## Library
 

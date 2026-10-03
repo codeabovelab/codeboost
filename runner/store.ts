@@ -5,9 +5,10 @@ import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
+import type { AlreadyFixedResult } from '../github/already-fixed.ts';
 import {
-  ATTEMPT_PHASES, CLOSED_STATUSES, MERGEABLE_STATUSES, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
-  assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
+  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  WRITABLE_KINDS, assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
 
@@ -23,6 +24,18 @@ export interface SuggestionRequest { state: SuggestionState; revision: number; s
 export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
 export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
+/** A PR codeboost opened (or is opening) for a task. `opening` means the outcome of the GitHub call is not yet known. */
+export interface TaskPullRequest {
+  openingId: string; repository: string; base: string; headBranch: string; headSha: string; draft: boolean;
+  state: 'opening' | 'opened' | 'abandoned'; number: number | null; url: string | null; createdAt: string;
+  /** The task state version this opening owns; only a response for that exact version may change the task status. */
+  ownerVersion: number;
+  /** The plan's review version this opening owns: review input (approvals, choices, notes) since then makes it stale. */
+  ownerReviewVersion: number;
+  /** An update of this open PR that started and has not been confirmed; the PR may already show it. */
+  refresh: { head: string; draft: boolean; stateVersion: number } | null;
+}
+export interface AlreadyFixedCheck { id: string; snapshotId: string; result: AlreadyFixedResult; stateVersion: number; reviewVersion: number; checkedAt: string }
 export type MergeAttemptState = 'submitting' | 'queued' | 'merged' | 'removed' | 'failed';
 export interface MergeAttempt {
   id: string; kind: 'queue' | 'direct'; state: MergeAttemptState; revision: number; snapshotId: string; reviewVersion: number; reviewedHead: string;
@@ -46,6 +59,17 @@ export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
   firstReason: FirstReason | null; stopReason: StopReason | null; exitCode: number | null; signal: string | null; result: unknown;
   diagnostic: string | null; diagnosticRef: string | null; createdAt: string; startedAt: string | null; settledAt: string | null;
+  /**
+   * The runner's own audit found a safety violation (#87 item 3): its text, kept whatever outcome the attempt settled
+   * with. The terminal write (or startup recovery) acted on it: the task went to needs human, unless it was closed.
+   */
+  safetyFinding: string | null;
+}
+/** A non-terminal attempt at startup, with what recovery needs to stop its preparation and export its storage. */
+export interface InterruptedAttempt extends AttemptRecord {
+  planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; allocationId: string | null;
+  /** Saved after D's allocation returned (#91); null when it never did. */
+  metadataBaseline: string | null; storageBase: string | null;
 }
 export type FeedbackKind = 'reject' | 'change-request' | 'segment-accept' | 'segment-assign' | 'finding-accept' | 'needs-human-guidance' | 'task-closed';
 const FEEDBACK_KINDS: readonly FeedbackKind[] = ['reject', 'change-request', 'segment-accept', 'segment-assign', 'finding-accept', 'needs-human-guidance', 'task-closed'];
@@ -78,8 +102,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 6) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 9) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -108,6 +132,22 @@ export class Store {
           );
           PRAGMA user_version=5;`);
         if (version < 6) this.#migrateV6();
+        if (version < 7) this.#migrateV7();
+        // A safety finding outlives the process that found it (#87 item 3).
+        // Idempotent, like the v7 tables: a database moved back to an older version keeps the column.
+        if (version < 8) {
+          if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'safety_finding'))
+            this.#db.exec('ALTER TABLE attempts ADD COLUMN safety_finding TEXT');
+          this.#db.exec('PRAGMA user_version=8');
+        }
+        // What startup recovery needs to export a recovered task storage (#91): D's metadata baseline and the commit the
+        // storage was seeded from. Idempotent, like v8.
+        if (version < 9) {
+          const columns = this.#db.prepare('PRAGMA table_info(attempts)').all().map(column => column.name);
+          if (!columns.includes('metadata_baseline')) this.#db.exec('ALTER TABLE attempts ADD COLUMN metadata_baseline TEXT');
+          if (!columns.includes('storage_base')) this.#db.exec('ALTER TABLE attempts ADD COLUMN storage_base TEXT');
+          this.#db.exec('PRAGMA user_version=9');
+        }
       });
     } catch (error) { this.#db.close(); throw error; }
   }
@@ -116,22 +156,70 @@ export class Store {
     return value==='claude'||value==='codex'?value:null;
   }
   setQuestionProvider(value: unknown): void {
-    if(value!==null&&value!=='claude'&&value!=='codex') throw new Error('Choose Claude Code or Codex.');
+    // Codex cannot answer questions yet (#75). A database that already names it reads back as Codex, and Ask refuses it.
+    if(value==='codex') throw new Error('Codex cannot answer questions yet. Choose Claude Code.');
+    if(value!==null&&value!=='claude') throw new Error('Choose Claude Code.');
     this.#run("INSERT INTO app_settings VALUES ('question_provider',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",value??'');
   }
   close(): void { this.#db.close(); }
   #get(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).get(...args); }
-  #run(sql: string, ...args: SQLInputValue[]) { return this.#db.prepare(sql).run(...args); }
+  #run(sql: string, ...args: SQLInputValue[]) {
+    this.#checkWrite();
+    // Some errors (for example a full disk) make SQLite roll back on its own. If the caller caught one, a later write must
+    // not autocommit on its own while the rest of the transaction is lost.
+    if (this.#depth > 0 && !this.#db.isTransaction)
+      throw Object.assign(new Error('SQLite rolled back the transaction after an earlier error.'), { code: 'ERR_SQLITE_ERROR' });
+    return this.#db.prepare(sql).run(...args);
+  }
+  // Shutdown write gate (runner-lifecycle.md, "Shutdown" step 1).
+  #gateClosed = false; #privileged = 0; #capabilityIssued = false;
+  #checkWrite(): void { if (this.#gateClosed && this.#privileged === 0) throw new ShuttingDownError(); }
+  /** Issued once, to the server, which hands it only to coordinators' settlement and close code. */
+  shutdownCapability(): ShutdownCapability {
+    if (this.#capabilityIssued) throw new Error('The shutdown capability was already issued.');
+    this.#capabilityIssued = true;
+    return Object.freeze({ run: <T>(fn: () => T): T => { this.#privileged++; try { return fn(); } finally { this.#privileged--; } } });
+  }
+  /** Shutdown step 1: from now on, every write without the capability throws ShuttingDownError. Reads still work. */
+  closeWrites(): void { this.#gateClosed = true; }
+  get writesClosed(): boolean { return this.#gateClosed; }
   #depth = 0;
   /** The user action whose transaction is open, so its events can prove they belong to it. */
   #action: { key: string; actionId: string } | null = null;
+  /** Callbacks waiting for the outermost transaction to end, in the order they were registered. */
+  #pending: { commit: () => void; rollback?: () => void }[] = [];
   /** Nested calls join the outer transaction, so a user action can wrap existing Store methods atomically. */
   #transaction<T>(fn: () => T): T {
     if (this.#depth > 0) { this.#depth++; try { return fn(); } finally { this.#depth--; } }
+    this.#checkWrite();
     this.#db.exec('BEGIN IMMEDIATE'); this.#depth = 1;
-    try { const result = fn(); this.#db.exec('COMMIT'); return result; }
-    catch (error) { this.#db.exec('ROLLBACK'); throw error; }
-    finally { this.#depth = 0; }
+    let result: T, committed = false;
+    try { result = fn(); this.#db.exec('COMMIT'); committed = true; }
+    // A failed COMMIT may already have rolled back (for example a full disk); ROLLBACK would then hide the real error.
+    catch (error) { if (this.#db.isTransaction) this.#db.exec('ROLLBACK'); throw error; }
+    finally {
+      this.#depth = 0;
+      if (this.#pending.length) {
+        const pending = this.#pending; this.#pending = [];
+        for (const entry of pending) Store.#callback(committed ? entry.commit : entry.rollback);
+      }
+    }
+    return result;
+  }
+  /** A callback runs after the transaction has ended; a throw must not make a committed write look failed. */
+  static #callback(fn: (() => void) | undefined): void {
+    if (!fn) return;
+    try { fn(); } catch (error) { console.error(`A transaction callback failed: ${JSON.stringify(bounded(error instanceof Error ? error.message : String(error)))}`); }
+  }
+  /**
+   * Run `commit` once the writes made so far are durable: at once outside a transaction (a throw then reaches the
+   * caller), otherwise after the outermost transaction commits (a throw is logged). If it rolls back instead, including
+   * when COMMIT itself fails, `commit` is dropped and `rollback` runs. Lets a caller apply an in-memory effect that cannot
+   * be undone only once the write that records it has committed (#79).
+   */
+  afterCommit(commit: () => void, rollback?: () => void): void {
+    if (this.#depth === 0) commit();
+    else this.#pending.push({ commit, rollback });
   }
   #current(key: string) {
     const row = this.#get('SELECT * FROM plans WHERE key=?', key);
@@ -490,6 +578,53 @@ export class Store {
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint)); return checkpoint;
     });
   }
+  /**
+   * F2's scope pause. `ranAt` is where the item actually ran: its plan revision and the snapshot its own commit
+   * created, not whatever is current, so a revision or HEAD observation saved since cannot erase the scope finding
+   * (plan-format.md, "After each run"). The checkpoint and the move to needs amendment commit together, so a refused
+   * status change (a closed task, an active attempt or merge) records no checkpoint either.
+   */
+  pauseForAmendment(identity: PlanIdentity, ranAt: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>, options: { owed?: boolean } = {}): Checkpoint {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      if (!this.#get('SELECT 1 FROM snapshots WHERE key=? AND id=?', key, ranAt.snapshotId)) throw new Error('Unknown snapshot.');
+      const ids = this.getPlan(identity, ranAt.revision).items.map(item => item.id);
+      if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i]))
+        throw new Error('Checkpoint must describe the executed plan prefix.');
+      // Only the executor's own task pauses. In the run that found it, that is a running task, or a review status someone
+      // set since (a merge must not go past the finding); a queued status set since is kept, and the next run pays the
+      // pause from there. A human gate is kept too. A pause owed from an earlier run is paid from queued as well.
+      const status = this.#task(key).status;
+      const pausable = status === 'running' || status === 'in review' || status === 'approved but merge blocked' || (options.owed === true && status === 'queued');
+      if (!pausable) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
+      this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
+      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
+      this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
+      return checkpoint;
+    });
+  }
+  /**
+   * The scope checkpoint recorded for a runner commit, found by the commit's head (not by the latest snapshot, which a
+   * later snapshot with the same head would shadow), or null if its pause was never recorded.
+   */
+  checkpointAtHead(identity: PlanIdentity, head: string): Checkpoint | null {
+    for (const row of this.#db.prepare('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC').all(identityKey(identity))) {
+      const checkpoint = decode<Checkpoint>(row.data);
+      if (this.getSnapshot(identity, checkpoint.snapshotId).head === head) return checkpoint;
+    }
+    return null;
+  }
+  /** The most recent scope checkpoint of this plan, or null. */
+  latestCheckpoint(identity: PlanIdentity): Checkpoint | null {
+    const row = this.#get('SELECT data FROM checkpoints WHERE key=? ORDER BY rowid DESC LIMIT 1', identityKey(identity));
+    return row ? decode<Checkpoint>(row.data) : null;
+  }
+  /** The latest snapshot of this plan whose head is `head` (the one a runner commit created), or null. */
+  snapshotWithHead(identity: PlanIdentity, head: string): string | null {
+    for (const row of this.#db.prepare('SELECT id, data FROM snapshots WHERE key=? ORDER BY rowid DESC').all(identityKey(identity)))
+      if (decode<Snapshot>(row.data).head === head) return row.id as string;
+    return null;
+  }
   getCheckpoint(identity: PlanIdentity, id: string): Checkpoint {
     const row = this.#get('SELECT data FROM checkpoints WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown checkpoint.'); return decode<Checkpoint>(row.data);
@@ -575,8 +710,33 @@ export class Store {
       result: row.result === null ? null : decode(row.result), diagnostic: row.diagnostic as string | null,
       diagnosticRef: row.diagnostic_ref as string | null, createdAt: row.created_at as string,
       startedAt: row.started_at as string | null, settledAt: row.settled_at as string | null,
+      safetyFinding: row.safety_finding as string | null,
     };
   }
+  /**
+   * A safety finding sends the task to needs human (plan-format.md, "After each run"), in the transaction that settles
+   * its attempt. A task cannot change status while it has an active attempt, so it is still running here: no human gate
+   * can hold the finding back.
+   */
+  #actOnFinding(key: string): void {
+    if (!this.#closed(this.#task(key).status as TaskStatus)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+  }
+  /**
+   * Record the runner's own safety finding on an active attempt (#87 item 3), before its terminal write, like the first
+   * reason. The first finding is kept. The terminal write acts on it: never only memory, so a crash, a failed write or
+   * a start through another caller cannot lose it.
+   */
+  recordSafetyFinding(identity: PlanIdentity, id: string, finding: string): boolean {
+    if (typeof finding !== 'string' || !finding.trim()) throw new GuardRefusal('A safety finding needs its reason.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const changed = this.#run(`UPDATE attempts SET safety_finding=? WHERE plan_key=? AND id=? AND state IN ('pending','running') AND safety_finding IS NULL`,
+        bounded(finding), key, id).changes === 1;
+      if (changed) this.#touch(key);
+      return changed;
+    });
+  }
+
   /** Every durable change to a task or its attempts increases the state version. */
   #touch(key: string): void {
     this.#run('UPDATE tasks SET state_version=state_version+1, updated_at=? WHERE plan_key=?', new Date().toISOString(), key);
@@ -621,6 +781,30 @@ export class Store {
     if (!row) throw new Error('Unknown attempt.');
     return this.#attemptRecord(row);
   }
+  /** The latest attempts, oldest first, for status views: results are flagged, not read. */
+  recentAttempts(identity: PlanIdentity, limit: number): (Omit<AttemptRecord, 'result'> & { hasResult: boolean })[] {
+    return this.#db.prepare(`SELECT * FROM (SELECT id, kind, phase, item, state, context, deadline, first_reason, stop_reason, exit_code, signal,
+      NULL AS result, result IS NOT NULL AS has_result, diagnostic, diagnostic_ref, created_at, started_at, settled_at, rowid AS row_order
+      FROM attempts WHERE plan_key=? ORDER BY rowid DESC LIMIT ?) ORDER BY row_order`).all(identityKey(identity), limit)
+      .map(row => { const { result: _result, ...attempt } = this.#attemptRecord(row); return { ...attempt, hasResult: row.has_result === 1 }; });
+  }
+  /**
+   * What `ItemExecutor.progress` needs about a task's execute attempts, without loading or decoding any attempt's result
+   * (up to 1 MiB each): a status poll asks for it (#91 part 2). `finished` lists each item completed at `revision` once.
+   */
+  executeProgress(identity: PlanIdentity, revision: number): { started: boolean; begun: boolean; earlierCommits: boolean; finished: string[] } {
+    const key = identityKey(identity), rev = "json_extract(context,'$.planRevision')";
+    const row = this.#get(`SELECT COUNT(*) > 0 AS started, COALESCE(SUM(${rev} = ?), 0) > 0 AS begun
+      FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL`, revision, key)!;
+    // Any writable kind's commit counts, as for hasRunnerCommit. Unlike it, a completed result that does not say it is unchanged
+    // (not valid JSON, or no `unchanged` field) counts as a commit: this check refuses a run, so it fails closed.
+    const earlier = this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')})
+      AND state='completed' AND ${rev} != ? AND (NOT json_valid(result) OR COALESCE(json_extract(result,'$.unchanged'), 0) = 0) LIMIT 1`,
+      key, ...WRITABLE_KINDS, revision);
+    const finished = this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
+      AND state='completed' AND ${rev} = ?`).all(key, revision).map(entry => entry.item as string);
+    return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier, finished };
+  }
   getAttempts(identity: PlanIdentity): AttemptRecord[] {
     return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));
   }
@@ -663,7 +847,7 @@ export class Store {
   /** Admission, including retry: status, state version, requeue claim, active attempt and captured context are checked in one transaction. */
   admitAttempt(identity: PlanIdentity, input: {
     expectedStateVersion: number; kind: AttemptKind; item?: string | null; expectedContext: InvocationContext;
-    deadline: number; budgetMs?: number; retryOf?: string; now?: number;
+    deadline: number; budgetMs?: number; retryOf?: string; now?: number; claimRequeue?: boolean;
   }): AttemptRecord {
     const now = input.now ?? Date.now(), budgetMs = input.budgetMs ?? DEFAULT_TASK_BUDGET_MS;
     if (!(input.kind in ATTEMPT_PHASES)) throw new GuardRefusal('Unknown attempt kind.');
@@ -684,7 +868,9 @@ export class Store {
         const task = this.#task(key);
         if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
         if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
-        if (task.requeue_pending === 1) throw new GuardRefusal('Recovery is requeueing this task.');
+        // Requeue claim: exactly one path (I3's requeue, or the user's Resume) clears it, by CAS in this admitting transaction.
+        if (task.requeue_pending === 1 && !input.claimRequeue) throw new GuardRefusal('Recovery is requeueing this task.');
+        if (input.claimRequeue && task.requeue_pending !== 1) throw new GuardRefusal('The requeue was already claimed.');
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
         if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
@@ -703,7 +889,7 @@ export class Store {
         const id = randomUUID(), created = new Date(now).toISOString();
         this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
           id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
-        this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+        this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', requeue_pending=0, budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
         this.#touch(key);
         return this.getAttempt(identity, id);
       });
@@ -739,6 +925,8 @@ export class Store {
    */
   settleAttempt(identity: PlanIdentity, id: string, settlement: Omit<Settlement, 'contextCurrent'> & {
     signal?: string | null; result?: unknown; diagnosticRef?: string | null;
+    /** Writable attempts: the runner's commit, recorded with `completed` in this same transaction. */
+    history?: { base: string; head: string; entries: readonly LedgerEntry[] };
   }): Classification {
     if (settlement.firstReason !== null && !FIRST_REASONS.includes(settlement.firstReason)) throw new GuardRefusal('Unknown stop reason.');
     const key = identityKey(identity);
@@ -761,10 +949,18 @@ export class Store {
       this.#run(`UPDATE attempts SET state=?, first_reason=?, stop_reason=?, exit_code=?, signal=?, result=?, diagnostic=?, diagnostic_ref=?, settled_at=? WHERE id=?`,
         outcome.state, firstReason, settlement.stopReason ?? null, settlement.exitCode, settlement.signal ?? null, result,
         outcome.reason, settlement.diagnosticRef ?? null, new Date().toISOString(), id);
-      // A pending cancel task wins over everything, including the time limit.
-      if (task.cancel_requested !== null && !this.#closed(task.status)) this.#closeTask(key, 'cancelled', task.cancel_requested as string);
-      else {
+      // The guards above ran first; recording history now advances the context without invalidating this attempt.
+      if (outcome.state === 'completed' && settlement.history) {
+        const context = decode<InvocationContext>(row.context);
+        this.recordHistory(identity, { revision: context.planRevision, snapshotId: context.snapshotId }, settlement.history.base, settlement.history.head, settlement.history.entries);
+      }
+      // A pending cancel task wins over everything, including the time limit and a safety finding.
+      if (task.cancel_requested !== null && !this.#closed(task.status)) {
+        this.#closeTask(key, 'cancelled', task.cancel_requested as string);
+      } else {
         if (outcome.timeLimit && !this.#closed(task.status)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+        // The runner's safety finding wins over the outcome: a stop or a stale context does not undo what the agent did.
+        if (row.safety_finding !== null) this.#actOnFinding(key);
         this.#touch(key);
       }
       return outcome;
@@ -816,8 +1012,8 @@ export class Store {
         return { response: value, replayed: false };
       });
     } catch (error) {
-      const storage = (error as { code?: string }).code === 'ERR_SQLITE_ERROR';
-      if (!replaying && !storage && !(error instanceof ActionIdReused) && this.#depth === 0) {
+      const storage = (error as { code?: string }).code === 'ERR_SQLITE_ERROR' || error instanceof ShuttingDownError;
+      if (!replaying && !storage && !(error instanceof ActionIdReused) && !(error instanceof BadRequest) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
         this.#transaction(() => {
           if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message });
@@ -841,7 +1037,7 @@ export class Store {
     return { response: outcome.value as T, replayed: true };
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
-  recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null }): FeedbackEvent {
+  recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null; supersedeLatest?: boolean }): FeedbackEvent {
     assertUuidV4(actionId, 'Action ID');
     if (this.#depth === 0 || this.#action?.key !== identityKey(identity) || this.#action.actionId !== actionId)
       throw new Error('Feedback events are written inside their user action, with its action ID.');
@@ -851,6 +1047,9 @@ export class Store {
     if (event.text != null && (typeof event.text !== 'string' || event.text.length > 4000)) throw new GuardRefusal('Feedback text is limited to 4000 characters.');
     if (typeof event.sourceRef !== 'string' || !event.sourceRef || event.sourceRef.length > 200) throw new GuardRefusal('Invalid feedback source.');
     const key = identityKey(identity), plan = this.#current(key);
+    // A changed segment choice links to the latest earlier event for the same choice key.
+    if (event.supersedeLatest && event.supersedes == null)
+      event = { ...event, supersedes: (this.#get("SELECT id FROM feedback_events WHERE plan_key=? AND source_ref=? AND kind IN ('segment-accept','segment-assign') ORDER BY rowid DESC LIMIT 1", key, event.sourceRef)?.id as string | undefined) ?? null };
     if (event.supersedes != null && !this.#get('SELECT 1 FROM feedback_events WHERE plan_key=? AND id=? AND source_ref=?', key, event.supersedes, event.sourceRef))
       throw new GuardRefusal('A superseded event must belong to the same source.');
     const id = randomUUID(), createdAt = new Date().toISOString();
@@ -868,6 +1067,446 @@ export class Store {
       snapshotId: row.snapshot_id as string | null, item: row.item as string | null, kind: row.kind as FeedbackKind, text: row.text as string | null,
       sourceRef: row.source_ref as string, supersedes: row.supersedes as string | null, createdAt: row.created_at as string,
     }));
+  }
+
+  // ---- F2d: the pre-PR already-fixed check and PR opening ----
+  #migrateV7(): void {
+    this.#db.exec(`
+      CREATE TABLE IF NOT EXISTS already_fixed_checks (
+        id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), snapshot_id TEXT NOT NULL,
+        outcome TEXT NOT NULL CHECK (outcome IN ('clear','found','unknown')), result TEXT NOT NULL,
+        state_version INTEGER NOT NULL, review_version INTEGER NOT NULL, checked_at TEXT NOT NULL);
+      CREATE TABLE IF NOT EXISTS task_pull_requests (
+        opening_id TEXT PRIMARY KEY, plan_key TEXT NOT NULL REFERENCES tasks(plan_key), repository TEXT NOT NULL, base TEXT NOT NULL,
+        head_branch TEXT NOT NULL, head_sha TEXT NOT NULL, draft INTEGER NOT NULL, owner_version INTEGER NOT NULL, owner_review_version INTEGER NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('opening','opened','abandoned')), number INTEGER, url TEXT,
+        refresh_head TEXT, refresh_draft INTEGER, refresh_version INTEGER, refresh_review_version INTEGER,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+        CHECK ((state = 'opened') = (number IS NOT NULL AND url IS NOT NULL)));
+      CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_number ON task_pull_requests (lower(repository), number) WHERE number IS NOT NULL;
+      CREATE UNIQUE INDEX IF NOT EXISTS task_pull_requests_opening ON task_pull_requests (plan_key) WHERE state = 'opening';
+      CREATE INDEX IF NOT EXISTS already_fixed_checks_task ON already_fixed_checks (plan_key);
+      CREATE INDEX IF NOT EXISTS task_pull_requests_task ON task_pull_requests (plan_key);
+      PRAGMA user_version=7;`);
+  }
+  #pullRequestRecord(row: Record<string, SQLOutputValue>): TaskPullRequest {
+    return {
+      openingId: row.opening_id as string, repository: row.repository as string, base: row.base as string, headBranch: row.head_branch as string,
+      headSha: row.head_sha as string, draft: row.draft === 1, state: row.state as TaskPullRequest['state'],
+      number: row.number as number | null, url: row.url as string | null, createdAt: row.created_at as string,
+      ownerVersion: row.owner_version as number, ownerReviewVersion: row.owner_review_version as number,
+      refresh: row.refresh_head === null ? null : { head: row.refresh_head as string, draft: row.refresh_draft === 1, stateVersion: row.refresh_version as number },
+    };
+  }
+  /** Every PR codeboost opened or started to open for the task, oldest first. */
+  taskPullRequests(identity: PlanIdentity): TaskPullRequest[] {
+    const key = identityKey(identity); this.#task(key);
+    return this.#db.prepare('SELECT * FROM task_pull_requests WHERE plan_key=? ORDER BY rowid').all(key).map(row => this.#pullRequestRecord(row));
+  }
+  latestAlreadyFixed(identity: PlanIdentity): AlreadyFixedCheck | null {
+    const key = identityKey(identity); this.#task(key);
+    const row = this.#get('SELECT * FROM already_fixed_checks WHERE plan_key=? ORDER BY rowid DESC LIMIT 1', key);
+    return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
+  }
+  /** Publishing runs after the task's last attempt settled, while the task is running, or in needs human for a draft PR. */
+  #assertPublishable(key: string, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
+    if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+    if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
+    if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
+    if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    // Interrupted work waiting to be requeued, or a rebase in progress, is not finished work to publish.
+    if (task.requeue_pending === 1) throw new GuardRefusal('The task has interrupted work waiting to be requeued.');
+    if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+  }
+  /**
+   * Records a pre-PR check. A match, or a check that could not be completed, moves a running task to possibly already
+   * fixed in the same transaction. A needs-human task keeps its status; its draft PR is not opened.
+   */
+  recordAlreadyFixed(identity: PlanIdentity, expectedStateVersion: number, input: { snapshotId: string; reviewVersion: number; draft: boolean; result: AlreadyFixedResult }): AlreadyFixedCheck {
+    if (!['clear', 'found', 'unknown'].includes(input.result?.outcome)) throw new Error('Invalid already-fixed result.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const task = this.#task(key);
+      this.#assertPublishable(key, task, expectedStateVersion, input.draft);
+      if (this.#current(key).snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
+      if (input.result.outcome !== 'clear' && !input.draft) this.#run("UPDATE tasks SET status='possibly already fixed' WHERE plan_key=?", key);
+      this.#touch(key);
+      const id = randomUUID(), checkedAt = new Date().toISOString(), stateVersion = this.#task(key).state_version as number;
+      // Review input (approvals, choices, notes) advances review_version without touching the task; bind the check to both,
+      // and refuse a result the publish obtained before a review change (it would move the task on stale review state).
+      const reviewVersion = this.#current(key).review_version as number;
+      if (reviewVersion !== input.reviewVersion) throw new GuardRefusal('The review changed during the check. Reload before writing.');
+      this.#run('INSERT INTO already_fixed_checks (id,plan_key,snapshot_id,outcome,result,state_version,review_version,checked_at) VALUES (?,?,?,?,?,?,?,?)',
+        id, key, input.snapshotId, input.result.outcome, encode(input.result), stateVersion, reviewVersion, checkedAt);
+      return { id, snapshotId: input.snapshotId, result: input.result, stateVersion, reviewVersion, checkedAt };
+    });
+  }
+  /**
+   * Records the intent to open a PR, immediately before the GitHub call. It requires a clear check with no task change
+   * since it was recorded, so the check and the PR bind to the same head (AGENTS.md: re-read before an irreversible action).
+   */
+  beginPullRequest(identity: PlanIdentity, input: { checkId: string; repository: string; base: string; headBranch: string; headSha: string; draft: boolean }): TaskPullRequest {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#assertCheckedHead(identity, input);
+      if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opening'", key)) throw new GuardRefusal('A pull request is already being opened; recover it first.');
+      const openingId = randomUUID(), now = new Date().toISOString();
+      this.#touch(key);
+      this.#run(`INSERT INTO task_pull_requests (opening_id,plan_key,repository,base,head_branch,head_sha,draft,owner_version,owner_review_version,state,number,url,created_at,updated_at)
+        VALUES (?,?,?,?,?,?,?,?,?,'opening',NULL,NULL,?,?)`, openingId, key, input.repository, input.base, input.headBranch, input.headSha, input.draft ? 1 : 0,
+        this.#task(key).state_version as number, this.#current(key).review_version as number, now, now);
+      return this.taskPullRequests(identity).find(pr => pr.openingId === openingId)!;
+    });
+  }
+  /**
+   * Records an update of the task's open PR before it starts, under the same guard as an opening. The PATCH and the
+   * draft change may land even if their confirmation is lost; the record keeps that visible until the update is
+   * confirmed or abandoned. Returns the state version the update owns.
+   */
+  beginRefresh(identity: PlanIdentity, input: { checkId: string; openingId: string; headSha: string; draft: boolean }): number {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#assertCheckedHead(identity, input);
+      // Only an opened PR is refreshed; an abandoned opening's PR is adopted first, by adoptOpening, when publish sees it.
+      const row = this.#get('SELECT state FROM task_pull_requests WHERE plan_key=? AND opening_id=?', key, input.openingId);
+      if (row?.state !== 'opened') throw new GuardRefusal('Unknown pull request.');
+      this.#touch(key);
+      const version = this.#task(key).state_version as number;
+      this.#run('UPDATE task_pull_requests SET refresh_head=?, refresh_draft=?, refresh_version=?, refresh_review_version=?, updated_at=? WHERE opening_id=?',
+        input.headSha, input.draft ? 1 : 0, version, this.#current(key).review_version as number, new Date().toISOString(), input.openingId);
+      return version;
+    });
+  }
+  /**
+   * Settles an update whose confirmation was lost. What GitHub shows now (`observed`, or null when the PR is no longer
+   * open) replaces the recorded draft flag and head, so a change that landed is not forgotten; then the in-flight record
+   * is cleared. The next publish checks again and repeats the update (it is idempotent).
+   */
+  settleUnconfirmedRefresh(identity: PlanIdentity, openingId: string, observed: { number: number; draft: boolean; headSha: string } | null): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const row = this.#get("SELECT number FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL", key, openingId);
+      if (!row) throw new GuardRefusal('No update of this pull request is in flight.');
+      if (observed && observed.number === row.number)
+        this.#run('UPDATE task_pull_requests SET draft=?, head_sha=? WHERE opening_id=?', observed.draft ? 1 : 0, observed.headSha, openingId);
+      this.#run("UPDATE task_pull_requests SET refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE opening_id=?",
+        new Date().toISOString(), openingId);
+      this.#touch(key);
+    });
+  }
+  /**
+   * Right before an update's GitHub calls, after the push's await: the task and its review are still exactly as the
+   * update recorded them, and the task is still publishable. A change during the push leaves the update in flight.
+   */
+  assertRefreshCurrent(identity: PlanIdentity, openingId: string, draft: boolean): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const row = this.#get("SELECT refresh_version, refresh_review_version FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL", key, openingId);
+      if (!row) throw new GuardRefusal('No update of this pull request is in flight.');
+      this.#assertPublishable(key, this.#task(key), row.refresh_version as number, draft);
+      if (this.#current(key).review_version !== row.refresh_review_version) throw new GuardRefusal('The review changed after the check. Reload before writing.');
+    });
+  }
+  #assertVersions(key: string, expected: { stateVersion: number; reviewVersion: number }): void {
+    if (this.#task(key).state_version !== expected.stateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+    if (this.#current(key).review_version !== expected.reviewVersion) throw new GuardRefusal('The review changed. Reload before writing.');
+  }
+  #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
+    const key = identityKey(identity), task = this.#task(key), check = this.latestAlreadyFixed(identity);
+    if (!check || check.id !== input.checkId || check.result.outcome !== 'clear') throw new GuardRefusal('A clear already-fixed check must come right before opening a pull request.');
+    this.#assertPublishable(key, task, check.stateVersion, input.draft);
+    if (this.#current(key).review_version !== check.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
+    const snapshot = this.getSnapshot(identity);
+    if (snapshot.id !== check.snapshotId || snapshot.head !== input.headSha) throw new GuardRefusal('The task head changed after the check.');
+  }
+  /**
+   * An opening's PR exists. The record is kept whatever happened to the task meanwhile, so the PR can still be found and
+   * closed. The task status changes only when the task is unchanged since the opening began (its owned state version),
+   * and only when `mayReview`: recovery passes false for a PR the main path would refuse (in another base than the
+   * configured one, or with another of the task's PRs open), so such a PR is recorded but never puts the task in review.
+   */
+  recordPullRequestOpened(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, mayReview = true): TaskStatus {
+    const key = identityKey(identity);
+    return this.#confirmPullRequest(key, pr, mayReview, () =>
+      this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opening'", key, openingId),
+      row => ({ head: row.head_sha as string, owned: row.owner_version as number, ownedReview: row.owner_review_version as number }), openingId, 'No pull request is being opened with this ID.');
+  }
+  /** A refresh of the task's open PR landed, for the head and state version beginRefresh recorded. Same status rule. */
+  recordRefreshConfirmed(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean },
+    refresh: { head: string; stateVersion: number }): TaskStatus {
+    const key = identityKey(identity);
+    return this.#confirmPullRequest(key, pr, true, () =>
+      this.#get("SELECT * FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND state='opened' AND number=? AND refresh_head=? AND refresh_version=?",
+        key, openingId, pr.number, refresh.head, refresh.stateVersion),
+      row => ({ head: refresh.head, owned: refresh.stateVersion, ownedReview: row.refresh_review_version as number }), openingId, 'No update of this pull request is in flight.');
+  }
+  #confirmPullRequest(key: string, pr: { number: number; url: string; headSha: string; draft: boolean }, mayReview: boolean, find: () => Record<string, SQLOutputValue> | undefined,
+    expected: (row: Record<string, SQLOutputValue>) => { head: string; owned: number; ownedReview: number }, openingId: string, missing: string): TaskStatus {
+    if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
+    return this.#transaction(() => {
+      const row = find();
+      if (!row) throw new GuardRefusal(missing);
+      const { head, owned, ownedReview } = expected(row);
+      // The record keeps the head GitHub reports, which may differ from the head that was pushed.
+      this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, head_sha=?, refresh_head=NULL, refresh_draft=NULL, refresh_version=NULL, refresh_review_version=NULL, updated_at=? WHERE opening_id=?",
+        pr.number, pr.url, pr.draft ? 1 : 0, pr.headSha, new Date().toISOString(), openingId);
+      const task = this.#task(key);
+      // Every status change and every admission increases the state version, so an unchanged version means the task is
+      // still in the status the opening or refresh was guarded for with no attempt active. Review input advances only the
+      // review version, so that must be unchanged too. A needs-human task stays there whatever the PR looks like; only a
+      // running task can move to in review, and only with a ready PR at the head it pushed. A PR showing another head
+      // (GitHub has not caught up, or someone else pushed) leaves the task running; the publisher makes it a draft and
+      // the next publish reconciles it.
+      if (mayReview && task.state_version === owned && this.#current(key).review_version === ownedReview && task.status === 'running'
+        && pr.headSha === head && !pr.draft) {
+        this.#run("UPDATE tasks SET status='in review' WHERE plan_key=?", key);
+      }
+      this.#touch(key);
+      return this.#task(key).status as TaskStatus;
+    });
+  }
+  /**
+   * An abandoned opening whose PR became visible is the task's PR after all: record its number, URL and draft state so
+   * it can be reused, closed or cleaned up. The task status does not change. Guarded by the state version the caller
+   * read; returns the new state version.
+   */
+  adoptOpening(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; draft: boolean }, expected: { stateVersion: number; reviewVersion: number }): number {
+    if (!Number.isSafeInteger(pr.number) || pr.number < 1 || typeof pr.url !== 'string') throw new Error('Invalid pull request.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#assertVersions(key, expected);
+      if (this.#run("UPDATE task_pull_requests SET state='opened', number=?, url=?, draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='abandoned'",
+        pr.number, pr.url, pr.draft ? 1 : 0, new Date().toISOString(), key, openingId).changes !== 1) throw new GuardRefusal('No abandoned opening with this ID.');
+      this.#touch(key);
+      return this.#task(key).state_version as number;
+    });
+  }
+  /** Whether the task can be published in this mode right now (status, no attempt, merge, requeue or rebase). */
+  canPublish(identity: PlanIdentity, draft: boolean): boolean {
+    const key = identityKey(identity), task = this.#task(key);
+    try { this.#assertPublishable(key, task, task.state_version as number, draft); return true; }
+    catch (error) { if (error instanceof GuardRefusal) return false; throw error; }
+  }
+  /** The full publish guard at the current state version, before any GitHub call: refuse early, with its reason. */
+  assertPublishableNow(identity: PlanIdentity, draft: boolean): void {
+    const key = identityKey(identity), task = this.#task(key);
+    this.#assertPublishable(key, task, task.state_version as number, draft);
+  }
+  /** The task, its review and its head are exactly as a publish read them before its last await. */
+  assertUnchangedSince(identity: PlanIdentity, input: { stateVersion: number; reviewVersion: number; snapshotId: string; draft: boolean }): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      this.#assertPublishable(key, this.#task(key), input.stateVersion, input.draft);
+      const plan = this.#current(key);
+      if (plan.review_version !== input.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
+      if (plan.snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
+    });
+  }
+  /**
+   * Records the draft state GitHub shows for the task's open PR. It also repairs a record whose draft change landed on
+   * GitHub but was never recorded (a crash or cancel right after the call). Guarded by the state version the caller
+   * read, so a task change is still noticed; returns the new state version.
+   */
+  recordPullRequestDraft(identity: PlanIdentity, openingId: string, number: number, draft: boolean, expected: { stateVersion: number; reviewVersion: number }): number {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#assertVersions(key, expected);
+      if (this.#run("UPDATE task_pull_requests SET draft=?, updated_at=? WHERE plan_key=? AND opening_id=? AND state='opened' AND number=?",
+        draft ? 1 : 0, new Date().toISOString(), key, openingId, number).changes !== 1) throw new GuardRefusal('Unknown pull request.');
+      this.#touch(key);
+      return this.#task(key).state_version as number;
+    });
+  }
+  /** Recovery found no PR for an opening whose outcome was lost; a new check and opening follow. */
+  abandonPullRequestOpening(identity: PlanIdentity, openingId: string): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      if (this.#run("UPDATE task_pull_requests SET state='abandoned', updated_at=? WHERE plan_key=? AND opening_id=? AND state='opening'", new Date().toISOString(), key, openingId).changes !== 1)
+        throw new GuardRefusal('No pull request is being opened with this ID.');
+      this.#touch(key);
+    });
+  }
+
+  // ---- F1d: startup recovery (runner-lifecycle.md, "Startup recovery") ----
+  /**
+   * The per-database runner owner token, tied to the database file's device and inode.
+   * A stored value that is malformed is refused; a copied database (different file identity) gets a new token.
+   */
+  runnerOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('runner_owner', 'Stored runner owner token is malformed. Refusing to start.', file);
+  }
+  /**
+   * The per-database owner token Ask writes as `io.codeboost.runner` (#65). It is separate from the runner's token, so
+   * Ask's recovery never removes the runner's live agents and the runner's recovery never sees Ask's storage. Same
+   * rules as `runnerOwnerToken`.
+   */
+  askOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('ask_owner', "Ask is off: the stored Ask owner token is malformed. Remove the 'ask_owner' row from app_settings in the review database, then retry.", file);
+  }
+  #ownerToken(key: string, malformed: string, file: { dev: number | bigint; ino: number | bigint }): string {
+    const identity = { dev: String(file.dev), ino: String(file.ino) };
+    return this.#transaction(() => {
+      const row = this.#get('SELECT value FROM app_settings WHERE key=?', key);
+      if (row) {
+        let stored: { token?: unknown; dev?: unknown; ino?: unknown };
+        try { stored = decode(row.value); } catch { throw new Error(malformed); }
+        if (typeof stored.token !== 'string' || !/^[0-9a-f]{32}$/.test(stored.token)) throw new Error(malformed);
+        if (stored.dev === identity.dev && stored.ino === identity.ino) return stored.token;
+      }
+      const token = randomUUID().replace(/-/g, '');
+      this.#run('INSERT INTO app_settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value', key, encode({ token, ...identity }));
+      return token;
+    });
+  }
+  /**
+   * Whether the runner has committed for this task (#87): a completed writable attempt whose result made a commit. Only
+   * then do the task's commits live in the runner-owned repository. One indexed lookup, for every review load.
+   */
+  hasRunnerCommit(identity: PlanIdentity): boolean {
+    return !!this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')}) AND state='completed'
+      AND json_valid(result) AND json_extract(result, '$.unchanged') = 0 LIMIT 1`, identityKey(identity), ...WRITABLE_KINDS);
+  }
+  /** Every partial-output file an attempt row references (`diagnostic_ref`). Retention never deletes one of these. */
+  referencedDiagnostics(): string[] {
+    return this.#db.prepare('SELECT diagnostic_ref FROM attempts WHERE diagnostic_ref IS NOT NULL').all().map(row => row.diagnostic_ref as string);
+  }
+  /**
+   * Retention, over its cap: stop referencing this file, in one transaction that also notes the removal in the row's
+   * diagnostic. Only after it commits may the file be deleted, so no row ever points at a missing file.
+   */
+  forgetDiagnostic(ref: string): boolean {
+    return this.#transaction(() => {
+      const rows = this.#db.prepare('SELECT id, plan_key FROM attempts WHERE diagnostic_ref=?').all(ref);
+      for (const row of rows) {
+        this.#run(`UPDATE attempts SET diagnostic_ref=NULL, diagnostic=TRIM(COALESCE(diagnostic,'') || ' (partial output removed by retention)') WHERE id=?`, row.id!);
+        this.#touch(row.plan_key as string);
+      }
+      return rows.length > 0;
+    });
+  }
+  /** "Preparation starting": saved before any preparation subprocess is spawned. */
+  markPreparationStarting(identity: PlanIdentity, id: string, startedAt: number): void {
+    const key = identityKey(identity);
+    if (this.#run(`UPDATE attempts SET preparation_started_at=? WHERE plan_key=? AND id=? AND state='pending'`, startedAt, key, id).changes !== 1)
+      throw new GuardRefusal('Only a pending attempt can start preparation.');
+  }
+  /** The spawn failed synchronously: no child exists, so the "starting" marker must not block the next startup. */
+  cancelPreparationStart(identity: PlanIdentity, id: string): void {
+    this.#run(`UPDATE attempts SET preparation_started_at=NULL WHERE plan_key=? AND id=? AND preparation_pgid IS NULL AND state='pending'`, identityKey(identity), id);
+  }
+  /**
+   * Saved in the same synchronous turn as the spawn. Preparation can run several subprocesses in turn: each one replaces
+   * the last, with its own start time when given, so startup recovery's start-time check (which guards against PID reuse)
+   * matches the group it finds.
+   */
+  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number, startedAt?: number): void {
+    if (!Number.isSafeInteger(pgid) || pgid < 2) throw new GuardRefusal('Invalid process group.');
+    if (startedAt !== undefined && !Number.isSafeInteger(startedAt)) throw new GuardRefusal('Invalid process start time.');
+    if (this.#run(`UPDATE attempts SET preparation_pgid=?, preparation_started_at=COALESCE(?, preparation_started_at) WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`,
+      pgid, startedAt ?? null, identityKey(identity), id).changes !== 1)
+      throw new GuardRefusal('Preparation was not marked as starting.');
+  }
+  /** F chooses the allocation ID and saves it before the asynchronous allocation starts. */
+  recordAllocation(identity: PlanIdentity, id: string, allocationId: string): void {
+    assertUuidV4(allocationId, 'Allocation ID');
+    if (this.#run(`UPDATE attempts SET allocation_id=? WHERE plan_key=? AND id=? AND state='pending' AND allocation_id IS NULL`, allocationId, identityKey(identity), id).changes !== 1)
+      throw new GuardRefusal('Allocation can be recorded once, for a pending attempt.');
+  }
+  /**
+   * Saved once D's allocation returns, for the allocation recorded before it: startup recovery passes both to D's export
+   * of a recovered storage, which refuses without the baseline. A crash before this write leaves them null, and that
+   * export then fails closed.
+   */
+  recordAllocationBaseline(identity: PlanIdentity, id: string, allocationId: string, metadataBaseline: string, base: string): void {
+    if (!/^[0-9a-f]{64}$/.test(metadataBaseline)) throw new GuardRefusal('Invalid metadata baseline.');
+    if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(base)) throw new GuardRefusal('Invalid storage base commit.');
+    if (this.#run(`UPDATE attempts SET metadata_baseline=?, storage_base=? WHERE plan_key=? AND id=? AND state='pending' AND allocation_id=? AND metadata_baseline IS NULL`,
+      metadataBaseline, base, identityKey(identity), id, allocationId).changes !== 1)
+      throw new GuardRefusal('The allocation baseline can be recorded once, for the pending attempt\'s own allocation.');
+  }
+  /** Every non-terminal attempt, across all plans, with the fields recovery needs. */
+  interruptedAttempts(): InterruptedAttempt[] {
+    return this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => ({
+      ...this.#attemptRecord(row), planKey: row.plan_key as string, preparationPgid: row.preparation_pgid as number | null,
+      preparationStartedAt: row.preparation_started_at as number | null, allocationId: row.allocation_id as string | null,
+      metadataBaseline: row.metadata_baseline as string | null, storageBase: row.storage_base as string | null,
+    }));
+  }
+  /**
+   * Startup recovery step 3, finalization phase: one transaction. Applies the settlement precedence to every
+   * leftover attempt, keeps the closed-task and pending-cancel guards, and sets the requeue claim.
+   */
+  recoverInterrupted(now: number, exports: Readonly<Record<string, { diagnosticRef?: string; failure?: string }>> = {}): { attemptId: string; planKey: string; state: string; requeued: boolean }[] {
+    const gated = ['needs human', 'needs amendment', 'needs approval', 'possibly already fixed'];
+    return this.#transaction(() => this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => {
+      const key = row.plan_key as string, task = this.#task(key);
+      const contextCurrent = sameContext(decode<InvocationContext>(row.context), this.#contextOf(key));
+      let firstReason = row.first_reason as FirstReason | null;
+      if (firstReason === null && contextCurrent && task.budget_deadline !== null && now >= (task.budget_deadline as number)) firstReason = 'time-limit';
+      const deadlinePassed = firstReason === null && now >= (row.deadline as number);
+      const outcome = classifySettlement({
+        firstReason, contextCurrent, exitCode: null, valid: false,
+        stopReason: (row.stop_reason as StopReason | null) ?? (deadlinePassed ? 'timeout' : undefined),
+        detail: 'Interrupted: codeboost stopped while this was running',
+      });
+      const exported = exports[row.id as string];
+      const diagnostic = exported?.failure ? `${outcome.reason ?? ''} Partial output could not be exported: ${exported.failure}`.trim() : outcome.reason;
+      this.#run(`UPDATE attempts SET state=?, first_reason=?, diagnostic=?, diagnostic_ref=COALESCE(?, diagnostic_ref), settled_at=? WHERE id=?`,
+        outcome.state, firstReason, bounded(diagnostic ?? ''), exported?.diagnosticRef ?? null, new Date(now).toISOString(), row.id!);
+      let requeued = false;
+      if (task.cancel_requested !== null && !this.#closed(task.status)) {
+        this.#closeTask(key, 'cancelled', task.cancel_requested as string);
+      } else {
+        if (outcome.timeLimit && !this.#closed(task.status)) this.#run(`UPDATE tasks SET status='needs human' WHERE plan_key=?`, key);
+        // A finding the process recorded before it stopped still sends the task to a person, and nothing requeues it.
+        if (row.safety_finding !== null) this.#actOnFinding(key);
+        const status = this.#task(key).status as string;
+        const interrupted = outcome.state === 'failed' && (outcome.reason ?? '').startsWith('Interrupted');
+        const shutdown = outcome.state === 'cancelled' && firstReason === 'shutdown';
+        if (!this.#closed(status) && !gated.includes(status) && (interrupted || shutdown)) {
+          this.#run('UPDATE tasks SET requeue_pending=1 WHERE plan_key=?', key); requeued = true;
+        }
+        this.#touch(key);
+      }
+      return { attemptId: row.id as string, planKey: key, state: outcome.state, requeued };
+    }));
+  }
+  /** Tasks whose confirmed merge lacks its closed status or task-closed event (recovery step 5). */
+  reconcileMergedTasks(): string[] {
+    return this.#transaction(() => {
+      const repaired: string[] = [];
+      for (const task of this.#db.prepare('SELECT plan_key, status FROM tasks').all()) {
+        const key = task.plan_key as string;
+        const latest = this.#get('SELECT id,data FROM merge_attempts WHERE key=? ORDER BY rowid DESC LIMIT 1', key);
+        if (!latest || decode<MergeAttempt>(latest.data).state !== 'merged') continue;
+        const hasEvent = this.#get("SELECT 1 FROM feedback_events WHERE plan_key=? AND kind='task-closed'", key);
+        if (task.status === 'merged' && hasEvent) continue;
+        this.#closeTask(key, 'merged', latest.id as string); repaired.push(key);
+      }
+      return repaired;
+    });
+  }
+
+  /** Which plan owns an attempt ID, across all plans; null if none. */
+  attemptOwner(attemptId: string): string | null {
+    return (this.#get('SELECT plan_key FROM attempts WHERE id=?', attemptId)?.plan_key as string | undefined) ?? null;
+  }
+  /** The allocation ID F saved for an attempt, across all plans; null if none (or no such attempt). */
+  attemptAllocation(attemptId: string): string | null {
+    return (this.#get('SELECT allocation_id FROM attempts WHERE id=?', attemptId)?.allocation_id as string | null | undefined) ?? null;
+  }
+  /** Interrupted rebases recorded by F3 (none exist before F3). */
+  rebasesInProgress(): { planKey: string; marker: unknown }[] {
+    return this.#db.prepare('SELECT plan_key, rebase_in_progress FROM tasks WHERE rebase_in_progress IS NOT NULL').all()
+      .map(row => ({ planKey: row.plan_key as string, marker: decode(row.rebase_in_progress) }));
+  }
+  /** After --release-preparation verified the directory is unused: clear the "starting" marker of a terminal attempt. */
+  clearPreparationMarker(attemptId: string): boolean {
+    return this.#run(`UPDATE attempts SET preparation_started_at=NULL WHERE id=? AND preparation_pgid IS NULL AND state NOT IN ('pending','running')`, attemptId).changes === 1;
+  }
+  /** Terminal attempts whose preparation started but whose process group was never saved. */
+  unownedPreparations(): string[] {
+    return this.#db.prepare(`SELECT id FROM attempts WHERE preparation_started_at IS NOT NULL AND preparation_pgid IS NULL AND state NOT IN ('pending','running')`).all().map(row => row.id as string);
   }
 
 }

@@ -17,9 +17,9 @@ The `Agent isolation` workflow runs the same command. The main `CI` workflow ski
 the Docker suites so that they never run in parallel.
 
 The live vendor probes need real credentials, so CI does not run them. To run them,
-set `CODEBOOST_RUN_AUTH_PROBES=1`, `CODEBOOST_CODEX_AUTH_FILE` (a Codex `auth.json`
-path) and `CLAUDE_CODE_OAUTH_TOKEN`. Do not put credentials in an issue, a pull
-request or chat.
+set `CODEBOOST_RUN_AUTH_PROBES=1` and `CLAUDE_CODE_OAUTH_TOKEN`. Codex has no live
+probe while it is refused (#93). Do not put credentials in an issue, a pull request
+or chat.
 
 ## What the gate proves
 
@@ -30,10 +30,13 @@ Each row is a T9 requirement for the Docker suite. The suite fails if any row fa
 | Isolation holds: non-root, no capabilities, read-only root, no host paths or secrets, vendor-only egress | `agent-container`: read-only isolation, lockdown and mount validation; `agent-network`: egress and DNS |
 | A read-only phase cannot write `/work` | `agent-container`: phase worktree for all five phases |
 | Planning and questions cannot run a process | `agent-policy`: tool sets exclude the command tool, and command dispatch refuses these phases |
+| Codex runs in no phase, because it cannot read code without its shell (see [Codex is refused in every phase](#codex-is-refused-in-every-phase)) | `agent-policy`: the Codex command refuses all five phases; `agent-adapter`: the Codex start call refuses them and allocates nothing; `runner-execution`: an execute task with Codex is refused before task storage exists |
+| A planning answer is checked against the mounted schema | `agent-policy`: only the Claude planning command passes `--json-schema`; `agent-container`: the profile refuses a command whose schema differs from the mounted file; `agent-adapter`: the answer is read from `structured_output` |
 | Task and scratch byte and inode limits hold | `agent-container`: task capacity; scratch capacity for Codex and Claude (`/tmp`, `HOME`, `CODEX_HOME`, output directory) |
 | Hard links and alias writes from `.git/config` and objects fail, and metadata stays unchanged | `agent-container`: metadata alias probe in planning, review and execute, with a digest of `.git` before and after |
 | Mountpoint replacement fails | `agent-container`: metadata and metadata alias probes (`mv` and `rm -rf` of `.git`) |
-| Both vendor startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes: Codex through its output file, Claude through its stdout envelope (credentials required) |
+| The Claude startup probes read the schema and return bounded valid output through their documented channel | `agent-supervisor` live probes (credentials required): Claude in questions through its stdout envelope; Claude in planning returns a schema-constrained answer as bare JSON; `agent-container`: the authenticated Claude startup path. Codex has no live probe while it is refused (#93). |
+| Nothing can be written beneath a gitlink, and execute and fix launch only on a clean tree (#81) | `agent-container`: the gitlink probe (writes, `mkdir`, `rmdir` and `mv` at every gitlink fail; the rest of `/work` stays writable); a pre-populated nested checkout, a restart with an untracked symlink parent and a restart with an occupied add destination are refused; a gitlink name Docker cannot mount, more than 256 gitlinks and an unreadable tree are refused; each check serves one profile over its own storage and head; the validator rejects a gitlink mount that is missing, writable, or of another size or mode; every directory above a nested gitlink is pinned, writable and `nosuid,nodev`, so renaming one fails (#99); the validator rejects a pin that is missing, read-only, at another subpath, from another volume, `volume-nocopy`, or not a volume |
 | Hostile input stays inside the boundary | `agent-container`: repositories with links that leave the checkout are refused, links inside the checkout still work, oversized repositories fail closed; `agent-policy`: option-like prompts; `agent-proxy`: hostile CONNECT traffic; `agent-supervisor`: hostile output |
 
 ## Why the gate can fail
@@ -57,31 +60,133 @@ metadata, read-only isolation and capacity probes had this defect.
 
 Use only these entry points to run an agent:
 
-1. `createTaskClone` creates a committed, standalone staging clone.
-2. `prepareTaskFilesystems` copies that clone into bounded task storage, labelled with the owner you pass: your
+1. `createTaskClone` creates a committed, standalone staging clone. The runner uses `createTaskCloneAsync`, which
+   takes an `AbortSignal` and reports each Git process group through `onProcessGroup` (#51 item 5).
+2. `prepareTaskFilesystems` (or `prepareTaskFilesystemsAsync`, which takes `signal` and `onProcessGroup` in the same
+   way) copies that clone into bounded task storage, labelled with the owner you pass: your
    runner token, the attempt ID, and an allocation ID (a lowercase UUID v4) you record first. Use each allocation
    ID once: before creating anything, D refuses an ID that another allocation in this process holds, or that any
    container, volume or network still carries (so a reuse after a restart is caught too). That check and the first
    create are not atomic, so right after its first create D checks again that its object is the only one with the ID;
    if not, it removes what it made and refuses. Cleanup removes an object by the ID captured at its create, even if
    its labels are wrong; an object found only by name (including task storage) must carry all three owner labels. Call
-   `removeTaskFilesystems` when the task ends. It refuses a repository that has a
-   symbolic link with an absolute target or a target outside the checkout, before it
-   creates any storage. Report this to the user as a repository the agent cannot run
-   on; do not retry it.
+   `removeTaskFilesystems` when the task ends (`removeTaskFilesystemsAsync` from a server, which does the same removal
+   without blocking the event loop). It refuses a repository that has a
+   symbolic link with an absolute target or one that can lead outside the checkout (resolved in the container as its
+   kernel would, even once the agent creates a missing directory on the way), or any link in its Git metadata; the
+   seeder checks this and the allocation removes what it made, then throws an `UnusableRepositoryError`. Report
+   this to the user as a repository the agent cannot run on; do not retry it.
 3. `captureInvocation` freezes the request. Capture each attempt ID once. A new
    attempt needs a new attempt ID.
-4. `startCodexInvocation` or `startClaudeInvocation` returns a handle at once and runs
+4. `startClaudeInvocation` returns a handle at once and runs
    the Docker setup and the agent inside it. It throws only when it allocated nothing
    (invalid input, an expired budget, or an attempt ID that is still owned); every
    later failure settles the handle. `cancel()` during setup kills the in-flight Docker
    call. The request carries `networkAllocationId`, a UUID you choose for the vendor network. Pass the vendor
    credential only as the function argument.
-5. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
+   - **Planning answers.** Use `startClaudeInvocation` for planning. It reads `schema.json` from the input directory
+     and passes its exact text to Claude as `--json-schema`. The container profile refuses the command if that text
+     differs from the file it mounts. The result's `stdout` is Claude's `structured_output` object as JSON text, with
+     no prose or Markdown around it. A Claude run that fails its own schema check settles with a nonzero exit code.
+     Questions answer in plain text and carry no schema flag. The schema file must be a regular file with one link,
+     at most 64 KiB of UTF-8, and a JSON object with `"type": "object"`; otherwise the start call throws. Leave out a
+     draft 2020-12 `$schema` line: Claude's `--json-schema` rejects it (see [plan format](../plan-format.md)).
+   - **Codex.** `startCodexInvocation` throws for every phase, and allocates nothing. Use Claude. See
+     [Codex is refused in every phase](#codex-is-refused-in-every-phase).
+5. To keep a stopped writable attempt's partial output, call `exportTaskDiff(storage, { base, imageId })` before
+   `removeTaskFilesystems`. `base` is the full ID of the commit the storage was seeded from (the clone's head). For a
+   recovery handle, also pass the `metadataBaseline` you recorded (step 6). It returns at most 1 MiB of diff
+   (`truncated` says whether it was cut), and takes `signal` and a deadline for the Docker work.
+   A changed file over 8 MiB, an untracked nested repository, a path Git will not add, an entry named `.git`, a fifo
+   or socket, an ignored untracked path, a submodule directory with content, and a changed file whose `ident` or
+   `working-tree-encoding` attribute changes what the diff shows each appear as a `codeboost:` notice line. When Git
+   fails, the error carries Git's last two error lines.
+6. To audit what a writable attempt changed (#66, `agents/container/changes.ts`):
+   - **Record the baseline.** The storage value carries `metadataBaseline`, a digest of the metadata volume that the
+     seeder takes as its last step. Record it with the allocation. `snapshotDeclaredLinks`, `inspectTaskChanges` and
+     `exportTaskDiff` each check the metadata against it before running any Git command, and need it back
+     (`metadataBaseline`) for a recovery handle.
+   - **Before launch**, call `snapshotDeclaredLinks(storage, paths, { imageId })` with the item's declared paths.
+     For each declared symlink it records where it resolves, one part at a time as the kernel would, and the state of
+     the target and everything beneath it. A link on the way, a target that is a link, or a link inside a directory
+     target shows as `through-link`. Do not launch an item with a `through-link` declared link: a write through it
+     lands somewhere its target does not cover. Keep the result.
+   - **Just before launch (execute and fix)**, call `checkTaskTree(storage, { base, operations, imageId })` with the
+     item's file operations (`{ kind, path, renamedFrom }`) and `base`, the clone's head (#81). It runs the inspection
+     below with no declared links, and refuses with `TaskTreeRefused` unless the work tree is exactly the tree of
+     `base`: no untracked or ignored entry, no changed content, mode or type (a directory replaced by a symlink shows
+     here), nothing in a gitlink directory, `HEAD` at `base`, and the metadata as seeded. It then checks each operation
+     against that tree: an add or rename destination is free, an edit, delete or rename source is a file or symlink
+     (never a gitlink), and no declared path lies beneath a file, symlink or gitlink. It also refuses when a gitlink
+     cannot get its mount: more than 256 gitlinks, or a name with a comma or a double quote, which Docker's `--mount`
+     cannot take. A tree it cannot read whole (an unreadable entry, a name the manifest cannot carry, more than
+     10,000 changes) is refused too. `differences` lists every reason, with paths quoted. A refusal gives the same
+     answer on retry, so a person must look. Any other error is the check failing to run.
+
+     Pass the result as `treeCheck` in the start call's request. An execute or fix profile requires it; a read-only
+     phase refuses one. The profile adds an empty read-only tmpfs (`--mount type=tmpfs,target=/work/<path>,readonly,
+     tmpfs-mode=0555,tmpfs-size=4096`) at every gitlink the check listed, and the validator allows exactly those mounts,
+     each read-only with that size and mode. Every directory above a gitlink below the top level is pinned (#99): the
+     profile mounts the work volume again at that path (`--mount type=volume,source=<work volume>,target=/work/<dir>,
+     volume-subpath=<dir>`, which needs Docker 26 or later). A mountpoint cannot be renamed, so the gitlink's mount
+     cannot be moved away with its parent and the path refilled; what is inside stays writable and `nosuid,nodev`, on
+     the same volume and limits. A pin is a mount boundary: `rename(2)` and hard links across it fail with `EXDEV`, so
+     `mv` copies instead, and a tool that writes a temporary file elsewhere and renames it into a pinned directory
+     fails. Docker resolves the subpath when the container starts, following any link there, so nothing may write the
+     work volume between the check and the start (nothing does). More than 256 pinned directories, or more than
+     128 KiB of paths in these mounts, is refused. The validator allows exactly these mounts: the task's own
+     work volume, writable, at that subpath. A check serves one profile, over the storage and head it was made for: a
+     copy, a second use, other storage or another head is refused, so check again before every invocation, retries
+     included.
+   - **After the handle settles**, call `inspectTaskChanges(storage, { base, linkSnapshot, imageId })`. It returns the
+     change manifest: every difference between the work tree and `base`, read without following links, with content
+     IDs as a commit would store them. New ignored files, fifos and entries under a `.git` part are listed; a new
+     directory that `base`'s own ignore rules ignore, with no tracked entry beneath it, is one entry (`ignored: true`). It also returns `agentCommits`,
+     `metadataChanged`, `linkTargetChanges`, `nestedGitlinkContent` and `digest`. If the metadata changed, no Git
+     command runs: the manifest has `metadataChanged: true` and every other list empty. Every change whose new entry
+     is a symlink carries `linkTargetTraversesLink`: whether its target, resolved one part at a time as the kernel
+     would in an agent container, passes through another link or is one. A target outside the work tree or in the
+     metadata counts as `true`.
+   - **Needs human.** The metadata is read-only to agents, so any agent commit or metadata change means a protection
+     failed. Route it to needs human, as for link target changes and nested gitlink content.
+   - **Refusals.** It refuses, and never returns part of the answer, when:
+     - there are more than 10,000 changes (a populated submodule counts as one);
+     - a name or link target it reports is longer than 1,024 bytes, is not strict UTF-8, or holds a Unicode control,
+       format, line or paragraph separator, or unassigned character (unchanged names are never checked);
+     - the recorded targets hold more than 20,000 entries;
+     - it cannot read something;
+     - `base` is not a commit in the storage, or Git fails;
+     - for a snapshot, the metadata changed since seeding (an export refuses then too).
+
+     Treat a refusal as needs human.
+   - **Both calls** run in a read-only container with no network, take `signal`, `onProcessGroup` and `timeoutMs`
+     (default 120 s), and settle only after their container is gone.
+   - **To commit what the audit approved**, call `commitTaskChanges(storage, { base, linkSnapshot, digest, message,
+     trailers, author, committer, imageId })`, with the approved manifest's `digest`. Identities are F's (`name`,
+     `email`, and `date` in Git's raw form, such as `1700000000 +0000`); nothing comes from the environment or the
+     repository, so the same inputs always give the same commit ID.
+     - It runs the inspection again in its own container and builds the commit from those same reads: `base` plus
+       exactly the manifest's changes, each file stored as the inspection hashed it. Ignored files the manifest lists
+       are committed. What the manifest does not list stays as `base` has it.
+     - Both volumes stay read-only. The objects go to a scratch store in the container's `/tmp`, and the commit comes
+       back as a `git bundle` (`bundle`) whose one ref, `refs/heads/codeboost` (`TASK_COMMIT_REF`), points at `head`,
+       with `base` as its prerequisite. Fetch it into a runner-owned repository and check that the ref is `head`.
+     - It refuses with `TaskCommitRefused` when the manifest's digest is not `digest` (the work tree changed after the
+       audit). It also refuses, whatever the audit said, any agent commit, metadata change, change to a declared link's
+       target (a `retargeted` entry is the item's own edit of the link, which the audit judges), gitlink content, and any change a tree cannot hold: a directory, a fifo or other special file, a path
+       under a `.git` part, or a symlink named `.gitmodules`.
+     - An empty change set makes no commit: `head` is `base`, `unchanged` is true and `bundle` is empty.
+     - It fails on whatever fails an inspection, on a bundle over `maxBundleBytes` (64 MiB at most), on new content
+       that does not fit the container's 512 MB `/tmp` (within its 1 GB of memory), and on any Git failure. Identities,
+       the message and trailer values must not hold Unicode noncharacters, which Git would re-encode, and a date's
+       offset of zero is written `+0000`. The default deadline is 300 s.
+     - Hooks, signing and the repository's commit encoding never apply. Calling it again with the same inputs on the
+       same storage gives the same `head`.
+7. After a crash or restart, call `recoverLeftovers(runnerOwner)` (`agents/recovery.ts`) while holding the
    database's single-runner lock and before admitting work. It touches only objects labelled with that runner
-   token. It removes agent containers, egress proxies, seeders and networks, and resolves once they are gone. It keeps
-   task storage whole (both volumes and the keeper) and returns one recovery handle per allocation, carrying its
-   attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
+   token. It removes agent containers, egress proxies, seeders, export, inspection and commit containers and networks, and
+   resolves once they are gone. It keeps task storage whole (both volumes and the keeper) and returns one recovery
+   handle per allocation, carrying its attempt and allocation IDs. `removeTaskFilesystems` accepts a handle as it accepts the value
    `prepareTaskFilesystems` returned. D issues a handle only after checking every part's owner labels. Objects without
    a runner label (from older builds), objects of this runner that D does not create, and storage whose parts
    disagree are listed in `unowned` and never touched. An object counts as D's only with exactly one kind label,
@@ -126,6 +231,65 @@ The caller must do the following:
 - Treat `stopReason` as the result of the invocation. A missing `stopReason` means
   the agent finished normally.
 
+## Codex is refused in every phase
+
+Decisions for #75 (planning and questions) and #93 (review, execute and fix), both
+recorded 2026-10-01.
+
+**Problem.** Codex 0.153.4 reads files only through its shell. D turns the shell off
+(`features.shell_tool=false`) in every phase. So Codex cannot see `/work` or the
+mounted input in any phase. E4's recordings showed this in planning: Codex planned
+without the code and asked for the schema. The live Codex probe in review answered:
+"I can't read that local file with the available tools." In execute and fix, Codex
+would change files it cannot see.
+
+The shell cannot simply be turned on (design, "Phase enforcement"):
+
+- Planning and questions must run no process.
+- Review and execute/fix may run only an exact approved argv, through a
+  runner-controlled dispatcher. The Codex shell runs any process, and the runner
+  never sees it. No vendor has the runner-controlled command tool yet
+  (`dispatchApprovedCommand` has no agent-facing caller).
+- If an adapter cannot enforce a phase profile, the phase is refused.
+
+**Options considered.** #93 lists every option for each phase.
+
+| Option | Result |
+| --- | --- |
+| a. Turn the shell on for Codex in planning and questions | Rejected (#75). It breaks the rule that these phases run no process. |
+| b. Turn the shell on for Codex in execute and fix | Not now (#93). It needs a design change, or a Codex setting that enforces exact argv. |
+| c. Keep the shell off and put the schema and chosen files in the prompt | Rejected. The 32 KiB prompt limit caps how much code Codex sees, and E2 would have to choose the files. |
+| d. Wait for a Codex tool that reads files without a process | Not chosen: the Codex probes would keep failing, and T9 would stay open. |
+| e. Use Claude only, in every phase | **Chosen.** |
+
+**What this changes.**
+
+- `createCodexCommand` and `startCodexInvocation` refuse every phase. The start call
+  refuses before it allocates anything. The phases the Codex adapter may run are one
+  set in `agents/policy.ts` (`CODEX_PHASES`), and it is empty. Ask and the runner
+  also refuse Codex on their own (below), so adding a phase to the set does not by
+  itself turn Codex on there.
+- The execute runner refuses a Codex task before it fetches the issue or allocates
+  task storage.
+- Ask offers only Claude Code. The Store refuses Codex as the question agent. A review
+  database that already names Codex reads back as Codex, and Ask refuses it with a
+  message that tells the user to choose Claude Code.
+- The Ask worker receives only `CLAUDE_CODE_OAUTH_TOKEN` as credential data.
+- E4 records Claude only: one draft and one suggestion.
+- The live Codex probes are removed. The T9 row for startup probes covers Claude only.
+  The Codex adapter's output-file decoding stays, and the isolation probes still
+  exercise it with a Codex container profile.
+
+**When to revisit.**
+
+- Planning, questions and review: when a pinned Codex version has a file-reading tool
+  that runs no process. Then pass the mounted schema with
+  `--output-schema /run/codeboost-input/schema.json`, and add live Codex probes for
+  those phases. Also restore a test that `createCodexCommand` writes its final message
+  to `CODEX_OUTPUT_FILE`, the file the adapter reads.
+- Execute and fix: when the design accepts the container as the only process boundary
+  in those phases, or when Codex can enforce exact approved argv (#93, option 1).
+
 ## First consumer: Ask
 
 Ask (`runner/question-container.ts`) is the first production caller. It follows the four entry points above in the
@@ -142,10 +306,11 @@ Ask keeps the contract's identity and cleanup rules:
   worker reply carry that attempt and the captured context. The Store then compares the attempt before saving it.
 - The worker's environment is an allowlist: `PATH`, `DOCKER_HOST` and its Ask root as `TMPDIR`. Every setup
   subprocess, including the image build, inherits only that, so no credential, home directory, Docker config or
-  agent socket reaches it. The credential lookup's own variables (`CLAUDE_CODE_OAUTH_TOKEN`,
-  `CODEBOOST_CODEX_AUTH_FILE`, `CODEX_HOME`, `HOME`) reach the worker as data and go only to the adapters. The
-  leftover Docker queries use the same `PATH`/`DOCKER_HOST` environment as lane D. Missing sign-in is reported
-  before any Docker work.
+  agent socket reaches it. The credential lookup's only variable, `CLAUDE_CODE_OAUTH_TOKEN`, reaches the worker as
+  data and goes only to the Claude adapter. Ask refuses Codex before any Docker work (see
+  [Codex is refused in every phase](#codex-is-refused-in-every-phase)).
+  Lane D's recovery runs in the worker, so it has the same environment. Missing sign-in is reported before any
+  Docker work.
 - Lane D's clone is a full host copy with no byte limit of its own. Before cloning, Ask measures the checkout at the
   reviewed head (`git ls-tree -r -t -l`) and the object store (`git count-objects -v`) and refuses a repository
   that would not fit the question's 512 MiB and 131,072-entry allocation. A bounded, D-owned clone would replace
@@ -153,20 +318,47 @@ Ask keeps the contract's identity and cleanup rules:
 - The stop reason (timeout, shutdown or cancellation) travels as a typed value (`StopError`) from `Questions`
   through the worker message to `handle.cancel()`, separate from the message shown to the user.
 - Output counts as an answer only with exit code 0 and no signal. A missing exit code or a signal is a failure.
+- Every Docker object Ask creates carries the review's **Ask owner token** as `io.codeboost.runner` (#65). The token
+  is per review database: the Store keeps it as `ask_owner`, tied to the database file's device and inode, like the
+  runner's token. It is a separate token from the runner's (`runner_owner`), because D's recovery removes every agent
+  container of the owner it is given. With one token, Ask's recovery could remove the runner's live agents, and the
+  runner's recovery would find Ask's storage.
+- The first question of each process, under the review's Ask lock and before any question starts, asks the worker
+  to run D's `recoverLeftovers(askOwner)`. It removes the agent containers, proxies, seeders and networks of that
+  owner. It returns a handle for each task-storage allocation, and Ask removes that storage at once (Ask only reads,
+  so there is nothing to export). The handles are valid only in the thread that recovered them, which is why the
+  worker runs recovery. Recovery runs even without a record, because a process killed early leaves no record.
+  It is single-flight: concurrent first questions share it.
+- Recovery touches nothing that carries another owner. Another review on the same Docker daemon, with live
+  questions or with leftovers of its own, does not block Ask and is not changed by it. Ask calls recovery with
+  `{ unowned: false }`, so D does not list or inspect other owners' objects at all, and their number or a failed
+  inspect of one cannot make Ask's recovery fail. Objects without an owner label come from builds before #51 item 3
+  and could belong to any review, so Ask neither removes them nor refuses because of them. This differs from the runner, whose startup recovery refuses to admit work while any exist
+  (`runner-lifecycle.md`, "Unowned resources"): Ask only reads, and refusing would bring back the cross-review block
+  that #65 removes.
+- Ask stays off when recovery rejects (Docker unreachable, a removal not confirmed, the 60-second limit), and when an
+  object carries this review's owner but recovery cannot identify it. The refusal for an unidentified object lists a
+  `docker … rm` command for each one (at most 20). The next question retries the whole startup check, including a
+  check that failed before it reached Docker (a legacy record, an Ask root that could not be deleted). Recovered storage whose
+  removal Docker does not confirm is kept and retried before each question, like the worker's own storage.
 - If Docker does not confirm storage removal, the worker keeps the allocation, retries removal before the next
   question, and refuses Ask while any removal is unconfirmed.
-- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. It reports
-  anything still unremoved, and codeboost writes those names to `<database>.ask-leftovers.json`. After a restart,
-  Ask stays off while any recorded container or volume still exists. The check is read-only label queries
-  (`docker ps`, `docker volume ls` and `docker network ls` for `io.codeboost.allocation`, `io.codeboost.invocation`
-  and `io.codeboost.egress`) with one 15-second limit, and the question can cancel it. The refusal shows
-  `docker rm`/`docker volume rm` commands for exactly the resources that remain, and the record clears itself once
-  they are gone. An unreadable record, a Docker daemon that cannot answer in time, or a worker that does not report
-  at shutdown keeps Ask off. Allocations beyond the record's cap of 100 count as unidentified, never dropped; Ask
-  roots are never dropped, and recording one past the cap is refused. Any labelled resource that is not part of a
-  still-listed allocation keeps the unidentified marker until none remain. D now has scoped recovery (#51 item 4),
-  but Ask cannot use it yet: it labels resources with a random per-session runner owner, so a later process does not
-  know the token to recover (#59).
+- At shutdown the worker makes one last removal attempt (bounded to 30 seconds) before it is terminated. Whatever is
+  left carries the review's owner label, so the next process's recovery removes it; nothing about Docker is written
+  to the record. A recovery still in flight at shutdown stops with the worker, and the next process runs it again.
+  The Docker clients it started may outlive the thread, so after that the review's Ask lock is kept until this
+  process exits, as after an abandonment.
+- `<database>.ask-leftovers.json` lists only Ask roots (below). A record from a build before #65 can also list agent
+  storage by name, or count failures it could not name. Those builds labelled Ask's objects with no owner or a random
+  one, so recovery cannot find them. While such a record exists, Ask stays off and shows the `docker rm` and
+  `docker volume rm` commands for the named storage. The user removes it, then deletes the record. An unreadable
+  record keeps Ask off. Ask roots are never dropped, and recording one past the cap of 100 is refused. Records
+  written by this build leave out the legacy fields, so an older build reads them as unreadable and keeps Ask off.
+- Known limits of owner scoping. Builds between #51 item 3 and #65 labelled Ask's objects with a random owner per
+  session; what such a process left after being killed is found by nobody, and has to be removed by hand
+  (`docker ps -a`, `docker volume ls` and `docker network ls` with `--filter label=io.codeboost.runner`, keeping
+  the owners of running reviews). The token is tied to the database file's device and inode, so a database moved to
+  another filesystem or restored from a backup gets a new token, and its earlier leftovers are not recovered.
 - Host copies are owned through one Ask root per worker, `<tmp>/codeboost-ask-XXXXXX`. The bridge creates it and
   records it before the worker starts, and runs the worker with it as `TMPDIR`. So the reviewed clone, lane D's
   input directory and its Codex auth copy all land inside it. The root is deleted, read-only directories included,
@@ -179,46 +371,45 @@ Ask keeps the contract's identity and cleanup rules:
   in the private lock directory and whose owner lock is free. It leaves folders whose owner is still running, and
   folders with a missing, malformed or foreign stamp, because Ask did not provably create those.
 - If storage setup itself fails and D cannot confirm its own cleanup, D returns no handle and Ask cannot tell which
-  resources were left. Ask stays off for the rest of the session, and the record counts the failure. After a
-  restart, Ask stays off while any container, volume or network labelled `io.codeboost.allocation`,
-  `io.codeboost.invocation` or `io.codeboost.egress` exists. Resources now carry caller-provided allocation IDs
-  and runner labels (#51 item 3), but Ask does not yet use them to name its resources.
+  resources were left. Ask stays off for the rest of the session. The resources carry the review's owner label, so
+  the first question after a restart removes them through recovery.
 - One process at a time runs Ask for a review. The lock is an exclusive SQLite transaction on a lock file keyed by
   the database file's identity (device and inode), in a private directory (`<tmp>/codeboost-asklocks-<uid>`, mode
   0700, checked to be owned by you). A lock path that is a symlink is refused, never followed. It is an OS file lock that the operating
   system releases when its process ends, so every spelling and every later name of the database, including an
-  atomic rename while a server runs, finds the same lock. It is taken before the scan and kept until the worker
-  and any startup scan still in flight have finished. Only the holder scans, starts a worker or writes the
-  record. The record itself is kept next to the database's canonical path (`realpath`), so relative,
-absolute and symlinked spellings share them. A database with other hard links is refused. Separating different
-  reviews that share one Docker daemon needs a per-database runner token: resources now carry runner labels
-  (#51 item 3), but Ask labels them with a random per-session owner until F1d's token exists (#59).
-- The first question of each process runs that scan even without a record, because a process killed before it
-  could write one leaves no record. Until Ask labels resources with a per-database runner token and filters its
-  scan by it, another codeboost process running Ask at the same moment also keeps this one off.
-- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off (it counts as untracked leftovers) until a restart finds no labelled resources. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
+  atomic rename while a server runs, finds the same lock. It is taken before the startup check and kept until the worker
+  and any startup check still in flight have finished. Only the holder recovers, starts a worker or writes the
+  record. The lock is what keeps recovery away from other processes' live questions: D's recovery cannot see other
+  processes, and it removes every agent container of the owner. It does not cover Docker clients that a killed
+  process left running, which can still create objects while the next process recovers; that needs lane D's
+  process groups (#51 item 5). The record itself is kept next to the database's canonical path (`realpath`), so relative,
+absolute and symlinked spellings share them. A database with other hard links is refused. A copy of the database
+  is a different file, so it gets its own Ask owner token and its own lock.
+- Lane D's settlement now ends within about 60 seconds of a cleanup failure (#51 item 1). A result with `unreleased` turns Ask off until codeboost restarts; recovery then removes what is left. Ask's own abandonment path predates the bound and is unchanged. Abandonment happens once: a crash, a watchdog and shutdown all wait on
   the same bounded termination. A question not settled 30 seconds after its
   deadline, or still settling after the 20-second shutdown grace period, makes the bridge abandon the worker. It
-  records unknown leftovers, waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
+  waits up to 15 seconds for the worker thread to stop (a synchronous Docker or Git call
   finishes first), then rejects the waiting questions, so shutdown cannot hang on D. A worker that does not answer
   the final release request at shutdown goes through the same bounded path. If the thread is still busy
-  after that wait, its ownership is already durable (unknown leftovers and the recorded root) and no new question is
+  after that wait, its ownership is already durable (the owner label and the recorded root) and no new question is
   admitted; the root is deleted as soon as the thread stops. After any abandonment the review lock is kept until the
   process exits: Docker CLI children the thread started can outlive it and cannot be awaited until lane D exposes
   process groups (#51 item 5).
-- If the worker itself crashes, its containers and storage may still exist. The bridge does not start a
-  replacement worker, and it records the crash at once as unidentified leftovers. After a restart, Ask stays off
-  while any container, volume or network labelled `io.codeboost.allocation`,
-  `io.codeboost.invocation` or `io.codeboost.egress` exists. Lane D's scoped recovery (#51 item 4) can reclaim
-  leftovers by runner token, but Ask's per-session token is lost with the process until F1d's per-database token
-  exists (#59).
+- If the worker itself crashes, its containers and storage may still exist, and its Docker CLI children may still be
+  changing them. The bridge does not start a replacement worker, so Ask stays off until codeboost restarts. The
+  first question after the restart removes them through recovery.
 
 `test/agent-question.test.ts` runs this path
-against real Docker; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
+against real Docker, including two reviews with different Ask owners on one daemon; its live case, like the vendor probes above, needs `CODEBOOST_RUN_AUTH_PROBES=1` and
 `CLAUDE_CODE_OAUTH_TOKEN`.
 
 ## Limits of this gate
 
 - CI does not run the live vendor probes. Run them locally with credentials before
-  a release that changes the image, the adapters or the prompts.
+  a release that changes the image, the adapters or the prompts. Codex has no live
+  probe while it is refused in every phase (#93).
 - T9 as a whole is complete only when lane F runs every suite in required CI (F6).
+- Gitlink mounts and the pre-launch check apply to execute and fix only. In planning, questions and review, `/work`
+  is a read-only volume, so nothing can be written beneath a gitlink there; that includes `check` attempts, which run
+  as review. Running an item's `cmd` in a writable task filesystem is not built yet; when it is, each run must call
+  `checkTaskTree` and get the same mounts before it starts.

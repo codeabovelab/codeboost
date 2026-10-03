@@ -1,4 +1,4 @@
-import { execFileSync } from 'node:child_process';
+import { fixtureGit } from './fixtures/git.ts';
 import { chmodSync, existsSync, lstatSync, mkdirSync, readdirSync, writeFileSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -6,8 +6,9 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskFilesystems } from '../agents/container/storage.ts';
-import { askInContainer, credentialEnvironment, measureGitRepository, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
-import { dockerQueryEnvironment } from '../runner/question-leftovers.ts';
+import type { RecoveredTaskStorage } from '../agents/container/storage.ts';
+import type { RecoveryReport, UnownedResource } from '../agents/recovery.ts';
+import { askInContainer, CODEX_QUESTIONS_REFUSED, credentialEnvironment, measureGitRepository, recoverAskOwner, recoverQuestionStorage, RetainedStorage, StopError, workerEnvironment, type ContainerDependencies, type ContainerQuestion } from '../runner/question-container.ts';
 import { QuestionWorker } from '../runner/question-agent.ts';
 
 const roots: string[] = [];
@@ -41,9 +42,10 @@ function fakeDeps(result: Partial<InvocationResult> = {}, env: Record<string, st
     createClone: options => { events.push('clone'); return { id: 'clone', taskId: options.taskId, directory: options.parent, head: options.head }; },
     prepareFilesystems: () => { events.push('prepare'); return filesystems; },
     removeFilesystems: value => { expect(value).toBe(filesystems); events.push('remove'); },
+    recover: async () => { throw new Error('Questions never recover.'); },
     measureRepository: () => ({ checkoutBytes: 1_024, entries: 3, objectBytes: 2_048 }),
     capture: input => { captured.push(input); return Object.freeze(input); },
-    startClaude: start('claude'), startCodex: start('codex'), env,
+    startClaude: start('claude'), env,
   };
   return { deps, events, captured, started, cancels, settle: (value: Partial<InvocationResult>) => settle({ attemptId: captured[0]!.attemptId,
     context: captured[0]!.context, exitCode: null, signal: null, stdout: '', stderr: '', ...value }) };
@@ -106,15 +108,14 @@ it('refuses to start without a Claude token, before any Docker or Git work', asy
   expect(fake.events).toEqual([]);
 });
 
-it('mounts the Codex auth file from CODEX_HOME and refuses when it is missing', async () => {
+it('refuses Codex before any Docker work, even with a Codex sign-in', async () => {
   const home = mkdtempSync(join(tmpdir(), 'codex-home-')); roots.push(home);
-  const missing = fakeDeps({}, { CODEX_HOME: home });
-  await expect(askInContainer(question({ provider: 'codex' }), missing.deps, new AbortController().signal)).rejects.toThrow('auth.json');
-  expect(missing.events).toEqual([]);
   writeFileSync(join(home, 'auth.json'), '{}');
-  const present = fakeDeps({}, { CODEX_HOME: home });
-  await askInContainer(question({ provider: 'codex' }), present.deps, new AbortController().signal);
-  expect(present.started[0]).toMatchObject({ vendor: 'codex', credential: join(home, 'auth.json') });
+  const fake = fakeDeps({}, { CODEX_HOME: home, CODEBOOST_CODEX_AUTH_FILE: join(home, 'auth.json') });
+  await expect(askInContainer(question({ provider: 'codex' }), fake.deps, new AbortController().signal))
+    .rejects.toThrow(CODEX_QUESTIONS_REFUSED);
+  expect(fake.events).toEqual([]);
+  expect(fake.started).toEqual([]);
 });
 
 it('releases storage when setup fails after allocation, and not before', async () => {
@@ -137,19 +138,20 @@ it('stops before starting the container once the deadline has passed', async () 
 let attempts = 0;
 const scope = () => ({ repository: '/repo', head: 'a'.repeat(40), snapshotId: 's', planId: 'p', planRevision: 1, noteId: 'n',
   attemptId: `attempt-${++attempts}`, contextId: 'c'.repeat(64) });
-// The bridge checks sign-in before asking, so the stub needs both credentials (and must not depend on ~/.codex).
-const codexAuth = join(mkdtempSync(join(tmpdir(), 'codex-auth-')), 'auth.json');
-writeFileSync(codexAuth, '{}');
+// The bridge checks sign-in before asking, so the stub needs the Claude credential.
 const stubWorker = () => new QuestionWorker(new URL('./fixtures/question-worker-stub.ts', import.meta.url), undefined,
-  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token', CODEBOOST_CODEX_AUTH_FILE: codexAuth } });
+  { env: { CLAUDE_CODE_OAUTH_TOKEN: 'test-token' } });
 
 it('returns the worker answer and forwards cancellation, settling only when the worker replies', async () => {
   const worker = stubWorker();
   try {
     expect(await worker.agent('claude')('answer', new AbortController().signal, scope(), 60_000)).toBe('claude:answer:n');
+    // A review database that still names Codex is refused before the worker sees the question.
+    await expect(worker.agent('codex')('answer', new AbortController().signal, scope(), 60_000))
+      .rejects.toThrow(CODEX_QUESTIONS_REFUSED);
     const controller = new AbortController();
     let done = false;
-    const pending = worker.agent('codex')('wait', controller.signal, scope(), 60_000).catch((error: Error) => error).finally(() => { done = true; });
+    const pending = worker.agent('claude')('wait', controller.signal, scope(), 60_000).catch((error: Error) => error).finally(() => { done = true; });
     await new Promise(resolve => setTimeout(resolve, 50));
     expect(done).toBe(false);
     controller.abort(new StopError('Agent timed out. Try again.', 'timeout'));
@@ -274,7 +276,6 @@ it('keeps storage whose removal failed, refuses Ask until it is removed, then co
   first.deps.removeFilesystems = () => { throw new Error('Docker did not confirm removal.'); };
   await expect(askInContainer(question(), first.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
   expect(retained.size).toBe(1);
-  expect(retained.list().map(entry => entry.keeper)).toEqual(['keeper']);
 
   const blocked = fakeDeps();
   blocked.deps.removeFilesystems = () => { throw new Error('Docker is still down.'); };
@@ -296,8 +297,7 @@ it('gives the worker an allowlisted environment and passes only the credential v
   const env = { PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', HOME: '/home/me', CLAUDE_CODE_OAUTH_TOKEN: 'secret-1',
     SSH_AUTH_SOCK: '/tmp/agent', AWS_ACCESS_KEY_ID: 'secret-2', DOCKER_CONFIG: '/home/me/.docker', CODEX_HOME: '/home/codex' };
   expect(workerEnvironment(env, '/tmp/codeboost-ask-abc123')).toEqual({ PATH: '/usr/bin', DOCKER_HOST: 'unix:///docker.sock', TMPDIR: '/tmp/codeboost-ask-abc123' });
-  expect(credentialEnvironment(env)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1', CODEX_HOME: '/home/codex', HOME: '/home/me' });
-  expect(Object.keys(dockerQueryEnvironment()).sort()).toEqual(['DOCKER_HOST', 'PATH']);
+  expect(credentialEnvironment(env)).toEqual({ CLAUDE_CODE_OAUTH_TOKEN: 'secret-1' });
 });
 
 it('starts the real bridge worker with exactly the allowlisted environment', async () => {
@@ -308,7 +308,7 @@ it('starts the real bridge worker with exactly the allowlisted environment', asy
     const seen = JSON.parse(await worker.agent('claude')('env', new AbortController().signal, scope(), 60_000));
     expect(seen.env.filter((name: string) => !['PATH', 'DOCKER_HOST', 'TMPDIR'].includes(name))).toEqual([]);
     expect(seen.env).toContain('TMPDIR');
-    expect(seen.credentials).toEqual(['CLAUDE_CODE_OAUTH_TOKEN', 'CODEBOOST_CODEX_AUTH_FILE']);
+    expect(seen.credentials).toEqual(['CLAUDE_CODE_OAUTH_TOKEN']);
   } finally {
     await worker.close();
     for (const name of ['SSH_AUTH_SOCK', 'AWS_ACCESS_KEY_ID', 'DOCKER_CONFIG']) if (!(name in saved)) delete process.env[name];
@@ -329,7 +329,7 @@ it.each([
 
 it('measures the checkout at the reviewed head and the object store with Git', () => {
   const repo = mkdtempSync(join(tmpdir(), 'measure-')); roots.push(repo);
-  const git = (...args: string[]) => execFileSync('git', ['-c', 'core.hooksPath=/dev/null', ...args], { cwd: repo, encoding: 'utf8' }).trim();
+  const git = (...args: string[]) => fixtureGit(repo, ...args);
   git('init', '-q'); git('config', 'user.name', 'T'); git('config', 'user.email', 't@example.com');
   mkdirSync(join(repo, 'dir')); writeFileSync(join(repo, 'dir', 'a.txt'), 'x'.repeat(1000)); writeFileSync(join(repo, 'b.txt'), 'y'.repeat(24));
   git('add', '.'); git('commit', '-qm', 'base');
@@ -376,3 +376,66 @@ it('closes the review store even when Ask cleanup fails at shutdown', async () =
   finally { Questions.prototype.close = closeQuestions; }
   expect(storeClosed).toBe(true);
 }, 30_000);
+
+const OWNER = '0123456789abcdef0123456789abcdef';
+const recovered = (n: number) => ({ runnerOwner: OWNER, attemptId: `attempt-${n}`, allocationId: `allocation-${n}`,
+  workVolume: `codeboost-work-${n}`, metadataVolume: `codeboost-meta-${n}` }) as RecoveredTaskStorage;
+const unowned = (name: string, reason: UnownedResource['reason'], labels: Record<string, string>): UnownedResource =>
+  ({ kind: 'container', name, id: `id-${name}`, labels, reason });
+const recovery = (report: Partial<RecoveryReport>, removeFilesystems: (value: unknown) => void = () => {}) => {
+  const owners: string[] = [];
+  return { owners, deps: { removeFilesystems, recover: async (owner: string) => { owners.push(owner); return { removed: [], storage: [], unowned: [], ...report }; } } };
+};
+
+it('recovers only its own owner and removes the storage it gets back, since Ask has nothing to export', async () => {
+  const removed: unknown[] = [];
+  const handles = [recovered(1), recovered(2)];
+  const fake = recovery({ storage: handles }, value => { removed.push(value); });
+  const retained = new RetainedStorage();
+  await recoverQuestionStorage(OWNER, fake.deps, retained);
+  expect(fake.owners).toEqual([OWNER]);
+  expect(removed).toEqual(handles);
+  expect(retained.size).toBe(0);
+});
+
+it('keeps recovered storage whose removal fails, which keeps Ask off until it is removed', async () => {
+  const handle = recovered(1);
+  const retained = new RetainedStorage();
+  await recoverQuestionStorage(OWNER, recovery({ storage: [handle] }, () => { throw new Error('Docker did not confirm removal.'); }).deps, retained);
+  expect(retained.size).toBe(1);
+  expect(() => retained.release(() => { throw new Error('still down'); })).toThrow('earlier question or session could not be removed');
+  const removed: unknown[] = [];
+  retained.release(value => { removed.push(value); });
+  expect(removed).toEqual([handle]);
+});
+
+it('is not blocked by objects without an owner, which may belong to another review on the same daemon', async () => {
+  const legacy = unowned('codeboost-keeper-legacy', 'no-runner-label', { 'io.codeboost.allocation': 'x' });
+  await expect(recoverQuestionStorage(OWNER, recovery({ unowned: [legacy] }).deps, new RetainedStorage())).resolves.toBeUndefined();
+});
+
+it('keeps Ask off, with removal commands, for objects of its own owner that recovery cannot identify', async () => {
+  const mine = unowned('codeboost-odd', 'unknown-kind', { 'io.codeboost.runner': OWNER });
+  const theirs = unowned('codeboost-theirs', 'unknown-kind', { 'io.codeboost.runner': 'f'.repeat(32) });
+  const removed: unknown[] = [];
+  const handle = recovered(1);
+  const error = await recoverQuestionStorage(OWNER, recovery({ storage: [handle], unowned: [mine, theirs] }, value => { removed.push(value); }).deps,
+    new RetainedStorage()).catch((caught: Error) => caught);
+  expect((error as Error).message.split('\n')).toEqual([expect.stringContaining("labelled with this review's Ask owner"), "docker container rm -f 'id-codeboost-odd'"]);
+  // Storage it could identify is still removed.
+  expect(removed).toEqual([handle]);
+});
+
+it('keeps Ask off when recovery cannot finish', async () => {
+  const deps = { removeFilesystems: () => {}, recover: async () => { throw new Error('Cannot connect to the Docker daemon'); } };
+  await expect(recoverQuestionStorage(OWNER, deps, new RetainedStorage())).rejects.toThrow(/could not remove what an earlier session.*Cannot connect/);
+});
+
+it("calls lane D's recovery for this owner only, without the daemon-wide search for unowned objects (#65)", async () => {
+  const recovery = await import('../agents/recovery.ts');
+  const spy = vi.spyOn(recovery, 'recoverLeftovers').mockResolvedValue({ removed: [], storage: [], unowned: [] });
+  try {
+    await recoverAskOwner(OWNER);
+    expect(spy).toHaveBeenCalledWith(OWNER, 60_000, { unowned: false });
+  } finally { spy.mockRestore(); }
+});

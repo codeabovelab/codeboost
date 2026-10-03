@@ -4,6 +4,7 @@ import { QuestionWorker } from './question-agent.ts';
 import { LeftoverLedger } from './question-leftovers.ts';
 import { StopError, type QuestionScope } from './question-container.ts';
 import type { ReviewNote } from './store.ts';
+import { settleWith, type ShutdownCapability } from './lifecycle.ts';
 export type QuestionAgent = (prompt: string, signal: AbortSignal, scope?: QuestionScope, timeoutMs?: number) => Promise<string>;
 const QUESTION_TIMEOUT_MS = 120_000;
 const SHUTDOWN_SETTLE_MS = 20_000;
@@ -26,10 +27,14 @@ export class Questions {
   private service: ReviewService;
   private agent?: QuestionAgent;
   private worker: QuestionWorker;
-  constructor(service: ReviewService, agent?: QuestionAgent) {
-    this.service=service; this.agent=agent;
+  /** Settlement writes (finishAnswer after abort) keep working after the Store write gate closes. */
+  private write: <T>(fn: () => T) => T;
+  constructor(service: ReviewService, agent?: QuestionAgent, capability?: ShutdownCapability) {
+    this.service=service; this.agent=agent; this.write = settleWith(capability);
     // Beside the review database's canonical path, so a restart of the same review finds what an earlier session left.
-    this.worker=new QuestionWorker(undefined,LeftoverLedger.forDatabase(service.config.database));
+    const ledger=LeftoverLedger.forDatabase(service.config.database);
+    // Ask's owner is per database, so its recovery acts only on this review's Docker objects (#65).
+    this.worker=new QuestionWorker(undefined,ledger,{runnerOwner:()=>service.store.askOwnerToken(ledger.identity!)});
   }
   isRunning(id: string) { return this.running.has(id); }
   get stopping() { return this.closing; }
@@ -61,13 +66,15 @@ export class Questions {
       try {
         if(!agent) throw new Error('Choose a question agent in Settings, then retry.');
         const aborted = new Promise<never>((_,reject)=>controller.signal.addEventListener('abort',()=>reject(controller.signal.reason),{once:true}));
-        const scope={repository:this.service.config.repository,head:view.snapshot.head,snapshotId:view.snapshot.id,planId:this.service.config.identity.planId,planRevision:view.plan.revision,noteId:id,attemptId:attempt,contextId:note.contextId};
+        const scope={repository:this.service.reviewRepository().path,head:view.snapshot.head,snapshotId:view.snapshot.id,planId:this.service.config.identity.planId,planRevision:view.plan.revision,noteId:id,attemptId:attempt,contextId:note.contextId};
         invocation = agent(questionPrompt(view,note),controller.signal,scope,QUESTION_TIMEOUT_MS);
         const text=await Promise.race([invocation,aborted]);
         if(typeof text!=='string'||!text.trim()||text.length>24000) throw new Error('Agent returned an empty or oversized answer.');
-        this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'complete',text:text.trim()});
+        this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'complete',text:text.trim()}));
       } catch(error) {
-        this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)});
+        try { this.write(()=>this.service.store.finishAnswer(this.service.config.identity,id,attempt,{status:'failed',error:(error instanceof Error?error.message:'Agent failed.').slice(0,1000)})); }
+        // The answer stays pending (the page shows it as interrupted); say why instead of dropping the error.
+        catch(saveError) { console.error(`Question ${id} could not record its failed answer: ${saveError instanceof Error?saveError.message:String(saveError)}`); }
       } finally {clearTimeout(timeout);}
     })();
     const settled = done.finally(async () => {
@@ -82,8 +89,8 @@ export class Questions {
     this.closing = true;
     for(const job of this.running.values())job.controller.abort(new StopError('Server stopped. Retry the question.','shutdown'));
     const settled=Promise.all([...this.running.values()].map(job=>job.done));
-    // Lane D may never settle (#51 item 1). After the grace period the worker is abandoned, which records its
-    // allocations as unknown and rejects the waiting questions, so shutdown cannot hang here.
+    // Lane D may never settle (#51 item 1). After the grace period the worker is abandoned, which rejects the waiting
+    // questions, so shutdown cannot hang here. What it left is removed by the next process's recovery.
     let timer: ReturnType<typeof setTimeout> | undefined;
     const graceful=await Promise.race([settled.then(()=>true),new Promise<false>(resolve=>{timer=setTimeout(()=>resolve(false),SHUTDOWN_SETTLE_MS);})]);
     clearTimeout(timer);

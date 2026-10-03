@@ -24,7 +24,10 @@ export interface UnownedResource extends RecoveredResource {
   readonly reason: 'no-runner-label' | 'unknown-kind' | 'inconsistent-storage';
 }
 export interface RecoveryReport {
-  /** Agent containers, egress proxies, seeders and networks of this runner, now confirmed gone. */
+  /**
+   * Agent containers, egress proxies, seeders, export, inspection and commit containers and networks of this runner,
+   * now confirmed gone.
+   */
   readonly removed: readonly RecoveredResource[];
   /** One handle per task-storage allocation of this runner, kept whole for export and `removeTaskFilesystems`. */
   readonly storage: readonly RecoveredTaskStorage[];
@@ -119,20 +122,26 @@ const removeById = async (resource: RecoveredResource, remaining: () => number) 
 
 /**
  * Crash recovery for one database (#51 item 4). Acts only on objects whose `io.codeboost.runner` label is
- * `runnerOwner`: it removes agent containers, egress proxies, seeders and networks, and resolves only once they are
- * gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per allocation. Objects from
- * older builds without a runner label, and anything it does not recognise, are reported and never touched.
+ * `runnerOwner`: it removes agent containers, egress proxies, seeders, export, inspection and commit containers and
+ * networks, and resolves only once they are gone. It keeps task storage whole (volumes and keeper) and returns a recovery handle per
+ * allocation. Objects from older builds without a runner label, and anything it does not recognise, are reported and
+ * never touched.
  *
  * Call it only while holding the database's single-runner lock and before admitting work: it removes every agent
  * container of this runner. It refuses to run while this process holds task storage of the runner, which every agent
  * mounts, but cannot see other processes; the lock is what excludes them.
+ *
+ * With `{ unowned: false }` it skips the daemon-wide search for objects without a runner label, which lists and
+ * inspects every codeboost object of every runner. A caller that does not act on them (Ask, #65) uses this, so other
+ * runners' objects cannot make its recovery fail or run out of time. `unowned` then lists only objects of this runner.
  *
  * Treat any rejection as "recovery did not finish": do not admit work, and run it again. It rejects with a
  * `RecoveryError` (message bounded to about 1 KB, plus `removed`) when a removal is not confirmed, and with a plain
  * `Error` when it refuses to run (a malformed token, or live storage of this runner here), when a list or inspect
  * fails, when a storage check cannot reach Docker, or when the deadline runs out. A rejection returns no handles.
  */
-export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000): Promise<RecoveryReport> {
+export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
+  options: { unowned?: boolean } = {}): Promise<RecoveryReport> {
   if (!isRunnerOwner(runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
   // Every agent mounts task storage, so a runner with live storage here may have live agents recovery would remove.
   if (hasLiveTaskStorage(runnerOwner))
@@ -143,6 +152,7 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   const unowned: UnownedResource[] = [];
   for (const kind of ['container', 'volume', 'network'] as const) {
     owned[kind] = await inspect(kind, await list(kind, `${RUNNER_LABEL}=${runnerOwner}`, remaining), remaining);
+    if (options.unowned === false) continue;
     // Docker cannot filter on a missing label, so list every codeboost object of this kind and keep those without one.
     const candidates = unique((await Promise.all(KIND_LABELS.map(label => list(kind, label, remaining)))).flat());
     for (const resource of await inspect(kind, candidates, remaining))
@@ -180,7 +190,11 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000)
   for (const resource of owned.container) {
     const kind = kindOf(resource);
     if (kind === 'storage:keeper') keep(resource, 'keeper');
-    else if (kind === 'storage:seeder' || kind === 'agent' || kind === 'egress') remove.push(resource);
+    // Seeders, export, inspection and commit containers are transient: a leftover one is removed, never kept with the
+    // storage.
+    else if (kind === 'storage:seeder' || kind === 'storage:export' || kind === 'storage:inspect' || kind === 'storage:commit'
+      || kind === 'agent' || kind === 'egress')
+      remove.push(resource);
     else unknown(resource);
   }
   for (const resource of owned.volume) {

@@ -28,15 +28,15 @@ export function readHistory(repo: string, baseRef: string, headRef = 'HEAD', lim
     if (diffBytes > maxDiffBytes) throw new Error('Review history exceeds the cumulative diff byte budget; choose a narrower base.');
     return data;
   };
-  // Inherited Git variables can redirect repository, index, config, and object lookup.
-  const environment = Object.fromEntries(Object.entries(process.env).filter(([key]) => !/^GIT_/i.test(key)));
   const run = (...args: string[]) => {
     const timeout = remaining();
     let result: Buffer;
     try {
       result = execFileSync('git', ['--no-pager', '--no-replace-objects', '-c', 'core.hooksPath=/dev/null', '-c', 'protocol.allow=never', ...args], {
         cwd: repo, maxBuffer: 32 * 1024 * 1024, timeout, killSignal: 'SIGKILL',
-        env: { ...environment, GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
+        // Allowlisted: inherited variables can redirect repository, index, config and object lookup, and Git reads
+        // variables outside the GIT_ namespace too, such as HOME and XDG_CONFIG_HOME for user attributes.
+        env: { PATH: process.env.PATH ?? '', GIT_OPTIONAL_LOCKS: '0', GIT_TERMINAL_PROMPT: '0',
           GIT_NO_LAZY_FETCH: '1', GIT_CONFIG_NOSYSTEM: '1', GIT_CONFIG_GLOBAL: '/dev/null', GIT_GRAFT_FILE: '/dev/null' },
         stdio: ['ignore', 'pipe', 'pipe'],
       });

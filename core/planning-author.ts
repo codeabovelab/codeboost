@@ -51,8 +51,9 @@ function boundedText(value: string, label: string): string {
   if (Buffer.byteLength(value, 'utf8') > MAX_PROMPT_BYTES) throw new Error(`${label} exceeds 32 KiB.`);
   return value;
 }
-/** Bound each field and the aggregate before serialization; never truncate source data. */
-function dataJSON(value: unknown, label: string): string {
+/** Bound each field and the aggregate before serialization; never truncate source data.
+ * Shared with the execution prompts (core/execution-prompt.ts). */
+export function dataJSON(value: unknown, label: string): string {
   let bytes = 0;
   function check(item: unknown, depth: number): void {
     if (depth > 50) throw new Error(`${label} is too deep.`);

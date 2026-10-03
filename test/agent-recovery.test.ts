@@ -161,6 +161,18 @@ describe('recoverLeftovers', () => {
     expect(names()).toContain(agent!.name);
   });
 
+  it.each(['export', 'inspect', 'commit'])('removes a leftover %s container with the other transient containers, keeping the storage', async kind => {
+    const mine = attempt(A, 'attempt-a'), storageLabels = mine.objects[0]!.labels;
+    const transient: FakeObject = { kind: 'container', id: id(), name: `codeboost-${kind}-${randomUUID()}`,
+      labels: { ...storageLabels, 'io.codeboost.task-storage': kind } };
+    daemon.objects.push(transient);
+    const report = await recoverLeftovers(A);
+    expect(report.removed.map(resource => resource.name)).toContain(transient.name);
+    expect(names()).not.toContain(transient.name);
+    expect(report.storage).toHaveLength(1);
+    expect(report.unowned).toEqual([]);
+  });
+
   it('reports objects without a runner label and never removes them', async () => {
     attempt(A, 'attempt-a');
     const legacy: FakeObject[] = [
@@ -256,6 +268,22 @@ describe('recoverLeftovers', () => {
     expect(report.removed).toHaveLength(4);
     expect(report.unowned).toMatchObject([{ name: legacy.name, reason: 'no-runner-label' }]);
     expect(names()).not.toContain(mine.objects[4]!.name);
+  });
+
+  it('with { unowned: false }, never lists or inspects objects of other runners, so they cannot fail it (#65)', async () => {
+    const mine = attempt(A, 'attempt-a'), theirs = attempt(B, 'attempt-b');
+    const legacy: FakeObject = { kind: 'container', id: id(), name: 'codeboost-agent-old', labels: { 'io.codeboost.invocation': 'old' } };
+    daemon.objects.push(legacy);
+    // Inspecting any of these would fail the recovery closed.
+    for (const object of [...theirs.objects, legacy]) daemon.brokenInspect.add(object.id || object.name);
+    const report = await recoverLeftovers(A, 120_000, { unowned: false });
+    expect(report.storage).toHaveLength(1);
+    expect(report.removed).toHaveLength(4);
+    expect(report.unowned).toEqual([]);
+    expect(names()).not.toContain(mine.objects[4]!.name);
+    for (const call of daemon.calls.filter(args => args[0] === 'ps' || args[1] === 'ls'))
+      expect(call[call.indexOf('--filter') + 1]).toBe(`label=io.codeboost.runner=${A}`);
+    await expect(recoverLeftovers(A)).rejects.toThrow();
   });
 
   it('still fails closed when an inspect fails for a reason other than the object being gone', async () => {

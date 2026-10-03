@@ -38,8 +38,9 @@ The PR body records the final validated head separately from this baseline.
    cancellation and shutdown need explicit lifecycle rules and controlled race tests.
 3. **E4:** Exercise imports, malformed provider output, hostile prompt data, delayed
    responses and replay end to end through the E interface and real SQLite authority.
-   Synthetic provider fixtures must be labeled as such. Real recorded Claude/Codex
-   output and OS/container enforcement cannot be claimed from fake-provider tests.
+   Synthetic provider fixtures must be labeled as such. Real recorded Claude output
+   and OS/container enforcement cannot be claimed from fake-provider tests. Codex does
+   not plan (#75), so E4 records Claude only.
 
 ## Ownership and integration boundaries
 

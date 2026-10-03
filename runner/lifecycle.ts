@@ -11,6 +11,11 @@ export type TaskStatus = 'queued' | 'running' | 'needs human' | 'needs amendment
 export const TASK_STATUSES: readonly TaskStatus[] = ['queued', 'running', 'needs human', 'needs amendment', 'needs approval',
   'possibly already fixed', 'in review', 'approved but merge blocked', 'merged', 'cancelled'];
 export const CLOSED_STATUSES: readonly TaskStatus[] = ['merged', 'cancelled'];
+/**
+ * Statuses that wait for a person; leaving one needs its own user action (runner-lifecycle.md), so a safety finding is
+ * owed there instead. Review statuses are not gates: a finding moves them to needs human, so the task cannot be merged.
+ */
+export const HUMAN_GATES: readonly TaskStatus[] = ['needs amendment', 'needs approval', 'possibly already fixed'];
 /** A merge starts only from review; every other status is closed, running, queued or waiting for a person. */
 export const MERGEABLE_STATUSES: readonly TaskStatus[] = ['in review', 'approved but merge blocked'];
 export const TERMINAL_STATES: readonly AttemptState[] = ['completed', 'failed', 'cancelled', 'stale'];
@@ -29,11 +34,13 @@ const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f
 /** Attempt, action and allocation IDs are lowercase UUID v4s; anything else is refused before use. */
 export function isUuidV4(value: unknown): value is string { return typeof value === 'string' && UUID_V4.test(value); }
 export function assertUuidV4(value: unknown, name: string): asserts value is string {
-  if (!isUuidV4(value)) throw new GuardRefusal(`${name} must be a lowercase UUID v4.`);
+  if (!isUuidV4(value)) throw new BadRequest(`${name} must be a lowercase UUID v4.`);
 }
 
 /** A guard refused the action. Refusals are definite outcomes and are recorded for replay. */
 export class GuardRefusal extends Error {}
+/** A malformed request, refused before any transaction and never recorded. The server maps it to HTTP 400. */
+export class BadRequest extends GuardRefusal {}
 /** Reusing an action ID for a different request. */
 export class ActionIdReused extends GuardRefusal {}
 /**
@@ -43,6 +50,24 @@ export class ActionIdReused extends GuardRefusal {}
 export class RefusalWithEffect extends GuardRefusal {
   readonly effect: () => void;
   constructor(message: string, effect: () => void) { super(message); this.effect = effect; }
+}
+/** A Store write after shutdown began. The server maps it to HTTP 503, never to the 409 used for review errors. */
+export class ShuttingDownError extends Error { constructor() { super('The review server is shutting down.'); } }
+/** Lets settling coordinator code write after the gate closes. Only the server hands it out, and never to HTTP handlers. */
+export interface ShutdownCapability { run<T>(fn: () => T): T }
+/** How a coordinator runs its settlement writes: through the capability when it has one, directly otherwise (tests, demos). */
+export function settleWith(capability?: ShutdownCapability): <T>(fn: () => T) => T {
+  return capability ? fn => capability.run(fn) : fn => fn();
+}
+
+/**
+ * Quote text that is not codeboost's (a Docker label, a file name) for one line of terminal output. JSON quoting escapes
+ * C0 controls; this also escapes what it leaves literal and a terminal may still act on: C1 controls (U+0080-U+009F, NEL
+ * among them), the Unicode line and paragraph separators, and invisible format and bidi characters that reorder text.
+ */
+export function quoteForTerminal(text: string): string {
+  return JSON.stringify(text).replace(/[\u0080-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u206f\ufeff]/gu,
+    char => `\\u${char.charCodeAt(0).toString(16).padStart(4, '0')}`);
 }
 
 export function bounded(reason: string): string {

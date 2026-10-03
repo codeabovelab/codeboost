@@ -1,11 +1,13 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
-import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, assertUuidV4 } from './lifecycle.ts';
-import { MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
+import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
+import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
 export interface MergeBlocker { code: string; message: string; }
+/** The longest a merge click may run before it is aborted; its last gh call's stop wait comes on top (github/merge.ts). */
+export const MERGE_OPERATION_TIMEOUT_MS = 14_000;
 const storageError = (error: unknown) => (error as { code?: string } | null)?.code === 'ERR_SQLITE_ERROR';
 /** The merge was not applied for a passing reason (deadline, shutdown); the same click may be sent again. */
 export class MergeNotApplied extends Error {}
@@ -42,9 +44,12 @@ export class MergeCoordinator {
   readonly service: ReviewService;
   readonly gateway: MergeGateway;
   readonly operationTimeoutMs: number;
-  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = 14_000) {
-    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 14_000) throw new Error('Invalid merge operation deadline.');
+  /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
+  #settle: <T>(fn: () => T) => T;
+  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability) {
+    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > MERGE_OPERATION_TIMEOUT_MS) throw new Error('Invalid merge operation deadline.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs;
+    this.#settle = settleWith(capability);
   }
 
   #attempt(): MergeAttempt | null {
@@ -106,8 +111,13 @@ export class MergeCoordinator {
     if (remote.mergeQueue && !queueGateway(this.gateway)) blockers.push({ code: 'merge-queue', message: 'This GitHub adapter cannot verify the merge-queue lifecycle.' });
     if (!remote.atomicBaseGuard) blockers.push({ code: 'base-guard', message: 'GitHub does not expose a server-enforced guard for the validated base.' });
     for (const check of remote.requiredChecks) if (check.state !== 'success') blockers.push({ code: 'check', message: `${check.context} is ${check.state}.` });
-    if (remote.alreadyFixed === 'found') blockers.push({ code: 'already-fixed', message: 'Another open or merged pull request references this issue.' });
-    if (remote.alreadyFixed === 'unknown') blockers.push({ code: 'already-fixed', message: 'The already-fixed check could not be completed.' });
+    // Once this PR has merged, the check counts it as the fix; the pr-state blocker already says so.
+    if (remote.pullRequestState !== 'MERGED' && remote.alreadyFixed === 'found') blockers.push({ code: 'already-fixed', message: remote.alreadyFixedDetail
+      ? `The issue may already be fixed: ${remote.alreadyFixedDetail}.`
+      : 'The issue may already be fixed: it is closed, another open or merged pull request refers to it, or a new base-branch commit mentions it.' });
+    if (remote.pullRequestState !== 'MERGED' && remote.alreadyFixed === 'unknown') blockers.push({ code: 'already-fixed', message: remote.alreadyFixedDetail
+      ? `The already-fixed check could not be completed: ${remote.alreadyFixedDetail}`
+      : 'The already-fixed check could not be completed.' });
 
     let attempt = this.#attempt();
     if (attempt?.kind === 'direct' && attempt.state === 'submitting') {
@@ -135,6 +145,7 @@ export class MergeCoordinator {
   async displayStatus(view = this.service.load(), signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
     try { return await this.status(view, false, signal); }
     catch (error) {
+      if (error instanceof ShuttingDownError) throw error;
       if (signal?.aborted) throw signal.reason;
       return { available: true, ready: false, action: null, blockers: [{ code: 'github', message: `Could not read GitHub merge state. ${error instanceof Error ? error.message : 'Unknown error.'}` }], remote: null, queue: this.#queueStatus() };
     }
@@ -282,9 +293,10 @@ export class MergeCoordinator {
         // report that action as failed; the durable submitting record is recoverable by polling.
         let applied = true;
         try {
-          applied = queueAttempt.kind === 'queue'
-            ? this.service.store.queueMergeAttempt(this.service.config.identity, queueAttempt.id, result.url)
-            : this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, { state: 'merged', url: result.url });
+          const attempt = queueAttempt;
+          applied = this.#settle(() => attempt.kind === 'queue'
+            ? this.service.store.queueMergeAttempt(this.service.config.identity, attempt.id, result.url)
+            : this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'merged', url: result.url }));
         } catch {}
         // Not applied: a concurrent poll changed the attempt first. A committed failure is the answer, not this success.
         if (!applied) {
@@ -302,15 +314,15 @@ export class MergeCoordinator {
       if (error instanceof CommittedFailure) throw error;
       // GitHub's refusal is definite only once the attempt's failed state (and the click's saved answer) is durable.
       let refusalSaved = false;
-      if (queueAttempt) try {
+      if (queueAttempt) try { const attempt = queueAttempt; this.#settle(() => {
         const message = error instanceof Error ? error.message : 'GitHub merge submission outcome is unknown.';
         if (error instanceof MergeSubmissionError && error.outcome === 'refused') {
-          refusalSaved = this.service.store.finishMergeAttempt(this.service.config.identity, queueAttempt.id, {
+          refusalSaved = this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, {
             state: 'failed', reason: message,
             requiresFreshReview: /head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|stale review/i.test(message),
           });
-        } else this.service.store.recordMergeAttemptDiagnostic(this.service.config.identity, queueAttempt.id, message);
-      } catch {}
+        } else this.service.store.recordMergeAttemptDiagnostic(this.service.config.identity, attempt.id, message);
+      }); } catch {}
       // A definite refusal before admission is this click's outcome; a resend replays it. Aborts, the deadline and
       // shutdown applied nothing for a passing reason, so the same click may be sent again.
       if (!queueAttempt && !signal.aborted && action) {
@@ -356,10 +368,11 @@ export class MergeCoordinator {
 
   async #pollQueue(attempt: MergeAttempt, signal: AbortSignal): Promise<MergeQueueStatus | null> {
     try {
-      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: 12_000, afterCursor: attempt.queueWatermark ?? null });
+      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: MERGE_INSPECTION_TIMEOUT_MS, afterCursor: attempt.queueWatermark ?? null });
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {
+      if (error instanceof ShuttingDownError) throw error;
       if (signal.aborted) throw signal.reason;
       const message = error instanceof Error ? error.message : 'Could not read the merge queue.';
       if (/head changed after review/i.test(message)) {

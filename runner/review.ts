@@ -4,26 +4,52 @@ import { isDeepStrictEqual } from 'node:util';
 import { Store, type ReviewState, type SnippetReference } from './store.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
+import { execFileSync } from 'node:child_process';
+import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
+import type { BaseEntry, PlanContext } from '../core/plan.ts';
 import { linkHistory } from '../core/linking.ts';
-import { applyChoices, approvalStates, approveItem, choiceKeys } from '../core/approvals.ts';
+import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
+import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 
-export interface ReviewConfig { database: string; repository: string; identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
+export interface ReviewConfig { database: string; repository: string;
+  /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
+  runnerRepository?: string;
+  identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
 export class ReviewService {
   store: Store;
   config: ReviewConfig;
+  /**
+   * The base tree listing of the last base commit read. A commit's tree never changes, so a later call for the same
+   * base reuses it instead of running Git again on the server's thread (each runner item asks for it, #91).
+   */
+  #baseEntries: { base: string; entries: readonly BaseEntry[] } | null = null;
   constructor(config: ReviewConfig) {
     if (typeof config.pathIdentity?.caseSensitive !== 'boolean' || !['none', 'NFC'].includes(config.pathIdentity.unicodeNormalization)) throw new Error('Known checkout path identity is required.');
     this.config = config; this.store = new Store(config.database);
   }
   close() { this.store.close(); }
+  /**
+   * Where the task's reviewed commits are. Once the runner has committed for the task (a completed writable attempt that
+   * made a commit, #87), its branch is the runner's: the head is the one the Store recorded with that commit, in the
+   * runner-owned repository. Before that, the user's repository and its HEAD. Owned ledger entries alone do not decide it:
+   * a reviewed branch in the user's repository (the demo, a planted experiment) carries them too.
+   */
+  reviewRepository(): { path: string; runnerOwned: boolean } {
+    if (!this.store.hasRunnerCommit(this.config.identity)) return { path: this.config.repository, runnerOwned: false };
+    if (!this.config.runnerRepository) throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
+    return { path: this.config.runnerRepository, runnerOwned: true };
+  }
   load() {
-    const { identity, repository, pathIdentity } = this.config;
+    const { identity, pathIdentity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
     let snapshot = this.store.getSnapshot(identity);
-    // HEAD changes are observed; no Git mutation is performed by the review service.
-    const history = readHistory(repository, snapshot.base, 'HEAD');
+    const reviewed = this.reviewRepository();
+    // HEAD changes in the user's repository are observed; no Git mutation is performed by the review service. Runner
+    // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
+    // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
+    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = (path: string) => {
       if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
@@ -63,6 +89,29 @@ export class ReviewService {
     const contextIds = new Map(plan.items.map(item => [item.id,createHash('sha256').update(JSON.stringify(segments.filter(segment=>segment.row===item.id).map(segment=>segment.key))).digest('hex')]));
     const notes = this.store.getReviewNotes(identity).map(note => {const contextId=contextIds.get(note.item)!;return { ...note, contextId, answerOutdated: note.snapshotId!==snapshot.id || note.revision!==plan.revision || (!!note.answer?.contextId && note.answer.contextId!==contextId), outdated: !!note.reference && (note.reference.head !== history.head || note.reference.base !== history.base || !segments.some(segment => segment.key === note.reference!.key && segment.row === note.item)) };});
     if (this.store.reviewVersion(identity) !== reviewVersion || this.store.getPlan(identity).revision !== plan.revision || this.store.getSnapshot(identity).id !== snapshot.id) throw new Error('Stale review state. Reload before writing.');
+    // Names each stale item's stale state from every input that decides it, so the page keeps a reviewer's view choice only while that state is unchanged.
+    const staleKeys = new Map<string, string | null>();
+    // Every field an approval covers, in the approval fingerprint's canonical form, hashed once per segment so a segment shared by many stale items is not serialized once per owner.
+    const reviewedDigests = new Map<string, string>();
+    const reviewedDigest = (segment: typeof segments[number]) => {
+      let digest = reviewedDigests.get(segment.key);
+      if (digest === undefined) reviewedDigests.set(segment.key, digest = createHash('sha256').update(stable(reviewedSegment(segment))).digest('hex'));
+      return digest;
+    };
+    const staleKey = (item: PlanItem): string | null => {
+      if (staleKeys.has(item.id)) return staleKeys.get(item.id) ?? null;
+      staleKeys.set(item.id, null);
+      if (states[item.id] !== 'stale') return null;
+      const key = createHash('sha256').update(JSON.stringify({
+        approval: saved.approvals.find(value => value.item === item.id) ?? null,
+        current: fingerprint(item, segments, identity),
+        ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(reviewedDigest),
+        dependencies: item.depends_on.map(id => { const dependency = plan.items.find(value => value.id === id); return dependency ? staleKey(dependency) : null; }),
+        replacement: replacementReview ? { snapshotId: snapshot.id, revision: plan.revision, requiresFreshReview: mergeAttempt.requiresFreshReview, reviewVersion: mergeAttempt.reviewVersion } : null,
+      })).digest('hex');
+      staleKeys.set(item.id, key);
+      return key;
+    };
     const items = plan.items.map(item => {
       const owned = segments.filter(segment => segment.row === item.id);
       const ambiguous = segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).length;
@@ -80,14 +129,39 @@ export class ReviewService {
         for (const dep of item.depends_on) if (states[dep] === 'stale') reasons.push(`Depends on ${dep}, which changed`);
         if (!reasons.length) reasons.push('Code or plan definition changed');
       }
-      return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before,
+      return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before, staleKey: staleKey(item),
         checks: { attributed: ambiguous ? `! ${ambiguous} ambiguous` : owned.length ? '✓ Attributed' : '– No changes', scope: outside.length ? `✕ ${new Set(outside).size} out of scope` : owned.length ? '✓ In scope' : '– No changes', tests: item.acceptance.some(check => check.type === 'cmd') ? '– Not run' : '– No tests defined', ai: '– Not run' }, outside: [...new Set(outside)],
       };
     });
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
-    return { repository: basename(repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
+    return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
-  act(input: unknown) {
+  /** The trusted plan context for import and Apply: base entries from the snapshot's base tree, and the configured path identity. */
+  planContext(): PlanContext {
+    const { identity, repository, pathIdentity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const pathKey = (path: string) => {
+      if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
+      const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
+      return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
+    };
+    // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
+    const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], { cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer, stdio: ['ignore', 'pipe', 'pipe'] });
+    if (this.#baseEntries?.base !== snapshot.base) {
+      const listing = git(['ls-tree', '-rz', snapshot.base], 64 * 1024 * 1024);
+      const entries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
+        const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
+        if (mode === '160000') return { path, kind: 'gitlink' };
+        if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!]) };
+        return { path, kind: 'file' };
+      });
+      this.#baseEntries = { base: snapshot.base, entries };
+    }
+    // Copies: callers own what they are given, and the cached listing stays as Git reported it.
+    const baseEntries = this.#baseEntries.entries.map(entry => ({ ...entry }));
+    return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
+  }
+  /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
+  act(input: unknown, actionId?: string) {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');
     const command = input as Record<string, unknown>;
     const view = this.load();
@@ -105,6 +179,11 @@ export class ReviewService {
       const item = command.action === 'assign' && typeof command.item === 'string' ? command.item : null;
       const storedKey = choiceKeys(view.segments, identity)[view.segments.indexOf(segment)]!;
       this.store.saveReview(identity, view.expected, [], [{ key: storedKey, action: command.action, item }]);
+      // Choice keys embed segment content and are unbounded; the event's source is a stable fixed-size fingerprint of the key.
+      const sourceRef = `choice:${createHash('sha256').update(storedKey).digest('hex')}`;
+      if (actionId) this.store.recordFeedback(identity, actionId, command.action === 'assign'
+        ? { kind: 'segment-assign', item, sourceRef, supersedeLatest: true }
+        : { kind: 'segment-accept', sourceRef, supersedeLatest: true });
     } else if (command.action === 'note' && typeof command.item === 'string' && typeof command.text === 'string' && (command.kind === 'question' || command.kind === 'change')) {
       let reference: SnippetReference | undefined;
       if (command.reference !== undefined) {
@@ -121,6 +200,7 @@ export class ReviewService {
         reference = { key: segment.key, path: segment.operation === '-' ? segment.oldPath ?? segment.path : segment.path, side: segment.operation === '+' ? 'new' : 'old', start, end, text, head: view.snapshot.head, base: view.snapshot.base };
       }
       createdNoteId = this.store.addReviewNote(identity, view.expected, command.item, command.kind, command.text, reference).id;
+      if (actionId && command.kind === 'change') this.store.recordFeedback(identity, actionId, { kind: 'change-request', item: command.item, text: command.text.trim(), sourceRef: createdNoteId });
     } else throw new Error('Unknown review command.');
     return { ...this.load(), createdNoteId };
   }

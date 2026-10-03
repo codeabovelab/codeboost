@@ -12,14 +12,28 @@ export interface PhasePolicy {
 export interface AgentCommand { readonly argv: readonly string[] }
 interface PolicyIdentity { readonly invocation: InvocationInput }
 const identities = new WeakMap<PhasePolicy, PolicyIdentity>();
-const commands = new WeakMap<AgentCommand, { readonly policy: PhasePolicy; readonly vendor: InvocationInput['vendor'] }>();
+const commands = new WeakMap<AgentCommand,
+  { readonly policy: PhasePolicy; readonly vendor: InvocationInput['vendor']; readonly schema?: string }>();
 
-const command = (policy: PhasePolicy, argv: readonly string[]): AgentCommand => {
+const command = (policy: PhasePolicy, argv: readonly string[], schema?: string): AgentCommand => {
   assertPhasePolicy(policy);
   const value = Object.freeze({ argv: Object.freeze([...argv]) });
-  commands.set(value, Object.freeze({ policy, vendor: assertPhasePolicy(policy).vendor }));
+  commands.set(value, Object.freeze({ policy, vendor: assertPhasePolicy(policy).vendor, schema }));
   return value;
 };
+
+/** The largest answer schema a command carries in its argv. The v1 plan-edit schema is under 10 KiB. */
+export const MAX_COMMAND_SCHEMA_BYTES = 64 * 1024;
+
+/**
+ * A command that carries an answer schema in its argv must carry the exact schema the profile mounts, so the vendor
+ * validates against the same schema the runner validates against.
+ */
+export function assertCommandSchema(value: AgentCommand, mounted: Buffer): void {
+  const schema = commands.get(value)?.schema;
+  if (schema !== undefined && !Buffer.from(schema, 'utf8').equals(mounted))
+    throw new Error('Command answer schema does not match the mounted schema.');
+}
 
 export function assertAgentCommand(value: AgentCommand, policy: PhasePolicy,
   vendor?: InvocationInput['vendor']): readonly string[] {
@@ -62,16 +76,53 @@ export function dispatchApprovedCommand<T>(policy: PhasePolicy, argv: readonly s
   return execute(Object.freeze([...argv]));
 }
 
-export function createClaudeCommand(policy: PhasePolicy, prompt: string): AgentCommand {
+/**
+ * Planning answers must match the request's schema, so the planning command carries it. Claude's `--json-schema` takes
+ * the schema text, not a path; the profile checks that text against the mounted file. Questions answer in plain text
+ * (their schema is `{"type":"string"}`), and the other phases return no JSON answer, so they carry no schema.
+ */
+export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Claude prompt must be nonempty and contain no NUL.');
   if (assertPhasePolicy(policy).vendor !== 'claude') throw new Error('Claude command requires a Claude invocation policy.');
+  if ((policy.phase === 'planning') !== (schema !== undefined))
+    throw new Error('Only the Claude planning command carries an answer schema, and it must.');
+  const schemaArguments = schema === undefined ? [] : ['--json-schema', assertPlanningSchema(schema)];
   const writable = policy.worktree === 'read-write';
   const allowed = writable ? 'Read,Glob,Grep,Edit,Write' : 'Read,Glob,Grep';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
-  return command(policy, ['claude', '--print', '--output-format', 'json', '--restricted', '--strict-mcp-config',
-    '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome', '--permission-prompts', 'none',
-    '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed, '--allowedTools', allowed,
-    '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir', '/run/codeboost-input', '--', prompt]);
+  return command(policy, ['claude', '--print', '--output-format', 'json', ...schemaArguments, '--restricted',
+    '--strict-mcp-config', '--mcp-config', '{"mcpServers":{}}', '--disable-slash-commands', '--no-chrome',
+    '--permission-prompts', 'none', '--permission-mode', writable ? 'acceptEdits' : 'plan', '--tools', allowed,
+    '--allowedTools', allowed, '--disallowedTools', 'Bash,WebFetch,WebSearch,NotebookEdit', '--add-dir',
+    '/run/codeboost-input', '--', prompt], schema);
+}
+
+/**
+ * A planning schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one command
+ * argument. Returns the schema unchanged.
+ */
+export function assertPlanningSchema(schema: string): string {
+  if (schema.includes('\0') || Buffer.byteLength(schema, 'utf8') > MAX_COMMAND_SCHEMA_BYTES)
+    throw new Error('Planning schema must contain no NUL and fit the command schema limit.');
+  let parsed: unknown;
+  try { parsed = JSON.parse(schema); } catch { throw new Error('Planning schema must be JSON.'); }
+  if (parsed === null || typeof parsed !== 'object' || Array.isArray(parsed)
+    || (parsed as { type?: unknown }).type !== 'object')
+    throw new Error('Planning schema must be a JSON object schema with "type": "object".');
+  return schema;
+}
+
+/**
+ * Phases Codex may run: none (#93). Codex 0.153.4 reads files only through its shell, and the shell is off in every
+ * phase, so Codex would plan, review or edit code it cannot see. Planning and questions run no process (#75); review
+ * and execute/fix may run only exact approved argv through the runner, which a free shell would bypass. Each phase is
+ * refused rather than weakened (see docs/implementation/agent-isolation.md, "Codex is refused in every phase").
+ */
+const CODEX_PHASES: ReadonlySet<Phase> = new Set();
+
+export function assertCodexPhase(phase: Phase): void {
+  if (!CODEX_PHASES.has(phase))
+    throw new Error(`Codex cannot run the ${phase} phase: it cannot read files without a shell, and its shell is off.`);
 }
 
 export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
@@ -82,9 +133,11 @@ export function codexBaseArguments(policy: PhasePolicy): readonly string[] {
 
 export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCommand {
   if (!prompt || prompt.includes('\0')) throw new Error('Codex prompt must be nonempty and contain no NUL.');
+  const base = codexBaseArguments(policy);
+  assertCodexPhase(policy.phase);
   const sandbox = policy.worktree === 'read-write' ? 'workspace-write' : 'read-only';
   // `--` ends option parsing, so a prompt beginning with `-` stays prompt data.
-  return command(policy, [...codexBaseArguments(policy), 'exec', '--sandbox', sandbox, '--skip-git-repo-check',
+  return command(policy, [...base, 'exec', '--sandbox', sandbox, '--skip-git-repo-check',
     '--output-last-message', '/run/codeboost-output/final.txt', '--', prompt]);
 }
 
@@ -94,7 +147,7 @@ export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' |
   | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'truncated-utf8-stderr'
   | 'replace-output-directory'
   | 'nonzero-output' | 'duplicate-protocol' | 'newline-free-deferred-output' | 'scratch-capacity' | 'metadata-alias'
-  | 'hostile-repo';
+  | 'hostile-repo' | 'gitlink-write';
 
 // `set -e` ignores a failing `! command`, so a negated check could never fail a probe. `deny` exits instead when a
 // forbidden action succeeds, and names the breach. Both streams of the attempted command are discarded, so a breach
@@ -170,6 +223,23 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + 'case "$resolved" in /work|/work/*) ;; '
       + '*) echo "isolation breach: link leaves the checkout $link" >&2; exit 1;; esac; done\' sh {} +; '
       + 'deny grep -rqs codeboost-host-secret /work /tmp "$HOME"; printf hostile-repo-contained',
+    // Every gitlink in the index (the head's, in a fresh copy) is its own empty read-only mount: nothing can be written beneath it, and it cannot be
+    // removed or moved aside. The rest of the work tree stays writable.
+    'gitlink-write': `${deny}set -eu; n=0; for p in $(git ls-files --stage | awk '$1 == "160000" { print $4 }'); do `
+      + 'n=$((n+1)); test "$(findmnt --noheadings --output TARGET --target "/work/$p")" = "/work/$p"; '
+      + 'findmnt --noheadings --output OPTIONS --target "/work/$p" | tr , "\\n" | grep -Fxq ro; '
+      + 'test -z "$(ls -A "/work/$p")"; deny touch "/work/$p/x"; deny mkdir "/work/$p/.git"; '
+      + 'deny rmdir "/work/$p"; deny mv "/work/$p" "/work/$p.moved"; '
+      // Each directory above it is pinned (#99): its own writable nosuid,nodev mountpoint, which cannot be moved aside,
+      // so the gitlink's mount cannot be carried off and its path refilled. What is inside stays writable.
+      + 'd=$(dirname "$p"); while [ "$d" != . ]; do '
+      + 'test "$(findmnt --noheadings --output TARGET --target "/work/$d")" = "/work/$d"; '
+      + 'o=$(findmnt --noheadings --output OPTIONS --target "/work/$d" | tr , "\\n"); '
+      + 'for x in rw nosuid nodev; do printf "%s\\n" "$o" | grep -Fxq "$x"; done; '
+      + 'deny mv "/work/$d" "/work/$d.moved"; test -d "/work/$p"; '
+      + 'touch "/work/$d/.pinned-write"; test -f "/work/$d/.pinned-write"; rm "/work/$d/.pinned-write"; '
+      + 'd=$(dirname "$d"); done; done; test "$n" -gt 0; '
+      + 'printf ok > /work/beside.txt; printf gitlink-protected',
   };
   return command(policy, probe === 'noop' ? ['true'] : ['sh', '-c', scripts[probe]]);
 }

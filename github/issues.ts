@@ -1,7 +1,7 @@
-import { execFile } from 'node:child_process';
-import { promisify } from 'node:util';
+import { ghEnvironment } from './gh-env.ts';
+import { dataJSON, MAX_PROMPT_BYTES } from '../core/planning-author.ts';
+import { runWithInput } from './run-with-input.ts';
 
-const runFile = promisify(execFile);
 const PAGE_SIZE = 100;
 const MAX_PAGES = 10;
 const MAX_ISSUES = PAGE_SIZE * MAX_PAGES;
@@ -9,6 +9,12 @@ const MAX_COLLABORATORS = PAGE_SIZE * MAX_PAGES;
 const MAX_BODY_LENGTH = 65_536;
 // Covers one bounded 100-record page, including JSON-escaped bodies, labels and response overhead.
 export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
+/**
+ * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
+ * it exits. A fetch settles only when gh has stopped, so a fetch aborted at its 12 s deadline (web/issues.ts) settles up
+ * to 0.75 s later: 12.75 s, below the 15-second serving request budget.
+ */
+export const ISSUE_KILL_GRACE_MS = 500, ISSUE_PIPE_GRACE_MS = 250;
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
@@ -35,6 +41,9 @@ export interface IssueSnapshot {
   readonly retrievedAt: string;
   readonly issues: readonly RepositoryIssue[];
 }
+
+/** The issue text an execute prompt carries, as untrusted data. */
+export interface IssueText { readonly number: number; readonly title: string; readonly body: string; readonly comments: readonly string[] }
 
 export interface IssueGateway {
   readonly repository: string;
@@ -153,10 +162,13 @@ export class GhIssueGateway implements IssueGateway {
   constructor(repository: string, run?: RunGh, now: () => Date = () => new Date()) {
     if (!repositoryName(repository)) throw new Error('A GitHub repository is required for issue retrieval.');
     this.repository = repository;
-    this.run = run ?? (async (args, options) => (await runFile('gh', [...args], {
+    this.run = run ?? ((args, options) => runWithInput('gh', args, {
       maxBuffer: ISSUE_PAGE_MAX_BYTES,
       signal: options?.signal,
-    })).stdout);
+      env: ghEnvironment(),
+      killGraceMs: ISSUE_KILL_GRACE_MS,
+      pipeGraceMs: ISSUE_PIPE_GRACE_MS,
+    }));
     this.now = now;
   }
 
@@ -221,7 +233,66 @@ export class GhIssueGateway implements IssueGateway {
     }));
   }
 
-  async fetch(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueSnapshot> {
+  /**
+   * One issue's text for an execute prompt (#91): its title, body and the comments of repository collaborators only
+   * (design, "Which comments reach the agent"), oldest first. Everything stays untrusted data inside the prompt.
+   * Fails closed on anything malformed, on a pull request, and past the comment page limit.
+   */
+  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueText> {
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
+    return this.#bounded(options, async signal => {
+      let decoded: unknown;
+      const output = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/issues/${number}`], { signal });
+      try { decoded = JSON.parse(output); }
+      catch { throw new Error('GitHub returned invalid issue JSON.'); }
+      const issue = object(decoded, 'GitHub returned a malformed issue.');
+      if (issue.number !== number) throw new Error('GitHub returned a different issue.');
+      if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
+      const title = boundedString(issue.title, 'title', 4096), body = boundedString(issue.body, 'body', MAX_BODY_LENGTH, true);
+      // The execute prompt carries the issue as one JSON data block of at most MAX_PROMPT_BYTES (dataJSON). A running byte
+      // count stops reading early (a title and body already over it read no collaborator or comment page); the exact check
+      // below uses the prompt's own serializer, so an issue accepted here is one the prompt can carry.
+      const tooLong = () => new Error(`Issue #${number}'s title, body and collaborator comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
+      // Only the size refusal is reworded; any other (text with a NUL, for one) keeps its own reason.
+      const carried = (text: IssueText) => {
+        try { dataJSON(text, 'Issue data'); } catch (error) { throw /exceeds/.test((error as Error).message) ? tooLong() : error; }
+      };
+      // The title and body alone, as the prompt serializes them (escaping included): an issue that cannot fit reads nothing more.
+      carried({ number, title, body, comments: [] });
+      let total = Buffer.byteLength(title) + Buffer.byteLength(body);
+      const collaborators = await this.#loadCollaborators(signal);
+      const comments: string[] = [];
+      for (let page = 1; ; page++) {
+        const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
+          `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });
+        let values: unknown;
+        try { values = JSON.parse(listed); }
+        catch { throw new Error('GitHub returned invalid comment JSON.'); }
+        if (!Array.isArray(values) || values.length > PAGE_SIZE) throw new Error('GitHub returned an invalid comment page.');
+        // Only an empty page past the limit ends the read cleanly; anything on it is more than codeboost reads.
+        if (page > MAX_PAGES && values.length) throw new Error(`Issue #${number} has more than ${MAX_ISSUES} comments; codeboost does not read past that limit.`);
+        for (const value of values) {
+          const comment = object(value, 'GitHub returned a malformed comment.');
+          // A deleted ("ghost") author is nobody's collaborator. Other people's comments are dropped before their body is
+          // checked, so none of theirs can make the issue unreadable.
+          if (comment.user === null) continue;
+          const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
+          if (!collaborators.has(author.toLocaleLowerCase('en-US'))) continue;
+          const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
+          total += Buffer.byteLength(text);
+          if (total > MAX_PROMPT_BYTES) throw tooLong();
+          comments.push(text);
+        }
+        if (values.length < PAGE_SIZE) break;
+      }
+      const text = { number, title, body, comments };
+      carried(text);
+      return text;
+    });
+  }
+
+  /** Runs `load` under the caller's signal and an overall deadline, as `fetch` does. */
+  async #bounded<T>(options: { signal?: AbortSignal; timeoutMs?: number }, load: (signal: AbortSignal) => Promise<T>): Promise<T> {
     const timeoutMs = options.timeoutMs ?? 12_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > 30_000) throw new Error('Invalid issue retrieval timeout.');
     options.signal?.throwIfAborted();
@@ -230,11 +301,9 @@ export class GhIssueGateway implements IssueGateway {
     options.signal?.addEventListener('abort', relay, { once: true });
     const timer = setTimeout(() => controller.abort(new Error('Issue retrieval timed out.')), timeoutMs);
     try {
-      const issues = await this.#load(controller.signal);
+      const value = await load(controller.signal);
       controller.signal.throwIfAborted();
-      const retrievedAt = this.now();
-      if (!Number.isFinite(retrievedAt.getTime())) throw new Error('Issue retrieval clock is invalid.');
-      return { repository: this.repository, retrievedAt: retrievedAt.toISOString(), issues };
+      return value;
     } catch (error) {
       if (options.signal?.aborted) throw options.signal.reason;
       if (controller.signal.aborted) throw new Error('Issue retrieval timed out.');
@@ -243,5 +312,15 @@ export class GhIssueGateway implements IssueGateway {
       clearTimeout(timer);
       options.signal?.removeEventListener('abort', relay);
     }
+  }
+
+  async fetch(options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueSnapshot> {
+    return this.#bounded(options, async signal => {
+      const issues = await this.#load(signal);
+      signal.throwIfAborted();
+      const retrievedAt = this.now();
+      if (!Number.isFinite(retrievedAt.getTime())) throw new Error('Issue retrieval clock is invalid.');
+      return { repository: this.repository, retrievedAt: retrievedAt.toISOString(), issues };
+    });
   }
 }
