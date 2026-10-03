@@ -33,6 +33,26 @@ An existing-store configuration may add a trusted GitHub binding:
 
 The issue must match the stored plan. The authenticated `gh` account must be able to read the pull request, issue timeline, applicable rulesets, and classic branch protection, and to merge the PR. Codeboost unions required checks from both rule sources, requires strict server-enforced current-base checks, rechecks the base and head immediately before merging, and passes the reviewed head to `gh pr merge --match-head-commit`. Missing permissions and ambiguous rule responses block the merge. When the branch uses a merge queue, codeboost adds the exact reviewed head to the queue and treats the merge as done only when GitHub confirms it merged; a queued pull request is not merged. If GitHub removes it from the queue while the plan, snapshot, review and head are unchanged, Merge offers a retry after the status refresh; if the head changed, it goes back to review first. A moved base and any unexecuted `cmd:` acceptance check remain blocked until [#22](https://github.com/codeabovelab/codeboost/issues/22) adds the runner path.
 
+## Runner (opt-in)
+
+A configuration with a `github` block may also add a `runner` block. The runner carries out plan items with Claude Code in the agent container and commits each item in its own repository, never in yours:
+
+```json
+{
+  "runner": {
+    "root": "/absolute/path/owned/by/you",
+    "committer": { "name": "codeboost", "email": "runner@example.invalid" }
+  }
+}
+```
+
+`root` must be a directory only you can write. Optional fields:
+- `diagnosticsDir`: where partial output of stopped attempts is kept, in a folder per database (`<diagnosticsDir>/<runner token>/diagnostics`), so databases sharing it never delete each other's files. The default is the runner root.
+- `diagnosticsCapBytes`: the size retention trims that directory back to. It is a target, not a hard limit: the file just saved is always kept, even when it alone passes the cap. The default is 256 MiB.
+- `limits`: task storage limits (`workBytes`, `workInodes`, `metadataBytes`, `metadataInodes`).
+
+The runner needs Docker and `CLAUDE_CODE_OAUTH_TOKEN`. At start, before the server opens, codeboost recovers what an earlier run left and builds the agent image; a recovery it cannot finish safely stops startup with what to do. Nothing in the review screen starts a run yet (#91 part 2).
+
 ## Library
 
 - `core/plan.ts`: schema validation; YAML/JSON import; projected file-state and dependency checks; literal command parsing; individual suggestion validation and application.

@@ -9,6 +9,7 @@ import type { RecoveredTaskStorage, TaskFilesystems, TaskStorageLimits } from '.
 import { RUNNER_LABEL, type ResourceOwner } from '../agents/labels.ts';
 import { recoverLeftovers, type RecoveryReport } from '../agents/recovery.ts';
 import { removeStaging } from './question-leftovers.ts';
+import { removalCommand } from './recovery.ts';
 
 export type Provider = 'claude' | 'codex';
 /** What the review knows about a question when it asks the agent. */
@@ -276,8 +277,7 @@ export async function recoverQuestionStorage(runnerOwner: string, deps: Pick<Con
   }
   const ours = report.unowned.filter(resource => resource.labels[RUNNER_LABEL] === runnerOwner);
   if (!ours.length) return;
-  const commands = ours.slice(0, MAX_LISTED).map(resource =>
-    `docker ${resource.kind} rm${resource.kind === 'container' ? ' -f' : ''} ${resource.id ?? resource.name}`);
+  const commands = ours.slice(0, MAX_LISTED).map(removalCommand);
   if (ours.length > MAX_LISTED) commands.push(`… and ${ours.length - MAX_LISTED} more labelled ${RUNNER_LABEL}=${runnerOwner}`);
   throw new Error(`Ask is off: Docker objects labelled with this review's Ask owner are not ones codeboost can identify, so it did not remove them. Remove them, then retry:\n${commands.join('\n')}`);
 }

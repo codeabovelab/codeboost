@@ -175,3 +175,14 @@ it('keeps observing the user\'s HEAD for a task the runner has not committed to,
  fixtureGit(config.repository,'commit','--allow-empty','-m','User work');
  expect(service.load().snapshot.head).toBe(fixtureGit(config.repository,'rev-parse','HEAD'));
 });
+it('reads a base commit\'s tree once and hands each caller its own copy (#91)',()=>{
+ const {service,config}=fixture();
+ const first=service.planContext();
+ expect(first.baseEntries.length).toBeGreaterThan(0);
+ first.baseEntries[0]!.path='changed by a caller';
+ // Git is not asked again for the same base: the listing survives the repository becoming unreadable.
+ service.config={...config,repository:join(config.repository,'missing')};
+ const second=service.planContext();
+ expect(second.baseEntries[0]!.path).not.toBe('changed by a caller');
+ expect(second.baseEntries.slice(1)).toEqual(first.baseEntries.slice(1));
+});

@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES } from '../github/issues.ts';
+import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES, type IssueText } from '../github/issues.ts';
+import { prepareExecution } from '../core/execution-prompt.ts';
 
 const rawIssue = (overrides: Record<string, unknown> = {}) => ({
   number: 7,
@@ -229,5 +230,58 @@ describe('GitHub issue retrieval', () => {
       return JSON.stringify([rawIssue()]);
     });
     await expect(gateway.fetch({ signal: controller.signal })).rejects.toBe(cancelled);
+  });
+});
+
+describe('issue text for an execute prompt (#91)', () => {
+  const comment = (login: string | null, body: string) => ({ body, user: login === null ? null : { login } });
+  const gateway = (pages: unknown[][], issue: Record<string, unknown> = rawIssue(), collaborators = ['member']) => {
+    const calls: string[][] = [];
+    return { calls, gateway: new GhIssueGateway('owner/repo', async args => {
+      calls.push([...args]);
+      if (isCollaboratorRequest(args)) return JSON.stringify(collaborators.map(login => ({ login })));
+      const path = args[5]!;
+      if (path.endsWith('/comments')) return JSON.stringify(pages[Number(args.at(-1)!.split('=')[1]) - 1] ?? []);
+      return JSON.stringify(issue);
+    }) };
+  };
+  it('keeps only collaborators\' comments, oldest first, across pages', async () => {
+    const full = Array.from({ length: 100 }, (_, n) => comment(n % 2 ? 'Member' : 'outsider', `c${n}`));
+    const { gateway: g, calls } = gateway([full, [comment('member', 'last'), comment(null, 'ghost')]]);
+    const text = await g.issueText(7);
+    expect(text).toMatchObject({ number: 7, title: 'Fix retries', body: 'Keep issue text as data.' });
+    expect(text.comments).toEqual([...full.filter((_, n) => n % 2).map(c => c.body), 'last']);
+    expect(calls.filter(args => args[5]!.endsWith('/comments')).map(args => args.at(-1))).toEqual(['page=1', 'page=2']);
+  });
+  it('refuses a pull request, a different issue, and text too long for a prompt', async () => {
+    await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
+    await expect(gateway([], rawIssue({ number: 8 })).gateway.issueText(7)).rejects.toThrow(/different issue/);
+    const long = Array.from({ length: 9 }, () => comment('member', 'x'.repeat(65_000)));
+    await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB an execute prompt carries/);
+  });
+  it('accepts exactly what an execute prompt can carry, end to end, and refuses the rest at the fetch (#91)', async () => {
+    const promptOf = (issue: IssueText) => prepareExecution({ identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, attemptId: 'attempt-1',
+      mode: 'execute', itemId: 'P1', approvedLessons: [], allowedCommands: [], issue,
+      plan: { schema_version: 1, issue: 7, revision: 1, summary: 'S', questions: [], items: [{ id: 'P1', title: 'T', intent: 'I',
+        files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'x' }], acceptance: [], depends_on: [] }] } });
+    // Under the budget: what the fetch returns, the prompt carries.
+    const fits = await gateway([[comment('member', 'x'.repeat(30_000))]]).gateway.issueText(7);
+    expect(promptOf(fits).prompt).toContain('x'.repeat(30_000));
+    // Small in characters, over the budget once escaped as the prompt escapes it ('<' becomes \u003c): refused at the
+    // fetch, with the reason, instead of at every attempt's preparation.
+    await expect(gateway([[comment('member', '<'.repeat(6_000))]]).gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB/);
+    expect(() => promptOf({ number: 7, title: 'Fix retries', body: 'Keep issue text as data.', comments: ['<'.repeat(6_000)] })).toThrow(/exceeds 32 KiB/);
+  });
+  it('ignores an oversized comment from someone else, and reads exactly the page limit', async () => {
+    const huge = comment('outsider', 'x'.repeat(70_000));
+    expect((await gateway([[huge, comment('member', 'kept')]]).gateway.issueText(7)).comments).toEqual(['kept']);
+    const pages = Array.from({ length: 10 }, () => Array.from({ length: 100 }, () => comment('outsider', 'spam')));
+    expect((await gateway(pages).gateway.issueText(7)).comments).toEqual([]);
+    await expect(gateway([...pages, [comment('outsider', 'one more')]]).gateway.issueText(7)).rejects.toThrow(/more than 1000 comments/);
+  });
+  it('stops on the caller\'s abort', async () => {
+    const controller = new AbortController();
+    controller.abort(new Error('stopped'));
+    await expect(gateway([]).gateway.issueText(7, { signal: controller.signal })).rejects.toThrow(/stopped/);
   });
 });
