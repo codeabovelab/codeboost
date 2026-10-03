@@ -72,6 +72,17 @@ async function until(check: () => boolean, label: string) {
 }
 
 describe('admission and slots', () => {
+  it('refuses a kind its deps cannot run before writing anything (#91)', () => {
+    const { store } = setup();
+    const limited = new RunnerCoordinator(store, { ...fakeD().deps, kinds: ['execute'] }); coordinators.push(limited);
+    const before = store.getTask(A).stateVersion;
+    expect(() => limited.start(A, request(store, A, { kind: 'review' }))).toThrow(/cannot run review attempts/);
+    expect(store.getTask(A).stateVersion).toBe(before);
+    expect(store.getAttempts(A)).toEqual([]);
+    expect(limited.isActive(A)).toBe(false);
+    // What the view uses to offer retry: the same answer admission gives.
+    expect([limited.runs('review'), limited.runs('execute')]).toEqual([false, true]);
+  });
   it('runs an attempt to completion, removes its preparation files and frees its slot', async () => {
     const { store, runner, launches, preparations, cleaned } = setup();
     const attempt = runner.start(A, request(store, A));

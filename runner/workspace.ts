@@ -28,6 +28,8 @@ export interface WorkspaceOptions {
 /** What `materialize` keeps for the later steps, behind `WorkspaceRef.storage`. */
 interface Held { readonly filesystems: TaskFilesystems; readonly attemptId: string; readonly identity: PlanIdentity }
 const held = (workspace: WorkspaceRef) => workspace.storage as Held;
+/** The task storage D allocated for a workspace `materialize` returned: what D's start call mounts. */
+export const workspaceFilesystems = (workspace: WorkspaceRef): TaskFilesystems => held(workspace).filesystems;
 
 /**
  * The real task workspace over lane D (#87): a fresh clone of the runner-owned repository at the recorded head, copied
@@ -60,6 +62,10 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
         store.recordAllocation(identity, attempt.id, allocationId);
         const filesystems = await prepareTaskFilesystemsAsync(clone, options.limits, imageId,
           { runnerOwner: options.runnerOwner, attemptId: attempt.id, allocationId }, { signal, onProcessGroup: record, timeoutMs: 120_000 });
+        // Startup recovery can export a recovered storage only with these (#91). Without them that export fails closed and
+        // records why, so a failed write costs only the partial output of a crash; it does not stop this attempt.
+        try { store.recordAllocationBaseline(identity, attempt.id, allocationId, filesystems.metadataBaseline, head); }
+        catch (error) { console.error(`Runner job ${attempt.id} could not save its storage baseline: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`); }
         return { clone, storage: { filesystems, attemptId: attempt.id, identity } satisfies Held };
       } catch (error) {
         // No subprocess ever started (its spawn failed at once): the "starting" marker must not block the next startup.

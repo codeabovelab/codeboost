@@ -30,6 +30,11 @@ export interface RunnerDeps {
    */
   readonly runnerOwner: string;
   /**
+   * The attempt kinds these deps can run. Admission refuses any other kind before it writes anything, so a retry of,
+   * say, a review attempt never reaches deps that would run it as an execute. Omitted: every kind.
+   */
+  readonly kinds?: readonly AttemptKind[];
+  /**
    * Host-side preparation (clone, prompt). On abort it must stop and await every subprocess it started, then reject.
    * It never leaves work running after it settles.
    */
@@ -135,6 +140,8 @@ export class RunnerCoordinator {
   get closing(): boolean { return this.#closing; }
   /** Resources D could not confirm removed; non-null keeps the runner closed to new work until restart. */
   get unreleased(): readonly UnreleasedResource[] | null { return this.#unreleased; }
+  /** Whether admission would take this kind (`RunnerDeps.kinds`); a view must not offer what admission refuses. */
+  runs(kind: AttemptKind): boolean { return !this.#deps.kinds || this.#deps.kinds.includes(kind); }
   #now(): number { return this.#deps.now?.() ?? Date.now(); }
   #used(group: Group): number {
     let used = 0;
@@ -154,6 +161,7 @@ export class RunnerCoordinator {
     const marker = this.#markers.get(key);
     if (marker) throw new GuardRefusal(NEEDS_RESTART[marker.reason]);
     if (!(request.kind in ATTEMPT_PHASES)) throw new GuardRefusal('Unknown attempt kind.');
+    if (this.#deps.kinds && !this.#deps.kinds.includes(request.kind)) throw new GuardRefusal(`The runner cannot run ${request.kind} attempts yet.`);
     const group: Group = WRITABLE_KINDS.includes(request.kind) ? 'writable' : 'readOnly';
     if (this.#used(group) >= this.#limits[group]) throw new GuardRefusal('No free runner slot. Try again when the current attempt finishes.');
     const job: Job = { identity: { ...identity }, key, group, attemptId: '', firstReason: null, reasonSaved: true, preparationTimedOut: false, controller: new AbortController(), timers: [] };

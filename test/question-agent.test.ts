@@ -421,7 +421,7 @@ it('keeps Ask off, with removal commands, for objects of its own owner that reco
   const handle = recovered(1);
   const error = await recoverQuestionStorage(OWNER, recovery({ storage: [handle], unowned: [mine, theirs] }, value => { removed.push(value); }).deps,
     new RetainedStorage()).catch((caught: Error) => caught);
-  expect((error as Error).message.split('\n')).toEqual([expect.stringContaining("labelled with this review's Ask owner"), 'docker container rm -f id-codeboost-odd']);
+  expect((error as Error).message.split('\n')).toEqual([expect.stringContaining("labelled with this review's Ask owner"), "docker container rm -f 'id-codeboost-odd'"]);
   // Storage it could identify is still removed.
   expect(removed).toEqual([handle]);
 });

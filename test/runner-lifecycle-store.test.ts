@@ -662,6 +662,30 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
     const reopened = open(path);
     expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 8 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+  });
+});
+
+describe('allocation baseline (#91)', () => {
+  it('saves the baseline once, for the pending attempt\'s own allocation, and hands it to recovery', () => {
+    const { store } = queued(); const attempt = admit(store), allocationId = randomUUID();
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'b'.repeat(64), oid(2))).toThrow(GuardRefusal);
+    store.recordAllocation(identity, attempt.id, allocationId);
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, randomUUID(), 'b'.repeat(64), oid(2))).toThrow(GuardRefusal);
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'short', oid(2))).toThrow(/baseline/);
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'b'.repeat(64), 'HEAD')).toThrow(/base commit/);
+    store.recordAllocationBaseline(identity, attempt.id, allocationId, 'b'.repeat(64), oid(2));
+    expect(() => store.recordAllocationBaseline(identity, attempt.id, allocationId, 'c'.repeat(64), oid(2))).toThrow(GuardRefusal);
+    expect(store.attemptAllocation(attempt.id)).toBe(allocationId);
+    expect(store.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, allocationId, metadataBaseline: 'b'.repeat(64), storageBase: oid(2) })]);
+  });
+  it('adds the baseline columns to a version 8 database', () => {
+    const { path, store } = queued(); const attempt = admit(store);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
+    const reopened = open(path);
+    expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
   });
 });
