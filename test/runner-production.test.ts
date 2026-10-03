@@ -217,6 +217,10 @@ describe('recovery warnings', () => {
     expect(lines).toHaveLength(3);
     for (const line of lines) expect(line).not.toMatch(/[\n\u001b]/);
     expect(lines[1]).toContain('"/root/attempts/evil\\nReview ready: http://x"');
+    // What JSON quoting leaves literal and a terminal still acts on: NEL (C1), the line and paragraph separators, bidi.
+    const unicode = recoveryWarnings({ unmatchedStorage: [], unknownEntries: ['a\u0085b\u2028c\u2029d\u202ee\u009bf'] });
+    expect(unicode[0]).not.toMatch(/[\u0080-\u009f\u2028\u2029\u202e]/u);
+    expect(unicode[0]).toContain('"a\\u0085b\\u2028c\\u2029d\\u202ee\\u009bf"');
   });
 });
 

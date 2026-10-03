@@ -283,6 +283,10 @@ describe('issue text for an execute prompt (#91)', () => {
     const { gateway: g, calls } = gateway([[comment('member', 'never read')]], rawIssue({ body: 'x'.repeat(40_000) }));
     await expect(g.issueText(7)).rejects.toThrow(/larger than the 32 KiB/);
     expect(calls.map(args => args[5])).toEqual(['repos/owner/repo/issues/7']);
+    // Small in bytes, over the budget once the prompt escapes it ('<' becomes \u003c): refused just as early.
+    const escaped = gateway([[comment('member', 'never read')]], rawIssue({ body: '<'.repeat(6_000) }));
+    await expect(escaped.gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB/);
+    expect(escaped.calls.map(args => args[5])).toEqual(['repos/owner/repo/issues/7']);
   });
   it('stops on the caller\'s abort', async () => {
     const controller = new AbortController();

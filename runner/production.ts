@@ -10,7 +10,7 @@ import { identityKey } from '../core/identity.ts';
 import type { RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
 import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources } from './execution.ts';
-import { isUuidV4, type ShutdownCapability } from './lifecycle.ts';
+import { isUuidV4, quoteForTerminal, type ShutdownCapability } from './lifecycle.ts';
 import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport, type RunnerLock } from './recovery.ts';
 import type { ReviewService } from './review.ts';
 import { openRunnerRepository, ownerOnlyDirectory } from './runner-repository.ts';
@@ -128,8 +128,8 @@ export function claudeLauncher(o: { imageId: string; runnerRoot: string; runnerO
  * labels and file names are not codeboost's, so each is quoted: a newline or control character in one cannot forge a line.
  */
 export function recoveryWarnings(report: Pick<RecoveryReport, 'unmatchedStorage' | 'unknownEntries'>): string[] {
-  return [...report.unmatchedStorage.map(attemptId => `Task storage labelled with attempt ${JSON.stringify(attemptId)} matches no attempt of this database; it was left in place.`),
-    ...report.unknownEntries.map(entry => `Unknown entry in the runner's attempt directory, left in place: ${JSON.stringify(entry)}`)];
+  return [...report.unmatchedStorage.map(attemptId => `Task storage labelled with attempt ${quoteForTerminal(attemptId)} matches no attempt of this database; it was left in place.`),
+    ...report.unknownEntries.map(entry => `Unknown entry in the runner's attempt directory, left in place: ${quoteForTerminal(entry)}`)];
 }
 
 export interface RunnerAssembly {
