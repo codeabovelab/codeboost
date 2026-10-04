@@ -11,6 +11,8 @@ import type { PublishRecord, Store } from './store.ts';
 const SETTLED = ['opened', 'possibly already fixed', 'draft skipped', 'draft unsupported', 'no changes',
   // Recorded by the v10 upgrade for a task that reached its status before publishing existed: only the action publishes it.
   'not published'];
+/** The record a publish writes before it starts; one left at startup is a publish whose process stopped (#103). */
+const IN_FLIGHT = 'publishing';
 /** Refusals a person acts on; anything else that fails is reported as `failed`. */
 const REFUSALS = [GuardRefusal, BranchPushRefused, OpeningUnsettled, PullRequestMisplaced, PullRequestRefused];
 
@@ -93,15 +95,16 @@ export class TaskPublishing {
   }
 
   /**
-   * Startup, once the runner lock is verified: publish if one is owed. Otherwise a publish action whose process stopped
-   * before its publish recorded an outcome (a crash) is settled now, so its replay stops saying `publishing`; the task's
-   * records (a PR it opened, recovered by its marker on the next publish) show what that publish did. Never throws.
+   * Startup, once the runner lock is verified: publish if one is owed. Otherwise a publish whose process stopped before
+   * it recorded an outcome (a crash) is settled now: its in-flight record, and any action reply still saying
+   * `publishing`, become `stopped`; the task's records (a PR it opened, recovered by its marker on the next publish)
+   * show what that publish did. Never throws.
    */
   startup(identity: PlanIdentity): void {
     try {
       const owed = this.owed(identity);
       if (owed) { this.#schedule(identity, owed.draft); return; }
-      if (this.#store.hasUnsettledPublishAction(identity))
+      if (this.#store.hasUnsettledPublishAction(identity) || this.#store.lastPublish(identity)?.outcome === IN_FLIGHT)
         this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false,
           message: 'The publish was interrupted before it recorded an outcome (codeboost stopped). Its pull request, if it opened one, is in the task\'s records; the publish action runs it again.' }));
     } catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
@@ -123,6 +126,10 @@ export class TaskPublishing {
     const reserved = Promise.withResolvers<void>();
     this.#running.set(key, reserved.promise);
     const run = async () => {
+      // Durable in-flight ownership before the first external write (AGENTS.md): if this process stops before the outcome
+      // is recorded, startup finds the marker and publishes again or settles it as interrupted. No marker, no publish.
+      try { this.#write(() => this.#store.recordPublish(identity, { outcome: IN_FLIGHT, draft, message: 'A pull request is being published.' })); }
+      catch (error) { console.error(`Could not record the publish as started, so it did not run: ${JSON.stringify(message(error, this.#secrets))}`); return; }
       let record: Omit<PublishRecord, 'stateVersion' | 'at'>, seenVersion: number | undefined;
       try {
         // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
