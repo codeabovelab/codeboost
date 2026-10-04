@@ -57,6 +57,19 @@ export function pushUrl(remote: string, env: NodeJS.ProcessEnv = process.env): s
   return `https://${host}/${remote}.git`;
 }
 
+/**
+ * The push's arguments. The lease pins the exact value read (empty: the branch must not exist), so the remote refuses the
+ * push if anyone moved the branch since, including a newer publish. That is what makes a push left running by a crashed
+ * codeboost harmless (#112): it can land only while the branch holds the value its own run read. The lease compares the
+ * value, not its history, so a branch that returns to that value (moved back by a person, or the same commit pushed again) lets it land (a codeboost
+ * commit; the next publish pushes the task head again). An empty lease matches a branch deleted since, so a run that
+ * read none can recreate a deleted branch at its own head: a stray branch with no PR, overwriting nothing. Only this one ref is sent: no tags, no hooks, no submodules.
+ */
+export function pushArguments(input: { url: string; ref: string; read: string | null; head: string }): string[] {
+  return ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',
+    `--force-with-lease=${input.ref}:${input.read ?? ''}`, '--', input.url, `${input.head}:${input.ref}`];
+}
+
 /** Remove every configured token value and every known token shape. */
 export function redact(text: string, secrets: readonly string[]): string {
   // Longest first, so a token that contains another is removed whole. A value under 8 characters is not a real token,
@@ -110,11 +123,9 @@ export class GitBranchPusher implements BranchPusher {
     if (remote !== null && !owned.has(remote))
       throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
     signal?.throwIfAborted();
-    // The lease pins the exact value read above (empty: the branch must not exist), so GitHub refuses the push if anyone
-    // moved the branch since. Only this one ref is sent: no tags, no hooks, no submodules.
+    // Leased to the value read above (pushArguments).
     try {
-      await this.#git(['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',
-        `--force-with-lease=${ref}:${remote ?? ''}`, '--', this.#url, `${input.head}:${ref}`], signal, true);
+      await this.#git(pushArguments({ url: this.#url, ref, read: remote, head: input.head }), signal, true);
     } catch (error) {
       if ((error as { staleLease?: boolean }).staleLease)
         throw new BranchPushRefused(`The branch ${input.branch} moved while codeboost pushed it. Nothing was pushed.`);
