@@ -59,6 +59,8 @@ export interface PublishRecord {
   outcome: string; draft: boolean; message: string; stateVersion: number; at: string; number?: number; url?: string;
   /** `close`: the record is a cancelled task's PR close (#111), whose settled outcome is `closed`. Absent: a publish. */
   action?: 'close';
+  /** An `opened` outcome that left the PR or the task not where the publish meant them: still owed (#103). */
+  reconcile?: boolean;
 }
 /** What the publish action replays once its publish has settled: the outcome, as `publish.last` shows it. */
 export function publishActionResponse(record: PublishRecord) {

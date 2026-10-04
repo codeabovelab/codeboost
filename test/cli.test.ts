@@ -67,10 +67,15 @@ it('refuses a runner startup without a token with its message, exit 1 and the lo
 });
 it('refuses a runner without github.baseBranch before the lock and before the token check (#103)', () => {
   for (const github of [{}, { baseBranch: 'refs/heads/main' }]) {
-    const result = review(github).run('--port', '0');
-    expect(result.status).toBe(1);
-    // Not the missing-token refusal that the runner's setup would give after the lock: the CLI checked the block first.
-    expect(result.stderr.trim()).toMatch(/^The runner publishes pull requests: add github\.baseBranch/);
+    // Another runner holds the lock, so a check made after the lock (as the runner's setup also makes it) would report
+    // the lock instead.
+    const { run, database } = review(github);
+    const held = acquireRunnerLock(database, { lockRoot: join(dirname(dirname(database)), 'home', '.codeboost', 'locks') });
+    try {
+      const result = run('--port', '0');
+      expect(result.status).toBe(1);
+      expect(result.stderr.trim()).toMatch(/^The runner publishes pull requests: add github\.baseBranch/);
+    } finally { held.release(); }
   }
   // No github block at all: refused as itself, before the lock, too. Another runner holds the lock meanwhile, so a check
   // made after the lock would report the lock instead.
@@ -163,6 +168,8 @@ it('starts a publish the database owes once startup has verified the lock (#103)
   try {
     await cli.until(() => cli.out().includes('Review ready'), 'the server to open');
     await cli.until(() => existsSync(calls), 'the startup publish to call gh');
+    // Stopped only once that publish has recorded its outcome: a stop while gh runs would record `stopped` instead.
+    await cli.until(() => { const store = new Store(database); try { return store.lastPublish(identity)?.outcome === 'failed'; } finally { store.close(); } }, 'the publish outcome');
     cli.child.kill('SIGINT');
     expect(await cli.exited).toBe(0);
     const reopened = new Store(database);
