@@ -1309,10 +1309,13 @@ export class Store {
    * Record a publish's outcome. An observation, not a task change: the task's state version does not move, so a refused
    * publish leaves the task exactly as it was. Settlement writes go through the shutdown capability.
    */
-  recordPublish(identity: PlanIdentity, record: Omit<PublishRecord, 'stateVersion' | 'at'>, actionId?: string): PublishRecord {
+  recordPublish(identity: PlanIdentity, record: Omit<PublishRecord, 'stateVersion' | 'at'>, actionId?: string, seenVersion?: number): PublishRecord {
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const saved: PublishRecord = { ...record, message: record.message.slice(0, 2000), stateVersion: this.#task(key).state_version as number, at: new Date().toISOString() };
+      // The version the publish last saw, when it reported one (#114); otherwise the current one, which it ended on.
+      const current = this.#task(key).state_version as number;
+      if (seenVersion !== undefined && (!Number.isSafeInteger(seenVersion) || seenVersion > current)) throw new Error('Invalid seen state version.');
+      const saved: PublishRecord = { ...record, message: record.message.slice(0, 2000), stateVersion: seenVersion ?? current, at: new Date().toISOString() };
       this.#run('INSERT INTO publish_outcomes (plan_key,data) VALUES (?,?) ON CONFLICT(plan_key) DO UPDATE SET data=excluded.data', key, encode(saved));
       // The same transaction refreshes the publish action's replay, as for a merge, so a resent click reports this outcome.
       if (actionId !== undefined) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='publish' AND json_extract(response,'$.ok')=1`,

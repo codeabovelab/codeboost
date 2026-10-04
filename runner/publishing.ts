@@ -108,16 +108,17 @@ export class TaskPublishing {
     const reserved = Promise.withResolvers<void>();
     this.#running.set(key, reserved.promise);
     const run = async () => {
-      let record: Omit<PublishRecord, 'stateVersion' | 'at'>;
+      let record: Omit<PublishRecord, 'stateVersion' | 'at'>, seenVersion: number | undefined;
       try {
         // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
         const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {});
         record = describe(outcome, draft);
+        seenVersion = outcome.seenVersion;
       } catch (error) {
         const stopped = error instanceof ShuttingDownError || (this.#closing && (error as Error)?.name === 'AbortError');
         record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets) };
       }
-      try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
+      try { this.#write(() => this.#store.recordPublish(identity, record, actionId, seenVersion)); }
       catch (error) { console.error(`Could not record the publish outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
     };
     // Starts once the caller's transaction (the action's userAction) has committed; a rollback starts nothing.

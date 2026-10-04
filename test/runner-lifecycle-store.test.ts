@@ -704,6 +704,12 @@ describe('publish outcomes (#103)', () => {
     expect(reopened.getTask(identity)).toEqual(before);
     expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
   });
+  it('stamps an outcome with the version the publish saw, and refuses one it cannot have seen (#114)', () => {
+    const { store } = queued(), version = store.getTask(identity).stateVersion;
+    expect(store.recordPublish(identity, { outcome: 'opened', draft: false, message: 'x' }, undefined, version)).toMatchObject({ stateVersion: version });
+    expect(() => store.recordPublish(identity, { outcome: 'opened', draft: false, message: 'x' }, undefined, store.getTask(identity).stateVersion + 1)).toThrow('Invalid seen state version.');
+    expect(store.lastPublish(identity)).toMatchObject({ stateVersion: version });
+  });
   it('records a task already running at the upgrade as not published, so the first start publishes nothing for it', () => {
     const { path, store } = queued(); admit(store);
     expect(store.getTask(identity).status).toBe('running');

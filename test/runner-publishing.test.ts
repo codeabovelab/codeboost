@@ -36,6 +36,8 @@ class FakeGitHub {
   prs: Pr[] = [];
   calls: string[] = [];
   onOpen?: (signal?: AbortSignal) => Promise<void>;
+  /** Runs inside a draft change, before it applies; a throw fails the change. */
+  onDraft?: () => void;
   readonly remote: string;
   constructor(remote: string) { this.remote = remote; }
   head(branch: string): string | null {
@@ -64,7 +66,7 @@ class FakeGitHub {
     findOwned: async input => this.prs.filter(pr => pr.open && pr.headBranch === input.headBranch && input.markers.includes(pr.marker))
       .map(pr => ({ ...this.#view(pr), marker: pr.marker, base: pr.base })),
     readPull: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; return { open: pr.open, headBranch: pr.headBranch, base: pr.base, marker: pr.marker }; },
-    markDraft: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
+    markDraft: async number => { this.onDraft?.(); const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
     refresh: async (number, input) => {
       this.calls.push(`refresh ${input.draft ? 'draft' : 'ready'}`);
       const pr = this.prs.find(candidate => candidate.number === number)!;
@@ -367,6 +369,23 @@ describe('publishing a finished task (#103)', () => {
     const { app, identity, store } = await serve(w, { before: completeAll, env: { GH_ENTERPRISE_TOKEN: token } });
     await publishSettled(app, identity);
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'gh failed: Authorization: token [token]' });
+  });
+
+  it('stamps the outcome with the version the publish saw, not one changed during its last GitHub call (#114)', async () => {
+    const w = world();
+    let seen = -1;
+    // GitHub shows another head than the one pushed, so the PR is to be made a draft; that call fails, and someone else
+    // changes the task while it runs.
+    w.github.onOpen = async () => { const pr = w.github.prs.at(-1)!; git(w.remote, 'update-ref', `refs/heads/${pr.headBranch}`, git(w.demo.repository, 'rev-list', '--max-parents=0', 'HEAD')); };
+    const { app, identity, store } = await serve(w, { before: completeAll });
+    w.github.onDraft = () => {
+      seen = store.getTask(identity).stateVersion;
+      store.cancelTask(identity, seen, randomUUID());
+      throw new Error('GitHub timed out.');
+    };
+    await publishSettled(app, identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', stateVersion: seen, message: expect.stringContaining('may still be ready for review') });
+    expect(store.getTask(identity).stateVersion).toBeGreaterThan(seen);
   });
 
   it('never publishes in a demo, even with a publisher', async () => {
