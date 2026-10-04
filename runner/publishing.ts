@@ -123,6 +123,23 @@ export class TaskPublishing {
   }
 
   /**
+   * Startup, once the runner lock is verified: do the job owed, if any. Otherwise a publish or close action whose process
+   * stopped before its job recorded an outcome (a crash) is settled now, so its replay stops saying `publishing` or
+   * `closing`; the task's records show what that job did, and the action runs it again. Never throws.
+   */
+  startup(identity: PlanIdentity): void {
+    try {
+      const job = this.owed(identity);
+      if (job) { this.#schedule(identity, job); return; }
+      if (this.#store.hasUnsettledPublishAction(identity)) {
+        const closing = this.#store.getTask(identity).status === 'cancelled';
+        this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false, ...(closing ? { action: 'close' as const } : {}),
+          message: `The ${closing ? 'close' : 'publish'} was interrupted before it recorded an outcome (codeboost stopped). The task's records show what it did; the ${closing ? 'close-pull-requests' : 'publish'} action runs it again.` }));
+      }
+    } catch (error) { console.error(`Could not start pull request work: ${JSON.stringify(message(error, this.#secrets))}`); }
+  }
+
+  /**
    * Shutdown: refuse new jobs, abort those in progress (the publisher refuses every later push, opening, ready change and
    * close) and await their recorded outcomes.
    */

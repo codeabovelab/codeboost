@@ -1317,10 +1317,18 @@ export class Store {
       const saved: PublishRecord = { ...record, message: record.message.slice(0, 2000), stateVersion: this.#task(key).state_version as number, at: new Date().toISOString() };
       this.#run('INSERT INTO publish_outcomes (plan_key,data) VALUES (?,?) ON CONFLICT(plan_key) DO UPDATE SET data=excluded.data', key, encode(saved));
       // The same transaction refreshes the publish action's replay, as for a merge, so a resent click reports this outcome.
-      if (actionId !== undefined) this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1`,
-        encode({ ok: true, value: publishActionResponse(saved) }), key, actionId);
+      // A reply still saying `publishing` or `closing` is an action whose job never recorded an outcome: its process stopped
+      // (a crash) before it could. One publish or close runs per task, so this outcome is that action's continuation and
+      // settles it too; otherwise its replay would say `publishing` or `closing` for ever.
+      this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1
+        AND (action_id=? OR json_extract(response,'$.value.outcome') IN ('publishing','closing'))`, encode({ ok: true, value: publishActionResponse(saved) }), key, actionId ?? null);
       return saved;
     });
+  }
+  /** Whether a publish or close action's saved reply still says `publishing` or `closing`: its job has not recorded an outcome yet. */
+  hasUnsettledPublishAction(identity: PlanIdentity): boolean {
+    return !!this.#get(`SELECT 1 FROM user_actions WHERE plan_key=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1
+      AND json_extract(response,'$.value.outcome') IN ('publishing','closing') LIMIT 1`, identityKey(identity));
   }
   lastPublish(identity: PlanIdentity): PublishRecord | null {
     const key = identityKey(identity); this.#task(key);
