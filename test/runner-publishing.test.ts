@@ -16,6 +16,7 @@ import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.
 import { baseBranch } from '../runner/production.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import type { MergeGateway } from '../github/merge.ts';
+import { OWED_REFUSAL } from '../runner/publishing.ts';
 import { PullRequestMisplaced, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
@@ -558,6 +559,64 @@ describe('publishing a finished task (#103)', () => {
       // Retried by itself at the deadline: the lost opening's PR is recovered by its marker, not opened again.
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 100 }), { timeout: 8_000, interval: 50 });
       expect(w.github.prs).toHaveLength(1);
+    });
+  });
+
+  describe('round 2 of the independent review', () => {
+    it('retries by itself a publish whose own opening reply was lost', async () => {
+      const w = world();
+      // GitHub creates the PR, but its list does not show it yet, and the reply is lost.
+      w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); w.github.onOpen = undefined; throw new Error('timed out'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 2_000 });
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      w.github.hidden.clear();
+      // No action and no restart: the retry at the opening's deadline recovers it by its marker.
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 100 }), { timeout: 8_000, interval: 50 });
+      expect(w.github.prs).toHaveLength(1);
+    });
+    it('publishes a task recorded as not published at the upgrade once a run has started after it', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        service.store.recordPublish(service.config.identity, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
+        // A person resumed it after the upgrade, and that run completed the plan.
+        completeAll(service);
+      } });
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+    });
+    it('pays owed work only for its own refusal: a stale or replayed publish action starts nothing', async () => {
+      const w = world(), actionId = randomUUID();
+      const { app, identity, store } = await serve(w, { before: completeAllOwingPause, startup: false });
+      const stale = store.getTask(identity).stateVersion - 1;
+      expect(await act(app, 'publish', actionId, stale)).toMatchObject({ status: 409, body: { error: 'Stale task state. Reload before writing.' } });
+      expect(store.getTask(identity).status).toBe('running');
+      // The replay of that saved refusal applies nothing either.
+      expect(await act(app, 'publish', actionId, stale)).toMatchObject({ status: 409 });
+      expect(store.getTask(identity).status).toBe('running');
+      expect(app.executor!.owes(identity)).toBe(true);
+      // Its own refusal for the owed pause pays it.
+      expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
+      expect(store.getTask(identity).status).toBe('needs amendment');
+    });
+    it('publishes the draft of a needs-human task although a scope pause is owed', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAllOwingPause(service);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      } });
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true })]);
+    });
+    it('keeps an interrupted draft publish recorded as a draft when startup settles it', async () => {
+      const w = world();
+      const { identity, store } = await serve(w, { before: service => {
+        const s = service.store, id = service.config.identity;
+        s.recordPublish(id, { outcome: 'publishing', draft: true, message: 'A pull request is being published.' });
+        s.cancelTask(id, s.getTask(id).stateVersion, randomUUID());
+      } });
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped', draft: true });
     });
   });
 
