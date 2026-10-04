@@ -160,6 +160,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
+  let findings: SafetyFindings | undefined;
   const config = { ...w.demo, demo: options.demo ?? false };
   app = await startServer(config, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
     options.before?.(service);
@@ -177,14 +178,15 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
       onProcessGroup: () => options.onPushSpawn?.(++spawns, () => app!, close) });
     const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main', ...(options.settleMs ? { settleMs: options.settleMs } : {}) });
     branchOf = identity => publisher(() => false).branch(identity);
-    return { deps, sources, findings: new SafetyFindings(service.store), publisher, ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
+    findings = new SafetyFindings(service.store);
+    return { deps, sources, findings, publisher, ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   });
   cleanups.push(close);
   // As the CLI does once it has verified the lock.
   if (options.startup !== false) app.publishOwed(() => undefined);
   const identity = w.demo.identity;
-  return { app, close, identity, store: app.service.store, branch: branchOf(identity), head: app.service.store.getSnapshot(identity).head };
+  return { app, close, identity, store: app.service.store, branch: branchOf(identity), head: app.service.store.getSnapshot(identity).head, findings: findings! };
 }
 const view = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
 async function act(app: App, action: string, actionId = randomUUID(), expectedStateVersion?: number) {
@@ -783,6 +785,56 @@ describe('publishing a finished task (#103)', () => {
       await act(second.app, 'publish', actionId, version);
       await second.app.publishing!.settled(second.identity);
       expect((await act(second.app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', reconcile: true });
+    });
+  });
+
+  describe('round 7 of the independent review', () => {
+    /** A safety finding the audit made on the last attempt, whose save failed: the executor holds it, owed, in memory. */
+    const owedFinding = (store: Store, findings: SafetyFindings, identity: PlanIdentity) => {
+      const attempt = store.getAttempts(identity).at(-1)!;
+      vi.spyOn(store, 'recordSafetyFinding').mockImplementationOnce(() => { throw new Error('database is locked'); });
+      findings.record(attempt.id, 'The last item wrote outside its workspace.');
+      expect(findings.owedAttempts()).toEqual([attempt.id]);
+    };
+    it('refuses a ready publish while a safety finding is owed, pays it, and publishes the draft instead', async () => {
+      const w = world(), actionId = randomUUID();
+      const { app, identity, store, findings } = await serve(w, { before: completeAll, startup: false });
+      owedFinding(store, findings, identity);
+      expect((await view(app)).publish).toMatchObject({ publishable: false });
+      const version = store.getTask(identity).stateVersion;
+      expect(await act(app, 'publish', actionId, version)).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
+      // Paid: the task went to a person, and its draft is published with the finding as its problem.
+      expect(store.getTask(identity).status).toBe('needs human');
+      await publishSettled(app, identity);
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The last item wrote outside its workspace.') })]);
+      // A replay of that refusal applies nothing: no payment, no publish.
+      const pay = vi.spyOn(app.executor!, 'payOwed'), actIfOwed = vi.spyOn(app.publishing!, 'actIfOwed');
+      expect(await act(app, 'publish', actionId, version)).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
+      expect(pay).not.toHaveBeenCalled();
+      expect(actIfOwed).not.toHaveBeenCalled();
+    });
+    it('pays a safety finding owed on a needs-human task before its draft, at startup', async () => {
+      const w = world();
+      const { app, identity, store, findings } = await serve(w, { before: needsHuman, startup: false });
+      owedFinding(store, findings, identity);
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      expect(findings.owedAttempts()).toEqual([]);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+    });
+    it('keeps one retry timer per task when a run\'s end starts a new chain while one is armed', async () => {
+      const w = world();
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_500, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      const publishes = () => starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      // A run's end starts a new chain while the first chain's retry is armed.
+      app.publishing!.actIfOwed(identity);
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      // The first publish, the new chain's, and that chain's one retry; the first chain's timer never fires.
+      expect(publishes()).toBe(3);
     });
   });
 

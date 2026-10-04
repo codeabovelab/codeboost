@@ -50,6 +50,11 @@ export class TaskPublishing {
    */
   #retried = new Map<string, { deadline: number; short: number }>();
   #shortRetryMs: number;
+  /**
+   * The reason an owed escalation was paid with (a safety finding whose save had failed): the executor settles it in
+   * memory only, so the task's attempt rows do not carry it, and the draft PR would otherwise not say why (#103).
+   */
+  #escalations = new Map<string, string>();
   /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
   #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
@@ -141,11 +146,7 @@ export class TaskPublishing {
     if (kind === 'publish' && status === 'cancelled') throw new GuardRefusal('The task is cancelled; its pull requests are closed, not published.');
     const job = this.mode(identity);
     // A person's action starts a new chain, with its own automatic retries (AGENTS.md: reset on an explicit user action).
-    // A retry the old chain armed is dropped with it, so it cannot fire later on the new chain's budget.
-    const key = identityKey(identity);
-    this.#retried.delete(key);
-    const armed = this.#retries.get(key);
-    if (armed) { clearTimeout(armed); this.#retries.delete(key); }
+    this.#newChain(identity);
     this.#schedule(identity, job, actionId);
     return job;
   }
@@ -162,7 +163,7 @@ export class TaskPublishing {
       if (!job) return;
       // A run's end, a cancel, a person's action or a restart is a meaningful lifecycle change: a new chain, with its own
       // automatic retries. A retry timer's own job is not, or the retries would be unbounded again.
-      if (!options.retry) this.#retried.delete(identityKey(identity));
+      if (!options.retry) this.#newChain(identity);
       this.#schedule(identity, job);
     }
     catch (error) { console.error(`Could not start pull request work: ${JSON.stringify(message(error, this.#secrets))}`); }
@@ -222,8 +223,20 @@ export class TaskPublishing {
     // owes the work, and mode() refuses to publish until it is paid.
     try {
       const paid = this.#executor.payOwed(identity);
+      if (paid?.kind === 'needs human') this.#escalations.set(identityKey(identity), paid.reason);
       if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
     } catch (error) { console.error(`Could not settle what an earlier run owes: ${JSON.stringify(message(error, this.#secrets))}`); }
+  }
+
+  /**
+   * A new chain (a run's end, a cancel, a person's action, a restart): a fresh retry budget, and a retry the old chain armed is
+   * dropped with it, so it cannot fire later on the new chain's budget. One timer per task at all times.
+   */
+  #newChain(identity: PlanIdentity): void {
+    const key = identityKey(identity);
+    this.#retried.delete(key);
+    const armed = this.#retries.get(key);
+    if (armed) { clearTimeout(armed); this.#retries.delete(key); }
   }
 
   /**
@@ -311,6 +324,9 @@ export class TaskPublishing {
    */
   #problems(identity: PlanIdentity): string[] {
     const task = this.#store.getTask(identity);
+    // An owed finding paid here first: only this process knows its text.
+    const escalated = this.#escalations.get(identityKey(identity));
+    if (escalated) return [escalated];
     const current = task.currentAttemptId === null ? undefined : this.#store.getAttempt(identity, task.currentAttemptId);
     if (current?.safetyFinding) return [current.safetyFinding];
     if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
