@@ -804,6 +804,29 @@ describe('publishing a finished task (#103)', () => {
       await publishSettled(app, identity);
       expect(findings.owedAttempts()).toEqual([]);
       expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The last item wrote outside its workspace.') })]);
+    });
+    it('names a later return to needs human by its own reason, not a finding paid before', async () => {
+      const w = world();
+      const { app, identity, store, findings } = await serve(w, { before: completeAll, startup: false });
+      owedFinding(store, findings, identity);
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      expect(w.github.prs).toEqual([expect.objectContaining({ body: expect.stringContaining('The last item wrote outside its workspace.') })]);
+      // A person dealt with the finding and the task ran again: its new attempt failed, and the next admission came after
+      // the task's budget, so it is back in needs human for that reason.
+      store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+      const admit = (now?: number) => store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute',
+        item: store.getPlan(identity).items[0]!.id, expectedContext: store.currentContext(identity), deadline: (now ?? Date.now()) + 60_000, ...(now ? { now } : {}) });
+      const attempt = admit();
+      store.markRunning(identity, attempt.id);
+      store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: 'The tests failed in retry.ts.' });
+      expect(() => admit(store.getTask(identity).budgetDeadline! + 1)).toThrow(/time budget/);
+      expect(store.getTask(identity).status).toBe('needs human');
+      app.publishing!.publishIfOwed(identity);
+      await publishSettled(app, identity);
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The tests failed in retry.ts.') })]);
+      expect(w.github.prs[0]!.body).not.toContain('The last item wrote outside its workspace.');
     });
     it('keeps one retry timer per task when a run\'s end starts a new chain while one is armed', async () => {
       const w = world();
