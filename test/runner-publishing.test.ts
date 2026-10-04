@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
-import { Store } from '../runner/store.ts';
+import { Store, type PublishRecord } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import type { ReviewService } from '../runner/review.ts';
 import type { PreparedAttempt, RunnerDeps } from '../runner/coordinator.ts';
@@ -41,6 +41,8 @@ class FakeGitHub {
   calls: string[] = [];
   onOpen?: (signal?: AbortSignal) => Promise<void>;
   onClose?: (number: number, signal?: AbortSignal) => Promise<void>;
+  /** Runs inside a draft change, before it applies; a throw fails the change. */
+  onDraft?: () => void;
   /** PRs GitHub's list does not show yet (it lags behind them). */
   hidden = new Set<number>();
   readonly remote: string;
@@ -87,7 +89,7 @@ class FakeGitHub {
       pr.open = false;
       return { number, url: pr.url };
     },
-    markDraft: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
+    markDraft: async number => { this.onDraft?.(); const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
     refresh: async (number, input) => {
       this.calls.push(`refresh ${input.draft ? 'draft' : 'ready'}`);
       const pr = this.prs.find(candidate => candidate.number === number)!;
@@ -428,6 +430,26 @@ describe('publishing a finished task (#103)', () => {
     const { app, identity, store } = await serve(w, { before: completeAll, env: { GH_ENTERPRISE_TOKEN: token } });
     await publishSettled(app, identity);
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'gh failed: Authorization: token [token]' });
+  });
+
+  it('stamps the outcome with the version the publish saw, not one changed during its last GitHub call (#114)', async () => {
+    const w = world();
+    let seen = -1;
+    // GitHub shows another head than the one pushed, so the PR is to be made a draft; that call fails, and someone else
+    // changes the task while it runs.
+    w.github.onOpen = async () => { const pr = w.github.prs.at(-1)!; git(w.remote, 'update-ref', `refs/heads/${pr.headBranch}`, git(w.demo.repository, 'rev-list', '--max-parents=0', 'HEAD')); };
+    const { app, identity, store } = await serve(w, { before: completeAll });
+    w.github.onDraft = () => {
+      seen = store.getTask(identity).stateVersion;
+      store.cancelTask(identity, seen, randomUUID());
+      throw new Error('GitHub timed out.');
+    };
+    const records = vi.spyOn(store, 'recordPublish');
+    await publishSettled(app, identity);
+    // The cancel then closes the PR (#111), so the publish's own record is read from what was recorded, not the last one.
+    const opened = records.mock.results.map(result => result.value as PublishRecord).find(record => record.outcome === 'opened');
+    expect(opened).toMatchObject({ stateVersion: seen, message: expect.stringContaining('may still be ready for review') });
+    expect(store.getTask(identity).stateVersion).toBeGreaterThan(seen);
   });
 
   describe('a publish\'s in-flight record', () => {

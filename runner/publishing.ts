@@ -284,7 +284,7 @@ export class TaskPublishing {
           : { outcome: 'publishing', draft, message: 'A pull request is being published.' }));
       }
       catch (error) { console.error(`Could not record the publish as started, so it did not run: ${JSON.stringify(message(error, this.#secrets))}`); return; }
-      let record: Omit<PublishRecord, 'stateVersion' | 'at'>, unsettled = false;
+      let record: Omit<PublishRecord, 'stateVersion' | 'at'>, seenVersion: number | undefined, unsettled = false;
       try {
         if (job.kind === 'close') {
           const closed = await this.#publisher.closeAll(identity, abort.signal);
@@ -295,6 +295,7 @@ export class TaskPublishing {
           // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
           const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {}, abort.signal);
           record = describe(outcome, draft);
+          seenVersion = outcome.seenVersion;
         }
       } catch (error) {
         // A guard refusal is mostly a race (the task, its review or its head changed during the job): one short retry
@@ -304,7 +305,7 @@ export class TaskPublishing {
         record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets),
           ...(job.kind === 'close' ? { action: 'close' as const } : {}) };
       }
-      try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
+      try { this.#write(() => this.#store.recordPublish(identity, record, actionId, seenVersion)); }
       catch (error) { console.error(`Could not record the pull request outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
       this.#retryIfUnsettled(identity, record, unsettled);
     };

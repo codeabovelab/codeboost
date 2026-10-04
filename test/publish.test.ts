@@ -175,7 +175,7 @@ describe('opening the task PR', () => {
     const store = runningTask();
     const result: AlreadyFixedResult = { outcome: 'found', baseHead: oid(9), matches: [{ kind: 'pull request', repository: 'owner/repo', number: 401, state: 'OPEN', draft: false }] };
     const { publisher, log } = harness(store, { results: [result] });
-    expect(await publisher.publish(identity)).toEqual({ kind: 'possibly already fixed', result });
+    expect(await publisher.publish(identity)).toEqual({ kind: 'possibly already fixed', result , seenVersion: expect.any(Number) });
     expect(log).toEqual(['find ', 'check']);
     expect(store.getTask(identity).status).toBe('possibly already fixed');
     expect(store.taskPullRequests(identity)).toEqual([]);
@@ -208,7 +208,7 @@ describe('opening the task PR', () => {
   it('opens no PR when the task changed nothing, and moves it to needs human', async () => {
     const store = runningTask({ head: oid(1) });
     const { publisher, log } = harness(store);
-    expect(await publisher.publish(identity)).toEqual({ kind: 'no changes' });
+    expect(await publisher.publish(identity)).toEqual({ kind: 'no changes' , seenVersion: expect.any(Number) });
     // The branch is looked up first (a foreign PR there would be refused); nothing is checked, pushed or opened.
     expect(log).toEqual(['find ']);
     expect(store.getTask(identity).status).toBe('needs human');
@@ -223,7 +223,7 @@ describe('opening the task PR', () => {
     store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
     store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
     const again = harness(store, { live, next });
-    expect(await again.publisher.publish(identity)).toEqual({ kind: 'no changes' });
+    expect(await again.publisher.publish(identity)).toEqual({ kind: 'no changes' , seenVersion: expect.any(Number) });
     expect(again.log).toContain('draft 100');
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true }]);
     expect(store.getTask(identity).status).toBe('needs human');
@@ -481,7 +481,7 @@ describe('guards found by the independent review', () => {
     store.markRunning(identity, attempt.id);
     store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true });
     store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(1), []);
-    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity)).toEqual({ kind: 'no changes', leftReady: 100 });
+    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity)).toEqual({ kind: 'no changes', leftReady: 100 , seenVersion: expect.any(Number) });
     expect(store.getTask(identity).status).toBe('needs human');
   });
   it('refuses a PR-number mismatch before the no-changes draft change', async () => {
@@ -518,12 +518,35 @@ describe('guards found by the independent review', () => {
     await expect(harness(store, { live, next, copies: [copy], closed: new Set([pr.number]) }).publisher.publish(identity)).rejects.toThrow(/cancelled/);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, headSha: oid(2), refresh: null }]);
   });
+  it('reports the version it saw when the last GitHub call came after its last Store write (#114)', async () => {
+    // leftReady: GitHub shows another head than the one pushed, and making the PR a draft fails; a change made during
+    // that call was not seen by this publish.
+    const store = runningTask();
+    let before = -1;
+    const left = harness(store, { open: async () => ({ number: 100, url: 'https://github.com/owner/repo/pull/100', headSha: oid(7), draft: false }), draftFails: true,
+      onDraft: () => { before = store.getTask(identity).stateVersion; store.cancelTask(identity, before, crypto.randomUUID()); } });
+    expect(await left.publisher.publish(identity)).toMatchObject({ kind: 'opened', leftReady: 100, seenVersion: before });
+    expect(store.getTask(identity).stateVersion).toBeGreaterThan(before);
+    // draft unsupported on the main path: the task's ready PR cannot become a draft, and nothing is written after.
+    const other = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    await harness(other, { live, next }).publisher.publish(identity);
+    rerun(other);
+    other.transitionTask(identity, other.getTask(identity).stateVersion, 'needs human');
+    // The draft step for a task that cannot keep a ready PR tries first; the main path's own draft change is the second.
+    let seen = -1, drafts = 0;
+    const again = harness(other, { live, next, draftsUnsupported: true, onDraft: () => {
+      if (++drafts !== 2) return;
+      seen = other.getTask(identity).stateVersion; other.cancelTask(identity, seen, crypto.randomUUID());
+    } });
+    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100, seenVersion: seen });
+    expect(other.getTask(identity).stateVersion).toBeGreaterThan(seen);
+  });
   it('reports drafts unsupported when a lost draft opening cannot be turned back into a draft', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     await expect(harness(store, { live, next, openTimesOut: true }).publisher.publish(identity, { problems: ['x'] })).rejects.toThrow('timeout');
     for (const [m, pr] of live) live.set(m, { ...pr, draft: false });
-    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    expect(await harness(store, { live, next, draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100, seenVersion: expect.any(Number) });
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }]);
   });
   it('refuses to recover an opening recorded for another repository', async () => {
@@ -786,11 +809,11 @@ describe('a repository without draft PRs', () => {
     const store = runningTask();
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     const { publisher } = harness(store, { draftsUnsupported: true });
-    expect(await publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null });
+    expect(await publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null , seenVersion: expect.any(Number) });
     expect(store.taskPullRequests(identity).map(pr => pr.state)).toEqual(['abandoned']);
     expect(store.getTask(identity).status).toBe('needs human');
     // Nothing is left in flight: the next publish does not wait for a settle time.
-    expect(await harness(store, { draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null });
+    expect(await harness(store, { draftsUnsupported: true }).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: null , seenVersion: expect.any(Number) });
   });
   it('leaves the existing ready PR exactly as it is: the draft refusal comes before any push or description change', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
@@ -798,7 +821,7 @@ describe('a repository without draft PRs', () => {
     rerun(store);
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     const again = harness(store, { live, next, draftsUnsupported: true });
-    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100, seenVersion: expect.any(Number) });
     // The draft step comes first, so the refusal leaves the PR exactly as it was: no push, no new description.
     expect(again.log.some(line => line.startsWith('push') || line.startsWith('refresh'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, refresh: null, headSha: oid(2) }]);
@@ -1770,7 +1793,7 @@ describe('shutdown and PRs left ready', () => {
     const store = runningTask({ head: oid(1) });
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     const version = store.getTask(identity).stateVersion;
-    expect(await harness(store).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'no changes' });
+    expect(await harness(store).publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'no changes' , seenVersion: expect.any(Number) });
     expect(store.getTask(identity)).toMatchObject({ status: 'needs human', stateVersion: version });
   });
   it('moves no task on the no-changes path when the publish is aborted during a refused draft change', async () => {
@@ -1979,7 +2002,7 @@ describe('shutdown and PRs left ready', () => {
     // The task changed since the opening (same status, new version), so the opening is not this publish's own.
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
     const again = harness(store, { live, next, draftsUnsupported: true });
-    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100 });
+    expect(await again.publisher.publish(identity, { problems: ['x'] })).toEqual({ kind: 'draft unsupported', number: 100, seenVersion: expect.any(Number) });
     expect(again.log).toContain('check');
   });
   it('converges after a base change once the person retargets the PR, even when the update is then lost', async () => {
