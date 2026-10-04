@@ -1,0 +1,918 @@
+import { mkdtempSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { randomUUID } from 'node:crypto';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import { fixtureGit as git } from './fixtures/git.ts';
+import { createDemo } from '../scripts/demo.ts';
+import { startServer } from '../web/server.ts';
+import { Store } from '../runner/store.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
+import type { ReviewService } from '../runner/review.ts';
+import type { PreparedAttempt, RunnerDeps } from '../runner/coordinator.ts';
+import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
+import { GitBranchPusher } from '../runner/branch-push.ts';
+import { PullRequestPublisher } from '../runner/publish.ts';
+import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
+import { baseBranch } from '../runner/production.ts';
+import { OWED_REFUSAL } from '../runner/publishing.ts';
+import { PullRequestMisplaced, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
+import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
+import type { PlanIdentity } from '../core/identity.ts';
+
+vi.setConfig({ testTimeout: 30_000 });
+const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
+  for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+const OWNER = 'c'.repeat(32), REPO = 'acme/app';
+type App = Awaited<ReturnType<typeof startServer>>;
+
+interface Pr { number: number; url: string; draft: boolean; open: boolean; base: string; headBranch: string; marker: string; body: string }
+/**
+ * GitHub, as far as publishing sees it: pull requests in memory, and branches in a real local bare repository, so a PR's
+ * head is whatever the push left on its branch. `onOpen` runs after GitHub created the PR and before the reply arrives.
+ */
+class FakeGitHub {
+  prs: Pr[] = [];
+  calls: string[] = [];
+  onOpen?: (signal?: AbortSignal) => Promise<void>;
+  /** PRs GitHub's list does not show yet (it lags behind them). */
+  hidden = new Set<number>();
+  readonly remote: string;
+  constructor(remote: string) { this.remote = remote; }
+  head(branch: string): string | null {
+    try { return git(this.remote, 'rev-parse', '--verify', '-q', `refs/heads/${branch}`); } catch { return null; }
+  }
+  /** The next answer about a PR shows this head instead of the branch's (GitHub lags behind a push), once. */
+  staleHeadOnce?: string;
+  #view(pr: Pr) {
+    const stale = this.staleHeadOnce; this.staleHeadOnce = undefined;
+    return { number: pr.number, url: pr.url, draft: pr.draft, headSha: stale ?? this.head(pr.headBranch) ?? '' };
+  }
+  checks: AlreadyFixedGateway = { repository: REPO, check: async () => { this.calls.push('check'); return { outcome: 'clear', baseHead: 'b'.repeat(40) }; } };
+  pulls: PullRequestGateway = {
+    repository: REPO,
+    open: async (input: OpenPullRequestInput, signal?: AbortSignal) => {
+      this.calls.push(`open ${input.draft ? 'draft' : 'ready'}`);
+      if (this.head(input.headBranch) === null) throw new Error('No such branch on GitHub.');
+      const pr: Pr = { number: 100 + this.prs.length, url: `https://github.com/${REPO}/pull/${100 + this.prs.length}`, draft: input.draft, open: true,
+        base: input.base, headBranch: input.headBranch, marker: input.marker, body: input.body };
+      this.prs.push(pr);
+      await this.onOpen?.(signal);
+      return this.#view(pr);
+    },
+    findOpened: async input => {
+      const open = this.prs.filter(pr => pr.open && !this.hidden.has(pr.number) && pr.headBranch === input.headBranch);
+      const own = open.filter(pr => input.markers.includes(pr.marker));
+      if (own.length > 1 || (own[0] && own[0].base !== input.base)) throw new PullRequestMisplaced('The task\'s pull requests are not where it publishes.');
+      if (open.some(pr => pr.base === input.base && !input.markers.includes(pr.marker))) throw new Error('An open pull request exists that codeboost did not open.');
+      return own[0] ? { ...this.#view(own[0]), marker: own[0].marker } : null;
+    },
+    findOwned: async input => this.prs.filter(pr => pr.open && !this.hidden.has(pr.number) && pr.headBranch === input.headBranch && input.markers.includes(pr.marker))
+      .map(pr => ({ ...this.#view(pr), marker: pr.marker, base: pr.base })),
+    readPull: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; return { open: pr.open, headBranch: pr.headBranch, base: pr.base, marker: pr.marker }; },
+    markDraft: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
+    refresh: async (number, input) => {
+      this.calls.push(`refresh ${input.draft ? 'draft' : 'ready'}`);
+      const pr = this.prs.find(candidate => candidate.number === number)!;
+      input.beforeReady?.();
+      pr.body = input.body; pr.draft = input.draft;
+      return this.#view(pr);
+    },
+  };
+}
+
+/** Every plan item completed, changing nothing: the task is running and its plan has run. */
+function completeAll(service: ReviewService) {
+  const s = service.store, id = service.config.identity, head = s.getSnapshot(id).head;
+  s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+  for (const item of s.getPlan(id).items) {
+    const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+    s.markRunning(id, attempt.id);
+    s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head, unchanged: true, inScope: [], outOfScope: [] } });
+  }
+  expect(s.getTask(id).status).toBe('running');
+}
+/**
+ * Every plan item completed, but the last changed a file outside its plan item, and its pause for amendment was never
+ * recorded (the write failed, or the process stopped): the next run owes that pause.
+ */
+function completeAllOwingPause(service: ReviewService) {
+  const s = service.store, id = service.config.identity, head = s.getSnapshot(id).head, items = s.getPlan(id).items;
+  s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+  for (const [index, item] of items.entries()) {
+    const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+    s.markRunning(id, attempt.id);
+    s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+      result: { head, unchanged: true, inScope: [], outOfScope: index === items.length - 1 ? ['run.sh'] : [] } });
+  }
+  expect(s.getTask(id).status).toBe('running');
+}
+/** The first item failed with a 1 ms task budget, which has passed: the task is running, and its next admission is refused. */
+function budgetSpent(service: ReviewService) {
+  const s = service.store, id = service.config.identity;
+  s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+  const admit = (budgetMs?: number) => s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+    expectedContext: s.currentContext(id), deadline: Date.now() + 60_000, ...(budgetMs ? { budgetMs } : {}) });
+  const attempt = admit(1);
+  s.markRunning(id, attempt.id);
+  s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: 'The tests failed in retry.ts.' });
+  const until = Date.now() + 5; while (Date.now() < until) { /* let the budget pass */ }
+  return admit;
+}
+/** As production gets there: an admission after the budget passed moves the task to needs human, and is refused. */
+function needsHuman(service: ReviewService) {
+  const admit = budgetSpent(service);
+  expect(() => admit()).toThrow(/time budget/);
+  expect(service.store.getTask(service.config.identity).status).toBe('needs human');
+}
+const BUDGET = 'The task\'s time budget ran out before its plan finished.';
+/** Wait until the startup publish (or any in progress) has settled, then return the GitHub calls made so far. */
+async function quiet(app: App, w: World, identity: PlanIdentity) { await app.publishing!.settled(identity); return [...w.github.calls]; }
+
+interface World { root: string; demo: ReturnType<typeof createDemo>; remote: string; github: FakeGitHub }
+function world(): World {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-publishing-')); roots.push(root);
+  const demo = createDemo(join(root, 'demo')), remote = join(root, 'remote.git');
+  git(root, 'init', '-q', '--bare', remote);
+  return { root, demo, remote, github: new FakeGitHub(remote) };
+}
+
+/**
+ * A server whose runner completes every item it admits without an agent (each changes nothing), and publishes through the
+ * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
+ * exists, as an earlier process would have left it.
+ */
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; env?: NodeJS.ProcessEnv; settleMs?: number; shortRetryMs?: number } = {}) {
+  let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
+  const close = () => closing ??= app!.close();
+  let branchOf: (identity: PlanIdentity) => string = () => '';
+  let findings: SafetyFindings | undefined;
+  const config = { ...w.demo, demo: options.demo ?? false };
+  app = await startServer(config, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+    options.before?.(service);
+    const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
+    await ensureCommit(repository, service.store.getSnapshot(service.config.identity).head);
+    const prepared: PreparedAttempt = { clone: { id: 'clone', taskId: 'task', directory: '/tmp/x', head: 'f'.repeat(40) }, vendor: 'claude', approvedArgv: [] };
+    const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
+      start: input => ({ attemptId: input.attemptId, cancel: () => undefined,
+        settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' }) }),
+      validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
+    const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 3, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+    const pusher = new GitBranchPusher({ repository, repositoryId: service.config.identity.repositoryId, remote: REPO, url: w.remote,
+      ownedCommits: identity => service.store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha),
+      onProcessGroup: () => options.onPushSpawn?.(++spawns, () => app!, close) });
+    const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main', ...(options.settleMs ? { settleMs: options.settleMs } : {}) });
+    branchOf = identity => publisher(() => false).branch(identity);
+    findings = new SafetyFindings(service.store);
+    return { deps, sources, findings, publisher, ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
+      recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
+  });
+  cleanups.push(close);
+  // As the CLI does once it has verified the lock.
+  if (options.startup !== false) app.publishOwed(() => undefined);
+  const identity = w.demo.identity;
+  return { app, close, identity, store: app.service.store, branch: branchOf(identity), head: app.service.store.getSnapshot(identity).head, findings: findings! };
+}
+const view = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
+async function act(app: App, action: string, actionId = randomUUID(), expectedStateVersion?: number) {
+  const { stateVersion } = await view(app);
+  const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
+    body: JSON.stringify({ action, expectedStateVersion: expectedStateVersion ?? stateVersion, actionId }) });
+  return { status: response.status, body: await response.json() as Record<string, any> };
+}
+const publishSettled = (app: App, identity: PlanIdentity) => vi.waitFor(async () => {
+  expect(app.publishing!.busy(identity)).toBe(false);
+  expect(app.service.store.lastPublish(identity)).not.toBeNull();
+}, { timeout: 20_000, interval: 20 });
+
+describe('publishing a finished task (#103)', () => {
+  it('opens one ready pull request when a run completes the plan, with the branch at the task head', async () => {
+    const w = world();
+    const { app, close, identity, store, branch, head } = await serve(w);
+    expect((await view(app)).publish).toMatchObject({ available: true, publishable: false, last: null });
+    expect((await act(app, 'start')).body.result).toMatchObject({ outcome: 'started' });
+    await publishSettled(app, identity);
+    expect(w.github.prs).toHaveLength(1);
+    expect(w.github.prs[0]).toMatchObject({ draft: false, base: 'main', headBranch: branch, open: true });
+    expect(w.github.head(branch)).toBe(head);
+    expect(store.getTask(identity).status).toBe('in review');
+    expect((await view(app)).publish).toMatchObject({ active: false, publishable: false,
+      last: { outcome: 'opened', draft: false, number: 100, url: `https://github.com/${REPO}/pull/100` } });
+    // Nothing is owed any more: a restart publishes nothing (no check, no open, no refresh).
+    await close();
+    const calls = [...w.github.calls], again = await serve(w);
+    expect(again.app.publishing!.busy(identity)).toBe(false);
+    expect(await quiet(again.app, w, identity)).toEqual(calls);
+  });
+
+  it('opens a draft pull request with its problems for a task that needs a person', async () => {
+    const w = world();
+    const { app, identity, store, branch, head } = await serve(w, { before: needsHuman });
+    await publishSettled(app, identity);
+    expect(w.github.prs).toHaveLength(1);
+    expect(w.github.prs[0]).toMatchObject({ draft: true, headBranch: branch });
+    expect(w.github.prs[0]!.body).toContain(BUDGET);
+    expect(w.github.head(branch)).toBe(head);
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true, number: 100 });
+  });
+
+  it('leaves a task whose branch holds someone else\'s commit running, and the publish action retries once a person fixed it', async () => {
+    const v = world();
+    // A person pushed the base commit (not codeboost's) to the task's branch before the publish.
+    const s2 = await serve(v, { before: service => {
+      completeAll(service);
+      const name = new PullRequestPublisher(service.store, { checks: v.github.checks, pulls: v.github.pulls, pusher: { push: async () => undefined } }, { repository: REPO, baseBranch: 'main' }).branch(service.config.identity);
+      git(v.demo.repository, '-c', 'protocol.file.allow=always', 'push', '-q', v.remote, `${service.store.getSnapshot(service.config.identity).base}:refs/heads/${name}`);
+    } });
+    await publishSettled(s2.app, s2.identity);
+    expect(s2.store.lastPublish(s2.identity)).toMatchObject({ outcome: 'refused', draft: false, message: expect.stringMatching(/which codeboost did not make\. Nothing was pushed\./) });
+    expect(s2.store.getTask(s2.identity).status).toBe('running');
+    expect(v.github.prs).toHaveLength(0);
+    expect((await view(s2.app)).publish).toMatchObject({ active: false, publishable: true, last: { outcome: 'refused' } });
+    // A person deletes the branch; the publish action runs again.
+    git(v.remote, 'update-ref', '-d', `refs/heads/${s2.branch}`);
+    const actionId = randomUUID(), version = s2.store.getTask(s2.identity).stateVersion;
+    expect(await act(s2.app, 'publish', actionId, version)).toMatchObject({ status: 200, body: { result: { outcome: 'publishing', draft: false } } });
+    expect((await view(s2.app)).publish).toMatchObject({ active: true });
+    await s2.app.publishing!.settled(s2.identity);
+    expect(s2.store.lastPublish(s2.identity)).toMatchObject({ outcome: 'opened', draft: false });
+    expect(v.github.head(s2.branch)).toBe(s2.head);
+    expect(s2.store.getTask(s2.identity).status).toBe('in review');
+    // The same action ID replays the publish's outcome, not "publishing", and publishes nothing again.
+    const calls = [...v.github.calls];
+    expect((await act(s2.app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', draft: false, number: 100 });
+    expect(s2.app.publishing!.busy(s2.identity)).toBe(false);
+    expect(v.github.calls).toEqual(calls);
+  });
+
+  it('refuses the publish action while nothing can be published, and records the refusal', async () => {
+    const w = world();
+    const { app } = await serve(w);
+    const refused = await act(app, 'publish');
+    expect(refused).toMatchObject({ status: 409, body: { error: expect.stringMatching(/The task is in review/) } });
+    expect(w.github.calls).toEqual([]);
+  });
+
+  it('closes the Store only after a publish stopped during its push has settled, and the next start publishes once', async () => {
+    const w = world();
+    let closedWhileBusy: boolean | undefined;
+    const first = await serve(w, { before: completeAll, onPushSpawn: (n, app, close) => {
+      // The third Git call is the push (after the commit check and the read of the remote).
+      if (n !== 3) return;
+      const service = app().service, closeStore = service.close.bind(service);
+      service.close = () => { closedWhileBusy = app().publishing!.busy(w.demo.identity); closeStore(); };
+      void close();
+    } });
+    await vi.waitFor(() => expect(closedWhileBusy).toBe(false), { timeout: 20_000 });
+    const store = new Store(w.demo.database);
+    try { expect(store.lastPublish(first.identity)).toMatchObject({ outcome: 'stopped', draft: false }); } finally { store.close(); }
+    expect(w.github.prs).toHaveLength(0);
+    const second = await serve(w);
+    await publishSettled(second.app, second.identity);
+    expect(second.store.lastPublish(second.identity)).toMatchObject({ outcome: 'opened' });
+    expect(w.github.prs).toHaveLength(1);
+    expect(w.github.head(second.branch)).toBe(second.head);
+  });
+
+  it('keeps an opening whose reply was lost to shutdown, and the next start recovers it by its marker', async () => {
+    const w = world();
+    let closedWhileBusy: boolean | undefined;
+    let appRef: App | undefined, closeApp: (() => Promise<void>) | undefined;
+    // GitHub created the PR; shutdown aborts the call before its reply arrives.
+    w.github.onOpen = signal => new Promise((_, reject) => {
+      const service = appRef!.service, closeStore = service.close.bind(service);
+      service.close = () => { closedWhileBusy = appRef!.publishing!.busy(w.demo.identity); closeStore(); };
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      void closeApp!();
+    });
+    const first = await serve(w, { before: completeAll, onPushSpawn: (_, app, close) => { appRef = app(); closeApp = close; } });
+    await vi.waitFor(() => expect(closedWhileBusy).toBe(false), { timeout: 20_000 });
+    const store = new Store(w.demo.database);
+    try {
+      expect(store.lastPublish(first.identity)).toMatchObject({ outcome: 'stopped' });
+      expect(store.taskPullRequests(first.identity)).toMatchObject([{ state: 'opening' }]);
+    } finally { store.close(); }
+    expect(w.github.prs).toHaveLength(1);
+    w.github.onOpen = undefined;
+    const second = await serve(w);
+    await publishSettled(second.app, second.identity);
+    // Recovered, not opened again.
+    expect(w.github.prs).toHaveLength(1);
+    expect(second.store.taskPullRequests(second.identity)).toMatchObject([{ state: 'opened', number: 100 }]);
+    expect(second.store.getTask(second.identity).status).toBe('in review');
+    expect(second.store.lastPublish(second.identity)).toMatchObject({ outcome: 'opened', number: 100 });
+  });
+
+  it('names the current attempt\'s safety finding in the draft, even when the budget has also run out', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: service => {
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000, budgetMs: 1 });
+      s.markRunning(id, attempt.id);
+      s.recordSafetyFinding(id, attempt.id, 'P1 wrote to a path outside its workspace.');
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: false });
+      const until = Date.now() + 5; while (Date.now() < until) { /* let the budget pass */ }
+    } });
+    expect(store.getTask(identity).status).toBe('needs human');
+    await publishSettled(app, identity);
+    expect(w.github.prs).toHaveLength(1);
+    expect(w.github.prs[0]!.body).toContain('P1 wrote to a path outside its workspace.');
+    expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+  });
+
+  it('publishes a draft when a resume is refused because the budget ran out, which moves the task to needs human', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: service => { budgetSpent(service); } });
+    expect(store.getTask(identity).status).toBe('running');
+    expect(await act(app, 'resume')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/time budget/) } });
+    expect(store.getTask(identity).status).toBe('needs human');
+    await publishSettled(app, identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(BUDGET) })]);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+  });
+
+  it('publishes nothing when resume is refused for a task already in needs human, though its last publish was refused', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { startup: false, before: service => {
+      needsHuman(service);
+      service.store.recordPublish(service.config.identity, { outcome: 'refused', draft: true, message: 'The branch moved.' });
+    } });
+    expect(await act(app, 'resume')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/needs human/) } });
+    expect(app.publishing!.busy(identity)).toBe(false);
+    expect(w.github.calls).toEqual([]);
+    // The publish action is how a person retries it.
+    expect(await act(app, 'publish')).toMatchObject({ status: 200, body: { result: { outcome: 'publishing', draft: true } } });
+    await app.publishing!.settled(identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+  });
+
+  it('refuses start, resume and a second publish while a publish runs, and records the publish refusal', async () => {
+    const w = world();
+    const opening = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    w.github.onOpen = async () => { opening.resolve(); await release.promise; };
+    const { app, identity, store } = await serve(w, { before: completeAll });
+    await opening.promise;
+    expect((await view(app)).publish).toMatchObject({ active: true, publishable: false });
+    for (const action of ['start', 'resume'])
+      expect(await act(app, action)).toMatchObject({ status: 409, body: { error: 'A pull request is being published for this task; try again when it has finished.' } });
+    const actionId = randomUUID(), version = store.getTask(identity).stateVersion;
+    const second = await act(app, 'publish', actionId, version);
+    expect(second).toMatchObject({ status: 409, body: { error: 'A pull request is already being published for this task.' } });
+    release.resolve();
+    await app.publishing!.settled(identity);
+    expect(store.getAttempts(identity)).toHaveLength(3);
+    // The refusal was recorded: the same action ID replays it, and starts nothing.
+    expect(await act(app, 'publish', actionId, version)).toMatchObject({ status: 409, body: second.body });
+    expect(w.github.prs).toHaveLength(1);
+  });
+
+  it('awaits a publish stopped by shutdown before the write gate closes, so a PR GitHub opened as the abort came is recorded', async () => {
+    const w = world();
+    let appRef: App | undefined, closeApp: (() => Promise<void>) | undefined;
+    // GitHub's reply arrives a moment after shutdown aborted the call: the publisher records the PR it opened.
+    w.github.onOpen = signal => new Promise(resolve => {
+      signal!.addEventListener('abort', () => setTimeout(resolve, 300), { once: true });
+      void closeApp!();
+    });
+    const first = await serve(w, { before: completeAll, onPushSpawn: (_, app, close) => { appRef = app(); closeApp = close; } });
+    await vi.waitFor(() => expect(appRef?.publishing?.busy(first.identity)).toBe(false), { timeout: 20_000 });
+    await closeApp!();
+    const store = new Store(w.demo.database);
+    try { expect(store.taskPullRequests(first.identity)).toMatchObject([{ state: 'opened', number: 100 }]); } finally { store.close(); }
+  });
+
+  it('removes the publishing environment\'s token values from a recorded failure', async () => {
+    const w = world(), token = 'not-a-github-shaped-secret-4711';
+    w.github.onOpen = async () => { throw new Error(`gh failed: Authorization: token ${token}`); };
+    const { app, identity, store } = await serve(w, { before: completeAll, env: { GH_ENTERPRISE_TOKEN: token } });
+    await publishSettled(app, identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'gh failed: Authorization: token [token]' });
+  });
+
+  describe('a publish\'s in-flight record', () => {
+    it('is written before any GitHub call', async () => {
+      const w = world();
+      let seen: unknown;
+      const opening = Promise.withResolvers<void>();
+      w.github.checks.check = async () => { opening.resolve(); return { outcome: 'clear', baseHead: 'b'.repeat(40) }; };
+      const { app, identity, store } = await serve(w, { before: completeAll, startup: false });
+      app.publishOwed(() => undefined);
+      seen = store.lastPublish(identity)?.outcome;
+      await opening.promise;
+      expect(seen).toBe('publishing');
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+    });
+    it('left by a process that stopped after the PR opened is settled as interrupted at startup', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service);
+        const s = service.store, id = service.config.identity;
+        // The crashed process recorded its publish as started; its outcome never landed, and nothing is owed now.
+        s.recordPublish(id, { outcome: 'publishing', draft: false, message: 'A pull request is being published.' });
+        s.cancelTask(id, s.getTask(id).stateVersion, randomUUID());
+      } });
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped', message: expect.stringMatching(/interrupted before it recorded an outcome/) });
+      expect(app.publishing!.busy(identity)).toBe(false);
+      expect(w.github.calls).toEqual([]);
+    });
+    it('starts no publish when it cannot be written', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: completeAll, startup: false });
+      vi.spyOn(store, 'recordPublish').mockImplementationOnce(() => { throw new Error('disk full'); });
+      app.publishOwed(() => undefined);
+      await app.publishing!.settled(identity);
+      expect(w.github.calls).toEqual([]);
+      expect(store.lastPublish(identity)).toBeNull();
+    });
+  });
+
+  describe('a publish action whose process stopped before its outcome was recorded', () => {
+    /** As the crashed process left it: the action committed its `publishing` reply, and its publish recorded nothing. */
+    const plant = (service: ReviewService, actionId: string) => {
+      const s = service.store, id = service.config.identity, expectedStateVersion = s.getTask(id).stateVersion;
+      s.userAction(id, { actionId, kind: 'publish', request: { attemptId: undefined, expectedStateVersion } }, () => ({ outcome: 'publishing', draft: false }));
+      return expectedStateVersion;
+    };
+    it('is settled by the startup publish when one is owed, so its replay reports that outcome', async () => {
+      const w = world(), actionId = randomUUID();
+      let version = -1;
+      const { app, identity, store } = await serve(w, { before: service => { completeAll(service); version = plant(service, actionId); } });
+      await publishSettled(app, identity);
+      expect(store.hasUnsettledPublishAction(identity)).toBe(false);
+      expect((await act(app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', draft: false, number: 100 });
+      expect(w.github.prs).toHaveLength(1);
+    });
+    it('is settled as interrupted at startup when nothing is owed, instead of replaying `publishing` for ever', async () => {
+      const w = world(), actionId = randomUUID();
+      let version = -1;
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service); version = plant(service, actionId);
+        // Meanwhile the task left what a publish serves (a person cancelled it), so nothing is owed at startup.
+        service.store.cancelTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, randomUUID());
+      } });
+      expect(store.hasUnsettledPublishAction(identity)).toBe(false);
+      expect((await act(app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'stopped', message: expect.stringMatching(/interrupted before it recorded an outcome/) });
+      expect(w.github.calls).toEqual([]);
+    });
+  });
+
+  it('pays a scope pause an earlier run owes instead of publishing its unreviewed changes as ready, at startup', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: completeAllOwingPause });
+    await app.publishing!.settled(identity);
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(w.github.calls).toEqual([]);
+    expect(store.lastPublish(identity)).toBeNull();
+  });
+  it('refuses the publish action while a scope pause is owed, and pays it', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: completeAllOwingPause, startup: false });
+    expect((await view(app)).publish).toMatchObject({ publishable: false });
+    expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/scope pause that has not been acted on/) } });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    await app.publishing!.settled(identity);
+    expect(w.github.calls).toEqual([]);
+  });
+
+  describe('round 1 of the independent review', () => {
+    it('starts nothing when the publish action is refused for a stale view, though a publish is owed', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service);
+        service.store.recordPublish(service.config.identity, { outcome: 'refused', draft: false, message: 'The branch moved.' });
+      }, startup: false });
+      const stale = store.getTask(identity).stateVersion - 1;
+      expect(await act(app, 'publish', randomUUID(), stale)).toMatchObject({ status: 409, body: { error: 'Stale task state. Reload before writing.' } });
+      expect(app.publishing!.busy(identity)).toBe(false);
+      expect(w.github.calls).toEqual([]);
+    });
+    it('keeps a task recorded as not published at the upgrade unpublished at startup, after unrelated changes', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service);
+        const s = service.store, id = service.config.identity;
+        // The upgrade comes after those runs (a later millisecond: timestamps are compared).
+        const until = Date.now() + 3; while (Date.now() < until) { /* let the clock move */ }
+        s.recordPublish(id, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
+        // An unrelated change since moves the task's state version.
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      } });
+      await app.publishing!.settled(identity);
+      expect(w.github.calls).toEqual([]);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'not published' });
+    });
+    it('still settles a leftover in-flight record at startup when paying owed work fails', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { startup: false, before: service => {
+        const s = service.store, id = service.config.identity;
+        // Running, with P2 and P3 still to run: owed work would be paid, and nothing can be published.
+        s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+        const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+        s.markRunning(id, attempt.id);
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head: s.getSnapshot(id).head, unchanged: true, inScope: [], outOfScope: [] } });
+        s.recordPublish(id, { outcome: 'publishing', draft: false, message: 'A pull request is being published.' });
+      } });
+      expect(store.getTask(identity).status).toBe('running');
+      const pay = vi.spyOn(app.executor!, 'payOwed').mockImplementation(() => { throw new Error('The snapshot of P1\'s commit is missing.'); });
+      app.publishOwed(() => undefined);
+      expect(pay).toHaveBeenCalled();
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped' });
+    });
+    it('settles only a stuck reply with the outcome on record, leaving that record as it is', async () => {
+      const w = world(), actionId = randomUUID();
+      const first = await serve(w, { before: completeAll });
+      await publishSettled(first.app, first.identity);
+      const opened = first.store.lastPublish(first.identity)!;
+      expect(opened).toMatchObject({ outcome: 'opened', number: 100 });
+      // A publish action committed its reply, and the process stopped before that publish recorded itself as started.
+      const version = first.store.getTask(first.identity).stateVersion;
+      first.store.userAction(first.identity, { actionId, kind: 'publish', request: { attemptId: undefined, expectedStateVersion: version } }, () => ({ outcome: 'publishing', draft: false }));
+      await first.close();
+      const second = await serve(w);
+      expect(second.store.lastPublish(second.identity)).toEqual(opened);
+      expect((await act(second.app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', number: 100 });
+    });
+    it('retries a publish refused while a lost opening settles, at that opening\'s deadline', async () => {
+      const w = world();
+      // The first publish's opening reply is lost: GitHub created the PR, its list does not show it yet.
+      w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); throw new Error('timed out'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 2_500 });
+      await publishSettled(app, identity);
+      expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opening' }]);
+      w.github.onOpen = undefined;
+      // Asked again at once: the opening is still settling, so this publish is refused.
+      await act(app, 'publish');
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused' }), { timeout: 5_000 });
+      w.github.hidden.clear();
+      // Retried by itself at the deadline: the lost opening's PR is recovered by its marker, not opened again.
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 100 }), { timeout: 8_000, interval: 50 });
+      expect(w.github.prs).toHaveLength(1);
+    });
+  });
+
+  describe('round 2 of the independent review', () => {
+    it('retries by itself a publish whose own opening reply was lost', async () => {
+      const w = world();
+      // GitHub creates the PR, but its list does not show it yet, and the reply is lost.
+      w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); w.github.onOpen = undefined; throw new Error('timed out'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 2_000 });
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      w.github.hidden.clear();
+      // No action and no restart: the retry at the opening's deadline recovers it by its marker.
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 100 }), { timeout: 8_000, interval: 50 });
+      expect(w.github.prs).toHaveLength(1);
+    });
+    it('publishes a task recorded as not published at the upgrade once a run has started after it', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        service.store.recordPublish(service.config.identity, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
+        // A person resumed it after the upgrade (a later millisecond: timestamps are compared), and that run completed the plan.
+        const until = Date.now() + 3; while (Date.now() < until) { /* let the clock move */ }
+        completeAll(service);
+      } });
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+    });
+    it('pays owed work only for its own refusal: a stale or replayed publish action starts nothing', async () => {
+      const w = world(), actionId = randomUUID();
+      const { app, identity, store } = await serve(w, { before: completeAllOwingPause, startup: false });
+      const stale = store.getTask(identity).stateVersion - 1;
+      expect(await act(app, 'publish', actionId, stale)).toMatchObject({ status: 409, body: { error: 'Stale task state. Reload before writing.' } });
+      expect(store.getTask(identity).status).toBe('running');
+      // The replay of that saved refusal applies nothing either.
+      expect(await act(app, 'publish', actionId, stale)).toMatchObject({ status: 409 });
+      expect(store.getTask(identity).status).toBe('running');
+      expect(app.executor!.owes(identity)).toBe(true);
+      // Its own refusal for the owed pause pays it.
+      expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
+      expect(store.getTask(identity).status).toBe('needs amendment');
+    });
+    it('publishes the draft of a needs-human task although a scope pause is owed', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAllOwingPause(service);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      } });
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true })]);
+    });
+    it('keeps an interrupted draft publish recorded as a draft when startup settles it', async () => {
+      const w = world();
+      const { identity, store } = await serve(w, { before: service => {
+        const s = service.store, id = service.config.identity;
+        s.recordPublish(id, { outcome: 'publishing', draft: true, message: 'A pull request is being published.' });
+        s.cancelTask(id, s.getTask(id).stateVersion, randomUUID());
+      } });
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped', draft: true });
+    });
+  });
+
+  describe('round 3 of the independent review', () => {
+    it('does not retry for ever when a lost opening stays stuck past its deadline', async () => {
+      const w = world();
+      // The opening's reply is lost (GitHub created the PR; its list does not show it yet).
+      w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); w.github.onOpen = undefined; throw new Error('timed out'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_000, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      // Someone copied its description onto another PR from the branch: recovery cannot tell which is the task's, so the
+      // opening stays, and every publish of it is refused for a reason only a person can fix.
+      const pr = w.github.prs[0]!;
+      w.github.prs.push({ ...pr, number: 999, url: `https://github.com/${REPO}/pull/999`, base: 'release' });
+      w.github.hidden.clear();
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      const publishes = starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      // The first publish and one retry at the opening's deadline; not one more every second.
+      expect(publishes).toBeLessThanOrEqual(2);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused' });
+    });
+    it('publishes the draft of an upgraded task when a person\'s refused resume moves it to needs human', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { startup: false, before: service => {
+        budgetSpent(service);
+        service.store.recordPublish(service.config.identity, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
+      } });
+      expect(await act(app, 'resume')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/time budget/) } });
+      expect(store.getTask(identity).status).toBe('needs human');
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+    });
+  });
+
+  describe('round 4 of the independent review', () => {
+    it('stops retrying when GitHub keeps failing every open: one retry at the deadline, not one every settle time', async () => {
+      const w = world();
+      // GitHub fails every open, creating nothing.
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 800, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      app.publishOwed(() => undefined);
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      expect(starts.mock.calls.filter(call => call[1].outcome === 'publishing').length).toBe(2);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' });
+    });
+    it('reconciles a ready PR that GitHub showed at another head: still owed, and published again by itself', async () => {
+      const w = world();
+      w.github.staleHeadOnce = 'a'.repeat(40);
+      const { app, identity, store } = await serve(w, { before: completeAll, shortRetryMs: 300, startup: false });
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', reconcile: true }), { timeout: 10_000 });
+      expect(store.getTask(identity).status).toBe('running');
+      expect(w.github.prs[0]!.draft).toBe(true);
+      // The short retry publishes again, and this time GitHub shows the pushed head.
+      await vi.waitFor(() => expect(store.getTask(identity).status).toBe('in review'), { timeout: 10_000, interval: 50 });
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+      expect(store.lastPublish(identity)!.reconcile).toBeUndefined();
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: false })]);
+    });
+    it('retries once, after a short wait, a publish refused because GitHub\'s list lags behind its PR', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: needsHuman, shortRetryMs: 300 });
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+      // Owed again (an earlier attempt failed), and GitHub's list does not show the PR for now.
+      store.recordPublish(identity, { outcome: 'refused', draft: true, message: 'The branch moved.' });
+      w.github.hidden.add(100);
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/list does not show it yet/) }), { timeout: 10_000 });
+      w.github.hidden.clear();
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true }), { timeout: 10_000, interval: 50 });
+    });
+  });
+
+  describe('round 5 of the independent review', () => {
+    it('gives a persistent list lag one short retry, not one every period', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: needsHuman, shortRetryMs: 200 });
+      await publishSettled(app, identity);
+      store.recordPublish(identity, { outcome: 'refused', draft: true, message: 'The branch moved.' });
+      // GitHub's list keeps leaving the PR out.
+      w.github.hidden.add(100);
+      const starts = vi.spyOn(store, 'recordPublish');
+      app.publishOwed(() => undefined);
+      await new Promise(resolve => setTimeout(resolve, 5_000));
+      expect(starts.mock.calls.filter(call => call[1].outcome === 'publishing').length).toBe(2);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/list does not show it yet/) });
+    });
+    it('starts no startup publish unless the lock check passes, which runs first', async () => {
+      const w = world();
+      const { app, identity } = await serve(w, { before: completeAll, startup: false });
+      const order: string[] = [];
+      expect(() => app.publishOwed(() => { order.push('verify'); throw new Error('The database path changed while opening. Refusing to start.'); }))
+        .toThrow('The database path changed');
+      expect(app.publishing!.busy(identity)).toBe(false);
+      expect(w.github.calls).toEqual([]);
+      app.publishOwed(() => { order.push('verify'); expect(app.publishing!.busy(identity)).toBe(false); });
+      expect(order).toEqual(['verify', 'verify']);
+      expect(app.publishing!.busy(identity)).toBe(true);
+      await publishSettled(app, identity);
+    });
+    it('starts a new chain with its own retries when a person asks again', async () => {
+      const w = world();
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 800, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      const publishes = () => starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      app.publishOwed(() => undefined);
+      // The first chain: its publish and one retry at the opening's deadline, then nothing.
+      await new Promise(resolve => setTimeout(resolve, 4_000));
+      expect(publishes()).toBe(2);
+      // A person asks again: a new chain, which gets its own retry at its opening's deadline.
+      await act(app, 'publish');
+      await new Promise(resolve => setTimeout(resolve, 4_000));
+      expect(publishes()).toBe(4);
+    });
+  });
+
+  describe('round 6 of the independent review', () => {
+    it('drops the old chain\'s armed retry when a person asks again', async () => {
+      const w = world();
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_500, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      const publishes = () => starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      // The first chain's retry at its opening's deadline is armed; a person asks again before it fires.
+      await act(app, 'publish');
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      // The first publish, the person's, and that chain's one retry: the old chain's timer never fires on the new budget.
+      expect(publishes()).toBe(3);
+    });
+    it('records no reconcile for a ready PR whose task can no longer be published, and replays reconcile when it is set', async () => {
+      const w = world();
+      // The task is cancelled while its PR opens: the PR is recorded, and nothing would ever reconcile it.
+      let cancel: (() => void) | undefined;
+      w.github.onOpen = async () => { cancel?.(); };
+      const first = await serve(w, { before: completeAll, startup: false });
+      cancel = () => first.store.cancelTask(first.identity, first.store.getTask(first.identity).stateVersion, randomUUID());
+      first.app.publishOwed(() => undefined);
+      await publishSettled(first.app, first.identity);
+      expect(first.store.getTask(first.identity).status).toBe('cancelled');
+      expect(first.store.lastPublish(first.identity)).toMatchObject({ outcome: 'opened' });
+      expect(first.store.lastPublish(first.identity)!.reconcile).toBeUndefined();
+      // A publish action whose PR GitHub shows at another head: its saved reply, replayed, says reconcile too.
+      const v = world();
+      v.github.staleHeadOnce = 'a'.repeat(40);
+      const second = await serve(v, { before: completeAll, startup: false });
+      const actionId = randomUUID(), version = second.store.getTask(second.identity).stateVersion;
+      await act(second.app, 'publish', actionId, version);
+      await second.app.publishing!.settled(second.identity);
+      expect((await act(second.app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', reconcile: true });
+    });
+  });
+
+  describe('round 7 of the independent review', () => {
+    /** A safety finding the audit made on the last attempt, whose save failed: the executor holds it, owed, in memory. */
+    const owedFinding = (store: Store, findings: SafetyFindings, identity: PlanIdentity) => {
+      const attempt = store.getAttempts(identity).at(-1)!;
+      vi.spyOn(store, 'recordSafetyFinding').mockImplementationOnce(() => { throw new Error('database is locked'); });
+      findings.record(attempt.id, 'The last item wrote outside its workspace.');
+      expect(findings.owedAttempts()).toEqual([attempt.id]);
+    };
+    it('refuses a ready publish while a safety finding is owed, pays it, and publishes the draft instead', async () => {
+      const w = world(), actionId = randomUUID();
+      const { app, identity, store, findings } = await serve(w, { before: completeAll, startup: false });
+      owedFinding(store, findings, identity);
+      expect((await view(app)).publish).toMatchObject({ publishable: false });
+      const version = store.getTask(identity).stateVersion;
+      expect(await act(app, 'publish', actionId, version)).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
+      // Paid: the task went to a person, and its draft is published with the finding as its problem.
+      expect(store.getTask(identity).status).toBe('needs human');
+      await publishSettled(app, identity);
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The last item wrote outside its workspace.') })]);
+      // A replay of that refusal applies nothing: no payment, no publish.
+      const pay = vi.spyOn(app.executor!, 'payOwed'), publishIfOwed = vi.spyOn(app.publishing!, 'publishIfOwed');
+      expect(await act(app, 'publish', actionId, version)).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
+      expect(pay).not.toHaveBeenCalled();
+      expect(publishIfOwed).not.toHaveBeenCalled();
+    });
+    it('pays a safety finding owed on a needs-human task before its draft, at startup', async () => {
+      const w = world();
+      const { app, identity, store, findings } = await serve(w, { before: needsHuman, startup: false });
+      owedFinding(store, findings, identity);
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      expect(findings.owedAttempts()).toEqual([]);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The last item wrote outside its workspace.') })]);
+    });
+    it('names a later return to needs human by its own reason, not a finding paid before', async () => {
+      const w = world();
+      const { app, identity, store, findings } = await serve(w, { before: completeAll, startup: false });
+      owedFinding(store, findings, identity);
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      expect(w.github.prs).toEqual([expect.objectContaining({ body: expect.stringContaining('The last item wrote outside its workspace.') })]);
+      // A person dealt with the finding and the task ran again: its new attempt failed, and the next admission came after
+      // the task's budget, so it is back in needs human for that reason.
+      store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+      const admit = (now?: number) => store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute',
+        item: store.getPlan(identity).items[0]!.id, expectedContext: store.currentContext(identity), deadline: (now ?? Date.now()) + 60_000, ...(now ? { now } : {}) });
+      const attempt = admit();
+      store.markRunning(identity, attempt.id);
+      store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: 'The tests failed in retry.ts.' });
+      expect(() => admit(store.getTask(identity).budgetDeadline! + 1)).toThrow(/time budget/);
+      expect(store.getTask(identity).status).toBe('needs human');
+      app.publishing!.publishIfOwed(identity);
+      await publishSettled(app, identity);
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The tests failed in retry.ts.') })]);
+      expect(w.github.prs[0]!.body).not.toContain('The last item wrote outside its workspace.');
+    });
+    it('keeps one retry timer per task when a run\'s end starts a new chain while one is armed', async () => {
+      const w = world();
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_500, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      const publishes = () => starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      // A run's end starts a new chain while the first chain's retry is armed.
+      app.publishing!.publishIfOwed(identity);
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      // The first publish, the new chain's, and that chain's one retry; the first chain's timer never fires.
+      expect(publishes()).toBe(3);
+    });
+  });
+
+  describe('round 9 of the independent review', () => {
+    it('retries once, after a short wait, a publish refused because the task changed during it', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: completeAll, shortRetryMs: 200, startup: false });
+      const check = store.recordAlreadyFixed.bind(store);
+      vi.spyOn(store, 'recordAlreadyFixed').mockImplementationOnce(() => { throw new GuardRefusal('The review changed during the check. Reload before writing.'); })
+        .mockImplementation(check);
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/review changed/) }), { timeout: 10_000 });
+      // Nothing a person must fix: the short retry publishes the task as it is now.
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false }), { timeout: 10_000, interval: 50 });
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: false })]);
+    });
+    it('names a safety finding whose save failed in the draft, even after the budget ran out', async () => {
+      const w = world();
+      const finding = 'Safety violation: The item wrote outside its workspace.';
+      const before = (service: ReviewService) => {
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+        const admit = (now?: number) => s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+          expectedContext: s.currentContext(id), deadline: (now ?? Date.now()) + 60_000, ...(now ? { now } : {}) });
+        const attempt = admit();
+        s.markRunning(id, attempt.id);
+        // The finding's own save failed, so the attempt row carries it only as its diagnostic; the run still escalated.
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: finding });
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      };
+      const { app, identity, store } = await serve(w, { before, startup: false });
+      expect(store.getAttempts(identity).at(-1)).toMatchObject({ safetyFinding: null, diagnostic: expect.stringContaining(finding) });
+      vi.spyOn(Date, 'now').mockReturnValue(store.getTask(identity).budgetDeadline! + 1);
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      vi.mocked(Date.now).mockRestore();
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(finding) })]);
+      expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+    });
+    it('pays no scope pause for a needs-human task, so nothing is logged as unsettled', async () => {
+      const w = world();
+      const before = (service: ReviewService) => {
+        completeAllOwingPause(service);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      };
+      const { app, identity, store } = await serve(w, { before, startup: false });
+      const errors = vi.spyOn(console, 'error');
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      expect(errors.mock.calls.filter(call => String(call[0]).includes('Could not settle what an earlier run owes'))).toEqual([]);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+    });
+  });
+
+  it('never publishes in a demo, even with a publisher', async () => {
+    const w = world();
+    const { app } = await serve(w, { demo: true, before: completeAll });
+    expect(app.publishing).toBeNull();
+    expect((await view(app)).publish).toMatchObject({ available: false });
+    expect(await act(app, 'publish')).toMatchObject({ status: 409 });
+    expect(w.github.calls).toEqual([]);
+  });
+});
+
+describe('github.baseBranch', () => {
+  it('is required, and refused when Git would refuse it as a branch name', () => {
+    expect(baseBranch({ baseBranch: 'main' })).toBe('main');
+    expect(baseBranch({ baseBranch: 'release/2.x' })).toBe('release/2.x');
+    for (const bad of [undefined, '', '-main', 'a..b', 'a//b', 'a/', 'a.', 'a.lock', 'a/.b', 'a@{b', 'a b', 'a\nb'])
+      expect(() => baseBranch({ baseBranch: bad })).toThrow(/github\.baseBranch/);
+    expect(() => baseBranch(undefined)).toThrow(/github\.baseBranch/);
+  });
+});

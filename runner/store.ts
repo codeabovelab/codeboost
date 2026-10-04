@@ -50,6 +50,21 @@ export interface MergeAttempt {
 export function mergeActionResponse(attempt: MergeAttempt) {
   return { attemptId: attempt.id, state: attempt.state, reason: attempt.reason, url: attempt.url };
 }
+/**
+ * The last publish of a task (#103), as GET /api/runner shows it. `outcome` is the publisher's outcome kind, or `refused`
+ * (a guard or GitHub refusal a person acts on), `failed` (anything else) or `stopped` (shutdown). `stateVersion` is the
+ * task's state version when it was recorded: a publish owed since then has not run yet.
+ */
+export interface PublishRecord {
+  outcome: string; draft: boolean; message: string; stateVersion: number; at: string; number?: number; url?: string;
+  /** An `opened` outcome that left the PR or the task not where the publish meant them: still owed (#103). */
+  reconcile?: boolean;
+}
+/** What the publish action replays once its publish has settled: the outcome, as `publish.last` shows it. */
+export function publishActionResponse(record: PublishRecord) {
+  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.reconcile ? { reconcile: true } : {}), ...(record.number === undefined ? {} : { number: record.number }),
+    ...(record.url === undefined ? {} : { url: record.url }) };
+}
 export interface TaskRecord {
   planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
   currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
@@ -102,8 +117,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 9) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 10) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -147,6 +162,17 @@ export class Store {
           if (!columns.includes('metadata_baseline')) this.#db.exec('ALTER TABLE attempts ADD COLUMN metadata_baseline TEXT');
           if (!columns.includes('storage_base')) this.#db.exec('ALTER TABLE attempts ADD COLUMN storage_base TEXT');
           this.#db.exec('PRAGMA user_version=9');
+        }
+        // The last publish of each task (#103): what GET /api/runner shows, kept across restarts so a refusal stays visible.
+        // A task already running or in needs human reached that status before codeboost published anything: it is recorded as
+        // not published, at its current state version, so the first start after the upgrade opens no PR a person did not ask
+        // for. The publish action publishes it.
+        if (version < 10) {
+          this.#db.exec('CREATE TABLE IF NOT EXISTS publish_outcomes (plan_key TEXT PRIMARY KEY REFERENCES tasks(plan_key), data TEXT NOT NULL)');
+          this.#run(`INSERT OR IGNORE INTO publish_outcomes (plan_key,data) SELECT plan_key, json_object('outcome','not published','draft',json('false'),
+            'message','This task reached its status before codeboost published pull requests. Use the publish action to publish it.',
+            'stateVersion',state_version,'at',?) FROM tasks WHERE status IN ('running','needs human')`, new Date().toISOString());
+          this.#db.exec('PRAGMA user_version=10');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -805,6 +831,11 @@ export class Store {
       AND state='completed' AND ${rev} = ?`).all(key, revision).map(entry => entry.item as string);
     return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier, finished };
   }
+  /** The heads of completed execute attempts that changed files outside their plan item, oldest first. */
+  scopeFindingHeads(identity: PlanIdentity): string[] {
+    return this.#db.prepare(`SELECT json_extract(result,'$.head') AS head FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+      AND json_valid(result) AND json_array_length(json_extract(result,'$.outOfScope')) > 0 ORDER BY rowid`).all(identityKey(identity)).map(row => row.head as string);
+  }
   getAttempts(identity: PlanIdentity): AttemptRecord[] {
     return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));
   }
@@ -1117,6 +1148,16 @@ export class Store {
     // Interrupted work waiting to be requeued, or a rebase in progress, is not finished work to publish.
     if (task.requeue_pending === 1) throw new GuardRefusal('The task has interrupted work waiting to be requeued.');
     if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+    // A ready PR is finished work: every item of the current plan revision has a completed execute attempt. Checked here,
+    // at every guarded publish write, so a plan revision that adds an item while a publish awaits GitHub refuses it.
+    if (!draft) {
+      const current = this.#current(key), revision = current.revision as number;
+      const items = decode<Plan>(this.#get('SELECT data FROM revisions WHERE key=? AND revision=?', key, revision)!.data).items;
+      const finished = new Set(this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
+        AND state='completed' AND json_extract(context,'$.planRevision') = ?`).all(key, revision).map(entry => entry.item as string));
+      const unrun = items.find(item => !finished.has(item.id));
+      if (unrun) throw new GuardRefusal(`${unrun.id} has not run yet; publish once every plan item has run.`);
+    }
   }
   /**
    * Records a pre-PR check. A match, or a check that could not be completed, moves a running task to possibly already
@@ -1280,6 +1321,39 @@ export class Store {
       this.#touch(key);
       return this.#task(key).state_version as number;
     });
+  }
+  /**
+   * Record a publish's outcome. An observation, not a task change: the task's state version does not move, so a refused
+   * publish leaves the task exactly as it was. Settlement writes go through the shutdown capability.
+   */
+  recordPublish(identity: PlanIdentity, record: Omit<PublishRecord, 'stateVersion' | 'at'>, actionId?: string): PublishRecord {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const saved: PublishRecord = { ...record, message: record.message.slice(0, 2000), stateVersion: this.#task(key).state_version as number, at: new Date().toISOString() };
+      this.#run('INSERT INTO publish_outcomes (plan_key,data) VALUES (?,?) ON CONFLICT(plan_key) DO UPDATE SET data=excluded.data', key, encode(saved));
+      // The same transaction refreshes the publish action's replay, as for a merge, so a resent click reports this outcome.
+      // A reply still saying `publishing` is an action whose publish never recorded an outcome: its process stopped (a
+      // crash) before it could. One publish runs per task, so this outcome is that action's continuation and settles it
+      // too; otherwise its replay would say `publishing` for ever.
+      this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
+        AND (action_id=? OR json_extract(response,'$.value.outcome')='publishing')`, encode({ ok: true, value: publishActionResponse(saved) }), key, actionId ?? null);
+      return saved;
+    });
+  }
+  /** Settle every publish action reply still saying `publishing` with `record`, the outcome on record, unchanged. */
+  settleUnsettledPublishReplies(identity: PlanIdentity, record: PublishRecord): void {
+    this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
+      AND json_extract(response,'$.value.outcome')='publishing'`, encode({ ok: true, value: publishActionResponse(record) }), identityKey(identity));
+  }
+  /** Whether a publish action's saved reply still says `publishing`: its publish has not recorded an outcome yet. */
+  hasUnsettledPublishAction(identity: PlanIdentity): boolean {
+    return !!this.#get(`SELECT 1 FROM user_actions WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
+      AND json_extract(response,'$.value.outcome')='publishing' LIMIT 1`, identityKey(identity));
+  }
+  lastPublish(identity: PlanIdentity): PublishRecord | null {
+    const key = identityKey(identity); this.#task(key);
+    const row = this.#get('SELECT data FROM publish_outcomes WHERE plan_key=?', key);
+    return row ? decode<PublishRecord>(row.data) : null;
   }
   /** Whether the task can be published in this mode right now (status, no attempt, merge, requeue or rebase). */
   canPublish(identity: PlanIdentity, draft: boolean): boolean {

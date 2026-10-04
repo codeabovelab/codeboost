@@ -95,6 +95,8 @@ export class SafetyFindings {
   /** Whether the finding is only in memory: the Store knows nothing of it, so the executor must act on it itself. */
   unsaved(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
   settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
+  /** The attempts whose finding is owed (only in memory). Usually none, so a check over them costs nothing. */
+  owedAttempts(): string[] { return [...this.#unsaved.keys()]; }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined;
@@ -327,6 +329,35 @@ export class ItemExecutor {
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }
+  /**
+   * Whether an earlier run left work owed that the next run pays before any item: a safety finding not yet acted on, or
+   * a scope pause never recorded (a failed write, the write gate, a crash). Reads only.
+   */
+  owes(identity: PlanIdentity, options: { scope?: boolean } = {}): boolean {
+    // Cheap enough for a poll: owed findings are in memory (usually none), and only completed attempts that changed files
+    // outside their items are read, not every attempt with its result.
+    const key = identityKey(identity);
+    if (this.#findings.owedAttempts().some(id => this.#store.attemptOwner(id) === key)) return true;
+    if (options.scope === false) return false;
+    return this.#store.scopeFindingHeads(identity).some(head => !this.#store.checkpointAtHead(identity, head));
+  }
+  /**
+   * Pay what an earlier run owes, outside a run, as a run would before its first item (#103: a task that owes a pause or
+   * an escalation must not be published as finished). Null when nothing is owed, or a run of the task is in progress
+   * (it pays its own); otherwise the outcome: needs human, needs amendment, or stopped when it could not be written.
+   * `scope: false` pays only an owed safety finding (a task in needs human cannot record a pause).
+   */
+  payOwed(identity: PlanIdentity, options: { scope?: boolean } = {}): ExecutionOutcome | null {
+    if (this.#runner.closing || this.#runner.isActive(identity) || this.busy(identity)) return null;
+    const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [] });
+    for (const earlier of this.#store.getAttempts(identity)) {
+      const finding = this.#findings.get(earlier.id);
+      if (finding) return this.#escalate(identity, earlier, finding, stopped, [], true);
+    }
+    if (options.scope === false) return null;
+    const owed = this.#unpausedScopeFinding(identity);
+    return owed ? this.#pause(identity, owed.row, owed.result, stopped, [], true) : null;
+  }
   /** Held in #inFlight from its start to its return, so close() can await it. */
   #track(key: string, run: Promise<ExecutionOutcome>): Promise<ExecutionOutcome> {
     this.#inFlight.set(key, run.catch(() => undefined));

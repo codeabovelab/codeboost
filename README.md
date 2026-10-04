@@ -35,7 +35,7 @@ The issue must match the stored plan. The authenticated `gh` account must be abl
 
 ## Runner (opt-in)
 
-A configuration with a `github` block may also add a `runner` block. The runner carries out plan items with Claude Code in the agent container and commits each item in its own repository, never in yours:
+A configuration with a `github` block may also add a `runner` block. The runner carries out plan items with Claude Code in the agent container and commits each item in its own repository, never in yours. It then publishes the task's pull request, so the `github` block needs `"baseBranch": "main"` (the branch the PR targets):
 
 ```json
 {
@@ -51,7 +51,7 @@ A configuration with a `github` block may also add a `runner` block. The runner 
 - `diagnosticsCapBytes`: the size retention trims that directory back to. It is a target, not a hard limit: the file just saved is always kept, even when it alone passes the cap. The default is 256 MiB.
 - `limits`: task storage limits (`workBytes`, `workInodes`, `metadataBytes`, `metadataInodes`).
 
-The runner needs Docker and `CLAUDE_CODE_OAUTH_TOKEN`. At start, before the server opens, codeboost recovers what an earlier run left and builds the agent image; a recovery it cannot finish safely stops startup with what to do. `POST /api/runner` with `start` or `resume` runs the plan; the review screen has no buttons for them yet.
+The runner needs Docker and `CLAUDE_CODE_OAUTH_TOKEN`. At start, before the server opens, codeboost recovers what an earlier run left and builds the agent image; a recovery it cannot finish safely stops startup with what to do. `POST /api/runner` with `start` or `resume` runs the plan; the review screen has no buttons for them yet. When a run has completed every item, codeboost pushes the task head to a `codeboost/…` branch with your `gh` credentials and opens a ready pull request into `baseBranch`; a task that needs a person gets a draft pull request with its problems. A publish that was refused (for example, the branch holds a commit codeboost did not make) is retried with the `publish` action, and `GET /api/runner` shows the last outcome under `publish`. Demos never publish.
 
 ## Library
 

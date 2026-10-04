@@ -69,6 +69,8 @@ export interface GhMergeConfig {
   pullRequest: number;
   issue: number;
   method?: 'merge' | 'squash' | 'rebase';
+  /** The branch a task's pull request targets (#103). Required when the review has a runner block. */
+  baseBranch?: string;
 }
 
 type BranchRules = Pick<RemoteMergeState, 'rulesKnown' | 'atomicBaseGuard' | 'mergeQueue' | 'requiredChecks'>;

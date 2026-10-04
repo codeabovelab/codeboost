@@ -8,6 +8,7 @@ import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MERGE_OPERATION_TIMEOUT_MS, MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { ItemExecutor } from '../runner/execution.ts';
+import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
 import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
@@ -53,6 +54,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   let planning: PlanningDeps | undefined;
   /** Runs a task's plan items; one per Store, like the coordinator. Only the production runner has one. */
   let executor: ItemExecutor | null = null;
+  /** Publishes the task's pull request (#103); only a production runner whose setup built a publisher has one. */
+  let publishing: TaskPublishing | null = null;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
   const capability = service.store.shutdownCapability();
   try {
@@ -84,6 +87,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       const assembly = await runnerSetup(service, capability);
       runner = new RunnerCoordinator(service.store, assembly.deps, undefined, capability);
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
+      // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
+      if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, { ...(assembly.shortRetryMs !== undefined ? { shortRetryMs: assembly.shortRetryMs } : {}) }); }
     } catch (error) { service.close(); throw error; }
   }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
@@ -112,6 +117,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (runner!.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
     // Between two items no attempt is active, but the run that admits the next one is still going.
     if (executor.busy(identity)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
+    // A publish reads the task head and pushes it; a new item must not move it meanwhile.
+    if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
     const merge = service.store.getMergeAttempt(identity);
     if (merge && (merge.state === 'submitting' || merge.state === 'queued')) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
     // Only the view stops here: the action lets admission refuse, because its refusal also moves the idle task to needs
@@ -161,15 +168,45 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // One progress read per poll, shared by both flags.
     const progress = free && executor ? executor.progress(identity) : undefined;
     return { available: !!runner, task, attempts, startable: !!progress && offered('start', progress), resumable: !!progress && offered('resume', progress),
-      stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved };
+      stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved, publish: publishView(progress) };
   };
+  /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
+  const publishView = (progress?: ReturnType<ItemExecutor['progress']>) => {
+    if (!publishing) return { available: false, active: false, publishable: false, draft: false, last: null };
+    let mode: { draft: boolean } | null = null;
+    try { mode = publishing.mode(identity, progress); } catch (error) { if (!(error instanceof GuardRefusal) && !(error instanceof ShuttingDownError)) throw error; }
+    return { available: true, active: publishing.busy(identity), publishable: mode !== null, draft: mode?.draft ?? false, last: publishing.lastOutcome(identity) };
+  };
+  /** A run's outcome is in the task and attempt rows; once it ends, the task's status decides whether a publish is owed. */
+  const afterRun = (outcome: Promise<unknown>) => void outcome
+    .catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`))
+    .finally(() => publishing?.publishIfOwed(identity));
   const runnerAction = (input: Record<string, unknown>) => {
     const { action, attemptId, expectedStateVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
-    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
+    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'publish'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
     if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
     if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
-    return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
+    // A refused start or resume can still move the task to needs human (an expired budget is committed with the refusal),
+    // and a task that moves there is owed a draft PR (#103). Only that move publishes: a person who pressed resume on a
+    // task already in needs human asked for no publish.
+    if (action === 'start' || action === 'resume') {
+      const before = service.store.getTask(identity).status;
+      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.publishIfOwed(identity, { personAsked: true }); }
+    }
+    // A publish refused because an earlier run owes a pause or an escalation pays it here, outside the refused transaction
+    // (AGENTS.md: a refusal's durable change is committed outside it); a task it sends to needs human then gets its draft.
+    // Only this action's own refusal for owed work: one for a stale view or a busy task, and any replay (which applies
+    // nothing, AGENTS.md), starts nothing.
+    if (action === 'publish') {
+      let replay: boolean;
+      try { replay = !!service.store.savedAction(identity, { actionId: actionId as string, kind: 'publish', request: { attemptId, expectedStateVersion } }); }
+      catch { replay = true; }
+      try { return act(); }
+      catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.publishIfOwed(identity, { personAsked: true }); throw error; }
+    }
+    return act();
+    function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
@@ -179,9 +216,16 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (choice.queue) service.store.transitionTask(identity, expectedStateVersion as number, 'queued');
         const begun = executor!.begin(identity, { fromItem: choice.fromItem, claimRequeue: choice.claimRequeue });
         // The run goes on after this request; its outcome is in the task and attempt rows. An error the run throws (storage,
-        // a missing snapshot) is only logged, and the next start or resume derives what is owed again.
-        void begun.outcome.catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`));
+        // a missing snapshot) is only logged, and the next start or resume derives what is owed again. Once it ends, the
+        // task's PR is published if the task is finished or needs a person (#103).
+        afterRun(begun.outcome);
         return begun.attemptId ? { outcome: 'started', attemptId: begun.attemptId, item: choice.fromItem } : { outcome: 'settled' };
+      }
+      if (action === 'publish') {
+        // Retries a publish that failed or was refused (#103); it runs after this action commits, in the background.
+        if (!publishing) throw new GuardRefusal(config.demo ? 'Demos never publish pull requests.' : 'This runner does not publish pull requests.');
+        // Replaced by the publish's outcome once it settles (recordPublish), so a replay reports that.
+        return { outcome: 'publishing', draft: publishing.request(identity, actionId as string).draft };
       }
       if (action === 'cancel-attempt') {
         if (!runner.stop(identity, attemptId as string, 'cancelled')) throw new GuardRefusal('That attempt is not running.');
@@ -193,7 +237,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
       return { outcome: 'started', attemptId: retry.id };
-    }).response;
+    }).response; }
   };
   /** Handles of suggestion requests started by this process, removed once their outcome settles. */
   const suggestionHandles = new Map<string, SuggestionHandle>();
@@ -367,12 +411,22 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   server.requestTimeout = 15000;
   await new Promise<void>((resolve, reject) => { server.once('error', reject); server.listen(port, '127.0.0.1', () => { server.removeListener('error', reject); resolve(); }); }).catch(error => { service.close(); throw error; });
   const address = server.address(); if (!address || typeof address === 'string') throw new Error('Cannot determine local address.');
-  return { server, service, token, runner, executor, url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
+  return { server, service, token, runner, executor, publishing,
+    /**
+     * Startup (#103): a publish an earlier process owed (a lost opening, a run that ended before its publish completed)
+     * runs once, in the background; recovery finds a lost opening by its marker. A publish pushes, so `verifyLock`
+     * (the runner lock still names the database) runs first, here: if it throws, nothing starts and its error is thrown.
+     */
+    publishOwed: (verifyLock: () => void) => { verifyLock(); publishing?.startup(identity); },
+    url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;
     // Same turn as the admission flag: a request already reading its body must not start a new Ask worker.
     questions.stopAdmission();
     runner?.rejectAdmission();
+    // Publishes are aborted at once (the publisher already refuses every later push and opening, through the
+    // coordinator's flag) and awaited before the write gate closes, so their last records still land (#103).
+    const publishingClosed = publishing?.close().then(() => undefined, (error: unknown) => error);
     server.closeIdleConnections();
     const closing = new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
     let timer: ReturnType<typeof setTimeout> | undefined;
@@ -383,6 +437,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       active.abort.abort(reason);
       if(active.readingBody)active.request.destroy(reason);
     }
+    const publishingFailure = await publishingClosed;
     // Step 3: after the drain, close the Store write gate. A request-path write still pending after the abort
     // (for example merge reconciliation after a GitHub await) now fails with 503; settling coordinators keep the capability.
     service.store.closeWrites();
@@ -391,7 +446,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const issuesClosed=issues.close();
     // Every step runs even when an earlier one fails: agents are still stopped, plan runs awaited and the Store closed
     // last. The first failure is reported; a later one never hides it.
-    const failures: unknown[] = [];
+    const failures: unknown[] = publishingFailure === undefined ? [] : [publishingFailure];
     const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
     await step(() => merges?.close());
     await step(() => issuesClosed);

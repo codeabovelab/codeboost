@@ -41,7 +41,7 @@ function fixture() {
   const service = new ReviewService(demo);
   const issue = service.store.getPlan(demo.identity).issue;
   // A real review, not a demo: the runner needs a github block for the issue text.
-  const config = { ...demo, demo: false, github: { repository: 'owner/repo', pullRequest: 1, issue } };
+  const config = { ...demo, demo: false, github: { repository: 'owner/repo', pullRequest: 1, issue, baseBranch: 'main' } };
   service.config = config;
   cleanups.push(() => { try { service.close(); } catch { /* closed by the test */ } });
   return { root, service, config, demo };

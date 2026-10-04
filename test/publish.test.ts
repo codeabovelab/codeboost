@@ -1,4 +1,6 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
@@ -324,7 +326,7 @@ describe('schema v7', () => {
       expect(upgraded.taskPullRequests(identity)).toEqual([]);
       expect(upgraded.latestAlreadyFixed(identity)).toBeNull();
       const db = new DatabaseSync(path, { readOnly: true });
-      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 9 });
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 10 });
       const names = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND (name LIKE '%pull_requests%' OR name LIKE 'already_fixed_checks%') AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name").all().map(row => row.name);
       expect(names).toEqual(['already_fixed_checks', 'already_fixed_checks_task', 'task_pull_requests', 'task_pull_requests_number', 'task_pull_requests_opening', 'task_pull_requests_task']);
       db.close();
@@ -1230,6 +1232,29 @@ describe('gh subprocess environment', () => {
   });
 });
 
+describe('a plan revision during a publish (#103 review)', () => {
+  it('refuses a ready publish when a revision adds an item while its first GitHub lookups run', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), hidden = new Set<string>();
+    // A lost opening, so the next publish awaits GitHub (its recovery) before its guarded read.
+    await expect(harness(store, { live, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const marker of live.keys()) hidden.add(marker);
+    let revised = false;
+    const { publisher, log } = harness(store, { live, hidden, config: { settleMs: 0 }, onFind: () => {
+      if (revised) return;
+      revised = true;
+      // A reviewer saves a revision that adds P2, which never ran.
+      const current = store.getPlan(identity);
+      store.importRevision(JSON.stringify({ ...current, revision: current.revision + 1, items: [...current.items,
+        { id: 'P2', title: 'Log it', intent: 'Log rejected input', files: [{ path: 'a.ts', kind: 'edit', renamed_from: null, change: 'Log' }], acceptance: [{ type: 'check', text: 'Logged' }], depends_on: [] }] }),
+      'json', context, current.revision);
+    } });
+    // The revision's items have not run at that revision (P1 ran at the old one), so the ready publish is refused.
+    await expect(publisher.publish(identity)).rejects.toThrow(/^P1 has not run yet; publish once every plan item has run\.$/);
+    expect(log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
+    expect(store.getTask(identity).status).toBe('running');
+  });
+});
+
 describe('GitHub PR adapter', () => {
   const marker = '<!-- codeboost:opening=11111111-1111-4111-8111-111111111111 -->';
   const response = (over: Record<string, unknown> = {}) => ({ number: 7, html_url: 'https://github.com/owner/repo/pull/7', state: 'open', draft: true, body: `${marker}\nplan`,
@@ -1350,6 +1375,14 @@ describe('GitHub PR adapter', () => {
     // Our PR whose plan text quotes an older marker still matches exactly one: its own first line.
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: `${marker}\nplan quoting ${other}` })]))
       .findOpened({ ...input, markers: [other, marker] })).toMatchObject({ marker });
+  });
+  it('runs gh with the environment it was given, so its GH_HOST matches the push\'s', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codeboost-gh-'));
+    try {
+      writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf \'{"number":7,"state":"open","body":"","head":{"ref":"x"},"base":{"ref":"%s"}}\' "$GH_HOST"\n', { mode: 0o755 });
+      const gh = new GhPullRequestGateway({ repository: 'owner/repo', env: { PATH: `${dir}:${process.env.PATH}`, GH_HOST: 'ghe.example.com' } });
+      expect((await gh.readPull(7)).base).toBe('ghe.example.com');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails a draft opening that GitHub created as ready, so the opening stays owned for recovery', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ draft: false })));
