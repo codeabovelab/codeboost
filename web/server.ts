@@ -10,6 +10,7 @@ import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { ItemExecutor } from '../runner/execution.ts';
 import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
+import { baseBranch } from '../github/validate.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
 import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
@@ -64,7 +65,12 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // Issue retrieval is read-only, so demos may show it; they use a local fixture and never contact GitHub.
     issues = new IssueBoard(issueGateway ?? (config.demo ? demoIssueGateway() : config.github ? new GhIssueGateway(config.github.repository) : null),
       'Issue ranking needs a GitHub repository. Add a github block with a repository to the review configuration.');
-    merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), MERGE_OPERATION_TIMEOUT_MS, capability) : null;
+    // With a runner block the merge targets the task's published PR (#121); without one, github.pullRequest is required.
+    const published = !config.demo && config.runner !== undefined && config.github
+      ? { repository: config.github.repository, baseBranch: baseBranch(config.github), ...(config.github.pullRequest !== undefined ? { configured: config.github.pullRequest } : {}) } : undefined;
+    if (!config.demo && config.github && !published && !mergeGateway && config.github.pullRequest === undefined)
+      throw new Error('Add github.pullRequest, the pull request to merge, to the review configuration, or add a runner block so codeboost publishes its own.');
+    merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), MERGE_OPERATION_TIMEOUT_MS, capability, published) : null;
     if (runnerDeps && runnerSetup) throw new Error('Pass runner deps or a runner setup, not both.');
     // Without a runner (no runner block, or a demo), runner actions report that it is not configured.
     runner = runnerDeps ? new RunnerCoordinator(service.store, runnerDeps, undefined, capability) : null;

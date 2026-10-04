@@ -15,7 +15,9 @@ import type { GhMergeConfig } from '../github/merge.ts';
 export interface ReviewConfig { database: string; repository: string;
   /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
   runnerRepository?: string;
-  identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig }
+  identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig;
+  /** The runner block, parsed by `parseRunnerConfig`. Its presence also makes the merge target the task's published PR (#121). */
+  runner?: unknown }
 export class ReviewService {
   store: Store;
   config: ReviewConfig;

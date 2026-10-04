@@ -8,6 +8,7 @@ import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
 import { GhIssueGateway, type IssueText } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
+import { baseBranch } from '../github/validate.ts';
 import { identityKey } from '../core/identity.ts';
 import type { RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
@@ -137,18 +138,8 @@ export function recoveryWarnings(report: Pick<RecoveryReport, 'unmatchedStorage'
     ...report.unknownEntries.map(entry => `Unknown entry in the runner's attempt directory, left in place: ${quoteForTerminal(entry)}`)];
 }
 
-/**
- * The branch a task's PR targets: `github.baseBranch`, required with a runner block (#103). Checked before anything is
- * created; Git's own refusal would come only after a run, at the push or the opening.
- */
-export function baseBranch(github: { baseBranch?: unknown } | undefined): string {
-  const name = github?.baseBranch;
-  // A short branch name, as GitHub's pull request API takes it: not a full ref (`refs/heads/main`) and not HEAD.
-  if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,199}$/.test(name) || /\.\.|\/\/|\/\.|@\{|\.lock(?:\/|$)|[./]$/.test(name)
-    || name === 'HEAD' || name.startsWith('refs/'))
-    throw new Error('The runner publishes pull requests: add github.baseBranch, the branch they target (for example "main"), to the review configuration.');
-  return name;
-}
+/** Moved to github/validate.ts so the server can check it without loading the runner (#121). */
+export { baseBranch };
 
 export interface RunnerAssembly {
   readonly deps: RunnerDeps;
