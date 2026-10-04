@@ -7,6 +7,7 @@ import { fixtureGit as git } from './fixtures/git.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 import type { ReviewService } from '../runner/review.ts';
 import type { PreparedAttempt, RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
@@ -860,6 +861,58 @@ describe('publishing a finished task (#103)', () => {
       await new Promise(resolve => setTimeout(resolve, 6_000));
       // The first publish, the new chain's, and that chain's one retry; the first chain's timer never fires.
       expect(publishes()).toBe(3);
+    });
+  });
+
+  describe('round 9 of the independent review', () => {
+    it('retries once, after a short wait, a publish refused because the task changed during it', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: completeAll, shortRetryMs: 200, startup: false });
+      const check = store.recordAlreadyFixed.bind(store);
+      vi.spyOn(store, 'recordAlreadyFixed').mockImplementationOnce(() => { throw new GuardRefusal('The review changed during the check. Reload before writing.'); })
+        .mockImplementation(check);
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/review changed/) }), { timeout: 10_000 });
+      // Nothing a person must fix: the short retry publishes the task as it is now.
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false }), { timeout: 10_000, interval: 50 });
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: false })]);
+    });
+    it('names a safety finding whose save failed in the draft, even after the budget ran out', async () => {
+      const w = world();
+      const finding = 'Safety violation: The item wrote outside its workspace.';
+      const before = (service: ReviewService) => {
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+        const admit = (now?: number) => s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+          expectedContext: s.currentContext(id), deadline: (now ?? Date.now()) + 60_000, ...(now ? { now } : {}) });
+        const attempt = admit();
+        s.markRunning(id, attempt.id);
+        // The finding's own save failed, so the attempt row carries it only as its diagnostic; the run still escalated.
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: finding });
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      };
+      const { app, identity, store } = await serve(w, { before, startup: false });
+      expect(store.getAttempts(identity).at(-1)).toMatchObject({ safetyFinding: null, diagnostic: expect.stringContaining(finding) });
+      vi.spyOn(Date, 'now').mockReturnValue(store.getTask(identity).budgetDeadline! + 1);
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      vi.mocked(Date.now).mockRestore();
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(finding) })]);
+      expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+    });
+    it('pays no scope pause for a needs-human task, so nothing is logged as unsettled', async () => {
+      const w = world();
+      const before = (service: ReviewService) => {
+        completeAllOwingPause(service);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      };
+      const { app, identity, store } = await serve(w, { before, startup: false });
+      const errors = vi.spyOn(console, 'error');
+      app.publishOwed(() => undefined);
+      await publishSettled(app, identity);
+      expect(errors.mock.calls.filter(call => String(call[0]).includes('Could not settle what an earlier run owes'))).toEqual([]);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
     });
   });
 
