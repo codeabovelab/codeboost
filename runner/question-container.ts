@@ -182,7 +182,7 @@ const stopMessages: Record<StopReason, string> = {
   cancelled: 'Agent cancelled.', timeout: 'Agent timed out. Try again.', shutdown: 'Server stopped. Retry the question.',
   'output-limit': 'Agent output exceeded its limit.', 'capture-failure': 'The agent container failed. Try again.',
 };
-const sameContext = (left: InvocationContext, right: InvocationContext) =>
+export const sameContext = (left: InvocationContext, right: InvocationContext) =>
   (Object.keys(right) as (keyof InvocationContext)[]).every(key => left[key] === right[key])
   && Object.keys(left).length === Object.keys(right).length;
 /** Accept only the result of this exact invocation, and only a clean exit. */
@@ -205,42 +205,86 @@ export function answerFromResult(provider: Provider, result: InvocationResult, i
  * the "questions" phase (read, list and search only; no commands), and vendor-only network access.
  * Every step is bounded by `deadline`. Storage is released only after the invocation settles.
  */
-export async function askInContainer(question: ContainerQuestion, deps: ContainerDependencies,
-  signal: AbortSignal, image: { id?: string } = {}, retained = new RetainedStorage()): Promise<string> {
+/**
+ * What differs between features that run one read-only agent in lane D's container (Ask, planning): the phase, the
+ * host root, limits, and the wording a person sees. Everything else is `runReadOnlyAgent`.
+ */
+export interface ReadOnlyFeature {
+  readonly phase: 'questions' | 'planning';
+  /** Prefix of the host root, under tmpdir(), that holds the clone's staging and the input mount. */
+  readonly rootPrefix: string;
+  /** Deletes one of this feature's roots and refuses any other path. Throws while the root is still on disk. */
+  removeRoot(root: string): void;
+  readonly storage: TaskStorageLimits;
+  /** The credential for `provider`, or a refusal. Runs before any Docker or Git work. */
+  credential(provider: Provider, env: ContainerDependencies['env']): string;
+  /** Throws when the repository at `head` would not fit `storage`. Runs before any host copy is made. */
+  assertFits(size: RepositorySize): void;
+  /** Shown when the deadline passes during setup. */
+  readonly timedOut: string;
+  /** This exact invocation's text after a clean exit, or a refusal. The text is still unvalidated. */
+  output(provider: Provider, result: InvocationResult, invocation: InvocationInput): string;
+  /** What a run throws when its cleanup did not settle. `failure` holds the run's own error, when it had one. */
+  cleanupFailed(failures: readonly unknown[], failure?: { error: unknown }): Error;
+}
+/** One read-only invocation: whose code, which attempt, and what the agent is asked. */
+export interface ReadOnlyRun {
+  readonly provider: Provider;
+  /** Host checkout to clone. The agent sees a read-only copy of `head`, never this directory. */
+  readonly repository: string;
+  readonly head: string;
+  /** Written as `io.codeboost.runner` on every Docker object this run creates. */
+  readonly runnerOwner: string;
+  readonly attemptId: string;
+  readonly taskId: string;
+  readonly deadline: number;
+  readonly context: InvocationContext;
+  readonly prompt: string;
+  /** The only file in the input mount. Claude planning receives it as `--json-schema`. */
+  readonly schemaText: string;
+}
+
+/**
+ * Run one read-only agent in lane D's container: a fresh container on a read-only copy of `head`, with vendor-only
+ * egress and the feature's phase. Resources are released on every path; what Docker or the host did not confirm
+ * removed is kept in `retained`, and the feature stays off while any remains.
+ *
+ * Lane D's image build, clone and storage allocation are synchronous Docker and Git calls, so callers run this in a
+ * worker thread whose TMPDIR is the feature's own root.
+ */
+export async function runReadOnlyAgent(feature: ReadOnlyFeature, run: ReadOnlyRun, deps: Omit<ContainerDependencies, 'recover'>,
+  signal: AbortSignal, image: { id?: string }, retained: RetainedStorage): Promise<string> {
   const remaining = () => {
     signal.throwIfAborted();
-    const value = question.deadline - Date.now();
-    if (value < 1) throw new Error('Agent timed out. Try again.');
+    const value = run.deadline - Date.now();
+    if (value < 1) throw new Error(feature.timedOut);
     return value;
   };
-  const credential = questionCredential(question.provider, deps.env);
+  const credential = feature.credential(run.provider, deps.env);
   retained.release(deps.removeFilesystems);
   image.id ??= deps.buildImage(remaining());
-  const root = mkdtempSync(join(tmpdir(), 'codeboost-question-'));
+  const root = mkdtempSync(join(tmpdir(), feature.rootPrefix));
   const staging = join(root, 'staging'), input = join(root, 'input');
-  let filesystems: TaskFilesystems | undefined;
+  let filesystems: TaskFilesystems | undefined, failure: { error: unknown } | undefined;
   try {
     mkdirSync(staging); mkdirSync(input);
-    writeFileSync(join(input, 'schema.json'), ANSWER_SCHEMA, { mode: 0o444 });
+    writeFileSync(join(input, 'schema.json'), run.schemaText, { mode: 0o444 });
     chmodSync(input, 0o555);
     // The clone is a full host copy with no byte limit of its own, so the repository must fit before it is made.
-    assertFitsQuestionStorage(deps.measureRepository(question.repository, question.head, Math.min(60_000, remaining())));
-    const clone = deps.createClone({ source: question.repository, parent: staging, taskId: `question-${question.noteId}`,
-      head: question.head, timeoutMs: Math.min(120_000, remaining()) });
-    const owner = { runnerOwner: question.runnerOwner, attemptId: question.attemptId, allocationId: randomUUID() };
-    try { filesystems = deps.prepareFilesystems(clone, QUESTION_STORAGE, image.id, owner, Math.min(60_000, remaining())); }
+    feature.assertFits(deps.measureRepository(run.repository, run.head, Math.min(60_000, remaining())));
+    const clone = deps.createClone({ source: run.repository, parent: staging, taskId: run.taskId,
+      head: run.head, timeoutMs: Math.min(120_000, remaining()) });
+    const owner = { runnerOwner: run.runnerOwner, attemptId: run.attemptId, allocationId: randomUUID() };
+    try { filesystems = deps.prepareFilesystems(clone, feature.storage, image.id, owner, Math.min(60_000, remaining())); }
     catch (error) {
       // D throws an AggregateError only when a failed allocation's own cleanup did not settle; it returns no handle.
       if (error instanceof AggregateError) retained.markUntracked();
       throw error;
     }
     remaining();
-    const invocation = deps.capture({ clone, phase: 'questions', vendor: question.provider, approvedArgv: [],
-      deadline: question.deadline, attemptId: question.attemptId, runnerOwner: question.runnerOwner,
-      context: { snapshotId: question.snapshotId, planId: question.planId, planRevision: question.planRevision,
-        assignmentId: question.noteId, referencedCodeHash: question.contextId,
-        stateVersion: 0 } });
-    const request = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: question.prompt,
+    const invocation = deps.capture({ clone, phase: feature.phase, vendor: run.provider, approvedArgv: [],
+      deadline: run.deadline, attemptId: run.attemptId, runnerOwner: run.runnerOwner, context: run.context });
+    const request = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: run.prompt,
       networkAllocationId: randomUUID() };
     const handle = deps.startClaude(request, credential);
     const cancel = () => handle.cancel(stopOf(signal.reason));
@@ -248,19 +292,40 @@ export async function askInContainer(question: ContainerQuestion, deps: Containe
     let result: InvocationResult;
     try { result = await handle.settled; }
     finally { signal.removeEventListener('abort', cancel); }
-    // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so no new
-    // question starts until a restart, whose recovery removes them by the review's owner label.
-    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed. Host leftovers (D's input and auth staging directories) are covered by
-    // the Ask root: the worker's TMPDIR is that root, D stages under tmpdir(), and the root is recorded durably before
-    // setup and deleted at startup before Ask is enabled again.
+    // D gave up on cleanup: these resources are no longer owned by anything in this process. Fail closed so nothing
+    // new starts until a restart, whose recovery removes them by the feature's owner label.
+    // Presence, not length, is the signal: an empty list still means D stopped before cleanup was confirmed. Host
+    // leftovers (D's input and auth staging directories) are covered by the worker's root: its TMPDIR is that root,
+    // D stages under tmpdir(), and the root is recorded durably before setup and deleted at startup.
     if (result.unreleased !== undefined) retained.markUntracked();
-    return answerFromResult(question.provider, result, invocation);
+    return feature.output(run.provider, result, invocation);
+  } catch (error) {
+    failure = { error };
+    throw error;
   } finally {
     const failures: unknown[] = [];
     if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.retain(filesystems); failures.push(error); }
-    try { removeStaging(root); } catch (error) { retained.retainPath(root); failures.push(error); }
-    if (failures.length) throw new AggregateError(failures, 'Question container cleanup did not settle.');
+    try { feature.removeRoot(root); } catch (error) { retained.retainPath(root); failures.push(error); }
+    if (failures.length) throw feature.cleanupFailed(failures, failure);
   }
+}
+
+/** Ask's part of a read-only run. Its wording and cleanup error are Ask's own and unchanged by the shared runner. */
+export const ASK_FEATURE: ReadOnlyFeature = Object.freeze({
+  phase: 'questions', rootPrefix: 'codeboost-question-', removeRoot: removeStaging, storage: QUESTION_STORAGE,
+  credential: questionCredential, assertFits: assertFitsQuestionStorage, timedOut: 'Agent timed out. Try again.',
+  output: answerFromResult,
+  cleanupFailed: (failures: readonly unknown[]) => new AggregateError(failures, 'Question container cleanup did not settle.'),
+});
+
+export async function askInContainer(question: ContainerQuestion, deps: ContainerDependencies,
+  signal: AbortSignal, image: { id?: string } = {}, retained = new RetainedStorage()): Promise<string> {
+  return runReadOnlyAgent(ASK_FEATURE, { provider: question.provider, repository: question.repository, head: question.head,
+    runnerOwner: question.runnerOwner, attemptId: question.attemptId, taskId: `question-${question.noteId}`,
+    deadline: question.deadline, prompt: question.prompt, schemaText: ANSWER_SCHEMA,
+    context: { snapshotId: question.snapshotId, planId: question.planId, planRevision: question.planRevision,
+      assignmentId: question.noteId, referencedCodeHash: question.contextId, stateVersion: 0 } },
+    deps, signal, image, retained);
 }
 
 // Bounds lane D's recovery, which otherwise allows two minutes; the first question waits for it.
