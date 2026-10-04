@@ -93,6 +93,21 @@ export class TaskPublishing {
   }
 
   /**
+   * Startup, once the runner lock is verified: publish if one is owed. Otherwise a publish action whose process stopped
+   * before its publish recorded an outcome (a crash) is settled now, so its replay stops saying `publishing`; the task's
+   * records (a PR it opened, recovered by its marker on the next publish) show what that publish did. Never throws.
+   */
+  startup(identity: PlanIdentity): void {
+    try {
+      const owed = this.owed(identity);
+      if (owed) { this.#schedule(identity, owed.draft); return; }
+      if (this.#store.hasUnsettledPublishAction(identity))
+        this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false,
+          message: 'The publish was interrupted before it recorded an outcome (codeboost stopped). Its pull request, if it opened one, is in the task\'s records; the publish action runs it again.' }));
+    } catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
+  }
+
+  /**
    * Shutdown: refuse new publishes, abort those in progress (the publisher refuses every later push, opening and ready
    * change) and await their recorded outcomes.
    */

@@ -406,7 +406,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
      * runs once, in the background; recovery finds a lost opening by its marker. The caller runs it once it has checked
      * that the runner lock still names the database, since a publish pushes.
      */
-    publishOwed: () => publishing?.publishIfOwed(identity),
+    publishOwed: () => publishing?.startup(identity),
     url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;
