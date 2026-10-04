@@ -202,10 +202,10 @@ it.each([
 
 it('removes only planning roots, and makes a read-only input directory writable first', () => {
   const foreign = mkdtempSync(join(tmpdir(), 'not-planning-')); roots.push(foreign);
-  expect(() => removePlanningRoot(foreign)).toThrow(/not a planning root/);
+  expect(() => removePlanningRoot(foreign)).toThrow(/is not a planning root/);
   expect(existsSync(foreign)).toBe(true);
   const nested = mkdtempSync(join(foreign, 'codeboost-planning-'));
-  expect(() => removePlanningRoot(nested)).toThrow(/not a planning root/);
+  expect(() => removePlanningRoot(nested)).toThrow(/is not a planning root/);
   const root = mkdtempSync(join(tmpdir(), 'codeboost-planning-')); roots.push(root);
   mkdirSync(join(root, 'input')); writeFileSync(join(root, 'input', 'schema.json'), '{}'); chmodSync(join(root, 'input'), 0o555);
   removePlanningRoot(root);
@@ -216,4 +216,44 @@ it('accepts only planning storage, never Ask\'s', () => {
   const fake = fakeDeps();
   // @ts-expect-error Ask's RetainedStorage words refusals for Ask and cannot remove planning roots.
   createPlanningProvider({ vendor: 'claude', repository: '/repo', head: HEAD, snapshotId: 's', runnerOwner: OWNER, deps: fake.deps, retained: new RetainedStorage() });
+});
+
+it('refuses a repository too large for planning before anything is copied', async () => {
+  const fake = fakeDeps();
+  fake.deps.measureRepository = () => ({ checkoutBytes: 512 * 1024 * 1024 + 1, entries: 3, objectBytes: 0 });
+  await expect(provider(fake.deps).invoke(draftRequest(), new AbortController().signal))
+    .rejects.toThrow(/^The repository is too large for planning\.$/);
+  expect(fake.events).toEqual(['build']);
+});
+
+it('stops before starting the container once its budget has passed', async () => {
+  const fake = fakeDeps(), build = fake.deps.buildImage;
+  fake.deps.buildImage = timeout => { const end = Date.now() + 5; while (Date.now() < end) { /* spend the budget */ } return build(timeout); };
+  const short = createPlanningProvider({ vendor: 'claude', repository: '/repo', head: HEAD, snapshotId: 'snapshot-1',
+    runnerOwner: OWNER, deps: fake.deps, timeoutMs: 1 });
+  await expect(short.invoke(draftRequest(), new AbortController().signal)).rejects.toThrow(/^Planning agent timed out\.$/);
+  expect(fake.events).not.toContain('start');
+});
+
+it('builds the agent image once across requests', async () => {
+  const fake = fakeDeps(), image = {};
+  const shared = createPlanningProvider({ vendor: 'claude', repository: '/repo', head: HEAD, snapshotId: 'snapshot-1',
+    runnerOwner: OWNER, deps: fake.deps, image });
+  await shared.invoke(draftRequest(), new AbortController().signal);
+  await shared.invoke(draftRequest('b9c7d9b8-c0bb-4d34-9fad-6cd2e5c37a67'), new AbortController().signal);
+  expect(fake.events.filter(event => event === 'build')).toEqual(['build']);
+});
+
+it.skipIf(process.getuid?.() === 0)('keeps a host copy it could not delete, naming it after the request\'s own error', async () => {
+  // Stage inside a parent we control; making it read-only stops the planning root from being removed.
+  const parent = mkdtempSync(join(tmpdir(), 'planning-tmp-')), saved = process.env.TMPDIR;
+  roots.push(parent); cleanups.push(() => chmodSync(parent, 0o700));
+  process.env.TMPDIR = parent;
+  const retained = new PlanningStorage(), fake = fakeDeps({ exitCode: 1, stdout: 'Invalid API key' }), clone = fake.deps.createClone;
+  fake.deps.createClone = options => { chmodSync(parent, 0o555); return clone(options); };
+  try {
+    await expect(provider(fake.deps, { retained }).invoke(draftRequest(), new AbortController().signal)).rejects
+      .toThrow(/^Claude could not write the plan\..* Cleanup also did not settle: A copy of the planned code could not be deleted \(.*codeboost-planning-.*\)\.$/);
+    expect(retained.paths()).toHaveLength(1);
+  } finally { if (saved === undefined) delete process.env.TMPDIR; else process.env.TMPDIR = saved; }
 });

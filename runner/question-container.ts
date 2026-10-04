@@ -114,9 +114,11 @@ export function measureGitRepository(source: string, head: string, timeoutMs: nu
   return { checkoutBytes, entries, objectBytes };
 }
 /** Refuse a repository whose staging copy would exceed the question's storage, before any host copy is made. */
+/** Whether a repository's checkout or Git objects would not fit `limits`. */
+export const exceedsStorage = (size: RepositorySize, limits: TaskStorageLimits) =>
+  size.checkoutBytes > limits.workBytes || size.entries > limits.workInodes || size.objectBytes > limits.metadataBytes;
 export function assertFitsQuestionStorage(size: RepositorySize): void {
-  if (size.checkoutBytes > QUESTION_STORAGE.workBytes || size.entries > QUESTION_STORAGE.workInodes
-    || size.objectBytes > QUESTION_STORAGE.metadataBytes)
+  if (exceedsStorage(size, QUESTION_STORAGE))
     throw new Error(`The repository is too large for Ask (checkout ${Math.ceil(size.checkoutBytes / 1048576)} MiB in ${size.entries} entries, Git objects ${Math.ceil(size.objectBytes / 1048576)} MiB; the limit is ${QUESTION_STORAGE.workBytes / 1048576} MiB and ${QUESTION_STORAGE.workInodes} entries).`);
 }
 
@@ -201,13 +203,9 @@ export function answerFromResult(provider: Provider, result: InvocationResult, i
 }
 
 /**
- * Answer one question inside the lane D container: a read-only `/work` checkout of the reviewed head,
- * the "questions" phase (read, list and search only; no commands), and vendor-only network access.
- * Every step is bounded by `deadline`. Storage is released only after the invocation settles.
- */
-/**
  * What differs between features that run one read-only agent in lane D's container (Ask, planning): the phase, the
- * host root, limits, and the wording a person sees. Everything else is `runReadOnlyAgent`.
+ * host root and its removal, limits, the credential rule, the output check, and the wording a person sees. Everything
+ * else is `runReadOnlyAgent`.
  */
 export interface ReadOnlyFeature {
   readonly phase: 'questions' | 'planning';
@@ -249,8 +247,8 @@ export interface ReadOnlyRun {
  * egress and the feature's phase. Resources are released on every path; what Docker or the host did not confirm
  * removed is kept in `retained`, and the feature stays off while any remains.
  *
- * Lane D's image build, clone and storage allocation are synchronous Docker and Git calls, so callers run this in a
- * worker thread whose TMPDIR is the feature's own root.
+ * Lane D's image build, clone and storage allocation are synchronous Docker and Git calls, so a serving process runs
+ * this in a worker thread whose TMPDIR is the feature's own root, as Ask's worker does.
  */
 export async function runReadOnlyAgent(feature: ReadOnlyFeature, run: ReadOnlyRun, deps: Omit<ContainerDependencies, 'recover'>,
   signal: AbortSignal, image: { id?: string }, retained: RetainedStorage): Promise<string> {
@@ -318,6 +316,11 @@ export const ASK_FEATURE: ReadOnlyFeature = Object.freeze({
   cleanupFailed: (failures: readonly unknown[]) => new AggregateError(failures, 'Question container cleanup did not settle.'),
 });
 
+/**
+ * Answer one question inside the lane D container: a read-only `/work` checkout of the reviewed head,
+ * the "questions" phase (read, list and search only; no commands), and vendor-only network access.
+ * Every step is bounded by `deadline`. Storage is released only after the invocation settles.
+ */
 export async function askInContainer(question: ContainerQuestion, deps: ContainerDependencies,
   signal: AbortSignal, image: { id?: string } = {}, retained = new RetainedStorage()): Promise<string> {
   return runReadOnlyAgent(ASK_FEATURE, { provider: question.provider, repository: question.repository, head: question.head,

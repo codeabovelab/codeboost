@@ -4,7 +4,7 @@ import { basename, dirname, join } from 'node:path';
 import type { InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { TaskStorageLimits } from '../agents/container/storage.ts';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
-import { allocations, RetainedStorage, runReadOnlyAgent, sameContext, type ContainerDependencies, type LeftoverPolicy, type Provider,
+import { allocations, exceedsStorage, RetainedStorage, runReadOnlyAgent, sameContext, type ContainerDependencies, type LeftoverPolicy, type Provider,
   type ReadOnlyFeature, type RepositorySize } from './question-container.ts';
 
 /** Ask's lane D dependencies, less startup recovery, which the runner owns for planning. */
@@ -53,7 +53,7 @@ const ROOT_PREFIX = 'codeboost-planning-';
  */
 export function removePlanningRoot(root: string): void {
   if (dirname(root) !== tmpdir() || !basename(root).startsWith(ROOT_PREFIX))
-    throw new Error(`Refusing to remove a path that is not a planning root (${root}).`);
+    throw new Error(`A copy of the planned code could not be deleted (${root}): it is not a planning root.`);
   try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
   try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
   catch (error) { throw new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }); }
@@ -100,10 +100,9 @@ export const PLANNING_FEATURE: ReadOnlyFeature = Object.freeze({
   phase: 'planning', rootPrefix: ROOT_PREFIX, removeRoot: removePlanningRoot, storage: PLANNING_STORAGE,
   credential: planningCredential, timedOut: stopMessages.timeout,
   assertFits: (size: RepositorySize) => {
-    if (size.checkoutBytes > PLANNING_STORAGE.workBytes || size.entries > PLANNING_STORAGE.workInodes
-      || size.objectBytes > PLANNING_STORAGE.metadataBytes) throw new Error('The repository is too large for planning.');
+    if (exceedsStorage(size, PLANNING_STORAGE)) throw new Error('The repository is too large for planning.');
   },
-  output: (_provider: Provider, result: InvocationResult, invocation: InvocationInput) => planningOutput(result, invocation),
+  output: (_vendor: Provider, result: InvocationResult, invocation: InvocationInput) => planningOutput(result, invocation),
   // What cleanup left is retained, and the next request names it. A successful request is refused rather than
   // returned, as Ask does, so a plan is never kept from an unsettled run. A failed one keeps its own message first.
   cleanupFailed: (failures: readonly unknown[], failure?: { error: unknown }) => failure

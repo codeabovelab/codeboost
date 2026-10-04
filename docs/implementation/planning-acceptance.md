@@ -68,8 +68,8 @@ and at 1 MiB + 1 byte the size limit. If a real output fails validation, fix the
 prompt or schema and record again. Do not edit the recording.
 
 The provider and Ask share one container runner, `runReadOnlyAgent` in
-`runner/question-container.ts`. Each passes its phase, host root, limits and
-wording as a `ReadOnlyFeature` (`ASK_FEATURE`, `PLANNING_FEATURE`). Ask's wording
+`runner/question-container.ts`. Each passes its phase, host root and removal,
+limits, credential rule, output check and wording as a `ReadOnlyFeature` (`ASK_FEATURE`, `PLANNING_FEATURE`). Ask's wording
 and cleanup error are unchanged (#117 part 1).
 
 Left for #117 part 2: the provider's image build, clone and storage calls are
