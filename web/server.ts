@@ -8,7 +8,7 @@ import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
 import { MERGE_OPERATION_TIMEOUT_MS, MergeCoordinator, MergeNotApplied, MergeOutcomeUnknown } from '../runner/merge.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { ItemExecutor } from '../runner/execution.ts';
-import { TaskPublishing } from '../runner/publishing.ts';
+import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
 import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
@@ -206,10 +206,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     }
     // A publish refused because an earlier run owes a pause or an escalation pays it here, outside the refused transaction
     // (AGENTS.md: a refusal's durable change is committed outside it); a task it sends to needs human then gets its draft.
-    // Only a refusal that came from owed work: one for a stale view, a busy task or a replayed refusal starts nothing.
+    // Only this action's own refusal for owed work: one for a stale view or a busy task, and any replay (which applies
+    // nothing, AGENTS.md), starts nothing.
     if (action === 'publish') {
-      const owing = !!publishing && !!executor?.owes(identity);
-      try { return act(); } catch (error) { if (owing && error instanceof GuardRefusal) publishing?.actIfOwed(identity); throw error; }
+      let replay: boolean;
+      try { replay = !!service.store.savedAction(identity, { actionId: actionId as string, kind: 'publish', request: { attemptId, expectedStateVersion } }); }
+      catch { replay = true; }
+      try { return act(); }
+      catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.actIfOwed(identity); throw error; }
     }
     return act();
     function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {

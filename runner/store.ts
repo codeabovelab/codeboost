@@ -831,6 +831,11 @@ export class Store {
       AND state='completed' AND ${rev} = ?`).all(key, revision).map(entry => entry.item as string);
     return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier, finished };
   }
+  /** The heads of completed execute attempts that changed files outside their plan item, oldest first. */
+  scopeFindingHeads(identity: PlanIdentity): string[] {
+    return this.#db.prepare(`SELECT json_extract(result,'$.head') AS head FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+      AND json_valid(result) AND json_array_length(json_extract(result,'$.outOfScope')) > 0 ORDER BY rowid`).all(identityKey(identity)).map(row => row.head as string);
+  }
   getAttempts(identity: PlanIdentity): AttemptRecord[] {
     return this.#db.prepare('SELECT * FROM attempts WHERE plan_key=? ORDER BY rowid').all(identityKey(identity)).map(row => this.#attemptRecord(row));
   }

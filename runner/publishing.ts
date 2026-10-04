@@ -13,6 +13,10 @@ const SETTLED = ['opened', 'possibly already fixed', 'draft skipped', 'draft uns
   'not published'];
 /** The records a publish or close writes before it starts; one left at startup is a job whose process stopped. */
 const IN_FLIGHT = ['publishing', 'closing'];
+/** The refusal while an earlier run owes work; the publish action that gets it pays that work (web/server.ts). */
+export const OWED_REFUSAL = 'An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.';
+/** How long a publish refused because GitHub's PR list lags behind a PR waits before it is tried again. */
+export const LIST_LAG_RETRY_MS = 30_000;
 /** Refusals a person acts on; anything else that fails is reported as `failed`. */
 const REFUSALS = [GuardRefusal, BranchPushRefused, OpeningUnsettled, PullRequestMisplaced, PullRequestRefused];
 /** A publish stopped because a person cancelled its task (#111); the close that follows does what is left. */
@@ -76,7 +80,9 @@ export class TaskPublishing {
       return { kind: 'publish', draft: false };
     }
     if (task.status === 'needs human') {
-      this.#assertNothingOwed(identity);
+      // A draft invites no review, and a scope pause cannot be recorded for a task already in needs human, so only an owed
+      // safety finding (its escalation records it) holds a draft back.
+      this.#assertNothingOwed(identity, false);
       this.#store.assertPublishableNow(identity, true);
       return { kind: 'publish', draft: true };
     }
@@ -88,8 +94,8 @@ export class TaskPublishing {
    * finished work until that is settled, so a ready PR must not show its unreviewed changes. publishIfOwed pays it. Read
    * only for a status that could publish, so a poll of any other task does not scan its attempts.
    */
-  #assertNothingOwed(identity: PlanIdentity): void {
-    if (this.#executor.owes(identity)) throw new GuardRefusal('An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.');
+  #assertNothingOwed(identity: PlanIdentity, scope = true): void {
+    if (this.#executor.owes(identity, { scope })) throw new GuardRefusal(OWED_REFUSAL);
   }
 
   /**
@@ -105,9 +111,9 @@ export class TaskPublishing {
     // in-flight record): the request is owed, whatever an earlier job settled, e.g. a close after a PR was reopened.
     if (this.#store.hasUnsettledPublishAction(identity)) return job;
     const last = this.#store.lastPublish(identity);
-    // A task that reached its status before publishing existed is published only when a person asks (the v10 upgrade's
-    // record), whatever changes since.
-    if (last?.outcome === 'not published') return null;
+    // A task that reached its status before publishing existed (the v10 upgrade's record) is published only when a person
+    // asks, until a run starts after the upgrade: that run's end is the first state the upgrade did not decide.
+    if (last?.outcome === 'not published' && !this.#store.getAttempts(identity).some(attempt => attempt.createdAt > last.at)) return null;
     if (job.kind === 'close') return last?.outcome === 'closed' ? null : job;
     return !last || !SETTLED.includes(last.outcome) || last.stateVersion !== this.#store.getTask(identity).stateVersion ? job : null;
   }
@@ -149,13 +155,15 @@ export class TaskPublishing {
    * runs it again. Never throws.
    */
   startup(identity: PlanIdentity): void {
+    // A publish of this process is running: its record is its own, not one a crash left.
+    if (this.busy(identity)) return;
     try {
       this.#payOwed(identity);
       const job = this.owed(identity);
       if (job) { this.#schedule(identity, job); return; }
       const last = this.#store.lastPublish(identity), closing = this.#store.getTask(identity).status === 'cancelled';
       if (!last || IN_FLIGHT.includes(last.outcome)) {
-        if (last || this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false, ...(closing ? { action: 'close' as const } : {}),
+        if (last || this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: last?.draft ?? false, ...(closing ? { action: 'close' as const } : {}),
           message: `The ${closing ? 'close' : 'publish'} was interrupted before it recorded an outcome (codeboost stopped). The task's records show what it did; the ${closing ? 'close-pull-requests' : 'publish'} action runs it again.` }));
       // Only a reply is stuck (its job never recorded itself as started): it reports the outcome on record, which is left
       // as it is, stamp included, so what is owed does not change.
@@ -187,6 +195,22 @@ export class TaskPublishing {
     } catch (error) { console.error(`Could not settle what an earlier run owes: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
+  /**
+   * A publish or close that ended with an opening still in flight (its reply was lost, or it was refused while one settles) or
+   * refused because GitHub's list lags behind a PR is tried again by itself: nothing else would (no run ends, startup has
+   * passed). It waits for the opening's own deadline, or a short while for the list, plus a second. Never throws.
+   */
+  #retryIfUnsettled(identity: PlanIdentity, unsettled: boolean): void {
+    try {
+      if (this.#closing) return;
+      const remaining = this.#publisher.settleRemaining(identity) ?? (unsettled ? LIST_LAG_RETRY_MS : null);
+      if (remaining === null) return;
+      const timer = setTimeout(() => { this.#retries.delete(timer); this.actIfOwed(identity); }, remaining + 1_000);
+      timer.unref?.();
+      this.#retries.add(timer);
+    } catch (error) { console.error(`Could not arrange a retry of the publish: ${JSON.stringify(message(error, this.#secrets))}`); }
+  }
+
   #schedule(identity: PlanIdentity, job: PullRequestJob, actionId?: string): void {
     const key = identityKey(identity);
     // Reserved in this turn, so a second request in the same transaction is refused.
@@ -201,7 +225,7 @@ export class TaskPublishing {
           : { outcome: 'publishing', draft, message: 'A pull request is being published.' }));
       }
       catch (error) { console.error(`Could not record the publish as started, so it did not run: ${JSON.stringify(message(error, this.#secrets))}`); return; }
-      let record: Omit<PublishRecord, 'stateVersion' | 'at'>;
+      let record: Omit<PublishRecord, 'stateVersion' | 'at'>, unsettled = false;
       try {
         if (job.kind === 'close') {
           const closed = await this.#publisher.closeAll(identity, abort.signal);
@@ -214,20 +238,14 @@ export class TaskPublishing {
           record = describe(outcome, draft);
         }
       } catch (error) {
-        // A publish or close refused while a lost opening settles is tried again once it has: nothing else would (no run
-        // ends, startup has passed). It waits for that opening's own deadline (plus a second), not a fresh settle time.
-        const remaining = error instanceof OpeningUnsettled && !this.#closing ? this.#publisher.settleRemaining(identity) : null;
-        if (remaining !== null) {
-          const timer = setTimeout(() => { this.#retries.delete(timer); this.actIfOwed(identity); }, remaining + 1_000);
-          timer.unref?.();
-          this.#retries.add(timer);
-        }
+        unsettled = error instanceof OpeningUnsettled;
         const stopped = error instanceof ShuttingDownError || error instanceof PublishCancelled || (this.#closing && (error as Error)?.name === 'AbortError');
         record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets),
           ...(job.kind === 'close' ? { action: 'close' as const } : {}) };
       }
       try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
       catch (error) { console.error(`Could not record the pull request outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
+      this.#retryIfUnsettled(identity, unsettled);
     };
     const release = () => {
       this.#running.delete(key);
