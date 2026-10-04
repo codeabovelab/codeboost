@@ -15,8 +15,11 @@ const SETTLED = ['opened', 'possibly already fixed', 'draft skipped', 'draft uns
 const IN_FLIGHT = 'publishing';
 /** The refusal while an earlier run owes work; the publish action that gets it pays that work (web/server.ts). */
 export const OWED_REFUSAL = 'An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.';
-/** How long a publish refused because GitHub's PR list lags behind a PR waits before it is tried again. */
-export const LIST_LAG_RETRY_MS = 30_000;
+/**
+ * How long a publish waits before its short retry: refused because GitHub's PR list lags behind a PR, refused just as
+ * an opening's deadline passed, or opened while GitHub still showed another head (`reconcile`).
+ */
+export const SHORT_RETRY_MS = 30_000;
 /** Refusals a person acts on; anything else that fails is reported as `failed`. */
 const REFUSALS = [GuardRefusal, BranchPushRefused, OpeningUnsettled, PullRequestMisplaced, PullRequestRefused];
 
@@ -33,15 +36,20 @@ export class TaskPublishing {
   /** Token values to remove from recorded error text: those of the environment the gh calls and the push run with. */
   #secrets: string[];
   #closing = false;
-  /** Retries of a publish refused while a lost opening settles (OpeningUnsettled), cleared at shutdown. */
+  /** The automatic retry armed for each task (at most one), cleared at shutdown. */
   #retries = new Map<string, ReturnType<typeof setTimeout>>();
-  /** Tasks whose list-lag retry has run since their last settled publish: it runs once, not every 30 s for ever. */
-  #listLagRetried = new Set<string>();
+  /**
+   * The automatic retries each task has had since its last settled publish: at most one at an opening's deadline and one
+   * short one per chain, so a GitHub outage that fails every open cannot republish every settle time for ever.
+   */
+  #retried = new Map<string, { deadline: number; short: number }>();
+  #shortRetryMs: number;
   /** Publishes in progress, by task, from scheduling until the outcome is recorded. */
   #running = new Map<string, Promise<void>>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
-    env: NodeJS.ProcessEnv = process.env) {
+    env: NodeJS.ProcessEnv = process.env, options: { shortRetryMs?: number } = {}) {
     this.#store = store; this.#publisher = publisher; this.#runner = runner; this.#executor = executor; this.#write = settleWith(capability);
+    this.#shortRetryMs = options.shortRetryMs ?? SHORT_RETRY_MS;
     this.#secrets = TOKEN_VARIABLES.flatMap(name => env[name] ?? []);
   }
 
@@ -99,7 +107,9 @@ export class TaskPublishing {
     // A task that reached its status before publishing existed (the v10 upgrade's record) is published only when a person
     // asks, until a run starts after the upgrade: that run's end is the first state the upgrade did not decide.
     if (last?.outcome === 'not published' && !options.personAsked && !this.#store.getAttempts(identity).some(attempt => attempt.createdAt > last.at)) return null;
-    return !last || !SETTLED.includes(last.outcome) || last.stateVersion !== this.#store.getTask(identity).stateVersion ? mode : null;
+    // `reconcile`: an open or update that left the PR or the task not where the publish meant them (GitHub showed another
+    // head, or a draft change failed); the next publish reconciles it, so it is still owed.
+    return !last || !SETTLED.includes(last.outcome) || last.reconcile || last.stateVersion !== this.#store.getTask(identity).stateVersion ? mode : null;
   }
 
   /**
@@ -170,22 +180,27 @@ export class TaskPublishing {
   }
 
   /**
-   * A publish that ended with an opening still in flight (its reply was lost, or it was refused while one settles) or
-   * refused because GitHub's list lags behind a PR is tried again by itself: nothing else would (no run ends, startup has
-   * passed). Bounded (AGENTS.md: back off recurring external polling): one timer per task; an opening is waited for only
-   * while its deadline is ahead (at the deadline the next publish abandons or adopts it, so one that is still there
-   * after it is stuck for a reason a person must fix, not a timing one); the list is waited for once per chain, 30 s.
-   * Never throws.
+   * A publish that ended with an opening still in flight (its reply was lost, or it was refused while one settles),
+   * refused because GitHub's list lags behind a PR, or opened without settling (`reconcile`) is tried again by itself:
+   * nothing else would (no run ends, startup has passed). Bounded (AGENTS.md: back off recurring external polling): one
+   * timer per task, and per chain (until a publish settles) at most one retry at an opening's deadline, while it is
+   * still ahead, and one short retry. What is still unsettled after them is stuck for a reason a person must fix (two
+   * PRs carry a marker, the repository changed, GitHub keeps failing): the next publish waits for a run's end, a restart
+   * or the action. Never throws.
    */
   #retryIfUnsettled(identity: PlanIdentity, record: Omit<PublishRecord, 'stateVersion' | 'at'>, unsettled: boolean): void {
     try {
       const key = identityKey(identity);
-      if (SETTLED.includes(record.outcome)) this.#listLagRetried.delete(key);
+      if (SETTLED.includes(record.outcome) && !record.reconcile) { this.#retried.delete(key); return; }
       if (this.#closing || this.#retries.has(key)) return;
+      const retried = this.#retried.get(key) ?? { deadline: 0, short: 0 };
       const remaining = this.#publisher.settleRemaining(identity);
-      let wait: number | null = remaining !== null && remaining > 0 ? remaining : null;
-      if (wait === null && remaining === null && unsettled && !this.#listLagRetried.has(key)) { this.#listLagRetried.add(key); wait = LIST_LAG_RETRY_MS; }
+      let wait: number | null = null;
+      if (remaining !== null && remaining > 0 && retried.deadline < 1) { retried.deadline++; wait = remaining; }
+      // Refused for the list's lag or just as an opening's deadline passed, or opened without settling: one short retry.
+      else if ((unsettled || record.reconcile) && retried.short < 1) { retried.short++; wait = this.#shortRetryMs; }
       if (wait === null) return;
+      this.#retried.set(key, retried);
       const timer = setTimeout(() => { this.#retries.delete(key); this.publishIfOwed(identity); }, wait + 1_000);
       timer.unref?.();
       this.#retries.set(key, timer);
@@ -240,7 +255,10 @@ export class TaskPublishing {
 function describe(outcome: PublishOutcome, draft: boolean): Omit<PublishRecord, 'stateVersion' | 'at'> {
   const ready = 'leftReady' in outcome && outcome.leftReady !== undefined ? ` Pull request #${outcome.leftReady} could not be made a draft and may still be ready for review.` : '';
   switch (outcome.kind) {
+    // A ready publish whose task did not reach in review (GitHub showed another head, so the PR was drafted), or any
+    // publish that left a PR ready it meant to draft, is not done: the next publish reconciles it.
     case 'opened': return { outcome: outcome.kind, draft, number: outcome.number, url: outcome.url,
+      ...((!draft && outcome.status !== 'in review') || outcome.leftReady !== undefined ? { reconcile: true } : {}),
       message: `Pull request #${outcome.number} is open${outcome.draft ? ' as a draft' : ''}; the task is ${outcome.status}.${ready}` };
     case 'possibly already fixed': return { outcome: outcome.kind, draft, message: `The issue may already be fixed (${checkSummary(outcome.result)}), so no pull request was opened.${ready}` };
     case 'draft skipped': return { outcome: outcome.kind, draft, message: `The issue may already be fixed (${checkSummary(outcome.result)}), so no draft pull request was opened.${ready}` };
