@@ -29,9 +29,9 @@ export interface MergeStatus {
 }
 export interface MergeUnavailableStatus { available: true; ready: false; action: null; blockers: MergeBlocker[]; remote: null; queue: MergeQueueStatus | null; }
 /**
- * With a runner block (#121), the merge targets the task's published PR, not `github.pullRequest`: the task's latest opened
- * record in `repository` and `baseBranch`, which GitHub must show from the task branch, into that base, with that record's
- * marker as its first line, as the only open PR from the branch.
+ * With a runner block (#121), the merge targets the task's published PR, not `github.pullRequest`: the opened record
+ * whose opening began last among the task's records in `repository` and `baseBranch`. GitHub must show it from the task
+ * branch, into that base, with that record's marker as its first line, as the only open PR from the branch.
  */
 export interface PublishedTarget {
   repository: string;
@@ -76,7 +76,7 @@ export class MergeCoordinator {
 
   /**
    * The PR to inspect. An attempt in flight or merged keeps the PR it was started for. Otherwise, without a runner block,
-   * the gateway's configured PR; with one, the task's latest opened PR in the configured base (#121).
+   * the gateway's configured PR; with one, the task's opened PR in the configured base whose opening began last (#121).
    */
   #resolve(attempt: MergeAttempt | null): ResolvedTarget {
     const pinned = attempt && (attempt.state === 'submitting' || attempt.state === 'queued' || attempt.state === 'merged') ? attempt : null;
