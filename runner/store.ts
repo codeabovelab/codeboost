@@ -57,6 +57,8 @@ export function mergeActionResponse(attempt: MergeAttempt) {
  */
 export interface PublishRecord {
   outcome: string; draft: boolean; message: string; stateVersion: number; at: string; number?: number; url?: string;
+  /** An `opened` outcome that left the PR or the task not where the publish meant them: still owed (#103). */
+  reconcile?: boolean;
 }
 /** What the publish action replays once its publish has settled: the outcome, as `publish.last` shows it. */
 export function publishActionResponse(record: PublishRecord) {

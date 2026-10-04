@@ -159,6 +159,8 @@ export interface RunnerAssembly {
   readonly publisher?: (closing: () => boolean) => PullRequestPublisher;
   /** The environment the publisher's gh calls and push run with; its token values are removed from recorded errors. */
   readonly env?: NodeJS.ProcessEnv;
+  /** Tests only: the delay of the publisher's short retry (SHORT_RETRY_MS, 30 s). */
+  readonly shortRetryMs?: number;
   readonly sources: ExecutionSources;
   readonly findings: SafetyFindings;
   readonly recovery: RecoveryReport;
