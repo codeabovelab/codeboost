@@ -135,7 +135,7 @@ function world(): World {
  * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
  * exists, as an earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -155,7 +155,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
       onProcessGroup: () => options.onPushSpawn?.(++spawns, () => app!, close) });
     const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main', ...(options.settleMs ? { settleMs: options.settleMs } : {}) });
     branchOf = identity => publisher(() => false).branch(identity);
-    return { deps, sources, findings: new SafetyFindings(service.store), publisher,
+    return { deps, sources, findings: new SafetyFindings(service.store), publisher, ...(options.env ? { env: options.env } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   });
   cleanups.push(close);
@@ -295,6 +295,25 @@ describe('publishing a finished task (#103)', () => {
     expect(second.store.lastPublish(second.identity)).toMatchObject({ outcome: 'opened', number: 100 });
   });
 
+  it('names the current attempt\'s safety finding in the draft, even when the budget has also run out', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: service => {
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000, budgetMs: 1 });
+      s.markRunning(id, attempt.id);
+      s.recordSafetyFinding(id, attempt.id, 'P1 wrote to a path outside its workspace.');
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: false });
+      const until = Date.now() + 5; while (Date.now() < until) { /* let the budget pass */ }
+    } });
+    expect(store.getTask(identity).status).toBe('needs human');
+    await publishSettled(app, identity);
+    expect(w.github.prs).toHaveLength(1);
+    expect(w.github.prs[0]!.body).toContain('P1 wrote to a path outside its workspace.');
+    expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+  });
+
   it('publishes a draft when a resume is refused because the budget ran out, which moves the task to needs human', async () => {
     const w = world();
     const { app, identity, store } = await serve(w, { before: service => { budgetSpent(service); } });
@@ -354,6 +373,14 @@ describe('publishing a finished task (#103)', () => {
     await closeApp!();
     const store = new Store(w.demo.database);
     try { expect(store.taskPullRequests(first.identity)).toMatchObject([{ state: 'opened', number: 100 }]); } finally { store.close(); }
+  });
+
+  it('removes the publishing environment\'s token values from a recorded failure', async () => {
+    const w = world(), token = 'not-a-github-shaped-secret-4711';
+    w.github.onOpen = async () => { throw new Error(`gh failed: Authorization: token ${token}`); };
+    const { app, identity, store } = await serve(w, { before: completeAll, env: { GH_ENTERPRISE_TOKEN: token } });
+    await publishSettled(app, identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'gh failed: Authorization: token [token]' });
   });
 
   it('never publishes in a demo, even with a publisher', async () => {

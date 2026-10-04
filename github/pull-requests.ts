@@ -117,12 +117,13 @@ export class GhPullRequestGateway implements PullRequestGateway {
   readonly run: RunGhWithInput;
   /** One deadline for a whole operation (every command and poll wait in it), not a fresh allowance per command. */
   readonly operationMs: number;
-  constructor(config: { repository: string; operationMs?: number }, run?: RunGhWithInput) {
+  /** `env`: the environment `gh` reads its allowlisted variables (GH_HOST, tokens) from. Default `process.env`. */
+  constructor(config: { repository: string; operationMs?: number; env?: NodeJS.ProcessEnv }, run?: RunGhWithInput) {
     if (!REPOSITORY.test(config.repository)) throw new Error('A GitHub repository is required to open pull requests.');
     if (config.operationMs !== undefined && (!Number.isSafeInteger(config.operationMs) || config.operationMs < 1)) throw new Error('Invalid operation deadline.');
     this.repository = config.repository;
     this.operationMs = config.operationMs ?? PR_OPERATION_DEADLINE_MS;
-    this.run = run ?? ((args, options) => runWithInput('gh', args, { input: options?.input, timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment() }));
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { input: options?.input, timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(config.env) }));
   }
 
   /** The caller's signal combined with this operation's single deadline; every command and wait in it uses the result. */
