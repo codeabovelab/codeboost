@@ -1,0 +1,24 @@
+{
+  "kind": "codeboost-planning-recording",
+  "version": 1,
+  "vendor": "claude",
+  "mode": "suggest",
+  "recordedAt": "2026-10-03T22:44:48.704Z",
+  "provenance": {
+    "image": "codeboost-agent:node26-codex0.153.4-claude2.1.281",
+    "cliVersion": "2.1.281",
+    "model": "claude CLI default (the adapter passes no model flag)",
+    "phase": "planning"
+  },
+  "request": {
+    "requestId": "9c972d36-a1f1-42ce-af32-b19b09fe4da5",
+    "revision": 1,
+    "issue": 412,
+    "baseSha": "b8e168bb67541c4ad21c00c8f6873f882d26521b",
+    "promptSha256": "9766b6b2f256691bf32c80799725b8880fd8772996d63030cf0ae677e1c942e5",
+    "schemaSha256": "b3c46f36405c4c7c57c9d8d903b6759a5ba0cf9b17ce99e3bba670f6f2ac5473",
+    "filesSha256": "f0ff86518eb6ac0bc07aa7167da6f6e0c72695ae75f87d6e1bf86e06cec7543e",
+    "commandSha256": "8bbe71dee7a100ed8d9a44797323031249a5777299055793ef4047c9124b854e"
+  },
+  "output": "{\"schema_version\":1,\"base_revision\":1,\"reply\":\"Split the fix and the test into two items: P1 removes the call counter so label() is pure, and P2 (depends on P1) adds a test to test/example.test.ts asserting assert.strictEqual(label(3), label(3)).\",\"edits\":[{\"op\":\"remove_file\",\"item\":\"P1\",\"summary\":\"Remove test/example.test.ts from P1's declared files\",\"reason\":\"The test is moving to its own item (P2) that depends on P1, per the one-concern-per-item rule.\",\"field\":null,\"value\":\"test/example.test.ts\",\"file\":null,\"check\":null,\"check_index\":null,\"depends_on\":null,\"new_item\":null},{\"op\":\"set_field\",\"item\":\"P1\",\"summary\":\"Update P1's intent to cover only the source fix\",\"reason\":\"P1 no longer includes the test, so its intent should describe only the code change.\",\"field\":\"intent\",\"value\":\"label(value) must depend only on value, not on how many times it has been called. Remove the hidden `calls` counter so the function is pure.\",\"file\":null,\"check\":null,\"check_index\":null,\"depends_on\":null,\"new_item\":null},{\"op\":\"add_item\",\"item\":\"P2\",\"summary\":\"Add item P2: test that label() is deterministic\",\"reason\":\"Per feedback, the test belongs in its own item that depends on the fix, with the exact assertion named.\",\"field\":null,\"value\":null,\"file\":null,\"check\":null,\"check_index\":null,\"depends_on\":null,\"new_item\":{\"id\":\"P2\",\"title\":\"Add test: label() returns the same text on repeated calls\",\"intent\":\"Cover the bug from issue 412 so a regression (like the old call counter) is caught: calling label with the same input twice must return identical text.\",\"files\":[{\"path\":\"test/example.test.ts\",\"kind\":\"edit\",\"renamed_from\":null,\"change\":\"Keep the existing 'labels a value' test. Add a new test, e.g. 'label returns the same text for repeated calls', that asserts assert.strictEqual(label(3), label(3)).\"}],\"acceptance\":[{\"type\":\"cmd\",\"text\":\"npm test\"},{\"type\":\"check\",\"text\":\"test/example.test.ts contains a test asserting assert.strictEqual(label(3), label(3))\"}],\"depends_on\":[\"P1\"]}}]}"
+}

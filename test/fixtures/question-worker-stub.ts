@@ -38,7 +38,9 @@ parentPort!.on('message', (message: WorkerRequest) => {
     }
     return;
   }
-  const { prompt, provider, noteId, attemptId } = message.question;
+  // A planning job carries a ReadOnlyRun; the stub reads the same fields from either kind (#117).
+  const job = message.type === 'ask' ? message.question : { ...message.run, noteId: message.run.taskId };
+  const { prompt, provider, noteId, attemptId } = job;
   if (prompt === 'crash') throw new Error('stub crashed');
   if (prompt === 'leak') {
     remaining++;
@@ -47,7 +49,13 @@ parentPort!.on('message', (message: WorkerRequest) => {
   }
   // Reports the owners this worker recovered, and the owner the question carries.
   if (prompt === 'recoveries') {
-    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: JSON.stringify({ recovered, owner: message.question.runnerOwner }) });
+    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: JSON.stringify({ recovered, owner: job.runnerOwner }) });
+    return;
+  }
+  // Reports which kind of job reached which feature's worker, and the job's owner and deadline (#117).
+  if (prompt === 'whoami') {
+    parentPort!.postMessage({ id: message.id, attemptId, ok: true, text: JSON.stringify({ kind: message.type, feature: workerData?.feature ?? null,
+      owner: job.runnerOwner, deadline: 'deadline' in job ? job.deadline : null, env: process.env.TMPDIR ?? null }) });
     return;
   }
   // Never replies, like a question whose lane D cleanup does not settle.

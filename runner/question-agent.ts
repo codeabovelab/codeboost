@@ -1,9 +1,10 @@
 import { randomBytes, randomUUID } from 'node:crypto';
 import { Worker } from 'node:worker_threads';
 import type { QuestionAgent } from './questions.ts';
-import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, type Provider } from './question-container.ts';
+import { credentialEnvironment, questionCredential, stopOf, workerEnvironment, type Provider, type ReadOnlyRun } from './question-container.ts';
+import { planningCredential } from './planning-provider.ts';
 import type { RecoverReply, ReleaseReply, WorkerReply, WorkerRequest } from './question-worker.ts';
-import { createAskRoot, removeAskRoot, type LeftoverLedger } from './question-leftovers.ts';
+import { ASK_NAMING, createWorkerRoot, removeWorkerRoot, type LeftoverLedger, type WorkerNaming } from './question-leftovers.ts';
 export type { Provider } from './question-container.ts';
 
 // Leave the worker time to cancel the container and release storage before the review's own timeout fires.
@@ -16,8 +17,12 @@ const ABANDON_AFTER_DEADLINE_MS = 30_000;
 // Bounds the wait for an abandoned worker thread to stop (a synchronous Docker or Git call finishes first).
 const DEFAULT_TERMINATE_WAIT_MS = 15_000;
 
-/** One worker owns every Ask container, so lane D's trusted image and allocations stay in one registry. */
-export class QuestionWorker {
+/**
+ * One worker owns every container of one feature (Ask or planning), so lane D's trusted image and allocations stay in
+ * one registry. Each feature has its own worker, root, ledger, lock and owner (#117); `naming` says which.
+ */
+export class AgentWorker {
+  private readonly naming: WorkerNaming;
   private worker?: Worker;
   // The worker's TMPDIR. Recorded before the worker starts, deleted after it stops.
   private root?: string;
@@ -44,8 +49,12 @@ export class QuestionWorker {
   private env: Readonly<Record<string, string | undefined>>;
   constructor(url = new URL('./question-worker.ts', import.meta.url), ledger?: LeftoverLedger,
     options: { abandonAfterDeadlineMs?: number; terminateWaitMs?: number; releaseTimeoutMs?: number; env?: Readonly<Record<string, string | undefined>>;
-      /** The review's Ask owner token. Without one, each worker uses a random owner, so it recovers nothing earlier. */
-      runnerOwner?: () => string } = {}) {
+      /** The review's owner token for this feature. Without one, each worker uses a random owner, so it recovers nothing earlier. */
+      runnerOwner?: () => string;
+      /** Which feature this worker serves. Defaults to the ledger's, then Ask's. */
+      naming?: WorkerNaming } = {}) {
+    this.naming = options.naming ?? ledger?.naming ?? ASK_NAMING;
+    if (ledger && ledger.naming !== this.naming) throw new Error('A worker and its ledger must serve the same feature.');
     const random = randomBytes(16).toString('hex');
     this.owner = options.runnerOwner ?? (() => random);
     this.url = url; this.ledger = ledger; this.abandonAfterMs = options.abandonAfterDeadlineMs ?? ABANDON_AFTER_DEADLINE_MS;
@@ -57,16 +66,16 @@ export class QuestionWorker {
     if (this.crashed) throw this.crashed;
     if (this.worker) return this.worker;
     // Stamped with this review's lock, so a later process can find it even if the record is renamed away or lost.
-    const root = createAskRoot(this.ledger?.lockPath ?? '');
+    const root = createWorkerRoot(this.ledger?.lockPath ?? '', this.naming);
     // Durable before any setup: a process killed from here on still leaves a record of this root.
-    try { this.ledger?.recordRoot(root); } catch (error) { removeAskRoot(root); throw error; }
+    try { this.ledger?.recordRoot(root); } catch (error) { removeWorkerRoot(root, this.naming); throw error; }
     let worker: Worker;
     try {
       worker = new Worker(this.url, { env: workerEnvironment(process.env, root),
-        workerData: { credentials: credentialEnvironment(this.env) } });
+        workerData: { credentials: credentialEnvironment(this.env), feature: this.naming.feature } });
     } catch (error) {
       // Nothing ran in the root yet: delete it and drop the record, so close() can release the lock.
-      removeAskRoot(root); this.ledger?.forget(root);
+      removeWorkerRoot(root, this.naming); this.ledger?.forget(root);
       throw error;
     }
     this.root = root;
@@ -81,7 +90,7 @@ export class QuestionWorker {
       if (!job) return;
       this.pending.delete(reply.id);
       clearTimeout(job.watchdog);
-      if (reply.attemptId !== job.attemptId) job.reject(new Error('The agent returned a result for a different question attempt.'));
+      if (reply.attemptId !== job.attemptId) job.reject(new Error(`The agent returned a result for a different ${this.naming.job} attempt.`));
       else if (reply.ok) job.resolve(reply.text); else job.reject(new Error(reply.error));
     });
     const fail = (error: Error) => { if (this.worker === worker) void this.#abandon(`stopped (${error.message})`); };
@@ -104,7 +113,7 @@ export class QuestionWorker {
   async #abandonOnce(why: string) {
     const worker = this.worker;
     this.worker = undefined;
-    this.crashed ??= new Error(`The agent container worker ${why}. Its containers and storage may still exist, so Ask is off until codeboost restarts. The first question after the restart removes them.`);
+    this.crashed ??= new Error(`The agent container worker ${why}. Its containers and storage may still exist, so ${this.naming.label} is off until codeboost restarts. The first ${this.naming.job} after the restart removes them.`);
     for (const release of this.releases.values()) release(null);
     this.releases.clear();
     this.#failRecoveries(this.crashed);
@@ -133,7 +142,7 @@ export class QuestionWorker {
     if (!root) return;
     this.root = undefined;
     try {
-      removeAskRoot(root); this.ledger?.forget(root);
+      removeWorkerRoot(root, this.naming); this.ledger?.forget(root);
       // A thread that stopped after close() has no more files to write; the lock still stays if it was abandoned.
       if (this.closed && !this.#abandoning && !this.#recoveryStopped) this.ledger?.release();
     }
@@ -141,17 +150,30 @@ export class QuestionWorker {
   }
   agent(provider: Provider): QuestionAgent {
     return async (prompt, signal, scope, timeoutMs) => {
-      if (this.crashed) throw this.crashed;
       // Missing sign-in is reported before any Docker work, including recovery.
-      questionCredential(provider, this.env);
-      // Held until close, so no other process can recover, start a worker or write the record for this review.
-      this.ledger?.acquire();
-      // The first question of a process removes what earlier sessions left. The check is single-flight: concurrent
-      // first questions share it, so recovery never runs once a question has started.
-      if (!this.scanned) await this.#startupScan(signal);
-      signal.throwIfAborted();
+      await this.#admit(() => questionCredential(provider, this.env), signal);
       return this.#ask(provider, prompt, signal, scope, timeoutMs);
     };
+  }
+  /**
+   * Run one planning request in this worker (#117). `deadline` bounds the whole request, setup included; the caller's
+   * own timer must allow the worker its settle margin after it.
+   */
+  async plan(run: Omit<ReadOnlyRun, 'runnerOwner'>, signal: AbortSignal): Promise<string> {
+    if (this.naming.feature !== 'planning') throw new Error('This worker does not run plans.');
+    await this.#admit(() => planningCredential(run.provider, this.env), signal);
+    return this.#submit(run.attemptId, run.deadline, signal, id => ({ type: 'plan', id, run: { ...run, runnerOwner: this.runnerOwner! } }));
+  }
+  /** What every job waits for: no crash, a credential, the review's lock, and this process's startup check. */
+  async #admit(credential: () => unknown, signal: AbortSignal) {
+    if (this.crashed) throw this.crashed;
+    credential();
+    // Held until close, so no other process can recover, start a worker or write the record for this review.
+    this.ledger?.acquire();
+    // The first job of a process removes what earlier sessions left. The check is single-flight: concurrent
+    // first jobs share it, so recovery never runs once a job has started.
+    if (!this.scanned) await this.#startupScan(signal);
+    signal.throwIfAborted();
   }
   #scanning?: Promise<void>;
   /**
@@ -184,19 +206,25 @@ export class QuestionWorker {
     });
   }
   #ask(provider: Provider, ...[prompt, signal, scope, timeoutMs]: Parameters<QuestionAgent>) {
+    if (!scope) return Promise.reject(new Error('Ask needs the reviewed repository and head.'));
+    const deadline = Date.now() + Math.max(1_000, (timeoutMs ?? 120_000) - SETTLE_MARGIN_MS);
+    return this.#submit(scope.attemptId, deadline, signal, id => ({ type: 'ask', id,
+      question: { ...scope, provider, prompt, runnerOwner: this.runnerOwner!, deadline } }));
+  }
+  /**
+   * Post one job to the worker. The promise settles only when the worker reports that the container and its storage
+   * are gone, or when the worker is abandoned because it did not settle in time after `deadline`.
+   */
+  #submit(attemptId: string, deadline: number, signal: AbortSignal, request: (id: string) => WorkerRequest) {
     return new Promise<string>((resolve, reject) => {
-      if (!scope) { reject(new Error('Ask needs the reviewed repository and head.')); return; }
       let worker: Worker;
       try { worker = this.start(); } catch (error) { reject(error as Error); return; }
       const id = randomUUID();
-      const question = { ...scope, provider, prompt, runnerOwner: this.runnerOwner!,
-        deadline: Date.now() + Math.max(1_000, (timeoutMs ?? 120_000) - SETTLE_MARGIN_MS) };
-      const watchdog = setTimeout(() => { if (this.pending.has(id)) void this.#abandon('did not settle a question after its deadline'); },
-        question.deadline - Date.now() + this.abandonAfterMs);
+      const watchdog = setTimeout(() => { if (this.pending.has(id)) void this.#abandon(`did not settle a ${this.naming.job} after its deadline`); },
+        deadline - Date.now() + this.abandonAfterMs);
       watchdog.unref?.();
-      this.pending.set(id, { attemptId: scope.attemptId, resolve, reject, watchdog });
-      worker.postMessage({ type: 'ask', id, question } satisfies WorkerRequest);
-      // The promise settles only when the worker reports that the container and its storage are gone.
+      this.pending.set(id, { attemptId, resolve, reject, watchdog });
+      worker.postMessage(request(id));
       const cancel = () => worker.postMessage({ type: 'cancel', id, stop: stopOf(signal.reason),
         reason: signal.reason instanceof Error ? signal.reason.message : 'Agent cancelled.' } satisfies WorkerRequest);
       if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
@@ -225,7 +253,7 @@ export class QuestionWorker {
     // An abandonment already in progress (crash or watchdog) owns the worker: wait for its bounded settlement.
     if (!worker) { await this.#abandoning; return; }
     // Questions still waiting mean lane D has not settled; do not wait on it at shutdown.
-    if (this.pending.size) { await this.#abandon('was stopped at shutdown with questions still settling'); return; }
+    if (this.pending.size) { await this.#abandon(`was stopped at shutdown with ${this.naming.jobs} still settling`); return; }
     const id = randomUUID();
     let timer: ReturnType<typeof setTimeout> | undefined;
     const released = await new Promise<Omit<ReleaseReply, 'id'> | null>(resolve => {
@@ -238,10 +266,10 @@ export class QuestionWorker {
     // which keeps the root recorded until the thread has stopped.
     if (released === null) { await this.#abandon('did not report its storage before shutdown'); return; }
     this.worker = undefined;
-    if (released.remaining) console.error(`codeboost: ${released.remaining} Ask allocation(s) could not be removed at shutdown; the first question after the next start removes them.`);
+    if (released.remaining) console.error(`codeboost: ${released.remaining} ${this.naming.label} allocation(s) could not be removed at shutdown; the first ${this.naming.job} after the next start removes them.`);
     try { await worker.terminate(); }
     // A recovery still in flight stops with the thread; the next process's recovery finishes it.
-    finally { this.#failRecoveries(new Error('Server stopped. Retry the question.')); }
+    finally { this.#failRecoveries(new Error(`Server stopped. Retry the ${this.naming.job}.`)); }
     this.#removeRoot();
   }
   /** Set when a recovery was stopped before it answered: its Docker clients may still be running. */
@@ -252,3 +280,6 @@ export class QuestionWorker {
     this.recoveries.clear();
   }
 }
+/** Ask's worker (see AgentWorker). */
+export const QuestionWorker = AgentWorker;
+export type QuestionWorker = AgentWorker;
