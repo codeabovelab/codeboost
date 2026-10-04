@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { GH_ENV_ALLOWLIST } from '../github/gh-env.ts';
-import { BranchPushRefused, CREDENTIAL_HELPER, GitBranchPusher, gitFailure, pushEnvironment, pushUrl, redact } from '../runner/branch-push.ts';
+import { BranchPushRefused, CREDENTIAL_HELPER, GitBranchPusher, gitFailure, pushArguments, pushEnvironment, pushUrl, redact } from '../runner/branch-push.ts';
 import { ensureCommit, fetchTaskCommit, openRunnerRepository, type RunnerRepository } from '../runner/runner-repository.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
@@ -107,6 +107,51 @@ describe('GitBranchPusher', () => {
     const created = pusher(s, { owned: () => { personPushes(s, REF); return []; } });
     await expect(created.instance.push(IDENTITY, { head, branch: BRANCH })).rejects.toThrow(BranchPushRefused);
     expect(remoteRefs(s)).toBe(`${s.base} ${REF}`);
+  });
+
+  describe('a push left running by a crashed codeboost (#112)', () => {
+    /**
+     * What such a process does: the pusher's own push arguments, from the runner repository, leased to the value that
+     * run read. The process outlives its codeboost, so it lands at any point of a later publish.
+     */
+    const leftover = (s: Setup, head: string, read: string | null) => {
+      try { git(s.repository.path, '-c', 'protocol.file.allow=always', ...pushArguments({ url: s.remote, ref: REF, read, head })); return 'landed'; }
+      catch (error) {
+        // Only the lease's own refusal counts; any other failure would prove nothing about the lease.
+        const output = `${(error as { stdout?: string }).stdout ?? ''}${(error as { stderr?: string }).stderr ?? ''}`;
+        if (/\[rejected\][^\n]*\(stale info\)/.test(output)) return 'refused';
+        throw error;
+      }
+    };
+    it('is refused by its lease when it lands after a newer publish, so it never overwrites the newer head', async () => {
+      const s = await setup(), old = await runnerCommit(s, 'old'), newer = await runnerCommit(s, 'newer');
+      // The crashed run read no branch; a restart's publish created it.
+      await pusher(s, { owned: () => [old, newer] }).instance.push(IDENTITY, { head: newer, branch: BRANCH });
+      expect(leftover(s, old, null)).toBe('refused');
+      expect(remoteRefs(s)).toBe(`${newer} ${REF}`);
+      // The crashed run read an earlier commit of its own; the restart's publish moved the branch on from it.
+      const t = await setup(), a = await runnerCommit(t, 'first'), b = await runnerCommit(t, 'second'), c = await runnerCommit(t, 'third');
+      await pusher(t).instance.push(IDENTITY, { head: a, branch: BRANCH });
+      await pusher(t, { owned: () => [a, b, c] }).instance.push(IDENTITY, { head: c, branch: BRANCH });
+      expect(leftover(t, b, a)).toBe('refused');
+      expect(remoteRefs(t)).toBe(`${c} ${REF}`);
+    });
+    it('makes a newer publish refuse when it lands between that publish\'s read and its push, and the next publish moves on', async () => {
+      const s = await setup(), old = await runnerCommit(s, 'old'), newer = await runnerCommit(s, 'newer');
+      // It lands while the newer publish reads the ledger: after the newer publish's read, before its push.
+      const between = pusher(s, { owned: () => { expect(leftover(s, old, null)).toBe('landed'); return [old, newer]; } });
+      await expect(between.instance.push(IDENTITY, { head: newer, branch: BRANCH })).rejects.toThrow(`The branch ${BRANCH} moved while codeboost pushed it`);
+      expect(remoteRefs(s)).toBe(`${old} ${REF}`);
+      // The next publish reads the leftover's head, a commit the ledger records as codeboost's, and moves the branch on.
+      await pusher(s, { owned: () => [old, newer] }).instance.push(IDENTITY, { head: newer, branch: BRANCH });
+      expect(remoteRefs(s)).toBe(`${newer} ${REF}`);
+    });
+    it('is simply read as codeboost\'s commit when it lands before a newer publish reads the branch', async () => {
+      const s = await setup(), old = await runnerCommit(s, 'old'), newer = await runnerCommit(s, 'newer');
+      expect(leftover(s, old, null)).toBe('landed');
+      await pusher(s, { owned: () => [old, newer] }).instance.push(IDENTITY, { head: newer, branch: BRANCH });
+      expect(remoteRefs(s)).toBe(`${newer} ${REF}`);
+    });
   });
 
   it('reads only the exact branch, not a longer ref that ends with its name', async () => {
