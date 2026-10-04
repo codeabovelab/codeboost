@@ -185,8 +185,15 @@ export class PullRequestPublisher {
     throw new Error(text);
   }
 
-  /** How long an opening whose outcome was lost stays owned; a close refused meanwhile is retried after it. */
-  get settleMs(): number { return this.#config.settleMs ?? DEFAULT_SETTLE_MS; }
+  /**
+   * How long until the task's lost opening may be abandoned (0 when it may be now, null when there is none): its own
+   * deadline, its creation plus the settle time, on the clock recovery uses. A close refused meanwhile waits for it.
+   */
+  settleRemaining(identity: PlanIdentity): number | null {
+    const lost = this.#store.taskPullRequests(identity).find(pr => pr.state === 'opening');
+    if (!lost) return null;
+    return Math.max(0, Date.parse(lost.createdAt) + (this.#config.settleMs ?? DEFAULT_SETTLE_MS) - (this.#config.now ?? Date.now)());
+  }
 
   async #publish(identity: PlanIdentity, input: { problems?: readonly string[] }, signal?: AbortSignal): Promise<PublishOutcome> {
     const draft = input.problems !== undefined;

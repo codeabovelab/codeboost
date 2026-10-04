@@ -154,9 +154,11 @@ export class TaskPublishing {
           record = describe(outcome, draft);
         }
       } catch (error) {
-        // A close refused while an opening settles is tried again once it has: nothing else would, until a restart.
-        if (job.kind === 'close' && error instanceof OpeningUnsettled && !this.#closing) {
-          const timer = setTimeout(() => { this.#retries.delete(timer); this.actIfOwed(identity); }, this.#publisher.settleMs + 1_000);
+        // A close refused while an opening settles is tried again once it has: nothing else would, until a restart. It
+        // waits for that opening's own deadline (plus a second), not a fresh settle time from now.
+        const remaining = job.kind === 'close' && error instanceof OpeningUnsettled && !this.#closing ? this.#publisher.settleRemaining(identity) : null;
+        if (remaining !== null) {
+          const timer = setTimeout(() => { this.#retries.delete(timer); this.actIfOwed(identity); }, remaining + 1_000);
           timer.unref?.();
           this.#retries.add(timer);
         }

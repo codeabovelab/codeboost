@@ -551,6 +551,29 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: late!.number }]);
   });
 
+  it('retries a refused close at the opening\'s own settle deadline, not a fresh settle time from the cancel', async () => {
+    const w = world();
+    const opening = Promise.withResolvers<void>();
+    let late: Pr | undefined;
+    w.github.onOpen = signal => new Promise((_, reject) => {
+      late = w.github.prs.at(-1); w.github.hidden.add(late!.number);
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      opening.resolve();
+    });
+    const { app, identity, store } = await serve(w, { before: needsHuman, settleMs: 8_000 });
+    await opening.promise;
+    // The opening is already about 6.5 s old (of its 8 s) when the task is cancelled.
+    await new Promise(resolve => setTimeout(resolve, 6_500));
+    await act(app, 'cancel-task');
+    const cancelled = Date.now();
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', action: 'close' }), { timeout: 5_000 });
+    w.github.hidden.delete(late!.number);
+    // About 1.5 s left plus the 1 s margin: closed well before a fresh 8 s window (9 s) would have retried it.
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 6_000, interval: 50 });
+    expect(Date.now() - cancelled).toBeLessThan(7_000);
+    expect(late!.open).toBe(false);
+  });
+
   it('calls GitHub for nothing when a task without any PR is cancelled, and each action refuses the other\'s status', async () => {
     const w = world();
     const { app, identity, store } = await serve(w);

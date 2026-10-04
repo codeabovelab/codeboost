@@ -1278,6 +1278,43 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     await expect(publisher.closeAll(identity)).rejects.toThrow('Pull request #100 was opened in owner/repo, not owner/renamed');
     expect(log).toEqual([]);
   });
+  it('reports how long the lost opening still has to settle, on the clock recovery uses', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await expect(harness(store, { live, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    const created = Date.parse(store.taskPullRequests(identity)[0]!.createdAt);
+    expect(harness(store, { live, config: { settleMs: 60_000, now: () => created + 59_500 } }).publisher.settleRemaining(identity)).toBe(500);
+    expect(harness(store, { live, config: { settleMs: 60_000, now: () => created + 61_000 } }).publisher.settleRemaining(identity)).toBe(0);
+    expect(harness(runningTask()).publisher.settleRemaining(identity)).toBeNull();
+  });
+  /** A cancelled task whose opening was abandoned (GitHub showed nothing in time) and whose PR GitHub shows now. */
+  async function abandonedThenCancelled() {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), hidden = new Set<string>();
+    await expect(harness(store, { live, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const marker of live.keys()) hidden.add(marker);
+    // The settle time has passed with nothing visible: the opening is abandoned, and the main path goes on (it opens a
+    // second PR into the base, which GitHub refuses while the hidden one is open; any outcome will do here).
+    await harness(store, { live, hidden, config: { settleMs: 0 } }).publisher.publish(identity).catch(() => undefined);
+    expect(store.taskPullRequests(identity).filter(pr => pr.number === null).map(pr => pr.state)).toEqual(expect.arrayContaining(['abandoned']));
+    expect(store.taskPullRequests(identity).every(pr => pr.state === 'abandoned')).toBe(true);
+    cancel(store);
+    return { store, live, marker: [...live.keys()][0]! };
+  }
+  it('adopts and closes an abandoned opening\'s PR that GitHub shows now', async () => {
+    const { store, live } = await abandonedThenCancelled(), closed = new Set<number>();
+    const { publisher, log } = harness(store, { live, closed });
+    expect(await publisher.closeAll(identity)).toContain(100);
+    expect(closed.has(100)).toBe(true);
+    expect(log).toContain('close 100');
+    expect(store.taskPullRequests(identity)).toContainEqual(expect.objectContaining({ state: 'opened', number: 100 }));
+  });
+  it('closes neither of two PRs that carry an abandoned opening\'s marker, and refuses', async () => {
+    const { store, live, marker } = await abandonedThenCancelled(), closed = new Set<number>();
+    const copy = { number: 999, url: 'https://github.com/owner/repo/pull/999', headSha: oid(8), draft: false, marker };
+    const { publisher } = harness(store, { live, closed, copies: [copy] });
+    await expect(publisher.closeAll(identity)).rejects.toThrow(/carry the first line of a pull request the task was opening, so codeboost closed neither/);
+    expect(closed.has(100) || closed.has(999)).toBe(false);
+    expect(store.taskPullRequests(identity).every(pr => pr.state === 'abandoned')).toBe(true);
+  });
   it('closes nothing when shutdown begins between the read and the close', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>();
     await harness(store, { live }).publisher.publish(identity);
