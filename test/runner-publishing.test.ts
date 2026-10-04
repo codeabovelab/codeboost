@@ -46,7 +46,12 @@ class FakeGitHub {
   head(branch: string): string | null {
     try { return git(this.remote, 'rev-parse', '--verify', '-q', `refs/heads/${branch}`); } catch { return null; }
   }
-  #view(pr: Pr) { return { number: pr.number, url: pr.url, draft: pr.draft, headSha: this.head(pr.headBranch) ?? '' }; }
+  /** The next answer about a PR shows this head instead of the branch's (GitHub lags behind a push), once. */
+  staleHeadOnce?: string;
+  #view(pr: Pr) {
+    const stale = this.staleHeadOnce; this.staleHeadOnce = undefined;
+    return { number: pr.number, url: pr.url, draft: pr.draft, headSha: stale ?? this.head(pr.headBranch) ?? '' };
+  }
   checks: AlreadyFixedGateway = { repository: REPO, check: async () => { this.calls.push('check'); return { outcome: 'clear', baseHead: 'b'.repeat(40) }; } };
   pulls: PullRequestGateway = {
     repository: REPO,
@@ -141,7 +146,7 @@ function world(): World {
  * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
  * exists, as an earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; env?: NodeJS.ProcessEnv; settleMs?: number } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; env?: NodeJS.ProcessEnv; settleMs?: number; shortRetryMs?: number } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -161,7 +166,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
       onProcessGroup: () => options.onPushSpawn?.(++spawns, () => app!, close) });
     const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main', ...(options.settleMs ? { settleMs: options.settleMs } : {}) });
     branchOf = identity => publisher(() => false).branch(identity);
-    return { deps, sources, findings: new SafetyFindings(service.store), publisher, ...(options.env ? { env: options.env } : {}),
+    return { deps, sources, findings: new SafetyFindings(service.store), publisher, ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   });
   cleanups.push(close);
@@ -523,10 +528,17 @@ describe('publishing a finished task (#103)', () => {
       const w = world();
       const { app, identity, store } = await serve(w, { startup: false, before: service => {
         const s = service.store, id = service.config.identity;
+        // Running, with P2 and P3 still to run: owed work would be paid, and nothing can be published.
+        s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+        const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+        s.markRunning(id, attempt.id);
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head: s.getSnapshot(id).head, unchanged: true, inScope: [], outOfScope: [] } });
         s.recordPublish(id, { outcome: 'publishing', draft: false, message: 'A pull request is being published.' });
       } });
-      vi.spyOn(app.executor!, 'payOwed').mockImplementation(() => { throw new Error('The snapshot of P1\'s commit is missing.'); });
+      expect(store.getTask(identity).status).toBe('running');
+      const pay = vi.spyOn(app.executor!, 'payOwed').mockImplementation(() => { throw new Error('The snapshot of P1\'s commit is missing.'); });
       app.publishOwed();
+      expect(pay).toHaveBeenCalled();
       expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped' });
     });
     it('settles only a stuck reply with the outcome on record, leaving that record as it is', async () => {
@@ -650,6 +662,47 @@ describe('publishing a finished task (#103)', () => {
       expect(store.getTask(identity).status).toBe('needs human');
       await publishSettled(app, identity);
       expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+    });
+  });
+
+  describe('round 4 of the independent review', () => {
+    it('stops retrying when GitHub keeps failing every open: one retry at the deadline, not one every settle time', async () => {
+      const w = world();
+      // GitHub fails every open, creating nothing.
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 800, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      app.publishOwed();
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      expect(starts.mock.calls.filter(call => call[1].outcome === 'publishing').length).toBe(2);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' });
+    });
+    it('reconciles a ready PR that GitHub showed at another head: still owed, and published again by itself', async () => {
+      const w = world();
+      w.github.staleHeadOnce = 'a'.repeat(40);
+      const { app, identity, store } = await serve(w, { before: completeAll, shortRetryMs: 300, startup: false });
+      app.publishOwed();
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', reconcile: true }), { timeout: 10_000 });
+      expect(store.getTask(identity).status).toBe('running');
+      expect(w.github.prs[0]!.draft).toBe(true);
+      // The short retry publishes again, and this time GitHub shows the pushed head.
+      await vi.waitFor(() => expect(store.getTask(identity).status).toBe('in review'), { timeout: 10_000, interval: 50 });
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+      expect(store.lastPublish(identity)!.reconcile).toBeUndefined();
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: false })]);
+    });
+    it('retries once, after a short wait, a publish refused because GitHub\'s list lags behind its PR', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: needsHuman, shortRetryMs: 300 });
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
+      // Owed again (an earlier attempt failed), and GitHub's list does not show the PR for now.
+      store.recordPublish(identity, { outcome: 'refused', draft: true, message: 'The branch moved.' });
+      w.github.hidden.add(100);
+      app.publishOwed();
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/list does not show it yet/) }), { timeout: 10_000 });
+      w.github.hidden.clear();
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true }), { timeout: 10_000, interval: 50 });
     });
   });
 
