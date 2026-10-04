@@ -14,6 +14,8 @@ import { GitBranchPusher } from '../runner/branch-push.ts';
 import { PullRequestPublisher } from '../runner/publish.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
 import { baseBranch } from '../runner/production.ts';
+import { MergeCoordinator } from '../runner/merge.ts';
+import type { MergeGateway } from '../github/merge.ts';
 import { PullRequestMisplaced, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
@@ -340,6 +342,26 @@ describe('publishing a finished task (#103)', () => {
     await closeApp!();
     const store = new Store(w.demo.database);
     try { expect(store.taskPullRequests(first.identity)).toMatchObject([{ state: 'opened', number: 100 }]); } finally { store.close(); }
+  });
+
+  it('publishes the whole task head, the branch\'s own commits too, which review shows as Unplanned and the merge gate blocks (#113)', async () => {
+    const w = world();
+    const { app, identity, store, branch, head } = await serve(w, { before: completeAll });
+    await publishSettled(app, identity);
+    // The demo branch's last commit was made by a person, not by codeboost: the ledger does not record it.
+    const owned = store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha);
+    expect(owned).not.toContain(head);
+    // It is published as it is: the PR's branch is the whole head.
+    expect(w.github.head(branch)).toBe(head);
+    expect(w.github.prs).toEqual([expect.objectContaining({ open: true, draft: false })]);
+    // Review shows its change in the Unplanned row, and the merge gate blocks until a person assigns or accepts it.
+    const view = app.service.load();
+    expect(view.segments.filter(segment => segment.row === 'Unplanned').map(segment => segment.path)).toContain('debug.log');
+    const gateway: MergeGateway = { inspect: async () => ({ base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
+      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear' }), merge: async () => { throw new Error('not merged here'); } };
+    const status = await new MergeCoordinator(app.service, gateway).status(view);
+    expect(status).toMatchObject({ ready: false });
+    expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'unplanned' }));
   });
 
   it('never publishes in a demo, even with a publisher', async () => {
