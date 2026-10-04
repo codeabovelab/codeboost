@@ -1,11 +1,11 @@
-import { randomUUID } from 'node:crypto';
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmodSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
-import type { InvocationContext, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
-import type { TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
+import type { InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
+import type { TaskStorageLimits } from '../agents/container/storage.ts';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
-import { allocations, RetainedStorage, stopOf, type ContainerDependencies, type LeftoverPolicy, type Provider } from './question-container.ts';
+import { allocations, exceedsStorage, RetainedStorage, runReadOnlyAgent, sameContext, type ContainerDependencies, type LeftoverPolicy, type Provider,
+  type ReadOnlyFeature, type RepositorySize } from './question-container.ts';
 
 /** Ask's lane D dependencies, less startup recovery, which the runner owns for planning. */
 export type PlanningDependencies = Omit<ContainerDependencies, 'recover'>;
@@ -53,9 +53,10 @@ const ROOT_PREFIX = 'codeboost-planning-';
  */
 export function removePlanningRoot(root: string): void {
   if (dirname(root) !== tmpdir() || !basename(root).startsWith(ROOT_PREFIX))
-    throw new Error(`Refusing to remove a path that is not a planning root (${root}).`);
+    throw new Error(`A copy of the planned code could not be deleted (${root}): it is not a planning root.`);
   try { chmodSync(join(root, 'input'), 0o700); } catch { /* never created, or already removed */ }
-  rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 });
+  try { rmSync(root, { recursive: true, force: true, maxRetries: 3, retryDelay: 50 }); }
+  catch (error) { throw new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }); }
 }
 
 // Planning reads the code; it needs no room to write. The same ceilings as Ask.
@@ -79,9 +80,6 @@ const stopMessages: Record<StopReason, string> = {
   cancelled: 'Planning agent cancelled.', timeout: 'Planning agent timed out.', shutdown: 'Server stopped during planning.',
   'output-limit': 'Planning agent output exceeded its limit.', 'capture-failure': 'Planning agent output could not be captured.',
 };
-const sameContext = (left: InvocationContext, right: InvocationContext) =>
-  (Object.keys(right) as (keyof InvocationContext)[]).every(key => left[key] === right[key])
-  && Object.keys(left).length === Object.keys(right).length;
 /** Accept only this exact invocation's output, and only after a clean exit. The text is still unvalidated. */
 export function planningOutput(result: InvocationResult, invocation: InvocationInput): string {
   if (result.attemptId !== invocation.attemptId || !result.context || !sameContext(result.context, invocation.context))
@@ -95,6 +93,22 @@ export function planningOutput(result: InvocationResult, invocation: InvocationI
   }
   return result.stdout;
 }
+
+const text = (error: unknown) => error instanceof Error ? error.message : String(error);
+/** Planning's part of a read-only run (see `runReadOnlyAgent`). */
+export const PLANNING_FEATURE: ReadOnlyFeature = Object.freeze({
+  phase: 'planning', rootPrefix: ROOT_PREFIX, removeRoot: removePlanningRoot, storage: PLANNING_STORAGE,
+  credential: planningCredential, timedOut: stopMessages.timeout,
+  assertFits: (size: RepositorySize) => {
+    if (exceedsStorage(size, PLANNING_STORAGE)) throw new Error('The repository is too large for planning.');
+  },
+  output: (_vendor: Provider, result: InvocationResult, invocation: InvocationInput) => planningOutput(result, invocation),
+  // What cleanup left is retained, and the next request names it. A successful request is refused rather than
+  // returned, as Ask does, so a plan is never kept from an unsettled run. A failed one keeps its own message first.
+  cleanupFailed: (failures: readonly unknown[], failure?: { error: unknown }) => failure
+    ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
+    : new AggregateError(failures, 'Planning container cleanup did not settle.'),
+});
 
 /**
  * E2's provider over lane D: each request runs in a fresh container on a read-only copy of `head`, in the "planning"
@@ -114,73 +128,12 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1) throw new Error('Planning timeout must be a positive integer.');
   return { async invoke(request: AuthorRequest, signal: AbortSignal): Promise<string> {
     if (request.phase !== 'planning' || request.access !== 'read-only') throw new Error('Planning requests must be read-only.');
-    const deadline = Date.now() + timeoutMs;
-    const remaining = () => {
-      signal.throwIfAborted();
-      const value = deadline - Date.now();
-      if (value < 1) throw new Error(stopMessages.timeout);
-      return value;
-    };
     signal.throwIfAborted();
-    const credential = planningCredential(vendor, deps.env);
-    retained.release(deps.removeFilesystems);
-    image.id ??= deps.buildImage(remaining());
-    const root = mkdtempSync(join(tmpdir(), ROOT_PREFIX));
-    const staging = join(root, 'staging'), input = join(root, 'input');
-    let filesystems: TaskFilesystems | undefined, failure: { error: unknown } | undefined;
-    try {
-      mkdirSync(staging); mkdirSync(input);
-      writeFileSync(join(input, 'schema.json'), request.schemaText, { mode: 0o444 });
-      chmodSync(input, 0o555);
-      // The clone is a full host copy with no byte limit of its own, so the repository must fit before it is made.
-      const size = deps.measureRepository(options.repository, options.head, Math.min(60_000, remaining()));
-      if (size.checkoutBytes > PLANNING_STORAGE.workBytes || size.entries > PLANNING_STORAGE.workInodes
-        || size.objectBytes > PLANNING_STORAGE.metadataBytes)
-        throw new Error('The repository is too large for planning.');
-      const clone = deps.createClone({ source: options.repository, parent: staging, taskId: `planning-${request.requestId}`,
-        head: options.head, timeoutMs: Math.min(120_000, remaining()) });
-      const owner = { runnerOwner: options.runnerOwner, attemptId: request.requestId, allocationId: randomUUID() };
-      try { filesystems = deps.prepareFilesystems(clone, PLANNING_STORAGE, image.id, owner, Math.min(60_000, remaining())); }
-      catch (error) {
-        // D throws an AggregateError only when a failed allocation's own cleanup did not settle; it returns no handle.
-        if (error instanceof AggregateError) retained.markUntracked();
-        throw error;
-      }
-      remaining();
-      const invocation = deps.capture({ clone, phase: 'planning', vendor: 'claude', approvedArgv: [], deadline,
-        attemptId: request.requestId, runnerOwner: options.runnerOwner,
-        context: { snapshotId: options.snapshotId, planId: request.identity.planId, planRevision: request.revision,
-          assignmentId: `${request.mode}-${request.issue}`, referencedCodeHash: options.head, stateVersion: 0 } });
-      const adapterRequest = { invocation, filesystems, inputDirectory: input, imageId: image.id, prompt: request.prompt,
-        networkAllocationId: randomUUID() };
-      const handle = deps.startClaude(adapterRequest, credential);
-      const cancel = () => handle.cancel(stopOf(signal.reason));
-      if (signal.aborted) cancel(); else signal.addEventListener('abort', cancel, { once: true });
-      let result: InvocationResult;
-      try { result = await handle.settled; }
-      finally { signal.removeEventListener('abort', cancel); }
-      // D stopped before confirming cleanup; the resources are found again by their labels after a restart.
-      if (result.unreleased !== undefined) retained.markUntracked();
-      return planningOutput(result, invocation);
-    } catch (error) {
-      failure = { error };
-      throw error;
-    } finally {
-      const failures: unknown[] = [];
-      if (filesystems) try { deps.removeFilesystems(filesystems); } catch (error) { retained.retain(filesystems); failures.push(error); }
-      try { removePlanningRoot(root); }
-      catch (error) {
-        retained.retainPath(root);
-        failures.push(new Error(`A copy of the planned code could not be deleted (${root}).`, { cause: error }));
-      }
-      // What cleanup left is retained above, and the next request names it. A successful request is refused rather than
-      // returned, as Ask does, so a plan is never kept from an unsettled run. A failed one keeps its own message first.
-      if (failures.length) {
-        const text = (error: unknown) => error instanceof Error ? error.message : String(error);
-        throw failure
-          ? new AggregateError([failure.error, ...failures], `${text(failure.error)} Cleanup also did not settle: ${failures.map(text).join('; ')}`)
-          : new AggregateError(failures, 'Planning container cleanup did not settle.');
-      }
-    }
+    return runReadOnlyAgent(PLANNING_FEATURE, { provider: vendor, repository: options.repository, head: options.head,
+      runnerOwner: options.runnerOwner, attemptId: request.requestId, taskId: `planning-${request.requestId}`,
+      deadline: Date.now() + timeoutMs, prompt: request.prompt, schemaText: request.schemaText,
+      context: { snapshotId: options.snapshotId, planId: request.identity.planId, planRevision: request.revision,
+        assignmentId: `${request.mode}-${request.issue}`, referencedCodeHash: options.head, stateVersion: 0 } },
+      deps, signal, image, retained);
   } };
 }
