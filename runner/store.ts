@@ -359,8 +359,9 @@ export class Store {
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
   /**
-   * `target`: the PR the attempt merges. With an `openingId` (the task's published PR, #121), that opening must still be the
-   * task's latest opened record in its base, with that number, and no opening or update of the task's PRs may be in flight.
+   * `target`: the PR the attempt merges. With an `openingId` (the task's published PR, #121), that opening must still be
+   * the task's opened record in its base whose opening began last, with that number, and no opening or update of the
+   * task's PRs may be in flight.
    */
   beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null,
     target: { pullRequest: number; openingId: string | null } | null = null): MergeAttempt {
