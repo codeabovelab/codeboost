@@ -1141,6 +1141,16 @@ export class Store {
     // Interrupted work waiting to be requeued, or a rebase in progress, is not finished work to publish.
     if (task.requeue_pending === 1) throw new GuardRefusal('The task has interrupted work waiting to be requeued.');
     if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
+    // A ready PR is finished work: every item of the current plan revision has a completed execute attempt. Checked here,
+    // at every guarded publish write, so a plan revision that adds an item while a publish awaits GitHub refuses it.
+    if (!draft) {
+      const current = this.#current(key), revision = current.revision as number;
+      const items = decode<Plan>(this.#get('SELECT data FROM revisions WHERE key=? AND revision=?', key, revision)!.data).items;
+      const finished = new Set(this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
+        AND state='completed' AND json_extract(context,'$.planRevision') = ?`).all(key, revision).map(entry => entry.item as string));
+      const unrun = items.find(item => !finished.has(item.id));
+      if (unrun) throw new GuardRefusal(`${unrun.id} has not run yet; publish once every plan item has run.`);
+    }
   }
   /**
    * Records a pre-PR check. A match, or a check that could not be completed, moves a running task to possibly already
@@ -1322,6 +1332,11 @@ export class Store {
         AND (action_id=? OR json_extract(response,'$.value.outcome')='publishing')`, encode({ ok: true, value: publishActionResponse(saved) }), key, actionId ?? null);
       return saved;
     });
+  }
+  /** Settle every publish action reply still saying `publishing` with `record`, the outcome on record, unchanged. */
+  settleUnsettledPublishReplies(identity: PlanIdentity, record: PublishRecord): void {
+    this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
+      AND json_extract(response,'$.value.outcome')='publishing'`, encode({ ok: true, value: publishActionResponse(record) }), identityKey(identity));
   }
   /** Whether a publish action's saved reply still says `publishing`: its publish has not recorded an outcome yet. */
   hasUnsettledPublishAction(identity: PlanIdentity): boolean {

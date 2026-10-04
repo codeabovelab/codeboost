@@ -29,6 +29,8 @@ export class TaskPublishing {
   /** Token values to remove from recorded error text: those of the environment the gh calls and the push run with. */
   #secrets: string[];
   #closing = false;
+  /** Retries of a publish refused while a lost opening settles (OpeningUnsettled), cleared at shutdown. */
+  #retries = new Set<ReturnType<typeof setTimeout>>();
   /** Publishes in progress, by task, from scheduling until the outcome is recorded. */
   #running = new Map<string, Promise<void>>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
@@ -52,21 +54,29 @@ export class TaskPublishing {
     if (this.busy(identity)) throw new GuardRefusal('A pull request is already being published for this task.');
     // Publishing reads the task head, so it waits for the run (and the attempt) to end: assertPublishable refuses an active attempt.
     if (this.#runner.isActive(identity) || this.#executor.busy(identity)) throw new GuardRefusal('A run of this task is still in progress; publish once it has ended.');
-    // An earlier run owes a safety escalation or a scope pause (its write failed, or the process stopped): the task is not
-    // finished work until that is settled, so a ready PR must not show its unreviewed changes. publishIfOwed pays it.
-    if (this.#executor.owes(identity)) throw new GuardRefusal('An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.');
     const task = this.#store.getTask(identity);
     if (task.status === 'running') {
       const { next } = progress ?? this.#executor.progress(identity);
       if (next !== null) throw new GuardRefusal(`${next} has not run yet; publish once every plan item has run.`);
+      this.#assertNothingOwed(identity);
       this.#store.assertPublishableNow(identity, false);
       return { draft: false };
     }
     if (task.status === 'needs human') {
+      this.#assertNothingOwed(identity);
       this.#store.assertPublishableNow(identity, true);
       return { draft: true };
     }
     throw new GuardRefusal(`The task is ${task.status}; a pull request is published for a running task whose plan items have all run, or a task that needs a person.`);
+  }
+
+  /**
+   * An earlier run owes a safety escalation or a scope pause (its write failed, or the process stopped): the task is not
+   * finished work until that is settled, so a ready PR must not show its unreviewed changes. publishIfOwed pays it. Read
+   * only for a status that could publish, so a poll of any other task does not scan its attempts.
+   */
+  #assertNothingOwed(identity: PlanIdentity): void {
+    if (this.#executor.owes(identity)) throw new GuardRefusal('An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.');
   }
 
   /**
@@ -78,6 +88,9 @@ export class TaskPublishing {
     try { mode = this.mode(identity); }
     catch (error) { if (error instanceof GuardRefusal || error instanceof ShuttingDownError) return null; throw error; }
     const last = this.#store.lastPublish(identity);
+    // A task that reached its status before publishing existed is published only when a person asks (the v10 upgrade's
+    // record), whatever changes since.
+    if (last?.outcome === 'not published') return null;
     return !last || !SETTLED.includes(last.outcome) || last.stateVersion !== this.#store.getTask(identity).stateVersion ? mode : null;
   }
 
@@ -108,9 +121,13 @@ export class TaskPublishing {
       this.#payOwed(identity);
       const owed = this.owed(identity);
       if (owed) { this.#schedule(identity, owed.draft); return; }
-      if (this.#store.hasUnsettledPublishAction(identity) || this.#store.lastPublish(identity)?.outcome === IN_FLIGHT)
-        this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false,
+      const last = this.#store.lastPublish(identity);
+      if (!last || last.outcome === IN_FLIGHT) {
+        if (last || this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false,
           message: 'The publish was interrupted before it recorded an outcome (codeboost stopped). Its pull request, if it opened one, is in the task\'s records; the publish action runs it again.' }));
+      // Only a reply is stuck (its publish never recorded itself as started): it reports the outcome on record, which is
+      // left as it is, stamp included, so what is owed does not change.
+      } else if (this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.settleUnsettledPublishReplies(identity, last));
     } catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
@@ -120,6 +137,8 @@ export class TaskPublishing {
    */
   async close(): Promise<void> {
     this.#closing = true;
+    for (const timer of this.#retries) clearTimeout(timer);
+    this.#retries.clear();
     await this.#publisher.close();
     while (this.#running.size) await Promise.all([...this.#running.values()]);
   }
@@ -127,8 +146,12 @@ export class TaskPublishing {
   /** Settle what an earlier run owes before deciding what to publish (see mode); a task it moves is then not finished work. */
   #payOwed(identity: PlanIdentity): void {
     if (this.#closing || this.#runner.closing) return;
-    const paid = this.#executor.payOwed(identity);
-    if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
+    // Its failure must not stop the caller from settling what it can (an in-flight record, a stuck reply): the task still
+    // owes the work, and mode() refuses to publish until it is paid.
+    try {
+      const paid = this.#executor.payOwed(identity);
+      if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
+    } catch (error) { console.error(`Could not settle what an earlier run owes: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
   #schedule(identity: PlanIdentity, draft: boolean, actionId?: string): void {
@@ -147,6 +170,14 @@ export class TaskPublishing {
         const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {});
         record = describe(outcome, draft);
       } catch (error) {
+        // Refused while a lost opening settles: nothing else would try again (no run ends, startup has passed), so it is
+        // tried again at that opening's own deadline, plus a second.
+        const remaining = error instanceof OpeningUnsettled && !this.#closing ? this.#publisher.settleRemaining(identity) : null;
+        if (remaining !== null) {
+          const timer = setTimeout(() => { this.#retries.delete(timer); this.publishIfOwed(identity); }, remaining + 1_000);
+          timer.unref?.();
+          this.#retries.add(timer);
+        }
         const stopped = error instanceof ShuttingDownError || (this.#closing && (error as Error)?.name === 'AbortError');
         record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets) };
       }
