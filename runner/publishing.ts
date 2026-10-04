@@ -54,7 +54,7 @@ export class TaskPublishing {
    * The reason an owed escalation was paid with (a safety finding whose save had failed): the executor settles it in
    * memory only, so the task's attempt rows do not carry it, and the draft PR would otherwise not say why (#103).
    */
-  #escalations = new Map<string, string>();
+  #escalations = new Map<string, { reason: string; attemptId: string | null }>();
   /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
   #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
@@ -223,7 +223,8 @@ export class TaskPublishing {
     // owes the work, and mode() refuses to publish until it is paid.
     try {
       const paid = this.#executor.payOwed(identity);
-      if (paid?.kind === 'needs human') this.#escalations.set(identityKey(identity), paid.reason);
+      // Tied to the attempt current once paid: a later run (a new attempt) that ends in needs human again has its own reason.
+      if (paid?.kind === 'needs human') this.#escalations.set(identityKey(identity), { reason: paid.reason, attemptId: this.#store.getTask(identity).currentAttemptId });
       if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
     } catch (error) { console.error(`Could not settle what an earlier run owes: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
@@ -324,9 +325,11 @@ export class TaskPublishing {
    */
   #problems(identity: PlanIdentity): string[] {
     const task = this.#store.getTask(identity);
-    // An owed finding paid here first: only this process knows its text.
-    const escalated = this.#escalations.get(identityKey(identity));
-    if (escalated) return [escalated];
+    // An owed finding paid here first: only this process knows its text. Only while the task is still in needs human from
+    // that payment (the same current attempt); once a later run has started, the finding is an earlier attempt's.
+    const key = identityKey(identity), escalated = this.#escalations.get(key);
+    if (escalated && task.status === 'needs human' && escalated.attemptId === task.currentAttemptId) return [escalated.reason];
+    this.#escalations.delete(key);
     const current = task.currentAttemptId === null ? undefined : this.#store.getAttempt(identity, task.currentAttemptId);
     if (current?.safetyFinding) return [current.safetyFinding];
     if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
