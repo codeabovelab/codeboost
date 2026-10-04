@@ -72,14 +72,15 @@ The provider and Ask share one container runner, `runReadOnlyAgent` in
 limits, credential rule, output check and wording as a `ReadOnlyFeature` (`ASK_FEATURE`, `PLANNING_FEATURE`). Ask's wording
 and cleanup error are unchanged (#117 part 1).
 
-Left for #117 part 2: the provider's image build, clone and storage calls are
-synchronous, so a server must run it off its request thread, as Ask does. That
-worker should also set TMPDIR to a planning root, as Ask's does, so the input and
-auth staging that lane D leaves when it gives up on cleanup is covered. E3's
-default 120-second suggestion timeout is shorter than the provider's ten-minute
-budget. Startup recovery does not yet remove planning's Docker resources after a
-crash, because they are not attempt allocations in the Store. The recording
-script prints its runner label if it leaves any.
+#117 part 2 wires the provider into the server. Each request runs in planning's
+own worker thread (`runner/planning.ts`, `AgentWorker` with `PLANNING_NAMING`),
+whose TMPDIR is a planning root recorded in a ledger beside the review database,
+so lane D's leftover input and auth staging is covered. Its Docker objects carry
+the database's planning owner, apart from Ask's and the runner's, and the first
+request of a process removes what earlier sessions left by that owner only. E3's
+suggestion timer and the request share one ten-minute budget. The recording
+script still runs the provider in its own process and prints its runner label if
+it leaves anything.
 
 F/G still own live API and UI integration. The Store now guarantees revision/snapshot
 binding and pending-only settlement across processes, and E3 requires the caller's

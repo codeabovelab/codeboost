@@ -5,7 +5,7 @@ import type { InvocationInput, InvocationResult, StopReason } from '../agents/co
 import type { TaskStorageLimits } from '../agents/container/storage.ts';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import { allocations, exceedsStorage, RetainedStorage, runReadOnlyAgent, sameContext, type ContainerDependencies, type LeftoverPolicy, type Provider,
-  type ReadOnlyFeature, type RepositorySize } from './question-container.ts';
+  type ReadOnlyFeature, type ReadOnlyRun, type RepositorySize } from './question-container.ts';
 
 /** Ask's lane D dependencies, less startup recovery, which the runner owns for planning. */
 export type PlanningDependencies = Omit<ContainerDependencies, 'recover'>;
@@ -63,7 +63,12 @@ export function removePlanningRoot(root: string): void {
 export const PLANNING_STORAGE: TaskStorageLimits = Object.freeze({
   workBytes: 512 * 1024 * 1024, workInodes: 131_072, metadataBytes: 512 * 1024 * 1024, metadataInodes: 131_072,
 });
-const DEFAULT_TIMEOUT_MS = 10 * 60_000;
+/**
+ * The whole budget of one planning request, setup included (#117). Lane D caps the invocation itself at ten minutes,
+ * and E3's suggestion timer uses this same budget, so the request settles inside it.
+ */
+export const PLANNING_BUDGET_MS = 10 * 60_000;
+const DEFAULT_TIMEOUT_MS = PLANNING_BUDGET_MS;
 
 /** Codex reads files only through its shell, and planning runs no process, so Codex cannot plan (#75, #93). */
 export const CODEX_PLANNING_REFUSED = 'Codex cannot write plans yet: it can read the code only by running commands, '
@@ -110,6 +115,22 @@ export const PLANNING_FEATURE: ReadOnlyFeature = Object.freeze({
     : new AggregateError(failures, 'Planning container cleanup did not settle.'),
 });
 
+/** Where a planning request reads the code: the review's repository at the snapshot's head. */
+export interface PlanningSource {
+  readonly vendor: Provider;
+  readonly repository: string;
+  readonly head: string;
+  readonly snapshotId: string;
+}
+/** One planning request as a read-only run, without its owner, which the process running it supplies. */
+export function planningRun(request: AuthorRequest, source: PlanningSource, deadline: number): Omit<ReadOnlyRun, 'runnerOwner'> {
+  if (request.phase !== 'planning' || request.access !== 'read-only') throw new Error('Planning requests must be read-only.');
+  return { provider: source.vendor, repository: source.repository, head: source.head, attemptId: request.requestId,
+    taskId: `planning-${request.requestId}`, deadline, prompt: request.prompt, schemaText: request.schemaText,
+    context: { snapshotId: source.snapshotId, planId: request.identity.planId, planRevision: request.revision,
+      assignmentId: `${request.mode}-${request.issue}`, referencedCodeHash: source.head, stateVersion: 0 } };
+}
+
 /**
  * E2's provider over lane D: each request runs in a fresh container on a read-only copy of `head`, in the "planning"
  * phase (read, list and search only; no commands) with vendor-only egress. The request's schema is the only file in
@@ -129,11 +150,8 @@ export function createPlanningProvider(options: PlanningProviderOptions): Planni
   return { async invoke(request: AuthorRequest, signal: AbortSignal): Promise<string> {
     if (request.phase !== 'planning' || request.access !== 'read-only') throw new Error('Planning requests must be read-only.');
     signal.throwIfAborted();
-    return runReadOnlyAgent(PLANNING_FEATURE, { provider: vendor, repository: options.repository, head: options.head,
-      runnerOwner: options.runnerOwner, attemptId: request.requestId, taskId: `planning-${request.requestId}`,
-      deadline: Date.now() + timeoutMs, prompt: request.prompt, schemaText: request.schemaText,
-      context: { snapshotId: options.snapshotId, planId: request.identity.planId, planRevision: request.revision,
-        assignmentId: `${request.mode}-${request.issue}`, referencedCodeHash: options.head, stateVersion: 0 } },
+    return runReadOnlyAgent(PLANNING_FEATURE, { ...planningRun(request, { vendor, repository: options.repository,
+      head: options.head, snapshotId: options.snapshotId }, Date.now() + timeoutMs), runnerOwner: options.runnerOwner },
       deps, signal, image, retained);
   } };
 }

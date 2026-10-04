@@ -16,12 +16,21 @@ import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
 import { SuggestionCoordinator, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
-/** Live planning runs only through D (G4 after #51). Until a provider is injected, starting a suggestion is refused. */
+import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
+export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
+/** Live planning runs only through D (G4 after #51, #117). Until a provider is injected, starting a suggestion is refused. */
 export interface PlanningDeps {
   provider: AuthorProvider;
-  /** Trusted repository, issue and approved-lesson inputs for a suggestion request. */
-  describe(): Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
+  /**
+   * Trusted repository, issue and approved-lesson inputs for a suggestion request. Production reads the issue from
+   * GitHub, so it may wait; `signal` ends with the HTTP request.
+   */
+  describe(signal: AbortSignal): PlanningDescription | Promise<PlanningDescription>;
+  /** Releases what the provider owns at shutdown, after every suggestion has settled. */
+  close?(): Promise<void>;
 }
+/** Production planning is built after the Store opens, from the review it serves (see web/cli.ts). */
+export type PlanningSetup = (service: ReviewService) => PlanningDeps;
 const publicRoot = new URL('./public/', import.meta.url);
 /** The longest shutdown waits for admitted requests to finish before aborting them; below the 15 s request timeout. */
 export const MAX_SHUTDOWN_DRAIN_MS = 14_500;
@@ -33,10 +42,11 @@ export type RunnerSetup = (service: ReviewService, capability: ShutdownCapabilit
 export const RUNNER_NOT_CONFIGURED = 'The runner is not configured. Add a runner block to the review configuration and restart codeboost.';
 /** Demos never run the runner, whatever their configuration says. */
 export const RUNNER_NOT_IN_DEMO = 'Demos do not run the runner. Use a review configuration with a runner block.';
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planning?: PlanningDeps, runnerSetup?: RunnerSetup) {
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planningInput?: PlanningDeps | PlanningSetup, runnerSetup?: RunnerSetup) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
+  let planning: PlanningDeps | undefined;
   /** Runs a task's plan items; one per Store, like the coordinator. Only the production runner has one. */
   let executor: ItemExecutor | null = null;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
@@ -60,7 +70,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       settleSuggestion: (identity, id, expected, outcome) => capability.run(() => store.settleSuggestion(identity, id, expected, outcome)),
       getSuggestions: (identity, id) => store.getSuggestions(identity, id),
     };
-    suggestions = planning ? new SuggestionCoordinator(suggestionStore, planning.provider) : null;
+    planning = typeof planningInput === 'function' ? planningInput(service) : planningInput;
+    // One budget for a suggestion, setup included: lane D's cap, which the provider's own deadline stays inside (#117).
+    suggestions = planning ? new SuggestionCoordinator(suggestionStore, planning.provider, PLANNING_BUDGET_MS) : null;
   } catch (error) { service.close(); throw error; }
   if (runnerSetup) {
     // Startup recovery runs here, before listen: nothing is admitted until it has finished.
@@ -182,9 +194,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   /** Handles of suggestion requests started by this process, removed once their outcome settles. */
   const suggestionHandles = new Map<string, SuggestionHandle>();
   const requireAction = (input: Record<string, unknown>) => { if (input.actionId === undefined) throw new BadRequest('actionId is required for this action.'); return input.actionId as string; };
-  const planningAction = (path: string, input: Record<string, unknown>) => {
+  const planningAction = async (path: string, input: Record<string, unknown>, signal: AbortSignal) => {
     const actionId = requireAction(input), { actionId: _omit, ...request } = input;
     const imported = path === '/api/plan/import', started = path === '/api/plan/suggestions';
+    // Read before the recorded action, which runs synchronously: the issue comes from GitHub (#117).
+    const described = started && planning && !stopping ? await planning.describe(signal) : undefined;
     const match = /^\/api\/plan\/suggestions\/([0-9a-f-]{36})\/(cancel|apply)$/.exec(path);
     const kind = imported ? 'plan-import' : started ? 'suggestion-start' : `suggestion-${match![2]}`;
     return service.store.userAction(identity, { actionId, kind, request }, () => {
@@ -199,7 +213,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const plan = service.store.getPlan(identity), snapshot = service.store.getSnapshot(identity);
         if (input.expectedRevision !== plan.revision || input.snapshotId !== snapshot.id) throw new GuardRefusal('Stale plan revision or snapshot. Reload before asking for suggestions.');
         if (typeof input.feedback !== 'string' || input.feedback.length > 4000) throw new BadRequest('feedback must be text of 4000 characters or fewer.');
-        const context = service.planContext(), described = planning.describe();
+        if (!described) throw new GuardRefusal('Planning agent not available yet.');
+        const context = service.planContext();
         const handle = suggestions.start({ context, revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
           repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } });
         suggestionHandles.set(handle.id, handle);
@@ -263,7 +278,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           return;
         }
         if(path==='/api/runner') { json(200, { result: runnerAction(input), runner: runnerView() }); return; }
-        if(planningPath) { json(200, { result: planningAction(path, input) }); return; }
+        if(planningPath) { json(200, { result: await planningAction(path, input, requestAbort.signal) }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
           const view=service.load();if(input.token!==view.token)throw new Error('Stale review state. Refresh and retry.');
@@ -366,6 +381,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     await step(() => closing);
     await step(() => questions.close());
     await step(() => suggestions?.close());
+    await step(() => planning?.close?.());
     await step(() => service.close());
     // Each later failure is still reported, so none is lost behind the first.
     for (const later of failures.slice(1)) console.error(`Shutdown step also failed: ${later instanceof Error ? later.message : String(later)}`);
