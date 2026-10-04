@@ -192,7 +192,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // task already in needs human asked for no publish.
     if (action === 'start' || action === 'resume') {
       const before = service.store.getTask(identity).status;
-      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.publishIfOwed(identity); }
+      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.publishIfOwed(identity, { personAsked: true }); }
     }
     // A publish refused because an earlier run owes a pause or an escalation pays it here, outside the refused transaction
     // (AGENTS.md: a refusal's durable change is committed outside it); a task it sends to needs human then gets its draft.
