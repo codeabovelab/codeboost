@@ -52,6 +52,9 @@ export class TaskPublishing {
     if (this.busy(identity)) throw new GuardRefusal('A pull request is already being published for this task.');
     // Publishing reads the task head, so it waits for the run (and the attempt) to end: assertPublishable refuses an active attempt.
     if (this.#runner.isActive(identity) || this.#executor.busy(identity)) throw new GuardRefusal('A run of this task is still in progress; publish once it has ended.');
+    // An earlier run owes a safety escalation or a scope pause (its write failed, or the process stopped): the task is not
+    // finished work until that is settled, so a ready PR must not show its unreviewed changes. publishIfOwed pays it.
+    if (this.#executor.owes(identity)) throw new GuardRefusal('An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.');
     const task = this.#store.getTask(identity);
     if (task.status === 'running') {
       const { next } = progress ?? this.#executor.progress(identity);
@@ -90,7 +93,7 @@ export class TaskPublishing {
 
   /** A run of the task ended, or the server started: publish if one is owed. Never throws. */
   publishIfOwed(identity: PlanIdentity): void {
-    try { const owed = this.owed(identity); if (owed) this.#schedule(identity, owed.draft); }
+    try { this.#payOwed(identity); const owed = this.owed(identity); if (owed) this.#schedule(identity, owed.draft); }
     catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
@@ -102,6 +105,7 @@ export class TaskPublishing {
    */
   startup(identity: PlanIdentity): void {
     try {
+      this.#payOwed(identity);
       const owed = this.owed(identity);
       if (owed) { this.#schedule(identity, owed.draft); return; }
       if (this.#store.hasUnsettledPublishAction(identity) || this.#store.lastPublish(identity)?.outcome === IN_FLIGHT)
@@ -118,6 +122,13 @@ export class TaskPublishing {
     this.#closing = true;
     await this.#publisher.close();
     while (this.#running.size) await Promise.all([...this.#running.values()]);
+  }
+
+  /** Settle what an earlier run owes before deciding what to publish (see mode); a task it moves is then not finished work. */
+  #payOwed(identity: PlanIdentity): void {
+    if (this.#closing || this.#runner.closing) return;
+    const paid = this.#executor.payOwed(identity);
+    if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
   }
 
   #schedule(identity: PlanIdentity, draft: boolean, actionId?: string): void {
