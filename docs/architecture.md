@@ -160,7 +160,7 @@ Dependencies point downward only. `core/` imports nothing that does input or out
 | Part | Main files | Owns | State |
 |---|---|---|---|
 | Command line | `web/cli.ts` | Parses `--demo` or `--config`, takes the single-runner lock, starts the server, releases the lock on Ctrl+C. | In use |
-| HTTP server | `web/server.ts` | Binds `127.0.0.1` only. Checks the token, Host and Origin. Bounded JSON bodies. Routes `/api/review`, `/api/action`, `/api/questions`, `/api/merge`, `/api/issues`, `/api/settings`, plus `/api/runner` and `/api/plan/*` when a runner or planning provider is supplied. Ordered shutdown. | In use; `/api/runner` and `/api/plan/*` not connected |
+| HTTP server | `web/server.ts` | Binds `127.0.0.1` only. Checks the token, Host and Origin. Bounded JSON bodies. Routes `/api/review`, `/api/action`, `/api/questions`, `/api/merge`, `/api/issues`, `/api/settings`, plus `/api/runner` and `/api/plan/*` when a runner or planning provider is supplied. Ordered shutdown. | In use; `/api/plan/suggestions` runs Claude through lane D for a review with a `github` block (#117) |
 | Browser screen | `web/public/*` | Review screen and Issues screen. Plain JavaScript with IBM Plex fonts served locally. Sends item and segment IDs and a state token, never fingerprints or ownership. | Yes |
 | Review service | `runner/review.ts` | Builds the review view: reads history, links it to the plan, computes approval states and merge blockers. Applies review commands through the store. | Yes |
 | Ask | `runner/questions.ts`, `runner/question-*.ts` | Answers a question about one plan item with a read-only agent. Runs lane D's synchronous setup in a worker thread so the server stays responsive. Tracks leftover containers. | Yes |

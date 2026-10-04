@@ -131,7 +131,7 @@ it('releases storage when setup fails after allocation, and not before', async (
 
 it('stops before starting the container once the deadline has passed', async () => {
   const fake = fakeDeps();
-  await expect(askInContainer(question({ deadline: Date.now() - 1 }), fake.deps, new AbortController().signal)).rejects.toThrow('timed out');
+  await expect(askInContainer(question({ deadline: Date.now() - 1 }), fake.deps, new AbortController().signal)).rejects.toThrow(/^Agent timed out\. Try again\.$/);
   expect(fake.events).not.toContain('start');
 });
 
@@ -209,7 +209,7 @@ it.skipIf(process.getuid?.() === 0)('keeps a host copy of the code it could not 
   const clone = fake.deps.createClone;
   fake.deps.createClone = options => { chmodSync(parent, 0o555); return clone(options); };
   try {
-    await expect(askInContainer(question(), fake.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
+    await expect(askInContainer(question(), fake.deps, new AbortController().signal, {}, retained)).rejects.toThrow(/^Question container cleanup did not settle\.$/);
     const [root] = retained.paths();
     expect(dirname(root!)).toBe(parent);
     expect(existsSync(root!)).toBe(true);
@@ -270,11 +270,21 @@ it('turns Ask off when a failed setup leaves storage D cannot hand back', async 
   expect(clean.untracked).toBe(0);
 });
 
+it('reports only Ask\'s cleanup error when a failed question\'s cleanup also fails', async () => {
+  // Ask's wording is unchanged by the shared runner (#117): its own error is not prefixed, unlike planning's.
+  const retained = new RetainedStorage(), fake = fakeDeps();
+  fake.deps.capture = () => { throw new Error('capture refused'); };
+  fake.deps.removeFilesystems = () => { throw new Error('Docker did not confirm removal.'); };
+  await expect(askInContainer(question(), fake.deps, new AbortController().signal, {}, retained))
+    .rejects.toThrow(/^Question container cleanup did not settle\.$/);
+  expect(retained.size).toBe(1);
+});
+
 it('keeps storage whose removal failed, refuses Ask until it is removed, then continues', async () => {
   const retained = new RetainedStorage();
   const first = fakeDeps();
   first.deps.removeFilesystems = () => { throw new Error('Docker did not confirm removal.'); };
-  await expect(askInContainer(question(), first.deps, new AbortController().signal, {}, retained)).rejects.toThrow('cleanup did not settle');
+  await expect(askInContainer(question(), first.deps, new AbortController().signal, {}, retained)).rejects.toThrow(/^Question container cleanup did not settle\.$/);
   expect(retained.size).toBe(1);
 
   const blocked = fakeDeps();

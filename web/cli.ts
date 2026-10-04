@@ -2,6 +2,7 @@ import { readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 import { startServer, type RunnerSetup } from './server.ts';
+import { productionPlanning } from './planning.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import { acquireRunnerLock, releasePreparation } from '../runner/recovery.ts';
@@ -12,7 +13,7 @@ function refuse(error: unknown): never { console.error(error instanceof Error ? 
 const checked = <T>(fn: () => T): T => { try { return fn(); } catch (error) { return refuse(error); } };
 const { values } = parseArgs({ options: { demo: { type:'boolean' }, directory:{type:'string'}, config:{type:'string'}, port:{type:'string'}, help:{type:'boolean'}, 'release-preparation':{type:'string'} } });
 if (values.help || (!values.demo && !values.config && values['release-preparation'] === undefined)) {
-  console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate; demos never merge. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block with a baseBranch for its pull requests, and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).');
+  console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate and plan suggestions (Claude Code in a Docker container, like Ask); demos never merge or plan. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block with a baseBranch for its pull requests, and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).');
 } else if (values['release-preparation'] !== undefined) {
   const attemptId = values['release-preparation'];
   checked(() => {
@@ -64,7 +65,8 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   };
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, duringStartup);
   let app: Awaited<ReturnType<typeof startServer>>;
-  try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, undefined, runnerSetup); }
+  // Planning (#117) is on for any non-demo review with a github block; it needs no runner block.
+  try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, productionPlanning(config), runnerSetup); }
   catch (error) {
     lock.release();
     // A refused runner startup (no token, a blocked recovery) is the person's to act on: its message, not a stack.
