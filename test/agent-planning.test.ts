@@ -1,6 +1,6 @@
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
-import { mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
+import { existsSync, mkdtempSync, realpathSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterAll, describe, expect, it } from 'vitest';
@@ -37,5 +37,10 @@ describe('planning in the agent container', () => {
       // Only a request that left the container through the vendor proxy can come back with Anthropic's 401.
       await expect(agent.invoke(request, new AbortController().signal)).rejects.toThrow(/Claude could not write the plan.*(401|authenticate)/);
     } finally { await agent.close(); }
+    // Closed cleanly: no Docker object carries planning's owner, and no planning root stays recorded.
+    const owner = owners.at(-1)!;
+    for (const kind of ['container', 'volume', 'network'])
+      expect(docker(kind, 'ls', ...(kind === 'container' ? ['-a'] : []), '--quiet', '--filter', `label=io.codeboost.runner=${owner}`).stdout.trim(), kind).toBe('');
+    expect(existsSync(`${realpathSync(service.config.database)}.planning-leftovers.json`)).toBe(false);
   }, 11 * 60_000);
 });

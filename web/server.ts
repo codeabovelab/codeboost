@@ -29,6 +29,10 @@ export interface PlanningDeps {
   /** Releases what the provider owns at shutdown, after every suggestion has settled. */
   close?(): Promise<void>;
 }
+/** A dependency the server reads from (GitHub) failed: 502, not recorded. */
+class UpstreamFailure extends Error {}
+/** How long a planning request may take to settle after shutdown aborts it, before its worker is abandoned (Ask's grace). */
+export const PLANNING_SHUTDOWN_GRACE_MS = 20_000;
 /** Production planning is built after the Store opens, from the review it serves (see web/cli.ts). */
 export type PlanningSetup = (service: ReviewService) => PlanningDeps;
 const publicRoot = new URL('./public/', import.meta.url);
@@ -197,10 +201,24 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const planningAction = async (path: string, input: Record<string, unknown>, signal: AbortSignal) => {
     const actionId = requireAction(input), { actionId: _omit, ...request } = input;
     const imported = path === '/api/plan/import', started = path === '/api/plan/suggestions';
-    // Read before the recorded action, which runs synchronously: the issue comes from GitHub (#117).
-    const described = started && planning && !stopping ? await planning.describe(signal) : undefined;
     const match = /^\/api\/plan\/suggestions\/([0-9a-f-]{36})\/(cancel|apply)$/.exec(path);
     const kind = imported ? 'plan-import' : started ? 'suggestion-start' : `suggestion-${match![2]}`;
+    // The issue comes from GitHub (#117), so it is read before the recorded action, which runs synchronously. A replay
+    // returns its saved outcome without reading GitHub again, and a start the recorded action would refuse anyway (no
+    // planning, shutdown, stale revision or snapshot) does not read it at all.
+    let described: PlanningDescription | undefined;
+    if (started) {
+      const saved = service.store.savedAction<unknown>(identity, { actionId, kind, request });
+      if (saved) return saved.response;
+      const plan = service.store.getPlan(identity), snapshot = service.store.getSnapshot(identity);
+      if (planning && suggestions && !stopping && input.expectedRevision === plan.revision && input.snapshotId === snapshot.id) {
+        try { described = await planning.describe(signal); }
+        catch (error) {
+          if (stopping) throw new ShuttingDownError();
+          throw new UpstreamFailure(`The issue could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+        }
+      }
+    }
     return service.store.userAction(identity, { actionId, kind, request }, () => {
       if (imported) {
         if (typeof input.source !== 'string' || !['json', 'yaml'].includes(input.format as string) || !Number.isSafeInteger(input.expectedRevision)) throw new BadRequest('source, format and expectedRevision are required.');
@@ -213,6 +231,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const plan = service.store.getPlan(identity), snapshot = service.store.getSnapshot(identity);
         if (input.expectedRevision !== plan.revision || input.snapshotId !== snapshot.id) throw new GuardRefusal('Stale plan revision or snapshot. Reload before asking for suggestions.');
         if (typeof input.feedback !== 'string' || input.feedback.length > 4000) throw new BadRequest('feedback must be text of 4000 characters or fewer.');
+        // Read above whenever the checks before this line pass; they cannot change across the synchronous action.
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
         const context = service.planContext();
         const handle = suggestions.start({ context, revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
@@ -225,7 +244,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (match![2] === 'cancel') {
         const handle = suggestionHandles.get(id), current = service.store.getSuggestions(identity, id);
         if (current.state === 'pending' && handle) { handle.cancel('Cancelled by the user.'); return { state: 'cancelling' }; }
-        // No handle in this process: startup recovery has already stopped any provider (planning runs only through D).
+        // No handle in this process: the request belonged to a process that ended, and its container's output had no
+        // route back to the Store (planning runs only through D, in that process's worker; runner-lifecycle.md).
         service.store.cancelSuggestions(identity, id, 'Cancelled by the user.');
         return { state: service.store.getSuggestions(identity, id).state };
       }
@@ -335,6 +355,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     } catch (error) {
       if (error instanceof ShuttingDownError) { json(503, { error: error.message }); return; }
       if (error instanceof BadRequest) { json(400, { error: error.message }); return; }
+      if (error instanceof UpstreamFailure) { json(502, { error: error.message }); return; }
       json(409, { error: error instanceof Error ? error.message : 'Review failed.' });
     }
     finally {
@@ -380,8 +401,18 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     await step(() => executor?.close());
     await step(() => closing);
     await step(() => questions.close());
-    await step(() => suggestions?.close());
-    await step(() => planning?.close?.());
+    // E3 aborts every suggestion at once and waits for each to settle. A planning request gets Ask's grace to settle
+    // after its abort; then the worker is closed, which abandons one stuck in a synchronous Docker call and so ends it.
+    await step(async () => {
+      const settled = suggestions?.close();
+      if (planning?.close) {
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        if (settled) await Promise.race([settled, new Promise(done => { timer = setTimeout(done, PLANNING_SHUTDOWN_GRACE_MS); })]);
+        clearTimeout(timer);
+        await planning.close();
+      }
+      await settled;
+    });
     await step(() => service.close());
     // Each later failure is still reported, so none is lost behind the first.
     for (const later of failures.slice(1)) console.error(`Shutdown step also failed: ${later instanceof Error ? later.message : String(later)}`);

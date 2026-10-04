@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto';
 import { existsSync, mkdtempSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
+import { Worker } from 'node:worker_threads';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AuthorRequest } from '../core/planning-author.ts';
 import { createDemo } from '../scripts/demo.ts';
@@ -77,6 +78,33 @@ it('never deletes Ask\'s folders when planning clears its own', () => {
   expect(existsSync(askRoot)).toBe(false);
 });
 
+it('never deletes planning\'s folders when Ask clears its own', () => {
+  const service = review(), database = realpathSync(service.config.database);
+  const planningLock = join(tmpdir(), `codeboost-planlocks-${process.getuid?.() ?? 'user'}`, 'codeboost-planlock-999999-999999.sqlite');
+  const planningRoot = createWorkerRoot(planningLock, PLANNING_NAMING); roots.push(planningRoot);
+  LeftoverLedger.forDatabase(database).assertClear();
+  expect(existsSync(planningRoot)).toBe(true);
+  LeftoverLedger.forDatabase(database, PLANNING_NAMING).assertClear();
+  expect(existsSync(planningRoot)).toBe(false);
+});
+
+it.each([
+  ['planning', 'ask', 'This worker does not run questions.'],
+  ['questions', 'plan', 'This worker does not run plans.'],
+] as const)('refuses, in the worker itself, a job for another feature: a %s worker given %s', async (feature, type, error) => {
+  // The production worker script, with no credentials: the refusal comes before any Docker or Git work.
+  const worker = new Worker(new URL('../runner/question-worker.ts', import.meta.url), { workerData: { feature, credentials: {} } });
+  try {
+    const id = randomUUID(), attemptId = randomUUID();
+    const job = type === 'ask'
+      ? { type, id, question: { attemptId, provider: 'claude', prompt: 'p', repository: '/nonexistent', head: 'a'.repeat(40) } }
+      : { type, id, run: { attemptId, provider: 'claude', prompt: 'p', repository: '/nonexistent', head: 'a'.repeat(40) } };
+    const reply = new Promise(resolve => worker.on('message', resolve));
+    worker.postMessage(job);
+    expect(await reply).toEqual({ id, attemptId, ok: false, error });
+  } finally { await worker.terminate(); }
+});
+
 it('refuses a worker whose ledger serves another feature, and plans only on planning\'s worker', async () => {
   const service = review();
   expect(() => new AgentWorker(STUB, LeftoverLedger.forDatabase(service.config.database), { naming: PLANNING_NAMING }))
@@ -97,7 +125,7 @@ it('runs a request in planning\'s worker, under a planning root, with the planni
   expect(reply).toMatchObject({ kind: 'plan', feature: 'planning', owner: service.store.planningOwnerToken(fileOf(service)) });
   expect(basename(reply.env!)).toMatch(/^codeboost-plan-[A-Za-z0-9]{6}$/);
   // The worker's deadline leaves its settle margin before E3's timer, which uses the whole budget.
-  expect(reply.deadline).toBeGreaterThan(before);
+  expect(reply.deadline).toBeGreaterThanOrEqual(before + PLANNING_BUDGET_MS - 5_000);
   expect(reply.deadline).toBeLessThanOrEqual(Date.now() + PLANNING_BUDGET_MS - 5_000);
 });
 
