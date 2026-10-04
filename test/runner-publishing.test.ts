@@ -391,6 +391,44 @@ describe('publishing a finished task (#103)', () => {
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'gh failed: Authorization: token [token]' });
   });
 
+  describe('a publish\'s in-flight record', () => {
+    it('is written before any GitHub call', async () => {
+      const w = world();
+      let seen: unknown;
+      const opening = Promise.withResolvers<void>();
+      w.github.checks.check = async () => { opening.resolve(); return { outcome: 'clear', baseHead: 'b'.repeat(40) }; };
+      const { app, identity, store } = await serve(w, { before: completeAll, startup: false });
+      app.publishOwed();
+      seen = store.lastPublish(identity)?.outcome;
+      await opening.promise;
+      expect(seen).toBe('publishing');
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+    });
+    it('left by a process that stopped after the PR opened is settled as interrupted at startup', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service);
+        const s = service.store, id = service.config.identity;
+        // The crashed process recorded its publish as started; its outcome never landed, and nothing is owed now.
+        s.recordPublish(id, { outcome: 'publishing', draft: false, message: 'A pull request is being published.' });
+        s.cancelTask(id, s.getTask(id).stateVersion, randomUUID());
+      } });
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped', message: expect.stringMatching(/interrupted before it recorded an outcome/) });
+      expect(app.publishing!.busy(identity)).toBe(false);
+      expect(w.github.calls).toEqual([]);
+    });
+    it('starts no publish when it cannot be written', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: completeAll, startup: false });
+      vi.spyOn(store, 'recordPublish').mockImplementationOnce(() => { throw new Error('disk full'); });
+      app.publishOwed();
+      await app.publishing!.settled(identity);
+      expect(w.github.calls).toEqual([]);
+      expect(store.lastPublish(identity)).toBeNull();
+    });
+  });
+
   describe('a publish action whose process stopped before its outcome was recorded', () => {
     /** As the crashed process left it: the action committed its `publishing` reply, and its publish recorded nothing. */
     const plant = (service: ReviewService, actionId: string) => {
