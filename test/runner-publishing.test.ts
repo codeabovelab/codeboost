@@ -369,6 +369,36 @@ describe('publishing a finished task (#103)', () => {
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'gh failed: Authorization: token [token]' });
   });
 
+  describe('a publish action whose process stopped before its outcome was recorded', () => {
+    /** As the crashed process left it: the action committed its `publishing` reply, and its publish recorded nothing. */
+    const plant = (service: ReviewService, actionId: string) => {
+      const s = service.store, id = service.config.identity, expectedStateVersion = s.getTask(id).stateVersion;
+      s.userAction(id, { actionId, kind: 'publish', request: { attemptId: undefined, expectedStateVersion } }, () => ({ outcome: 'publishing', draft: false }));
+      return expectedStateVersion;
+    };
+    it('is settled by the startup publish when one is owed, so its replay reports that outcome', async () => {
+      const w = world(), actionId = randomUUID();
+      let version = -1;
+      const { app, identity, store } = await serve(w, { before: service => { completeAll(service); version = plant(service, actionId); } });
+      await publishSettled(app, identity);
+      expect(store.hasUnsettledPublishAction(identity)).toBe(false);
+      expect((await act(app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', draft: false, number: 100 });
+      expect(w.github.prs).toHaveLength(1);
+    });
+    it('is settled as interrupted at startup when nothing is owed, instead of replaying `publishing` for ever', async () => {
+      const w = world(), actionId = randomUUID();
+      let version = -1;
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service); version = plant(service, actionId);
+        // Meanwhile the task left what a publish serves (a person cancelled it), so nothing is owed at startup.
+        service.store.cancelTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, randomUUID());
+      } });
+      expect(store.hasUnsettledPublishAction(identity)).toBe(false);
+      expect((await act(app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'stopped', message: expect.stringMatching(/interrupted before it recorded an outcome/) });
+      expect(w.github.calls).toEqual([]);
+    });
+  });
+
   it('never publishes in a demo, even with a publisher', async () => {
     const w = world();
     const { app } = await serve(w, { demo: true, before: completeAll });
