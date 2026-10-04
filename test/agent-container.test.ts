@@ -4,6 +4,7 @@ import { createHash, randomBytes, randomUUID } from 'node:crypto';
 import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { pathToFileURL } from 'node:url';
 import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
@@ -2154,6 +2155,63 @@ describe('real Docker agent isolation', () => {
         try { await step(); } catch (error) { failures.push(error); }
       }
       if (failures.length) throw new AggregateError(failures, 'Recovery test cleanup failed.');
+    }
+  }, 180_000);
+
+  it('exports through a recovery handle after a restart, then removes the storage by that handle', async () => {
+    const data = fixture({ hostile: agentBase });
+    const owner = { runnerOwner: randomBytes(16).toString('hex'), attemptId: `restart-${randomUUID()}`, allocationId: randomUUID() };
+    const staging = join(data.root, 'restart-staging'); mkdirSync(staging);
+    // An earlier process clones and allocates task storage, then exits without releasing it, as a crash does: this
+    // process never held the allocator value.
+    const specifier = (path: string) => JSON.stringify(pathToFileURL(join(import.meta.dirname, path)).href);
+    const earlier = spawnSync(process.execPath, ['--input-type=module', '-e', [
+      `import { createTaskClone } from ${specifier('../git/clone.ts')};`,
+      `import { buildAgentImage } from ${specifier('../agents/container/image.ts')};`,
+      `import { prepareTaskFilesystems } from ${specifier('../agents/container/storage.ts')};`,
+      'const { source, staging, head, owner } = JSON.parse(process.env.EARLIER);',
+      // Image trust is per process: a restarted process builds (from cache) before it allocates, as the server does.
+      'const imageId = buildAgentImage();',
+      "const clone = createTaskClone({ source, parent: staging, taskId: 'task-1', head });",
+      'const limits = { workBytes: 16 * 1024 * 1024, workInodes: 512, metadataBytes: 16 * 1024 * 1024, metadataInodes: 512 };',
+      // The last line, after anything the build wrote to standard output.
+      "process.stdout.write('\\n' + JSON.stringify(prepareTaskFilesystems(clone, limits, imageId, owner)));",
+    ].join('\n')], { encoding: 'utf8', timeout: 120_000, env: { ...process.env,
+      EARLIER: JSON.stringify({ source: data.source, staging, head: data.clone.head, owner }) } });
+    try {
+      if (earlier.status !== 0) throw new Error(`The earlier process failed (${earlier.status}): ${earlier.stderr}`);
+      const left = JSON.parse(earlier.stdout.trim().split('\n').pop()!) as ReturnType<typeof prepareTaskFilesystems>;
+      agentChanges(left);
+      const report = await recoverLeftovers(owner.runnerOwner);
+      expect(report.removed).toEqual([]);
+      expect(report.storage).toEqual([{ ...owner, workVolume: left.workVolume, metadataVolume: left.metadataVolume,
+        keeper: left.keeper }]);
+      const handle = report.storage[0]!;
+      // D keeps no baseline across a restart: the export needs the one F recorded, and checks the metadata against it.
+      await expect(exportTaskDiff(handle, { base: data.clone.head, imageId })).rejects.toThrow('needs the metadataBaseline');
+      await expect(exportTaskDiff(handle, { base: data.clone.head, imageId, metadataBaseline: 'c'.repeat(64) }))
+        .rejects.toThrow('metadata changed');
+      const before = storageSnapshot(left);
+      const exported = await exportTaskDiff(handle, { base: data.clone.head, imageId, metadataBaseline: left.metadataBaseline });
+      expect(storageSnapshot(left)).toBe(before);
+      const text = exported.diff.toString('utf8');
+      expect(exported.truncated).toBe(false);
+      for (const expected of ['+committed', '+changed', '+staged only', '+brand new', 'GIT binary patch'])
+        expect(text).toContain(expected);
+      // Every export, refused or not, removed its container: only the keeper is left before release.
+      expect(docker('ps', '--all', '--quiet', '--no-trunc', '--filter', `label=io.codeboost.allocation=${owner.allocationId}`))
+        .toBe(docker('container', 'inspect', '--format', '{{.Id}}', left.keeper));
+      // The handle still releases the storage after the export, once.
+      removeTaskFilesystems(handle);
+      expect(isRecoveredTaskStorage(handle)).toBe(false);
+      for (const [kind, ref] of [['container', left.keeper], ['volume', left.workVolume], ['volume', left.metadataVolume]] as const)
+        expect(spawnSync('docker', [kind, 'inspect', ref], { stdio: 'ignore' }).status).not.toBe(0);
+    } finally {
+      // Never throws, so a failure above is the one reported.
+      const labelled = (...args: string[]) => spawnSync('docker', [...args, '--quiet', '--filter',
+        `label=io.codeboost.allocation=${owner.allocationId}`], { encoding: 'utf8' }).stdout?.split('\n').filter(Boolean) ?? [];
+      for (const name of labelled('ps', '--all')) spawnSync('docker', ['rm', '--force', name], { stdio: 'ignore' });
+      for (const name of labelled('volume', 'ls')) spawnSync('docker', ['volume', 'rm', '--force', name], { stdio: 'ignore' });
     }
   }, 180_000);
 
