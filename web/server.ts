@@ -196,8 +196,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     }
     // A publish refused because an earlier run owes a pause or an escalation pays it here, outside the refused transaction
     // (AGENTS.md: a refusal's durable change is committed outside it); a task it sends to needs human then gets its draft.
+    // Only a refusal that came from owed work: one for a stale view, a busy task or a replayed refusal starts nothing.
     if (action === 'publish') {
-      try { return act(); } catch (error) { if (error instanceof GuardRefusal) publishing?.publishIfOwed(identity); throw error; }
+      const owing = !!publishing && !!executor?.owes(identity);
+      try { return act(); } catch (error) { if (owing && error instanceof GuardRefusal) publishing?.publishIfOwed(identity); throw error; }
     }
     return act();
     function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
