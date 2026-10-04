@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { importPlan, applySuggestion, assertEditReply, assertPlan, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
+import type { PlanningMode } from '../core/planning-suggestions.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import type { AlreadyFixedResult } from '../github/already-fixed.ts';
@@ -20,8 +21,7 @@ export function requireSupportedNode(version = process.versions.node): void {
 export interface Snapshot { id: string; base: string; head: string }
 export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
 export type SuggestionState = 'pending' | 'ready' | 'failed' | 'cancelled' | 'invalidated' | 'consumed';
-/** A planning request: card suggestions for the current plan, or a whole draft of its next revision (#124). */
-export type PlanningMode = 'suggest' | 'draft';
+export type { PlanningMode } from '../core/planning-suggestions.ts';
 /** `reply` is the suggestion cards; for a draft it is always null here (read it with `getDraft`). */
 export interface SuggestionRequest { mode: PlanningMode; state: SuggestionState; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null }
 /** A draft request: `revision` is the plan revision it was drafted against; `plan` would become revision + 1. */
@@ -307,7 +307,8 @@ export class Store {
     if (!row) throw new Error('Unknown snapshot.');
     return decode<Snapshot>(row.data);
   }
-  beginSuggestions(identity: PlanIdentity, expected: ReviewState, mode: PlanningMode = 'suggest'): string {
+  /** `mode` is required, so a caller cannot record a draft as a suggestion by leaving it out (#124). */
+  beginSuggestions(identity: PlanIdentity, expected: ReviewState, mode: PlanningMode): string {
     if (mode !== 'suggest' && mode !== 'draft') throw new Error('Invalid planning request mode.');
     const key = identityKey(identity);
     return this.#transaction(() => {

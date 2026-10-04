@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -51,7 +52,7 @@ it('applies a ready draft as the next revision once, and keeps the earlier revis
 
 it('keeps drafts and suggestions apart: neither ID works on the other\'s path', () => {
   const { store } = fixture(), draft = readyDraft(store);
-  const suggestion = store.beginSuggestions(identity, state(store));
+  const suggestion = store.beginSuggestions(identity, state(store), 'suggest');
   store.completeSuggestions(identity, suggestion, cards());
   expect(() => store.applySuggestion(identity, draft, 0, context)).toThrow('Suggestion is unavailable.');
   expect(() => store.applyDraft(identity, suggestion, context)).toThrow('Draft is unavailable.');
@@ -87,13 +88,49 @@ it('checks a draft like an import when it is applied', () => {
   const { store } = fixture();
   // Schema-valid, so it is published, but it names a file the base does not have.
   const id = readyDraft(store, { ...redraft(), items: [{ ...redraft().items[0]!, files: [{ path: 'missing', kind: 'edit', renamed_from: null, change: 'x' }] }] });
-  expect(() => store.applyDraft(identity, id, context)).toThrow();
+  expect(() => store.applyDraft(identity, id, context)).toThrow(/missing/);
   expect(store.getPlan(identity).revision).toBe(1);
   expect(store.getDraft(identity, id).state).toBe('ready');
 });
 
+it.each([
+  ['while a merge is in progress', (store: Store) => { store.beginMergeAttempt(identity, { ...state(store), reviewVersion: store.reviewVersion(identity) }, oid(2), null, 'direct'); },
+    /merge is in progress/],
+  ['once the task has closed', (store: Store) => { store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID()); },
+    /closed task never changes/],
+] as const)('refuses to apply a ready draft %s', (_, block, message) => {
+  const { store } = fixture(), id = readyDraft(store);
+  block(store);
+  expect(() => store.applyDraft(identity, id, context)).toThrow(message);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+
+it('refuses to apply a draft under another plan\'s identity or issue', () => {
+  const { store } = fixture(), id = readyDraft(store), other = { ...identity, planId: 'other' };
+  store.createPlan(JSON.stringify(plan()), 'json', { ...context, identity: other }, oid(1), oid(2));
+  expect(() => store.applyDraft(other, id, { ...context, identity: other })).toThrow('Draft is unavailable.');
+  expect(() => store.applyDraft(identity, id, { ...context, issue: 2 })).toThrow();
+  expect(store.getDraft(identity, id).state).toBe('ready');
+});
+
+it('dismisses a ready draft', () => {
+  const { store } = fixture(), id = readyDraft(store);
+  store.cancelSuggestions(identity, id, 'Dismissed.');
+  expect(store.getDraft(identity, id)).toMatchObject({ state: 'cancelled', reason: 'Dismissed.' });
+  expect(() => store.applyDraft(identity, id, context)).toThrow('Draft is unavailable.');
+});
+
+it('migrates a database that already has the mode column below v11', () => {
+  const { store, path, open } = fixture(), id = readyDraft(store);
+  store.close(); stores.splice(stores.indexOf(store), 1);
+  const legacy = new DatabaseSync(path);
+  legacy.exec('PRAGMA user_version=9;');
+  legacy.close();
+  expect(open().getDraft(identity, id).state).toBe('ready');
+});
+
 it.each([9, 10])('migrates a v%i database to v11, reading its existing requests as suggestions', version => {
-  const { store, path, open } = fixture(), id = store.beginSuggestions(identity, state(store));
+  const { store, path, open } = fixture(), id = store.beginSuggestions(identity, state(store), 'suggest');
   store.close(); stores.splice(stores.indexOf(store), 1);
   const legacy = new DatabaseSync(path);
   legacy.exec(`ALTER TABLE requests DROP COLUMN mode; PRAGMA user_version=${version};`);
@@ -149,16 +186,26 @@ it('marks a draft stale when the plan changes while Claude writes it', async () 
   } finally { await coordinator.close(); }
 });
 
-it('runs one planning invocation per plan, shared by drafts and suggestions', async () => {
+it.each([['draft', 'suggest'], ['suggest', 'draft']] as const)('runs one planning invocation per plan: a %s blocks a %s', async (first, second) => {
   const { store } = fixture();
   let release!: () => void;
   const held = new Promise<void>(done => { release = done; });
-  const { coordinator, input } = coordinate(store, () => JSON.stringify(redraft()));
-  const slow = new SuggestionCoordinator(store, { async invoke() { await held; return JSON.stringify(redraft()); } });
+  const { input } = coordinate(store, () => '');
+  const slow = new SuggestionCoordinator(store, { async invoke(request) {
+    await held; return JSON.stringify(request.mode === 'draft' ? redraft() : cards()); } });
   try {
-    const draft = slow.start(input, 'draft');
-    expect(() => slow.start(input)).toThrow('A suggestion invocation is still active for this plan.');
+    const running = slow.start(input, first);
+    expect(() => slow.start(input, second)).toThrow('A suggestion invocation is still active for this plan.');
     release();
-    await draft.result;
-  } finally { await slow.close(); await coordinator.close(); }
+    expect(await running.result).toMatchObject({ state: 'completed' });
+  } finally { await slow.close(); }
+});
+
+it('sends the user\'s feedback and the current plan to Claude in a draft request', async () => {
+  const { store } = fixture(), { coordinator, input, requests } = coordinate(store, () => JSON.stringify(redraft()));
+  try {
+    await coordinator.start(input, 'draft').result;
+    expect(requests[0]!.prompt).toContain('Split the work.');
+    expect(requests[0]!.prompt).toContain('"summary":"Example"');
+  } finally { await coordinator.close(); }
 });

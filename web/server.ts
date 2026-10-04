@@ -201,9 +201,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const suggestionHandles = new Map<string, SuggestionHandle>();
   const requireAction = (input: Record<string, unknown>) => { if (input.actionId === undefined) throw new BadRequest('actionId is required for this action.'); return input.actionId as string; };
   const planningAction = async (path: string, input: Record<string, unknown>, signal: AbortSignal) => {
-    const actionId = requireAction(input), { actionId: _omit, ...request } = input;
+    const actionId = requireAction(input), { actionId: _omit, ...body } = input;
     // Suggestions are edit cards for the current plan; a draft is a whole next revision (#124). They share one lifecycle.
     const imported = path === '/api/plan/import', route = PLANNING_REQUEST.exec(path);
+    // The recorded request names the planning request the path acts on, so one action ID cannot replay across two.
+    const request = route?.[2] ? { ...body, requestId: route[2] } : body;
     const mode: PlanningMode = route?.[1] === 'drafts' ? 'draft' : 'suggest', noun = mode === 'draft' ? 'draft' : 'suggestion';
     const started = !imported && !route![2];
     const kind = imported ? 'plan-import' : started ? `${noun}-start` : `${noun}-${route![3]}`;
@@ -244,8 +246,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         void handle.result.finally(() => suggestionHandles.delete(handle.id));
         return { requestId: handle.id };
       }
-      const id = route![2]!, current = service.store.getSuggestions(identity, id);
-      // An ID is used only on its own kind's routes.
+      const id = route![2]!;
+      // An ID is used only on its own kind's routes; an unknown one is named by the route's kind.
+      let current: ReturnType<typeof service.store.getSuggestions>;
+      try { current = service.store.getSuggestions(identity, id); } catch { throw new Error(`Unknown ${noun} request.`); }
       if (current.mode !== mode) throw new Error(`Unknown ${noun} request.`);
       if (route![3] === 'cancel') {
         const handle = suggestionHandles.get(id);

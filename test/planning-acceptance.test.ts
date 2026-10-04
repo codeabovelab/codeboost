@@ -44,7 +44,7 @@ it.each(['json', 'yaml'] as const)('imports %s as the next revision and invalida
 });
 it('rejects an import for another selected issue without changing the plan or pending request', async () => {
   const f = fixture(), before = f.store.getPlan(f.context.identity);
-  const id = f.store.beginSuggestions(f.context.identity, { revision: 1, snapshotId: f.input.snapshotId });
+  const id = f.store.beginSuggestions(f.context.identity, { revision: 1, snapshotId: f.input.snapshotId }, 'suggest');
   expect(() => f.store.importRevision(JSON.stringify({ ...plan(), issue: 413 }), 'json', f.context, 1)).toThrow(/issue/);
   expect(f.store.getPlan(f.context.identity)).toEqual(before);
   expect(f.store.getSuggestions(f.context.identity, id)).toMatchObject({ state: 'pending', revision: 1, reply: null });

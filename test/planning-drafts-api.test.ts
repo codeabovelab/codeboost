@@ -91,3 +91,24 @@ it('cancels a draft while Claude is still writing it', async () => {
   expect(await served.api('POST', `/api/plan/drafts/${id}/cancel`, { actionId: randomUUID() })).toEqual({ status: 200, body: { result: { state: 'cancelling' } } });
   expect(await served.settled('drafts', id)).toMatchObject({ state: 'cancelled', plan: null, reason: 'Cancelled by the user.' });
 });
+
+it('refuses an action ID reused across kinds, or across two drafts', async () => {
+  const served = await serve(redraft);
+  const actionId = randomUUID(), body = { expectedRevision: served.view.plan.revision, snapshotId: served.view.snapshot.id, feedback: '', actionId };
+  const first = (await served.api('POST', '/api/plan/drafts', body)).body.result.requestId as string;
+  expect(await served.api('POST', '/api/plan/suggestions', body)).toMatchObject({ status: 409, body: { error: 'Action ID already used for a different request.' } });
+  await served.settled('drafts', first);
+  // A second ready draft against the same revision; one apply action ID must not act on both.
+  const second = (await served.start('drafts')).body.result.requestId as string;
+  await served.settled('drafts', second);
+  const apply = { actionId: randomUUID() };
+  expect(await served.api('POST', `/api/plan/drafts/${first}/cancel`, apply)).toMatchObject({ status: 200 });
+  expect(await served.api('POST', `/api/plan/drafts/${second}/cancel`, apply)).toMatchObject({ status: 409, body: { error: 'Action ID already used for a different request.' } });
+  expect((await served.api('GET', `/api/plan/drafts/${second}`)).body.state).toBe('ready');
+});
+
+it('names an unknown ID by the route\'s kind', async () => {
+  const served = await serve(redraft), unknown = randomUUID();
+  expect(await served.api('POST', `/api/plan/drafts/${unknown}/apply`, { actionId: randomUUID() })).toMatchObject({ status: 409, body: { error: 'Unknown draft request.' } });
+  expect(await served.api('POST', `/api/plan/suggestions/${unknown}/cancel`, { actionId: randomUUID() })).toMatchObject({ status: 409, body: { error: 'Unknown suggestion request.' } });
+});

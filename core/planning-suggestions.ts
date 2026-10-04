@@ -6,7 +6,7 @@ import type { Diagnostic, EditReply, Plan } from './plan.ts';
 export interface SuggestionStore {
   getPlan(identity: PlanIdentity): Plan;
   getSnapshot(identity: PlanIdentity): { id: string; base: string; head: string };
-  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }, mode?: PlanningMode): string;
+  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }, mode: PlanningMode): string;
   completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void;
   settleSuggestion(identity: PlanIdentity, id: string, expected: { revision: number; snapshotId: string }, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean;
   getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null };
