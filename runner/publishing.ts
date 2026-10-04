@@ -44,6 +44,11 @@ export class TaskPublishing {
    */
   #retried = new Map<string, { deadline: number; short: number }>();
   #shortRetryMs: number;
+  /**
+   * The reason an owed escalation was paid with (a safety finding whose save had failed): the executor settles it in
+   * memory only, so the task's attempt rows do not carry it, and the draft PR would otherwise not say why (#103).
+   */
+  #escalations = new Map<string, { reason: string; attemptId: string | null }>();
   /** Publishes in progress, by task, from scheduling until the outcome is recorded. */
   #running = new Map<string, Promise<void>>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
@@ -119,11 +124,7 @@ export class TaskPublishing {
   request(identity: PlanIdentity, actionId: string): { draft: boolean } {
     const mode = this.mode(identity);
     // A person's action starts a new chain, with its own automatic retries (AGENTS.md: reset on an explicit user action).
-    // A retry the old chain armed is dropped with it, so it cannot fire later on the new chain's budget.
-    const key = identityKey(identity);
-    this.#retried.delete(key);
-    const armed = this.#retries.get(key);
-    if (armed) { clearTimeout(armed); this.#retries.delete(key); }
+    this.#newChain(identity);
     this.#schedule(identity, mode.draft, actionId);
     return mode;
   }
@@ -139,7 +140,7 @@ export class TaskPublishing {
       if (!owed) return;
       // A run's end, a person's action or a restart is a meaningful lifecycle change: a new chain, with its own automatic
       // retries. A retry timer's own publish is not, or the retries would be unbounded again.
-      if (!options.retry) this.#retried.delete(identityKey(identity));
+      if (!options.retry) this.#newChain(identity);
       this.#schedule(identity, owed.draft);
     }
     catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
@@ -189,8 +190,21 @@ export class TaskPublishing {
     // owes the work, and mode() refuses to publish until it is paid.
     try {
       const paid = this.#executor.payOwed(identity);
+      // Tied to the attempt current once paid: a later run (a new attempt) that ends in needs human again has its own reason.
+      if (paid?.kind === 'needs human') this.#escalations.set(identityKey(identity), { reason: paid.reason, attemptId: this.#store.getTask(identity).currentAttemptId });
       if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
     } catch (error) { console.error(`Could not settle what an earlier run owes: ${JSON.stringify(message(error, this.#secrets))}`); }
+  }
+
+  /**
+   * A new chain (a run's end, a person's action, a restart): a fresh retry budget, and a retry the old chain armed is
+   * dropped with it, so it cannot fire later on the new chain's budget. One timer per task at all times.
+   */
+  #newChain(identity: PlanIdentity): void {
+    const key = identityKey(identity);
+    this.#retried.delete(key);
+    const armed = this.#retries.get(key);
+    if (armed) { clearTimeout(armed); this.#retries.delete(key); }
   }
 
   /**
@@ -260,6 +274,11 @@ export class TaskPublishing {
    */
   #problems(identity: PlanIdentity): string[] {
     const task = this.#store.getTask(identity);
+    // An owed finding paid here first: only this process knows its text. Only while the task is still in needs human from
+    // that payment (the same current attempt); once a later run has started, the finding is an earlier attempt's.
+    const key = identityKey(identity), escalated = this.#escalations.get(key);
+    if (escalated && task.status === 'needs human' && escalated.attemptId === task.currentAttemptId) return [escalated.reason];
+    this.#escalations.delete(key);
     const current = task.currentAttemptId === null ? undefined : this.#store.getAttempt(identity, task.currentAttemptId);
     if (current?.safetyFinding) return [current.safetyFinding];
     if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
