@@ -62,7 +62,8 @@ export function pushUrl(remote: string, env: NodeJS.ProcessEnv = process.env): s
  * push if anyone moved the branch since, including a newer publish. That is what makes a push left running by a crashed
  * codeboost harmless (#112): it can land only while the branch holds the value its own run read. The lease compares the
  * value, not its history, so a branch that returns to that value (moved back by a person, or the same commit pushed again) lets it land (a codeboost
- * commit; the next publish pushes the task head again). Only this one ref is sent: no tags, no hooks, no submodules.
+ * commit; the next publish pushes the task head again). An empty lease matches a branch deleted since, so a run that
+ * read none can recreate a deleted branch at its own head: a stray branch with no PR, overwriting nothing. Only this one ref is sent: no tags, no hooks, no submodules.
  */
 export function pushArguments(input: { url: string; ref: string; read: string | null; head: string }): string[] {
   return ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',

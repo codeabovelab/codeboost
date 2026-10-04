@@ -146,6 +146,15 @@ describe('GitBranchPusher', () => {
       await pusher(s, { owned: () => [old, newer] }).instance.push(IDENTITY, { head: newer, branch: BRANCH });
       expect(remoteRefs(s)).toBe(`${newer} ${REF}`);
     });
+    it('recreates the branch when the run read none and the branch was deleted since a newer publish created it', async () => {
+      const s = await setup(), old = await runnerCommit(s, 'old'), newer = await runnerCommit(s, 'newer');
+      // The crashed run read no branch; a restart's publish created it; then it was deleted (by a person, or by GitHub
+      // after the PR merged). The empty lease matches again, so the leftover lands.
+      await pusher(s, { owned: () => [old, newer] }).instance.push(IDENTITY, { head: newer, branch: BRANCH });
+      git(s.remote, 'update-ref', '-d', REF);
+      expect(leftover(s, old, null)).toBe('landed');
+      expect(remoteRefs(s)).toBe(`${old} ${REF}`);
+    });
     it('is simply read as codeboost\'s commit when it lands before a newer publish reads the branch', async () => {
       const s = await setup(), old = await runnerCommit(s, 'old'), newer = await runnerCommit(s, 'newer');
       expect(leftover(s, old, null)).toBe('landed');
