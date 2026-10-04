@@ -11,6 +11,8 @@ import type { PublishRecord, Store } from './store.ts';
 const SETTLED = ['opened', 'possibly already fixed', 'draft skipped', 'draft unsupported', 'no changes',
   // Recorded by the v10 upgrade for a task that reached its status before publishing existed: only the action publishes it.
   'not published'];
+/** The records a publish or close writes before it starts; one left at startup is a job whose process stopped. */
+const IN_FLIGHT = ['publishing', 'closing'];
 /** Refusals a person acts on; anything else that fails is reported as `failed`. */
 const REFUSALS = [GuardRefusal, BranchPushRefused, OpeningUnsettled, PullRequestMisplaced, PullRequestRefused];
 /** A publish stopped because a person cancelled its task (#111); the close that follows does what is left. */
@@ -125,13 +127,14 @@ export class TaskPublishing {
   /**
    * Startup, once the runner lock is verified: do the job owed, if any. Otherwise a publish or close action whose process
    * stopped before its job recorded an outcome (a crash) is settled now, so its replay stops saying `publishing` or
-   * `closing`; the task's records show what that job did, and the action runs it again. Never throws.
+   * `closing`, and its in-flight record becomes `stopped`; the task's records show what that job did, and the action
+   * runs it again. Never throws.
    */
   startup(identity: PlanIdentity): void {
     try {
       const job = this.owed(identity);
       if (job) { this.#schedule(identity, job); return; }
-      if (this.#store.hasUnsettledPublishAction(identity)) {
+      if (this.#store.hasUnsettledPublishAction(identity) || IN_FLIGHT.includes(this.#store.lastPublish(identity)?.outcome ?? '')) {
         const closing = this.#store.getTask(identity).status === 'cancelled';
         this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: false, ...(closing ? { action: 'close' as const } : {}),
           message: `The ${closing ? 'close' : 'publish'} was interrupted before it recorded an outcome (codeboost stopped). The task's records show what it did; the ${closing ? 'close-pull-requests' : 'publish'} action runs it again.` }));
@@ -157,8 +160,15 @@ export class TaskPublishing {
     const reserved = Promise.withResolvers<void>(), abort = new AbortController();
     this.#running.set(key, { job, done: reserved.promise, abort });
     const run = async () => {
-      let record: Omit<PublishRecord, 'stateVersion' | 'at'>;
+      // Durable in-flight ownership before the first external write (AGENTS.md): if this process stops before the outcome
+      // is recorded, startup finds the marker and publishes again or settles it as interrupted. No marker, no publish.
       const draft = job.kind === 'publish' && job.draft;
+      try {
+        this.#write(() => this.#store.recordPublish(identity, job.kind === 'close' ? { outcome: 'closing', draft: false, action: 'close', message: 'The task\'s pull requests are being closed.' }
+          : { outcome: 'publishing', draft, message: 'A pull request is being published.' }));
+      }
+      catch (error) { console.error(`Could not record the publish as started, so it did not run: ${JSON.stringify(message(error, this.#secrets))}`); return; }
+      let record: Omit<PublishRecord, 'stateVersion' | 'at'>;
       try {
         if (job.kind === 'close') {
           const closed = await this.#publisher.closeAll(identity, abort.signal);
