@@ -95,6 +95,8 @@ export class SafetyFindings {
   /** Whether the finding is only in memory: the Store knows nothing of it, so the executor must act on it itself. */
   unsaved(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
   settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
+  /** The attempts whose finding is owed (only in memory). Usually none, so a check over them costs nothing. */
+  owedAttempts(): string[] { return [...this.#unsaved.keys()]; }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined;
@@ -331,8 +333,13 @@ export class ItemExecutor {
    * Whether an earlier run left work owed that the next run pays before any item: a safety finding not yet acted on, or
    * a scope pause never recorded (a failed write, the write gate, a crash). Reads only.
    */
-  owes(identity: PlanIdentity): boolean {
-    return this.#store.getAttempts(identity).some(earlier => this.#findings.get(earlier.id) !== undefined) || this.#unpausedScopeFinding(identity) !== null;
+  owes(identity: PlanIdentity, options: { scope?: boolean } = {}): boolean {
+    // Cheap enough for a poll: owed findings are in memory (usually none), and only completed attempts that changed files
+    // outside their items are read, not every attempt with its result.
+    const key = identityKey(identity);
+    if (this.#findings.owedAttempts().some(id => this.#store.attemptOwner(id) === key)) return true;
+    if (options.scope === false) return false;
+    return this.#store.scopeFindingHeads(identity).some(head => !this.#store.checkpointAtHead(identity, head));
   }
   /**
    * Pay what an earlier run owes, outside a run, as a run would before its first item (#103: a task that owes a pause or
