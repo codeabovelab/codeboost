@@ -88,6 +88,21 @@ function completeAll(service: ReviewService) {
   }
   expect(s.getTask(id).status).toBe('running');
 }
+/**
+ * Every plan item completed, but the last changed a file outside its plan item, and its pause for amendment was never
+ * recorded (the write failed, or the process stopped): the next run owes that pause.
+ */
+function completeAllOwingPause(service: ReviewService) {
+  const s = service.store, id = service.config.identity, head = s.getSnapshot(id).head, items = s.getPlan(id).items;
+  s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+  for (const [index, item] of items.entries()) {
+    const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+    s.markRunning(id, attempt.id);
+    s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+      result: { head, unchanged: true, inScope: [], outOfScope: index === items.length - 1 ? ['run.sh'] : [] } });
+  }
+  expect(s.getTask(id).status).toBe('running');
+}
 /** The first item failed with a 1 ms task budget, which has passed: the task is running, and its next admission is refused. */
 function budgetSpent(service: ReviewService) {
   const s = service.store, id = service.config.identity;
@@ -457,6 +472,24 @@ describe('publishing a finished task (#103)', () => {
       expect((await act(app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'stopped', message: expect.stringMatching(/interrupted before it recorded an outcome/) });
       expect(w.github.calls).toEqual([]);
     });
+  });
+
+  it('pays a scope pause an earlier run owes instead of publishing its unreviewed changes as ready, at startup', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: completeAllOwingPause });
+    await app.publishing!.settled(identity);
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(w.github.calls).toEqual([]);
+    expect(store.lastPublish(identity)).toBeNull();
+  });
+  it('refuses the publish action while a scope pause is owed, and pays it', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: completeAllOwingPause, startup: false });
+    expect((await view(app)).publish).toMatchObject({ publishable: false });
+    expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/scope pause that has not been acted on/) } });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    await app.publishing!.settled(identity);
+    expect(w.github.calls).toEqual([]);
   });
 
   it('never publishes in a demo, even with a publisher', async () => {

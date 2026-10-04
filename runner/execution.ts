@@ -327,6 +327,28 @@ export class ItemExecutor {
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }
+  /**
+   * Whether an earlier run left work owed that the next run pays before any item: a safety finding not yet acted on, or
+   * a scope pause never recorded (a failed write, the write gate, a crash). Reads only.
+   */
+  owes(identity: PlanIdentity): boolean {
+    return this.#store.getAttempts(identity).some(earlier => this.#findings.get(earlier.id) !== undefined) || this.#unpausedScopeFinding(identity) !== null;
+  }
+  /**
+   * Pay what an earlier run owes, outside a run, as a run would before its first item (#103: a task that owes a pause or
+   * an escalation must not be published as finished). Null when nothing is owed, or a run of the task is in progress
+   * (it pays its own); otherwise the outcome: needs human, needs amendment, or stopped when it could not be written.
+   */
+  payOwed(identity: PlanIdentity): ExecutionOutcome | null {
+    if (this.#runner.closing || this.#runner.isActive(identity) || this.busy(identity)) return null;
+    const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [] });
+    for (const earlier of this.#store.getAttempts(identity)) {
+      const finding = this.#findings.get(earlier.id);
+      if (finding) return this.#escalate(identity, earlier, finding, stopped, [], true);
+    }
+    const owed = this.#unpausedScopeFinding(identity);
+    return owed ? this.#pause(identity, owed.row, owed.result, stopped, [], true) : null;
+  }
   /** Held in #inFlight from its start to its return, so close() can await it. */
   #track(key: string, run: Promise<ExecutionOutcome>): Promise<ExecutionOutcome> {
     this.#inFlight.set(key, run.catch(() => undefined));
