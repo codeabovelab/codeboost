@@ -118,6 +118,16 @@ export class PullRequestPublisher {
     finally { inflight.delete(key); this.#running.delete(publish); }
   }
 
+  /**
+   * How long until the task's lost opening may be abandoned (0 when it may be now, null when there is none): its own
+   * deadline, its creation plus the settle time, on the clock recovery uses.
+   */
+  settleRemaining(identity: PlanIdentity): number | null {
+    const lost = this.#store.taskPullRequests(identity).find(pr => pr.state === 'opening');
+    if (!lost) return null;
+    return Math.max(0, Date.parse(lost.createdAt) + (this.#config.settleMs ?? DEFAULT_SETTLE_MS) - (this.#config.now ?? Date.now)());
+  }
+
   async #publish(identity: PlanIdentity, input: { problems?: readonly string[] }, signal?: AbortSignal): Promise<PublishOutcome> {
     const draft = input.problems !== undefined;
     const recovered = await this.#recover(identity, draft, signal);

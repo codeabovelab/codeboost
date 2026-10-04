@@ -38,6 +38,8 @@ class FakeGitHub {
   onOpen?: (signal?: AbortSignal) => Promise<void>;
   /** Runs inside a draft change, before it applies; a throw fails the change. */
   onDraft?: () => void;
+  /** PRs GitHub's list does not show yet (it lags behind them). */
+  hidden = new Set<number>();
   readonly remote: string;
   constructor(remote: string) { this.remote = remote; }
   head(branch: string): string | null {
@@ -57,13 +59,13 @@ class FakeGitHub {
       return this.#view(pr);
     },
     findOpened: async input => {
-      const open = this.prs.filter(pr => pr.open && pr.headBranch === input.headBranch);
+      const open = this.prs.filter(pr => pr.open && !this.hidden.has(pr.number) && pr.headBranch === input.headBranch);
       const own = open.filter(pr => input.markers.includes(pr.marker));
       if (own.length > 1 || (own[0] && own[0].base !== input.base)) throw new PullRequestMisplaced('The task\'s pull requests are not where it publishes.');
       if (open.some(pr => pr.base === input.base && !input.markers.includes(pr.marker))) throw new Error('An open pull request exists that codeboost did not open.');
       return own[0] ? { ...this.#view(own[0]), marker: own[0].marker } : null;
     },
-    findOwned: async input => this.prs.filter(pr => pr.open && pr.headBranch === input.headBranch && input.markers.includes(pr.marker))
+    findOwned: async input => this.prs.filter(pr => pr.open && !this.hidden.has(pr.number) && pr.headBranch === input.headBranch && input.markers.includes(pr.marker))
       .map(pr => ({ ...this.#view(pr), marker: pr.marker, base: pr.base })),
     readPull: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; return { open: pr.open, headBranch: pr.headBranch, base: pr.base, marker: pr.marker }; },
     markDraft: async number => { this.onDraft?.(); const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
@@ -138,7 +140,7 @@ function world(): World {
  * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
  * exists, as an earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; env?: NodeJS.ProcessEnv } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; env?: NodeJS.ProcessEnv; settleMs?: number } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -156,7 +158,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     const pusher = new GitBranchPusher({ repository, repositoryId: service.config.identity.repositoryId, remote: REPO, url: w.remote,
       ownedCommits: identity => service.store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha),
       onProcessGroup: () => options.onPushSpawn?.(++spawns, () => app!, close) });
-    const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main' });
+    const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main', ...(options.settleMs ? { settleMs: options.settleMs } : {}) });
     branchOf = identity => publisher(() => false).branch(identity);
     return { deps, sources, findings: new SafetyFindings(service.store), publisher, ...(options.env ? { env: options.env } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
@@ -487,6 +489,73 @@ describe('publishing a finished task (#103)', () => {
     expect(store.getTask(identity).status).toBe('needs amendment');
     await app.publishing!.settled(identity);
     expect(w.github.calls).toEqual([]);
+  });
+
+  describe('round 1 of the independent review', () => {
+    it('starts nothing when the publish action is refused for a stale view, though a publish is owed', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service);
+        service.store.recordPublish(service.config.identity, { outcome: 'refused', draft: false, message: 'The branch moved.' });
+      }, startup: false });
+      const stale = store.getTask(identity).stateVersion - 1;
+      expect(await act(app, 'publish', randomUUID(), stale)).toMatchObject({ status: 409, body: { error: 'Stale task state. Reload before writing.' } });
+      expect(app.publishing!.busy(identity)).toBe(false);
+      expect(w.github.calls).toEqual([]);
+    });
+    it('keeps a task recorded as not published at the upgrade unpublished at startup, after unrelated changes', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: service => {
+        completeAll(service);
+        const s = service.store, id = service.config.identity;
+        s.recordPublish(id, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
+        // An unrelated change since moves the task's state version.
+        s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+      } });
+      await app.publishing!.settled(identity);
+      expect(w.github.calls).toEqual([]);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'not published' });
+    });
+    it('still settles a leftover in-flight record at startup when paying owed work fails', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { startup: false, before: service => {
+        const s = service.store, id = service.config.identity;
+        s.recordPublish(id, { outcome: 'publishing', draft: false, message: 'A pull request is being published.' });
+      } });
+      vi.spyOn(app.executor!, 'payOwed').mockImplementation(() => { throw new Error('The snapshot of P1\'s commit is missing.'); });
+      app.publishOwed();
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped' });
+    });
+    it('settles only a stuck reply with the outcome on record, leaving that record as it is', async () => {
+      const w = world(), actionId = randomUUID();
+      const first = await serve(w, { before: completeAll });
+      await publishSettled(first.app, first.identity);
+      const opened = first.store.lastPublish(first.identity)!;
+      expect(opened).toMatchObject({ outcome: 'opened', number: 100 });
+      // A publish action committed its reply, and the process stopped before that publish recorded itself as started.
+      const version = first.store.getTask(first.identity).stateVersion;
+      first.store.userAction(first.identity, { actionId, kind: 'publish', request: { attemptId: undefined, expectedStateVersion: version } }, () => ({ outcome: 'publishing', draft: false }));
+      await first.close();
+      const second = await serve(w);
+      expect(second.store.lastPublish(second.identity)).toEqual(opened);
+      expect((await act(second.app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', number: 100 });
+    });
+    it('retries a publish refused while a lost opening settles, at that opening\'s deadline', async () => {
+      const w = world();
+      // The first publish's opening reply is lost: GitHub created the PR, its list does not show it yet.
+      w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); throw new Error('timed out'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 2_500 });
+      await publishSettled(app, identity);
+      expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opening' }]);
+      w.github.onOpen = undefined;
+      // Asked again at once: the opening is still settling, so this publish is refused.
+      await act(app, 'publish');
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused' }), { timeout: 5_000 });
+      w.github.hidden.clear();
+      // Retried by itself at the deadline: the lost opening's PR is recovered by its marker, not opened again.
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 100 }), { timeout: 8_000, interval: 50 });
+      expect(w.github.prs).toHaveLength(1);
+    });
   });
 
   it('never publishes in a demo, even with a publisher', async () => {

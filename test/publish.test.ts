@@ -1255,6 +1255,29 @@ describe('gh subprocess environment', () => {
   });
 });
 
+describe('a plan revision during a publish (#103 review)', () => {
+  it('refuses a ready publish when a revision adds an item while its first GitHub lookups run', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), hidden = new Set<string>();
+    // A lost opening, so the next publish awaits GitHub (its recovery) before its guarded read.
+    await expect(harness(store, { live, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const marker of live.keys()) hidden.add(marker);
+    let revised = false;
+    const { publisher, log } = harness(store, { live, hidden, config: { settleMs: 0 }, onFind: () => {
+      if (revised) return;
+      revised = true;
+      // A reviewer saves a revision that adds P2, which never ran.
+      const current = store.getPlan(identity);
+      store.importRevision(JSON.stringify({ ...current, revision: current.revision + 1, items: [...current.items,
+        { id: 'P2', title: 'Log it', intent: 'Log rejected input', files: [{ path: 'a.ts', kind: 'edit', renamed_from: null, change: 'Log' }], acceptance: [{ type: 'check', text: 'Logged' }], depends_on: [] }] }),
+      'json', context, current.revision);
+    } });
+    // The revision's items have not run at that revision (P1 ran at the old one), so the ready publish is refused.
+    await expect(publisher.publish(identity)).rejects.toThrow(/^P1 has not run yet; publish once every plan item has run\.$/);
+    expect(log.some(line => line.startsWith('push') || line.startsWith('open'))).toBe(false);
+    expect(store.getTask(identity).status).toBe('running');
+  });
+});
+
 describe('GitHub PR adapter', () => {
   const marker = '<!-- codeboost:opening=11111111-1111-4111-8111-111111111111 -->';
   const response = (over: Record<string, unknown> = {}) => ({ number: 7, html_url: 'https://github.com/owner/repo/pull/7', state: 'open', draft: true, body: `${marker}\nplan`,
