@@ -345,14 +345,16 @@ export class ItemExecutor {
    * Pay what an earlier run owes, outside a run, as a run would before its first item (#103: a task that owes a pause or
    * an escalation must not be published as finished). Null when nothing is owed, or a run of the task is in progress
    * (it pays its own); otherwise the outcome: needs human, needs amendment, or stopped when it could not be written.
+   * `scope: false` pays only an owed safety finding (a task in needs human cannot record a pause).
    */
-  payOwed(identity: PlanIdentity): ExecutionOutcome | null {
+  payOwed(identity: PlanIdentity, options: { scope?: boolean } = {}): ExecutionOutcome | null {
     if (this.#runner.closing || this.#runner.isActive(identity) || this.busy(identity)) return null;
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [] });
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);
       if (finding) return this.#escalate(identity, earlier, finding, stopped, [], true);
     }
+    if (options.scope === false) return null;
     const owed = this.#unpausedScopeFinding(identity);
     return owed ? this.#pause(identity, owed.row, owed.result, stopped, [], true) : null;
   }
