@@ -119,7 +119,11 @@ export class TaskPublishing {
   request(identity: PlanIdentity, actionId: string): { draft: boolean } {
     const mode = this.mode(identity);
     // A person's action starts a new chain, with its own automatic retries (AGENTS.md: reset on an explicit user action).
-    this.#retried.delete(identityKey(identity));
+    // A retry the old chain armed is dropped with it, so it cannot fire later on the new chain's budget.
+    const key = identityKey(identity);
+    this.#retried.delete(key);
+    const armed = this.#retries.get(key);
+    if (armed) { clearTimeout(armed); this.#retries.delete(key); }
     this.#schedule(identity, mode.draft, actionId);
     return mode;
   }
