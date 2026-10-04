@@ -1343,6 +1343,14 @@ export class Store {
   askOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
     return this.#ownerToken('ask_owner', "Ask is off: the stored Ask owner token is malformed. Remove the 'ask_owner' row from app_settings in the review database, then retry.", file);
   }
+  /**
+   * The per-database owner token planning writes as `io.codeboost.runner` (#117). It is separate from Ask's and the
+   * runner's, so planning's recovery never removes their agents and theirs never see planning's storage. Same rules as
+   * `runnerOwnerToken`.
+   */
+  planningOwnerToken(file: { dev: number | bigint; ino: number | bigint }): string {
+    return this.#ownerToken('planning_owner', "Planning is off: the stored planning owner token is malformed. Remove the 'planning_owner' row from app_settings in the review database, then retry.", file);
+  }
   #ownerToken(key: string, malformed: string, file: { dev: number | bigint; ino: number | bigint }): string {
     const identity = { dev: String(file.dev), ino: String(file.ino) };
     return this.#transaction(() => {
