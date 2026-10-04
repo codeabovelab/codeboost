@@ -52,7 +52,7 @@ function review(github: Record<string, unknown> = { baseBranch: 'main' }) {
     const { CLAUDE_CODE_OAUTH_TOKEN: _token, ...env } = process.env;
     return spawnSync(process.execPath, [cli, '--config', config, ...args], { encoding: 'utf8', env: { ...env, HOME: join(root, 'home') }, timeout: 20_000 });
   };
-  return { run, fakeDocker, start, database: demo.database };
+  return { run, fakeDocker, start, database: demo.database, identity: demo.identity };
 }
 
 it('refuses a runner startup without a token with its message, exit 1 and the lock released', () => {
@@ -134,6 +134,32 @@ it('ignores a runner block in a demo configuration opened with --config, and ser
   } finally { child.kill('SIGKILL'); }
 });
 
+it('starts a publish the database owes once startup has verified the lock (#103)', async () => {
+  const { fakeDocker, start, database, identity } = review(), docker = fakeDocker();
+  // A task an earlier process left in needs human with no draft PR yet: a draft publish is owed.
+  const store = new Store(database);
+  try {
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: store.getPlan(identity).items[0]!.id,
+      expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+  } finally { store.close(); }
+  // A gh that records each call and fails, so nothing reaches GitHub.
+  const bin = docker.path.split(':')[0]!, calls = join(bin, 'gh-calls');
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$@" >> '${calls}'\nexit 1\n`); chmodSync(join(bin, 'gh'), 0o755);
+  docker.release();
+  const cli = start(docker);
+  try {
+    await cli.until(() => cli.out().includes('Review ready'), 'the server to open');
+    await cli.until(() => existsSync(calls), 'the startup publish to call gh');
+    cli.child.kill('SIGINT');
+    expect(await cli.exited).toBe(0);
+    const reopened = new Store(database);
+    try { expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'failed', draft: true }); } finally { reopened.close(); }
+  } finally { cli.child.kill('SIGKILL'); }
+});
 it('refuses with a message, not a stack, when the database path changes during a runner startup', async () => {
   const { fakeDocker, start, database } = review(), docker = fakeDocker();
   const cli = start(docker);

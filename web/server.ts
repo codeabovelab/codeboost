@@ -72,7 +72,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       runner = new RunnerCoordinator(service.store, assembly.deps, undefined, capability);
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
-      if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability); }
+      if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env); }
     } catch (error) { service.close(); throw error; }
   }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
