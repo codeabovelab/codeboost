@@ -744,6 +744,48 @@ describe('publishing a finished task (#103)', () => {
     });
   });
 
+  describe('round 6 of the independent review', () => {
+    it('drops the old chain\'s armed retry when a person asks again', async () => {
+      const w = world();
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_500, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      const publishes = () => starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      app.publishOwed(() => undefined);
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      // The first chain's retry at its opening's deadline is armed; a person asks again before it fires.
+      await act(app, 'publish');
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      // The first publish, the person's, and that chain's one retry: the old chain's timer never fires on the new budget.
+      expect(publishes()).toBe(3);
+    });
+    it('records no reconcile for a ready PR whose task can no longer be published, and replays reconcile when it is set', async () => {
+      const w = world();
+      // The task is cancelled while its PR opens: the PR is recorded, and nothing would ever reconcile it.
+      let cancel: (() => void) | undefined;
+      w.github.onOpen = async () => { cancel?.(); };
+      const first = await serve(w, { before: completeAll, startup: false });
+      cancel = () => first.store.cancelTask(first.identity, first.store.getTask(first.identity).stateVersion, randomUUID());
+      const records = vi.spyOn(first.store, 'recordPublish');
+      first.app.publishOwed(() => undefined);
+      await first.app.publishing!.settled(first.identity);
+      expect(first.store.getTask(first.identity).status).toBe('cancelled');
+      // The publish's own outcome carries no reconcile; then, the task being cancelled, its PR is closed (#111).
+      const opened = records.mock.calls.map(call => call[1]).find(record => record.outcome === 'opened');
+      expect(opened).toMatchObject({ outcome: 'opened' });
+      expect(opened!.reconcile).toBeUndefined();
+      expect(first.store.lastPublish(first.identity)).toMatchObject({ outcome: 'closed', action: 'close' });
+      // A publish action whose PR GitHub shows at another head: its saved reply, replayed, says reconcile too.
+      const v = world();
+      v.github.staleHeadOnce = 'a'.repeat(40);
+      const second = await serve(v, { before: completeAll, startup: false });
+      const actionId = randomUUID(), version = second.store.getTask(second.identity).stateVersion;
+      await act(second.app, 'publish', actionId, version);
+      await second.app.publishing!.settled(second.identity);
+      expect((await act(second.app, 'publish', actionId, version)).body.result).toMatchObject({ outcome: 'opened', reconcile: true });
+    });
+  });
+
   it('never publishes in a demo, even with a publisher', async () => {
     const w = world();
     const { app } = await serve(w, { demo: true, before: completeAll });
