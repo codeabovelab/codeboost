@@ -105,10 +105,11 @@ it('migrates unbound active requests to terminal history instead of reviving the
   const { store, path } = fixture(); const id = ready(store);
   close(store);
   const legacy = new DatabaseSync(path);
-  legacy.exec('DROP TABLE merge_attempts; ALTER TABLE requests DROP COLUMN reason; ALTER TABLE requests DROP COLUMN snapshot_id; PRAGMA user_version=3;');
+  legacy.exec('DROP TABLE merge_attempts; ALTER TABLE requests DROP COLUMN reason; ALTER TABLE requests DROP COLUMN snapshot_id; ALTER TABLE requests DROP COLUMN mode; PRAGMA user_version=3;');
   legacy.close();
   const recovered = open(path);
-  expect(recovered.getSuggestions(identity, id)).toEqual({ state: 'invalidated', revision: 1, snapshotId: null, reply: reply(), reason: 'Request predates snapshot binding.' });
+  // Requests from before #124 carry no mode: every one of them is a suggestion.
+  expect(recovered.getSuggestions(identity, id)).toEqual({ mode: 'suggest', state: 'invalidated', revision: 1, snapshotId: null, reply: reply(), reason: 'Request predates snapshot binding.' });
   expect(() => recovered.applySuggestion(identity, id, 0, context)).toThrow(/unavailable/);
 });
 it('invalidates pending and ready requests when another connection advances the snapshot', () => {

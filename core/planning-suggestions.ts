@@ -1,16 +1,21 @@
 import { identityKey, type PlanIdentity } from './identity.ts';
-import { prepareSuggestions, type AuthorInput, type AuthorProvider } from './planning-author.ts';
+import { prepareDraft, prepareSuggestions, type AuthorInput, type AuthorProvider, type PreparedAuthor } from './planning-author.ts';
 import type { Diagnostic, EditReply, Plan } from './plan.ts';
 
 /** Implemented by the existing Store. No SQL or second persistence writer in core. */
 export interface SuggestionStore {
   getPlan(identity: PlanIdentity): Plan;
   getSnapshot(identity: PlanIdentity): { id: string; base: string; head: string };
-  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }): string;
+  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }, mode?: PlanningMode): string;
   completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void;
   settleSuggestion(identity: PlanIdentity, id: string, expected: { revision: number; snapshotId: string }, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean;
   getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null };
 }
+/**
+ * A planning request (#124): typed edit cards for the current plan, or a whole draft of its next revision. `revision`
+ * in the input is always the current revision the request is bound to.
+ */
+export type PlanningMode = 'suggest' | 'draft';
 export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'> & { snapshotId: string };
 export type SuggestionOutcome =
   | { state: 'completed'; id: string; warnings: Diagnostic[] }
@@ -32,7 +37,10 @@ function retainDiagnostic(reason: string | null, diagnostic: string): string {
   return reason && reason !== diagnostic ? `${reason} ${diagnostic}` : diagnostic;
 }
 
-/** One instance per runner. Close it before closing Store. Not a cross-process scheduler. */
+/**
+ * One instance per runner. Close it before closing Store. Not a cross-process scheduler. Suggestions and drafts share
+ * one active invocation per plan.
+ */
 export class SuggestionCoordinator {
   #store: SuggestionStore;
   #provider: AuthorProvider;
@@ -45,7 +53,7 @@ export class SuggestionCoordinator {
       throw new Error('Suggestion timeout must fit a positive timer interval.');
     this.#store = store; this.#provider = provider; this.#timeoutMs = timeoutMs;
   }
-  start(input: SuggestionInput): SuggestionHandle {
+  start(input: SuggestionInput, mode: PlanningMode = 'suggest'): SuggestionHandle {
     if (this.#closing) throw new Error('Suggestion coordinator is closing.');
     const identity = { ...input.context.identity }, key = identityKey(identity);
     if (this.#active.has(key)) throw new Error('A suggestion invocation is still active for this plan.');
@@ -54,9 +62,12 @@ export class SuggestionCoordinator {
     if (previousPlan.revision !== input.revision) throw new Error('Stale plan revision.');
     if (snapshot.id !== snapshotId || snapshot.base !== input.repo.baseSha) throw new Error('Stale repository snapshot.');
     // Validate before allocating a durable request; no await permits local state changes.
-    const prepared = prepareSuggestions({ ...input, requestId: 'pending', previousPlan });
+    const prepared: PreparedAuthor<unknown> = mode === 'draft'
+      ? prepareDraft({ ...input, revision: input.revision + 1, requestId: 'pending', previousPlan })
+      : prepareSuggestions({ ...input, requestId: 'pending', previousPlan });
     const expected = Object.freeze({ revision: input.revision, snapshotId });
-    const id = this.#store.beginSuggestions(identity, expected);
+    const noun = mode === 'draft' ? 'Draft' : 'Suggestion';
+    const id = this.#store.beginSuggestions(identity, expected, mode);
     const request = Object.freeze({ ...prepared.request, requestId: id });
     const controller = new AbortController();
     let stopped: Omit<TerminalOutcome, 'id'> | undefined;
@@ -84,11 +95,11 @@ export class SuggestionCoordinator {
       catch (error) { stopped.reason += ` Request cleanup failed: ${String(error)}`; }
       finally { controller.abort(new Error(reason)); }
     };
-    const timer = setTimeout(() => stop('failed', 'Suggestion invocation timed out.'), this.#timeoutMs);
+    const timer = setTimeout(() => stop('failed', `${noun} invocation timed out.`), this.#timeoutMs);
     let finish!: (result: SuggestionOutcome) => void;
     const result = new Promise<SuggestionOutcome>(resolve => { finish = resolve; });
     const handle: SuggestionHandle = Object.freeze({ id, result,
-      cancel: (reason = 'Suggestion cancelled by user.') => stop('cancelled', reason) });
+      cancel: (reason = `${noun} cancelled by user.`) => stop('cancelled', reason) });
     this.#active.set(key, { handle, stop });
     // Defer invocation until the handle owns its slot, including synchronous provider errors.
     void Promise.resolve().then(async () => {
@@ -101,11 +112,11 @@ export class SuggestionCoordinator {
           if (afterInvocation) outcome = { id, ...afterInvocation };
           else {
             const current = this.#store.getSuggestions(identity, id);
-            if (this.#store.getPlan(identity).revision !== request.revision ||
+            if (this.#store.getPlan(identity).revision !== expected.revision ||
                 this.#store.getSnapshot(identity).id !== snapshot.id || current.state === 'invalidated') {
               outcome = { id, state: 'stale', reason: 'Plan revision or snapshot changed during authoring.' };
             } else if (current.state !== 'pending') {
-              outcome = { id, state: current.state === 'cancelled' ? 'cancelled' : 'stale', reason: `Suggestion request is ${current.state}.` };
+              outcome = { id, state: current.state === 'cancelled' ? 'cancelled' : 'stale', reason: `${noun} request is ${current.state}.` };
             } else {
               const validated = prepared.validate(source);
               this.#store.completeSuggestions(identity, id, validated.value);
@@ -120,11 +131,11 @@ export class SuggestionCoordinator {
         if (!stopped) {
           try {
             const current = this.#store.getSuggestions(identity, id);
-            if (current.state === 'invalidated' || this.#store.getPlan(identity).revision !== request.revision ||
+            if (current.state === 'invalidated' || this.#store.getPlan(identity).revision !== expected.revision ||
                 this.#store.getSnapshot(identity).id !== snapshot.id)
               outcome = { id, state: 'stale', reason: `Plan revision or snapshot changed before publication. ${outcome.reason}` };
             else if (current.state === 'cancelled')
-              outcome = { id, state: 'cancelled', reason: `Suggestion request was cancelled before publication. ${outcome.reason}` };
+              outcome = { id, state: 'cancelled', reason: `${noun} request was cancelled before publication. ${outcome.reason}` };
           } catch { /* Preserve the original error if durable state cannot be read. */ }
         }
       }

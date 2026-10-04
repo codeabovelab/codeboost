@@ -2,7 +2,7 @@ import type { DatabaseSync, SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
-import { importPlan, applySuggestion, assertEditReply, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
+import { importPlan, applySuggestion, assertEditReply, assertPlan, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import type { AlreadyFixedResult } from '../github/already-fixed.ts';
@@ -20,7 +20,12 @@ export function requireSupportedNode(version = process.versions.node): void {
 export interface Snapshot { id: string; base: string; head: string }
 export interface ReviewState { revision: number; snapshotId: string; reviewVersion?: number }
 export type SuggestionState = 'pending' | 'ready' | 'failed' | 'cancelled' | 'invalidated' | 'consumed';
-export interface SuggestionRequest { state: SuggestionState; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null }
+/** A planning request: card suggestions for the current plan, or a whole draft of its next revision (#124). */
+export type PlanningMode = 'suggest' | 'draft';
+/** `reply` is the suggestion cards; for a draft it is always null here (read it with `getDraft`). */
+export interface SuggestionRequest { mode: PlanningMode; state: SuggestionState; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null }
+/** A draft request: `revision` is the plan revision it was drafted against; `plan` would become revision + 1. */
+export interface DraftRequest { state: SuggestionState; revision: number; snapshotId: string | null; plan: Plan | null; reason: string | null }
 export interface SnippetReference { key: string; path: string; side: 'old' | 'new'; start: number; end: number; text: string; head: string; base: string }
 export interface QuestionAnswer { provider?: 'claude' | 'codex'; attempt: string; contextId?: string; status: 'pending' | 'complete' | 'failed'; expiresAt: number; text?: string; error?: string }
 export interface ReviewNote { id: string; item: string; kind: 'question' | 'change'; text: string; reference?: SnippetReference; answer?: QuestionAnswer; createdAt: string; revision: number; snapshotId: string }
@@ -102,8 +107,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 9) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 11) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -147,6 +152,12 @@ export class Store {
           if (!columns.includes('metadata_baseline')) this.#db.exec('ALTER TABLE attempts ADD COLUMN metadata_baseline TEXT');
           if (!columns.includes('storage_base')) this.#db.exec('ALTER TABLE attempts ADD COLUMN storage_base TEXT');
           this.#db.exec('PRAGMA user_version=9');
+        }
+        // Planning requests carry their mode (#124): every earlier request is a suggestion. Idempotent, like v8.
+        if (version < 11) {
+          if (!this.#db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'mode'))
+            this.#db.exec("ALTER TABLE requests ADD COLUMN mode TEXT NOT NULL DEFAULT 'suggest'");
+          this.#db.exec('PRAGMA user_version=11');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -296,21 +307,28 @@ export class Store {
     if (!row) throw new Error('Unknown snapshot.');
     return decode<Snapshot>(row.data);
   }
-  beginSuggestions(identity: PlanIdentity, expected: ReviewState): string {
+  beginSuggestions(identity: PlanIdentity, expected: ReviewState, mode: PlanningMode = 'suggest'): string {
+    if (mode !== 'suggest' && mode !== 'draft') throw new Error('Invalid planning request mode.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
       const id = randomUUID();
-      this.#run("INSERT INTO requests (id,key,revision,state,reply,snapshot_id,reason) VALUES (?,?,?,'pending',NULL,?,NULL)", id, key, expected.revision, expected.snapshotId); return id;
+      this.#run("INSERT INTO requests (id,key,revision,state,reply,snapshot_id,reason,mode) VALUES (?,?,?,'pending',NULL,?,NULL,?)", id, key, expected.revision, expected.snapshotId, mode); return id;
     });
   }
+  /**
+   * Publish a request's validated reply, by the request's own mode: suggestion cards against the current revision, or
+   * a draft plan of the next revision for the plan's issue. The full plan checks run again when a draft is applied.
+   */
   completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void {
-    assertEditReply(reply);
     const key = identityKey(identity);
     this.#transaction(() => {
       const current = this.#current(key);
-      if (reply.base_revision !== current.revision || this.#run("UPDATE requests SET state='ready',reply=?,reason=NULL WHERE id=? AND key=? AND revision=? AND snapshot_id=? AND state='pending'", encode(reply), id, key, current.revision!, current.snapshot_id!).changes !== 1)
-        throw new Error('Suggestion request is stale, cancelled, or complete.');
+      const row = this.#get('SELECT mode FROM requests WHERE id=? AND key=?', id, key);
+      const fits = row?.mode === 'draft' ? (assertPlan(reply), reply.revision === (current.revision as number) + 1 && reply.issue === current.issue)
+        : (assertEditReply(reply), reply.base_revision === current.revision);
+      if (!fits || this.#run("UPDATE requests SET state='ready',reply=?,reason=NULL WHERE id=? AND key=? AND revision=? AND snapshot_id=? AND state='pending'", encode(reply), id, key, current.revision!, current.snapshot_id!).changes !== 1)
+        throw new Error(`${row?.mode === 'draft' ? 'Draft' : 'Suggestion'} request is stale, cancelled, or complete.`);
     });
   }
   settleSuggestion(identity: PlanIdentity, id: string, expected: ReviewState, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean {
@@ -422,13 +440,40 @@ export class Store {
   getSuggestions(identity: PlanIdentity, id: string): SuggestionRequest {
     const row = this.#get('SELECT * FROM requests WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown suggestion request.');
-    return { state: row.state as SuggestionState, revision: row.revision as number, snapshotId: row.snapshot_id as string | null, reply: row.reply === null ? null : decode<EditReply>(row.reply), reason: row.reason as string | null };
+    const mode = row.mode as PlanningMode;
+    return { mode, state: row.state as SuggestionState, revision: row.revision as number, snapshotId: row.snapshot_id as string | null,
+      reply: row.reply === null || mode === 'draft' ? null : decode<EditReply>(row.reply), reason: row.reason as string | null };
+  }
+  /** A draft request (#124). Refuses a suggestion request's ID. */
+  getDraft(identity: PlanIdentity, id: string): DraftRequest {
+    const row = this.#get("SELECT * FROM requests WHERE key=? AND id=? AND mode='draft'", identityKey(identity), id);
+    if (!row) throw new Error('Unknown draft request.');
+    return { state: row.state as SuggestionState, revision: row.revision as number, snapshotId: row.snapshot_id as string | null,
+      plan: row.reply === null ? null : decode<Plan>(row.reply), reason: row.reason as string | null };
+  }
+  /**
+   * Apply a ready draft as the next revision (#124): the draft must still be bound to the current revision and
+   * snapshot, and it passes every check an import does. The request is then consumed, so a replay is refused.
+   */
+  applyDraft(identity: PlanIdentity, id: string, context: PlanContext): Plan {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#context(key, context);
+      const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready' AND mode='draft'", id, key);
+      if (!request) throw new Error('Draft is unavailable.');
+      const current = this.#current(key);
+      if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Draft is unavailable.');
+      const revision = current.revision as number;
+      const plan = importPlan(request.reply as string, 'json', context, revision + 1).plan;
+      this.#savePlan(key, plan, revision);
+      this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return plan;
+    });
   }
   applySuggestion(identity: PlanIdentity, id: string, index: number, context: PlanContext): Plan {
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#context(key, context);
-      const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready'", id, key);
+      const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready' AND mode='suggest'", id, key);
       if (!request) throw new Error('Suggestion is unavailable.');
       const current = this.#current(key);
       if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Suggestion is unavailable.');
