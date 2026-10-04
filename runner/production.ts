@@ -156,6 +156,8 @@ export interface RunnerAssembly {
    * irreversible GitHub change. Absent: nothing is published (tests that only run items).
    */
   readonly publisher?: (closing: () => boolean) => PullRequestPublisher;
+  /** The environment the publisher's gh calls and push run with; its token values are removed from recorded errors. */
+  readonly env?: NodeJS.ProcessEnv;
   readonly sources: ExecutionSources;
   readonly findings: SafetyFindings;
   readonly recovery: RecoveryReport;
@@ -232,7 +234,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   // ledger has no other kind of commit codeboost pushes (only recordRebase writes foreign entries).
   const pusher = new GitBranchPusher({ repository, repositoryId: identity.repositoryId, remote: github.repository, env: o.env as NodeJS.ProcessEnv,
     ownedCommits: requested => service.store.getLedger(requested).filter(entry => entry.origin === 'owned').map(entry => entry.sha) });
-  const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: new GhAlreadyFixedGateway({ repository: github.repository }),
-    pulls: new GhPullRequestGateway({ repository: github.repository }), pusher, closing }, { repository: github.repository, baseBranch: base });
-  return { deps, sources, findings, recovery, publisher };
+  // The same environment as the push, so the PR calls go to the same GH_HOST with the same credentials.
+  const env = o.env as NodeJS.ProcessEnv;
+  const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: new GhAlreadyFixedGateway({ repository: github.repository, env }),
+    pulls: new GhPullRequestGateway({ repository: github.repository, env }), pusher, closing }, { repository: github.repository, baseBranch: base });
+  return { deps, sources, findings, recovery, publisher, env };
 }

@@ -1,4 +1,6 @@
-import { existsSync } from 'node:fs';
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { GuardRefusal, ShuttingDownError } from '../runner/lifecycle.ts';
@@ -1350,6 +1352,14 @@ describe('GitHub PR adapter', () => {
     // Our PR whose plan text quotes an older marker still matches exactly one: its own first line.
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: `${marker}\nplan quoting ${other}` })]))
       .findOpened({ ...input, markers: [other, marker] })).toMatchObject({ marker });
+  });
+  it('runs gh with the environment it was given, so its GH_HOST matches the push\'s', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'codeboost-gh-'));
+    try {
+      writeFileSync(join(dir, 'gh'), '#!/bin/sh\nprintf \'{"number":7,"state":"open","body":"","head":{"ref":"x"},"base":{"ref":"%s"}}\' "$GH_HOST"\n', { mode: 0o755 });
+      const gh = new GhPullRequestGateway({ repository: 'owner/repo', env: { PATH: `${dir}:${process.env.PATH}`, GH_HOST: 'ghe.example.com' } });
+      expect((await gh.readPull(7)).base).toBe('ghe.example.com');
+    } finally { rmSync(dir, { recursive: true, force: true }); }
   });
   it('fails a draft opening that GitHub created as ready, so the opening stays owned for recovery', async () => {
     const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ draft: false })));

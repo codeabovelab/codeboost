@@ -24,11 +24,15 @@ const REFUSALS = [GuardRefusal, BranchPushRefused, OpeningUnsettled, PullRequest
 export class TaskPublishing {
   #store: Store; #publisher: PullRequestPublisher; #runner: RunnerCoordinator; #executor: ItemExecutor;
   #write: <T>(fn: () => T) => T;
+  /** Token values to remove from recorded error text: those of the environment the gh calls and the push run with. */
+  #secrets: string[];
   #closing = false;
   /** Publishes in progress, by task, from scheduling until the outcome is recorded. */
   #running = new Map<string, Promise<void>>();
-  constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability) {
+  constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
+    env: NodeJS.ProcessEnv = process.env) {
     this.#store = store; this.#publisher = publisher; this.#runner = runner; this.#executor = executor; this.#write = settleWith(capability);
+    this.#secrets = TOKEN_VARIABLES.flatMap(name => env[name] ?? []);
   }
 
   /** Whether a publish of this task is in progress. */
@@ -85,7 +89,7 @@ export class TaskPublishing {
   /** A run of the task ended, or the server started: publish if one is owed. Never throws. */
   publishIfOwed(identity: PlanIdentity): void {
     try { const owed = this.owed(identity); if (owed) this.#schedule(identity, owed.draft); }
-    catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error))}`); }
+    catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
   /**
@@ -111,10 +115,10 @@ export class TaskPublishing {
         record = describe(outcome, draft);
       } catch (error) {
         const stopped = error instanceof ShuttingDownError || (this.#closing && (error as Error)?.name === 'AbortError');
-        record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error) };
+        record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets) };
       }
       try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
-      catch (error) { console.error(`Could not record the publish outcome: ${JSON.stringify(message(error))}`); }
+      catch (error) { console.error(`Could not record the publish outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
     };
     // Starts once the caller's transaction (the action's userAction) has committed; a rollback starts nothing.
     this.#store.afterCommit(() => {
@@ -123,14 +127,15 @@ export class TaskPublishing {
   }
 
   /**
-   * Why a needs-human task needs a person, for its draft PR, from what sent it there now: its spent budget, or its current
-   * attempt's safety finding or diagnostic. An earlier attempt's finding, which a person may have dealt with, is not used.
+   * Why a needs-human task needs a person, for its draft PR, from what sent it there now: its current attempt's safety
+   * finding first (a budget that also ran out since must not hide it), then its spent budget, then that attempt's
+   * diagnostic. An earlier attempt's finding, which a person may have dealt with, is not used.
    */
   #problems(identity: PlanIdentity): string[] {
     const task = this.#store.getTask(identity);
-    if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
     const current = task.currentAttemptId === null ? undefined : this.#store.getAttempt(identity, task.currentAttemptId);
     if (current?.safetyFinding) return [current.safetyFinding];
+    if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
     if (current?.diagnostic) return [current.diagnostic];
     return ['The task needs a person.'];
   }
@@ -159,5 +164,4 @@ function checkSummary(result: Extract<PublishOutcome, { kind: 'draft skipped' }>
  * An error's text for the record and the runner view. A `gh` failure carries its output, which a server or proxy may have
  * echoed a token into: every configured token value and every GitHub token shape is removed, as for the push.
  */
-const message = (error: unknown) => redact(error instanceof Error ? error.message : String(error),
-  TOKEN_VARIABLES.flatMap(name => process.env[name] ?? [])).slice(0, 2000);
+const message = (error: unknown, secrets: readonly string[]) => redact(error instanceof Error ? error.message : String(error), secrets).slice(0, 2000);
