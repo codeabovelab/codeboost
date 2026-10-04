@@ -41,7 +41,7 @@ const baseOf = new WeakMap<Map<string, OpenedPullRequest>, Map<string, string>>(
 /** `live` is GitHub's set of open PRs by marker; share it between harnesses to model later runs of the same task. */
 function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?: (input: OpenPullRequestInput) => Promise<OpenedPullRequest>; found?: OpenedPullRequest | null;
   push?: BranchPusher['push']; live?: Map<string, OpenedPullRequest>; next?: { value: number }; config?: Partial<PublishConfig>; draftAfterRefresh?: boolean;
-  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number>; onRead?: () => void; copies?: (OpenedPullRequest & { marker: string })[] } = {}) {
+  onFind?: () => void; refreshFails?: boolean; closed?: Set<number>; hidden?: Set<string>; openTimesOut?: boolean; draftFails?: boolean; draftsUnsupported?: boolean; onDraft?: () => void; onRefresh?: () => void; closing?: () => boolean; onCheck?: () => void; moved?: Set<number>; unmarked?: Set<number>; onRead?: () => void; onCloseRead?: () => void; copies?: (OpenedPullRequest & { marker: string })[] } = {}) {
   const publishConfig = { ...config, ...options.config };
   // The task's branch, as the publisher names it (one task per harness).
   let publishBranch = '';
@@ -122,6 +122,17 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       if (options.draftsUnsupported) throw new DraftsUnsupported('no drafts');
       if (options.draftFails) throw new Error('timeout marking the PR a draft');
       const pr = { ...live.get(input.marker)!, draft: true }; live.set(input.marker, pr); return pr;
+    },
+    // Like the adapter: read by number (never the list), refuse an open PR that is no longer the task's, then close.
+    async close(number, input) {
+      log.push(`close ${number}`);
+      const [m] = [...live].find(([, pr]) => pr.number === number) ?? [undefined];
+      if (m === undefined || closed.has(number)) return { number, url: 'https://github.com/owner/repo/pull/1' };
+      if (options.unmarked?.has(number) || options.moved?.has(number) || m !== input.marker) throw new PullRequestMisplaced(`Pull request #${number} is open but no longer the task's.`);
+      options.onCloseRead?.();
+      input.beforeClose?.();
+      closed.add(number);
+      return { number, url: 'https://github.com/owner/repo/pull/1' };
     },
     async refresh(number, input) {
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
@@ -255,7 +266,7 @@ describe('opening the task PR', () => {
     } };
     const opened: string[] = [];
     const publisher = new PullRequestPublisher(store, { checks: gate, pusher: { async push() {} },
-      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async findOwned() { return []; }, async readPull() { throw new Error('unreachable'); }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); } } }, config);
+      pulls: { async open() { opened.push('open'); throw new Error('unreachable'); }, async findOpened() { return null; }, async findOwned() { return []; }, async readPull() { throw new Error('unreachable'); }, async refresh() { throw new Error('unreachable'); }, async markDraft() { throw new Error('unreachable'); }, async close() { throw new Error('unreachable'); } } }, config);
     await expect(publisher.publish(identity)).rejects.toThrow(GuardRefusal);
     expect(opened).toEqual([]);
   });
@@ -1255,6 +1266,108 @@ describe('gh subprocess environment', () => {
   });
 });
 
+describe('closing a cancelled task\'s pull requests (#111)', () => {
+  const cancel = (store: Store) => store.cancelTask(identity, store.getTask(identity).stateVersion, crypto.randomUUID());
+  it('closes only a cancelled task\'s PRs', async () => {
+    const store = runningTask(), { publisher, log } = harness(store);
+    await expect(publisher.closeAll(identity)).rejects.toThrow(/Only a cancelled task/);
+    expect(log).toEqual([]);
+  });
+  it('closes a recorded PR by its number, though GitHub\'s list does not show it yet', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), hidden = new Set<string>();
+    await harness(store, { live }).publisher.publish(identity);
+    for (const marker of live.keys()) hidden.add(marker);
+    cancel(store);
+    const closed = new Set<number>(), { publisher, log } = harness(store, { live, hidden, closed });
+    expect(await publisher.closeAll(identity)).toEqual([100]);
+    expect(closed).toEqual(new Set([100]));
+    expect(log).toEqual(['close 100']);
+  });
+  it('refuses, and leaves open, a PR that is no longer the task\'s', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    cancel(store);
+    const closed = new Set<number>(), { publisher } = harness(store, { live, closed, unmarked: new Set([100]) });
+    await expect(publisher.closeAll(identity)).rejects.toThrow(PullRequestMisplaced);
+    expect(closed.size).toBe(0);
+  });
+  it('reports a PR recorded in another repository instead of recording the close as done', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    cancel(store);
+    // The configuration now names another repository (a rename or a transfer).
+    const { publisher, log } = harness(store, { live, config: { repository: 'owner/renamed' } });
+    await expect(publisher.closeAll(identity)).rejects.toThrow(PullRequestMisplaced);
+    await expect(publisher.closeAll(identity)).rejects.toThrow('Pull request #100 was opened in owner/repo, not owner/renamed');
+    expect(log).toEqual([]);
+  });
+  it('reports how long the lost opening still has to settle, on the clock recovery uses', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await expect(harness(store, { live, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    const created = Date.parse(store.taskPullRequests(identity)[0]!.createdAt);
+    expect(harness(store, { live, config: { settleMs: 60_000, now: () => created + 59_500 } }).publisher.settleRemaining(identity)).toBe(500);
+    expect(harness(store, { live, config: { settleMs: 60_000, now: () => created + 61_000 } }).publisher.settleRemaining(identity)).toBe(0);
+    expect(harness(runningTask()).publisher.settleRemaining(identity)).toBeNull();
+  });
+  /** A cancelled task whose opening was abandoned (GitHub showed nothing in time) and whose PR GitHub shows now. */
+  async function abandonedThenCancelled() {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), hidden = new Set<string>();
+    await expect(harness(store, { live, openTimesOut: true }).publisher.publish(identity)).rejects.toThrow('timeout');
+    for (const marker of live.keys()) hidden.add(marker);
+    // The settle time has passed with nothing visible: the opening is abandoned, and the main path goes on (it opens a
+    // second PR into the base, which GitHub refuses while the hidden one is open; any outcome will do here).
+    await harness(store, { live, hidden, config: { settleMs: 0 } }).publisher.publish(identity).catch(() => undefined);
+    expect(store.taskPullRequests(identity).filter(pr => pr.number === null).map(pr => pr.state)).toEqual(expect.arrayContaining(['abandoned']));
+    expect(store.taskPullRequests(identity).every(pr => pr.state === 'abandoned')).toBe(true);
+    cancel(store);
+    return { store, live, marker: [...live.keys()][0]! };
+  }
+  it('adopts and closes an abandoned opening\'s PR that GitHub shows now', async () => {
+    const { store, live } = await abandonedThenCancelled(), closed = new Set<number>();
+    const { publisher, log } = harness(store, { live, closed });
+    expect(await publisher.closeAll(identity)).toContain(100);
+    expect(closed.has(100)).toBe(true);
+    expect(log).toContain('close 100');
+    expect(store.taskPullRequests(identity)).toContainEqual(expect.objectContaining({ state: 'opened', number: 100 }));
+  });
+  it('closes neither of two PRs that carry an abandoned opening\'s marker, and refuses', async () => {
+    const { store, live, marker } = await abandonedThenCancelled(), closed = new Set<number>();
+    const copy = { number: 999, url: 'https://github.com/owner/repo/pull/999', headSha: oid(8), draft: false, marker };
+    const { publisher } = harness(store, { live, closed, copies: [copy] });
+    await expect(publisher.closeAll(identity)).rejects.toThrow(/carry the first line of a pull request the task was opening, so codeboost closed neither/);
+    expect(closed.has(100) || closed.has(999)).toBe(false);
+    expect(store.taskPullRequests(identity).every(pr => pr.state === 'abandoned')).toBe(true);
+  });
+  it('still closes the next PR when an earlier one cannot be closed, and reports the problem', async () => {
+    // Two distinct recorded PRs: #100 from the first run, closed by a person, then #101 from the rerun.
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, closed = new Set<number>();
+    await harness(store, { live, next, closed }).publisher.publish(identity);
+    closed.add(100);
+    rerun(store);
+    await harness(store, { live, next, closed }).publisher.publish(identity);
+    expect(store.taskPullRequests(identity).map(pr => pr.number)).toEqual([100, 101]);
+    // #100 is reopened, but without its first-line marker: it is no longer the task's, so its close is refused.
+    closed.delete(100);
+    cancel(store);
+    const { publisher, log } = harness(store, { live, next, closed, unmarked: new Set([100]) });
+    const failure = await publisher.closeAll(identity).then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(PullRequestMisplaced);
+    expect((failure as Error).message).toMatch(/^Pull requests #101 closed\. Pull request #100 is open but no longer the task's\./);
+    expect(log).toEqual(['close 100', 'close 101']);
+    expect(closed.has(101)).toBe(true);
+    expect(closed.has(100)).toBe(false);
+  });
+  it('closes nothing when shutdown begins between the read and the close', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>();
+    await harness(store, { live }).publisher.publish(identity);
+    cancel(store);
+    let closing = false;
+    const closed = new Set<number>(), { publisher } = harness(store, { live, closed, closing: () => closing, onCloseRead: () => { closing = true; } });
+    await expect(publisher.closeAll(identity)).rejects.toThrow(ShuttingDownError);
+    expect(closed.size).toBe(0);
+  });
+});
+
 describe('a plan revision during a publish (#103 review)', () => {
   it('refuses a ready publish when a revision adds an item while its first GitHub lookups run', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>(), hidden = new Set<string>();
@@ -1398,6 +1511,48 @@ describe('GitHub PR adapter', () => {
     // Our PR whose plan text quotes an older marker still matches exactly one: its own first line.
     expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify([response({ body: `${marker}\nplan quoting ${other}` })]))
       .findOpened({ ...input, markers: [other, marker] })).toMatchObject({ marker });
+  });
+  it('closes the task\'s PR with a PATCH, after checking its branch, repository and marker, and requires GitHub to show it closed (#111)', async () => {
+    const calls: string[][] = [], inputs: (string | undefined)[] = [];
+    let state = 'open';
+    const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async (args, options) => {
+      calls.push([...args]); inputs.push(options?.input);
+      if (args.includes('PATCH')) state = 'closed';
+      return JSON.stringify(response({ state }));
+    });
+    const close = { headBranch: 'codeboost/issue-12-task', marker };
+    expect(await gh.close(7, close)).toEqual({ number: 7, url: 'https://github.com/owner/repo/pull/7' });
+    expect(calls).toEqual([['api', '-H', 'Accept: application/vnd.github+json', 'repos/owner/repo/pulls/7'],
+      ['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', 'repos/owner/repo/pulls/7', '--input', '-']]);
+    expect(JSON.parse(inputs[1]!)).toEqual({ state: 'closed' });
+    // Already closed: success, with no PATCH.
+    calls.length = 0;
+    expect(await gh.close(7, close)).toMatchObject({ number: 7 });
+    expect(calls).toHaveLength(1);
+    // GitHub answered the PATCH but still shows the PR open.
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response())).close(7, close)).rejects.toThrow(/did not close/);
+  });
+  it('never closes a PR that is no longer the task\'s: another branch, a fork, no marker, another number (#111)', async () => {
+    for (const over of [{ head: { sha: oid(2), ref: 'other', repo: { full_name: 'owner/repo' } } }, { head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: { full_name: 'fork/repo' } } },
+      { head: { sha: oid(2), ref: 'codeboost/issue-12-task', repo: null } }, { body: 'no marker' }, { body: `plan\n${marker}` }, { number: 8 }]) {
+      const calls: string[][] = [];
+      const gh = new GhPullRequestGateway({ repository: 'owner/repo' }, async args => { calls.push([...args]); return JSON.stringify(response(over)); });
+      await expect(gh.close(7, { headBranch: 'codeboost/issue-12-task', marker }), JSON.stringify(over)).rejects.toThrow();
+      expect(calls.some(call => call.includes('PATCH')), JSON.stringify(over)).toBe(false);
+    }
+    // A closed PR is done, whoever edited it since.
+    expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, async () => JSON.stringify(response({ state: 'closed', body: 'edited' })))
+      .close(7, { headBranch: 'codeboost/issue-12-task', marker })).toMatchObject({ number: 7 });
+  });
+  it('re-checks right before the close, and a close that landed is not failed by an edited description (#111)', async () => {
+    let state = 'open';
+    const calls: string[][] = [];
+    const run = async (args: readonly string[]) => { calls.push([...args]); if (args.includes('PATCH')) state = 'closed';
+      return JSON.stringify(response(args.includes('PATCH') ? { state, body: 'edited by a person' } : { state })); };
+    await expect(new GhPullRequestGateway({ repository: 'owner/repo' }, run).close(7, { headBranch: 'codeboost/issue-12-task', marker, beforeClose: () => { throw new Error('shutting down'); } }))
+      .rejects.toThrow('shutting down');
+    expect(calls.some(call => call.includes('PATCH'))).toBe(false);
+    expect(await new GhPullRequestGateway({ repository: 'owner/repo' }, run).close(7, { headBranch: 'codeboost/issue-12-task', marker })).toMatchObject({ number: 7 });
   });
   it('runs gh with the environment it was given, so its GH_HOST matches the push\'s', async () => {
     const dir = mkdtempSync(join(tmpdir(), 'codeboost-gh-'));

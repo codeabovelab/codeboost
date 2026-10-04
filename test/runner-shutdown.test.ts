@@ -229,7 +229,7 @@ describe('/api/runner', () => {
     const first = await api(app, 'POST', '/api/runner', cancel);
     expect(first).toMatchObject({ status: 200, body: { result: { outcome: 'closed' }, runner: { task: { status: 'cancelled' } } } });
     expect((await api(app, 'POST', '/api/runner', cancel)).body.result).toEqual(first.body.result);
-    expect((await api(app, 'POST', '/api/runner', { ...cancel, action: 'retry', attemptId: randomUUID() }))).toMatchObject({ status: 409, body: { error: /different request/ } });
+    expect((await api(app, 'POST', '/api/runner', { ...cancel, action: 'retry', attemptId: randomUUID() }))).toMatchObject({ status: 409, body: { error: expect.stringMatching(/different request/) } });
     expect((await api(app, 'POST', '/api/runner', { ...cancel, actionId: 'not-a-uuid' })).status).toBe(400);
   });
   it('answers 400 for a malformed runner request and records nothing under its action ID', async () => {

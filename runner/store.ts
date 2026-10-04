@@ -57,12 +57,14 @@ export function mergeActionResponse(attempt: MergeAttempt) {
  */
 export interface PublishRecord {
   outcome: string; draft: boolean; message: string; stateVersion: number; at: string; number?: number; url?: string;
+  /** `close`: the record is a cancelled task's PR close (#111), whose settled outcome is `closed`. Absent: a publish. */
+  action?: 'close';
   /** An `opened` outcome that left the PR or the task not where the publish meant them: still owed (#103). */
   reconcile?: boolean;
 }
 /** What the publish action replays once its publish has settled: the outcome, as `publish.last` shows it. */
 export function publishActionResponse(record: PublishRecord) {
-  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.reconcile ? { reconcile: true } : {}), ...(record.number === undefined ? {} : { number: record.number }),
+  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.action ? { action: record.action } : {}), ...(record.reconcile ? { reconcile: true } : {}), ...(record.number === undefined ? {} : { number: record.number }),
     ...(record.url === undefined ? {} : { url: record.url }) };
 }
 export interface TaskRecord {
@@ -1335,23 +1337,23 @@ export class Store {
       const saved: PublishRecord = { ...record, message: record.message.slice(0, 2000), stateVersion: seenVersion ?? current, at: new Date().toISOString() };
       this.#run('INSERT INTO publish_outcomes (plan_key,data) VALUES (?,?) ON CONFLICT(plan_key) DO UPDATE SET data=excluded.data', key, encode(saved));
       // The same transaction refreshes the publish action's replay, as for a merge, so a resent click reports this outcome.
-      // A reply still saying `publishing` is an action whose publish never recorded an outcome: its process stopped (a
-      // crash) before it could. One publish runs per task, so this outcome is that action's continuation and settles it
-      // too; otherwise its replay would say `publishing` for ever.
-      this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
-        AND (action_id=? OR json_extract(response,'$.value.outcome')='publishing')`, encode({ ok: true, value: publishActionResponse(saved) }), key, actionId ?? null);
+      // A reply still saying `publishing` or `closing` is an action whose job never recorded an outcome: its process stopped
+      // (a crash) before it could. One publish or close runs per task, so this outcome is that action's continuation and
+      // settles it too; otherwise its replay would say `publishing` or `closing` for ever.
+      this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1
+        AND (action_id=? OR json_extract(response,'$.value.outcome') IN ('publishing','closing'))`, encode({ ok: true, value: publishActionResponse(saved) }), key, actionId ?? null);
       return saved;
     });
   }
-  /** Settle every publish action reply still saying `publishing` with `record`, the outcome on record, unchanged. */
+  /** Settle every publish or close action reply still saying `publishing` or `closing` with `record`, the outcome on record, unchanged. */
   settleUnsettledPublishReplies(identity: PlanIdentity, record: PublishRecord): void {
-    this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
-      AND json_extract(response,'$.value.outcome')='publishing'`, encode({ ok: true, value: publishActionResponse(record) }), identityKey(identity));
+    this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1
+      AND json_extract(response,'$.value.outcome') IN ('publishing','closing')`, encode({ ok: true, value: publishActionResponse(record) }), identityKey(identity));
   }
-  /** Whether a publish action's saved reply still says `publishing`: its publish has not recorded an outcome yet. */
+  /** Whether a publish or close action's saved reply still says `publishing` or `closing`: its job has not recorded an outcome yet. */
   hasUnsettledPublishAction(identity: PlanIdentity): boolean {
-    return !!this.#get(`SELECT 1 FROM user_actions WHERE plan_key=? AND kind='publish' AND json_extract(response,'$.ok')=1
-      AND json_extract(response,'$.value.outcome')='publishing' LIMIT 1`, identityKey(identity));
+    return !!this.#get(`SELECT 1 FROM user_actions WHERE plan_key=? AND kind IN ('publish','close-pull-requests') AND json_extract(response,'$.ok')=1
+      AND json_extract(response,'$.value.outcome') IN ('publishing','closing') LIMIT 1`, identityKey(identity));
   }
   lastPublish(identity: PlanIdentity): PublishRecord | null {
     const key = identityKey(identity); this.#task(key);

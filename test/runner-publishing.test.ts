@@ -6,7 +6,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
-import { Store } from '../runner/store.ts';
+import { Store, type PublishRecord } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import type { ReviewService } from '../runner/review.ts';
 import type { PreparedAttempt, RunnerDeps } from '../runner/coordinator.ts';
@@ -40,6 +40,7 @@ class FakeGitHub {
   prs: Pr[] = [];
   calls: string[] = [];
   onOpen?: (signal?: AbortSignal) => Promise<void>;
+  onClose?: (number: number, signal?: AbortSignal) => Promise<void>;
   /** Runs inside a draft change, before it applies; a throw fails the change. */
   onDraft?: () => void;
   /** PRs GitHub's list does not show yet (it lags behind them). */
@@ -77,6 +78,17 @@ class FakeGitHub {
     findOwned: async input => this.prs.filter(pr => pr.open && !this.hidden.has(pr.number) && pr.headBranch === input.headBranch && input.markers.includes(pr.marker))
       .map(pr => ({ ...this.#view(pr), marker: pr.marker, base: pr.base })),
     readPull: async number => { const pr = this.prs.find(candidate => candidate.number === number)!; return { open: pr.open, headBranch: pr.headBranch, base: pr.base, marker: pr.marker }; },
+    // Like the adapter: read by number, closed is done, an open PR must still be the task's, then the re-check and close.
+    close: async (number, input, signal) => {
+      this.calls.push(`close ${number}`);
+      const pr = this.prs.find(candidate => candidate.number === number)!;
+      if (!pr.open) return { number, url: pr.url };
+      if (pr.headBranch !== input.headBranch || pr.marker !== input.marker) throw new PullRequestMisplaced('Not the task\'s pull request.');
+      input.beforeClose?.();
+      await this.onClose?.(number, signal);
+      pr.open = false;
+      return { number, url: pr.url };
+    },
     markDraft: async number => { this.onDraft?.(); const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
     refresh: async (number, input) => {
       this.calls.push(`refresh ${input.draft ? 'draft' : 'ready'}`);
@@ -149,7 +161,7 @@ function world(): World {
  * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
  * exists, as an earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; env?: NodeJS.ProcessEnv; settleMs?: number; shortRetryMs?: number } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -162,7 +174,8 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     const prepared: PreparedAttempt = { clone: { id: 'clone', taskId: 'task', directory: '/tmp/x', head: 'f'.repeat(40) }, vendor: 'claude', approvedArgv: [] };
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
       start: input => ({ attemptId: input.attemptId, cancel: () => undefined,
-        settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' }) }),
+        // `hold`: the attempt keeps running until the test releases it.
+        settled: (options.hold ?? Promise.resolve()).then(() => ({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' })) }),
       validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
     const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 3, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     const pusher = new GitBranchPusher({ repository, repositoryId: service.config.identity.repositoryId, remote: REPO, url: w.remote,
@@ -431,8 +444,11 @@ describe('publishing a finished task (#103)', () => {
       store.cancelTask(identity, seen, randomUUID());
       throw new Error('GitHub timed out.');
     };
+    const records = vi.spyOn(store, 'recordPublish');
     await publishSettled(app, identity);
-    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', stateVersion: seen, message: expect.stringContaining('may still be ready for review') });
+    // The cancel then closes the PR (#111), so the publish's own record is read from what was recorded, not the last one.
+    const opened = records.mock.results.map(result => result.value as PublishRecord).find(record => record.outcome === 'opened');
+    expect(opened).toMatchObject({ stateVersion: seen, message: expect.stringContaining('may still be ready for review') });
     expect(store.getTask(identity).stateVersion).toBeGreaterThan(seen);
   });
 
@@ -797,11 +813,15 @@ describe('publishing a finished task (#103)', () => {
       w.github.onOpen = async () => { cancel?.(); };
       const first = await serve(w, { before: completeAll, startup: false });
       cancel = () => first.store.cancelTask(first.identity, first.store.getTask(first.identity).stateVersion, randomUUID());
+      const records = vi.spyOn(first.store, 'recordPublish');
       first.app.publishOwed(() => undefined);
-      await publishSettled(first.app, first.identity);
+      await first.app.publishing!.settled(first.identity);
       expect(first.store.getTask(first.identity).status).toBe('cancelled');
-      expect(first.store.lastPublish(first.identity)).toMatchObject({ outcome: 'opened' });
-      expect(first.store.lastPublish(first.identity)!.reconcile).toBeUndefined();
+      // The publish's own outcome carries no reconcile; then, the task being cancelled, its PR is closed (#111).
+      const opened = records.mock.calls.map(call => call[1]).find(record => record.outcome === 'opened');
+      expect(opened).toMatchObject({ outcome: 'opened' });
+      expect(opened!.reconcile).toBeUndefined();
+      expect(first.store.lastPublish(first.identity)).toMatchObject({ outcome: 'closed', action: 'close' });
       // A publish action whose PR GitHub shows at another head: its saved reply, replayed, says reconcile too.
       const v = world();
       v.github.staleHeadOnce = 'a'.repeat(40);
@@ -833,10 +853,10 @@ describe('publishing a finished task (#103)', () => {
       await publishSettled(app, identity);
       expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The last item wrote outside its workspace.') })]);
       // A replay of that refusal applies nothing: no payment, no publish.
-      const pay = vi.spyOn(app.executor!, 'payOwed'), publishIfOwed = vi.spyOn(app.publishing!, 'publishIfOwed');
+      const pay = vi.spyOn(app.executor!, 'payOwed'), actIfOwed = vi.spyOn(app.publishing!, 'actIfOwed');
       expect(await act(app, 'publish', actionId, version)).toMatchObject({ status: 409, body: { error: OWED_REFUSAL } });
       expect(pay).not.toHaveBeenCalled();
-      expect(publishIfOwed).not.toHaveBeenCalled();
+      expect(actIfOwed).not.toHaveBeenCalled();
     });
     it('pays a safety finding owed on a needs-human task before its draft, at startup', async () => {
       const w = world();
@@ -865,7 +885,7 @@ describe('publishing a finished task (#103)', () => {
       store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: 'The tests failed in retry.ts.' });
       expect(() => admit(store.getTask(identity).budgetDeadline! + 1)).toThrow(/time budget/);
       expect(store.getTask(identity).status).toBe('needs human');
-      app.publishing!.publishIfOwed(identity);
+      app.publishing!.actIfOwed(identity);
       await publishSettled(app, identity);
       expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining('The tests failed in retry.ts.') })]);
       expect(w.github.prs[0]!.body).not.toContain('The last item wrote outside its workspace.');
@@ -879,7 +899,7 @@ describe('publishing a finished task (#103)', () => {
       app.publishOwed(() => undefined);
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
       // A run's end starts a new chain while the first chain's retry is armed.
-      app.publishing!.publishIfOwed(identity);
+      app.publishing!.actIfOwed(identity);
       await new Promise(resolve => setTimeout(resolve, 6_000));
       // The first publish, the new chain's, and that chain's one retry; the first chain's timer never fires.
       expect(publishes()).toBe(3);
@@ -955,5 +975,241 @@ describe('github.baseBranch', () => {
     for (const bad of [undefined, '', '-main', 'a..b', 'a//b', 'a/', 'a.', 'a.lock', 'a/.b', 'a@{b', 'a b', 'a\nb'])
       expect(() => baseBranch({ baseBranch: bad })).toThrow(/github\.baseBranch/);
     expect(() => baseBranch(undefined)).toThrow(/github\.baseBranch/);
+  });
+});
+
+describe('closing a cancelled task\'s pull requests (#111)', () => {
+  const closedRecord = { outcome: 'closed', action: 'close' };
+  it('closes a ready PR when a task in review is cancelled, and keeps the branch', async () => {
+    const w = world();
+    const { app, identity, store, branch, head } = await serve(w, { before: completeAll });
+    await publishSettled(app, identity);
+    expect(store.getTask(identity).status).toBe('in review');
+    expect((await act(app, 'cancel-task')).body.result).toEqual({ outcome: 'closed' });
+    await app.publishing!.settled(identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ number: 100, open: false, draft: false })]);
+    expect(w.github.head(branch)).toBe(head);
+    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(store.lastPublish(identity)).toMatchObject({ ...closedRecord, message: 'Pull request #100 closed; the task\'s branch is kept.' });
+    // Nothing is owed after a close that closed them.
+    expect((await view(app)).publish).toMatchObject({ active: false, closable: false, publishable: false });
+    // Nothing is owed any more: a restart closes nothing.
+    await app.publishing!.settled(identity);
+    const calls = [...w.github.calls];
+    const again = await serve(w);
+    expect(await quiet(again.app, w, identity)).toEqual(calls);
+  });
+
+  it('closes the draft PR of a cancelled needs-human task', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: needsHuman });
+    await publishSettled(app, identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, open: true })]);
+    await act(app, 'cancel-task');
+    await app.publishing!.settled(identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, open: false })]);
+    expect(store.lastPublish(identity)).toMatchObject(closedRecord);
+  });
+
+  it('cancels at once during a draft opening, stops the publish, and closes the PR GitHub opened meanwhile', async () => {
+    const w = world();
+    const opening = Promise.withResolvers<void>();
+    // GitHub creates the PR; the reply never arrives before the cancel aborts the call.
+    w.github.onOpen = signal => new Promise((_, reject) => {
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      opening.resolve();
+    });
+    const { app, identity, store } = await serve(w, { before: needsHuman });
+    await opening.promise;
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opening' }]);
+    const records = vi.spyOn(store, 'recordPublish');
+    // The cancel is not refused and does not wait for GitHub.
+    expect(await act(app, 'cancel-task')).toMatchObject({ status: 200, body: { result: { outcome: 'closed' } } });
+    expect(store.getTask(identity).status).toBe('cancelled');
+    await app.publishing!.settled(identity);
+    // The publish was recorded as stopped by the cancel, then the close: in flight, then done.
+    expect(records.mock.calls.map(call => [call[1].outcome, call[1].action])).toEqual([['stopped', undefined], ['closing', 'close'], ['closed', 'close']]);
+    expect(records.mock.calls[0]![1].message).toBe('The task was cancelled; its pull requests are closed instead.');
+    // Recovered by its marker, recorded, and closed.
+    expect(w.github.prs).toEqual([expect.objectContaining({ number: 100, open: false })]);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: 100 }]);
+    expect(store.lastPublish(identity)).toMatchObject({ ...closedRecord, message: expect.stringMatching(/^Pull request #100 closed/) });
+    expect(store.getTask(identity).status).toBe('cancelled');
+  });
+
+  it('records a failed close as owed, and the close-pull-requests action retries it; its replay reports the outcome', async () => {
+    const w = world();
+    let fail = true;
+    w.github.onClose = async () => { if (fail) { fail = false; throw new Error('GitHub is down.'); } };
+    const { app, identity, store } = await serve(w, { before: needsHuman });
+    await publishSettled(app, identity);
+    await act(app, 'cancel-task');
+    await app.publishing!.settled(identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', action: 'close', message: 'GitHub is down.' });
+    expect(w.github.prs[0]!.open).toBe(true);
+    expect((await view(app)).publish).toMatchObject({ closable: true, last: { outcome: 'failed' } });
+    const actionId = randomUUID(), version = store.getTask(identity).stateVersion;
+    expect(await act(app, 'close-pull-requests', actionId, version)).toMatchObject({ status: 200, body: { result: { outcome: 'closing' } } });
+    await app.publishing!.settled(identity);
+    expect(w.github.prs[0]!.open).toBe(false);
+    expect((await act(app, 'close-pull-requests', actionId, version)).body.result).toMatchObject(closedRecord);
+  });
+
+  it('closes the PRs at the next start when shutdown stopped the close', async () => {
+    const w = world();
+    let closeApp: (() => Promise<void>) | undefined, first = true;
+    w.github.onClose = (_, signal) => {
+      if (!first) return Promise.resolve();
+      first = false;
+      return new Promise((_, reject) => { signal!.addEventListener('abort', () => reject(signal!.reason), { once: true }); void closeApp!(); });
+    };
+    const s1 = await serve(w, { before: needsHuman });
+    await publishSettled(s1.app, s1.identity);
+    closeApp = s1.close;
+    await act(s1.app, 'cancel-task');
+    await vi.waitFor(() => expect(first).toBe(false));
+    await closeApp();
+    const store = new Store(w.demo.database);
+    try { expect(store.lastPublish(s1.identity)).toMatchObject({ outcome: 'stopped', action: 'close' }); } finally { store.close(); }
+    expect(w.github.prs[0]!.open).toBe(true);
+    const s2 = await serve(w);
+    await s2.app.publishing!.settled(s2.identity);
+    expect(w.github.prs[0]!.open).toBe(false);
+    expect(s2.store.lastPublish(s2.identity)).toMatchObject(closedRecord);
+  });
+
+  it('closes a recorded PR that GitHub\'s list does not show yet, by its number', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w, { before: needsHuman });
+    await publishSettled(app, identity);
+    w.github.hidden.add(100);
+    await act(app, 'cancel-task');
+    await app.publishing!.settled(identity);
+    expect(w.github.prs[0]!.open).toBe(false);
+    expect(store.lastPublish(identity)).toMatchObject(closedRecord);
+  });
+
+  it('starts no close when a cancel is replayed or refused, though a close is owed', async () => {
+    const w = world();
+    w.github.onClose = async () => { throw new Error('GitHub is down.'); };
+    const { app, identity, store } = await serve(w, { before: needsHuman });
+    await publishSettled(app, identity);
+    const actionId = randomUUID(), version = store.getTask(identity).stateVersion;
+    await act(app, 'cancel-task', actionId, version);
+    await app.publishing!.settled(identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', action: 'close' });
+    const calls = [...w.github.calls];
+    expect((await act(app, 'cancel-task', actionId, version)).body.result).toEqual({ outcome: 'closed' });
+    expect(await act(app, 'cancel-task')).toMatchObject({ status: 409, body: { error: 'The task is already closed.' } });
+    expect(app.publishing!.busy(identity)).toBe(false);
+    expect(w.github.calls).toEqual(calls);
+  });
+
+  it('retries a close refused while the cancelled opening settles, and closes the PR GitHub showed late', async () => {
+    const w = world();
+    const opening = Promise.withResolvers<void>();
+    let late: Pr | undefined;
+    // GitHub creates the PR, but its list does not show it until after the first close was refused.
+    w.github.onOpen = signal => new Promise((_, reject) => {
+      late = w.github.prs.at(-1); w.github.hidden.add(late!.number);
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      opening.resolve();
+    });
+    const { app, identity, store } = await serve(w, { before: needsHuman, settleMs: 300 });
+    await opening.promise;
+    await act(app, 'cancel-task');
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', action: 'close' }), { timeout: 10_000 });
+    w.github.hidden.delete(late!.number);
+    // Retried by itself once the opening has settled (300 ms + 1 s here).
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 10_000, interval: 50 });
+    expect(late!.open).toBe(false);
+    expect(store.taskPullRequests(identity)).toMatchObject([{ state: 'opened', number: late!.number }]);
+  });
+
+  it('retries a refused close at the opening\'s own settle deadline, not a fresh settle time from the cancel', async () => {
+    const w = world();
+    const opening = Promise.withResolvers<void>();
+    let late: Pr | undefined;
+    w.github.onOpen = signal => new Promise((_, reject) => {
+      late = w.github.prs.at(-1); w.github.hidden.add(late!.number);
+      signal!.addEventListener('abort', () => reject(signal!.reason), { once: true });
+      opening.resolve();
+    });
+    const { app, identity, store } = await serve(w, { before: needsHuman, settleMs: 8_000 });
+    await opening.promise;
+    // The opening is already about 6.5 s old (of its 8 s) when the task is cancelled.
+    await new Promise(resolve => setTimeout(resolve, 6_500));
+    await act(app, 'cancel-task');
+    const cancelled = Date.now();
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', action: 'close' }), { timeout: 5_000 });
+    w.github.hidden.delete(late!.number);
+    // About 1.5 s left plus the 1 s margin: closed well before a fresh 8 s window (9 s) would have retried it.
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 6_000, interval: 50 });
+    expect(Date.now() - cancelled).toBeLessThan(7_000);
+    expect(late!.open).toBe(false);
+  });
+
+  it('cancels promptly while an attempt runs, closes nothing until it settles, then closes the PR', async () => {
+    const w = world(), hold = Promise.withResolvers<void>();
+    const { app, identity, store } = await serve(w, { hold: hold.promise, before: service => {
+      // The first item failed and the task went to a person (no budget involved), so a draft PR is published at startup.
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id);
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: 'The tests failed.' });
+      s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+    } });
+    await publishSettled(app, identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, open: true })]);
+    // A person sends it back to the queue and resumes it; the attempt keeps running.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started' });
+    const calls = [...w.github.calls];
+    expect((await act(app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    // Nothing is closed while the attempt runs: the task is not cancelled until it settles.
+    expect(store.getTask(identity).status).not.toBe('cancelled');
+    expect(app.publishing!.busy(identity)).toBe(false);
+    expect(w.github.calls).toEqual(calls);
+    expect(w.github.prs[0]!.open).toBe(true);
+    hold.resolve();
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 20_000, interval: 50 });
+    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(w.github.prs[0]!.open).toBe(false);
+  });
+
+  it('runs a close asked for after a PR was reopened, when its process stopped before it recorded anything', async () => {
+    const w = world(), actionId = randomUUID();
+    const first = await serve(w, { before: needsHuman });
+    await publishSettled(first.app, first.identity);
+    await act(first.app, 'cancel-task');
+    await first.app.publishing!.settled(first.identity);
+    expect(first.store.lastPublish(first.identity)).toMatchObject(closedRecord);
+    await first.close();
+    // A person reopens the PR and asks for a close; that process stops right after saving the action.
+    w.github.prs[0]!.open = true;
+    const crashed = new Store(w.demo.database);
+    let version = -1;
+    try {
+      version = crashed.getTask(first.identity).stateVersion;
+      crashed.userAction(first.identity, { actionId, kind: 'close-pull-requests', request: { attemptId: undefined, expectedStateVersion: version } }, () => ({ outcome: 'closing' }));
+    } finally { crashed.close(); }
+    const second = await serve(w);
+    await second.app.publishing!.settled(second.identity);
+    expect(w.github.prs[0]!.open).toBe(false);
+    expect((await act(second.app, 'close-pull-requests', actionId, version)).body.result).toMatchObject({ outcome: 'closed', action: 'close' });
+  });
+
+  it('calls GitHub for nothing when a task without any PR is cancelled, and each action refuses the other\'s status', async () => {
+    const w = world();
+    const { app, identity, store } = await serve(w);
+    expect(await act(app, 'close-pull-requests')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/only a cancelled task's pull requests are closed/) } });
+    await act(app, 'cancel-task');
+    expect(app.publishing!.busy(identity)).toBe(false);
+    expect(w.github.calls).toEqual([]);
+    expect(store.lastPublish(identity)).toBeNull();
+    expect(await act(app, 'close-pull-requests')).toMatchObject({ status: 409, body: { error: 'The task has no pull request to close.' } });
+    expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: 'The task is cancelled; its pull requests are closed, not published.' } });
   });
 });

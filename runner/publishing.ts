@@ -11,8 +11,8 @@ import type { PublishRecord, Store } from './store.ts';
 const SETTLED = ['opened', 'possibly already fixed', 'draft skipped', 'draft unsupported', 'no changes',
   // Recorded by the v10 upgrade for a task that reached its status before publishing existed: only the action publishes it.
   'not published'];
-/** The record a publish writes before it starts; one left at startup is a publish whose process stopped (#103). */
-const IN_FLIGHT = 'publishing';
+/** The records a publish or close writes before it starts; one left at startup is a job whose process stopped. */
+const IN_FLIGHT = ['publishing', 'closing'];
 /** The refusal while an earlier run owes work; the publish action that gets it pays that work (web/server.ts). */
 export const OWED_REFUSAL = 'An earlier run left a safety finding or a scope pause that has not been acted on yet; it is settled before anything is published.';
 /**
@@ -22,13 +22,19 @@ export const OWED_REFUSAL = 'An earlier run left a safety finding or a scope pau
 export const SHORT_RETRY_MS = 30_000;
 /** Refusals a person acts on; anything else that fails is reported as `failed`. */
 const REFUSALS = [GuardRefusal, BranchPushRefused, OpeningUnsettled, PullRequestMisplaced, PullRequestRefused];
+/** A publish stopped because a person cancelled its task (#111); the close that follows does what is left. */
+export class PublishCancelled extends Error {}
+
+/** What a task's pull request work is now: a publish (ready or draft), or the close of a cancelled task's PRs (#111). */
+export type PullRequestJob = { kind: 'publish'; draft: boolean } | { kind: 'close' };
 
 /**
- * Publishes a task's pull request in production (#103): when a run ends, on the `publish` action, and once at startup.
- * The task's status decides the mode: a running task whose every plan item has run gets a ready PR, a task in needs human
- * a draft PR with its problems. One publish per task at a time, in the background, tracked until it settles; its outcome
- * is recorded in the Store, where GET /api/runner reads it. Shutdown aborts every publish and awaits it before the Store's
- * write gate closes, so a publish's last records still land.
+ * Publishes a task's pull request in production (#103), and closes a cancelled task's PRs (#111): when a run ends, when
+ * a task is cancelled, on the `publish` and `close-pull-requests` actions, and once at startup. The task's status
+ * decides the job: a running task whose every plan item has run gets a ready PR, a task in needs human a draft PR with
+ * its problems, a cancelled task's open PRs are closed. One job per task at a time, in the background, tracked until it
+ * settles; its outcome is recorded in the Store, where GET /api/runner reads it. Shutdown aborts every job and awaits it
+ * before the Store's write gate closes, so a job's last records still land.
  */
 export class TaskPublishing {
   #store: Store; #publisher: PullRequestPublisher; #runner: RunnerCoordinator; #executor: ItemExecutor;
@@ -49,8 +55,8 @@ export class TaskPublishing {
    * memory only, so the task's attempt rows do not carry it, and the draft PR would otherwise not say why (#103).
    */
   #escalations = new Map<string, { reason: string; attemptId: string | null }>();
-  /** Publishes in progress, by task, from scheduling until the outcome is recorded. */
-  #running = new Map<string, Promise<void>>();
+  /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
+  #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
     env: NodeJS.ProcessEnv = process.env, options: { shortRetryMs?: number } = {}) {
     this.#store = store; this.#publisher = publisher; this.#runner = runner; this.#executor = executor; this.#write = settleWith(capability);
@@ -58,42 +64,49 @@ export class TaskPublishing {
     this.#secrets = TOKEN_VARIABLES.flatMap(name => env[name] ?? []);
   }
 
-  /** Whether a publish of this task is in progress. */
+  /** Whether a publish or close of this task is in progress. */
   busy(identity: PlanIdentity): boolean { return this.#running.has(identityKey(identity)); }
   lastOutcome(identity: PlanIdentity): PublishRecord | null { return this.#store.lastPublish(identity); }
-  /** Resolves once the task's publish in progress, if any, has recorded its outcome. */
-  async settled(identity: PlanIdentity): Promise<void> { await this.#running.get(identityKey(identity)); }
+  /** Resolves once the task's job in progress, and any close it led to, have recorded their outcomes. */
+  async settled(identity: PlanIdentity): Promise<void> {
+    for (let job = this.#running.get(identityKey(identity)); job; job = this.#running.get(identityKey(identity))) await job.done;
+  }
 
   /**
-   * What a publish would do now: a ready or a draft PR. Throws the refusal otherwise, with what a person can act on.
-   * Writes nothing, so the view asks it too and never offers what the action would refuse.
+   * What a job would do now. Throws the refusal otherwise, with what a person can act on. Writes nothing, so the view
+   * asks it too and never offers what an action would refuse.
    */
-  mode(identity: PlanIdentity, progress?: { next: string | null }): { draft: boolean } {
+  mode(identity: PlanIdentity, progress?: { next: string | null }): PullRequestJob {
     if (this.#closing || this.#runner.closing) throw new ShuttingDownError();
-    if (this.busy(identity)) throw new GuardRefusal('A pull request is already being published for this task.');
+    if (this.busy(identity)) throw new GuardRefusal(`A pull request is already being ${this.#running.get(identityKey(identity))!.job.kind === 'close' ? 'closed' : 'published'} for this task.`);
+    const task = this.#store.getTask(identity);
+    if (task.status === 'cancelled') {
+      // Only what the task opened, or was opening, can be closed: a task that never began a PR has nothing to do.
+      if (!this.#store.taskPullRequests(identity).length) throw new GuardRefusal('The task has no pull request to close.');
+      return { kind: 'close' };
+    }
     // Publishing reads the task head, so it waits for the run (and the attempt) to end: assertPublishable refuses an active attempt.
     if (this.#runner.isActive(identity) || this.#executor.busy(identity)) throw new GuardRefusal('A run of this task is still in progress; publish once it has ended.');
-    const task = this.#store.getTask(identity);
     if (task.status === 'running') {
       const { next } = progress ?? this.#executor.progress(identity);
       if (next !== null) throw new GuardRefusal(`${next} has not run yet; publish once every plan item has run.`);
       this.#assertNothingOwed(identity);
       this.#store.assertPublishableNow(identity, false);
-      return { draft: false };
+      return { kind: 'publish', draft: false };
     }
     if (task.status === 'needs human') {
       // A draft invites no review, and a scope pause cannot be recorded for a task already in needs human, so only an owed
       // safety finding (its escalation records it) holds a draft back.
       this.#assertNothingOwed(identity, false);
       this.#store.assertPublishableNow(identity, true);
-      return { draft: true };
+      return { kind: 'publish', draft: true };
     }
     throw new GuardRefusal(`The task is ${task.status}; a pull request is published for a running task whose plan items have all run, or a task that needs a person.`);
   }
 
   /**
    * An earlier run owes a safety escalation or a scope pause (its write failed, or the process stopped): the task is not
-   * finished work until that is settled, so a ready PR must not show its unreviewed changes. publishIfOwed pays it. Read
+   * finished work until that is settled, so a ready PR must not show its unreviewed changes. actIfOwed pays it. Read
    * only for a status that could publish, so a poll of any other task does not scan its attempts.
    */
   #assertNothingOwed(identity: PlanIdentity, scope = true): void {
@@ -101,84 +114,104 @@ export class TaskPublishing {
   }
 
   /**
-   * The publish owed, if any: the task can be published, and no publish has settled since the task last changed. Null
-   * when nothing is owed.
+   * The job owed, if any. A publish is owed when the task can be published and no publish has settled since the task last
+   * changed; a close, when the task is cancelled, has a pull request record, and its PRs have not been closed since. Either
+   * is owed while an action that asked for it has not recorded an outcome.
    */
-  owed(identity: PlanIdentity, options: { personAsked?: boolean } = {}): { draft: boolean } | null {
-    let mode;
-    try { mode = this.mode(identity); }
+  owed(identity: PlanIdentity, options: { personAsked?: boolean } = {}): PullRequestJob | null {
+    let job;
+    try { job = this.mode(identity); }
     catch (error) { if (error instanceof GuardRefusal || error instanceof ShuttingDownError) return null; throw error; }
+    // A person asked for this job and its process stopped before it recorded anything (a crash between the action and its
+    // in-flight record): the request is owed, whatever an earlier job settled, e.g. a close after a PR was reopened.
+    if (this.#store.hasUnsettledPublishAction(identity)) return job;
     const last = this.#store.lastPublish(identity);
     // A task that reached its status before publishing existed (the v10 upgrade's record) is published only when a person
     // asks, until a run starts after the upgrade: that run's end is the first state the upgrade did not decide.
     if (last?.outcome === 'not published' && !options.personAsked && !this.#store.getAttempts(identity).some(attempt => attempt.createdAt > last.at)) return null;
+    if (job.kind === 'close') return last?.outcome === 'closed' ? null : job;
     // `reconcile`: an open or update that left the PR or the task not where the publish meant them (GitHub showed another
     // head, or a draft change failed); the next publish reconciles it, so it is still owed.
-    return !last || !SETTLED.includes(last.outcome) || last.reconcile || last.stateVersion !== this.#store.getTask(identity).stateVersion ? mode : null;
+    return !last || !SETTLED.includes(last.outcome) || last.reconcile || last.stateVersion !== this.#store.getTask(identity).stateVersion ? job : null;
   }
 
   /**
-   * The `publish` action: start a publish now, or throw its refusal. Runs after the caller's transaction commits; its
-   * outcome replaces the action's saved response, so a replay reports it.
+   * The `publish` or `close-pull-requests` action: start that job now, or throw its refusal. Runs after the caller's
+   * transaction commits; its outcome replaces the action's saved response, so a replay reports it.
    */
-  request(identity: PlanIdentity, actionId: string): { draft: boolean } {
-    const mode = this.mode(identity);
+  request(identity: PlanIdentity, kind: PullRequestJob['kind'], actionId: string): PullRequestJob {
+    // The action's own refusal comes first: asking to close a running task's PRs is not answered with a publish refusal.
+    const status = this.#store.getTask(identity).status;
+    if (kind === 'close' && status !== 'cancelled') throw new GuardRefusal(`The task is ${status}; only a cancelled task's pull requests are closed.`);
+    if (kind === 'publish' && status === 'cancelled') throw new GuardRefusal('The task is cancelled; its pull requests are closed, not published.');
+    const job = this.mode(identity);
     // A person's action starts a new chain, with its own automatic retries (AGENTS.md: reset on an explicit user action).
     this.#newChain(identity);
-    this.#schedule(identity, mode.draft, actionId);
-    return mode;
+    this.#schedule(identity, job, actionId);
+    return job;
   }
 
   /**
-   * A run of the task ended, the server started, or a person's start or resume moved the task (`personAsked`: it also ends
-   * the v10 upgrade's `not published` hold, as a run starting would): publish if one is owed. Never throws.
+   * A run of the task ended, the task was cancelled, the server started, or a person's start or resume moved the task
+   * (`personAsked`: it also ends the v10 upgrade's `not published` hold, as a run starting would): do the job owed, if
+   * any. Never throws.
    */
-  publishIfOwed(identity: PlanIdentity, options: { personAsked?: boolean; retry?: boolean } = {}): void {
+  actIfOwed(identity: PlanIdentity, options: { personAsked?: boolean; retry?: boolean } = {}): void {
     try {
       this.#payOwed(identity);
-      const owed = this.owed(identity, options);
-      if (!owed) return;
-      // A run's end, a person's action or a restart is a meaningful lifecycle change: a new chain, with its own automatic
-      // retries. A retry timer's own publish is not, or the retries would be unbounded again.
+      const job = this.owed(identity, options);
+      if (!job) return;
+      // A run's end, a cancel, a person's action or a restart is a meaningful lifecycle change: a new chain, with its own
+      // automatic retries. A retry timer's own job is not, or the retries would be unbounded again.
       if (!options.retry) this.#newChain(identity);
-      this.#schedule(identity, owed.draft);
+      this.#schedule(identity, job);
     }
-    catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
+    catch (error) { console.error(`Could not start pull request work: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
   /**
-   * Startup, once the runner lock is verified: publish if one is owed. Otherwise a publish whose process stopped before
-   * it recorded an outcome (a crash) is settled now: its in-flight record, and any action reply still saying
-   * `publishing`, become `stopped`; the task's records (a PR it opened, recovered by its marker on the next publish)
-   * show what that publish did. Never throws.
+   * The task was just cancelled (#111): stop its publish in progress, if any, whose own end then closes what it left;
+   * otherwise close the task's PRs now. The cancel itself never waits for GitHub.
+   */
+  taskCancelled(identity: PlanIdentity): void {
+    const running = this.#running.get(identityKey(identity));
+    if (running?.job.kind === 'publish') running.abort.abort(new PublishCancelled('The task was cancelled; its pull requests are closed instead.'));
+    else if (!running) this.actIfOwed(identity);
+  }
+
+  /**
+   * Startup, once the runner lock is verified: do the job owed, if any. Otherwise a publish or close action whose process
+   * stopped before its job recorded an outcome (a crash) is settled now, so its replay stops saying `publishing` or
+   * `closing`, and its in-flight record becomes `stopped`; the task's records show what that job did, and the action
+   * runs it again. Never throws.
    */
   startup(identity: PlanIdentity): void {
     // A publish of this process is running: its record is its own, not one a crash left.
     if (this.busy(identity)) return;
     try {
       this.#payOwed(identity);
-      const owed = this.owed(identity);
-      if (owed) { this.#schedule(identity, owed.draft); return; }
-      const last = this.#store.lastPublish(identity);
-      if (!last || last.outcome === IN_FLIGHT) {
-        if (last || this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: last?.draft ?? false,
-          message: 'The publish was interrupted before it recorded an outcome (codeboost stopped). Its pull request, if it opened one, is in the task\'s records; the publish action runs it again.' }));
-      // Only a reply is stuck (its publish never recorded itself as started): it reports the outcome on record, which is
-      // left as it is, stamp included, so what is owed does not change.
+      const job = this.owed(identity);
+      if (job) { this.#schedule(identity, job); return; }
+      const last = this.#store.lastPublish(identity), closing = this.#store.getTask(identity).status === 'cancelled';
+      if (!last || IN_FLIGHT.includes(last.outcome)) {
+        if (last || this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.recordPublish(identity, { outcome: 'stopped', draft: last?.draft ?? false, ...(closing ? { action: 'close' as const } : {}),
+          message: `The ${closing ? 'close' : 'publish'} was interrupted before it recorded an outcome (codeboost stopped). The task's records show what it did; the ${closing ? 'close-pull-requests' : 'publish'} action runs it again.` }));
+      // Only a reply is stuck (its job never recorded itself as started): it reports the outcome on record, which is left
+      // as it is, stamp included, so what is owed does not change.
       } else if (this.#store.hasUnsettledPublishAction(identity)) this.#write(() => this.#store.settleUnsettledPublishReplies(identity, last));
-    } catch (error) { console.error(`Could not start publishing: ${JSON.stringify(message(error, this.#secrets))}`); }
+    } catch (error) { console.error(`Could not start pull request work: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
   /**
-   * Shutdown: refuse new publishes, abort those in progress (the publisher refuses every later push, opening and ready
-   * change) and await their recorded outcomes.
+   * Shutdown: refuse new jobs, abort those in progress (the publisher refuses every later push, opening, ready change and
+   * close) and await their recorded outcomes.
    */
   async close(): Promise<void> {
     this.#closing = true;
     for (const timer of this.#retries.values()) clearTimeout(timer);
     this.#retries.clear();
     await this.#publisher.close();
-    while (this.#running.size) await Promise.all([...this.#running.values()]);
+    while (this.#running.size) await Promise.all([...this.#running.values()].map(running => running.done));
   }
 
   /** Settle what an earlier run owes before deciding what to publish (see mode); a task it moves is then not finished work. */
@@ -198,7 +231,7 @@ export class TaskPublishing {
   }
 
   /**
-   * A new chain (a run's end, a person's action, a restart): a fresh retry budget, and a retry the old chain armed is
+   * A new chain (a run's end, a cancel, a person's action, a restart): a fresh retry budget, and a retry the old chain armed is
    * dropped with it, so it cannot fire later on the new chain's budget. One timer per task at all times.
    */
   #newChain(identity: PlanIdentity): void {
@@ -209,7 +242,7 @@ export class TaskPublishing {
   }
 
   /**
-   * A publish that ended with an opening still in flight (its reply was lost, or it was refused while one settles),
+   * A publish or close that ended with an opening still in flight (its reply was lost, or it was refused while one settles),
    * refused because GitHub's list lags behind a PR, or opened without settling (`reconcile`) is tried again by itself:
    * nothing else would (no run ends, startup has passed). Bounded (AGENTS.md: back off recurring external polling): one
    * timer per task, and per chain (until a publish settles) at most one retry at an opening's deadline, while it is
@@ -220,7 +253,7 @@ export class TaskPublishing {
   #retryIfUnsettled(identity: PlanIdentity, record: Omit<PublishRecord, 'stateVersion' | 'at'>, unsettled: boolean): void {
     try {
       const key = identityKey(identity);
-      if (SETTLED.includes(record.outcome) && !record.reconcile) { this.#retried.delete(key); return; }
+      if ((SETTLED.includes(record.outcome) || record.outcome === 'closed') && !record.reconcile) { this.#retried.delete(key); return; }
       if (this.#closing || this.#retries.has(key)) return;
       const retried = this.#retried.get(key) ?? { deadline: 0, short: 0 };
       const remaining = this.#publisher.settleRemaining(identity);
@@ -231,43 +264,62 @@ export class TaskPublishing {
       else if ((unsettled || record.reconcile) && !(remaining !== null && remaining > 0) && retried.short < 1) { retried.short++; wait = this.#shortRetryMs; }
       if (wait === null) return;
       this.#retried.set(key, retried);
-      const timer = setTimeout(() => { this.#retries.delete(key); this.publishIfOwed(identity, { retry: true }); }, wait + 1_000);
+      const timer = setTimeout(() => { this.#retries.delete(key); this.actIfOwed(identity, { retry: true }); }, wait + 1_000);
       timer.unref?.();
       this.#retries.set(key, timer);
     } catch (error) { console.error(`Could not arrange a retry of the publish: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
-  #schedule(identity: PlanIdentity, draft: boolean, actionId?: string): void {
+  #schedule(identity: PlanIdentity, job: PullRequestJob, actionId?: string): void {
     const key = identityKey(identity);
     // Reserved in this turn, so a second request in the same transaction is refused.
-    const reserved = Promise.withResolvers<void>();
-    this.#running.set(key, reserved.promise);
+    const reserved = Promise.withResolvers<void>(), abort = new AbortController();
+    this.#running.set(key, { job, done: reserved.promise, abort });
     const run = async () => {
       // Durable in-flight ownership before the first external write (AGENTS.md): if this process stops before the outcome
       // is recorded, startup finds the marker and publishes again or settles it as interrupted. No marker, no publish.
-      try { this.#write(() => this.#store.recordPublish(identity, { outcome: IN_FLIGHT, draft, message: 'A pull request is being published.' })); }
+      const draft = job.kind === 'publish' && job.draft;
+      try {
+        this.#write(() => this.#store.recordPublish(identity, job.kind === 'close' ? { outcome: 'closing', draft: false, action: 'close', message: 'The task\'s pull requests are being closed.' }
+          : { outcome: 'publishing', draft, message: 'A pull request is being published.' }));
+      }
       catch (error) { console.error(`Could not record the publish as started, so it did not run: ${JSON.stringify(message(error, this.#secrets))}`); return; }
       let record: Omit<PublishRecord, 'stateVersion' | 'at'>, seenVersion: number | undefined, unsettled = false;
       try {
-        // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
-        const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {});
-        record = describe(outcome, draft);
-        seenVersion = outcome.seenVersion;
+        if (job.kind === 'close') {
+          const closed = await this.#publisher.closeAll(identity, abort.signal);
+          record = { outcome: 'closed', draft: false, action: 'close', message: closed.length
+            ? `${closed.length === 1 ? 'Pull request' : 'Pull requests'} ${closed.map(number => `#${number}`).join(', ')} closed; the task's branch is kept.`
+            : 'No open pull request of the task was left to close.' };
+        } else {
+          // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
+          const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {}, abort.signal);
+          record = describe(outcome, draft);
+          seenVersion = outcome.seenVersion;
+        }
       } catch (error) {
-        // A guard refusal is mostly a race (the task, its review or its head changed during the publish): one short retry
-        // publishes the new state. One that persists is in mode() too, so the retry finds nothing owed.
+        // A guard refusal is mostly a race (the task, its review or its head changed during the job): one short retry
+        // acts on the new state. One that persists is in mode() too, so the retry finds nothing owed.
         unsettled = error instanceof OpeningUnsettled || error instanceof GuardRefusal;
-        const stopped = error instanceof ShuttingDownError || (this.#closing && (error as Error)?.name === 'AbortError');
-        record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets) };
+        const stopped = error instanceof ShuttingDownError || error instanceof PublishCancelled || (this.#closing && (error as Error)?.name === 'AbortError');
+        record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets),
+          ...(job.kind === 'close' ? { action: 'close' as const } : {}) };
       }
       try { this.#write(() => this.#store.recordPublish(identity, record, actionId, seenVersion)); }
-      catch (error) { console.error(`Could not record the publish outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
+      catch (error) { console.error(`Could not record the pull request outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
       this.#retryIfUnsettled(identity, record, unsettled);
     };
+    const release = () => {
+      this.#running.delete(key);
+      // A publish that the task's cancel stopped, or that ended as the task was cancelled, leaves its PRs to close (#111).
+      // Started before `done` resolves, so settled() and shutdown see the close too. Only then: a refused publish stays
+      // owed, and starting it again here would repeat it without end. A close never starts another job.
+      try { if (job.kind === 'publish' && this.#store.getTask(identity).status === 'cancelled') this.actIfOwed(identity); }
+      catch (error) { console.error(`Could not start closing pull requests: ${JSON.stringify(message(error, this.#secrets))}`); }
+      reserved.resolve();
+    };
     // Starts once the caller's transaction (the action's userAction) has committed; a rollback starts nothing.
-    this.#store.afterCommit(() => {
-      void run().finally(() => { this.#running.delete(key); reserved.resolve(); });
-    }, () => { this.#running.delete(key); reserved.resolve(); });
+    this.#store.afterCommit(() => { void run().finally(release); }, () => { this.#running.delete(key); reserved.resolve(); });
   }
 
   /**
