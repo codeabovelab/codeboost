@@ -45,6 +45,7 @@ export const EXECUTE_STORAGE: TaskStorageLimits = Object.freeze({
 const EXECUTE_SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost execute summary","type":"string"}\n';
 /** How long one read of the issue serves later plan items: the length of a short multi-item run. */
 export const ISSUE_REUSE_MS = 5 * 60_000;
+export const RUNNER_NEEDS_GITHUB = 'The runner reads the plan\'s issue from GitHub: add a github block to the review configuration.';
 export const RUNNER_CREDENTIAL_MISSING = 'The runner runs Claude Code, which needs CLAUDE_CODE_OAUTH_TOKEN. Create one with `claude setup-token`, set it, and restart codeboost.';
 
 /** Check the `runner` block of a review configuration before anything is created. */
@@ -174,7 +175,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   onSlowStart?: () => void }): Promise<RunnerAssembly> {
   const { service, config } = o, review = service.config;
   if (review.demo) throw new Error('Demos never run the runner.');
-  if (!review.github) throw new Error('The runner reads the plan\'s issue from GitHub: add a github block to the review configuration.');
+  if (!review.github) throw new Error(RUNNER_NEEDS_GITHUB);
   const base = baseBranch(review.github);
   // The push URL too (the repository's shape, GH_HOST), before recovery and the image build rather than after them.
   pushUrl(review.github.repository, o.env as NodeJS.ProcessEnv);

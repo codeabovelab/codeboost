@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from '../agents/container/image.ts';
@@ -9,19 +9,20 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { Store } from '../runner/store.ts';
-import { RUNNER_CREDENTIAL_MISSING } from '../runner/production.ts';
+import { acquireRunnerLock } from '../runner/recovery.ts';
+import { RUNNER_CREDENTIAL_MISSING, RUNNER_NEEDS_GITHUB } from '../runner/production.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const cli = fileURLToPath(new URL('../web/cli.ts', import.meta.url));
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 /** A non-demo review with a runner block, and a HOME of its own so the lock directory is the test's. */
-function review(github: Record<string, unknown> = { baseBranch: 'main' }) {
+function review(github: Record<string, unknown> | null = { baseBranch: 'main' }) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-cli-')); roots.push(root);
   const demo = createDemo(join(root, 'demo')), store = new Store(demo.database), issue = store.getPlan(demo.identity).issue; store.close();
   mkdirSync(join(root, 'runner'), { mode: 0o700 }); mkdirSync(join(root, 'home'), { mode: 0o700 });
   const config = join(root, 'review.json');
-  writeFileSync(config, JSON.stringify({ ...demo, demo: false, github: { repository: 'owner/repo', pullRequest: 1, issue, ...github },
+  writeFileSync(config, JSON.stringify({ ...demo, demo: false, ...(github ? { github: { repository: 'owner/repo', pullRequest: 1, issue, ...github } } : {}),
     runner: { root: join(root, 'runner'), committer: { name: 'codeboost', email: 'runner@codeboost.invalid' } } }));
   /**
    * A `docker` that answers every call with nothing (no leftovers, an image that matches the pinned profile) once the hold
@@ -71,6 +72,14 @@ it('refuses a runner without github.baseBranch before the lock and before the to
     // Not the missing-token refusal that the runner's setup would give after the lock: the CLI checked the block first.
     expect(result.stderr.trim()).toMatch(/^The runner publishes pull requests: add github\.baseBranch/);
   }
+  // No github block at all: refused as itself, before the lock, too. Another runner holds the lock meanwhile, so a check
+  // made after the lock would report the lock instead.
+  const { run, database } = review(null);
+  const held = acquireRunnerLock(database, { lockRoot: join(dirname(dirname(database)), 'home', '.codeboost', 'locks') });
+  try {
+    const missing = run('--port', '0');
+    expect([missing.status, missing.stderr.trim()]).toEqual([1, RUNNER_NEEDS_GITHUB]);
+  } finally { held.release(); }
 });
 it('refuses a bad port and an unknown preparation with a message, never a stack', () => {
   const { run } = review();

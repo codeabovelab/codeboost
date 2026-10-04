@@ -6,7 +6,7 @@ import { productionPlanning } from './planning.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import { acquireRunnerLock, releasePreparation } from '../runner/recovery.ts';
-import { baseBranch, parseRunnerConfig, recoveryWarnings, setUpRunner } from '../runner/production.ts';
+import { RUNNER_NEEDS_GITHUB, baseBranch, parseRunnerConfig, recoveryWarnings, setUpRunner } from '../runner/production.ts';
 requireSupportedNode();
 /** A refusal the person acts on (bad input, a held lock, a blocked recovery): its message and exit 1, not a stack. */
 function refuse(error: unknown): never { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
@@ -39,8 +39,10 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   // Checked before the lock, so a malformed block changes nothing. Demos never run the runner, however they were opened.
   const runnerConfig = checked(() => {
     if (config.demo === true || config.runner === undefined) return null;
-    // The PR's base branch too (#103); a missing github block is refused by the runner's setup, with its own message.
-    if (config.github) baseBranch(config.github);
+    // The github block and the PR's base branch too (#103), before the lock: a missing block or base branch must be reported
+    // as itself, not as a lock conflict.
+    if (!config.github) throw new Error(RUNNER_NEEDS_GITHUB);
+    baseBranch(config.github);
     return parseRunnerConfig(config.runner);
   });
   // Decision 1: one runner per database, held as an OS lock keyed by the database file's device and inode.

@@ -204,6 +204,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       const before = service.store.getTask(identity).status;
       try { return act(); } finally { if (before !== 'cancelled' && service.store.getTask(identity).status === 'cancelled') publishing?.taskCancelled(identity); }
     }
+    // A publish refused because an earlier run owes a pause or an escalation pays it here, outside the refused transaction
+    // (AGENTS.md: a refusal's durable change is committed outside it); a task it sends to needs human then gets its draft.
+    if (action === 'publish') {
+      try { return act(); } catch (error) { if (error instanceof GuardRefusal) publishing?.actIfOwed(identity); throw error; }
+    }
     return act();
     function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
