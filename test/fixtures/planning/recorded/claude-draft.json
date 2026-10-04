@@ -1,0 +1,24 @@
+{
+  "kind": "codeboost-planning-recording",
+  "version": 1,
+  "vendor": "claude",
+  "mode": "draft",
+  "recordedAt": "2026-10-03T22:43:46.042Z",
+  "provenance": {
+    "image": "codeboost-agent:node26-codex0.153.4-claude2.1.281",
+    "cliVersion": "2.1.281",
+    "model": "claude CLI default (the adapter passes no model flag)",
+    "phase": "planning"
+  },
+  "request": {
+    "requestId": "6185171e-49c5-48c3-8483-a56e4e758571",
+    "revision": 1,
+    "issue": 412,
+    "baseSha": "b8e168bb67541c4ad21c00c8f6873f882d26521b",
+    "promptSha256": "adec3564684205bb51346afaaf5d36abe5f29e26079a9c5002617ecc9e8719b4",
+    "schemaSha256": "55b04a7df0f02165460c4ebc5cf40a00ca2a0ca8fa56a3bf8434aacfe8350179",
+    "filesSha256": "f0ff86518eb6ac0bc07aa7167da6f6e0c72695ae75f87d6e1bf86e06cec7543e",
+    "commandSha256": "35cc440bb5ad4b80ad77bf80be3f279d5e9b6d8846cdd88fe52aa4e5c4b5ecd7"
+  },
+  "output": "{\"schema_version\":1,\"issue\":412,\"revision\":1,\"summary\":\"Remove the leftover call counter in label() so it returns deterministic text for the same input every time, and add a test that calls it twice.\",\"items\":[{\"id\":\"P1\",\"title\":\"Make label() deterministic and test repeated calls\",\"intent\":\"label() currently uses a module-level call counter left over from debugging, causing it to alternate output text ('value N' vs 'even call: N') across calls with the same input. Remove the counter so the function is pure and always returns the same text for the same input, and add a regression test that calls label() twice with the same argument.\",\"files\":[{\"path\":\"src/example.ts\",\"kind\":\"edit\",\"renamed_from\":null,\"change\":\"Remove the module-level `calls` variable and the increment logic inside label(). Change label(value) to always return `value ${value}` (the non-alternating branch), removing the parity check entirely.\"},{\"path\":\"test/example.test.ts\",\"kind\":\"edit\",\"renamed_from\":null,\"change\":\"Add a test case that calls label(3) twice and asserts both results are equal to each other (and match the expected `value 3` text), verifying the output no longer changes between calls.\"}],\"acceptance\":[{\"type\":\"cmd\",\"text\":\"npm test\"}],\"depends_on\":[]}],\"questions\":[]}"
+}
