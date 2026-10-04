@@ -135,7 +135,7 @@ function world(): World {
  * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
  * exists, as an earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void> } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -147,7 +147,8 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     const prepared: PreparedAttempt = { clone: { id: 'clone', taskId: 'task', directory: '/tmp/x', head: 'f'.repeat(40) }, vendor: 'claude', approvedArgv: [] };
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
       start: input => ({ attemptId: input.attemptId, cancel: () => undefined,
-        settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' }) }),
+        // `hold`: the attempt keeps running until the test releases it.
+        settled: (options.hold ?? Promise.resolve()).then(() => ({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' })) }),
       validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
     const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 3, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     const pusher = new GitBranchPusher({ repository, repositoryId: service.config.identity.repositoryId, remote: REPO, url: w.remote,
@@ -640,6 +641,58 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 6_000, interval: 50 });
     expect(Date.now() - cancelled).toBeLessThan(7_000);
     expect(late!.open).toBe(false);
+  });
+
+  it('cancels promptly while an attempt runs, closes nothing until it settles, then closes the PR', async () => {
+    const w = world(), hold = Promise.withResolvers<void>();
+    const { app, identity, store } = await serve(w, { hold: hold.promise, before: service => {
+      // The first item failed and the task went to a person (no budget involved), so a draft PR is published at startup.
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id);
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: 'The tests failed.' });
+      s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
+    } });
+    await publishSettled(app, identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, open: true })]);
+    // A person sends it back to the queue and resumes it; the attempt keeps running.
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started' });
+    const calls = [...w.github.calls];
+    expect((await act(app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    // Nothing is closed while the attempt runs: the task is not cancelled until it settles.
+    expect(store.getTask(identity).status).not.toBe('cancelled');
+    expect(app.publishing!.busy(identity)).toBe(false);
+    expect(w.github.calls).toEqual(calls);
+    expect(w.github.prs[0]!.open).toBe(true);
+    hold.resolve();
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 20_000, interval: 50 });
+    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(w.github.prs[0]!.open).toBe(false);
+  });
+
+  it('runs a close asked for after a PR was reopened, when its process stopped before it recorded anything', async () => {
+    const w = world(), actionId = randomUUID();
+    const first = await serve(w, { before: needsHuman });
+    await publishSettled(first.app, first.identity);
+    await act(first.app, 'cancel-task');
+    await first.app.publishing!.settled(first.identity);
+    expect(first.store.lastPublish(first.identity)).toMatchObject(closedRecord);
+    await first.close();
+    // A person reopens the PR and asks for a close; that process stops right after saving the action.
+    w.github.prs[0]!.open = true;
+    const crashed = new Store(w.demo.database);
+    let version = -1;
+    try {
+      version = crashed.getTask(first.identity).stateVersion;
+      crashed.userAction(first.identity, { actionId, kind: 'close-pull-requests', request: { attemptId: undefined, expectedStateVersion: version } }, () => ({ outcome: 'closing' }));
+    } finally { crashed.close(); }
+    const second = await serve(w);
+    await second.app.publishing!.settled(second.identity);
+    expect(w.github.prs[0]!.open).toBe(false);
+    expect((await act(second.app, 'close-pull-requests', actionId, version)).body.result).toMatchObject({ outcome: 'closed', action: 'close' });
   });
 
   it('calls GitHub for nothing when a task without any PR is cancelled, and each action refuses the other\'s status', async () => {

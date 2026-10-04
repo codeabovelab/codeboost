@@ -1315,6 +1315,25 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     expect(closed.has(100) || closed.has(999)).toBe(false);
     expect(store.taskPullRequests(identity).every(pr => pr.state === 'abandoned')).toBe(true);
   });
+  it('still closes the next PR when an earlier one cannot be closed, and reports the problem', async () => {
+    // Two distinct recorded PRs: #100 from the first run, closed by a person, then #101 from the rerun.
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 }, closed = new Set<number>();
+    await harness(store, { live, next, closed }).publisher.publish(identity);
+    closed.add(100);
+    rerun(store);
+    await harness(store, { live, next, closed }).publisher.publish(identity);
+    expect(store.taskPullRequests(identity).map(pr => pr.number)).toEqual([100, 101]);
+    // #100 is reopened, but without its first-line marker: it is no longer the task's, so its close is refused.
+    closed.delete(100);
+    cancel(store);
+    const { publisher, log } = harness(store, { live, next, closed, unmarked: new Set([100]) });
+    const failure = await publisher.closeAll(identity).then(() => null, (error: unknown) => error);
+    expect(failure).toBeInstanceOf(PullRequestMisplaced);
+    expect((failure as Error).message).toMatch(/^Pull requests #101 closed\. Pull request #100 is open but no longer the task's\./);
+    expect(log).toEqual(['close 100', 'close 101']);
+    expect(closed.has(101)).toBe(true);
+    expect(closed.has(100)).toBe(false);
+  });
   it('closes nothing when shutdown begins between the read and the close', async () => {
     const store = runningTask(), live = new Map<string, OpenedPullRequest>();
     await harness(store, { live }).publisher.publish(identity);

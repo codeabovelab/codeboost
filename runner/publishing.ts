@@ -83,12 +83,16 @@ export class TaskPublishing {
 
   /**
    * The job owed, if any. A publish is owed when the task can be published and no publish has settled since the task last
-   * changed; a close, when the task is cancelled, has a pull request record, and its PRs have not been closed since.
+   * changed; a close, when the task is cancelled, has a pull request record, and its PRs have not been closed since. Either
+   * is owed while an action that asked for it has not recorded an outcome.
    */
   owed(identity: PlanIdentity): PullRequestJob | null {
     let job;
     try { job = this.mode(identity); }
     catch (error) { if (error instanceof GuardRefusal || error instanceof ShuttingDownError) return null; throw error; }
+    // A person asked for this job and its process stopped before it recorded anything (a crash between the action and its
+    // in-flight record): the request is owed, whatever an earlier job settled, e.g. a close after a PR was reopened.
+    if (this.#store.hasUnsettledPublishAction(identity)) return job;
     const last = this.#store.lastPublish(identity);
     if (job.kind === 'close') return last?.outcome === 'closed' ? null : job;
     return !last || !SETTLED.includes(last.outcome) || last.stateVersion !== this.#store.getTask(identity).stateVersion ? job : null;
