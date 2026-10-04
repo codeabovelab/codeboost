@@ -2,7 +2,7 @@ import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { PullRequestMisplaced, PullRequestRefused } from '../github/pull-requests.ts';
 import { BranchPushRefused, redact, TOKEN_VARIABLES } from './branch-push.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
-import type { ItemExecutor } from './execution.ts';
+import { SAFETY_VIOLATION, type ItemExecutor } from './execution.ts';
 import { GuardRefusal, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { OpeningUnsettled, type PublishOutcome, type PullRequestPublisher } from './publish.ts';
 import type { PublishRecord, Store } from './store.ts';
@@ -189,7 +189,8 @@ export class TaskPublishing {
     // Its failure must not stop the caller from settling what it can (an in-flight record, a stuck reply): the task still
     // owes the work, and mode() refuses to publish until it is paid.
     try {
-      const paid = this.#executor.payOwed(identity);
+      // A task in needs human cannot record a scope pause, and its draft does not wait for one (mode): only a finding.
+      const paid = this.#executor.payOwed(identity, { scope: this.#store.getTask(identity).status !== 'needs human' });
       // Tied to the attempt current once paid: a later run (a new attempt) that ends in needs human again has its own reason.
       if (paid?.kind === 'needs human') this.#escalations.set(identityKey(identity), { reason: paid.reason, attemptId: this.#store.getTask(identity).currentAttemptId });
       if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
@@ -252,7 +253,9 @@ export class TaskPublishing {
         const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {});
         record = describe(outcome, draft);
       } catch (error) {
-        unsettled = error instanceof OpeningUnsettled;
+        // A guard refusal is mostly a race (the task, its review or its head changed during the publish): one short retry
+        // publishes the new state. One that persists is in mode() too, so the retry finds nothing owed.
+        unsettled = error instanceof OpeningUnsettled || error instanceof GuardRefusal;
         const stopped = error instanceof ShuttingDownError || (this.#closing && (error as Error)?.name === 'AbortError');
         record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets) };
       }
@@ -280,6 +283,8 @@ export class TaskPublishing {
     this.#escalations.delete(key);
     const current = task.currentAttemptId === null ? undefined : this.#store.getAttempt(identity, task.currentAttemptId);
     if (current?.safetyFinding) return [current.safetyFinding];
+    // A finding whose save failed while the run still moved the task: the attempt's diagnostic is the finding's text.
+    if (current?.diagnostic?.startsWith(SAFETY_VIOLATION)) return [current.diagnostic];
     if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
     if (current?.diagnostic) return [current.diagnostic];
     return ['The task needs a person.'];
