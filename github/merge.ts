@@ -1,7 +1,8 @@
 import { GhAlreadyFixedGateway, type AlreadyFixedGateway, type AlreadyFixedMatch } from './already-fixed.ts';
 import { ghEnvironment } from './gh-env.ts';
+import { markerOf } from './pull-requests.ts';
 import { runWithInput } from './run-with-input.ts';
-import { REPOSITORY, SHA } from './validate.ts';
+import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 
 /**
  * How long a stopped `gh` gets after SIGTERM before SIGKILL, and how long its inherited output pipes may stay open after
@@ -38,6 +39,27 @@ export interface RemoteMergeState {
   alreadyFixedDetail?: string;
   /** The pull request's web URL, when GitHub reports a valid one. Display only; never used to decide readiness. */
   url?: string;
+  /** The pull request this state describes, as GitHub reports it. */
+  pullRequest: number;
+  /** GitHub does not merge a draft. */
+  draft: boolean;
+  /**
+   * Read only for a published target (#121): where GitHub shows the PR, its description's first line, whether it comes
+   * from a fork, and every open PR from its head branch. The coordinator decides from these whether it is the task's PR.
+   */
+  published?: PublishedPullRequestState;
+}
+export interface PublishedPullRequestState {
+  headBranch: string; baseBranch: string; crossRepository: boolean; marker: string;
+  branchOpen: Array<{ number: number; base: string }>;
+}
+/** The pull request one inspection acts on. Without one, the gateway uses its configured `pullRequest`. */
+export interface MergeTarget {
+  pullRequest: number;
+  /** The task's own PRs in this repository; the already-fixed check excludes them while open. `pullRequest` is always one. */
+  ownPullRequests?: readonly number[];
+  /** The task branch of a published target (#121). The inspection then also reads `RemoteMergeState.published`. */
+  headBranch?: string;
 }
 
 export interface MergeResult { url: string; }
@@ -56,23 +78,29 @@ export type MergeQueueObservation =
   | { state: 'failed'; reviewedHead: string; entryId: string; reason: string }
   | { state: 'merged'; reviewedHead: string; mergedAt: string };
 export interface MergeQueueGateway {
-  queueWatermark(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<string | null>;
-  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null }): Promise<MergeQueueObservation>;
+  queueWatermark(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; pullRequest?: number }): Promise<string | null>;
+  inspectQueue(expectedHead: string, options?: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null; pullRequest?: number }): Promise<MergeQueueObservation>;
 }
 export interface MergeGateway {
-  inspect(options?: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal }): Promise<RemoteMergeState>;
-  merge(expectedHead: string, options?: { signal?: AbortSignal }): Promise<MergeResult>;
+  inspect(options?: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal; target?: MergeTarget }): Promise<RemoteMergeState>;
+  /** `pullRequest`: the PR to merge; without it, the configured one. */
+  merge(expectedHead: string, options?: { signal?: AbortSignal; pullRequest?: number }): Promise<MergeResult>;
 }
 
 export interface GhMergeConfig {
   repository: string;
-  pullRequest: number;
+  /**
+   * The PR to merge. Required without a runner block. With one, the merge targets the task's published PR, and this, if
+   * set, must name that PR (#121).
+   */
+  pullRequest?: number;
   issue: number;
   method?: 'merge' | 'squash' | 'rebase';
   /** The branch a task's pull request targets (#103). Required when the review has a runner block. */
   baseBranch?: string;
 }
 
+type ResolvedTarget = { pullRequest: number; ownPullRequests: readonly number[]; headBranch?: string };
 type BranchRules = Pick<RemoteMergeState, 'rulesKnown' | 'atomicBaseGuard' | 'mergeQueue' | 'requiredChecks'>;
 export type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
 
@@ -89,6 +117,10 @@ function describeMatches(matches: readonly AlreadyFixedMatch[]): string {
 
 function confirmedMergeRefusal(message: string): boolean {
   return /required (?:approving )?review|required status check|branch protection|merge conflict|not mergeable|head (?:branch |commit )?(?:was )?(?:modified|changed)|does not match.*head|pull request.*(?:closed|draft)|merge method.*not allowed/i.test(message);
+}
+
+function validNumber(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) >= 1;
 }
 
 function fullSha(value: unknown, label: string): string {
@@ -111,19 +143,36 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   readonly config: GhMergeConfig;
   readonly run: RunGh;
   readonly checks: AlreadyFixedGateway;
-  #cache: { expiresAt: number; state: RemoteMergeState } | null = null;
+  /** Keyed by the inspected target, so a state read for one PR is never served for another. */
+  #cache: { key: string; expiresAt: number; state: RemoteMergeState } | null = null;
   #generation = 0;
-  #inflight: { generation: number; promise: Promise<RemoteMergeState> } | null = null;
+  #inflight: { generation: number; key: string; promise: Promise<RemoteMergeState> } | null = null;
   /** `checks` defaults to the pre-PR check's GitHub adapter for the same repository, using this gateway's runner. */
   constructor(config: GhMergeConfig, run?: RunGh, checks?: AlreadyFixedGateway) {
-    if (!REPOSITORY.test(config.repository) || !Number.isSafeInteger(config.pullRequest) || config.pullRequest < 1 || !Number.isSafeInteger(config.issue) || config.issue < 1)
-      throw new Error('A GitHub repository, pull request, and issue are required for merging.');
+    if (!REPOSITORY.test(config.repository) || (config.pullRequest !== undefined && !validNumber(config.pullRequest)) || !Number.isSafeInteger(config.issue) || config.issue < 1)
+      throw new Error('A GitHub repository and issue, and a valid pull request number if one is given, are required for merging.');
     if (config.method !== undefined && !['merge','squash','rebase'].includes(config.method)) throw new Error('GitHub merge method must be merge, squash, or rebase.');
     if (checks && checks.repository?.toLowerCase() !== config.repository.toLowerCase()) throw new Error('The already-fixed check must name and read the merge repository.');
     this.config = config;
     this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(), killGraceMs: MERGE_KILL_GRACE_MS, pipeGraceMs: MERGE_PIPE_GRACE_MS }));
     // The check uses this gateway's runner, so its stopped `gh` calls settle within the same grace periods as the merge's.
     this.checks = checks ?? new GhAlreadyFixedGateway({ repository: config.repository }, this.run);
+  }
+
+  /** The PR a call acts on: the one given, else the configured one. */
+  #number(pullRequest?: number): number {
+    const number = pullRequest ?? this.config.pullRequest;
+    if (number === undefined) throw new Error('No pull request to merge: add github.pullRequest, or publish the task\'s pull request first.');
+    if (!validNumber(number)) throw new Error('Invalid pull request number.');
+    return number;
+  }
+
+  #target(target?: MergeTarget): ResolvedTarget {
+    const pullRequest = this.#number(target?.pullRequest);
+    const own = target?.ownPullRequests ?? [];
+    if (own.some(number => !validNumber(number))) throw new Error('Invalid pull request number.');
+    if (target?.headBranch !== undefined && (typeof target.headBranch !== 'string' || !BRANCH.test(target.headBranch))) throw new Error('Invalid pull request branch.');
+    return { pullRequest, ownPullRequests: [...new Set([pullRequest, ...own])], ...(target?.headBranch !== undefined ? { headBranch: target.headBranch } : {}) };
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
@@ -141,20 +190,21 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
   }
 
   /**
-   * The pre-merge "already fixed" check runs the pre-PR check (`github/already-fixed.ts`) with the same rules. This PR is
-   * the task's own PR: excluded while open, a match once merged. The base-branch scan starts at the PR's base commit, the
-   * base the merge is validated against; the task has no own commits on the base branch before its merge.
+   * The pre-merge "already fixed" check runs the pre-PR check (`github/already-fixed.ts`) with the same rules. This PR and
+   * the task's other recorded PRs are its own: excluded while open, a match once merged. The base-branch scan starts at the
+   * PR's base commit, the base the merge is validated against; the task has no own commits on the base branch before its
+   * merge.
    * The check stops early enough that its `gh` processes, which may need both grace periods after an abort, settle before
    * the inspection's deadline; stopped that way it is `unknown`.
    */
-  async #alreadyFixed(baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
+  async #alreadyFixed(ownPullRequests: readonly number[], baseBranch: string, base: string, deadlineAt: number, signal?: AbortSignal): Promise<Pick<RemoteMergeState, 'alreadyFixed' | 'alreadyFixedDetail'>> {
     // A check started with no settle time left could leave processes running past the inspection's deadline.
     const runFor = deadlineAt - MERGE_CHECK_SETTLE_MS - Date.now();
     if (runFor <= 0) return { alreadyFixed: 'unknown', alreadyFixedDetail: 'No time was left to run the check.' };
     const stop = new AbortController();
     const timer = setTimeout(() => stop.abort(new Error('The already-fixed check did not finish in time.')), runFor);
     try {
-      const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [this.config.pullRequest], ownCommits: new Set() },
+      const result = await this.checks.check({ issue: this.config.issue, taskBase: base, baseBranch, ownPullRequests: [...ownPullRequests], ownCommits: new Set() },
         signal ? AbortSignal.any([signal, stop.signal]) : stop.signal);
       // An answer that arrives after the check was stopped is not used. (One after a caller's abort is refused by the
       // inspection itself, once the rule reads have ended.)
@@ -170,28 +220,58 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     } finally { clearTimeout(timer); }
   }
 
-  async #inspectNow(deadlineAt: number, signal?: AbortSignal): Promise<RemoteMergeState> {
-    const pr = await this.#json(['pr','view',String(this.config.pullRequest),'--repo',this.config.repository,'--json','baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url'], signal) as Record<string, unknown>;
-    if (typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || !['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !['MERGEABLE','CONFLICTING','UNKNOWN'].includes(String(pr.mergeable)) || !Array.isArray(pr.statusCheckRollup))
+  async #inspectNow(target: ResolvedTarget, deadlineAt: number, signal?: AbortSignal): Promise<RemoteMergeState> {
+    const published = target.headBranch !== undefined;
+    const fields = 'number,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,state,mergeable,statusCheckRollup,url' + (published ? ',body,isCrossRepository' : '');
+    const pr = await this.#json(['pr','view',String(target.pullRequest),'--repo',this.config.repository,'--json',fields], signal) as Record<string, unknown>;
+    if (typeof pr.baseRefName !== 'string' || typeof pr.headRefName !== 'string' || !['OPEN','CLOSED','MERGED'].includes(String(pr.state)) || !['MERGEABLE','CONFLICTING','UNKNOWN'].includes(String(pr.mergeable)) || !Array.isArray(pr.statusCheckRollup)
+      || typeof pr.isDraft !== 'boolean' || (published && (typeof pr.body !== 'string' || typeof pr.isCrossRepository !== 'boolean')))
       throw new Error('GitHub returned an incomplete pull request state.');
+    if (pr.number !== target.pullRequest) throw new Error('GitHub returned a different pull request.');
     const base = fullSha(pr.baseRefOid, 'base SHA'), head = fullSha(pr.headRefOid, 'head SHA');
-    // The already-fixed check needs only the PR's base, so it runs alongside the rule reads. If those fail, the check is
-    // stopped; it is awaited on every path, so no `gh` process it started outlives the inspection.
-    const failed = new AbortController();
-    const alreadyFixed = this.#alreadyFixed(pr.baseRefName, base, deadlineAt, signal ? AbortSignal.any([signal, failed.signal]) : failed.signal);
-    alreadyFixed.catch(() => {});
-    let rules: BranchRules;
-    try { rules = await this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, signal); }
-    catch (error) { failed.abort(error); await alreadyFixed.catch(() => {}); throw error; }
-    const fixed = await alreadyFixed;
+    // The already-fixed check needs only the PR's base, so it runs alongside the rule reads (and, for a published target,
+    // the branch's PR list). If either read fails, the others are stopped. All three are awaited on every path, so no `gh`
+    // process they started outlives the inspection.
+    const failed = new AbortController(), reads = signal ? AbortSignal.any([signal, failed.signal]) : failed.signal;
+    const stopOthers = (error: unknown) => { failed.abort(error); throw error; };
+    const alreadyFixed = this.#alreadyFixed(target.ownPullRequests, pr.baseRefName, base, deadlineAt, reads);
+    const [ruleRead, listRead] = await Promise.allSettled([
+      this.#rules(pr.baseRefName, pr.statusCheckRollup as Array<Record<string, unknown>>, reads).catch(stopOthers),
+      published ? this.#branchOpen(target.headBranch!, reads).catch(stopOthers) : undefined,
+    ]);
+    const fixed = await alreadyFixed.catch(error => error instanceof Error ? error : new Error(String(error)));
+    for (const read of [ruleRead, listRead]) if (read.status === 'rejected') throw read.reason;
+    if (fixed instanceof Error) throw fixed;
+    const rules = (ruleRead as PromiseFulfilledResult<BranchRules>).value;
+    const branchOpen = (listRead as PromiseFulfilledResult<PublishedPullRequestState['branchOpen'] | undefined>).value;
     // The rule reads turn a failed read into rulesKnown: false, so a read that ends after an abort must not yield a state.
     signal?.throwIfAborted();
     return {
-      base, head,
+      base, head, pullRequest: target.pullRequest, draft: pr.isDraft,
       pullRequestState: pr.state as RemoteMergeState['pullRequestState'], mergeable: pr.mergeable as RemoteMergeState['mergeable'],
       ...rules, ...fixed,
       ...(typeof pr.url === 'string' && pr.url.length <= 2048 && /^https:\/\//.test(pr.url) ? { url: pr.url } : {}),
+      ...(published ? { published: { headBranch: pr.headRefName, baseBranch: pr.baseRefName, crossRepository: pr.isCrossRepository as boolean,
+        marker: markerOf(pr.body as string), branchOpen: branchOpen! } } : {}),
     };
+  }
+
+  /**
+   * Every open PR from `headBranch` in this repository, with its base. One page is read, as in the publisher's lookup: a
+   * full page could hide another PR from the branch, so it fails closed, and so does any malformed entry.
+   */
+  async #branchOpen(headBranch: string, signal?: AbortSignal): Promise<PublishedPullRequestState['branchOpen']> {
+    const owner = this.config.repository.split('/')[0]!;
+    const query = new URLSearchParams({ state: 'open', head: `${owner}:${headBranch}`, per_page: '100' });
+    const response = await this.#json(['api','-H','Accept: application/vnd.github+json',`repos/${this.config.repository}/pulls?${query}`], signal);
+    if (!Array.isArray(response)) throw new Error('GitHub returned an invalid pull request list.');
+    if (response.length >= 100) throw new Error(`GitHub lists 100 or more open pull requests from ${headBranch}; codeboost cannot read them all.`);
+    return response.map(entry => {
+      const pr = entry as { number?: unknown; head?: { ref?: unknown }; base?: { ref?: unknown } } | null;
+      if (!pr || typeof pr !== 'object' || !validNumber(pr.number) || pr.head?.ref !== headBranch || typeof pr.base?.ref !== 'string')
+        throw new Error('GitHub returned an invalid pull request list.');
+      return { number: pr.number, base: pr.base.ref };
+    });
   }
 
   /** The effective branch rules and the state of each required check on the PR. */
@@ -285,30 +365,32 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     return { rulesKnown, atomicBaseGuard, mergeQueue, requiredChecks };
   }
 
-  async inspect(options: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal } = {}): Promise<RemoteMergeState> {
+  async inspect(options: { fresh?: boolean; timeoutMs?: number; signal?: AbortSignal; target?: MergeTarget } = {}): Promise<RemoteMergeState> {
     const timeoutMs = options.timeoutMs ?? MERGE_INSPECTION_TIMEOUT_MS;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub inspection timeout.');
-    if (!options.fresh && this.#cache && this.#cache.expiresAt > Date.now()) return this.#cache.state;
+    const target = this.#target(options.target), key = JSON.stringify(target);
+    if (!options.fresh && this.#cache?.key === key && this.#cache.expiresAt > Date.now()) return this.#cache.state;
     const generation = this.#generation;
-    if (!options.fresh && this.#inflight?.generation === generation) return this.#inflight.promise;
+    if (!options.fresh && this.#inflight?.generation === generation && this.#inflight.key === key) return this.#inflight.promise;
     const timeout = new AbortController(), deadlineAt = Date.now() + timeoutMs;
     const timer = setTimeout(() => timeout.abort(new Error('GitHub merge-state inspection timed out.')), timeoutMs);
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
-    const attempt = this.#inspectNow(deadlineAt, signal).catch(error => {
+    const attempt = this.#inspectNow(target, deadlineAt, signal).catch(error => {
       // The combined signal keeps the reason of whichever abort came first, the caller's or the deadline's; a stopped gh
       // call can settle after both have fired.
       if (signal.aborted) throw signal.reason;
       throw error;
     }).then(state => {
-      if (this.#generation === generation) this.#cache = { expiresAt: Date.now() + 5_000, state };
+      if (this.#generation === generation) this.#cache = { key, expiresAt: Date.now() + 5_000, state };
       return state;
     }).finally(() => { clearTimeout(timer); if (this.#inflight?.promise === attempt) this.#inflight = null; });
-    if (!options.fresh) this.#inflight = { generation, promise: attempt };
+    if (!options.fresh) this.#inflight = { generation, key, promise: attempt };
     return attempt;
   }
 
-  async queueWatermark(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<string | null> {
+  async queueWatermark(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; pullRequest?: number } = {}): Promise<string | null> {
     fullSha(expectedHead, 'expected head SHA');
+    const number = this.#number(options.pullRequest);
     const timeoutMs = options.timeoutMs ?? 6_000;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub queue watermark timeout.');
     const [owner, name] = this.config.repository.split('/') as [string, string];
@@ -318,14 +400,14 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     const signal = options.signal ? AbortSignal.any([options.signal, timeout.signal]) : timeout.signal;
     try {
       if (options.signal?.aborted) throw options.signal.reason;
-      const response = await this.#json(['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${this.config.pullRequest}`], signal) as {
+      const response = await this.#json(['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${number}`], signal) as {
         data?: { repository?: { pullRequest?: { number?: unknown; headRefOid?: unknown; timelineItems?: { edges?: unknown } } | null } | null };
         errors?: unknown;
       };
       if (signal.aborted) throw signal.reason;
       if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue watermark data with errors.');
       const pull = response.data?.repository?.pullRequest;
-      if (!pull || pull.number !== this.config.pullRequest || fullSha(pull.headRefOid, 'queue watermark head SHA') !== expectedHead || !Array.isArray(pull.timelineItems?.edges))
+      if (!pull || pull.number !== number || fullSha(pull.headRefOid, 'queue watermark head SHA') !== expectedHead || !Array.isArray(pull.timelineItems?.edges))
         throw new Error('GitHub returned an incomplete merge-queue watermark.');
       const edges = pull.timelineItems.edges;
       if (edges.length > 1) throw new Error('GitHub returned an invalid merge-queue watermark.');
@@ -343,8 +425,9 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     } finally { clearTimeout(timer); }
   }
 
-  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null } = {}): Promise<MergeQueueObservation> {
+  async inspectQueue(expectedHead: string, options: { signal?: AbortSignal; timeoutMs?: number; afterCursor?: string | null; pullRequest?: number } = {}): Promise<MergeQueueObservation> {
     fullSha(expectedHead, 'expected head SHA');
+    const number = this.#number(options.pullRequest);
     const timeoutMs = options.timeoutMs ?? MERGE_INSPECTION_TIMEOUT_MS;
     if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MERGE_INSPECTION_TIMEOUT_MS) throw new Error('Invalid GitHub queue inspection timeout.');
     const correlated = Object.hasOwn(options, 'afterCursor');
@@ -360,13 +443,13 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
       let cursor = options.afterCursor ?? null, pull: Record<string, unknown> | null = null, stable = '', page = 0;
       const events: Array<{ id: string; type: unknown; createdAt: string; reason: string | undefined; beforeHead: string | undefined }> = [];
       while (page++ < 10) {
-        const args = ['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${this.config.pullRequest}`];
+        const args = ['api','graphql','-f',`query=${query}`,'-f',`owner=${owner}`,'-f',`name=${name}`,'-F',`number=${number}`];
         if (cursor !== null) args.push('-f', `after=${cursor}`);
         const response = await this.#json(args, signal) as { data?: { repository?: { pullRequest?: Record<string, unknown> | null } | null }; errors?: unknown };
         if (signal.aborted) throw signal.reason;
         if (Object.hasOwn(response, 'errors') && (!Array.isArray(response.errors) || response.errors.length > 0)) throw new Error('GitHub returned merge-queue data with errors.');
         const nextPull = response.data?.repository?.pullRequest;
-        if (!nextPull || nextPull.number !== this.config.pullRequest) throw new Error('GitHub returned an incomplete merge-queue pull request.');
+        if (!nextPull || nextPull.number !== number) throw new Error('GitHub returned an incomplete merge-queue pull request.');
         const current = JSON.stringify({ number: nextPull.number, headRefOid: nextPull.headRefOid, state: nextPull.state, mergedAt: nextPull.mergedAt, mergeQueueEntry: nextPull.mergeQueueEntry });
         if (stable && current !== stable) throw new Error('GitHub merge-queue state changed during paginated inspection.');
         stable = current; pull = nextPull;
@@ -392,7 +475,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         if (page === 10 || typeof value.pageInfo.endCursor !== 'string' || !value.pageInfo.endCursor) throw new Error('GitHub merge-queue history exceeded the inspection limit.');
         cursor = value.pageInfo.endCursor;
       }
-      if (!pull || pull.number !== this.config.pullRequest) throw new Error('GitHub returned an incomplete merge-queue pull request.');
+      if (!pull || pull.number !== number) throw new Error('GitHub returned an incomplete merge-queue pull request.');
       const reviewedHead = fullSha(pull.headRefOid, 'queue pull request head SHA');
       if (reviewedHead !== expectedHead) throw new Error('The pull request head changed after review.');
       if (!['OPEN','CLOSED','MERGED'].includes(String(pull.state))) throw new Error('GitHub returned an invalid queue pull request state.');
@@ -419,7 +502,7 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
         if (correlated && attemptEvents.length !== 1) throw new Error('GitHub returned an ambiguous active event sequence for the current enqueue attempt.');
         const queueHead = fullSha(value.headCommit?.oid, 'merge-queue head SHA');
         const entryHead = fullSha(value.pullRequest?.headRefOid, 'merge-queue entry pull request head SHA');
-        if (value.pullRequest?.number !== this.config.pullRequest || queueHead !== expectedHead || entryHead !== expectedHead) throw new Error('The merge-queue entry does not match the reviewed pull request head.');
+        if (value.pullRequest?.number !== number || queueHead !== expectedHead || entryHead !== expectedHead) throw new Error('The merge-queue entry does not match the reviewed pull request head.');
         if (value.state === 'UNMERGEABLE') return { state: 'failed', reviewedHead, entryId: value.id, reason: 'GitHub reported the merge queue entry as unmergeable.' };
         return {
           state: 'queued', reviewedHead, entryId: value.id, phase: value.state as MergeQueueEntryPhase,
@@ -439,15 +522,16 @@ export class GhMergeGateway implements MergeGateway, MergeQueueGateway {
     } finally { clearTimeout(timer); }
   }
 
-  async merge(expectedHead: string, options: { signal?: AbortSignal } = {}): Promise<MergeResult> {
+  async merge(expectedHead: string, options: { signal?: AbortSignal; pullRequest?: number } = {}): Promise<MergeResult> {
     fullSha(expectedHead, 'expected head SHA');
+    const number = this.#number(options.pullRequest);
     const flag = this.config.method === 'squash' ? '--squash' : this.config.method === 'rebase' ? '--rebase' : '--merge';
     this.#generation++;
     this.#cache = null;
     try {
       if (options.signal?.aborted) throw options.signal.reason;
-      await this.run(['pr','merge',String(this.config.pullRequest),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead], { signal: options.signal });
-      return { url: `https://github.com/${this.config.repository}/pull/${this.config.pullRequest}` };
+      await this.run(['pr','merge',String(number),'--repo',this.config.repository,flag,'--match-head-commit',expectedHead], { signal: options.signal });
+      return { url: `https://github.com/${this.config.repository}/pull/${number}` };
     } catch (error) {
       if (error instanceof MergeSubmissionError) throw error;
       const message = error instanceof Error ? error.message : 'GitHub merge submission failed with an unknown outcome.';

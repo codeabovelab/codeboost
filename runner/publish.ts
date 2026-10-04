@@ -2,7 +2,7 @@ import { createHash } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { pullRequestBody, pullRequestTitle } from '../core/pull-request-body.ts';
 import type { AlreadyFixedGateway, AlreadyFixedResult } from '../github/already-fixed.ts';
-import { DraftsUnsupported, PullRequestMisplaced, PullRequestRefused, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
+import { DraftsUnsupported, PullRequestMisplaced, PullRequestRefused, openingMarker, type OpenedPullRequest, type PullRequestGateway } from '../github/pull-requests.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError } from './lifecycle.ts';
 import type { Store, TaskPullRequest } from './store.ts';
 
@@ -40,7 +40,7 @@ export type PublishOutcome =
    */
   | { kind: 'no changes'; leftReady?: number };
 
-const marker = (openingId: string) => `<!-- codeboost:opening=${openingId} -->`;
+const marker = openingMarker;
 const pullRequestList = (prs: readonly { number: number }[]) => `Pull requests ${prs.map(pr => `#${pr.number}`).join(' and ')}`;
 /**
  * Tasks with a publish in progress, per Store, shared by every publisher over that Store. One publish per task at a

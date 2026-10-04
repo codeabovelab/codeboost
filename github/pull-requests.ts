@@ -92,6 +92,8 @@ async function draftCall<T>(call: () => Promise<T>): Promise<T> {
  * agent-controlled, so a marker-shaped string there never identifies a PR.
  */
 export const markerOf = (body: string): string => body.split('\n', 1)[0]!.trim();
+/** The marker of one opening: the first line of the description of the PR it opens. */
+export const openingMarker = (openingId: string): string => `<!-- codeboost:opening=${openingId} -->`;
 /**
  * One deadline for a whole open, lookup, refresh or draft change, whatever the caller's signal. Stopping `gh` at the
  * deadline can take up to 6 seconds more (SIGTERM grace and pipe drain), so an operation settles within 66 seconds.
