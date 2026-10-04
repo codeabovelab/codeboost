@@ -140,6 +140,8 @@ export class TaskPublishing {
     if (kind === 'close' && status !== 'cancelled') throw new GuardRefusal(`The task is ${status}; only a cancelled task's pull requests are closed.`);
     if (kind === 'publish' && status === 'cancelled') throw new GuardRefusal('The task is cancelled; its pull requests are closed, not published.');
     const job = this.mode(identity);
+    // A person's action starts a new chain, with its own automatic retries (AGENTS.md: reset on an explicit user action).
+    this.#retried.delete(identityKey(identity));
     this.#schedule(identity, job, actionId);
     return job;
   }
@@ -149,8 +151,16 @@ export class TaskPublishing {
    * (`personAsked`: it also ends the v10 upgrade's `not published` hold, as a run starting would): do the job owed, if
    * any. Never throws.
    */
-  actIfOwed(identity: PlanIdentity, options: { personAsked?: boolean } = {}): void {
-    try { this.#payOwed(identity); const job = this.owed(identity, options); if (job) this.#schedule(identity, job); }
+  actIfOwed(identity: PlanIdentity, options: { personAsked?: boolean; retry?: boolean } = {}): void {
+    try {
+      this.#payOwed(identity);
+      const job = this.owed(identity, options);
+      if (!job) return;
+      // A run's end, a cancel, a person's action or a restart is a meaningful lifecycle change: a new chain, with its own
+      // automatic retries. A retry timer's own job is not, or the retries would be unbounded again.
+      if (!options.retry) this.#retried.delete(identityKey(identity));
+      this.#schedule(identity, job);
+    }
     catch (error) { console.error(`Could not start pull request work: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
@@ -231,10 +241,11 @@ export class TaskPublishing {
       let wait: number | null = null;
       if (remaining !== null && remaining > 0 && retried.deadline < 1) { retried.deadline++; wait = remaining; }
       // Refused for the list's lag or just as an opening's deadline passed, or opened without settling: one short retry.
-      else if ((unsettled || record.reconcile) && retried.short < 1) { retried.short++; wait = this.#shortRetryMs; }
+      // Not while an opening's deadline is still ahead: a publish before it would only be refused again.
+      else if ((unsettled || record.reconcile) && !(remaining !== null && remaining > 0) && retried.short < 1) { retried.short++; wait = this.#shortRetryMs; }
       if (wait === null) return;
       this.#retried.set(key, retried);
-      const timer = setTimeout(() => { this.#retries.delete(key); this.actIfOwed(identity); }, wait + 1_000);
+      const timer = setTimeout(() => { this.#retries.delete(key); this.actIfOwed(identity, { retry: true }); }, wait + 1_000);
       timer.unref?.();
       this.#retries.set(key, timer);
     } catch (error) { console.error(`Could not arrange a retry of the publish: ${JSON.stringify(message(error, this.#secrets))}`); }
@@ -310,7 +321,9 @@ function describe(outcome: PublishOutcome, draft: boolean): Omit<PublishRecord, 
     // A ready publish whose task did not reach in review (GitHub showed another head, so the PR was drafted), or any
     // publish that left a PR ready it meant to draft, is not done: the next publish reconciles it.
     case 'opened': return { outcome: outcome.kind, draft, number: outcome.number, url: outcome.url,
-      ...((!draft && outcome.status !== 'in review') || outcome.leftReady !== undefined ? { reconcile: true } : {}),
+      // Only while the task can still be published (running, needs human): an approved, merged or cancelled task is
+      // published no more, so nothing would reconcile it.
+      ...(['running', 'needs human'].includes(outcome.status) && ((!draft && outcome.status !== 'in review') || outcome.leftReady !== undefined) ? { reconcile: true } : {}),
       message: `Pull request #${outcome.number} is open${outcome.draft ? ' as a draft' : ''}; the task is ${outcome.status}.${ready}` };
     case 'possibly already fixed': return { outcome: outcome.kind, draft, message: `The issue may already be fixed (${checkSummary(outcome.result)}), so no pull request was opened.${ready}` };
     case 'draft skipped': return { outcome: outcome.kind, draft, message: `The issue may already be fixed (${checkSummary(outcome.result)}), so no draft pull request was opened.${ready}` };

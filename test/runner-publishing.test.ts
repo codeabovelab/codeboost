@@ -182,7 +182,7 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   });
   cleanups.push(close);
   // As the CLI does once it has verified the lock.
-  if (options.startup !== false) app.publishOwed();
+  if (options.startup !== false) app.publishOwed(() => undefined);
   const identity = w.demo.identity;
   return { app, close, identity, store: app.service.store, branch: branchOf(identity), head: app.service.store.getSnapshot(identity).head };
 }
@@ -412,7 +412,7 @@ describe('publishing a finished task (#103)', () => {
       const opening = Promise.withResolvers<void>();
       w.github.checks.check = async () => { opening.resolve(); return { outcome: 'clear', baseHead: 'b'.repeat(40) }; };
       const { app, identity, store } = await serve(w, { before: completeAll, startup: false });
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       seen = store.lastPublish(identity)?.outcome;
       await opening.promise;
       expect(seen).toBe('publishing');
@@ -436,7 +436,7 @@ describe('publishing a finished task (#103)', () => {
       const w = world();
       const { app, identity, store } = await serve(w, { before: completeAll, startup: false });
       vi.spyOn(store, 'recordPublish').mockImplementationOnce(() => { throw new Error('disk full'); });
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       await app.publishing!.settled(identity);
       expect(w.github.calls).toEqual([]);
       expect(store.lastPublish(identity)).toBeNull();
@@ -531,7 +531,7 @@ describe('publishing a finished task (#103)', () => {
       } });
       expect(store.getTask(identity).status).toBe('running');
       const pay = vi.spyOn(app.executor!, 'payOwed').mockImplementation(() => { throw new Error('The snapshot of P1\'s commit is missing.'); });
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       expect(pay).toHaveBeenCalled();
       expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped' });
     });
@@ -633,7 +633,7 @@ describe('publishing a finished task (#103)', () => {
       w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); w.github.onOpen = undefined; throw new Error('timed out'); };
       const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_000, startup: false });
       const starts = vi.spyOn(store, 'recordPublish');
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
       // Someone copied its description onto another PR from the branch: recovery cannot tell which is the task's, so the
       // opening stays, and every publish of it is refused for a reason only a person can fix.
@@ -666,7 +666,7 @@ describe('publishing a finished task (#103)', () => {
       w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
       const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 800, startup: false });
       const starts = vi.spyOn(store, 'recordPublish');
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       await new Promise(resolve => setTimeout(resolve, 6_000));
       expect(starts.mock.calls.filter(call => call[1].outcome === 'publishing').length).toBe(2);
       expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' });
@@ -675,7 +675,7 @@ describe('publishing a finished task (#103)', () => {
       const w = world();
       w.github.staleHeadOnce = 'a'.repeat(40);
       const { app, identity, store } = await serve(w, { before: completeAll, shortRetryMs: 300, startup: false });
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', reconcile: true }), { timeout: 10_000 });
       expect(store.getTask(identity).status).toBe('running');
       expect(w.github.prs[0]!.draft).toBe(true);
@@ -693,10 +693,54 @@ describe('publishing a finished task (#103)', () => {
       // Owed again (an earlier attempt failed), and GitHub's list does not show the PR for now.
       store.recordPublish(identity, { outcome: 'refused', draft: true, message: 'The branch moved.' });
       w.github.hidden.add(100);
-      app.publishOwed();
+      app.publishOwed(() => undefined);
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/list does not show it yet/) }), { timeout: 10_000 });
       w.github.hidden.clear();
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true }), { timeout: 10_000, interval: 50 });
+    });
+  });
+
+  describe('round 5 of the independent review', () => {
+    it('gives a persistent list lag one short retry, not one every period', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { before: needsHuman, shortRetryMs: 200 });
+      await publishSettled(app, identity);
+      store.recordPublish(identity, { outcome: 'refused', draft: true, message: 'The branch moved.' });
+      // GitHub's list keeps leaving the PR out.
+      w.github.hidden.add(100);
+      const starts = vi.spyOn(store, 'recordPublish');
+      app.publishOwed(() => undefined);
+      await new Promise(resolve => setTimeout(resolve, 5_000));
+      expect(starts.mock.calls.filter(call => call[1].outcome === 'publishing').length).toBe(2);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/list does not show it yet/) });
+    });
+    it('starts no startup publish unless the lock check passes, which runs first', async () => {
+      const w = world();
+      const { app, identity } = await serve(w, { before: completeAll, startup: false });
+      const order: string[] = [];
+      expect(() => app.publishOwed(() => { order.push('verify'); throw new Error('The database path changed while opening. Refusing to start.'); }))
+        .toThrow('The database path changed');
+      expect(app.publishing!.busy(identity)).toBe(false);
+      expect(w.github.calls).toEqual([]);
+      app.publishOwed(() => { order.push('verify'); expect(app.publishing!.busy(identity)).toBe(false); });
+      expect(order).toEqual(['verify', 'verify']);
+      expect(app.publishing!.busy(identity)).toBe(true);
+      await publishSettled(app, identity);
+    });
+    it('starts a new chain with its own retries when a person asks again', async () => {
+      const w = world();
+      w.github.onOpen = async () => { w.github.prs.pop(); throw new Error('HTTP 502'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 800, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      const publishes = () => starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      app.publishOwed(() => undefined);
+      // The first chain: its publish and one retry at the opening's deadline, then nothing.
+      await new Promise(resolve => setTimeout(resolve, 4_000));
+      expect(publishes()).toBe(2);
+      // A person asks again: a new chain, which gets its own retry at its opening's deadline.
+      await act(app, 'publish');
+      await new Promise(resolve => setTimeout(resolve, 4_000));
+      expect(publishes()).toBe(4);
     });
   });
 

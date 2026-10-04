@@ -213,7 +213,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       try { replay = !!service.store.savedAction(identity, { actionId: actionId as string, kind: 'publish', request: { attemptId, expectedStateVersion } }); }
       catch { replay = true; }
       try { return act(); }
-      catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.actIfOwed(identity); throw error; }
+      catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.actIfOwed(identity, { personAsked: true }); throw error; }
     }
     return act();
     function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
@@ -435,10 +435,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   return { server, service, token, runner, executor, publishing,
     /**
      * Startup (#103): a publish an earlier process owed (a lost opening, a run that ended before its publish completed)
-     * runs once, in the background; recovery finds a lost opening by its marker. The caller runs it once it has checked
-     * that the runner lock still names the database, since a publish pushes.
+     * runs once, in the background; recovery finds a lost opening by its marker. A publish pushes, so `verifyLock`
+     * (the runner lock still names the database) runs first, here: if it throws, nothing starts and its error is thrown.
      */
-    publishOwed: () => publishing?.startup(identity),
+    publishOwed: (verifyLock: () => void) => { verifyLock(); publishing?.startup(identity); },
     url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;
