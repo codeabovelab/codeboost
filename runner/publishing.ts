@@ -40,7 +40,9 @@ export class TaskPublishing {
   #secrets: string[];
   #closing = false;
   /** Retries of a publish or close refused while a lost opening settles (OpeningUnsettled), cleared at shutdown. */
-  #retries = new Set<ReturnType<typeof setTimeout>>();
+  #retries = new Map<string, ReturnType<typeof setTimeout>>();
+  /** Tasks whose list-lag retry has run since their last settled publish: it runs once, not every 30 s for ever. */
+  #listLagRetried = new Set<string>();
   /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
   #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
@@ -91,7 +93,7 @@ export class TaskPublishing {
 
   /**
    * An earlier run owes a safety escalation or a scope pause (its write failed, or the process stopped): the task is not
-   * finished work until that is settled, so a ready PR must not show its unreviewed changes. publishIfOwed pays it. Read
+   * finished work until that is settled, so a ready PR must not show its unreviewed changes. actIfOwed pays it. Read
    * only for a status that could publish, so a poll of any other task does not scan its attempts.
    */
   #assertNothingOwed(identity: PlanIdentity, scope = true): void {
@@ -103,7 +105,7 @@ export class TaskPublishing {
    * changed; a close, when the task is cancelled, has a pull request record, and its PRs have not been closed since. Either
    * is owed while an action that asked for it has not recorded an outcome.
    */
-  owed(identity: PlanIdentity): PullRequestJob | null {
+  owed(identity: PlanIdentity, options: { personAsked?: boolean } = {}): PullRequestJob | null {
     let job;
     try { job = this.mode(identity); }
     catch (error) { if (error instanceof GuardRefusal || error instanceof ShuttingDownError) return null; throw error; }
@@ -113,7 +115,7 @@ export class TaskPublishing {
     const last = this.#store.lastPublish(identity);
     // A task that reached its status before publishing existed (the v10 upgrade's record) is published only when a person
     // asks, until a run starts after the upgrade: that run's end is the first state the upgrade did not decide.
-    if (last?.outcome === 'not published' && !this.#store.getAttempts(identity).some(attempt => attempt.createdAt > last.at)) return null;
+    if (last?.outcome === 'not published' && !options.personAsked && !this.#store.getAttempts(identity).some(attempt => attempt.createdAt > last.at)) return null;
     if (job.kind === 'close') return last?.outcome === 'closed' ? null : job;
     return !last || !SETTLED.includes(last.outcome) || last.stateVersion !== this.#store.getTask(identity).stateVersion ? job : null;
   }
@@ -132,9 +134,13 @@ export class TaskPublishing {
     return job;
   }
 
-  /** A run of the task ended, the task was cancelled, or the server started: do the job owed, if any. Never throws. */
-  actIfOwed(identity: PlanIdentity): void {
-    try { this.#payOwed(identity); const job = this.owed(identity); if (job) this.#schedule(identity, job); }
+  /**
+   * A run of the task ended, the task was cancelled, the server started, or a person's start or resume moved the task
+   * (`personAsked`: it also ends the v10 upgrade's `not published` hold, as a run starting would): do the job owed, if
+   * any. Never throws.
+   */
+  actIfOwed(identity: PlanIdentity, options: { personAsked?: boolean } = {}): void {
+    try { this.#payOwed(identity); const job = this.owed(identity, options); if (job) this.#schedule(identity, job); }
     catch (error) { console.error(`Could not start pull request work: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
@@ -177,7 +183,7 @@ export class TaskPublishing {
    */
   async close(): Promise<void> {
     this.#closing = true;
-    for (const timer of this.#retries) clearTimeout(timer);
+    for (const timer of this.#retries.values()) clearTimeout(timer);
     this.#retries.clear();
     await this.#publisher.close();
     while (this.#running.size) await Promise.all([...this.#running.values()].map(running => running.done));
@@ -185,8 +191,9 @@ export class TaskPublishing {
 
   /** Settle what an earlier run owes before deciding what to publish (see mode); a task it moves is then not finished work. */
   #payOwed(identity: PlanIdentity): void {
-    // A closed task (cancelled, merged) owes nothing a publish waits for: its PRs are closed, not published.
-    if (this.#closing || this.#runner.closing || ['cancelled', 'merged'].includes(this.#store.getTask(identity).status)) return;
+    if (this.#closing || this.#runner.closing) return;
+    // Only where a run would pay it before its first item (a running or queued task), or where a draft waits on it.
+    if (!['running', 'queued', 'needs human'].includes(this.#store.getTask(identity).status)) return;
     // Its failure must not stop the caller from settling what it can (an in-flight record, a stuck reply): the task still
     // owes the work, and mode() refuses to publish until it is paid.
     try {
@@ -198,16 +205,23 @@ export class TaskPublishing {
   /**
    * A publish or close that ended with an opening still in flight (its reply was lost, or it was refused while one settles) or
    * refused because GitHub's list lags behind a PR is tried again by itself: nothing else would (no run ends, startup has
-   * passed). It waits for the opening's own deadline, or a short while for the list, plus a second. Never throws.
+   * passed). Bounded (AGENTS.md: back off recurring external polling): one timer per task; an opening is waited for only
+   * while its deadline is ahead (at the deadline the next publish abandons or adopts it, so one that is still there
+   * after it is stuck for a reason a person must fix, not a timing one); the list is waited for once per chain, 30 s.
+   * Never throws.
    */
-  #retryIfUnsettled(identity: PlanIdentity, unsettled: boolean): void {
+  #retryIfUnsettled(identity: PlanIdentity, record: Omit<PublishRecord, 'stateVersion' | 'at'>, unsettled: boolean): void {
     try {
-      if (this.#closing) return;
-      const remaining = this.#publisher.settleRemaining(identity) ?? (unsettled ? LIST_LAG_RETRY_MS : null);
-      if (remaining === null) return;
-      const timer = setTimeout(() => { this.#retries.delete(timer); this.actIfOwed(identity); }, remaining + 1_000);
+      const key = identityKey(identity);
+      if (SETTLED.includes(record.outcome)) this.#listLagRetried.delete(key);
+      if (this.#closing || this.#retries.has(key)) return;
+      const remaining = this.#publisher.settleRemaining(identity);
+      let wait: number | null = remaining !== null && remaining > 0 ? remaining : null;
+      if (wait === null && remaining === null && unsettled && !this.#listLagRetried.has(key)) { this.#listLagRetried.add(key); wait = LIST_LAG_RETRY_MS; }
+      if (wait === null) return;
+      const timer = setTimeout(() => { this.#retries.delete(key); this.actIfOwed(identity); }, wait + 1_000);
       timer.unref?.();
-      this.#retries.add(timer);
+      this.#retries.set(key, timer);
     } catch (error) { console.error(`Could not arrange a retry of the publish: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
 
@@ -245,7 +259,7 @@ export class TaskPublishing {
       }
       try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
       catch (error) { console.error(`Could not record the pull request outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
-      this.#retryIfUnsettled(identity, unsettled);
+      this.#retryIfUnsettled(identity, record, unsettled);
     };
     const release = () => {
       this.#running.delete(key);

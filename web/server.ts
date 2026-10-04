@@ -195,7 +195,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // task already in needs human asked for no publish.
     if (action === 'start' || action === 'resume') {
       const before = service.store.getTask(identity).status;
-      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.actIfOwed(identity); }
+      try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.actIfOwed(identity, { personAsked: true }); }
     }
     // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
     // stopping an attempt closes the task when the attempt settles; the run's end then closes them (afterRun).

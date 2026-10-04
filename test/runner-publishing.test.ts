@@ -503,6 +503,8 @@ describe('publishing a finished task (#103)', () => {
       const { app, identity, store } = await serve(w, { before: service => {
         completeAll(service);
         const s = service.store, id = service.config.identity;
+        // The upgrade comes after those runs (a later millisecond: timestamps are compared).
+        const until = Date.now() + 3; while (Date.now() < until) { /* let the clock move */ }
         s.recordPublish(id, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
         // An unrelated change since moves the task's state version.
         s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
@@ -569,7 +571,8 @@ describe('publishing a finished task (#103)', () => {
       const w = world();
       const { app, identity, store } = await serve(w, { before: service => {
         service.store.recordPublish(service.config.identity, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
-        // A person resumed it after the upgrade, and that run completed the plan.
+        // A person resumed it after the upgrade (a later millisecond: timestamps are compared), and that run completed the plan.
+        const until = Date.now() + 3; while (Date.now() < until) { /* let the clock move */ }
         completeAll(service);
       } });
       await publishSettled(app, identity);
@@ -608,6 +611,39 @@ describe('publishing a finished task (#103)', () => {
         s.cancelTask(id, s.getTask(id).stateVersion, randomUUID());
       } });
       expect(store.lastPublish(identity)).toMatchObject({ outcome: 'stopped', draft: true });
+    });
+  });
+
+  describe('round 3 of the independent review', () => {
+    it('does not retry for ever when a lost opening stays stuck past its deadline', async () => {
+      const w = world();
+      // The opening's reply is lost (GitHub created the PR; its list does not show it yet).
+      w.github.onOpen = async () => { w.github.hidden.add(w.github.prs.at(-1)!.number); w.github.onOpen = undefined; throw new Error('timed out'); };
+      const { app, identity, store } = await serve(w, { before: completeAll, settleMs: 1_000, startup: false });
+      const starts = vi.spyOn(store, 'recordPublish');
+      app.publishOwed();
+      await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed' }), { timeout: 5_000 });
+      // Someone copied its description onto another PR from the branch: recovery cannot tell which is the task's, so the
+      // opening stays, and every publish of it is refused for a reason only a person can fix.
+      const pr = w.github.prs[0]!;
+      w.github.prs.push({ ...pr, number: 999, url: `https://github.com/${REPO}/pull/999`, base: 'release' });
+      w.github.hidden.clear();
+      await new Promise(resolve => setTimeout(resolve, 6_000));
+      const publishes = starts.mock.calls.filter(call => call[1].outcome === 'publishing').length;
+      // The first publish and one retry at the opening's deadline; not one more every second.
+      expect(publishes).toBeLessThanOrEqual(2);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused' });
+    });
+    it('publishes the draft of an upgraded task when a person\'s refused resume moves it to needs human', async () => {
+      const w = world();
+      const { app, identity, store } = await serve(w, { startup: false, before: service => {
+        budgetSpent(service);
+        service.store.recordPublish(service.config.identity, { outcome: 'not published', draft: false, message: 'Before publishing existed.' });
+      } });
+      expect(await act(app, 'resume')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/time budget/) } });
+      expect(store.getTask(identity).status).toBe('needs human');
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: true });
     });
   });
 
