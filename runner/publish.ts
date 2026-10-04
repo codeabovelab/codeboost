@@ -337,7 +337,7 @@ export class PullRequestPublisher {
     // a draft, whatever GitHub returned.
     if (pr.draft || (!draft && status === 'in review' && pr.headSha === head)) return opened;
     let drafted;
-    // Only the GitHub call's failure becomes leftReady (the PR stays ready; the next publish reconciles it). A Store
+    // Only the GitHub call's failure becomes leftReady (the PR stays ready; the next publish of a task that can still be published reconciles it). A Store
     // failure after a draft change that landed propagates, so it is not misreported as a ready PR.
     try { drafted = await this.#pulls.markDraft(pr.number, { base, headBranch: branch, marker: marker(openingId) }, signal); }
     catch (error) { if (signal?.aborted) throw error; return { ...opened, leftReady: pr.number }; }

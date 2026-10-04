@@ -62,7 +62,7 @@ export interface PublishRecord {
 }
 /** What the publish action replays once its publish has settled: the outcome, as `publish.last` shows it. */
 export function publishActionResponse(record: PublishRecord) {
-  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.number === undefined ? {} : { number: record.number }),
+  return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.reconcile ? { reconcile: true } : {}), ...(record.number === undefined ? {} : { number: record.number }),
     ...(record.url === undefined ? {} : { url: record.url }) };
 }
 export interface TaskRecord {
