@@ -45,11 +45,19 @@ export interface WorkerNaming {
   readonly rootName: string;
   /** What another process may be running, in refusals: "running Ask for this review". */
   readonly activity: string;
+  /** One unit of work, in messages: "the first question after the restart". */
+  readonly job: string;
+  /** Units of work, in messages: "questions still settling". */
+  readonly jobs: string;
+  /** Which jobs the feature's worker runs (see question-worker.ts). */
+  readonly feature: 'questions' | 'planning';
 }
 export const ASK_NAMING: WorkerNaming = Object.freeze({ label: 'Ask', root: 'ask', prep: 'askprep', lock: 'asklock',
-  record: 'ask-leftovers.json', code: 'reviewed code', folders: 'Ask folders', worker: 'the Ask worker', rootName: 'an Ask root', activity: 'Ask' });
+  record: 'ask-leftovers.json', code: 'reviewed code', folders: 'Ask folders', worker: 'the Ask worker', rootName: 'an Ask root', activity: 'Ask',
+  job: 'question', jobs: 'questions', feature: 'questions' });
 export const PLANNING_NAMING: WorkerNaming = Object.freeze({ label: 'Planning', root: 'plan', prep: 'planprep', lock: 'planlock',
-  record: 'planning-leftovers.json', code: 'planned code', folders: 'planning folders', worker: 'the planning worker', rootName: 'a planning root', activity: 'planning' });
+  record: 'planning-leftovers.json', code: 'planned code', folders: 'planning folders', worker: 'the planning worker', rootName: 'a planning root', activity: 'planning',
+  job: 'planning request', jobs: 'planning requests', feature: 'planning' });
 
 /**
  * A worker root: one directory per agent worker, set as the worker's TMPDIR, so every host copy it or lane D makes

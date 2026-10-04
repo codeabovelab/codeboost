@@ -8,7 +8,7 @@ import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { RecoveredTaskStorage, TaskFilesystems, TaskStorageLimits } from '../agents/container/storage.ts';
 import { RUNNER_LABEL, type ResourceOwner } from '../agents/labels.ts';
 import { recoverLeftovers, type RecoveryReport } from '../agents/recovery.ts';
-import { removeStaging } from './question-leftovers.ts';
+import { ASK_NAMING, removeStaging, type WorkerNaming } from './question-leftovers.ts';
 import { removalCommand } from './recovery.ts';
 
 export type Provider = 'claude' | 'codex';
@@ -350,14 +350,14 @@ const MAX_LISTED = 20;
  *
  * Recovery is asked not to look for objects without an owner label: they come from builds before runner labels and
  * may belong to any review on this daemon, so they neither block Ask nor are touched. Objects carrying this owner that
- * recovery cannot identify keep Ask off.
+ * recovery cannot identify keep Ask off. Planning's worker runs it the same way with its own owner and `naming` (#117).
  */
 export async function recoverQuestionStorage(runnerOwner: string, deps: Pick<ContainerDependencies, 'recover' | 'removeFilesystems'>,
-  retained: RetainedStorage): Promise<void> {
+  retained: RetainedStorage, naming: WorkerNaming = ASK_NAMING): Promise<void> {
   let report: RecoveryReport;
   try { report = await deps.recover(runnerOwner); }
   catch (error) {
-    throw new Error(`Ask is off: codeboost could not remove what an earlier session of this review left in Docker (${error instanceof Error ? error.message.slice(0, 300) : 'unknown error'}). Check that Docker is running, then retry.`);
+    throw new Error(`${naming.label} is off: codeboost could not remove what an earlier session of this review left in Docker (${error instanceof Error ? error.message.slice(0, 300) : 'unknown error'}). Check that Docker is running, then retry.`);
   }
   for (const handle of report.storage) {
     try { deps.removeFilesystems(handle); } catch { retained.retain(handle); }
@@ -366,5 +366,5 @@ export async function recoverQuestionStorage(runnerOwner: string, deps: Pick<Con
   if (!ours.length) return;
   const commands = ours.slice(0, MAX_LISTED).map(removalCommand);
   if (ours.length > MAX_LISTED) commands.push(`… and ${ours.length - MAX_LISTED} more labelled ${RUNNER_LABEL}=${runnerOwner}`);
-  throw new Error(`Ask is off: Docker objects labelled with this review's Ask owner are not ones codeboost can identify, so it did not remove them. Remove them, then retry:\n${commands.join('\n')}`);
+  throw new Error(`${naming.label} is off: Docker objects labelled with this review's ${naming.activity} owner are not ones codeboost can identify, so it did not remove them. Remove them, then retry:\n${commands.join('\n')}`);
 }
