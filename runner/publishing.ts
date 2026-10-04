@@ -247,11 +247,12 @@ export class TaskPublishing {
       // is recorded, startup finds the marker and publishes again or settles it as interrupted. No marker, no publish.
       try { this.#write(() => this.#store.recordPublish(identity, { outcome: IN_FLIGHT, draft, message: 'A pull request is being published.' })); }
       catch (error) { console.error(`Could not record the publish as started, so it did not run: ${JSON.stringify(message(error, this.#secrets))}`); return; }
-      let record: Omit<PublishRecord, 'stateVersion' | 'at'>, unsettled = false;
+      let record: Omit<PublishRecord, 'stateVersion' | 'at'>, seenVersion: number | undefined, unsettled = false;
       try {
         // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
         const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {});
         record = describe(outcome, draft);
+        seenVersion = outcome.seenVersion;
       } catch (error) {
         // A guard refusal is mostly a race (the task, its review or its head changed during the publish): one short retry
         // publishes the new state. One that persists is in mode() too, so the retry finds nothing owed.
@@ -259,7 +260,7 @@ export class TaskPublishing {
         const stopped = error instanceof ShuttingDownError || (this.#closing && (error as Error)?.name === 'AbortError');
         record = { outcome: stopped ? 'stopped' : REFUSALS.some(type => error instanceof type) ? 'refused' : 'failed', draft, message: message(error, this.#secrets) };
       }
-      try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
+      try { this.#write(() => this.#store.recordPublish(identity, record, actionId, seenVersion)); }
       catch (error) { console.error(`Could not record the publish outcome: ${JSON.stringify(message(error, this.#secrets))}`); }
       this.#retryIfUnsettled(identity, record, unsettled);
     };
