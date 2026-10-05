@@ -2,7 +2,7 @@ import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { PullRequestMisplaced, PullRequestRefused } from '../github/pull-requests.ts';
 import { BranchPushRefused, redact, TOKEN_VARIABLES } from './branch-push.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
-import { SAFETY_VIOLATION, type ItemExecutor } from './execution.ts';
+import type { ItemExecutor } from './execution.ts';
 import { GuardRefusal, ShuttingDownError, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { OpeningUnsettled, type PublishOutcome, type PullRequestPublisher } from './publish.ts';
 import type { PublishRecord, Store } from './store.ts';
@@ -50,11 +50,6 @@ export class TaskPublishing {
    */
   #retried = new Map<string, { deadline: number; short: number }>();
   #shortRetryMs: number;
-  /**
-   * The reason an owed escalation was paid with (a safety finding whose save had failed): the executor settles it in
-   * memory only, so the task's attempt rows do not carry it, and the draft PR would otherwise not say why (#103).
-   */
-  #escalations = new Map<string, { reason: string; attemptId: string | null }>();
   /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
   #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
@@ -224,8 +219,6 @@ export class TaskPublishing {
     try {
       // A task in needs human cannot record a scope pause, and its draft does not wait for one (mode): only a finding.
       const paid = this.#executor.payOwed(identity, { scope: this.#store.getTask(identity).status !== 'needs human' });
-      // Tied to the attempt current once paid: a later run (a new attempt) that ends in needs human again has its own reason.
-      if (paid?.kind === 'needs human') this.#escalations.set(identityKey(identity), { reason: paid.reason, attemptId: this.#store.getTask(identity).currentAttemptId });
       if (paid?.kind === 'stopped') console.error(`Could not settle what an earlier run owes: ${JSON.stringify(paid.reason ?? '')}`);
     } catch (error) { console.error(`Could not settle what an earlier run owes: ${JSON.stringify(message(error, this.#secrets))}`); }
   }
@@ -329,15 +322,12 @@ export class TaskPublishing {
    */
   #problems(identity: PlanIdentity): string[] {
     const task = this.#store.getTask(identity);
-    // An owed finding paid here first: only this process knows its text. Only while the task is still in needs human from
-    // that payment (the same current attempt); once a later run has started, the finding is an earlier attempt's.
-    const key = identityKey(identity), escalated = this.#escalations.get(key);
-    if (escalated && task.status === 'needs human' && escalated.attemptId === task.currentAttemptId) return [escalated.reason];
-    this.#escalations.delete(key);
+    // ItemExecutor remembers every escalation it makes because an unsaved finding exists nowhere else after it is settled.
+    // It returns that reason only while this task is still at the human gate on the same current attempt.
+    const escalated = this.#executor.escalationReason(identity);
+    if (escalated) return [escalated];
     const current = task.currentAttemptId === null ? undefined : this.#store.getAttempt(identity, task.currentAttemptId);
     if (current?.safetyFinding) return [current.safetyFinding];
-    // A finding whose save failed while the run still moved the task: the attempt's diagnostic is the finding's text.
-    if (current?.diagnostic?.startsWith(SAFETY_VIOLATION)) return [current.diagnostic];
     if (task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) return ['The task\'s time budget ran out before its plan finished.'];
     if (current?.diagnostic) return [current.diagnostic];
     return ['The task needs a person.'];

@@ -297,6 +297,7 @@ const direct = <T>(fn: () => T): T => fn();
  */
 export class ItemExecutor {
   #store: Store; #runner: RunnerCoordinator; #sources: ExecutionSources; #findings: SafetyFindings;
+  #escalations = new Map<string, { reason: string; attemptId: string | null }>();
   #deadlineMs: number;
   /** F2's status changes after an attempt settles are settlement writes: they still land after the shutdown gate closes. */
   #write: <T>(fn: () => T) => T;
@@ -348,6 +349,16 @@ export class ItemExecutor {
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }
+  /**
+   * The reason this process most recently moved the task to needs human. An unsaved finding exists nowhere else after
+   * #escalate settles it, so publishing reads it here. It applies only while that same attempt still owns the human gate.
+   */
+  escalationReason(identity: PlanIdentity): string | undefined {
+    const key = identityKey(identity), escalation = this.#escalations.get(key), task = this.#store.getTask(identity);
+    if (escalation && task.status === 'needs human' && escalation.attemptId === task.currentAttemptId) return escalation.reason;
+    this.#escalations.delete(key);
+    return undefined;
+  }
   /**
    * Whether an earlier run left work owed that the next run pays before any item: a safety finding not yet acted on, or
    * a scope pause never recorded (a failed write, the write gate, a crash). Reads only.
@@ -529,6 +540,12 @@ export class ItemExecutor {
   #escalate(identity: PlanIdentity, row: AttemptRecord, violation: string,
     stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[], owed = false): ExecutionOutcome {
     const item = row.item!, task = this.#store.getTask(identity);
+    const remember = () => {
+      const current = this.#store.getTask(identity), key = identityKey(identity);
+      if (current.status === 'needs human' && current.currentAttemptId === row.id)
+        this.#escalations.set(key, { reason: violation, attemptId: row.id });
+      else this.#escalations.delete(key);
+    };
     // The terminal write failed: the attempt still counts as active, so the move waits for restart; keep the finding owed.
     if (row.state === 'pending' || row.state === 'running') {
       const unresolved = this.#runner.status(identity).unresolved;
@@ -537,8 +554,9 @@ export class ItemExecutor {
     // A saved finding: the terminal write acted on it, so the task went to needs human then (or was closed by a pending
     // cancel), and where it is now is a person's doing.
     if (!this.#findings.owed(row.id)) {
-      return CLOSED_STATUSES.includes(task.status) ? stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`)
-        : { kind: 'needs human', item, reason: violation, completed: [...done] };
+      if (CLOSED_STATUSES.includes(task.status)) return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
+      remember();
+      return { kind: 'needs human', item, reason: violation, completed: [...done] };
     }
     if (CLOSED_STATUSES.includes(task.status)) {
       this.#findings.settle(row.id);
@@ -547,6 +565,7 @@ export class ItemExecutor {
     // Already where the finding sends it: nothing is owed.
     if (task.status === 'needs human') {
       this.#findings.settle(row.id);
+      remember();
       return { kind: 'needs human', item, reason: violation, completed: [...done] };
     }
     if (HUMAN_GATES.includes(task.status))
@@ -559,7 +578,7 @@ export class ItemExecutor {
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);
     }
     // Inside a caller's transaction (begin, #91 part 2) the move can still roll back; the finding stays owed until it commits.
-    this.#store.afterCommit(() => this.#findings.settle(row.id));
+    this.#store.afterCommit(() => { this.#findings.settle(row.id); remember(); });
     return { kind: 'needs human', item, reason: violation, completed: [...done] };
   }
   /** The earliest completed execute attempt whose out-of-scope files have no checkpoint yet (its pause was lost). */

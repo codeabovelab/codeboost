@@ -88,7 +88,7 @@ describe('merge coordinator after the gate closes', () => {
     store.createPlan(JSON.stringify(plan), 'json', { identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] }, oid(1), oid(2));
     const view = { items: [{ id: 'P1', state: 'approved', outside: [], acceptance: [], checks: {} }], plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: store.getSnapshot(identity).id, base: oid(1), head: oid(2) }, token: 't', expected: { revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) } } as unknown as ReturnType<ReviewService['load']>;
     const service = { store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService;
-    const state: RemoteMergeState = { base: oid(1), head: oid(2), pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', ...remote };
+    const state: RemoteMergeState = { base: oid(1), head: oid(2), pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false, ...remote };
     const gateway: MergeGateway & MergeQueueGateway = {
       inspect: vi.fn(async () => state), merge: vi.fn(async () => ({ url: 'https://github.example/pr/1' })),
       queueWatermark: vi.fn(async () => 'c'), inspectQueue: vi.fn(async () => ({ state: 'merged', reviewedHead: oid(2), mergedAt: '2026-09-26T00:00:00Z' }) as never),

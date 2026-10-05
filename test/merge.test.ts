@@ -29,7 +29,7 @@ function alreadyFixedReads(args: readonly string[], fake: IssueFake = {}): strin
 /** Answers the merge adapter's own reads: an open PR 7 into main with no rules or protection. */
 function mergeReads(args: readonly string[], pull: Record<string, unknown> = {}): string {
   const joined = args.join(' ');
-  if (joined.startsWith('pr view 7')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], ...pull });
+  if (joined.startsWith('pr view 7')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [], ...pull });
   if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
   if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
   if (/\/branches\/[^/]+$/.test(joined)) return JSON.stringify({ protected: false });
@@ -44,7 +44,7 @@ function readyView(): ReviewView {
 function serviceFor(view: ReviewView): ReviewService { return { load: vi.fn(() => view) } as unknown as ReviewService; }
 
 function remote(view: ReviewView, change: Partial<RemoteMergeState> = {}): RemoteMergeState {
-  return { base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', ...change };
+  return { base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false, ...change };
 }
 
 function gateway(states: RemoteMergeState[]): MergeGateway & { heads: string[] } {
@@ -886,7 +886,7 @@ it('parses required checks from both rule sources and pins the gh merge head', a
   let pullReads = 0;
   const run = async (args: readonly string[]) => {
     calls.push([...args]); const joined = args.join(' ');
-    if (joined.startsWith('pr view 7')) { pullReads++; return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
+    if (joined.startsWith('pr view 7')) { pullReads++; return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [
       { name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } },
       { name: 'race', status: 'IN_PROGRESS', conclusion: 'SUCCESS' },
       { context: 'lint', state: 'SUCCESS' },
@@ -1121,7 +1121,7 @@ it.each([
 ] as const)('fails closed for an invalid %s check app identity', async (_source, rules, requiredStatusChecks) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } }] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [{ name: 'test', status: 'COMPLETED', conclusion: 'SUCCESS', app: { databaseId: 10 } }] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([rules]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });
@@ -1164,7 +1164,7 @@ it('preserves caller cancellation while reading merge status', async () => {
 it.each([[false, true], [true, false]])('treats a protection 404 with protected=%s as rulesKnown=%s', async (protectedBranch, expectedKnown) => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: protectedBranch });
     if (joined.endsWith('/protection')) throw new Error('HTTP 404: Not Found');
@@ -1179,7 +1179,7 @@ it.each([[false, true], [true, false]])('treats a protection 404 with protected=
 it.each([false, 'required', []])('fails closed for malformed classic protection metadata: %j', async requiredStatusChecks => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });
@@ -1193,7 +1193,7 @@ it.each([false, 'required', []])('fails closed for malformed classic protection 
 it('fails closed for a ruleset entry without a type', async () => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{}]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: true, checks: [] } });
@@ -1207,7 +1207,7 @@ it('fails closed for a ruleset entry without a type', async () => {
 it('does not treat empty strict check policies as an atomic base guard', async () => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[{ type: 'required_status_checks', parameters: { strict_required_status_checks_policy: true, required_status_checks: [] } }]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: { strict: true, checks: [], contexts: [] } });
@@ -1485,7 +1485,7 @@ it('does not let an inspection started before merge repopulate the cache', async
   const delayedTimeline = new Promise<string>(resolve => { releaseTimeline = resolve; });
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) { pullReads++; return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] }); }
+    if (joined.startsWith('pr view')) { pullReads++; return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] }); }
     if (joined.startsWith('pr merge')) return '';
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: false });
@@ -1512,7 +1512,7 @@ it.each([
 ])('fails closed for inconsistent classic protection fields: %j', async requiredStatusChecks => {
   const run = async (args: readonly string[]) => {
     const joined = args.join(' ');
-    if (joined.startsWith('pr view')) return JSON.stringify({ baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
+    if (joined.startsWith('pr view')) return JSON.stringify({ number: 7, isDraft: false, baseRefName: 'main', baseRefOid: sha('a'), headRefName: 'feature', headRefOid: sha('b'), state: 'OPEN', mergeable: 'MERGEABLE', statusCheckRollup: [] });
     if (joined.includes('/rules/branches/')) return JSON.stringify([[]]);
     if (/branches\/main$/.test(joined)) return JSON.stringify({ protected: true });
     if (joined.endsWith('/protection')) return JSON.stringify({ required_status_checks: requiredStatusChecks });

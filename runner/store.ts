@@ -50,6 +50,11 @@ export interface MergeAttempt {
   occurredAt: string | null; createdAt: string; updatedAt: string;
   /** The user action that started this attempt; its saved replay response follows the attempt. */
   actionId?: string | null;
+  /**
+   * The PR this attempt merges (#121). Reconciliation and queue polls read this PR, never one resolved again. Attempts saved
+   * before #121 have none: they targeted the configured `github.pullRequest`.
+   */
+  pullRequest?: number | null;
 }
 /** Saved replay response for the user action that started a merge; refreshed on every attempt change. */
 export function mergeActionResponse(attempt: MergeAttempt) {
@@ -399,8 +404,16 @@ export class Store {
     if (typeof reason !== 'string' || !reason.trim() || reason.length > 4000) throw new Error('Invalid cancellation reason.');
     this.#run("UPDATE requests SET state='cancelled',reason=? WHERE id=? AND key=? AND state IN ('pending','ready')", reason.trim(), id, identityKey(identity));
   }
-  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null): MergeAttempt {
+  /**
+   * `target`: the PR the attempt merges. With an `openingId` (the task's published PR, #121), that opening must still be
+   * the task's opened record in its base whose opening began last, with that number, and no opening or update of the
+   * task's PRs may be in flight.
+   */
+  beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null,
+    target: { pullRequest: number; openingId: string | null } | null = null): MergeAttempt {
     sha(reviewedHead);
+    if (target !== null && (!Number.isSafeInteger(target.pullRequest) || target.pullRequest < 1 || (target.openingId !== null && typeof target.openingId !== 'string')))
+      throw new Error('Invalid merge target.');
     if (actionId !== null) assertUuidV4(actionId, 'Action ID');
     if (!['queue','direct'].includes(kind)) throw new Error('Invalid merge attempt kind.');
     if (queueWatermark !== null && (typeof queueWatermark !== 'string' || !queueWatermark || queueWatermark.length > 512)) throw new Error('Invalid merge-queue event cursor.');
@@ -420,11 +433,19 @@ export class Store {
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
       if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');
+      if (target?.openingId) {
+        if (this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND (state='opening' OR refresh_head IS NOT NULL)", key))
+          throw new GuardRefusal('The task\'s pull request is being opened or updated. Wait for publishing to finish, then refresh.');
+        const row = this.#get('SELECT rowid, state, number, base, repository FROM task_pull_requests WHERE plan_key=? AND opening_id=?', key, target.openingId);
+        const newer = row && this.#get("SELECT 1 FROM task_pull_requests WHERE plan_key=? AND state='opened' AND rowid>? AND base=? AND lower(repository)=lower(?)",
+          key, row.rowid as number, row.base as string, row.repository as string);
+        if (row?.state !== 'opened' || row.number !== target.pullRequest || newer) throw new GuardRefusal('The task\'s pull request changed during merge validation. Refresh before merging.');
+      }
       const now = new Date().toISOString();
       const attempt: MergeAttempt = {
         id: randomUUID(), kind, state: 'submitting', revision: expected.revision, snapshotId: expected.snapshotId,
         reviewVersion: expected.reviewVersion, reviewedHead, queueWatermark, url: null, reason: null, requiresFreshReview: false,
-        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now, actionId,
+        entryId: null, phase: null, position: null, occurredAt: null, createdAt: now, updatedAt: now, actionId, pullRequest: target?.pullRequest ?? null,
       };
       this.#run('INSERT INTO merge_attempts VALUES (?,?,?)', attempt.id, key, encode(attempt));
       this.#touch(key);

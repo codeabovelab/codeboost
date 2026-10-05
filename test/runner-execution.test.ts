@@ -608,6 +608,7 @@ describe('item execution', () => {
     expect(atRelease).toBe('needs human');
     const row = store.getAttempts(identity)[0]!;
     expect(row).toMatchObject({ state: 'failed', safetyFinding: expect.stringContaining('Git metadata') });
+    expect(h.executor.escalationReason(identity)).toBeUndefined();
   });
   it('treats an audit that throws as a safety violation', async () => {
     const { store, executor, commits } = setup({ pathKeyError: new Error('Non-ASCII case-insensitive paths require an adapter.') });

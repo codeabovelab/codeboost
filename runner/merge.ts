@@ -1,7 +1,8 @@
 import type { ReviewService } from './review.ts';
 import { mergeActionResponse, type MergeAttempt } from './store.ts';
 import { ActionIdReused, GuardRefusal, MERGEABLE_STATUSES, ShuttingDownError, assertUuidV4, settleWith, type ShutdownCapability } from './lifecycle.ts';
-import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type RemoteMergeState } from '../github/merge.ts';
+import { MERGE_INSPECTION_TIMEOUT_MS, MergeSubmissionError, type MergeGateway, type MergeQueueGateway, type MergeQueueObservation, type MergeResult, type MergeTarget, type RemoteMergeState } from '../github/merge.ts';
+import { openingMarker } from '../github/pull-requests.ts';
 
 type ReviewView = ReturnType<ReviewService['load']>;
 type QueueGateway = MergeGateway & MergeQueueGateway;
@@ -27,6 +28,21 @@ export interface MergeStatus {
   remote: RemoteMergeState; queue: MergeQueueStatus | null;
 }
 export interface MergeUnavailableStatus { available: true; ready: false; action: null; blockers: MergeBlocker[]; remote: null; queue: MergeQueueStatus | null; }
+/**
+ * With a runner block (#121), the merge targets the task's published PR, not `github.pullRequest`: the opened record
+ * whose opening began last among the task's records in `repository` and `baseBranch`. GitHub must show it from the task
+ * branch, into that base, with that record's marker as its first line, as the only open PR from the branch.
+ */
+export interface PublishedTarget {
+  repository: string;
+  baseBranch: string;
+  /** `github.pullRequest`, if the configuration still names one. It must be the task's PR. */
+  configured?: number;
+}
+/** No PR can be inspected. The display keeps the blockers found before the target was resolved. */
+class MergeTargetUnavailable extends Error { blockers: MergeBlocker[] = []; }
+/** The PR one status read inspected. `openingId` is set for the task's published PR, which admission re-reads. */
+interface ResolvedTarget { target?: MergeTarget; openingId: string | null; marker?: string; headBranch?: string }
 
 function queueGateway(gateway: MergeGateway): gateway is QueueGateway {
   const queue = gateway as Partial<MergeQueueGateway>;
@@ -44,16 +60,60 @@ export class MergeCoordinator {
   readonly service: ReviewService;
   readonly gateway: MergeGateway;
   readonly operationTimeoutMs: number;
+  readonly published: PublishedTarget | null;
   /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
   #settle: <T>(fn: () => T) => T;
-  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability) {
+  constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability, published?: PublishedTarget) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > MERGE_OPERATION_TIMEOUT_MS) throw new Error('Invalid merge operation deadline.');
-    this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs;
+    if (published && (published.configured !== undefined && (!Number.isSafeInteger(published.configured) || published.configured < 1))) throw new Error('Invalid configured pull request.');
+    this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs; this.published = published ?? null;
     this.#settle = settleWith(capability);
   }
 
   #attempt(): MergeAttempt | null {
     return this.service.store?.getMergeAttempt(this.service.config.identity) ?? null;
+  }
+
+  /**
+   * The PR to inspect. An attempt in flight or merged keeps the PR it was started for. Otherwise, without a runner block,
+   * the gateway's configured PR; with one, the task's opened PR in the configured base whose opening began last (#121).
+   */
+  #resolve(attempt: MergeAttempt | null): ResolvedTarget {
+    const pinned = attempt && (attempt.state === 'submitting' || attempt.state === 'queued' || attempt.state === 'merged') ? attempt : null;
+    const published = this.published;
+    if (!published) return { ...(pinned?.pullRequest ? { target: { pullRequest: pinned.pullRequest } } : {}), openingId: null };
+    const rows = this.service.store.taskPullRequests(this.service.config.identity);
+    const here = rows.filter(pr => pr.repository.toLowerCase() === published.repository.toLowerCase());
+    const ownPullRequests = [...new Set(here.flatMap(pr => pr.number === null ? [] : [pr.number]))];
+    if (pinned) {
+      // An attempt saved before #121 has no PR: it merged the configured one.
+      const number = pinned.pullRequest ?? published.configured;
+      if (!number) throw new MergeTargetUnavailable('This merge attempt was saved without its pull request, and github.pullRequest is not set. Set github.pullRequest to the pull request it merged.');
+      return { target: { pullRequest: number, ownPullRequests }, openingId: null };
+    }
+    if (rows.some(pr => pr.state === 'opening' || pr.refresh !== null))
+      throw new MergeTargetUnavailable('The task\'s pull request is being opened or updated. Wait for publishing to finish, then refresh.');
+    const latest = here.filter(pr => pr.state === 'opened' && pr.base === published.baseBranch).at(-1);
+    if (!latest || latest.number === null) throw new MergeTargetUnavailable(`The task has no published pull request into ${published.baseBranch}.`);
+    if (published.configured !== undefined && published.configured !== latest.number)
+      throw new MergeTargetUnavailable(`github.pullRequest is #${published.configured}, but the task's pull request is #${latest.number}. Remove github.pullRequest from the review configuration.`);
+    return { target: { pullRequest: latest.number, ownPullRequests, headBranch: latest.headBranch }, openingId: latest.openingId,
+      marker: openingMarker(latest.openingId), headBranch: latest.headBranch };
+  }
+
+  /** Whether GitHub shows the task's published PR where it was opened, as the only open PR from its branch. */
+  #publishedBlockers(remote: RemoteMergeState, resolved: ResolvedTarget): MergeBlocker[] {
+    const number = resolved.target!.pullRequest, branch = resolved.headBranch!, base = this.published!.baseBranch, seen = remote.published;
+    const blocker = (message: string) => [{ code: 'pull-request', message }];
+    if (remote.pullRequest !== number || !seen) return blocker(`GitHub did not report pull request #${number} as the task's pull request.`);
+    if (seen.crossRepository || seen.headBranch !== branch || seen.baseBranch !== base)
+      return blocker(`Pull request #${number} is no longer from ${branch} into ${base}. Restore its branch and base, or close it and publish the task again.`);
+    if (seen.marker !== resolved.marker) return blocker(`Pull request #${number} no longer starts with its codeboost marker. Restore its first line.`);
+    if (remote.pullRequestState !== 'OPEN') return [];
+    const others = seen.branchOpen.filter(pr => pr.number !== number);
+    if (others.length) return blocker(`Pull request #${number} must be the only open pull request from ${branch}. Close ${others.map(pr => `#${pr.number} (into ${pr.base})`).join(', ')}.`);
+    if (!seen.branchOpen.some(pr => pr.number === number && pr.base === base)) return blocker(`GitHub's pull request list does not show #${number} yet. Refresh later.`);
+    return [];
   }
 
   #current(attempt: MergeAttempt): boolean {
@@ -84,6 +144,10 @@ export class MergeCoordinator {
   }
 
   async status(view = this.service.load(), fresh = false, signal?: AbortSignal): Promise<MergeStatus> {
+    return (await this.#status(view, fresh, signal)).status;
+  }
+
+  async #status(view: ReviewView, fresh: boolean, signal?: AbortSignal): Promise<{ status: MergeStatus; resolved: ResolvedTarget }> {
     const blockers: MergeBlocker[] = [];
     for (const item of view.items) {
       if (item.state !== 'approved') blockers.push({ code: 'approval', message: `${item.id} is ${item.state}.` });
@@ -101,8 +165,14 @@ export class MergeCoordinator {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
     }
-    const remote = await this.gateway.inspect({ fresh, timeoutMs: fresh ? 6_000 : undefined, signal });
+    let resolved: ResolvedTarget;
+    try { resolved = this.#resolve(this.#attempt()); }
+    catch (error) { if (error instanceof MergeTargetUnavailable) error.blockers = blockers; throw error; }
+    const remote = await this.gateway.inspect({ fresh, timeoutMs: fresh ? 6_000 : undefined, signal, ...(resolved.target ? { target: resolved.target } : {}) });
     if (signal?.aborted) throw signal.reason;
+    if (resolved.target && remote.pullRequest !== resolved.target.pullRequest) throw new Error('GitHub returned a different pull request.');
+    if (resolved.headBranch !== undefined) blockers.push(...this.#publishedBlockers(remote, resolved));
+    if (remote.draft) blockers.push({ code: 'draft', message: `Pull request #${remote.pullRequest} is a draft; GitHub does not merge a draft.` });
     if (remote.pullRequestState !== 'OPEN') blockers.push({ code: 'pr-state', message: `Pull request is ${remote.pullRequestState.toLowerCase()}.` });
     if (remote.base !== view.snapshot.base) blockers.push({ code: 'base', message: 'The base branch moved. Rebase and review the resulting snapshot.' });
     if (remote.head !== view.snapshot.head) blockers.push({ code: 'head', message: 'The pull request head moved. Refresh the review.' });
@@ -121,25 +191,29 @@ export class MergeCoordinator {
 
     let attempt = this.#attempt();
     if (attempt?.kind === 'direct' && attempt.state === 'submitting') {
-      if (remote.pullRequestState === 'MERGED' && remote.head === attempt.reviewedHead)
+      // Only a read of the attempt's own PR settles it (#121); an attempt saved before #121 merged the PR read here.
+      if (remote.pullRequestState === 'MERGED' && remote.head === attempt.reviewedHead && (attempt.pullRequest == null || attempt.pullRequest === remote.pullRequest))
         // Reconciling a lost response: keep GitHub's PR URL, so a replayed click reports it as the first response would.
         this.service.store.finishMergeAttempt(this.service.config.identity, attempt.id, { state: 'merged', ...(remote.url ? { url: remote.url } : {}) });
       attempt = this.#attempt();
     }
     const queue = this.#queueStatus(attempt);
-    if (attempt?.state === 'submitting' || attempt?.state === 'queued') {
-      blockers.unshift({ code: 'queue-active', message: attempt.state === 'submitting'
-        ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
-        : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' });
-    } else if (attempt?.state === 'merged') {
-      blockers.unshift({ code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' });
-    } else if (attempt && !this.#freshReviewComplete(attempt)) {
-      blockers.unshift({ code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' });
-    }
+    const attemptBlocker = this.#attemptBlocker(attempt);
+    if (attemptBlocker) blockers.unshift(attemptBlocker);
     const active = attempt?.state === 'submitting' || attempt?.state === 'queued' || attempt?.state === 'merged';
     const retry = !!queue?.retryable;
     const ready = !active && blockers.length === 0;
-    return { available: true, ready, action: ready ? (retry ? 'retry' : 'merge') : null, blockers, remote, queue };
+    return { status: { available: true, ready, action: ready ? (retry ? 'retry' : 'merge') : null, blockers, remote, queue }, resolved };
+  }
+
+  /** What the merge attempt on record says, shown first. */
+  #attemptBlocker(attempt: MergeAttempt | null): MergeBlocker | null {
+    if (attempt?.state === 'submitting' || attempt?.state === 'queued') return { code: 'queue-active', message: attempt.state === 'submitting'
+      ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
+      : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' };
+    if (attempt?.state === 'merged') return { code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' };
+    if (attempt && !this.#freshReviewComplete(attempt)) return { code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' };
+    return null;
   }
 
   async displayStatus(view = this.service.load(), signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
@@ -147,6 +221,11 @@ export class MergeCoordinator {
     catch (error) {
       if (error instanceof ShuttingDownError) throw error;
       if (signal?.aborted) throw signal.reason;
+      if (error instanceof MergeTargetUnavailable) {
+        const attempt = this.#attempt(), attemptBlocker = this.#attemptBlocker(attempt);
+        const blockers = [...(attemptBlocker ? [attemptBlocker] : []), { code: 'pull-request', message: error.message }, ...error.blockers];
+        return { available: true, ready: false, action: null, blockers, remote: null, queue: this.#queueStatus(attempt) };
+      }
       return { available: true, ready: false, action: null, blockers: [{ code: 'github', message: `Could not read GitHub merge state. ${error instanceof Error ? error.message : 'Unknown error.'}` }], remote: null, queue: this.#queueStatus() };
     }
   }
@@ -254,12 +333,16 @@ export class MergeCoordinator {
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
-      const status = await this.#statusForMerge(view, signal);
+      const { status, resolved } = await this.#statusForMerge(view, signal);
       if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
       view = this.service.load();
       if (view.token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
-      const finalStatus = await this.#statusForMerge(view, signal);
-      if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head) throw new Error('The pull request changed during merge validation. Refresh before merging.');
+      const { status: finalStatus, resolved: finalTarget } = await this.#statusForMerge(view, signal);
+      // The same PR, opened by the same opening, in every pass (#121).
+      const samePullRequest = (other: { status: MergeStatus; resolved: ResolvedTarget }) =>
+        other.status.remote.pullRequest === status.remote.pullRequest && other.resolved.openingId === resolved.openingId;
+      if (finalStatus.remote.base !== status.remote.base || finalStatus.remote.head !== status.remote.head || !samePullRequest({ status: finalStatus, resolved: finalTarget }))
+        throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (finalStatus.remote.mergeQueue !== status.remote.mergeQueue) throw new Error('Merge-queue requirements changed during validation. Refresh before merging.');
       if (!finalStatus.ready) throw new Error(`Merge requirements changed during validation. ${finalStatus.blockers[0]!.message}`);
       let commandStatus = finalStatus;
@@ -267,9 +350,10 @@ export class MergeCoordinator {
       if (status.remote.mergeQueue) {
         if (!queueGateway(this.gateway)) throw new Error('This GitHub adapter cannot verify the merge-queue lifecycle.');
         if (view.expected.reviewVersion === undefined) throw new Error('A current review version is required for merging.');
-        queueWatermark = await this.gateway.queueWatermark(status.remote.head, { signal, timeoutMs: 6_000 });
-        commandStatus = await this.#statusForMerge(view, signal);
-        if (commandStatus.remote.base !== finalStatus.remote.base || commandStatus.remote.head !== finalStatus.remote.head || commandStatus.remote.mergeQueue !== finalStatus.remote.mergeQueue)
+        queueWatermark = await this.gateway.queueWatermark(status.remote.head, { signal, timeoutMs: 6_000, pullRequest: status.remote.pullRequest });
+        const command = await this.#statusForMerge(view, signal);
+        commandStatus = command.status;
+        if (commandStatus.remote.base !== finalStatus.remote.base || commandStatus.remote.head !== finalStatus.remote.head || commandStatus.remote.mergeQueue !== finalStatus.remote.mergeQueue || !samePullRequest(command))
           throw new Error('Merge-queue requirements changed after queue correlation. Refresh before merging.');
         if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
       }
@@ -278,7 +362,7 @@ export class MergeCoordinator {
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
         const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
         const begin = () => store.beginMergeAttempt(config.identity, { ...view.expected, reviewVersion }, commandStatus.remote.head, queueWatermark,
-          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion);
+          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion, { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId });
         let begun: MergeAttempt | null = null;
         // The attempt and the click's saved response commit in one transaction, or neither does.
         if (action) store.userAction(config.identity, action, () => mergeActionResponse(begun = begin()));
@@ -287,7 +371,7 @@ export class MergeCoordinator {
         if (!begun) throw new Error('This merge click was already submitted. Refresh to see its outcome.');
         queueAttempt = begun;
       }
-      const result = await this.gateway.merge(commandStatus.remote.head, { signal });
+      const result = await this.gateway.merge(commandStatus.remote.head, { signal, pullRequest: commandStatus.remote.pullRequest });
       if (queueAttempt) {
         // The enqueue command has already committed externally. A local refresh failure must not
         // report that action as failed; the durable submitting record is recoverable by polling.
@@ -342,9 +426,9 @@ export class MergeCoordinator {
     }
   }
 
-  #statusForMerge(view: ReviewView, signal: AbortSignal): Promise<MergeStatus> {
+  #statusForMerge(view: ReviewView, signal: AbortSignal): Promise<{ status: MergeStatus; resolved: ResolvedTarget }> {
     if (signal.aborted) return Promise.reject(signal.reason);
-    return this.status(view, true, signal);
+    return this.#status(view, true, signal);
   }
 
   async pollQueue(): Promise<MergeQueueStatus | null> {
@@ -354,9 +438,12 @@ export class MergeCoordinator {
     if (!attempt || (attempt.state !== 'submitting' && attempt.state !== 'queued')) return this.#queueStatus(attempt);
     if (attempt.kind === 'direct') return this.#queueStatus(attempt);
     if (!queueGateway(this.gateway)) return this.#queueStatus(attempt, 'This GitHub adapter cannot verify the merge-queue lifecycle.');
+    // The attempt's own PR; an attempt saved before #121 queued the configured one.
+    const pullRequest = attempt.pullRequest ?? this.published?.configured;
+    if (this.published && !pullRequest) return this.#queueStatus(attempt, 'This merge attempt was saved without its pull request, and github.pullRequest is not set. Set github.pullRequest to the pull request it queued.');
     const abort = new AbortController();
     this.#queueAbort = abort;
-    const poll = this.#pollQueue(attempt, abort.signal).finally(() => {
+    const poll = this.#pollQueue(attempt, pullRequest ?? undefined, abort.signal).finally(() => {
       if (this.#queuePoll === poll) this.#queuePoll = null;
       if (this.#queueAbort === abort) this.#queueAbort = null;
     });
@@ -366,9 +453,10 @@ export class MergeCoordinator {
 
   queueSnapshot(): MergeQueueStatus | null { return this.#queueStatus(); }
 
-  async #pollQueue(attempt: MergeAttempt, signal: AbortSignal): Promise<MergeQueueStatus | null> {
+  async #pollQueue(attempt: MergeAttempt, pullRequest: number | undefined, signal: AbortSignal): Promise<MergeQueueStatus | null> {
     try {
-      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: MERGE_INSPECTION_TIMEOUT_MS, afterCursor: attempt.queueWatermark ?? null });
+      const observation = await (this.gateway as QueueGateway).inspectQueue(attempt.reviewedHead, { signal, timeoutMs: MERGE_INSPECTION_TIMEOUT_MS, afterCursor: attempt.queueWatermark ?? null,
+        ...(pullRequest !== undefined ? { pullRequest } : {}) });
       this.#publishQueueObservation(attempt, observation);
       return this.#queueStatus();
     } catch (error) {

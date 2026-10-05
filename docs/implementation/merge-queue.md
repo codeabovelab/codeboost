@@ -4,7 +4,7 @@ Queue-backed merging is enabled only when the configured GitHub adapter implemen
 
 ## Durable lifecycle
 
-SQLite owns the merge-attempt record and retains its plan revision, snapshot, review version, and exact reviewed head. Legal transitions are:
+SQLite owns the merge-attempt record and retains its plan revision, snapshot, review version, exact reviewed head, and the pull request it merges (#121). The queue watermark, enqueue and every later queue inspection use that pull request, never the one the gate would choose now (see "Which pull request" in `guarded-merge.md`). An attempt saved before #121 names none; it queued `github.pullRequest`, which is read instead, and without that setting a poll reports an observation error and leaves the attempt unchanged. Legal transitions are:
 
 ```text
 submitting -> queued -> merged
