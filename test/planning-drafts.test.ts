@@ -161,7 +161,7 @@ it('migrates a database that already has the mode column below v11', () => {
   expect(open().getDraft(identity, id).state).toBe('ready');
 });
 
-it.each([9, 10])('migrates a v%i database to v11, reading its existing requests as suggestions', version => {
+it.each([9, 10])('migrates a v%i database to the current schema, reading its existing requests as suggestions', version => {
   const { store, path, open } = fixture(), id = store.beginSuggestions(identity, state(store), 'suggest');
   store.close(); stores.splice(stores.indexOf(store), 1);
   const legacy = new DatabaseSync(path);
@@ -170,7 +170,7 @@ it.each([9, 10])('migrates a v%i database to v11, reading its existing requests 
   const migrated = open();
   expect(migrated.getSuggestions(identity, id)).toMatchObject({ mode: 'suggest', state: 'pending' });
   const db = new DatabaseSync(path);
-  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 }); } finally { db.close(); }
+  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 12 }); } finally { db.close(); }
 });
 
 /** E3 in draft mode, with a provider that answers from `source`. */

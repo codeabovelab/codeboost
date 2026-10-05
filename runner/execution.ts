@@ -278,6 +278,7 @@ export type ExecutionOutcome =
 /** A run in progress: its plan, the item it is on and that item's attempt, and what it finished. */
 interface Run {
   plan: ReturnType<Store['getPlan']>; index: number; attempt: AttemptRecord; done: string[]; unchanged: string[];
+  reviewVersion?: number;
   stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome;
 }
 const refusal = (error: unknown) => error instanceof GuardRefusal || error instanceof ShuttingDownError;
@@ -319,7 +320,7 @@ export class ItemExecutor {
    * throws (the refusal itself where admission refused), and the caller's own writes roll back with it. A finding or scope
    * pause owed from an earlier run is acted on instead, as the run's whole outcome, and admits nothing (`attemptId` null).
    */
-  begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean } = {}): { attemptId: string | null; outcome: Promise<ExecutionOutcome> } {
+  begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean; expectedReviewVersion?: number } = {}): { attemptId: string | null; outcome: Promise<ExecutionOutcome> } {
     const key = identityKey(identity);
     if (this.#inFlight.has(key)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     const begun = this.#begin(identity, options, true);
@@ -388,11 +389,12 @@ export class ItemExecutor {
    * The synchronous start of a run: owed work first, then the first item's admission. With `strict`, a run that cannot
    * admit its first item throws instead of returning a stopped outcome.
    */
-  #begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean }, strict: boolean): { outcome: ExecutionOutcome } | Run {
+  #begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean; expectedReviewVersion?: number }, strict: boolean): { outcome: ExecutionOutcome } | Run {
     const plan = this.#store.getPlan(identity);
     const start = options.fromItem ? plan.items.findIndex(item => item.id === options.fromItem) : 0;
     if (start < 0) throw new Error('Unknown plan item.');
-    const run: Run = { plan, index: start, attempt: undefined!, done: [], unchanged: [], stopped: undefined! };
+    const run: Run = { plan, index: start, attempt: undefined!, done: [], unchanged: [], stopped: undefined!,
+      ...(options.expectedReviewVersion === undefined ? {} : { reviewVersion: options.expectedReviewVersion }) };
     run.stopped = (item, state, reason) => ({ kind: 'stopped', item, state, reason, completed: [...run.done] });
     const notStarted = (reason: string, error?: unknown): { outcome: ExecutionOutcome } => {
       if (strict) throw error ?? new GuardRefusal(reason);
@@ -455,6 +457,16 @@ export class ItemExecutor {
     }
     if (expected && !sameContext(current, expected))
       return run.stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
+    if (run.reviewVersion !== undefined) {
+      const changed = this.#store.reviewVersion(identity) !== run.reviewVersion;
+      const unapproved = changed ? [] : this.#store.unapprovedExecutionItems(identity, run.plan.revision);
+      if (changed || unapproved.length) {
+        const reason = changed ? `The review changed during the run; review it before running ${item.id}.`
+          : `Approve every plan item before running ${item.id}. Waiting for: ${unapproved.join(', ')}.`;
+        if (strict) throw new GuardRefusal(reason);
+        return run.stopped(item.id, 'not started', reason);
+      }
+    }
     try {
       return this.#runner.start(identity, {
         expectedStateVersion: this.#store.getTask(identity).stateVersion, kind: 'execute', item: item.id,

@@ -124,8 +124,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 11) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 12) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -186,6 +186,20 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'mode'))
             this.#db.exec("ALTER TABLE requests ADD COLUMN mode TEXT NOT NULL DEFAULT 'suggest'");
           this.#db.exec('PRAGMA user_version=11');
+        }
+        // Choices written before review-version ordering existed must not become an infinite threshold. Give every
+        // legacy choice the review version at upgrade, then advance the visible version so a fresh approval can follow it.
+        if (version < 12) {
+          const changed = new Set<string>();
+          for (const row of this.#db.prepare('SELECT key,choice_key,data FROM choices').all()) {
+            const choice = decode<SegmentChoice & ReviewState>(row.data);
+            if (Number.isSafeInteger(choice.reviewVersion) && choice.reviewVersion! >= 0) continue;
+            const boundary = this.#current(row.key as string).review_version as number;
+            this.#run('UPDATE choices SET data=? WHERE key=? AND choice_key=?', encode({ ...choice, reviewVersion: boundary }), row.key!, row.choice_key!);
+            changed.add(row.key as string);
+          }
+          for (const key of changed) this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
+          this.#db.exec('PRAGMA user_version=12');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -596,14 +610,14 @@ export class Store {
       if (this.#taskClosed(key)) throw new GuardRefusal('A closed task never changes.');
       // Approvals and choices must not change the reviewed state while GitHub may still merge it.
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-      const plan = this.getPlan(identity);
+      const plan = this.getPlan(identity), reviewVersion = this.reviewVersion(identity);
       for (const approval of approvals) {
         if (!plan.items.some(item => item.id === approval.item) || !approval.fingerprint) throw new Error('Invalid approval.');
-        this.#run('INSERT OR REPLACE INTO approvals VALUES (?,?,?)', key, approval.item, encode({ ...approval, ...expected }));
+        this.#run('INSERT OR REPLACE INTO approvals VALUES (?,?,?)', key, approval.item, encode({ ...approval, ...expected, reviewVersion }));
       }
       for (const choice of choices) {
         if (!choice.key || !['assign','accept'].includes(choice.action) || (choice.action === 'assign' ? !plan.items.some(item => item.id === choice.item) : choice.item !== null)) throw new Error('Invalid segment choice.');
-        this.#run('INSERT OR REPLACE INTO choices VALUES (?,?,?)', key, choice.key, encode({ ...choice, ...expected }));
+        this.#run('INSERT OR REPLACE INTO choices VALUES (?,?,?)', key, choice.key, encode({ ...choice, ...expected, reviewVersion }));
       }
       this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
     });

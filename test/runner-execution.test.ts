@@ -270,6 +270,24 @@ describe('item execution', () => {
     expect(h.commits.map(c => c.item)).toEqual(['P1']);
     expect(h.runner.status(identity).unresolved).toBeNull();
   });
+  it('stops before the next item when review input changes during the run', async () => {
+    let store!: Store, changed = false;
+    const h = setup({ onLaunch: attemptId => {
+      if (changed || store.getAttempt(identity, attemptId).item !== 'P1') return;
+      changed = true;
+      const snapshot = store.getSnapshot(identity);
+      store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, [],
+        [{ key: 'later-choice', action: 'assign', item: 'P1' }]);
+    } });
+    store = h.store;
+    const snapshot = store.getSnapshot(identity), current = store.getPlan(identity);
+    store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
+      current.items.map(item => ({ item: item.id, fingerprint: `approved-${item.id}` })), []);
+    const begun = h.executor.begin(identity, { expectedReviewVersion: store.reviewVersion(identity) });
+    expect(await begun.outcome).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'],
+      reason: expect.stringMatching(/review changed/) });
+    expect(store.getAttempts(identity).map(row => row.item)).toEqual(['P1']);
+  });
   it('still pauses for amendment, bound to where the item ran, when the plan changes after its attempt settled', async () => {
     let store!: Store;
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {

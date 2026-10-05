@@ -120,12 +120,19 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (executor.busy(identity)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     // A publish reads the task head and pushes it; a new item must not move it meanwhile.
     if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
-    // A failed durable save must not let an ordinary refusal strand an in-memory finding until restart loses it.
-    if (executor.owes(identity)) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
+    // A failed durable save must not let an ordinary refusal strand an in-memory safety finding until restart loses it.
+    if (executor.owes(identity, { scope: false })) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
+      claimRequeue: task.requeuePending, queue: false, owed: true };
+    const merge = service.store.getMergeAttempt(identity);
+    const activeMerge = !!merge && (merge.state === 'submitting' || merge.state === 'queued');
+    // Scope-only debt is actionable only where pauseForAmendment can commit it. Otherwise expose the ordinary refusal;
+    // unlike a safety finding, repeatedly offering an impossible pause cannot preserve or improve durable evidence.
+    const scopePausable = ['running', 'in review', 'approved but merge blocked', 'queued'].includes(task.status)
+      && task.cancelRequested === null && !activeMerge;
+    if (scopePausable && executor.owes(identity)) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
       claimRequeue: task.requeuePending, queue: false, owed: true };
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
-    const merge = service.store.getMergeAttempt(identity);
-    if (merge && (merge.state === 'submitting' || merge.state === 'queued')) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    if (activeMerge) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
     // Only the view stops here: the action lets admission refuse, because its refusal also moves the idle task to needs
     // human (the time-limit mapping), and nothing else would.
     if (forView && task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) throw new GuardRefusal('The task time budget has run out; it needs a person.');
@@ -246,7 +253,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         const choice = runChoice(action);
         // In this transaction with the admission: a refused admission rolls the move to queued back with it.
         if (choice.queue) service.store.transitionTask(identity, expectedStateVersion as number, 'queued');
-        const begun = executor!.begin(identity, { fromItem: choice.fromItem, claimRequeue: choice.claimRequeue });
+        const begun = executor!.begin(identity, { fromItem: choice.fromItem, claimRequeue: choice.claimRequeue,
+          expectedReviewVersion: expectedReviewVersion as number });
         // The run goes on after this request; its outcome is in the task and attempt rows. An error the run throws (storage,
         // a missing snapshot) is only logged, and the next start or resume derives what is owed again. Once it ends, the
         // task's PR is published if the task is finished or needs a person (#103).

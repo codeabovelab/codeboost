@@ -426,6 +426,23 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity)).toHaveLength(1);
     expect(await view(app)).toMatchObject({ startable: false, resumable: false });
   });
+  it('does not offer scope-only owed work from a state where the pause cannot be recorded', async () => {
+    for (const blocker of ['human', 'merge'] as const) {
+      const { app, identity, store } = await serve({ before: service => {
+        committedFirstItem(service, false, ['other.ts']);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, blocker === 'human' ? 'needs human' : 'in review');
+        if (blocker === 'merge') {
+          const snapshot = s.getSnapshot(id);
+          s.beginMergeAttempt(id, { revision: s.getPlan(id).revision, snapshotId: snapshot.id,
+            reviewVersion: s.reviewVersion(id) }, snapshot.head, null, 'direct');
+        }
+      } });
+      expect(await view(app), blocker).toMatchObject({ startable: false, resumable: false });
+      expect((await act(app, 'resume')).status, blocker).toBe(409);
+      expect(store.latestCheckpoint(identity), blocker).toBeNull();
+    }
+  });
   it('acts on an owed safety finding before moving a task in review to queued', async () => {
     let earlier = '';
     const { app, identity, store } = await serve({ before: service => {
