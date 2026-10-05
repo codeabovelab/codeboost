@@ -169,7 +169,7 @@ Dependencies point downward only. `core/` imports nothing that does input or out
 | Execution | `runner/execution.ts` | Runs plan items in order: fresh workspace, prompt, agent, post-run audit, then the runner's own commit and ledger entry. Pauses in needs amendment on an out-of-scope edit; moves to needs human on a safety violation. | Not connected; uses a test workspace until #66 part 2 and #87 |
 | Publishing | `runner/publish.ts`, `runner/publishing.ts`, `runner/branch-push.ts` | Runs the already-fixed check, pushes the task head, then opens or reuses the task's pull request (a draft when the task needs a person). Records each opening before calling GitHub, so a lost outcome can be found again by a marker. `TaskPublishing` (#103) publishes when a run ends, on the `publish` runner action, and once at startup, and records the last outcome. On cancel it closes the task's PRs (#111). | With a runner block (needs `github.baseBranch`); never in a demo |
 | Lock and startup recovery | `runner/recovery.ts` | One runner per database, held as an OS lock on the database file's device and inode. Startup recovery finalizes interrupted attempts and removes leftover containers and storage. | Lock in use; recovery not connected |
-| Store | `runner/store.ts` | The only database handle and all SQL. Revision numbers, snapshots, ledger, approvals, choices, notes, suggestion requests, tasks, attempts, user actions, feedback events, merge attempts, pull request openings, already-fixed results. | In use |
+| Store | `runner/store.ts` | The only database handle and all SQL. Revision numbers, snapshots, ledger, approvals, choices, notes, suggestion and draft requests, tasks, attempts, user actions, feedback events, merge attempts, pull request openings, already-fixed results. | In use |
 | Plan logic | `core/plan.ts`, `core/parse-v1.ts`, `schema/` | Schema validation, YAML and JSON import, meaning checks (IDs, dependencies, paths, projected file operations), literal command parsing, suggestion edits. | Yes |
 | Linking engine | `core/linking.ts` | Replays each commit's line changes and assigns every final line to an owner from the ledger. Produces segments and the Unplanned and Ambiguous rows. | Yes |
 | Approvals | `core/approvals.ts` | Approval fingerprints, dependency staleness, assignments, and accept-as-is choices. | Yes |
@@ -351,7 +351,7 @@ All state is in one SQLite file, opened with WAL and full synchronization. Each 
 
 | Group | Tables | Notes |
 |---|---|---|
-| Plans | `plans`, `revisions`, `requests` | SQLite allocates revision numbers. Old revisions are never changed. Suggestion requests are bound to a revision and snapshot. |
+| Plans | `plans`, `revisions`, `requests` | SQLite allocates revision numbers. Old revisions are never changed. Suggestion and draft requests (`mode`, #124) are bound to a revision and snapshot. |
 | Code history | `snapshots`, `ledger`, `rewrites` | Ledger entries are immutable. Rebase mappings record which old commit became which new one; foreign stays foreign. |
 | Review | `approvals`, `choices`, `review_notes`, `checkpoints`, `continuations` | Stored approvals are claims about a past snapshot. Freshness is recomputed every time. |
 | Runner | `tasks`, `attempts`, `user_actions`, `feedback_events`, `merge_attempts`, `app_settings` | User actions carry idempotency keys. Feedback events are append-only and feed the future learning feature. |

@@ -31,26 +31,48 @@ function production(config = demo()): ReviewConfig {
 }
 const text = (number: number): IssueText => ({ number, title: 'Retries ignore the cap', body: 'Body with <tags>.', comments: ['Collaborator note.'] });
 const closable = (close = vi.fn(async () => undefined)) => ({ close, invoke: vi.fn() }) as unknown as PlanningAgent;
+const verified = { verifyLock: () => undefined };
 
 it('is off in a demo and without a github block, so neither plans', () => {
   const config = demo();
-  expect(productionPlanning(config)).toBeUndefined();
-  expect(productionPlanning({ ...config, demo: false })).toBeUndefined();
-  expect(productionPlanning(production(config))).toBeTypeOf('function');
+  expect(productionPlanning(config, verified)).toBeUndefined();
+  expect(productionPlanning({ ...config, demo: false }, verified)).toBeUndefined();
+  expect(productionPlanning(production(config), verified)).toBeTypeOf('function');
 });
 
 it('tells each request the GitHub issue, the repository and the base commit, read with a bound', async () => {
   const config = production(), service = new ReviewService(config); closers.push(() => service.close());
   const issueText = vi.fn(async (number: number) => text(number)), signal = new AbortController().signal;
-  const deps = productionPlanning(config, { issues: { issueText }, agent: () => closable() })!(service);
+  const deps = productionPlanning(config, { ...verified, issues: { issueText }, agent: () => closable() })!(service);
   expect(await deps.describe(signal)).toEqual({ issue: text(config.github!.issue), approvedLessons: [],
     repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base } });
   expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
 });
 
+it('names the configured base branch, when there is one', async () => {
+  const base = production(), config = { ...base, github: { ...base.github!, baseBranch: 'release' } };
+  const service = new ReviewService(config); closers.push(() => service.close());
+  const deps = productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent: () => closable() })!(service);
+  expect((await deps.describe(new AbortController().signal)).repo).toEqual({ name: 'acme/retry-service', baseRef: 'release' });
+});
+
+it('fails requests an earlier process left pending, only after the lock is verified', () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const store = service.store, expected = { revision: store.getPlan(config.identity).revision, snapshotId: store.getSnapshot(config.identity).id };
+  const pending = store.beginSuggestions(config.identity, expected, 'draft');
+  // A lock that no longer names this database: nothing is settled, and startup stops.
+  const refused = productionPlanning(config, { verifyLock: () => { throw new Error('The database path changed.'); }, agent: () => closable() })!;
+  expect(() => refused(service)).toThrow('The database path changed.');
+  expect(store.getDraft(config.identity, pending).state).toBe('pending');
+  const order: string[] = [], settle = vi.spyOn(store, 'settleInterruptedRequests');
+  productionPlanning(config, { verifyLock: () => { order.push('verified'); expect(settle).not.toHaveBeenCalled(); }, agent: () => closable() })!(service);
+  expect(order).toEqual(['verified']);
+  expect(store.getDraft(config.identity, pending)).toMatchObject({ state: 'failed', reason: 'The server stopped before this request finished. Ask again.' });
+});
+
 it('closes the planning agent when the server closes', async () => {
   const config = production(), close = vi.fn(async () => undefined);
-  const setup = productionPlanning(config, { issues: { issueText: async number => text(number) }, agent: () => closable(close) })!;
+  const setup = productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent: () => closable(close) })!;
   const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, setup);
   await app.close();
   expect(close).toHaveBeenCalledTimes(1);

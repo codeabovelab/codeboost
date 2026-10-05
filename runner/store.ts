@@ -482,6 +482,10 @@ export class Store {
     return this.#run("UPDATE requests SET state='failed', reason=? WHERE state='pending'",
       'The server stopped before this request finished. Ask again.').changes as number;
   }
+  /** The mode of a planning request, or undefined when there is no such request for this plan. */
+  requestMode(identity: PlanIdentity, id: string): PlanningMode | undefined {
+    return this.#get('SELECT mode FROM requests WHERE key=? AND id=?', identityKey(identity), id)?.mode as PlanningMode | undefined;
+  }
   /** A draft request (#124). Refuses a suggestion request's ID. */
   getDraft(identity: PlanIdentity, id: string): DraftRequest {
     const row = this.#get("SELECT * FROM requests WHERE key=? AND id=? AND mode='draft'", identityKey(identity), id);

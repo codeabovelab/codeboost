@@ -203,6 +203,20 @@ it('marks a draft stale when the plan changes while Claude writes it', async () 
   } finally { await coordinator.close(); }
 });
 
+it('marks a draft stale when the snapshot changes while Claude writes it', async () => {
+  const { store } = fixture();
+  const { coordinator, input } = coordinate(store, () => {
+    store.recordHistory(identity, state(store), oid(3), oid(4), []);
+    return JSON.stringify(redraft());
+  });
+  try {
+    const handle = coordinator.start(input, 'draft');
+    expect(await handle.result).toMatchObject({ state: 'stale' });
+    expect(store.getDraft(identity, handle.id)).toMatchObject({ state: 'invalidated', reason: 'Repository snapshot changed.' });
+    expect(store.getPlan(identity).revision).toBe(1);
+  } finally { await coordinator.close(); }
+});
+
 it.each([['draft', 'suggest'], ['suggest', 'draft']] as const)('runs one planning invocation per plan: a %s blocks a %s', async (first, second) => {
   const { store } = fixture();
   let release!: () => void;

@@ -68,7 +68,7 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, duringStartup);
   let app: Awaited<ReturnType<typeof startServer>>;
   // Planning (#117) is on for any non-demo review with a github block; it needs no runner block.
-  try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, productionPlanning(config), runnerSetup); }
+  try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, productionPlanning(config, { verifyLock: () => lock.verify() }), runnerSetup); }
   catch (error) {
     lock.release();
     // A refused runner startup (no token, a blocked recovery) is the person's to act on: its message, not a stack.

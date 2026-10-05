@@ -80,8 +80,6 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       getSuggestions: (identity, id) => store.getSuggestions(identity, id),
     };
     planning = typeof planningInput === 'function' ? planningInput(service) : planningInput;
-    // A suggestion or draft still pending belonged to a process that ended; nothing can complete it now (#124).
-    service.store.settleInterruptedRequests();
     // One budget for a suggestion, setup included: lane D's cap, which the provider's own deadline stays inside (#117).
     suggestions = planning ? new SuggestionCoordinator(suggestionStore, planning.provider, PLANNING_BUDGET_MS) : null;
   } catch (error) { service.close(); throw error; }
@@ -271,7 +269,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const actionId = requireAction(input), { actionId: _omit, ...body } = input;
     // Suggestions are edit cards for the current plan; a draft is a whole next revision (#124). They share one lifecycle.
     const imported = path === '/api/plan/import', route = PLANNING_REQUEST.exec(path);
-    // The recorded request names the planning request the path acts on, so one action ID cannot replay across two.
+    // The recorded request names the planning request the path acts on, so one action ID cannot replay across two. The
+    // path alone names it: a body that also carries one could make an older record's hash match another request's.
+    if (route?.[2] && 'requestId' in body) throw new BadRequest('The request ID comes from the path, not the body.');
     const request = route?.[2] ? { ...body, requestId: route[2] } : body;
     const mode: PlanningMode = route?.[1] === 'drafts' ? 'draft' : 'suggest', noun = mode === 'draft' ? 'draft' : 'suggestion';
     const started = !imported && !route![2];
@@ -325,10 +325,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         return { requestId: handle.id };
       }
       const id = route![2]!;
-      // An ID is used only on its own kind's routes; an unknown one is named by the route's kind.
-      let current: ReturnType<typeof service.store.getSuggestions>;
-      try { current = service.store.getSuggestions(identity, id); } catch { throw new Error(`Unknown ${noun} request.`); }
-      if (current.mode !== mode) throw new Error(`Unknown ${noun} request.`);
+      // An ID is used only on its own kind's routes; an unknown one is named by the route's kind. A storage error is not
+      // a refusal, so it is never turned into one (it would be recorded under the action ID).
+      if (service.store.requestMode(identity, id) !== mode) throw new Error(`Unknown ${noun} request.`);
+      const current = service.store.getSuggestions(identity, id);
       if (route![3] === 'cancel') {
         const handle = suggestionHandles.get(id);
         if (current.state === 'pending' && handle) { handle.cancel('Cancelled by the user.'); return { state: 'cancelling' }; }
