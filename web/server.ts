@@ -11,11 +11,11 @@ import { ItemExecutor } from '../runner/execution.ts';
 import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
-import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
+import { ActionIdReused, BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
-import { SuggestionCoordinator, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
+import { SuggestionCoordinator, type PlanningMode, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
@@ -30,6 +30,8 @@ export interface PlanningDeps {
   /** Releases what the provider owns at shutdown, after every suggestion has settled. */
   close?(): Promise<void>;
 }
+/** Start, cancel or apply a suggestion or a draft (#124): `/api/plan/<kind>` or `/api/plan/<kind>/<id>/<action>`. */
+const PLANNING_REQUEST = /^\/api\/plan\/(suggestions|drafts)(?:\/([0-9a-f-]{36})\/(cancel|apply))?$/;
 /** A dependency the server reads from (GitHub) failed: 502, not recorded. */
 class UpstreamFailure extends Error {}
 /** How long a planning request may take to settle after shutdown aborts it, before its worker is abandoned (Ask's grace). */
@@ -72,7 +74,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const store = service.store;
     const suggestionStore: SuggestionStore = {
       getPlan: identity => store.getPlan(identity), getSnapshot: identity => store.getSnapshot(identity),
-      beginSuggestions: (identity, expected) => store.beginSuggestions(identity, expected),
+      beginSuggestions: (identity, expected, mode) => store.beginSuggestions(identity, expected, mode),
       completeSuggestions: (identity, id, reply) => capability.run(() => store.completeSuggestions(identity, id, reply)),
       settleSuggestion: (identity, id, expected, outcome) => capability.run(() => store.settleSuggestion(identity, id, expected, outcome)),
       getSuggestions: (identity, id) => store.getSuggestions(identity, id),
@@ -264,10 +266,28 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const suggestionHandles = new Map<string, SuggestionHandle>();
   const requireAction = (input: Record<string, unknown>) => { if (input.actionId === undefined) throw new BadRequest('actionId is required for this action.'); return input.actionId as string; };
   const planningAction = async (path: string, input: Record<string, unknown>, signal: AbortSignal) => {
-    const actionId = requireAction(input), { actionId: _omit, ...request } = input;
-    const imported = path === '/api/plan/import', started = path === '/api/plan/suggestions';
-    const match = /^\/api\/plan\/suggestions\/([0-9a-f-]{36})\/(cancel|apply)$/.exec(path);
-    const kind = imported ? 'plan-import' : started ? 'suggestion-start' : `suggestion-${match![2]}`;
+    const actionId = requireAction(input), { actionId: _omit, ...body } = input;
+    // Suggestions are edit cards for the current plan; a draft is a whole next revision (#124). They share one lifecycle.
+    const imported = path === '/api/plan/import', route = PLANNING_REQUEST.exec(path);
+    // The recorded request names the planning request the path acts on, so one action ID cannot replay across two.
+    const request = route?.[2] ? { ...body, requestId: route[2] } : body;
+    const mode: PlanningMode = route?.[1] === 'drafts' ? 'draft' : 'suggest', noun = mode === 'draft' ? 'draft' : 'suggestion';
+    const started = !imported && !route![2];
+    const kind = imported ? 'plan-import' : started ? `${noun}-start` : `${noun}-${route![3]}`;
+    if (route?.[2]) {
+      // Replay first (AGENTS.md): the saved outcome, or saved refusal, under this request's hash.
+      try { const saved = service.store.savedAction<unknown>(identity, { actionId, kind, request }); if (saved) return saved.response; }
+      catch (error) {
+        // A suggestion cancel or apply recorded before #124 hashed the body alone; its replay still returns its outcome.
+        // A body carrying a request ID never takes this path, so an older record cannot be aimed at another request.
+        if (!(error instanceof ActionIdReused) || mode !== 'suggest' || 'requestId' in body) throw error;
+        const legacy = service.store.savedAction<unknown>(identity, { actionId, kind, request: body });
+        if (!legacy) throw error;
+        return legacy.response;
+      }
+      // Only the path names the request.
+      if ('requestId' in body) throw new BadRequest('The request ID comes from the path, not the body.');
+    }
     // The issue comes from GitHub (#117), so it is read before the recorded action, which runs synchronously. A replay
     // returns its saved outcome without reading GitHub again, and a start the recorded action would refuse anyway (no
     // planning, shutdown, stale revision or snapshot) does not read it at all.
@@ -294,26 +314,31 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (stopping) throw new ShuttingDownError();
         if (!suggestions || !planning) throw new GuardRefusal('Planning agent not available yet.');
         const plan = service.store.getPlan(identity), snapshot = service.store.getSnapshot(identity);
-        if (input.expectedRevision !== plan.revision || input.snapshotId !== snapshot.id) throw new GuardRefusal('Stale plan revision or snapshot. Reload before asking for suggestions.');
+        if (input.expectedRevision !== plan.revision || input.snapshotId !== snapshot.id) throw new GuardRefusal(`Stale plan revision or snapshot. Reload before asking for ${mode === 'draft' ? 'a draft' : 'suggestions'}.`);
         if (typeof input.feedback !== 'string' || input.feedback.length > 4000) throw new BadRequest('feedback must be text of 4000 characters or fewer.');
         // Read above whenever the checks before this line pass; they cannot change across the synchronous action.
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
         const context = service.planContext();
         const handle = suggestions.start({ context, revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
-          repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } });
+          repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } }, mode);
         suggestionHandles.set(handle.id, handle);
         void handle.result.finally(() => suggestionHandles.delete(handle.id));
         return { requestId: handle.id };
       }
-      const id = match![1]!;
-      if (match![2] === 'cancel') {
-        const handle = suggestionHandles.get(id), current = service.store.getSuggestions(identity, id);
+      const id = route![2]!;
+      // An ID is used only on its own kind's routes; an unknown one is named by the route's kind. A storage error is not
+      // a refusal, so it is never turned into one (it would be recorded under the action ID).
+      if (service.store.requestMode(identity, id) !== mode) throw new Error(`Unknown ${noun} request.`);
+      const current = service.store.getSuggestions(identity, id);
+      if (route![3] === 'cancel') {
+        const handle = suggestionHandles.get(id);
         if (current.state === 'pending' && handle) { handle.cancel('Cancelled by the user.'); return { state: 'cancelling' }; }
         // No handle in this process: the request belonged to a process that ended, and its container's output had no
         // route back to the Store (planning runs only through D, in that process's worker; runner-lifecycle.md).
         service.store.cancelSuggestions(identity, id, 'Cancelled by the user.');
         return { state: service.store.getSuggestions(identity, id).state };
       }
+      if (mode === 'draft') return { revision: service.store.applyDraft(identity, id, service.planContext()).revision };
       if (!Number.isSafeInteger(input.index)) throw new BadRequest('index is required.');
       return { revision: service.store.applySuggestion(identity, id, input.index as number, service.planContext()).revision };
     }).response;
@@ -340,9 +365,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (req.method === 'GET' && path === '/api/issues') { json(200, issues.view()); return; }
         if (req.method === 'GET' && path === '/api/review') { json(200, await load(requestAbort.signal)); return; }
         if (req.method === 'GET' && path === '/api/runner') { json(200, runnerView()); return; }
-        const suggestionRead = /^\/api\/plan\/suggestions\/([0-9a-f-]{36})$/.exec(path);
-        if (req.method === 'GET' && suggestionRead) { json(200, service.store.getSuggestions(identity, suggestionRead[1]!)); return; }
-        const planningPath = path === '/api/plan/import' || path === '/api/plan/suggestions' || /^\/api\/plan\/suggestions\/[0-9a-f-]{36}\/(cancel|apply)$/.test(path);
+        const planningRead = /^\/api\/plan\/(suggestions|drafts)\/([0-9a-f-]{36})$/.exec(path);
+        if (req.method === 'GET' && planningRead) {
+          const id = planningRead[2]!;
+          if (planningRead[1] === 'drafts') { json(200, service.store.getDraft(identity, id)); return; }
+          const request = service.store.getSuggestions(identity, id);
+          if (request.mode !== 'suggest') throw new Error('Unknown suggestion request.');
+          json(200, request); return;
+        }
+        const planningPath = path === '/api/plan/import' || PLANNING_REQUEST.test(path);
         if (req.method !== 'POST' || !(['/api/action','/api/settings','/api/issues','/api/runner'].includes(path) || planningPath) || req.headers['content-type'] !== 'application/json') { json(405, { error: 'Unsupported request.' }); return; }
         const chunks: Buffer[] = []; let size = 0;
         activeRequest.readingBody=true;

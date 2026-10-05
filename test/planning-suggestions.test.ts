@@ -109,7 +109,7 @@ it('closes admission first, aborts all jobs and waits for unsettled providers be
   expect(f.calls.every(call => call.signal.aborted)).toBe(true);
   await Promise.resolve(); expect(closed).toBe(false);
   f.pending.reject(new Error('Provider abort'));
-  for (const job of [first, second]) expect(await job.result).toMatchObject({ state: 'cancelled', reason: 'Suggestion coordinator is closing.' });
+  for (const job of [first, second]) expect(await job.result).toMatchObject({ state: 'cancelled', reason: 'Planning coordinator is closing.' });
   await closing; expect(closed).toBe(true);
   expect(f.store.getSuggestions(f.identity, first.id).state).toBe('cancelled');
   expect(f.store.getSuggestions(other.context.identity, second.id).state).toBe('cancelled');
