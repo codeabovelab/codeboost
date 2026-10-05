@@ -108,7 +108,8 @@ it('validates follow-up drafts and cards only against the audited unfinished suf
   previous.items.push({ id: 'P2', title: 'Finish planned output', intent: 'Create the file that P1 did not produce',
     files: [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Create planned output' }],
     acceptance: [{ type: 'check', text: 'The file exists' }], depends_on: ['P1'] });
-  const value = { ...input(), context: { ...input().context, baseEntries: [] }, completedItems: ['P1'], previousPlan: previous };
+  const value = { ...input(), context: { ...input().context, baseEntries: [] }, completedItems: ['P1'], previousPlan: previous,
+    continuationContext: { checkpointId: 'cp-1', head: 'a'.repeat(40), completedItems: ['P1'], ownerItem: 'P1', outOfScopePaths: ['debug.log'] } };
   const draft = { ...previous, revision: 2 };
   expect(prepareDraft({ ...value, revision: 2 }).validate(JSON.stringify(draft)).value).toEqual(draft);
   const suggestion = reply(); suggestion.edits[0]!.item = 'P2';

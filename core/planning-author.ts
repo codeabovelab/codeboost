@@ -97,6 +97,9 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
   const previous = input.previousPlan ? structuredClone(input.previousPlan) : undefined;
   const completedItems = input.completedItems === undefined || input.completedItems.length === 0
     ? undefined : structuredClone([...input.completedItems]);
+  if (completedItems && (!input.continuationContext || input.continuationContext.completedItems.length !== completedItems.length ||
+      input.continuationContext.completedItems.some((item, index) => item !== completedItems[index])))
+    throw new Error('Planning continuation context does not match its completed prefix.');
   if (previous) {
     // The existing suffix is context for the provider to repair, not a candidate. Validate its structure and the
     // checkpoint-owned prefix here; require the proposed candidate to pass full suffix semantics below.
@@ -123,7 +126,9 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
     feedback_data_json: dataJSON(input.feedback, 'Feedback'),
     previous_plan_json: dataJSON(previous ?? null, 'Previous plan'),
-    continuation_data_json: dataJSON(input.continuationContext ?? null, 'Continuation context'),
+    continuation_context_instruction: input.continuationContext
+      ? `Checkpoint continuation context:\n<continuation_context>\n${dataJSON(input.continuationContext, 'Continuation context')}\n</continuation_context>\nWhen this context is present, preserve the completed item IDs. Only the checkpoint owner may be amended to declare the observed paths. Do not rewrite completed work or claim unfinished work already ran. The unfinished suffix is context for correction and may currently fail validation against the audited tree; the candidate you return must correct it so the entire remaining suffix is valid against that tree.\n`
+      : '',
   };
   const conditional = template.replace(/\{\{#if previous_plan\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => previous ? block : '');
   // One pass over trusted template only: inserted data is never interpreted again.

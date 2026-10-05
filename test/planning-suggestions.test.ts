@@ -49,6 +49,8 @@ function checkpointFixture() {
   const basis = f.store.continuationBasis(f.identity)!;
   f.value.completedItems = basis.completed;
   f.value.continuationBinding = { checkpointId: checkpoint.id, head: basis.head, completedItems: basis.completed };
+  f.value.continuationContext = { checkpointId: checkpoint.id, head: basis.head, completedItems: basis.completed,
+    ownerItem: checkpoint.item, outOfScopePaths: checkpoint.outOfScopePaths };
   return f;
 }
 it('binds the store request before invocation and publishes only valid replies', async () => {
