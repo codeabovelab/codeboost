@@ -95,6 +95,17 @@ export class SafetyFindings {
   /** Whether the finding is only in memory: the Store knows nothing of it, so the executor must act on it itself. */
   unsaved(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
   settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
+  /** Retry the durable save after the attempt may already have settled. */
+  persist(attemptId: string): boolean {
+    const finding = this.#unsaved.get(attemptId);
+    if (!finding) return true;
+    const identity = findIdentity(this.#store, { id: attemptId } as AttemptRecord);
+    if (!this.#store.recordOwedSafetyFinding(identity, attemptId, finding) && !this.#row(attemptId)?.safetyFinding) return false;
+    this.#unsaved.delete(attemptId);
+    // A strict begin usually runs inside userAction's outer transaction. Restore the in-memory debt if that rolls back.
+    this.#store.afterCommit(() => undefined, () => this.#unsaved.set(attemptId, finding));
+    return true;
+  }
   /** The attempts whose finding is owed (only in memory). Usually none, so a check over them costs nothing. */
   owedAttempts(): string[] { return [...this.#unsaved.keys()]; }
 }
@@ -321,11 +332,13 @@ export class ItemExecutor {
    * reconciled with (#88), the items an execute attempt completed at the current revision, and the first item none did
    * (null when every item has run).
    */
-  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; next: string | null } {
-    const plan = this.#store.getPlan(identity), { started, begun, earlierCommits, finished } = this.#store.executeProgress(identity, plan.revision);
+  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; prefixHead: string | null; next: string | null } {
+    const plan = this.#store.getPlan(identity), { started, begun, earlierCommits, finished, finishedHeads } = this.#store.executeProgress(identity, plan.revision);
     const done = new Set(finished);
+    let prefixHead: string | null = null;
+    for (const item of plan.items) { if (!done.has(item.id)) break; prefixHead = finishedHeads[item.id] ?? null; }
     return { started, begun, earlierCommits, completed: plan.items.filter(item => done.has(item.id)).map(item => item.id),
-      next: plan.items.find(item => !done.has(item.id))?.id ?? null };
+      prefixHead, next: plan.items.find(item => !done.has(item.id))?.id ?? null };
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }
@@ -392,11 +405,22 @@ export class ItemExecutor {
     // A safety finding not yet acted on (a failed write, a human gate at the time) goes to needs human first.
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);
-      if (finding) return this.#settledOrRefused(this.#escalate(identity, earlier, finding, run.stopped, [], true), strict);
+      if (finding) {
+        if (options.claimRequeue) this.#store.claimRequeue(identity, this.#store.getTask(identity).stateVersion);
+        const persisted = !strict || this.#findings.persist(earlier.id), current = this.#store.getAttempt(identity, earlier.id);
+        // A pending cancel can leave the original attempt active. Saving the finding is the durable work owed; its
+        // terminal write will apply the cancellation (which wins) without losing the safety evidence.
+        if (persisted && (current.state === 'pending' || current.state === 'running'))
+          return { outcome: run.stopped(current.item!, 'not started', `${finding} The finding is saved and waits for the active attempt to settle.`) };
+        return this.#settledOrRefused(this.#escalate(identity, current, finding, run.stopped, [], true), strict);
+      }
     }
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
-    if (owed) return this.#settledOrRefused(this.#pause(identity, owed.row, owed.result, run.stopped, [], true), strict);
+    if (owed) {
+      if (options.claimRequeue) this.#store.claimRequeue(identity, this.#store.getTask(identity).stateVersion);
+      return this.#settledOrRefused(this.#pause(identity, owed.row, owed.result, run.stopped, [], true), strict);
+    }
     // Continuing after a scope pause (plan-format.md: reconcile the executed prefix with the audited head, validate the
     // remaining items from that checkpoint) is not built yet (#88), so a paused task runs no further items: fail closed.
     const checkpoint = this.#store.latestCheckpoint(identity);

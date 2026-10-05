@@ -654,6 +654,23 @@ export class Store {
       choices: this.#db.prepare('SELECT data FROM choices WHERE key=? ORDER BY choice_key').all(key).map(row => decode<SegmentChoice & ReviewState>(row.data)),
     };
   }
+  /** Before execution, approvals belong to the current snapshot; after a completed item, this revision's approvals survive its own commits. */
+  unapprovedExecutionItems(identity: PlanIdentity, revision: number): string[] {
+    const key = identityKey(identity), plan = this.getPlan(identity, revision);
+    const completed = !!this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+      AND json_extract(context,'$.planRevision')=? LIMIT 1`, key, revision);
+    const snapshotId = this.getSnapshot(identity).id, review = this.getReview(identity);
+    // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
+    // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
+    let latestChoiceVersion = -1;
+    for (const choice of review.choices) if (choice.revision === revision && (completed || choice.snapshotId === snapshotId)) {
+      if (choice.reviewVersion === undefined) latestChoiceVersion = Number.MAX_SAFE_INTEGER;
+      else if (choice.reviewVersion > latestChoiceVersion) latestChoiceVersion = choice.reviewVersion;
+    }
+    const approved = new Set(review.approvals.filter(value => value.revision === revision && (completed || value.snapshotId === snapshotId)
+      && (value.reviewVersion ?? -1) > latestChoiceVersion).map(value => value.item));
+    return plan.items.filter(item => !approved.has(item.id)).map(item => item.id);
+  }
   /** Records evidence from an already completed safety audit; does not authorize execution. */
   recordCheckpoint(identity: PlanIdentity, expected: ReviewState, evidence: Omit<Checkpoint, 'id' | 'revision' | 'snapshotId'>): Checkpoint {
     const key = identityKey(identity);
@@ -823,6 +840,18 @@ export class Store {
       return changed;
     });
   }
+  /** Retry a finding whose original durable save failed, including after its attempt became terminal. */
+  recordOwedSafetyFinding(identity: PlanIdentity, id: string, finding: string): boolean {
+    if (typeof finding !== 'string' || !finding.trim()) throw new GuardRefusal('A safety finding needs its reason.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const row = this.#get('SELECT state,safety_finding FROM attempts WHERE plan_key=? AND id=?', key, id);
+      if (!row || row.safety_finding !== null) return false;
+      this.#run('UPDATE attempts SET safety_finding=? WHERE plan_key=? AND id=?', bounded(finding), key, id);
+      if (TERMINAL_STATES.includes(row.state as AttemptState)) this.#actOnFinding(key);
+      this.#touch(key); return true;
+    });
+  }
 
   /** Every durable change to a task or its attempts increases the state version. */
   #touch(key: string): void {
@@ -875,11 +904,8 @@ export class Store {
       FROM attempts WHERE plan_key=? ORDER BY rowid DESC LIMIT ?) ORDER BY row_order`).all(identityKey(identity), limit)
       .map(row => { const { result: _result, ...attempt } = this.#attemptRecord(row); return { ...attempt, hasResult: row.has_result === 1 }; });
   }
-  /**
-   * What `ItemExecutor.progress` needs about a task's execute attempts, without loading or decoding any attempt's result
-   * (up to 1 MiB each): a status poll asks for it (#91 part 2). `finished` lists each item completed at `revision` once.
-   */
-  executeProgress(identity: PlanIdentity, revision: number): { started: boolean; begun: boolean; earlierCommits: boolean; finished: string[] } {
+  /** What `ItemExecutor.progress` needs about execute attempts. It decodes only completed results' small head field. */
+  executeProgress(identity: PlanIdentity, revision: number): { started: boolean; begun: boolean; earlierCommits: boolean; finished: string[]; finishedHeads: Record<string, string | null> } {
     const key = identityKey(identity), rev = "json_extract(context,'$.planRevision')";
     const row = this.#get(`SELECT COUNT(*) > 0 AS started, COALESCE(SUM(${rev} = ?), 0) > 0 AS begun
       FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL`, revision, key)!;
@@ -888,9 +914,27 @@ export class Store {
     const earlier = this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')})
       AND state='completed' AND ${rev} != ? AND (NOT json_valid(result) OR COALESCE(json_extract(result,'$.unchanged'), 0) = 0) LIMIT 1`,
       key, ...WRITABLE_KINDS, revision);
-    const finished = this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
-      AND state='completed' AND ${rev} = ?`).all(key, revision).map(entry => entry.item as string);
-    return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier, finished };
+    const finishedRows = this.#db.prepare(`SELECT item,CASE WHEN json_valid(result)
+      THEN CASE WHEN json_type(result,'$.head')='text' THEN json_extract(result,'$.head') ELSE NULL END ELSE NULL END AS head
+      FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
+      AND state='completed' AND ${rev} = ? ORDER BY rowid`).all(key, revision);
+    const finishedHeads: Record<string, string | null> = Object.create(null);
+    for (const entry of finishedRows) {
+      const head = typeof entry.head === 'string' && /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(entry.head) ? entry.head : null;
+      finishedHeads[entry.item as string] = head;
+    }
+    return { started: row.started === 1, begun: row.begun === 1, earlierCommits: !!earlier,
+      finished: Object.keys(finishedHeads), finishedHeads };
+  }
+  /** Claim recovery when a user's Resume settles owed work instead of admitting a replacement attempt. */
+  claimRequeue(identity: PlanIdentity, expectedStateVersion: number): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const task = this.#task(key);
+      if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (task.requeue_pending !== 1) throw new GuardRefusal('The requeue was already claimed.');
+      this.#run('UPDATE tasks SET requeue_pending=0 WHERE plan_key=?', key); this.#touch(key);
+    });
   }
   /** The heads of completed execute attempts that changed files outside their plan item, oldest first. */
   scopeFindingHeads(identity: PlanIdentity): string[] {

@@ -111,16 +111,19 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (!executor || !progress) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
     // Shutdown began: answer 503 before any refusal, so nothing is recorded under the action ID and the UI may resend.
     if (!forView && runner!.closing) throw new ShuttingDownError();
-    const task = service.store.getTask(identity), { started, begun, earlierCommits, next } = progress;
+    const task = service.store.getTask(identity), { started, begun, earlierCommits, completed, prefixHead, next } = progress;
     // Checked in the order a person can act on: a closed task first, then what admission would refuse.
     if (task.status === 'merged' || task.status === 'cancelled') throw new GuardRefusal(`The task is ${task.status}.`);
-    if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
     if (!runner!.runs('execute')) throw new GuardRefusal('The runner cannot run execute attempts yet.');
     if (runner!.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
     // Between two items no attempt is active, but the run that admits the next one is still going.
     if (executor.busy(identity)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     // A publish reads the task head and pushes it; a new item must not move it meanwhile.
     if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
+    // A failed durable save must not let an ordinary refusal strand an in-memory finding until restart loses it.
+    if (executor.owes(identity)) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
+      claimRequeue: task.requeuePending, queue: false, owed: true };
+    if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
     const merge = service.store.getMergeAttempt(identity);
     if (merge && (merge.state === 'submitting' || merge.state === 'queued')) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
     // Only the view stops here: the action lets admission refuse, because its refusal also moves the idle task to needs
@@ -138,6 +141,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         throw new GuardRefusal('This plan has already started running; resume the task instead.');
       if (task.status !== 'in review' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; start runs a task that is in review or queued.`);
       if (ran) throw new GuardRefusal(begun ? `This plan revision has already run; the task is ${task.status}.` : 'Recovery left this task to requeue; it cannot start until that is resolved.');
+      const unapproved = service.store.unapprovedExecutionItems(identity, service.store.getPlan(identity).revision);
+      if (unapproved.length) throw new GuardRefusal(`Approve every plan item before running it. Waiting for: ${unapproved.join(', ')}.`);
       return { fromItem: next!, claimRequeue: false, queue: task.status === 'in review' };
     }
     // As for start: point to start only where start's own checks pass.
@@ -149,6 +154,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     }
     if (!started && !task.requeuePending) throw new GuardRefusal(startWould ? toStart : 'No item of this plan has run yet, so there is nothing to resume.');
     if (!next) throw new GuardRefusal('Every item of this plan has run.');
+    if (completed.length && prefixHead !== service.store.getSnapshot(identity).head)
+      throw new GuardRefusal('The completed plan prefix no longer ends at the current task head; review the changed head before resuming.');
+    const unapproved = service.store.unapprovedExecutionItems(identity, service.store.getPlan(identity).revision);
+    if (unapproved.length) throw new GuardRefusal(`Approve every plan item before running it. Waiting for: ${unapproved.join(', ')}.`);
     return { fromItem: next, claimRequeue: task.requeuePending, queue: false };
   };
   const offered = (action: 'start' | 'resume', progress: ReturnType<ItemExecutor['progress']>) => {
@@ -170,7 +179,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // One progress read per poll, shared by both flags.
     const progress = free && executor ? executor.progress(identity) : undefined;
     return { available: !!runner, task, attempts, startable: !!progress && offered('start', progress), resumable: !!progress && offered('resume', progress),
-      stateVersion: task.stateVersion, retryable, stopRequested: status.stopRequested, unresolved: status.unresolved, publish: publishView(progress) };
+      stateVersion: task.stateVersion, reviewVersion: service.store.reviewVersion(identity), retryable, stopRequested: status.stopRequested, unresolved: status.unresolved, publish: publishView(progress) };
   };
   /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
   const publishView = (progress?: ReturnType<ItemExecutor['progress']>) => {
@@ -187,11 +196,20 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     .catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`))
     .finally(() => publishing?.actIfOwed(identity));
   const runnerAction = (input: Record<string, unknown>) => {
-    const { action, attemptId, expectedStateVersion, actionId } = input;
+    const { action, attemptId, expectedStateVersion, expectedReviewVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
     if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'publish', 'close-pull-requests'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
     if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
+    if ((action === 'start' || action === 'resume') && !Number.isSafeInteger(expectedReviewVersion)) {
+      // Actions saved before #107 had no review version in their request hash. They remain replayable, but this shape
+      // can never create a new action now: a miss falls through to the new-field validation below.
+      const legacy = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string,
+        request: { attemptId, expectedStateVersion } });
+      if (legacy) return legacy.response;
+      throw new BadRequest('expectedReviewVersion must be an integer for start and resume.');
+    }
     if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
+    const request = { attemptId, expectedStateVersion, ...((action === 'start' || action === 'resume') ? { expectedReviewVersion } : {}) };
     // A refused start or resume can still move the task to needs human (an expired budget is committed with the refusal),
     // and a task that moves there is owed a draft PR (#103). Only that move publishes: a person who pressed resume on a
     // task already in needs human asked for no publish.
@@ -218,8 +236,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.actIfOwed(identity, { personAsked: true }); throw error; }
     }
     return act();
-    function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request: { attemptId, expectedStateVersion } }, () => {
+    function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if ((action === 'start' || action === 'resume') && service.store.reviewVersion(identity) !== expectedReviewVersion)
+        throw new GuardRefusal('Stale review state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
       if (action === 'start' || action === 'resume') {
