@@ -14,7 +14,7 @@ Derived planted-review configurations clear the source GitHub binding because th
 With a runner block, the task's PR is the `opened` record whose opening began last among the task's records in the configured repository with base `github.baseBranch`. (An older opening adopted later is not chosen; if its PR is open, it is a second open PR from the branch, which blocks merging.) Merging is blocked (`pull-request`) when:
 
 - the task has no such record;
-- an opening of the task's PRs is still in flight, or an update of one is (`refresh`);
+- an opening of the task's PRs is still in flight, or an update of one is (its record's `refresh` field is set);
 - GitHub shows the PR from another branch than the record's, from a fork, or into another base;
 - the PR's description does not start with that record's marker;
 - the PR is open, but another PR is open from the same branch, or GitHub's list of open PRs from the branch does not show it yet.

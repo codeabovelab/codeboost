@@ -39,8 +39,8 @@ export interface PublishedTarget {
   /** `github.pullRequest`, if the configuration still names one. It must be the task's PR. */
   configured?: number;
 }
-/** No PR can be inspected; the message is the merge's only blocker. */
-class MergeTargetUnavailable extends Error {}
+/** No PR can be inspected. The display keeps the blockers found before the target was resolved. */
+class MergeTargetUnavailable extends Error { blockers: MergeBlocker[] = []; }
 /** The PR one status read inspected. `openingId` is set for the task's published PR, which admission re-reads. */
 interface ResolvedTarget { target?: MergeTarget; openingId: string | null; marker?: string; headBranch?: string }
 
@@ -165,7 +165,9 @@ export class MergeCoordinator {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
     }
-    const resolved = this.#resolve(this.#attempt());
+    let resolved: ResolvedTarget;
+    try { resolved = this.#resolve(this.#attempt()); }
+    catch (error) { if (error instanceof MergeTargetUnavailable) error.blockers = blockers; throw error; }
     const remote = await this.gateway.inspect({ fresh, timeoutMs: fresh ? 6_000 : undefined, signal, ...(resolved.target ? { target: resolved.target } : {}) });
     if (signal?.aborted) throw signal.reason;
     if (resolved.target && remote.pullRequest !== resolved.target.pullRequest) throw new Error('GitHub returned a different pull request.');
@@ -196,19 +198,22 @@ export class MergeCoordinator {
       attempt = this.#attempt();
     }
     const queue = this.#queueStatus(attempt);
-    if (attempt?.state === 'submitting' || attempt?.state === 'queued') {
-      blockers.unshift({ code: 'queue-active', message: attempt.state === 'submitting'
-        ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
-        : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' });
-    } else if (attempt?.state === 'merged') {
-      blockers.unshift({ code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' });
-    } else if (attempt && !this.#freshReviewComplete(attempt)) {
-      blockers.unshift({ code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' });
-    }
+    const attemptBlocker = this.#attemptBlocker(attempt);
+    if (attemptBlocker) blockers.unshift(attemptBlocker);
     const active = attempt?.state === 'submitting' || attempt?.state === 'queued' || attempt?.state === 'merged';
     const retry = !!queue?.retryable;
     const ready = !active && blockers.length === 0;
     return { status: { available: true, ready, action: ready ? (retry ? 'retry' : 'merge') : null, blockers, remote, queue }, resolved };
+  }
+
+  /** What the merge attempt on record says, shown first. */
+  #attemptBlocker(attempt: MergeAttempt | null): MergeBlocker | null {
+    if (attempt?.state === 'submitting' || attempt?.state === 'queued') return { code: 'queue-active', message: attempt.state === 'submitting'
+      ? attempt.reason ? `The merge submission outcome is unknown. ${attempt.reason} Waiting for GitHub reconciliation.` : attempt.kind === 'queue' ? 'The reviewed head is being submitted to the merge queue.' : 'The reviewed head is being submitted for direct merge.'
+      : 'The reviewed head is queued. Waiting for GitHub to confirm the outcome.' };
+    if (attempt?.state === 'merged') return { code: 'queue-merged', message: 'GitHub confirmed that the reviewed head was merged.' };
+    if (attempt && !this.#freshReviewComplete(attempt)) return { code: 'queue-head', message: attempt.reason ?? 'The pull request snapshot changed after the queue attempt. Review the replacement snapshot.' };
+    return null;
   }
 
   async displayStatus(view = this.service.load(), signal?: AbortSignal): Promise<MergeStatus | MergeUnavailableStatus> {
@@ -216,7 +221,11 @@ export class MergeCoordinator {
     catch (error) {
       if (error instanceof ShuttingDownError) throw error;
       if (signal?.aborted) throw signal.reason;
-      if (error instanceof MergeTargetUnavailable) return { available: true, ready: false, action: null, blockers: [{ code: 'pull-request', message: error.message }], remote: null, queue: this.#queueStatus() };
+      if (error instanceof MergeTargetUnavailable) {
+        const attempt = this.#attempt(), attemptBlocker = this.#attemptBlocker(attempt);
+        const blockers = [...(attemptBlocker ? [attemptBlocker] : []), { code: 'pull-request', message: error.message }, ...error.blockers];
+        return { available: true, ready: false, action: null, blockers, remote: null, queue: this.#queueStatus(attempt) };
+      }
       return { available: true, ready: false, action: null, blockers: [{ code: 'github', message: `Could not read GitHub merge state. ${error instanceof Error ? error.message : 'Unknown error.'}` }], remote: null, queue: this.#queueStatus() };
     }
   }

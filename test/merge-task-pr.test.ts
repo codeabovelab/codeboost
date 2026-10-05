@@ -269,11 +269,23 @@ describe('the merge gate with a runner block (#121)', () => {
     const unknown = await new MergeCoordinator(service(legacy.store), old.client, undefined, undefined, PUBLISHED).pollQueue();
     expect(unknown?.observationError).toMatch(/saved without its pull request/);
     expect(legacy.store.getMergeAttempt(identity)).toEqual(before);
+    // The attempt on record is still shown first.
     expect((await new MergeCoordinator(service(legacy.store), old.client, undefined, undefined, PUBLISHED).displayStatus()).blockers).toEqual([
+      { code: 'queue-active', message: 'The reviewed head is being submitted to the merge queue.' },
       { code: 'pull-request', message: expect.stringMatching(/saved without its pull request/) }]);
     expect(old.queued).toEqual([]);
     await new MergeCoordinator(service(legacy.store), old.client, undefined, undefined, { ...PUBLISHED, configured: 5 }).pollQueue();
     expect(old.queued).toEqual([5]);
+  });
+
+  it('shows the review\'s own blockers beside one that names no PR to inspect', async () => {
+    const store = runningTask(); toReview(store);
+    const reviewing = service(store);
+    (reviewing.load() as unknown as { items: Array<{ state: string }> }).items[0]!.state = 'pending';
+    const shown = await new MergeCoordinator(reviewing, github(store).client, undefined, undefined, PUBLISHED).displayStatus();
+    expect(shown.blockers).toEqual([
+      { code: 'pull-request', message: 'The task has no published pull request into main.' },
+      { code: 'approval', message: 'P1 is pending.' }]);
   });
 
   it('keeps the configured PR without a runner block, and pins the PR GitHub reported', async () => {
@@ -453,7 +465,29 @@ describe('the server chooses the merge target (#121)', { timeout: 60_000 }, () =
     try {
       const response = await fetch(`${new URL(app.url).origin}/api/review`, { headers: { 'x-codeboost-token': app.token } });
       const view = await response.json() as { merge: { blockers: unknown[] } };
-      expect(view.merge.blockers).toEqual([{ code: 'pull-request', message: 'The task has no published pull request into main.' }]);
+      expect(view.merge.blockers[0]).toEqual({ code: 'pull-request', message: 'The task has no published pull request into main.' });
+    } finally { await app.close(); }
+  });
+  it('blocks when github.pullRequest names another PR than the task\'s published one', async () => {
+    const { config, issue } = demo();
+    // The demo task runs every item and publishes PR 7.
+    const store = new Store(config.database), id = config.identity;
+    try {
+      store.transitionTask(id, store.getTask(id).stateVersion, 'queued');
+      for (const { id: item } of store.getPlan(id).items) {
+        const attempt = store.admitAttempt(id, { expectedStateVersion: store.getTask(id).stateVersion, kind: 'execute', item, expectedContext: store.currentContext(id), deadline: Date.now() + 60_000 });
+        store.markRunning(id, attempt.id); store.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true });
+      }
+      const check = store.recordAlreadyFixed(id, store.getTask(id).stateVersion, { snapshotId: store.getSnapshot(id).id, reviewVersion: store.reviewVersion(id), draft: false, result: { outcome: 'clear', baseHead: oid(9) } });
+      const head = store.getSnapshot(id).head;
+      const opening = store.beginPullRequest(id, { checkId: check.id, repository: 'owner/repo', base: 'main', headBranch: BRANCH, headSha: head, draft: false });
+      expect(store.recordPullRequestOpened(id, opening.openingId, { number: 7, url: url(7), headSha: head, draft: false }, true)).toBe('in review');
+    } finally { store.close(); }
+    const app = await startServer({ ...config, demo: false, runner: {}, github: { repository: 'owner/repo', issue, baseBranch: 'main', pullRequest: 5 } }, 0);
+    try {
+      const response = await fetch(`${new URL(app.url).origin}/api/review`, { headers: { 'x-codeboost-token': app.token } });
+      const view = await response.json() as { merge: { blockers: unknown[] } };
+      expect(view.merge.blockers[0]).toEqual({ code: 'pull-request', message: 'github.pullRequest is #5, but the task\'s pull request is #7. Remove github.pullRequest from the review configuration.' });
     } finally { await app.close(); }
   });
 });
