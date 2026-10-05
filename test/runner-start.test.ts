@@ -232,8 +232,10 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: itemIds[1]!,
         expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
       s.markRunning(id, attempt.id);
+      const committedHead = 'd'.repeat(40);
       s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
-        result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+        result: { head: committedHead, unchanged: false, inScope: [], outOfScope: [] },
+        history: { base: snapshot.base, head: committedHead, entries: [{ sha: committedHead, owner: itemIds[1]!, origin: 'owned', sourceSha: null }] } });
     } });
     expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
     expect(await view(app)).toMatchObject({ resumable: true, continuation: { completedItems: [items[0], items[1]], next: items[2], approved: true } });
