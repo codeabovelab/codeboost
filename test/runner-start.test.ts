@@ -362,8 +362,11 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       service.store.recordSafetyFinding = save;
     } });
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
-    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getTask(identity).status).toBe('needs amendment');
     expect(store.getAttempt(identity, earlier).safetyFinding).toMatch(/held after the pause/);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs human');
   });
   it('persists owed safety work before active-merge and pending-cancel refusals', async () => {
     for (const blocker of ['merge', 'cancel'] as const) {
@@ -405,6 +408,10 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       findings.record(interrupted, 'Safety violation: recovered'); service.store.recordSafetyFinding = save;
     } });
     expect(store.getTask(identity).requeuePending).toBe(true);
+    expect(await view(app)).toMatchObject({ startable: false, resumable: true });
+    expect((await act(app, 'start')).body.error).toMatch(/recovery left this task to requeue/i);
+    expect(store.getTask(identity).requeuePending).toBe(true);
+    expect(store.getAttempt(identity, interrupted).safetyFinding).toBeNull();
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
     expect(store.getTask(identity)).toMatchObject({ status: 'needs human', requeuePending: false });
     expect(store.getAttempts(identity)).toHaveLength(1);

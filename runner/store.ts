@@ -8,7 +8,7 @@ import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import type { AlreadyFixedResult } from '../github/already-fixed.ts';
 import {
-  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, HUMAN_GATES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   WRITABLE_KINDS, assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
@@ -124,8 +124,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 12) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 13) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -207,6 +207,12 @@ export class Store {
           }
           for (const key of changed) this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
           this.#db.exec('PRAGMA user_version=12');
+        }
+        // A finding persisted behind a human gate still owes its escalation after restart.
+        if (version < 13) {
+          if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'safety_owed'))
+            this.#db.exec('ALTER TABLE attempts ADD COLUMN safety_owed INTEGER NOT NULL DEFAULT 0 CHECK (safety_owed IN (0,1))');
+          this.#db.exec('PRAGMA user_version=13');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -874,17 +880,35 @@ export class Store {
       return changed;
     });
   }
-  /** Retry a finding whose original durable save failed, including after its attempt became terminal. */
+  /** Retry a finding whose original durable save failed. False keeps its escalation owed behind a human gate. */
   recordOwedSafetyFinding(identity: PlanIdentity, id: string, finding: string): boolean {
     if (typeof finding !== 'string' || !finding.trim()) throw new GuardRefusal('A safety finding needs its reason.');
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const row = this.#get('SELECT state,safety_finding FROM attempts WHERE plan_key=? AND id=?', key, id);
-      if (!row || row.safety_finding !== null) return false;
-      this.#run('UPDATE attempts SET safety_finding=? WHERE plan_key=? AND id=?', bounded(finding), key, id);
-      if (TERMINAL_STATES.includes(row.state as AttemptState)) this.#actOnFinding(key);
-      this.#touch(key); return true;
+      const row = this.#get('SELECT state,safety_finding,safety_owed FROM attempts WHERE plan_key=? AND id=?', key, id);
+      if (!row) return false;
+      let changed = false;
+      if (row.safety_finding === null) {
+        this.#run('UPDATE attempts SET safety_finding=? WHERE plan_key=? AND id=?', bounded(finding), key, id);
+        changed = true;
+      }
+      const before = this.#task(key).status as TaskStatus;
+      const terminal = TERMINAL_STATES.includes(row.state as AttemptState);
+      const acted = !terminal || !HUMAN_GATES.includes(before);
+      const owed = terminal && !acted ? 1 : 0;
+      if (row.safety_owed !== owed) {
+        this.#run('UPDATE attempts SET safety_owed=? WHERE plan_key=? AND id=?', owed, key, id);
+        changed = true;
+      }
+      if (terminal && acted) this.#actOnFinding(key);
+      if (changed || this.#task(key).status !== before) this.#touch(key);
+      return acted;
     });
+  }
+  /** Terminal findings whose evidence is durable but whose escalation is still blocked by a human gate. */
+  owedSafetyFindings(): { attemptId: string; finding: string }[] {
+    return this.#db.prepare('SELECT id,safety_finding FROM attempts WHERE safety_owed=1 AND safety_finding IS NOT NULL ORDER BY rowid').all()
+      .map(row => ({ attemptId: row.id as string, finding: row.safety_finding as string }));
   }
 
   /** Every durable change to a task or its attempts increases the state version. */

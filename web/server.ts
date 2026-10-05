@@ -120,6 +120,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (executor.busy(identity)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     // A publish reads the task head and pushes it; a new item must not move it meanwhile.
     if (publishing?.busy(identity)) throw new GuardRefusal('A pull request is being published for this task; try again when it has finished.');
+    // Recovery owns this claim for Resume even when owed work will settle instead of admitting an item. Start must not
+    // consume it and strand the task behind the resulting human gate.
+    if (action === 'start' && task.requeuePending) throw new GuardRefusal('Recovery left this task to requeue; it cannot start until Resume resolves that claim.');
     // A failed durable save must not let an ordinary refusal strand an in-memory safety finding until restart loses it.
     if (executor.owes(identity, { scope: false })) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
       claimRequeue: task.requeuePending, queue: false, owed: true };
