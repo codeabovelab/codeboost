@@ -298,6 +298,23 @@ it('refuses a suffix that is invalid against the audited tree despite a valid ba
     .toThrow(/remaining plan is invalid.*Missing source: a/);
   expect(store.continuationRevision(identity, checkpoint.id)).toBeNull();
 });
+it('re-reads the actual checkpoint tree for legacy checkpoint rows', () => {
+  const { store, path } = fixture(true); store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const checkpoint = store.recordCheckpoint(identity, state(store), {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  close(store);
+  const db = new DatabaseSync(path);
+  db.prepare('UPDATE checkpoints SET data=? WHERE key=? AND id=?').run(
+    JSON.stringify({ ...checkpoint, treeHead: undefined }), JSON.stringify([identity.repositoryId, identity.taskId, identity.planId]), checkpoint.id);
+  db.close();
+  const reopened = open(path), amended = reopened.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  reopened.importRevision(JSON.stringify(amended), 'json', context, 1);
+  expect(() => reopened.approveContinuation(identity, checkpoint.id, state(reopened), {
+    ...context, baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
+  })).not.toThrow();
+});
 it('rejects duplicate source SHA mappings and rolls back every resulting ledger/snapshot write', () => {
   const { store } = fixture(); const before = store.getSnapshot(identity);
   expect(() => store.recordRebase(identity, state(store), oid(3), oid(5), [{ oldSha: oid(2), newSha: oid(4) }, { oldSha: oid(2), newSha: oid(5) }])).toThrow();

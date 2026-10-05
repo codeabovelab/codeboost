@@ -118,7 +118,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // Shutdown began: answer 503 before any refusal, so nothing is recorded under the action ID and the UI may resend.
     if (!forView && runner!.closing) throw new ShuttingDownError();
     const task = service.store.getTask(identity), { started, begun, earlierCommits } = progress;
-    const continuation = service.store.continuationProgress(identity);
+    // Safety evidence must settle before reconciliation can refuse on a stale prefix or head.
+    const safetyOwed = executor.owes(identity, { scope: false });
+    const continuation = safetyOwed ? null : service.store.continuationProgress(identity);
     const completed = continuation?.completed ?? progress.completed;
     const prefixHead = continuation?.head ?? progress.prefixHead;
     const next = continuation ? continuation.next : progress.next;
@@ -134,7 +136,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // consume it and strand the task behind the resulting human gate.
     if (action === 'start' && task.requeuePending) throw new GuardRefusal('Recovery left this task to requeue; it cannot start until Resume resolves that claim.');
     // A failed durable save must not let an ordinary refusal strand an in-memory safety finding until restart loses it.
-    if (executor.owes(identity, { scope: false })) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
+    if (safetyOwed) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
       claimRequeue: task.requeuePending, queue: false, owed: true };
     const merge = service.store.getMergeAttempt(identity);
     const activeMerge = !!merge && (merge.state === 'submitting' || merge.state === 'queued');
@@ -278,7 +280,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
       if (action === 'approve-continuation') {
-        if (!executor || runner.closing || runner.isActive(identity) || executor.busy(identity) || publishing?.busy(identity))
+        if (runner.closing) throw new ShuttingDownError();
+        if (!executor || runner.isActive(identity) || executor.busy(identity) || publishing?.busy(identity))
           throw new GuardRefusal('The runner is busy or closing; continuation cannot be approved yet.');
         const progress = service.store.continuationProgress(identity);
         if (!progress) throw new GuardRefusal('This task has no scope checkpoint.');

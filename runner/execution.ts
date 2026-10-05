@@ -343,13 +343,22 @@ export class ItemExecutor {
    * reconciled with (#88), the items an execute attempt completed at the current revision, and the first item none did
    * (null when every item has run).
    */
-  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; prefixHead: string | null; next: string | null } {
+  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; prefixHead: string | null; next: string | null; continuationError?: string } {
     const plan = this.#store.getPlan(identity), { started, begun, earlierCommits, finished, finishedHeads } = this.#store.executeProgress(identity, plan.revision);
     const done = new Set(finished);
     let prefixHead: string | null = null;
     for (const item of plan.items) { if (!done.has(item.id)) break; prefixHead = finishedHeads[item.id] ?? null; }
-    return { started, begun, earlierCommits, completed: plan.items.filter(item => done.has(item.id)).map(item => item.id),
+    const ordinary = { started, begun, earlierCommits, completed: plan.items.filter(item => done.has(item.id)).map(item => item.id),
       prefixHead, next: plan.items.find(item => !done.has(item.id))?.id ?? null };
+    const checkpoint = this.#store.latestCheckpoint(identity);
+    if (!checkpoint) return ordinary;
+    try {
+      const continuation = this.#store.continuationProgress(identity);
+      return continuation ? { ...ordinary, completed: continuation.completed, prefixHead: continuation.head, next: continuation.next } : ordinary;
+    } catch (error) {
+      // Do not let a malformed continuation look complete to publishing; runnerView can still report the reason.
+      return { ...ordinary, continuationError: error instanceof Error ? error.message : String(error) };
+    }
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }

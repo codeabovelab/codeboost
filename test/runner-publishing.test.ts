@@ -123,6 +123,36 @@ function completeAll(service: ReviewService) {
   }
   expect(s.getTask(id).status).toBe('running');
 }
+/** One old-revision checkpoint plus a complete amended suffix, all at the unchanged base head. */
+function completeContinuation(service: ReviewService) {
+  const s = service.store, id = service.config.identity, initial = s.getSnapshot(id), plan = s.getPlan(id);
+  s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+  const first = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: plan.items[0]!.id,
+    expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+  s.markRunning(id, first.id);
+  s.settleAttempt(id, first.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { head: initial.head, unchanged: true, inScope: [], outOfScope: [] } });
+  const entries = [...service.planContext().baseEntries, { path: 'extra.ts', kind: 'file' as const }];
+  const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: s.getSnapshot(id).id, reviewVersion: s.reviewVersion(id) }, {
+    item: plan.items[0]!.id, completedItems: [plan.items[0]!.id], outOfScopePaths: ['extra.ts'], baseEntries: entries,
+  });
+  const amended = s.getPlan(id);
+  amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  const context = { ...service.planContext(), baseEntries: entries };
+  s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
+  const current = s.getPlan(id), snapshot = s.getSnapshot(id);
+  s.saveReview(id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+    current.items.map(item => approveItem(current, [], item.id, id, true)), []);
+  s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, context);
+  for (const item of current.items.slice(1)) {
+    const next = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id,
+      expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+    s.markRunning(id, next.id);
+    s.settleAttempt(id, next.id, { firstReason: null, exitCode: 0, valid: true,
+      result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+  }
+  expect(s.getTask(id).status).toBe('running');
+}
 /**
  * Every plan item completed, but the last changed a file outside its plan item, and its pause for amendment was never
  * recorded (the write failed, or the process stopped): the next run owes that pause.
@@ -246,6 +276,19 @@ const publishSettled = (app: App, identity: PlanIdentity) => vi.waitFor(async ()
 }, { timeout: 20_000, interval: 20 });
 
 describe('publishing a finished task (#103)', () => {
+  it.each(['automatic', 'explicit'] as const)('publishes a completed continuation through the %s path', async path => {
+    const w = world(), { app, identity, store } = await serve(w, { before: completeContinuation, startup: path === 'explicit' ? false : undefined });
+    expect(() => store.assertPublishableNow(identity, false)).not.toThrow();
+    expect(store.canPublish(identity, false)).toBe(true);
+    if (path === 'explicit') {
+      expect(app.publishing!.mode(identity)).toMatchObject({ kind: 'publish', draft: false });
+      expect((await act(app, 'publish')).status).toBe(200);
+    }
+    await publishSettled(app, identity);
+    expect(w.github.calls).toContain('open ready');
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false });
+  });
+
   it('opens one ready pull request when a run completes the plan, with the branch at the task head', async () => {
     const w = world();
     const { app, close, identity, store, branch, head } = await serve(w);

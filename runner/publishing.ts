@@ -71,7 +71,7 @@ export class TaskPublishing {
    * What a job would do now. Throws the refusal otherwise, with what a person can act on. Writes nothing, so the view
    * asks it too and never offers what an action would refuse.
    */
-  mode(identity: PlanIdentity, progress?: { next: string | null }): PullRequestJob {
+  mode(identity: PlanIdentity, progress?: { next: string | null; continuationError?: string }): PullRequestJob {
     if (this.#closing || this.#runner.closing) throw new ShuttingDownError();
     if (this.busy(identity)) throw new GuardRefusal(`A pull request is already being ${this.#running.get(identityKey(identity))!.job.kind === 'close' ? 'closed' : 'published'} for this task.`);
     const task = this.#store.getTask(identity);
@@ -83,7 +83,9 @@ export class TaskPublishing {
     // Publishing reads the task head, so it waits for the run (and the attempt) to end: assertPublishable refuses an active attempt.
     if (this.#runner.isActive(identity) || this.#executor.busy(identity)) throw new GuardRefusal('A run of this task is still in progress; publish once it has ended.');
     if (task.status === 'running') {
-      const { next } = progress ?? this.#executor.progress(identity);
+      const current = progress ?? this.#executor.progress(identity);
+      if (current.continuationError) throw new GuardRefusal(`The task continuation cannot be reconciled for publishing: ${current.continuationError}`);
+      const { next } = current;
       if (next !== null) throw new GuardRefusal(`${next} has not run yet; publish once every plan item has run.`);
       this.#assertNothingOwed(identity);
       this.#store.assertPublishableNow(identity, false);

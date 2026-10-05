@@ -82,6 +82,7 @@ function committedFirstItem(service: ReviewService, unchanged = false, outOfScop
   if (unchanged) s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
   else s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head, unchanged: false, inScope: [], outOfScope },
     history: { base: snapshot.base, head, entries: [{ sha: head, owner: item, origin: 'owned', sourceSha: null }] } });
+  return attempt.id;
 }
 /** Save a new plan revision, as a person editing the plan does. */
 function revise(service: ReviewService) {
@@ -211,6 +212,63 @@ describe('resume (#91 part 2)', () => {
 });
 
 describe('start and resume refusals and races (#91 part 2)', () => {
+  it('retains current-revision approvals over completed continuation items and starts the next suffix item', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), itemIds = s.getPlan(id).items.map(item => item.id);
+      const entries = [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: itemIds[0]!, completedItems: [itemIds[0]!], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the observed file' });
+      const context = { ...service.planContext(), baseEntries: entries };
+      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
+      const next = s.getPlan(id);
+      s.saveReview(id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+        next.items.map(item => approveItem(next, [], item.id, id, true)), []);
+      service.planContextAt = () => context;
+      s.approveContinuation(id, checkpoint.id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, context);
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: itemIds[1]!,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id);
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+    } });
+    expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+    expect(await view(app)).toMatchObject({ resumable: true, continuation: { completedItems: [items[0], items[1]], next: items[2], approved: true } });
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[2] });
+    expect(store.getAttempts(identity).at(-1)?.item).toBe(items[2]);
+  });
+  it('does not skip a completed continuation item edited without changing its ID', async () => {
+    const { identity, store } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), itemIds = s.getPlan(id).items.map(item => item.id);
+      const baseContext = service.planContext();
+      const entries = [...baseContext.baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: itemIds[0]!, completedItems: [itemIds[0]!], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the observed file' });
+      const context = { ...service.planContext(), baseEntries: entries };
+      s.importRevision(JSON.stringify(amended), 'json', baseContext, 1);
+      const next = s.getPlan(id);
+      s.saveReview(id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+        next.items.map(item => approveItem(next, [], item.id, id, true)), []);
+      service.planContextAt = () => context;
+      s.approveContinuation(id, checkpoint.id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, context);
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: itemIds[1]!,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id);
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+      const changed = s.getPlan(id);
+      changed.items[1]!.intent += ' (revised after execution)';
+      s.importRevision(JSON.stringify(changed), 'json', baseContext, next.revision);
+    } });
+    expect(() => store.continuationProgress(identity)).toThrow(/Completed item P2 changed after it ran/);
+  });
   it('requires explicit continuation approval and resumes at the audited suffix through the API', async () => {
     const { app, identity, store, items } = await serve({ before: service => {
       committedFirstItem(service, false, ['other.ts']);
@@ -515,6 +573,27 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getTask(identity)).toMatchObject({ status: 'needs human', stateVersion: before + 1 });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
+  it('settles owed safety evidence before an invalid continuation prefix can refuse resume', async () => {
+    let earlier = '';
+    const { app, identity, store } = await serve({ before: service => {
+      earlier = committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), plan = s.getPlan(id);
+      s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: plan.items[0]!.id, completedItems: [plan.items[0]!.id], outOfScopePaths: ['other.ts'],
+        baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
+      });
+      const amended = s.getPlan(id), first = amended.items[0]!.id;
+      amended.items[0]!.id = 'P999';
+      for (const item of amended.items) item.depends_on = item.depends_on.map(dependency => dependency === first ? 'P999' : dependency);
+      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
+      const current = s.getPlan(id);
+      s.saveReview(id, { revision: current.revision, snapshotId: s.getSnapshot(id).id, reviewVersion: s.reviewVersion(id) },
+        current.items.map(item => approveItem(current, [], item.id, id, true)), []);
+    }, findings: findings => findings.record(earlier, 'Safety violation: checkpoint reconciliation regression') });
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)[0]!.safetyFinding).toMatch(/checkpoint reconciliation regression/);
+  });
   it('replays an action ID, and refuses a second resume made against the old state', async () => {
     const { app, identity, store } = await serve({ before: service => { failedFirstItem(service); } });
     const { stateVersion } = await view(app), actionId = randomUUID();
@@ -580,5 +659,21 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity)).toEqual([]);
     // Not recorded: the same action ID is refused afresh (503 again), never replayed as a saved refusal.
     expect((await act(app, 'start', { actionId })).status).toBe(503);
+  });
+  it('answers 503 to continuation approval during shutdown without saving the action refusal', async () => {
+    const { app, identity, store } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
+      s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: s.getPlan(id).items[0]!.id, completedItems: [s.getPlan(id).items[0]!.id], outOfScopePaths: ['other.ts'],
+        baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
+      });
+    } });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    app.runner!.rejectAdmission();
+    expect(await act(app, 'approve-continuation', { actionId })).toMatchObject({ status: 503 });
+    expect(store.savedAction(identity, { actionId, kind: 'approve-continuation', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeUndefined();
   });
 });

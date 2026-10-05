@@ -109,6 +109,8 @@ export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
   /** Runner-audited actual tree, retained separately from the declared plan. */
   baseEntries: PlanContext['baseEntries']; completedItems: string[]; outOfScopePaths: string[];
+  /** Present on new checkpoints; absent on pre-continuation rows whose saved tree was only the original base tree. */
+  treeHead?: string;
 }
 type ExecutionResultLike = { head?: unknown; unchanged?: unknown };
 const encode = (value: unknown) => JSON.stringify(value);
@@ -727,6 +729,22 @@ export class Store {
       if (!completedSnapshot) break;
       prefixSnapshots.add(completedSnapshot);
     }
+    // A continuation approval starts a new reviewed ancestry at its audited snapshot. The checkpoint's completed
+    // prefix belongs to earlier plan revisions, so those attempts cannot identify the snapshots its approvals survive.
+    const checkpoint = this.latestCheckpoint(identity), continuation = checkpoint ? this.continuationProgress(identity) : null;
+    if (continuation && this.continuationApproved(identity, continuation)) {
+      const approvalSnapshot = this.continuationApproval(identity, checkpoint!.id, revision);
+      if (approvalSnapshot) {
+        prefixSnapshots.add(approvalSnapshot);
+        const afterCheckpoint = new Set(continuation.completed.slice(checkpoint!.completedItems.length));
+        for (const row of this.#db.prepare(`SELECT item,context FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+          AND json_extract(context,'$.planRevision')=? ORDER BY rowid`).all(key, revision)) {
+          const context = decode<InvocationContext>(row.context);
+          if (typeof row.item === 'string' && afterCheckpoint.has(row.item) && typeof context.snapshotId === 'string')
+            prefixSnapshots.add(context.snapshotId);
+        }
+      }
+    }
     const reviewedExecutionSnapshot = (value: ReviewState) => value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId);
     // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
     // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
@@ -746,7 +764,7 @@ export class Store {
       this.#expect(key, expected);
       const plan = this.getPlan(identity), ids = plan.items.map(item => item.id);
       if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i])) throw new Error('Checkpoint must describe the executed plan prefix.');
-      const checkpoint = { ...evidence, ...expected, id: randomUUID() };
+      const checkpoint = { ...evidence, ...expected, treeHead: this.getSnapshot(identity, expected.snapshotId).head, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint)); return checkpoint;
     });
   }
@@ -770,7 +788,8 @@ export class Store {
       const pausable = status === 'running' || status === 'in review' || status === 'approved but merge blocked' || (options.owed === true && status === 'queued');
       if (!pausable) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
-      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
+      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId,
+        treeHead: this.getSnapshot(identity, ranAt.snapshotId).head, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
       return checkpoint;
     });
@@ -827,6 +846,13 @@ export class Store {
         this.getSnapshot(identity, row.context.snapshotId).head !== head || plan.items[completed.length]?.id !== row.item ||
         !this.continuationApproval(identity, checkpoint.id, row.context.planRevision))
         throw new GuardRefusal('Work after the checkpoint cannot be reconciled with the amended plan.');
+      // An ID-preserving edit is still a different unit of work. A continuation may amend the checkpoint item to
+      // declare the already-observed out-of-scope change, but every later item must remain identical to the revision
+      // that actually executed it, or the changed work must be run again.
+      const executedPlan = this.getPlan(identity, row.context.planRevision);
+      const executedItem = executedPlan.items.find(item => item.id === row.item);
+      if (!executedItem || JSON.stringify(executedItem) !== JSON.stringify(plan.items[completed.length]))
+        throw new GuardRefusal(`Completed item ${row.item} changed after it ran; review and rerun it before continuing.`);
       head = result.head;
       completed.push(row.item);
     }
@@ -871,9 +897,13 @@ export class Store {
       if (!progress || progress.checkpoint.id !== checkpointId || !checkpoint.outOfScopePaths.length || expected.revision <= checkpoint.revision)
         throw new GuardRefusal('Continuation requires an amended plan at the audited checkpoint.');
       if (this.getSnapshot(identity).head !== progress.head ||
-          (progress.completed.length === checkpoint.completedItems.length &&
-            (checkpoint.snapshotId !== expected.snapshotId || JSON.stringify(context.baseEntries) !== JSON.stringify(checkpoint.baseEntries))))
+          (progress.completed.length === checkpoint.completedItems.length && checkpoint.snapshotId !== expected.snapshotId))
         throw new GuardRefusal('The audited checkpoint tree or snapshot changed; review it before continuing.');
+      // New checkpoint rows bind the saved entries to their immutable commit tree. Legacy rows saved the original base
+      // tree instead; the caller re-reads the actual tree at progress.head, so comparing it to that old evidence rejects
+      // valid amendments and is not an integrity check.
+      if (checkpoint.treeHead === progress.head && JSON.stringify(context.baseEntries) !== JSON.stringify(checkpoint.baseEntries))
+        throw new GuardRefusal('The audited checkpoint tree changed; review it before continuing.');
       if (!progress.next) throw new GuardRefusal('Every item of the amended plan has run.');
       const amendedItem = this.getPlan(identity).items[checkpoint.completedItems.length - 1]!;
       const declared = new Set(amendedItem.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(context.pathKey));
@@ -1422,7 +1452,8 @@ export class Store {
     return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   /** Publishing runs after the task's last attempt settled, while the task is running, or in needs human for a draft PR. */
-  #assertPublishable(key: string, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
+  #assertPublishable(identity: PlanIdentity, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
+    const key = identityKey(identity);
     if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
     if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
     if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
@@ -1437,6 +1468,11 @@ export class Store {
       const items = decode<Plan>(this.#get('SELECT data FROM revisions WHERE key=? AND revision=?', key, revision)!.data).items;
       const finished = new Set(this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
         AND state='completed' AND json_extract(context,'$.planRevision') = ?`).all(key, revision).map(entry => entry.item as string));
+      const checkpoint = this.latestCheckpoint(identity), continuation = checkpoint ? this.continuationProgress(identity) : null;
+      if (continuation) {
+        if (!this.continuationApproved(identity, continuation)) throw new GuardRefusal('The current continuation revision is not approved for publishing.');
+        for (const item of continuation.completed) finished.add(item);
+      }
       const unrun = items.find(item => !finished.has(item.id));
       if (unrun) throw new GuardRefusal(`${unrun.id} has not run yet; publish once every plan item has run.`);
     }
@@ -1450,7 +1486,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       const task = this.#task(key);
-      this.#assertPublishable(key, task, expectedStateVersion, input.draft);
+      this.#assertPublishable(identity, task, expectedStateVersion, input.draft);
       if (this.#current(key).snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
       if (input.result.outcome !== 'clear' && !input.draft) this.#run("UPDATE tasks SET status='possibly already fixed' WHERE plan_key=?", key);
       this.#touch(key);
@@ -1526,7 +1562,7 @@ export class Store {
     this.#transaction(() => {
       const row = this.#get("SELECT refresh_version, refresh_review_version FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL", key, openingId);
       if (!row) throw new GuardRefusal('No update of this pull request is in flight.');
-      this.#assertPublishable(key, this.#task(key), row.refresh_version as number, draft);
+      this.#assertPublishable(identity, this.#task(key), row.refresh_version as number, draft);
       if (this.#current(key).review_version !== row.refresh_review_version) throw new GuardRefusal('The review changed after the check. Reload before writing.');
     });
   }
@@ -1537,7 +1573,7 @@ export class Store {
   #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
     const key = identityKey(identity), task = this.#task(key), check = this.latestAlreadyFixed(identity);
     if (!check || check.id !== input.checkId || check.result.outcome !== 'clear') throw new GuardRefusal('A clear already-fixed check must come right before opening a pull request.');
-    this.#assertPublishable(key, task, check.stateVersion, input.draft);
+    this.#assertPublishable(identity, task, check.stateVersion, input.draft);
     if (this.#current(key).review_version !== check.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
     const snapshot = this.getSnapshot(identity);
     if (snapshot.id !== check.snapshotId || snapshot.head !== input.headSha) throw new GuardRefusal('The task head changed after the check.');
@@ -1643,19 +1679,19 @@ export class Store {
   /** Whether the task can be published in this mode right now (status, no attempt, merge, requeue or rebase). */
   canPublish(identity: PlanIdentity, draft: boolean): boolean {
     const key = identityKey(identity), task = this.#task(key);
-    try { this.#assertPublishable(key, task, task.state_version as number, draft); return true; }
+    try { this.#assertPublishable(identity, task, task.state_version as number, draft); return true; }
     catch (error) { if (error instanceof GuardRefusal) return false; throw error; }
   }
   /** The full publish guard at the current state version, before any GitHub call: refuse early, with its reason. */
   assertPublishableNow(identity: PlanIdentity, draft: boolean): void {
     const key = identityKey(identity), task = this.#task(key);
-    this.#assertPublishable(key, task, task.state_version as number, draft);
+    this.#assertPublishable(identity, task, task.state_version as number, draft);
   }
   /** The task, its review and its head are exactly as a publish read them before its last await. */
   assertUnchangedSince(identity: PlanIdentity, input: { stateVersion: number; reviewVersion: number; snapshotId: string; draft: boolean }): void {
     const key = identityKey(identity);
     this.#transaction(() => {
-      this.#assertPublishable(key, this.#task(key), input.stateVersion, input.draft);
+      this.#assertPublishable(identity, this.#task(key), input.stateVersion, input.draft);
       const plan = this.#current(key);
       if (plan.review_version !== input.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
       if (plan.snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
