@@ -418,7 +418,7 @@ describe('publishing a finished task (#103)', () => {
     const view = app.service.load();
     expect(view.segments.filter(segment => segment.row === 'Unplanned').map(segment => segment.path)).toContain('debug.log');
     const gateway: MergeGateway = { inspect: async () => ({ base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
-      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear' }), merge: async () => { throw new Error('not merged here'); } };
+      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 100, draft: false }), merge: async () => { throw new Error('not merged here'); } };
     const status = await new MergeCoordinator(app.service, gateway).status(view);
     expect(status).toMatchObject({ ready: false });
     expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'unplanned' }));
