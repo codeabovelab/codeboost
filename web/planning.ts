@@ -31,8 +31,8 @@ export function productionPlanning(config: ReviewConfig, options: {
       provider,
       async describe(signal) {
         const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
-        // The configured base branch (#103), or the base commit when none is configured.
-        const baseRef = github.baseBranch ?? service.store.getSnapshot(config.identity).base;
+        // The configured base branch (#103), or the base commit when none (or an empty one) is configured.
+        const baseRef = github.baseBranch || service.store.getSnapshot(config.identity).base;
         return { issue: { number: text.number, title: text.title, body: text.body, comments: [...text.comments] },
           approvedLessons: [], repo: { name: github.repository, baseRef } };
       },

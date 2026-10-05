@@ -234,3 +234,12 @@ it('never replays a record of this build through another request\'s path by nami
     .toMatchObject({ status: 409, body: { error: 'Action ID already used for a different request.' } });
   expect((await served.api('GET', `/api/plan/suggestions/${other}`)).body.state).toBe('ready');
 });
+
+it('refuses a draft against a stale revision or snapshot, starting nothing', async () => {
+  const served = await serve(redraft);
+  for (const stale of [{ expectedRevision: served.view.plan.revision + 1, snapshotId: served.view.snapshot.id },
+    { expectedRevision: served.view.plan.revision, snapshotId: randomUUID() }])
+    expect(await served.api('POST', '/api/plan/drafts', { ...stale, feedback: '', actionId: randomUUID() }))
+      .toMatchObject({ status: 409, body: { error: 'Stale plan revision or snapshot. Reload before asking for a draft.' } });
+  expect(served.requests).toHaveLength(0);
+});

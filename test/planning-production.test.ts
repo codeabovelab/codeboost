@@ -49,11 +49,20 @@ it('tells each request the GitHub issue, the repository and the base commit, rea
   expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
 });
 
-it('names the configured base branch, when there is one', async () => {
-  const base = production(), config = { ...base, github: { ...base.github!, baseBranch: 'release' } };
-  const service = new ReviewService(config); closers.push(() => service.close());
-  const deps = productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent: () => closable() })!(service);
-  expect((await deps.describe(new AbortController().signal)).repo).toEqual({ name: 'acme/retry-service', baseRef: 'release' });
+it.each([['release', 'release'], ['', null]] as const)('names the configured base branch %j, or else the base commit, in the prompt', async (baseBranch, expected) => {
+  const base = production(), config = { ...base, github: { ...base.github!, baseBranch } };
+  const requests: AuthorRequest[] = [];
+  const agent = () => ({ close: async () => undefined, invoke: async (request: AuthorRequest, signal: AbortSignal) => {
+    requests.push(request); return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } }) as unknown as PlanningAgent;
+  const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined,
+    productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent })!);
+  closers.push(() => app.close());
+  const call = async (method: string, path: string, body?: unknown) => (await fetch(`${new URL(app.url).origin}${path}`, { method,
+    headers: { 'x-codeboost-token': app.token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined })).json() as Promise<Record<string, any>>;
+  const view = await call('GET', '/api/review');
+  await call('POST', '/api/plan/drafts', { expectedRevision: view.plan.revision, snapshotId: view.snapshot.id, feedback: '', actionId: randomUUID() });
+  await vi.waitFor(() => expect(requests).toHaveLength(1));
+  expect(requests[0]!.prompt).toContain(`"base_ref":${JSON.stringify(expected ?? view.snapshot.base)}`);
 });
 
 it('fails requests an earlier process left pending, only after the lock is verified', () => {
