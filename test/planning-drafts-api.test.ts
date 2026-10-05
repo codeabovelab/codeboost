@@ -198,3 +198,25 @@ it('dismisses a ready draft, and cancels a pending one when the server shuts dow
   try { expect(store.getDraft(held.config.identity, pending)).toMatchObject({ state: 'cancelled', reason: 'Suggestion coordinator is closing.' }); }
   finally { store.close(); }
 });
+
+it('replays a recorded cancel before refusing a body request ID, and refuses one on suggestion routes too', async () => {
+  const served = await serve(view => async () => JSON.stringify(cards(view.plan.revision)));
+  const id = (await served.start('suggestions')).body.result.requestId as string;
+  await served.settled('suggestions', id);
+  const actionId = randomUUID(), first = await served.api('POST', `/api/plan/suggestions/${id}/cancel`, { actionId });
+  expect(first).toEqual({ status: 200, body: { result: { state: 'cancelled' } } });
+  // A resend that also names the request in its body still replays: replay comes before every other check.
+  expect(await served.api('POST', `/api/plan/suggestions/${id}/cancel`, { actionId, requestId: id })).toEqual(first);
+  expect(await served.api('POST', `/api/plan/suggestions/${id}/apply`, { index: 0, actionId: randomUUID(), requestId: id }))
+    .toMatchObject({ status: 400, body: { error: 'The request ID comes from the path, not the body.' } });
+});
+
+it('replays a suggestion apply recorded before #124 with its saved revision', async () => {
+  const served = await serve(redraft), actionId = randomUUID();
+  const store = new Store(served.config.database);
+  try { store.userAction(served.config.identity, { actionId, kind: 'suggestion-apply', request: { index: 0 } }, () => ({ revision: 7 })); }
+  finally { store.close(); }
+  expect(await served.api('POST', `/api/plan/suggestions/${randomUUID()}/apply`, { index: 0, actionId })).toEqual({ status: 200, body: { result: { revision: 7 } } });
+  // The body differs from the recorded one, so it is a different request.
+  expect(await served.api('POST', `/api/plan/suggestions/${randomUUID()}/apply`, { index: 1, actionId })).toMatchObject({ status: 409 });
+});

@@ -130,6 +130,21 @@ it('fails, at startup, every request an earlier process left pending, and nothin
   expect(store.settleInterruptedRequests()).toBe(0);
 });
 
+it('settles pending requests of every plan in the database, and no other state', () => {
+  const { store } = fixture(), other = { ...identity, planId: 'other' };
+  store.createPlan(JSON.stringify(plan()), 'json', { ...context, identity: other }, oid(1), oid(2));
+  const elsewhere = store.beginSuggestions(other, { revision: 1, snapshotId: store.getSnapshot(other).id }, 'suggest');
+  const cancelled = readyDraft(store); store.cancelSuggestions(identity, cancelled, 'Dismissed.');
+  // Pending until the apply below invalidates it.
+  const invalidated = store.beginSuggestions(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, 'suggest');
+  const consumed = readyDraft(store); store.applyDraft(identity, consumed, context);
+  expect(store.getSuggestions(identity, invalidated).state).toBe('invalidated');
+  expect(store.settleInterruptedRequests()).toBe(1);
+  expect(store.getSuggestions(other, elsewhere).state).toBe('failed');
+  expect(store.getDraft(identity, cancelled)).toMatchObject({ state: 'cancelled', reason: 'Dismissed.' });
+  expect(store.getDraft(identity, consumed).state).toBe('consumed');
+});
+
 it('dismisses a ready draft', () => {
   const { store } = fixture(), id = readyDraft(store);
   store.cancelSuggestions(identity, id, 'Dismissed.');

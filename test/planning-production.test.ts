@@ -70,6 +70,14 @@ it('fails requests an earlier process left pending, only after the lock is verif
   expect(store.getDraft(config.identity, pending)).toMatchObject({ state: 'failed', reason: 'The server stopped before this request finished. Ask again.' });
 });
 
+it('closes the Store and starts nothing when the planning setup refuses', async () => {
+  const config = production(), close = vi.spyOn(ReviewService.prototype, 'close');
+  const setup = productionPlanning(config, { verifyLock: () => { throw new Error('The database path changed.'); }, agent: () => closable() })!;
+  await expect(startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, setup)).rejects.toThrow('The database path changed.');
+  expect(close).toHaveBeenCalledTimes(1);
+  close.mockRestore();
+});
+
 it('closes the planning agent when the server closes', async () => {
   const config = production(), close = vi.fn(async () => undefined);
   const setup = productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent: () => closable(close) })!;

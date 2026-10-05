@@ -269,23 +269,24 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const actionId = requireAction(input), { actionId: _omit, ...body } = input;
     // Suggestions are edit cards for the current plan; a draft is a whole next revision (#124). They share one lifecycle.
     const imported = path === '/api/plan/import', route = PLANNING_REQUEST.exec(path);
-    // The recorded request names the planning request the path acts on, so one action ID cannot replay across two. The
-    // path alone names it: a body that also carries one could make an older record's hash match another request's.
-    if (route?.[2] && 'requestId' in body) throw new BadRequest('The request ID comes from the path, not the body.');
+    // The recorded request names the planning request the path acts on, so one action ID cannot replay across two.
     const request = route?.[2] ? { ...body, requestId: route[2] } : body;
     const mode: PlanningMode = route?.[1] === 'drafts' ? 'draft' : 'suggest', noun = mode === 'draft' ? 'draft' : 'suggestion';
     const started = !imported && !route![2];
     const kind = imported ? 'plan-import' : started ? `${noun}-start` : `${noun}-${route![3]}`;
-    // A suggestion cancel or apply recorded before #124 hashed the body alone: its replay still returns the saved outcome
-    // (or refusal). Drafts are new, so none was recorded that way.
-    if (route?.[2] && mode === 'suggest') {
-      try { service.store.savedAction(identity, { actionId, kind, request }); }
+    if (route?.[2]) {
+      // Replay first (AGENTS.md): the saved outcome, or saved refusal, under this request's hash.
+      try { const saved = service.store.savedAction<unknown>(identity, { actionId, kind, request }); if (saved) return saved.response; }
       catch (error) {
-        if (!(error instanceof ActionIdReused)) throw error;
+        // A suggestion cancel or apply recorded before #124 hashed the body alone; its replay still returns its outcome.
+        // A body carrying a request ID never takes this path, so an older record cannot be aimed at another request.
+        if (!(error instanceof ActionIdReused) || mode !== 'suggest' || 'requestId' in body) throw error;
         const legacy = service.store.savedAction<unknown>(identity, { actionId, kind, request: body });
         if (!legacy) throw error;
         return legacy.response;
       }
+      // Only the path names the request.
+      if ('requestId' in body) throw new BadRequest('The request ID comes from the path, not the body.');
     }
     // The issue comes from GitHub (#117), so it is read before the recorded action, which runs synchronously. A replay
     // returns its saved outcome without reading GitHub again, and a start the recorded action would refuse anyway (no

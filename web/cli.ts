@@ -68,11 +68,13 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.on(signal, duringStartup);
   let app: Awaited<ReturnType<typeof startServer>>;
   // Planning (#117) is on for any non-demo review with a github block; it needs no runner block.
-  try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, productionPlanning(config, { verifyLock: () => lock.verify() }), runnerSetup); }
+  const planningSetup = productionPlanning(config, { verifyLock: () => lock.verify() });
+  try { app = await startServer(config, port, undefined, undefined, undefined, undefined, undefined, planningSetup, runnerSetup); }
   catch (error) {
     lock.release();
-    // A refused runner startup (no token, a blocked recovery) is the person's to act on: its message, not a stack.
-    if (!runnerSetup) throw error;
+    // A refused runner or planning startup (no token, a blocked recovery, a lock that no longer names the database) is
+    // the person's to act on: its message, not a stack.
+    if (!runnerSetup && !planningSetup) throw error;
     console.error(error instanceof Error ? error.message : String(error)); process.exit(1);
   }
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.removeListener(signal, duringStartup);

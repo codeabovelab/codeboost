@@ -188,3 +188,20 @@ it('refuses with a message, not a stack, when the database path changes during a
     expect(cli.err().trim()).toBe('The database path changed while opening. Refusing to start.');
   } finally { docker.release(); cli.child.kill('SIGKILL'); }
 });
+it('fails, once startup has verified the lock, a planning request an earlier process left pending (#124)', async () => {
+  const { fakeDocker, start, database, identity } = review(), docker = fakeDocker();
+  const store = new Store(database);
+  let pending: string;
+  try { pending = store.beginSuggestions(identity, { revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id }, 'draft'); }
+  finally { store.close(); }
+  docker.release();
+  const cli = start(docker);
+  try {
+    await cli.until(() => cli.out().includes('Review ready'), 'the server to open');
+    const reopened = new Store(database);
+    try { expect(reopened.getDraft(identity, pending)).toMatchObject({ state: 'failed', reason: 'The server stopped before this request finished. Ask again.' }); }
+    finally { reopened.close(); }
+    cli.child.kill('SIGINT');
+    expect(await cli.exited).toBe(0);
+  } finally { cli.child.kill('SIGKILL'); }
+});
