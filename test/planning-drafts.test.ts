@@ -170,7 +170,7 @@ it.each([9, 10])('migrates a v%i database to the current schema, reading its exi
   const migrated = open();
   expect(migrated.getSuggestions(identity, id)).toMatchObject({ mode: 'suggest', state: 'pending' });
   const db = new DatabaseSync(path);
-  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 }); } finally { db.close(); }
+  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 14 }); } finally { db.close(); }
 });
 
 /** E3 in draft mode, with a provider that answers from `source`. */

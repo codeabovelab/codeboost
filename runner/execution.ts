@@ -57,6 +57,8 @@ export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: 
 /** Trusted runner-side sources for a task. Issue text and lessons are untrusted data inside the prompt. */
 export interface ExecutionSources {
   planContext(identity: PlanIdentity): PlanContext;
+  /** Entries of the audited runner commit, read from its immutable tree after export. */
+  checkpointContext(identity: PlanIdentity, head: string): PlanContext;
   /** The issue text the prompt carries; fetched per attempt, so it may await (and must stop on abort). */
   issue(identity: PlanIdentity, signal: AbortSignal): IssueText | Promise<IssueText>;
   lessons(identity: PlanIdentity): readonly string[];
@@ -412,7 +414,7 @@ export class ItemExecutor {
    */
   #begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean; expectedReviewVersion?: number }, strict: boolean): { outcome: ExecutionOutcome } | Run {
     const plan = this.#store.getPlan(identity);
-    const start = options.fromItem ? plan.items.findIndex(item => item.id === options.fromItem) : 0;
+    let start = options.fromItem ? plan.items.findIndex(item => item.id === options.fromItem) : 0;
     if (start < 0) throw new Error('Unknown plan item.');
     const run: Run = { plan, index: start, attempt: undefined!, done: [], unchanged: [], stopped: undefined!,
       ...(options.expectedReviewVersion === undefined ? {} : { reviewVersion: options.expectedReviewVersion }) };
@@ -448,11 +450,27 @@ export class ItemExecutor {
       if (options.claimRequeue) this.#store.claimRequeue(identity, this.#store.getTask(identity).stateVersion);
       return this.#settledOrRefused(this.#pause(identity, owed.row, owed.result, run.stopped, [], true), strict);
     }
-    // Continuing after a scope pause (plan-format.md: reconcile the executed prefix with the audited head, validate the
-    // remaining items from that checkpoint) is not built yet (#88), so a paused task runs no further items: fail closed.
-    const checkpoint = this.#store.latestCheckpoint(identity);
-    if (checkpoint)
-      return notStarted(`${checkpoint.item} changed files outside its plan item. Continuing after a scope pause is not supported yet (#88), so this task runs no further items.`);
+    const continuation = this.#store.latestCheckpoint(identity) ? this.#store.continuationProgress(identity) : null;
+    const next = continuation ? continuation.next : this.progress(identity).next;
+    if (!options.fromItem && next) start = plan.items.findIndex(item => item.id === next);
+    run.index = start;
+    if (continuation) {
+      if (!continuation.next) return notStarted('Every item of the amended plan has run.');
+      if (plan.revision <= continuation.checkpoint.revision || !this.#store.continuationApproved(identity, continuation))
+        return notStarted('The amended plan needs an approved continuation at the current audited head.');
+      if (plan.items[start]?.id !== continuation.next)
+        return notStarted(`Continuation must start with ${continuation.next}, the next item after the audited prefix.`);
+      const completed = new Set(continuation.completed);
+      if (plan.items[start]!.depends_on.some(id => !completed.has(id)))
+        return notStarted(`Dependencies of ${continuation.next} are not complete at the checkpoint.`);
+    } else {
+      const progress = this.progress(identity);
+      if (!progress.next) return notStarted('Every item of this plan has run.');
+      if (!progress.begun && progress.earlierCommits)
+        return notStarted('The revised plan has earlier runner commits that need reconciliation.');
+      if (plan.items[start]?.id !== progress.next)
+        return notStarted(`Execution must start with ${progress.next}, the first unfinished plan item.`);
+    }
     const admitted = this.#admit(identity, run, null, options.claimRequeue === true, strict);
     if (!('id' in admitted)) return { outcome: admitted };
     run.attempt = admitted;
@@ -618,7 +636,7 @@ export class ItemExecutor {
     let checkpointId: string;
     try {
       checkpointId = (owed ? direct : this.#write)(() => this.#store.pauseForAmendment(identity, { revision: row.context.planRevision, snapshotId }, {
-        item, baseEntries: this.#sources.planContext(identity).baseEntries,
+        item, baseEntries: this.#sources.checkpointContext(identity, result.head).baseEntries,
         completedItems: items.slice(0, items.findIndex(entry => entry.id === item) + 1).map(entry => entry.id), outOfScopePaths: result.outOfScope,
       }, { owed })).id;
     } catch (error) {

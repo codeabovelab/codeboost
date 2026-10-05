@@ -2,7 +2,7 @@ import type { DatabaseSync, SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
-import { importPlan, applySuggestion, assertEditReply, assertPlan, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
+import { importPlan, applySuggestion, assertEditReply, assertPlan, validateContinuationPlan, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
 import type { PlanningMode } from '../core/planning-suggestions.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
@@ -110,6 +110,7 @@ export interface Checkpoint {
   /** Runner-audited actual tree, retained separately from the declared plan. */
   baseEntries: PlanContext['baseEntries']; completedItems: string[]; outOfScopePaths: string[];
 }
+type ExecutionResultLike = { head?: unknown; unchanged?: unknown };
 const encode = (value: unknown) => JSON.stringify(value);
 const decode = <T>(value: unknown): T => JSON.parse(value as string) as T;
 function sha(value: string): void {
@@ -129,8 +130,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 13) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 14) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -218,6 +219,12 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'safety_owed'))
             this.#db.exec('ALTER TABLE attempts ADD COLUMN safety_owed INTEGER NOT NULL DEFAULT 0 CHECK (safety_owed IN (0,1))');
           this.#db.exec('PRAGMA user_version=13');
+        }
+        // Bind a continuation decision to the reviewed snapshot. Old rows had no such binding and cannot admit work.
+        if (version < 14) {
+          if (!this.#db.prepare('PRAGMA table_info(continuations)').all().some(column => column.name === 'snapshot_id'))
+            this.#db.exec('ALTER TABLE continuations ADD COLUMN snapshot_id TEXT');
+          this.#db.exec('PRAGMA user_version=14');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -794,13 +801,95 @@ export class Store {
     const row = this.#get('SELECT data FROM checkpoints WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown checkpoint.'); return decode<Checkpoint>(row.data);
   }
-  /** Persist a person's approval only after the runner reconciles the prefix and validates the suffix. */
-  approveContinuation(identity: PlanIdentity, checkpointId: string, expected: ReviewState): void {
+  /** Reconcile every completed execute item after the checkpoint with the recorded task head. */
+  continuationProgress(identity: PlanIdentity): { checkpoint: Checkpoint; completed: string[]; next: string | null; head: string } | null {
+    const checkpoint = this.latestCheckpoint(identity);
+    if (!checkpoint) return null;
+    const plan = this.getPlan(identity), completed = [...checkpoint.completedItems];
+    const prefix = plan.items.slice(0, completed.length);
+    if (prefix.length !== completed.length || prefix.some((item, index) => item.id !== completed[index]))
+      throw new GuardRefusal('The amended plan changed the completed checkpoint prefix.');
+    let head = this.getSnapshot(identity, checkpoint.snapshotId).head;
+    const key = identityKey(identity);
+    const origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed' AND item=?
+      AND json_extract(context,'$.planRevision')=? AND json_extract(result,'$.head')=? ORDER BY rowid DESC LIMIT 1`,
+      key, checkpoint.item, checkpoint.revision, head)?.rowid as number | undefined;
+    if (origin === undefined && this.#get('SELECT 1 AS found FROM attempts WHERE plan_key=? LIMIT 1', key))
+      throw new GuardRefusal('The checkpoint has no completed execute attempt at its audited head.');
+    const later = origin === undefined ? [] : this.#db.prepare(`SELECT * FROM attempts WHERE plan_key=? AND rowid>?
+      AND state='completed' AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')}) ORDER BY rowid LIMIT 10001`)
+      .all(key, origin, ...WRITABLE_KINDS);
+    if (later.length > 10000) throw new GuardRefusal('Too many completed attempts follow the checkpoint to reconcile safely.');
+    for (const stored of later) {
+      const row = this.#attemptRecord(stored);
+      const result = row.result as ExecutionResultLike | null;
+      if (row.kind !== 'execute' || !result || typeof result.head !== 'string' || !row.item ||
+        this.getSnapshot(identity, row.context.snapshotId).head !== head || plan.items[completed.length]?.id !== row.item ||
+        !this.continuationApproval(identity, checkpoint.id, row.context.planRevision))
+        throw new GuardRefusal('Work after the checkpoint cannot be reconciled with the amended plan.');
+      head = result.head;
+      completed.push(row.item);
+    }
+    if (head !== this.getSnapshot(identity).head)
+      throw new GuardRefusal('The task head no longer ends at the audited completed prefix.');
+    return { checkpoint, completed, next: plan.items[completed.length]?.id ?? null, head };
+  }
+  continuationApproval(identity: PlanIdentity, checkpointId: string, revision: number): string | null {
+    const row = this.#get('SELECT snapshot_id FROM continuations WHERE key=? AND checkpoint_id=? AND revision=?', identityKey(identity), checkpointId, revision);
+    return typeof row?.snapshot_id === 'string' ? row.snapshot_id : null;
+  }
+  /** An approval still covers this head only when its own revision's completed attempts connect it to the current head. */
+  continuationApproved(identity: PlanIdentity, progress: NonNullable<ReturnType<Store['continuationProgress']>>): boolean {
+    const revision = this.getPlan(identity).revision;
+    const snapshotId = this.continuationApproval(identity, progress.checkpoint.id, revision);
+    if (!snapshotId) return false;
+    if (snapshotId === this.getSnapshot(identity).id) return true;
+    let head = this.getSnapshot(identity, snapshotId).head, advanced = false;
+    const key = identityKey(identity), origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+      AND item=? AND json_extract(context,'$.planRevision')=? AND json_extract(result,'$.head')=? ORDER BY rowid DESC LIMIT 1`,
+      key, progress.checkpoint.item, progress.checkpoint.revision, this.getSnapshot(identity, progress.checkpoint.snapshotId).head)?.rowid as number | undefined;
+    if (origin === undefined) return false;
+    const attempts = this.#db.prepare(`SELECT * FROM attempts WHERE plan_key=? AND rowid>? AND kind='execute' AND state='completed'
+      AND json_extract(context,'$.planRevision')=? ORDER BY rowid LIMIT 10001`).all(key, origin, revision);
+    if (attempts.length > 10000) return false;
+    for (const stored of attempts) {
+      const row = this.#attemptRecord(stored);
+      if (this.getSnapshot(identity, row.context.snapshotId).head !== head) continue;
+      const result = row.result as ExecutionResultLike | null;
+      if (!result || typeof result.head !== 'string') return false;
+      head = result.head; advanced = true;
+    }
+    return advanced && head === progress.head;
+  }
+  /** Persist a person's approval after reconciling the prefix and validating the suffix at its actual tree. */
+  approveContinuation(identity: PlanIdentity, checkpointId: string, expected: ReviewState, context: PlanContext): void {
     const key = identityKey(identity);
     this.#transaction(() => {
       this.#expect(key, expected); const checkpoint = this.getCheckpoint(identity, checkpointId);
-      if (!checkpoint.outOfScopePaths.length || checkpoint.snapshotId !== expected.snapshotId || expected.revision <= checkpoint.revision) throw new Error('Continuation requires an amended plan at the audited checkpoint.');
-      this.#run('INSERT INTO continuations VALUES (?,?,?) ON CONFLICT(key,checkpoint_id,revision) DO NOTHING', key, checkpointId, expected.revision);
+      this.#context(key, context);
+      const progress = this.continuationProgress(identity);
+      if (!progress || progress.checkpoint.id !== checkpointId || !checkpoint.outOfScopePaths.length || expected.revision <= checkpoint.revision)
+        throw new GuardRefusal('Continuation requires an amended plan at the audited checkpoint.');
+      if (this.getSnapshot(identity).head !== progress.head ||
+          (progress.completed.length === checkpoint.completedItems.length &&
+            (checkpoint.snapshotId !== expected.snapshotId || JSON.stringify(context.baseEntries) !== JSON.stringify(checkpoint.baseEntries))))
+        throw new GuardRefusal('The audited checkpoint tree or snapshot changed; review it before continuing.');
+      if (!progress.next) throw new GuardRefusal('Every item of the amended plan has run.');
+      const amendedItem = this.getPlan(identity).items[checkpoint.completedItems.length - 1]!;
+      const declared = new Set(amendedItem.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(context.pathKey));
+      if (checkpoint.outOfScopePaths.some(path => !declared.has(context.pathKey(path))))
+        throw new GuardRefusal('The amended checkpoint item must declare every out-of-scope path it changed.');
+      const validation = validateContinuationPlan(this.getPlan(identity), context, progress.completed);
+      if (validation.errors.length) throw new GuardRefusal(`The remaining plan is invalid at the audited head: ${validation.errors.map(error => error.message).join(' ')}`);
+      const status = this.getTask(identity).status;
+      if (!['needs amendment', 'queued', 'running'].includes(status)) throw new GuardRefusal(`The task is ${status}; continuation cannot be approved.`);
+      const task = this.#task(key);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      if (status === 'needs amendment') this.transitionTask(identity, this.getTask(identity).stateVersion, 'queued');
+      this.#run(`INSERT INTO continuations (key,checkpoint_id,revision,snapshot_id) VALUES (?,?,?,?)
+        ON CONFLICT(key,checkpoint_id,revision) DO UPDATE SET snapshot_id=excluded.snapshot_id`, key, checkpointId, expected.revision, expected.snapshotId);
     });
   }
   continuationRevision(identity: PlanIdentity, checkpointId: string): number | null {

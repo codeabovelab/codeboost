@@ -137,6 +137,18 @@ export function validatePlan(value: unknown, context: PlanContext): Validation {
   return validator(value, context);
 }
 
+/** Validate only work still to run, starting with the runner-audited tree at its checkpoint. */
+export function validateContinuationPlan(plan: Plan, context: PlanContext, completedItems: readonly string[]): Validation {
+  const prefix = plan.items.slice(0, completedItems.length).map(item => item.id);
+  if (!completedItems.length || prefix.length !== completedItems.length || prefix.some((id, index) => id !== completedItems[index]) || completedItems.length >= plan.items.length)
+    return { errors: [{ code: 'continuation-prefix', message: 'The amended plan must retain the completed item prefix and have a remaining item.' }], warnings: [] };
+  const completed = new Set(completedItems);
+  const suffix: Plan = { ...plan, items: plan.items.slice(completedItems.length).map(item => ({
+    ...item, depends_on: item.depends_on.filter(id => !completed.has(id)),
+  })) };
+  return validatePlan(suffix, context);
+}
+
 function validateV1(value: Plan, context: PlanContext): Validation {
   try { assertPlan(value); } catch (error) {
     if (error instanceof PlanError) return { errors: error.diagnostics, warnings: [] };

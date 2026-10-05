@@ -191,7 +191,8 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
     await ensureCommit(repository, service.store.getSnapshot(service.config.identity).head);
     const prepared: PreparedAttempt = { clone: { id: 'clone', taskId: 'task', directory: '/tmp/x', head: 'f'.repeat(40) }, vendor: 'claude', approvedArgv: [] };
-    const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 3, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+    const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
+      issue: () => ({ number: 3, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     const pusher = new GitBranchPusher({ repository, repositoryId: service.config.identity.repositoryId, remote: REPO, url: w.remote,
       ownedCommits: identity => service.store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha),
       onProcessGroup: () => options.onPushSpawn?.(++spawns, () => app!, close) });

@@ -150,7 +150,8 @@ describe('server with a runner setup', () => {
   const assembly = (service: ReviewService) => {
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
-    const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+    const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: (_identity, head) => service.planContextAt(head),
+      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     return { deps, sources, findings: new SafetyFindings(service.store), recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   };
   it('closes the Store only after the plan runs in progress, and after a failing step', async () => {

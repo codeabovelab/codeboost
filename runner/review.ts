@@ -144,8 +144,8 @@ export class ReviewService {
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
     return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
-  /** The trusted plan context for import and Apply: base entries from the snapshot's base tree, and the configured path identity. */
-  planContext(): PlanContext {
+  /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */
+  planContextAt(head?: string): PlanContext {
     const { identity, repository, pathIdentity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
     const pathKey = (path: string) => {
       if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
@@ -153,21 +153,27 @@ export class ReviewService {
       return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
     };
     // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
-    const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], { cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer, stdio: ['ignore', 'pipe', 'pipe'] });
-    if (this.#baseEntries?.base !== snapshot.base) {
-      const listing = git(['ls-tree', '-rz', snapshot.base], 64 * 1024 * 1024);
+    const treeHead = head ?? snapshot.base;
+    if (head && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Expected a full checkpoint head.');
+    const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], {
+      cwd: head ? this.reviewRepository().path : repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (this.#baseEntries?.base !== treeHead) {
+      const listing = git(['ls-tree', '-rz', treeHead], 64 * 1024 * 1024);
       const entries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
         const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
         if (mode === '160000') return { path, kind: 'gitlink' };
-        if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!]) };
+        if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!], 64 * 1024 * 1024) };
         return { path, kind: 'file' };
       });
-      this.#baseEntries = { base: snapshot.base, entries };
+      this.#baseEntries = { base: treeHead, entries };
     }
     // Copies: callers own what they are given, and the cached listing stays as Git reported it.
     const baseEntries = this.#baseEntries.entries.map(entry => ({ ...entry }));
     return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
   }
+  planContext(): PlanContext { return this.planContextAt(); }
   /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
   act(input: unknown, actionId?: string) {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');

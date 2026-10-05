@@ -213,6 +213,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   };
   const sources: ExecutionSources = {
     planContext: requested => { only(requested); return service.planContext(); },
+    checkpointContext: (requested, head) => { only(requested); return service.planContextAt(head); },
     issue: (requested, signal) => { only(requested); return issueText(service.store.getPlan(identity).issue, signal); },
     // Learning (L1–L4) is not built: no lesson is approved yet.
     lessons: () => [],

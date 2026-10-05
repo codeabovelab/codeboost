@@ -33,7 +33,8 @@ async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before
     options.before?.(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
-    const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+    const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
+      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     const findings = new SafetyFindings(service.store);
     options.findings?.(findings, service);
     return { deps, sources, findings, recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
@@ -210,6 +211,32 @@ describe('resume (#91 part 2)', () => {
 });
 
 describe('start and resume refusals and races (#91 part 2)', () => {
+  it('requires explicit continuation approval and resumes at the audited suffix through the API', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
+      const entries = [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      s.pauseForAmendment(id, { revision: 1, snapshotId: snapshot.id }, {
+        item: s.getPlan(id).items[0]!.id, completedItems: [s.getPlan(id).items[0]!.id], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the observed file' });
+      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
+      const next = s.getPlan(id);
+      s.saveReview(id, { revision: next.revision, snapshotId: s.getSnapshot(id).id, reviewVersion: s.reviewVersion(id) },
+        next.items.map(item => approveItem(next, [], item.id, id, true)), []);
+      const baseContext = service.planContext();
+      service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+    } });
+    expect(await view(app)).toMatchObject({ resumable: false, startable: false });
+    expect((await act(app, 'resume')).body.error).toMatch(/Approve the amended plan continuation/);
+    const approved = await act(app, 'approve-continuation');
+    expect(approved).toMatchObject({ status: 200, body: { result: { outcome: 'approved', next: items[1] } } });
+    expect(store.getTask(identity).status).toBe('queued');
+    expect(await view(app)).toMatchObject({ resumable: true, startable: false });
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[1] });
+    expect(store.getAttempts(identity).map(row => row.item)).toEqual([items[0], items[1]]);
+  });
   it('guards start with the review version as well as the task state version', async () => {
     const { app, identity, store } = await serve();
     const before = await view(app);
@@ -256,12 +283,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
   it('refuses both, in the view and the action alike, once an earlier revision left commits (#88)', async () => {
     const { app } = await serve({ before: service => { committedFirstItem(service); revise(service); } });
     expect(await view(app)).toMatchObject({ startable: false, resumable: false });
-    expect((await act(app, 'resume')).body.error).toMatch(/revised after items of it were committed.*#88/);
-    expect((await act(app, 'start')).body.error).toMatch(/revised after items of it were committed.*#88/);
+    expect((await act(app, 'resume')).body.error).toMatch(/plan changed after runner commits without a scope checkpoint/);
+    expect((await act(app, 'start')).body.error).toMatch(/plan changed after runner commits without a scope checkpoint/);
   });
   it('counts a fix attempt\'s commit at an earlier revision too (#88)', async () => {
     const { app } = await serve({ before: service => { committedFirstItem(service, false, [], 'fix'); revise(service); } });
-    expect((await act(app, 'start')).body.error).toMatch(/revised after items of it were committed.*#88/);
+    expect((await act(app, 'start')).body.error).toMatch(/plan changed after runner commits without a scope checkpoint/);
   });
   it('lets admission refuse a spent budget, which moves the idle task to needs human; the view offers nothing', async () => {
     const { app, identity, store } = await serve({ before: service => { failedFirstItem(service, 1); } });

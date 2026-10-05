@@ -21,7 +21,10 @@ afterEach(() => { for (const store of stores.splice(0)) store.close(); for (cons
 function directory() { const dir = mkdtempSync(join(tmpdir(), 'codeboost-store-')); dirs.push(dir); return dir; }
 function open(path: string) { const store = new Store(path); stores.push(store); return store; }
 function close(store: Store) { store.close(); stores.splice(stores.indexOf(store), 1); }
-function fixture() { const path = join(directory(), 'state.sqlite'); const store = open(path); store.createPlan(JSON.stringify(plan()), 'json', context, oid(1), oid(2)); return { path, store }; }
+function fixture(two = false) { const path = join(directory(), 'state.sqlite'); const store = open(path);
+  const initial = plan();
+  if (two) initial.items.push({ ...structuredClone(initial.items[0]!), id: 'P2', depends_on: ['P1'] });
+  store.createPlan(JSON.stringify(initial), 'json', context, oid(1), oid(2)); return { path, store }; }
 const state = (store: Store) => ({ revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id });
 function ready(store: Store) { const id = store.beginSuggestions(identity, state(store), 'suggest'); store.completeSuggestions(identity, id, reply()); return id; }
 it('allocates revisions in SQLite, survives reopen, and keeps old revisions and snapshots immutable', () => {
@@ -197,13 +200,17 @@ it('retains typed file-card approvals/choices while fingerprints detect later me
   expect(approvalStates(store.getPlan(identity), [segment], store.getReview(identity).approvals, identity).P1).toBe('stale');
 });
 it('retains checkpoint scope evidence after amended continuation and rejects a moved head', () => {
-  const { store, path } = fixture(); const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }] });
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).toThrow(/amended/);
-  store.importRevision(JSON.stringify(plan()), 'json', context, 1);
-  store.approveContinuation(identity, checkpoint.id, state(store));
+  const { store, path } = fixture(true); store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const entries = [...context.baseEntries, { path: 'outside', kind: 'file' as const }];
+  const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: entries });
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: entries })).toThrow(/amended/);
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: entries });
   const recovered = open(path); expect(recovered.getCheckpoint(identity, checkpoint.id)).toEqual(checkpoint); expect(recovered.continuationRevision(identity, checkpoint.id)).toBe(2);
   store.recordHistory(identity, state(store), oid(1), oid(3), []);
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).toThrow(/checkpoint/);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: entries })).toThrow(/head|checkpoint/);
 });
 it('rejects unsupported Node versions and opens SQLite without warnings', () => {
   expect(() => requireSupportedNode('24.0.0')).toThrow(/Upgrade Node/); expect(() => requireSupportedNode('26.6.0')).toThrow();
@@ -267,13 +274,29 @@ it('allows historical ledger retries after the owning item is removed, but rejec
   expect(store.getLedger(identity).find(entry => entry.sha === oid(5))!.owner).toBe('P1');
 });
 it('allows a later amended revision to receive a fresh continuation approval', () => {
-  const { store } = fixture(); const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
-  store.importRevision(JSON.stringify(plan()), 'json', context, 1); store.approveContinuation(identity, checkpoint.id, state(store));
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).not.toThrow();
-  store.importRevision(JSON.stringify(plan()), 'json', context, 2);
+  const { store } = fixture(true); store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1); store.approveContinuation(identity, checkpoint.id, state(store), context);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), context)).not.toThrow();
+  store.importRevision(JSON.stringify(store.getPlan(identity)), 'json', context, 2);
   expect(store.continuationRevision(identity, checkpoint.id)).toBe(2);
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).not.toThrow();
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), context)).not.toThrow();
   expect(store.continuationRevision(identity, checkpoint.id)).toBe(3);
+});
+it('refuses a suffix that is invalid against the audited tree despite a valid base-tree plan', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const checkpoint = store.recordCheckpoint(identity, state(store), {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: [],
+  });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: [] }))
+    .toThrow(/remaining plan is invalid.*Missing source: a/);
+  expect(store.continuationRevision(identity, checkpoint.id)).toBeNull();
 });
 it('rejects duplicate source SHA mappings and rolls back every resulting ledger/snapshot write', () => {
   const { store } = fixture(); const before = store.getSnapshot(identity);
