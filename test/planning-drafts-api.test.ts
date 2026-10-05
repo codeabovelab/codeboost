@@ -117,6 +117,30 @@ it('prepares a follow-up planning request from the checkpoint tree and applies t
   expect((await api('POST', `/api/plan/drafts/${draftId}/apply`, { actionId: randomUUID() })).status).toBe(200);
 });
 
+it.each(['drafts', 'suggestions'] as const)('API %s apply commits invalidation when checkpoint lineage changes after the reply is ready', async kind => {
+  const served = await serve(view => async request => request.mode === 'draft'
+    ? JSON.stringify({ ...view.plan, revision: request.revision }) : JSON.stringify(cards(view.plan.revision)));
+  const id = (await served.start(kind)).body.result.requestId as string;
+  await served.settled(kind, id);
+  const service = new ReviewService(served.config);
+  try {
+    const store = service.store, identity = served.config.identity, plan = store.getPlan(identity), snapshot = store.getSnapshot(identity);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute',
+      item: plan.items[0]!.id, expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+      result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+    store.recordCheckpoint(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, {
+      item: plan.items[0]!.id, completedItems: [plan.items[0]!.id], outOfScopePaths: ['debug.log'], baseEntries: service.planContext().baseEntries,
+    });
+  } finally { service.close(); }
+  const action = { actionId: randomUUID(), ...(kind === 'suggestions' ? { index: 0 } : {}) };
+  expect(await served.api('POST', `/api/plan/${kind}/${id}/apply`, action)).toMatchObject({ status: 409,
+    body: { error: kind === 'drafts' ? 'Draft is unavailable.' : 'Suggestion is unavailable.' } });
+  expect((await served.api('GET', `/api/plan/${kind}/${id}`)).body.state).toBe('invalidated');
+});
+
 it('keeps draft and suggestion IDs on their own routes', async () => {
   const served = await serve(view => async (request, signal) => request.mode === 'draft' ? redraft(view)(request, signal)
     : JSON.stringify(cards(view.plan.revision)));

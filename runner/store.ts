@@ -584,7 +584,8 @@ export class Store {
    */
   applyDraft(identity: PlanIdentity, id: string, context: PlanContext): Plan {
     const key = identityKey(identity);
-    const applied = this.#transaction(() => {
+    let applied: Plan | null;
+    try { applied = this.#transaction(() => {
       this.#context(key, context);
       const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready' AND mode='draft'", id, key);
       if (!request) throw new Error('Draft is unavailable.');
@@ -593,21 +594,25 @@ export class Store {
       const progress = this.continuationBasis(identity), currentBinding = progress ? { checkpointId: progress.checkpoint.id, head: progress.head, completedItems: progress.completed } : null;
       const requestBinding = request.continuation === null ? null : decode<ContinuationBinding>(request.continuation);
       if (stable(requestBinding) !== stable(currentBinding)) {
-        this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed before application.' WHERE id=? AND key=?", id, key);
-        return null;
+        const invalidate = () => this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed before application.' WHERE id=? AND key=? AND state='ready'", id, key);
+        throw new RefusalWithEffect('Draft is unavailable.', invalidate);
       }
       const revision = current.revision as number;
       const plan = importPlan(request.reply as string, 'json', context, revision + 1, progress?.completed).plan;
       if (progress) this.continuationProgress(identity, plan);
       this.#savePlan(key, plan, revision);
       this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return plan;
-    });
+    }); } catch (error) {
+      if (error instanceof RefusalWithEffect && this.#depth === 0) this.#transaction(error.effect);
+      throw error;
+    }
     if (!applied) throw new Error('Draft is unavailable.');
     return applied;
   }
   applySuggestion(identity: PlanIdentity, id: string, index: number, context: PlanContext): Plan {
     const key = identityKey(identity);
-    const applied = this.#transaction(() => {
+    let applied: Plan | null;
+    try { applied = this.#transaction(() => {
       this.#context(key, context);
       const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready' AND mode='suggest'", id, key);
       if (!request) throw new Error('Suggestion is unavailable.');
@@ -618,8 +623,8 @@ export class Store {
       const currentBinding = progress ? { checkpointId: progress.checkpoint.id, head: progress.head, completedItems: progress.completed } : null;
       const requestBinding = request.continuation === null ? null : decode<ContinuationBinding>(request.continuation);
       if (stable(requestBinding) !== stable(currentBinding)) {
-        this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed before application.' WHERE id=? AND key=?", id, key);
-        return null;
+        const invalidate = () => this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed before application.' WHERE id=? AND key=? AND state='ready'", id, key);
+        throw new RefusalWithEffect('Suggestion is unavailable.', invalidate);
       }
       const next = applySuggestion(plan, decode<EditReply>(request.reply), index, context, {
         identity, schemaVersion: plan.schema_version, baseRevision: request.revision as number, issue: plan.issue,
@@ -627,7 +632,10 @@ export class Store {
       if (progress) this.continuationProgress(identity, next);
       this.#savePlan(key, next, request.revision as number);
       this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return next;
-    });
+    }); } catch (error) {
+      if (error instanceof RefusalWithEffect && this.#depth === 0) this.#transaction(error.effect);
+      throw error;
+    }
     if (!applied) throw new Error('Suggestion is unavailable.');
     return applied;
   }
@@ -997,6 +1005,10 @@ export class Store {
       if (status === 'needs amendment' && progress.next) this.transitionTask(identity, this.getTask(identity).stateVersion, 'queued');
       else if (!progress.next && status !== 'running') {
         this.#run("UPDATE tasks SET status='running' WHERE plan_key=?", key);
+        this.#touch(key);
+      }
+      if (!progress.next && task.requeue_pending === 1) {
+        this.#run('UPDATE tasks SET requeue_pending=0 WHERE plan_key=?', key);
         this.#touch(key);
       }
       this.#run(`INSERT INTO continuations (key,checkpoint_id,revision,snapshot_id) VALUES (?,?,?,?)

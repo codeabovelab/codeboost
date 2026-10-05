@@ -392,6 +392,53 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'start')).body.error).toMatch(/The task is running; start runs a task that is in review or queued/);
     expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
   });
+  it('clears a recovery requeue when an amended suffix removes the interrupted final item', async () => {
+    const { app, identity, store } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      const plan = s.getPlan(id), firstTwo = plan.items.slice(0, 2).map(item => item.id), firstSnapshot = s.getSnapshot(id);
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      for (const item of plan.items.slice(0, 2)) {
+        const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id,
+          expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+        s.markRunning(id, attempt.id);
+        const last = item.id === firstTwo[0];
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+          result: { head: firstSnapshot.head, unchanged: true, inScope: [], outOfScope: last ? ['extra.ts'] : [] } });
+        if (last) {
+          const entries = [...service.planContext().baseEntries, { path: 'extra.ts', kind: 'file' as const }];
+          const checkpoint = s.recordCheckpoint(id, { revision: plan.revision, snapshotId: firstSnapshot.id, reviewVersion: s.reviewVersion(id) }, {
+            item: item.id, completedItems: [item.id], outOfScopePaths: ['extra.ts'], baseEntries: entries,
+          });
+          const amended = s.getPlan(id);
+          amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare observed output' });
+          s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
+          const current = s.getPlan(id), snapshot = s.getSnapshot(id);
+          approvePlan(service);
+          const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
+          service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });
+          s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+            { ...checkpointContext, baseEntries: entries });
+        } else if (item.id === firstTwo[1]) {
+          // The preceding checkpoint is approved; this is continuation work P2.
+        }
+      }
+      const p3 = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: 'P3',
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, p3.id); s.recoverInterrupted(Date.now());
+      const checkpoint = s.latestCheckpoint(id)!, amended = s.getPlan(id);
+      amended.items = amended.items.slice(0, 2);
+      s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
+      const current = s.getPlan(id), snapshot = s.getSnapshot(id);
+      approvePlan(service);
+      const entries = checkpoint.baseEntries;
+      const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
+      service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });
+      s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+        { ...checkpointContext, baseEntries: entries });
+    } });
+    expect(store.getTask(identity).requeuePending).toBe(false);
+    expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
+  });
   it('neither offers nor admits start or resume while a run of the task is still finishing between items', async () => {
     const { app, identity, store } = await serve({ before: service => { failedFirstItem(service); } });
     expect(await view(app)).toMatchObject({ resumable: true });

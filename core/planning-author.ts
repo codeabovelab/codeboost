@@ -20,6 +20,7 @@ export interface AuthorInput {
   feedback: string;
   previousPlan?: Plan;
   completedItems?: readonly string[];
+  continuationContext?: { checkpointId: string; head: string; completedItems: readonly string[]; ownerItem: string; outOfScopePaths: readonly string[] } | null;
 }
 export interface AuthorRequest {
   readonly mode: 'draft' | 'suggest';
@@ -97,7 +98,11 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
   const completedItems = input.completedItems === undefined || input.completedItems.length === 0
     ? undefined : structuredClone([...input.completedItems]);
   if (previous) {
-    const result = completedItems === undefined ? validatePlan(previous, context) : validateContinuationPlan(previous, context, completedItems, true);
+    // The existing suffix is context for the provider to repair, not a candidate. Validate its structure and the
+    // checkpoint-owned prefix here; require the proposed candidate to pass full suffix semantics below.
+    const result = completedItems === undefined ? validatePlan(previous, context) : validateContinuationPlan({
+      ...previous, items: previous.items.slice(0, completedItems.length),
+    }, context, completedItems, true);
     if (result.errors.length) throw new PlanError(result.errors);
     if (input.revision !== previous.revision + (mode === 'draft' ? 1 : 0)) throw new Error('Previous plan revision mismatch.');
   } else if (mode === 'suggest') throw new Error('Suggestions require a previous plan.');
@@ -118,6 +123,7 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
     feedback_data_json: dataJSON(input.feedback, 'Feedback'),
     previous_plan_json: dataJSON(previous ?? null, 'Previous plan'),
+    continuation_data_json: dataJSON(input.continuationContext ?? null, 'Continuation context'),
   };
   const conditional = template.replace(/\{\{#if previous_plan\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => previous ? block : '');
   // One pass over trusted template only: inserted data is never interpreted again.

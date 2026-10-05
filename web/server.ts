@@ -405,6 +405,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
         const amendment = service.planningContextForAmendment(), context = amendment.context;
         const handle = suggestions.start({ context, completedItems: amendment.completedItems, continuationBinding: amendment.continuation,
+          continuationContext: amendment.continuationContext,
           revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
           repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } }, mode);
         suggestionHandles.set(handle.id, handle);

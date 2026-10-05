@@ -189,13 +189,16 @@ export class ReviewService {
     if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
     return this.planContextAt(progress.head);
   }
-  planningContextForAmendment(): { context: PlanContext; completedItems: string[]; continuation: { checkpointId: string; head: string; completedItems: string[] } | null } {
+  planningContextForAmendment(): { context: PlanContext; completedItems: string[]; continuation: { checkpointId: string; head: string; completedItems: string[] } | null;
+    continuationContext: { checkpointId: string; head: string; completedItems: string[]; ownerItem: string; outOfScopePaths: string[] } | null } {
     const checkpoint = this.store.latestCheckpoint(this.config.identity);
-    if (!checkpoint) return { context: this.planContext(), completedItems: [], continuation: null };
+    if (!checkpoint) return { context: this.planContext(), completedItems: [], continuation: null, continuationContext: null };
     const progress = this.store.continuationBasis(this.config.identity);
     if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
     return { context: this.planContextAt(progress.head), completedItems: progress.completed,
-      continuation: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed } };
+      continuation: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed },
+      continuationContext: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed, ownerItem: checkpoint.item,
+        outOfScopePaths: checkpoint.outOfScopePaths } };
   }
   /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
   act(input: unknown, actionId?: string) {

@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -102,6 +103,22 @@ it('refuses to apply a ready planning reply after its checkpoint lineage changes
   });
   expect(() => f.store.applyDraft(f.identity, handle.id, f.value.context)).toThrow(/unavailable/i);
   expect(f.store.getDraft(f.identity, handle.id).state).toBe('invalidated');
+  await f.coordinator.close();
+});
+it.each(['draft', 'suggest'] as const)('commits %s invalidation and the saved refusal when a nested apply sees changed checkpoint lineage', async mode => {
+  const f = checkpointFixture(), handle = f.coordinator.start(f.value, mode);
+  const suggestion = reply(); suggestion.base_revision = 2; suggestion.edits[0]!.item = 'P2';
+  f.pending.resolve(mode === 'draft' ? JSON.stringify({ ...f.store.getPlan(f.identity), revision: 3 }) : JSON.stringify(suggestion));
+  expect(await handle.result).toMatchObject({ state: 'completed' });
+  f.store.recordCheckpoint(f.identity, { revision: 2, snapshotId: f.store.getSnapshot(f.identity).id }, {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra'], baseEntries: f.value.context.baseEntries,
+  });
+  const action = { actionId: randomUUID(), kind: mode === 'draft' ? 'draft-apply' : 'suggestion-apply', request: { id: handle.id, index: 0 } };
+  expect(() => f.store.userAction(f.identity, action, () => mode === 'draft'
+    ? f.store.applyDraft(f.identity, handle.id, f.value.context)
+    : f.store.applySuggestion(f.identity, handle.id, 0, f.value.context))).toThrow(/unavailable/i);
+  expect(f.store.getSuggestions(f.identity, handle.id).state).toBe('invalidated');
+  expect(() => f.store.savedAction(f.identity, action)).toThrow(/unavailable/i);
   await f.coordinator.close();
 });
 it('does not publish a continuation reply whose candidate changes an executed item', async () => {
