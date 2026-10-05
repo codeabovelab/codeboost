@@ -6,15 +6,17 @@ states what those lanes must do when they call the isolation boundary.
 
 ## Run the gate
 
-The gate needs a running Docker daemon. Run the suites one file at a time, because
-they share one image tag and one daemon:
+The complete gate needs a running Docker daemon:
 
 ```bash
-npx vitest run --no-file-parallelism test/agent-contract.test.ts test/agent-clone.test.ts test/agent-container.test.ts test/agent-network.test.ts test/agent-policy.test.ts test/agent-proxy.test.ts test/agent-adapter.test.ts test/agent-supervisor.test.ts test/agent-output.test.ts test/agent-gate.test.ts test/agent-question.test.ts
+npm test
 ```
 
-The `Agent isolation` workflow runs the same command. The main `CI` workflow skips
-the Docker suites so that they never run in parallel.
+`vitest.config.ts` finishes the ordinary test project first, then runs the Docker-backed
+files one at a time because they share one image tag and daemon. Use
+`npx vitest run --project docker` to rerun only that serial project. The `Agent isolation`
+workflow runs the complete gate. The main `CI` workflow skips the Docker project so that
+it can cover the ordinary project independently.
 
 The live vendor probes need real credentials, so CI does not run them. To run them,
 set `CODEBOOST_RUN_AUTH_PROBES=1` and `CLAUDE_CODE_OAUTH_TOKEN`. Codex has no live

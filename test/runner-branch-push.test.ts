@@ -3,7 +3,7 @@ import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync 
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { GH_ENV_ALLOWLIST } from '../github/gh-env.ts';
@@ -14,6 +14,9 @@ const OWNER = '0123456789abcdef0123456789abcdef';
 const IDENTITY: PlanIdentity = { repositoryId: 'repo-1', taskId: 'task-1', planId: 'plan-1' };
 const BRANCH = 'codeboost/issue-7-task-1-0123456789abcdef', REF = `refs/heads/${BRANCH}`;
 const roots: string[] = [];
+// These are real multi-process Git integration tests. The crashed-push cases intentionally perform several clones,
+// bundles, remote reads and leased pushes, so five seconds is below their normal loaded runtime on development hosts.
+vi.setConfig({ testTimeout: 20_000 });
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 async function setup() {
