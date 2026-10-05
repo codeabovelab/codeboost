@@ -120,7 +120,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const task = service.store.getTask(identity), { started, begun, earlierCommits } = progress;
     // Safety evidence must settle before reconciliation can refuse on a stale prefix or head.
     const safetyOwed = executor.owes(identity, { scope: false });
-    const continuation = safetyOwed ? null : service.store.continuationProgress(identity);
+    const anyFindingOwed = executor.owes(identity);
+    const continuation = anyFindingOwed ? null : service.store.continuationProgress(identity);
     const completed = continuation?.completed ?? progress.completed;
     const prefixHead = continuation?.head ?? progress.prefixHead;
     const next = continuation ? continuation.next : progress.next;
@@ -253,6 +254,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (action === 'start' || action === 'resume') {
       const before = service.store.getTask(identity).status;
       try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.actIfOwed(identity, { personAsked: true }); }
+    }
+    // A final-item scope amendment can finish the plan without another runner attempt; its approval moves the task to
+    // running, after which the ordinary publishing gate can open the ready pull request.
+    if (action === 'approve-continuation') {
+      const before = service.store.getTask(identity).status;
+      try { return act(); } finally {
+        if (before !== 'running' && service.store.getTask(identity).status === 'running') publishing?.actIfOwed(identity, { personAsked: true });
+      }
     }
     // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
     // stopping an attempt closes the task when the attempt settles; the run's end then closes them (afterRun).

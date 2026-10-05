@@ -243,10 +243,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity).at(-1)?.item).toBe(items[2]);
   });
   it('does not skip a completed continuation item edited without changing its ID', async () => {
+    let baseContext: ReturnType<ReviewService['planContext']> | undefined;
     const { identity, store } = await serve({ before: service => {
       committedFirstItem(service, false, ['other.ts']);
       const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), itemIds = s.getPlan(id).items.map(item => item.id);
-      const baseContext = service.planContext();
+      baseContext = service.planContext();
+      // Keep the import context so the regression can restore the executed definition with different object-key order.
       const entries = [...baseContext.baseEntries, { path: 'other.ts', kind: 'file' as const }];
       const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
         item: itemIds[0]!, completedItems: [itemIds[0]!], outOfScopePaths: ['other.ts'], baseEntries: entries,
@@ -270,6 +272,10 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       s.importRevision(JSON.stringify(changed), 'json', baseContext, next.revision);
     } });
     expect(() => store.continuationProgress(identity)).toThrow(/Completed item P2 changed after it ran/);
+    const restored = store.getPlan(identity), item = store.getPlan(identity, 2).items[1]!;
+    restored.items[1] = { acceptance: item.acceptance, files: item.files, id: item.id, title: item.title, intent: item.intent, depends_on: item.depends_on };
+    store.importRevision(JSON.stringify(restored), 'json', baseContext!, store.getPlan(identity).revision);
+    expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1', 'P2'], next: 'P3' });
   });
   it('requires explicit continuation approval and resumes at the audited suffix through the API', async () => {
     const { app, identity, store, items } = await serve({ before: service => {
@@ -595,6 +601,40 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
     expect(store.getTask(identity).status).toBe('needs human');
     expect(store.getAttempts(identity)[0]!.safetyFinding).toMatch(/checkpoint reconciliation regression/);
+  });
+  it('records an owed later scope pause before reconciling an edited completed item', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, firstSnapshot = s.getSnapshot(id), baseContext = service.planContext();
+      const entries = [...baseContext.baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      const firstItem = s.getPlan(id).items[0]!.id;
+      const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: firstSnapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: firstItem, completedItems: [firstItem], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the first observed path' });
+      s.importRevision(JSON.stringify(amended), 'json', baseContext, 1);
+      const current = s.getPlan(id), reviewSnapshot = s.getSnapshot(id);
+      s.saveReview(id, { revision: current.revision, snapshotId: reviewSnapshot.id, reviewVersion: s.reviewVersion(id) },
+        current.items.map(item => approveItem(current, [], item.id, id, true)), []);
+      service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+      s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: reviewSnapshot.id, reviewVersion: s.reviewVersion(id) },
+        { ...baseContext, baseEntries: entries });
+      const before = s.getSnapshot(id), second = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute',
+        item: current.items[1]!.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, second.id);
+      const head = 'd'.repeat(40);
+      s.settleAttempt(id, second.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head, unchanged: false, inScope: [], outOfScope: ['later.ts'] },
+        history: { base: before.base, head, entries: [{ sha: head, owner: current.items[1]!.id, origin: 'owned', sourceSha: null }] } });
+      const changed = s.getPlan(id);
+      changed.items[1]!.files.push({ path: 'later.ts', kind: 'add', renamed_from: null, change: 'Declare the later observed path' });
+      s.importRevision(JSON.stringify(changed), 'json', baseContext, current.revision);
+      expect(() => s.continuationProgress(id)).toThrow(/changed after it ran/);
+    } });
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(store.latestCheckpoint(identity)).toMatchObject({ item: items[1], completedItems: items.slice(0, 2), outOfScopePaths: ['later.ts'] });
   });
   it('replays an action ID, and refuses a second resume made against the old state', async () => {
     const { app, identity, store } = await serve({ before: service => { failedFirstItem(service); } });

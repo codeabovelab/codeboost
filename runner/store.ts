@@ -3,6 +3,7 @@ import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
 import { importPlan, applySuggestion, assertEditReply, assertPlan, validateContinuationPlan, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
+import { stable } from '../core/approvals.ts';
 import type { PlanningMode } from '../core/planning-suggestions.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
@@ -828,6 +829,24 @@ export class Store {
     const prefix = plan.items.slice(0, completed.length);
     if (prefix.length !== completed.length || prefix.some((item, index) => item.id !== completed[index]))
       throw new GuardRefusal('The amended plan changed the completed checkpoint prefix.');
+    const checkpointPlan = this.getPlan(identity, checkpoint.revision);
+    // Earlier completed items are immutable. The checkpoint owner may only append declarations for the observed
+    // out-of-scope paths; its intent, acceptance criteria, and pre-existing work remain the executed definition.
+    for (let index = 0; index < checkpoint.completedItems.length; index++) {
+      const before = checkpointPlan.items[index], current = plan.items[index];
+      if (!before || !current) throw new GuardRefusal(`Completed item ${checkpoint.completedItems[index]} changed before the audited checkpoint.`);
+      if (index < checkpoint.completedItems.length - 1) {
+        if (stable(before) !== stable(current))
+          throw new GuardRefusal(`Completed item ${checkpoint.completedItems[index]} changed before the audited checkpoint.`);
+        continue;
+      }
+      const observed = new Set(checkpoint.outOfScopePaths);
+      const existingFiles = current.files.slice(0, before.files.length);
+      const addedFiles = current.files.slice(before.files.length);
+      if (stable({ ...current, files: existingFiles }) !== stable(before) ||
+          addedFiles.some(file => !observed.has(file.path)))
+        throw new GuardRefusal(`Completed checkpoint item ${checkpoint.completedItems[index]} changed beyond its scope declaration.`);
+    }
     let head = this.getSnapshot(identity, checkpoint.snapshotId).head;
     const key = identityKey(identity);
     const origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed' AND item=?
@@ -851,7 +870,7 @@ export class Store {
       // that actually executed it, or the changed work must be run again.
       const executedPlan = this.getPlan(identity, row.context.planRevision);
       const executedItem = executedPlan.items.find(item => item.id === row.item);
-      if (!executedItem || JSON.stringify(executedItem) !== JSON.stringify(plan.items[completed.length]))
+      if (!executedItem || stable(executedItem) !== stable(plan.items[completed.length]))
         throw new GuardRefusal(`Completed item ${row.item} changed after it ran; review and rerun it before continuing.`);
       head = result.head;
       completed.push(row.item);
@@ -904,20 +923,25 @@ export class Store {
       // valid amendments and is not an integrity check.
       if (checkpoint.treeHead === progress.head && JSON.stringify(context.baseEntries) !== JSON.stringify(checkpoint.baseEntries))
         throw new GuardRefusal('The audited checkpoint tree changed; review it before continuing.');
-      if (!progress.next) throw new GuardRefusal('Every item of the amended plan has run.');
       const amendedItem = this.getPlan(identity).items[checkpoint.completedItems.length - 1]!;
       const declared = new Set(amendedItem.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(context.pathKey));
       if (checkpoint.outOfScopePaths.some(path => !declared.has(context.pathKey(path))))
         throw new GuardRefusal('The amended checkpoint item must declare every out-of-scope path it changed.');
-      const validation = validateContinuationPlan(this.getPlan(identity), context, progress.completed);
-      if (validation.errors.length) throw new GuardRefusal(`The remaining plan is invalid at the audited head: ${validation.errors.map(error => error.message).join(' ')}`);
+      if (progress.next) {
+        const validation = validateContinuationPlan(this.getPlan(identity), context, progress.completed);
+        if (validation.errors.length) throw new GuardRefusal(`The remaining plan is invalid at the audited head: ${validation.errors.map(error => error.message).join(' ')}`);
+      }
       const status = this.getTask(identity).status;
       if (!['needs amendment', 'queued', 'running'].includes(status)) throw new GuardRefusal(`The task is ${status}; continuation cannot be approved.`);
       const task = this.#task(key);
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
-      if (status === 'needs amendment') this.transitionTask(identity, this.getTask(identity).stateVersion, 'queued');
+      if (status === 'needs amendment' && progress.next) this.transitionTask(identity, this.getTask(identity).stateVersion, 'queued');
+      else if (!progress.next && status !== 'running') {
+        this.#run("UPDATE tasks SET status='running' WHERE plan_key=?", key);
+        this.#touch(key);
+      }
       this.#run(`INSERT INTO continuations (key,checkpoint_id,revision,snapshot_id) VALUES (?,?,?,?)
         ON CONFLICT(key,checkpoint_id,revision) DO UPDATE SET snapshot_id=excluded.snapshot_id`, key, checkpointId, expected.revision, expected.snapshotId);
     });

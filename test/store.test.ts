@@ -315,6 +315,30 @@ it('re-reads the actual checkpoint tree for legacy checkpoint rows', () => {
     ...context, baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
   })).not.toThrow();
 });
+it('refuses edits to completed items before the checkpoint owner', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.intent += ' revised after completion';
+  amended.items[1]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  expect(() => store.continuationProgress(identity)).toThrow(/Completed item P1 changed before the audited checkpoint/);
+});
+it('refuses checkpoint-owner edits beyond declaring the observed scope finding', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.intent += ' changed after it completed';
+  amended.items[1]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  expect(() => store.continuationProgress(identity)).toThrow(/changed beyond its scope declaration/);
+});
 it('rejects duplicate source SHA mappings and rolls back every resulting ledger/snapshot write', () => {
   const { store } = fixture(); const before = store.getSnapshot(identity);
   expect(() => store.recordRebase(identity, state(store), oid(3), oid(5), [{ oldSha: oid(2), newSha: oid(4) }, { oldSha: oid(2), newSha: oid(5) }])).toThrow();

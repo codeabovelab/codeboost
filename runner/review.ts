@@ -11,6 +11,7 @@ import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
+import { GuardRefusal } from './lifecycle.ts';
 
 export interface ReviewConfig { database: string; repository: string;
   /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
@@ -86,7 +87,14 @@ export class ReviewService {
     }
     // The execution gate also orders approvals after attribution choices and binds them to the current or executed-prefix
     // snapshots. Reflect that same gate in the review UI so an approval execution would refuse is available to reapprove.
-    const executionUnapproved = new Set(this.store.unapprovedExecutionItems(identity, plan.revision));
+    let executionUnapproved: Set<string>;
+    try { executionUnapproved = new Set(this.store.unapprovedExecutionItems(identity, plan.revision)); }
+    catch (error) {
+      if (!(error instanceof GuardRefusal)) throw error;
+      // Keep the review available when checkpoint reconciliation refuses. Surface every saved approval as stale;
+      // execution remains fail-closed in Store.unapprovedExecutionItems and resume.
+      executionUnapproved = new Set(plan.items.map(item => item.id));
+    }
     for (const item of plan.items) if (states[item.id] === 'approved' && executionUnapproved.has(item.id)) states[item.id] = 'stale';
     for (const item of plan.items) {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';

@@ -153,6 +153,29 @@ function completeContinuation(service: ReviewService) {
   }
   expect(s.getTask(id).status).toBe('running');
 }
+/** The last item found an out-of-scope file, leaving no suffix after the person amends its declaration. */
+function finalItemScopeFinding(service: ReviewService) {
+  const s = service.store, id = service.config.identity, items = s.getPlan(id).items, initial = s.getSnapshot(id);
+  s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+  for (const [index, item] of items.entries()) {
+    const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id,
+      expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+    s.markRunning(id, attempt.id);
+    const last = index === items.length - 1, head = initial.head;
+    s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+      result: { head, unchanged: true, inScope: [], outOfScope: last ? ['extra.ts'] : [] } });
+  }
+  const baseContext = service.planContext(), entries = [...baseContext.baseEntries, { path: 'extra.ts', kind: 'file' as const }];
+  const snapshot = s.getSnapshot(id), checkpoint = s.pauseForAmendment(id,
+    { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+      item: items.at(-1)!.id, completedItems: items.map(item => item.id), outOfScopePaths: ['extra.ts'], baseEntries: entries,
+    });
+  const amended = s.getPlan(id);
+  amended.items.at(-1)!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  s.importRevision(JSON.stringify(amended), 'json', baseContext, 1);
+  service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+  return checkpoint;
+}
 /**
  * Every plan item completed, but the last changed a file outside its plan item, and its pause for amendment was never
  * recorded (the write failed, or the process stopped): the next run owes that pause.
@@ -267,7 +290,7 @@ async function act(app: App, action: string, actionId = randomUUID(), expectedSt
   const { stateVersion, reviewVersion } = await view(app);
   const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
     body: JSON.stringify({ action, expectedStateVersion: expectedStateVersion ?? stateVersion,
-      ...((action === 'start' || action === 'resume') ? { expectedReviewVersion: reviewVersion } : {}), actionId }) });
+      ...((action === 'start' || action === 'resume' || action === 'approve-continuation') ? { expectedReviewVersion: reviewVersion } : {}), actionId }) });
   return { status: response.status, body: await response.json() as Record<string, any> };
 }
 const publishSettled = (app: App, identity: PlanIdentity) => vi.waitFor(async () => {
@@ -276,6 +299,16 @@ const publishSettled = (app: App, identity: PlanIdentity) => vi.waitFor(async ()
 }, { timeout: 20_000, interval: 20 });
 
 describe('publishing a finished task (#103)', () => {
+  it('approves a final-item scope finding and publishes the completed plan ready', async () => {
+    const w = world(), { app, identity, store } = await serve(w, { before: service => { finalItemScopeFinding(service); }, startup: false });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(store.continuationProgress(identity)?.next).toBeNull();
+    expect((await act(app, 'approve-continuation')).status).toBe(200);
+    expect(store.getTask(identity).status).toBe('running');
+    await publishSettled(app, identity);
+    expect(w.github.calls).toContain('open ready');
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false });
+  });
   it.each(['automatic', 'explicit'] as const)('publishes a completed continuation through the %s path', async path => {
     const w = world(), { app, identity, store } = await serve(w, { before: completeContinuation, startup: path === 'explicit' ? false : undefined });
     expect(() => store.assertPublishableNow(identity, false)).not.toThrow();
