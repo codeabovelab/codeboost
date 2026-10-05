@@ -195,7 +195,7 @@ it('dismisses a ready draft, and cancels a pending one when the server shuts dow
   const pending = (await held.start('drafts')).body.result.requestId as string;
   await held.close();
   const store = new Store(held.config.database);
-  try { expect(store.getDraft(held.config.identity, pending)).toMatchObject({ state: 'cancelled', reason: 'Suggestion coordinator is closing.' }); }
+  try { expect(store.getDraft(held.config.identity, pending)).toMatchObject({ state: 'cancelled', reason: 'Planning coordinator is closing.' }); }
   finally { store.close(); }
 });
 
@@ -219,4 +219,18 @@ it('replays a suggestion apply recorded before #124 with its saved revision', as
   expect(await served.api('POST', `/api/plan/suggestions/${randomUUID()}/apply`, { index: 0, actionId })).toEqual({ status: 200, body: { result: { revision: 7 } } });
   // The body differs from the recorded one, so it is a different request.
   expect(await served.api('POST', `/api/plan/suggestions/${randomUUID()}/apply`, { index: 1, actionId })).toMatchObject({ status: 409 });
+});
+
+it('never replays a record of this build through another request\'s path by naming it in the body', async () => {
+  const served = await serve(view => async () => JSON.stringify(cards(view.plan.revision)));
+  const recorded = (await served.start('suggestions')).body.result.requestId as string;
+  await served.settled('suggestions', recorded);
+  const other = (await served.start('suggestions')).body.result.requestId as string;
+  await served.settled('suggestions', other);
+  const actionId = randomUUID();
+  expect((await served.api('POST', `/api/plan/suggestions/${recorded}/cancel`, { actionId })).status).toBe(200);
+  // The body names the recorded request: its hash would match that record if the old-hash fallback took this body.
+  expect(await served.api('POST', `/api/plan/suggestions/${other}/cancel`, { actionId, requestId: recorded }))
+    .toMatchObject({ status: 409, body: { error: 'Action ID already used for a different request.' } });
+  expect((await served.api('GET', `/api/plan/suggestions/${other}`)).body.state).toBe('ready');
 });

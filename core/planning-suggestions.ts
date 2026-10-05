@@ -54,7 +54,7 @@ export class SuggestionCoordinator {
     this.#store = store; this.#provider = provider; this.#timeoutMs = timeoutMs;
   }
   start(input: SuggestionInput, mode: PlanningMode = 'suggest'): SuggestionHandle {
-    if (this.#closing) throw new Error('Suggestion coordinator is closing.');
+    if (this.#closing) throw new Error('Planning coordinator is closing.');
     const identity = { ...input.context.identity }, key = identityKey(identity);
     if (this.#active.has(key)) throw new Error('A planning invocation is still active for this plan.');
     const snapshotId = input.snapshotId;
@@ -162,7 +162,7 @@ export class SuggestionCoordinator {
     this.#closing = true;
     const active = [...this.#active.values()];
     this.#closePromise = Promise.all(active.map(job => job.handle.result)).then(() => undefined);
-    for (const job of active) job.stop('cancelled', 'Suggestion coordinator is closing.');
+    for (const job of active) job.stop('cancelled', 'Planning coordinator is closing.');
     return this.#closePromise;
   }
 }
