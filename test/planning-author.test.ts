@@ -102,6 +102,18 @@ it('validates cards independently and rejects a batch with even one dependent in
   const value = reply(); value.edits.push({ ...value.edits[0]!, item: 'P2' });
   expect(() => prepareSuggestions({ ...input(), previousPlan: plan() }).validate(JSON.stringify(value))).toThrow(/Target item/);
 });
+it('validates follow-up drafts and cards only against the audited unfinished suffix', () => {
+  const previous = plan();
+  previous.items[0]!.files = [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Original planned output' }];
+  previous.items.push({ id: 'P2', title: 'Finish planned output', intent: 'Create the file that P1 did not produce',
+    files: [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Create planned output' }],
+    acceptance: [{ type: 'check', text: 'The file exists' }], depends_on: ['P1'] });
+  const value = { ...input(), context: { ...input().context, baseEntries: [] }, completedItems: ['P1'], previousPlan: previous };
+  const draft = { ...previous, revision: 2 };
+  expect(prepareDraft({ ...value, revision: 2 }).validate(JSON.stringify(draft)).value).toEqual(draft);
+  const suggestion = reply(); suggestion.edits[0]!.item = 'P2';
+  expect(prepareSuggestions(value).validate(JSON.stringify(suggestion)).value).toEqual(suggestion);
+});
 it('serializes only the four issue contract fields, excluding API metadata', () => {
   const value = input();
   value.issue = { ...value.issue, privateMetadata: 'must not reach provider' } as typeof value.issue;

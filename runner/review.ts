@@ -185,9 +185,17 @@ export class ReviewService {
   planContextForAmendment(): PlanContext {
     const checkpoint = this.store.latestCheckpoint(this.config.identity);
     if (!checkpoint) return this.planContext();
-    const progress = this.store.continuationProgress(this.config.identity);
+    const progress = this.store.continuationBasis(this.config.identity);
     if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
     return this.planContextAt(progress.head);
+  }
+  planningContextForAmendment(): { context: PlanContext; completedItems: string[]; continuation: { checkpointId: string; head: string; completedItems: string[] } | null } {
+    const checkpoint = this.store.latestCheckpoint(this.config.identity);
+    if (!checkpoint) return { context: this.planContext(), completedItems: [], continuation: null };
+    const progress = this.store.continuationBasis(this.config.identity);
+    if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
+    return { context: this.planContextAt(progress.head), completedItems: progress.completed,
+      continuation: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed } };
   }
   /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
   act(input: unknown, actionId?: string) {

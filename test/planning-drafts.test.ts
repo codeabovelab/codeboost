@@ -170,7 +170,20 @@ it.each([9, 10])('migrates a v%i database to the current schema, reading its exi
   const migrated = open();
   expect(migrated.getSuggestions(identity, id)).toMatchObject({ mode: 'suggest', state: 'pending' });
   const db = new DatabaseSync(path);
-  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 14 }); } finally { db.close(); }
+  try { expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 }); } finally { db.close(); }
+});
+it('adds checkpoint bindings to v14 planning requests without losing their state', () => {
+  const { store, path, open } = fixture(), id = store.beginSuggestions(identity, state(store), 'draft');
+  store.close(); stores.splice(stores.indexOf(store), 1);
+  const legacy = new DatabaseSync(path);
+  legacy.exec('ALTER TABLE requests DROP COLUMN continuation; PRAGMA user_version=14;'); legacy.close();
+  const migrated = open();
+  expect(migrated.getDraft(identity, id).state).toBe('pending');
+  const db = new DatabaseSync(path);
+  try {
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
+    expect(db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'continuation')).toBe(true);
+  } finally { db.close(); }
 });
 
 /** E3 in draft mode, with a provider that answers from `source`. */

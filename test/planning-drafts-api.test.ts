@@ -6,6 +6,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import type { EditReply } from '../core/plan.ts';
 import { createDemo } from '../scripts/demo.ts';
+import { ReviewService } from '../runner/review.ts';
 import { startServer, type PlanningDeps } from '../web/server.ts';
 import { Store } from '../runner/store.ts';
 
@@ -19,9 +20,10 @@ afterEach(async () => {
 type Answer = (request: AuthorRequest, signal: AbortSignal) => Promise<string>;
 type View = { plan: Record<string, any>; snapshot: { id: string } };
 /** `answer` is made from the review as it was when the server started. */
-async function serve(answer: (view: View) => Answer, options: { describe?: PlanningDeps['describe'] } = {}) {
+async function serve(answer: (view: View) => Answer, options: { describe?: PlanningDeps['describe']; prepare?: (config: ReturnType<typeof createDemo>) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-drafts-api-')); roots.push(root);
   const config = createDemo(join(root, 'demo'));
+  options.prepare?.(config);
   const requests: AuthorRequest[] = [];
   let answering!: Answer;
   const provider: AuthorProvider = { invoke: (request, signal) => { requests.push(request); return answering(request, signal); } };
@@ -69,6 +71,50 @@ it('drafts the next revision, keeps it until applied, then applies it exactly on
   expect(await served.api('POST', `/api/plan/drafts/${id}/apply`, { actionId: randomUUID() }))
     .toMatchObject({ status: 409, body: { error: 'Draft is unavailable.' } });
   expect((await served.api('GET', '/api/review')).body.plan).toMatchObject({ revision: served.view.plan.revision + 1, summary: 'Redrafted by Claude' });
+});
+
+it('prepares a follow-up planning request from the checkpoint tree and applies the suffix safely', async () => {
+  const served = await serve(view => async request => request.mode === 'draft'
+    ? JSON.stringify({ ...view.plan, revision: request.revision, summary: 'Continue from checkpoint' })
+    : JSON.stringify({ schema_version: 1, base_revision: request.revision, reply: 'Rename suffix', edits: [{
+      op: 'set_field', item: 'P2', summary: 'Rename suffix', reason: 'Clearer', field: 'title', value: 'Updated suffix title',
+      file: null, check: null, check_index: null, depends_on: null, new_item: null,
+    }] }), { prepare: config => {
+      const service = new ReviewService(config);
+      try {
+        const current = service.store.getPlan(config.identity), base = service.planContext();
+        current.items[0]!.files = [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Original planned output' }];
+        service.store.importRevision(JSON.stringify(current), 'json', base, current.revision);
+        const audited = service.planContextAt(service.store.getSnapshot(config.identity).head);
+        const completed = service.store.getPlan(config.identity), snapshot = service.store.getSnapshot(config.identity);
+        service.store.recordCheckpoint(config.identity, { revision: completed.revision, snapshotId: snapshot.id,
+          reviewVersion: service.store.reviewVersion(config.identity) }, {
+          item: 'P1', completedItems: ['P1'], outOfScopePaths: ['debug.log'], baseEntries: audited.baseEntries,
+        });
+        completed.items[0]!.files.push({ path: 'debug.log', kind: 'edit', renamed_from: null, change: 'Declare observed output' });
+        completed.items[1]!.files = [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Create output not present at checkpoint' }];
+        service.store.importRevision(JSON.stringify(completed), 'json', service.planContextForAmendment(), completed.revision);
+      } finally { service.close(); }
+    } });
+  const { api, view, requests } = served;
+  const start = (kind: 'drafts' | 'suggestions') => api('POST', `/api/plan/${kind}`, {
+    expectedRevision: view.plan.revision, snapshotId: view.snapshot.id, feedback: '', actionId: randomUUID(),
+  });
+  const started = await start('suggestions');
+  expect(started).toMatchObject({ status: 200, body: { result: { requestId: expect.any(String) } } });
+  const id = started.body.result.requestId as string;
+  await served.settled('suggestions', id);
+  expect(requests[0]!.mode).toBe('suggest');
+  expect(await api('POST', `/api/plan/suggestions/${id}/apply`, { index: 0, actionId: randomUUID() }))
+    .toMatchObject({ status: 200, body: { result: { revision: view.plan.revision + 1 } } });
+  expect((await api('GET', '/api/review')).body.plan.items[1].title).toBe('Updated suffix title');
+  const refreshed = (await api('GET', '/api/review')).body as View;
+  const draftStart = await api('POST', '/api/plan/drafts', { expectedRevision: refreshed.plan.revision,
+    snapshotId: refreshed.snapshot.id, feedback: '', actionId: randomUUID() });
+  expect(draftStart.status).toBe(200);
+  const draftId = draftStart.body.result.requestId as string;
+  await served.settled('drafts', draftId);
+  expect((await api('POST', `/api/plan/drafts/${draftId}/apply`, { actionId: randomUUID() })).status).toBe(200);
 });
 
 it('keeps draft and suggestion IDs on their own routes', async () => {

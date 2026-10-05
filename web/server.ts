@@ -80,8 +80,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const store = service.store;
     const suggestionStore: SuggestionStore = {
       getPlan: identity => store.getPlan(identity), getSnapshot: identity => store.getSnapshot(identity),
-      beginSuggestions: (identity, expected, mode) => store.beginSuggestions(identity, expected, mode),
-      completeSuggestions: (identity, id, reply) => capability.run(() => store.completeSuggestions(identity, id, reply)),
+      beginSuggestions: (identity, expected, mode, continuation) => store.beginSuggestions(identity, expected, mode, continuation),
+      completeSuggestions: (identity, id, reply, candidatePlans) => capability.run(() => store.completeSuggestions(identity, id, reply, candidatePlans)),
       settleSuggestion: (identity, id, expected, outcome) => capability.run(() => store.settleSuggestion(identity, id, expected, outcome)),
       getSuggestions: (identity, id) => store.getSuggestions(identity, id),
     };
@@ -403,8 +403,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (typeof input.feedback !== 'string' || input.feedback.length > 4000) throw new BadRequest('feedback must be text of 4000 characters or fewer.');
         // Read above whenever the checks before this line pass; they cannot change across the synchronous action.
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
-        const context = service.planContext();
-        const handle = suggestions.start({ context, revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
+        const amendment = service.planningContextForAmendment(), context = amendment.context;
+        const handle = suggestions.start({ context, completedItems: amendment.completedItems, continuationBinding: amendment.continuation,
+          revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
           repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } }, mode);
         suggestionHandles.set(handle.id, handle);
         void handle.result.finally(() => suggestionHandles.delete(handle.id));

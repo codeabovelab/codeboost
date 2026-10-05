@@ -42,6 +42,7 @@ export interface PlanContext {
   allowedCommands: readonly (readonly string[])[];
   issue: number;
 }
+export interface ContinuationBinding { checkpointId: string; head: string; completedItems: readonly string[] }
 export interface Validation { errors: Diagnostic[]; warnings: Diagnostic[] }
 export class PlanError extends Error {
   readonly diagnostics: Diagnostic[];
@@ -143,6 +144,11 @@ export function validateContinuationPlan(plan: Plan, context: PlanContext, compl
   if (!completedItems.length || prefix.length !== completedItems.length || prefix.some((id, index) => id !== completedItems[index]) ||
       completedItems.length > plan.items.length || (!allowEmptySuffix && completedItems.length === plan.items.length))
     return { errors: [{ code: 'continuation-prefix', message: 'The amended plan must retain the completed item prefix and have a remaining item.' }], warnings: [] };
+  const ids = new Set<string>();
+  for (const item of plan.items) {
+    if (ids.has(item.id)) return { errors: [{ code: 'duplicate-id', message: `Duplicate item ID ${item.id}.`, item: item.id }], warnings: [] };
+    ids.add(item.id);
+  }
   // There is no executable suffix to validate, but the plan remains bound to
   // the selected issue even after every item has completed.
   if (completedItems.length === plan.items.length) {

@@ -370,6 +370,36 @@ it('uses configured path identity when matching checkpoint scope declarations', 
   expect(() => store.importRevision(JSON.stringify(identityDrift), 'json', normalizedContext, 2)).toThrow(/Plan issue does not match/);
   expect(store.getPlan(identity).revision).toBe(2);
 });
+it('can restore an executed definition after a transient pre-checkpoint amendment', () => {
+  const { store } = fixture(true), id = identity;
+  store.transitionTask(id, store.getTask(id).stateVersion, 'queued');
+  const start = store.getSnapshot(id), attempt = store.admitAttempt(id, { expectedStateVersion: store.getTask(id).stateVersion,
+    kind: 'execute', item: 'P1', expectedContext: store.currentContext(id), deadline: Date.now() + 60_000 });
+  store.markRunning(id, attempt.id);
+  const head = oid(7);
+  store.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { head, unchanged: false, inScope: [], outOfScope: ['outside'] },
+    history: { base: start.base, head, entries: [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }] } });
+  const transient = store.getPlan(id); transient.items[0]!.intent += ' transient edit';
+  store.importRevision(JSON.stringify(transient), 'json', context, 1);
+  store.pauseForAmendment(id, { revision: 1, snapshotId: store.getSnapshot(id).id }, {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'],
+    baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
+  }, { owed: true });
+  const restore = store.getPlan(id); restore.items[0]!.intent = plan().items[0]!.intent;
+  restore.items[0]!.files.push({ path: 'outside', kind: 'edit', renamed_from: null, change: 'Declare observed file' });
+  expect(() => store.importRevision(JSON.stringify(restore), 'json', {
+    ...context, baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
+  }, 2)).not.toThrow();
+  expect(store.continuationProgress(id)).toMatchObject({ completed: ['P1'], next: 'P2', head });
+});
+it('refuses a suffix ID collision with the completed checkpoint prefix without saving it', () => {
+  const { store } = fixture(true);
+  store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  const amended = store.getPlan(identity); amended.items[1]!.id = 'P1';
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/Duplicate item ID P1/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
 it('validates saved amendments against the checkpoint tree and completed suffix', () => {
   const path = join(directory(), 'state.sqlite'), store = open(path);
   const initial: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'Example', questions: [], items: [
