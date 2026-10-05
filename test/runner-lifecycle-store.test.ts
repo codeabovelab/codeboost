@@ -85,15 +85,21 @@ describe('schema v12 review ordering', () => {
   it('gives legacy choices a finite boundary so a later approval can authorize execution', () => {
     const { store, path } = fixture();
     const snapshot = store.getSnapshot(identity);
-    store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, [],
+    store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
+      [{ item: 'P1', fingerprint: 'legacy-approval' }],
       [{ key: 'legacy-choice', action: 'assign', item: 'P1' }]);
     store.close(); stores.splice(stores.indexOf(store), 1);
     const legacy = new DatabaseSync(path);
-    legacy.exec(`UPDATE choices SET data=json_remove(data,'$.reviewVersion'); PRAGMA user_version=11;`);
+    legacy.exec(`UPDATE choices SET data=json_remove(data,'$.reviewVersion');
+      UPDATE approvals SET data=json_remove(data,'$.reviewVersion');
+      PRAGMA user_version=11;`);
     legacy.close();
 
     const migrated = open(path), migratedVersion = migrated.reviewVersion(identity);
     expect(migrated.getReview(identity).choices[0]!.reviewVersion).toBe(migratedVersion - 1);
+    // Execution already treats an unversioned approval as invalid. Remove it too, so the review UI renders the item
+    // unreviewed and leaves its approval control available instead of showing an unusable approved state.
+    expect(migrated.getReview(identity).approvals).toEqual([]);
     expect(migrated.unapprovedExecutionItems(identity, 1)).toEqual(['P1']);
     migrated.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: migratedVersion },
       [{ item: 'P1', fingerprint: 'approved-after-upgrade' }], []);

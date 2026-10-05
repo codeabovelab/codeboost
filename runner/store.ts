@@ -188,7 +188,8 @@ export class Store {
           this.#db.exec('PRAGMA user_version=11');
         }
         // Choices written before review-version ordering existed must not become an infinite threshold. Give every
-        // legacy choice the review version at upgrade, then advance the visible version so a fresh approval can follow it.
+        // legacy choice the review version at upgrade. Legacy approvals are already invalid for execution, so remove
+        // them too: the review UI then renders those items unreviewed and permits the fresh approvals that must follow.
         if (version < 12) {
           const changed = new Set<string>();
           for (const row of this.#db.prepare('SELECT key,choice_key,data FROM choices').all()) {
@@ -196,6 +197,12 @@ export class Store {
             if (Number.isSafeInteger(choice.reviewVersion) && choice.reviewVersion! >= 0) continue;
             const boundary = this.#current(row.key as string).review_version as number;
             this.#run('UPDATE choices SET data=? WHERE key=? AND choice_key=?', encode({ ...choice, reviewVersion: boundary }), row.key!, row.choice_key!);
+            changed.add(row.key as string);
+          }
+          for (const row of this.#db.prepare('SELECT key,item,data FROM approvals').all()) {
+            const approval = decode<Approval & ReviewState>(row.data);
+            if (Number.isSafeInteger(approval.reviewVersion) && approval.reviewVersion! >= 0) continue;
+            this.#run('DELETE FROM approvals WHERE key=? AND item=?', row.key!, row.item!);
             changed.add(row.key as string);
           }
           for (const key of changed) this.#run('UPDATE plans SET review_version=review_version+1 WHERE key=?', key);
