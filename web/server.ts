@@ -392,7 +392,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     return service.store.userAction(identity, { actionId, kind, request }, () => {
       if (imported) {
         if (typeof input.source !== 'string' || !['json', 'yaml'].includes(input.format as string) || !Number.isSafeInteger(input.expectedRevision)) throw new BadRequest('source, format and expectedRevision are required.');
-        return { revision: service.store.importRevision(input.source, input.format as 'json' | 'yaml', service.planContext(), input.expectedRevision as number).revision };
+        return { revision: service.store.importRevision(input.source, input.format as 'json' | 'yaml', service.planContextForAmendment(), input.expectedRevision as number).revision };
       }
       if (started) {
         // Like Ask and the runner, no new agent starts once shutdown began; 503 is not recorded, so the UI may resend.
@@ -423,9 +423,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         service.store.cancelSuggestions(identity, id, 'Cancelled by the user.');
         return { state: service.store.getSuggestions(identity, id).state };
       }
-      if (mode === 'draft') return { revision: service.store.applyDraft(identity, id, service.planContext()).revision };
+      if (mode === 'draft') return { revision: service.store.applyDraft(identity, id, service.planContextForAmendment()).revision };
       if (!Number.isSafeInteger(input.index)) throw new BadRequest('index is required.');
-      return { revision: service.store.applySuggestion(identity, id, input.index as number, service.planContext()).revision };
+      return { revision: service.store.applySuggestion(identity, id, input.index as number, service.planContextForAmendment()).revision };
     }).response;
   };
   let stopping = false;

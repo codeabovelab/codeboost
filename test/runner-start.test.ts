@@ -269,10 +269,11 @@ describe('start and resume refusals and races (#91 part 2)', () => {
         result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
       const changed = s.getPlan(id);
       changed.items[1]!.intent += ' (revised after execution)';
-      s.importRevision(JSON.stringify(changed), 'json', baseContext, next.revision);
+      expect(() => s.importRevision(JSON.stringify(changed), 'json', baseContext!, next.revision))
+        .toThrow(/Completed item P2 changed after it ran/);
+      expect(s.getPlan(id).revision).toBe(next.revision);
     } });
-    expect(() => store.continuationProgress(identity)).toThrow(/Completed item P2 changed after it ran/);
-    const restored = store.getPlan(identity), item = store.getPlan(identity, 2).items[1]!;
+    const restored = store.getPlan(identity), item = restored.items[1]!;
     restored.items[1] = { acceptance: item.acceptance, files: item.files, id: item.id, title: item.title, intent: item.intent, depends_on: item.depends_on };
     store.importRevision(JSON.stringify(restored), 'json', baseContext!, store.getPlan(identity).revision);
     expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1', 'P2'], next: 'P3' });
@@ -581,7 +582,7 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getTask(identity)).toMatchObject({ status: 'needs human', stateVersion: before + 1 });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
-  it('settles owed safety evidence before an invalid continuation prefix can refuse resume', async () => {
+  it('settles owed safety evidence before continuation reconciliation can refuse resume', async () => {
     let earlier = '';
     const { app, identity, store } = await serve({ before: service => {
       earlier = committedFirstItem(service, false, ['other.ts']);
@@ -590,19 +591,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
         item: plan.items[0]!.id, completedItems: [plan.items[0]!.id], outOfScopePaths: ['other.ts'],
         baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
       });
-      const amended = s.getPlan(id), first = amended.items[0]!.id;
-      amended.items[0]!.id = 'P999';
-      for (const item of amended.items) item.depends_on = item.depends_on.map(dependency => dependency === first ? 'P999' : dependency);
-      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
-      const current = s.getPlan(id);
-      s.saveReview(id, { revision: current.revision, snapshotId: s.getSnapshot(id).id, reviewVersion: s.reviewVersion(id) },
-        current.items.map(item => approveItem(current, [], item.id, id, true)), []);
     }, findings: findings => findings.record(earlier, 'Safety violation: checkpoint reconciliation regression') });
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
     expect(store.getTask(identity).status).toBe('needs human');
     expect(store.getAttempts(identity)[0]!.safetyFinding).toMatch(/checkpoint reconciliation regression/);
   });
-  it('records an owed later scope pause before reconciling an edited completed item', async () => {
+  it('records an owed later scope pause before continuation reconciliation', async () => {
     const { app, identity, store, items } = await serve({ before: service => {
       committedFirstItem(service, false, ['other.ts']);
       const s = service.store, id = service.config.identity, firstSnapshot = s.getSnapshot(id), baseContext = service.planContext();
@@ -627,10 +621,6 @@ describe('start and resume refusals and races (#91 part 2)', () => {
       s.settleAttempt(id, second.id, { firstReason: null, exitCode: 0, valid: true,
         result: { head, unchanged: false, inScope: [], outOfScope: ['later.ts'] },
         history: { base: before.base, head, entries: [{ sha: head, owner: current.items[1]!.id, origin: 'owned', sourceSha: null }] } });
-      const changed = s.getPlan(id);
-      changed.items[1]!.files.push({ path: 'later.ts', kind: 'add', renamed_from: null, change: 'Declare the later observed path' });
-      s.importRevision(JSON.stringify(changed), 'json', baseContext, current.revision);
-      expect(() => s.continuationProgress(id)).toThrow(/changed after it ran/);
     } });
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
     expect(store.getTask(identity).status).toBe('needs amendment');

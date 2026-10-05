@@ -125,8 +125,10 @@ function sha(value: string): void {
  */
 export class Store {
   #db: DatabaseSync;
-  constructor(path: string) {
+  #pathKey: (path: string) => string;
+  constructor(path: string, pathKey: (path: string) => string = value => value) {
     requireSupportedNode();
+    this.#pathKey = pathKey;
     const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
     this.#db = new DatabaseSync(path, { timeout: 5000 });
     try {
@@ -357,7 +359,10 @@ export class Store {
     return this.#transaction(() => {
       this.#context(key, context);
       if (this.#current(key).revision !== expected) throw new Error('Stale plan revision.');
-      const plan = importPlan(source, format, context, expected + 1).plan;
+      const checkpoint = this.latestCheckpoint(context.identity);
+      const progress = checkpoint ? this.continuationProgress(context.identity) : null;
+      const plan = importPlan(source, format, context, expected + 1, progress?.completed).plan;
+      if (progress) this.continuationProgress(context.identity, plan);
       this.#savePlan(key, plan, expected); return plan;
     });
   }
@@ -564,7 +569,9 @@ export class Store {
       const current = this.#current(key);
       if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Draft is unavailable.');
       const revision = current.revision as number;
-      const plan = importPlan(request.reply as string, 'json', context, revision + 1).plan;
+      const checkpoint = this.latestCheckpoint(identity), progress = checkpoint ? this.continuationProgress(identity) : null;
+      const plan = importPlan(request.reply as string, 'json', context, revision + 1, progress?.completed).plan;
+      if (progress) this.continuationProgress(identity, plan);
       this.#savePlan(key, plan, revision);
       this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return plan;
     });
@@ -578,9 +585,11 @@ export class Store {
       const current = this.#current(key);
       if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Suggestion is unavailable.');
       const plan = this.getPlan(identity);
+      const checkpoint = this.latestCheckpoint(identity), progress = checkpoint ? this.continuationProgress(identity) : null;
       const next = applySuggestion(plan, decode<EditReply>(request.reply), index, context, {
         identity, schemaVersion: plan.schema_version, baseRevision: request.revision as number, issue: plan.issue,
-      });
+      }, progress?.completed);
+      if (progress) this.continuationProgress(identity, next);
       this.#savePlan(key, next, request.revision as number);
       this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return next;
     });
@@ -822,10 +831,10 @@ export class Store {
     if (!row) throw new Error('Unknown checkpoint.'); return decode<Checkpoint>(row.data);
   }
   /** Reconcile every completed execute item after the checkpoint with the recorded task head. */
-  continuationProgress(identity: PlanIdentity): { checkpoint: Checkpoint; completed: string[]; next: string | null; head: string } | null {
+  continuationProgress(identity: PlanIdentity, candidate?: Plan): { checkpoint: Checkpoint; completed: string[]; next: string | null; head: string } | null {
     const checkpoint = this.latestCheckpoint(identity);
     if (!checkpoint) return null;
-    const plan = this.getPlan(identity), completed = [...checkpoint.completedItems];
+    const plan = candidate ?? this.getPlan(identity), completed = [...checkpoint.completedItems];
     const prefix = plan.items.slice(0, completed.length);
     if (prefix.length !== completed.length || prefix.some((item, index) => item.id !== completed[index]))
       throw new GuardRefusal('The amended plan changed the completed checkpoint prefix.');
@@ -840,11 +849,11 @@ export class Store {
           throw new GuardRefusal(`Completed item ${checkpoint.completedItems[index]} changed before the audited checkpoint.`);
         continue;
       }
-      const observed = new Set(checkpoint.outOfScopePaths);
+      const observed = new Set(checkpoint.outOfScopePaths.map(this.#pathKey));
       const existingFiles = current.files.slice(0, before.files.length);
       const addedFiles = current.files.slice(before.files.length);
       if (stable({ ...current, files: existingFiles }) !== stable(before) ||
-          addedFiles.some(file => !observed.has(file.path)))
+          addedFiles.some(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])].some(path => !observed.has(this.#pathKey(path)))))
         throw new GuardRefusal(`Completed checkpoint item ${checkpoint.completedItems[index]} changed beyond its scope declaration.`);
     }
     let head = this.getSnapshot(identity, checkpoint.snapshotId).head;

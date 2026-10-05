@@ -27,9 +27,16 @@ export class ReviewService {
    * base reuses it instead of running Git again on the server's thread (each runner item asks for it, #91).
    */
   #baseEntries: { base: string; entries: readonly BaseEntry[] } | null = null;
+  #pathKey: (path: string) => string;
   constructor(config: ReviewConfig) {
     if (typeof config.pathIdentity?.caseSensitive !== 'boolean' || !['none', 'NFC'].includes(config.pathIdentity.unicodeNormalization)) throw new Error('Known checkout path identity is required.');
-    this.config = config; this.store = new Store(config.database);
+    this.config = config;
+    this.#pathKey = path => {
+      if (!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
+      const normalized = config.pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
+      return config.pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
+    };
+    this.store = new Store(config.database, this.#pathKey);
   }
   close() { this.store.close(); }
   /**
@@ -44,7 +51,7 @@ export class ReviewService {
     return { path: this.config.runnerRepository, runnerOwned: true };
   }
   load() {
-    const { identity, pathIdentity } = this.config;
+    const { identity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
     let snapshot = this.store.getSnapshot(identity);
@@ -54,11 +61,7 @@ export class ReviewService {
     // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
     const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
-    const pathKey = (path: string) => {
-      if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
-      const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
-      return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
-    };
+    const pathKey = this.#pathKey;
     const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey);
     const saved = this.store.getReview(identity), keys = choiceKeys(raw, identity);
     const deltas = new Map(history.final.map(file => [JSON.stringify([file.newPath ?? file.oldPath, file.oldPath]), file]));
@@ -154,12 +157,8 @@ export class ReviewService {
   }
   /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */
   planContextAt(head?: string): PlanContext {
-    const { identity, repository, pathIdentity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
-    const pathKey = (path: string) => {
-      if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
-      const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
-      return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
-    };
+    const { identity, repository } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const pathKey = this.#pathKey;
     // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
     const treeHead = head ?? snapshot.base;
     if (head && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Expected a full checkpoint head.');
@@ -182,6 +181,14 @@ export class ReviewService {
     return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
   }
   planContext(): PlanContext { return this.planContextAt(); }
+  /** When a checkpoint exists, edits are validated against the audited task head and completed work is excluded. */
+  planContextForAmendment(): PlanContext {
+    const checkpoint = this.store.latestCheckpoint(this.config.identity);
+    if (!checkpoint) return this.planContext();
+    const progress = this.store.continuationProgress(this.config.identity);
+    if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
+    return this.planContextAt(progress.head);
+  }
   /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
   act(input: unknown, actionId?: string) {
     if (!input || typeof input !== 'object') throw new Error('Invalid review command.');

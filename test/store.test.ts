@@ -19,7 +19,7 @@ const reply = (revision = 1): EditReply => ({ schema_version: 1, base_revision: 
 const dirs: string[] = [], stores: Store[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function directory() { const dir = mkdtempSync(join(tmpdir(), 'codeboost-store-')); dirs.push(dir); return dir; }
-function open(path: string) { const store = new Store(path); stores.push(store); return store; }
+function open(path: string, pathKey: (path: string) => string = p => p) { const store = new Store(path, pathKey); stores.push(store); return store; }
 function close(store: Store) { store.close(); stores.splice(stores.indexOf(store), 1); }
 function fixture(two = false) { const path = join(directory(), 'state.sqlite'); const store = open(path);
   const initial = plan();
@@ -324,8 +324,8 @@ it('refuses edits to completed items before the checkpoint owner', () => {
   const amended = store.getPlan(identity);
   amended.items[0]!.intent += ' revised after completion';
   amended.items[1]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
-  store.importRevision(JSON.stringify(amended), 'json', context, 1);
-  expect(() => store.continuationProgress(identity)).toThrow(/Completed item P1 changed before the audited checkpoint/);
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/Completed item P1 changed before the audited checkpoint/);
+  expect(store.getPlan(identity).revision).toBe(1);
 });
 it('refuses checkpoint-owner edits beyond declaring the observed scope finding', () => {
   const { store } = fixture(true);
@@ -336,8 +336,57 @@ it('refuses checkpoint-owner edits beyond declaring the observed scope finding',
   const amended = store.getPlan(identity);
   amended.items[1]!.intent += ' changed after it completed';
   amended.items[1]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
-  store.importRevision(JSON.stringify(amended), 'json', context, 1);
-  expect(() => store.continuationProgress(identity)).toThrow(/changed beyond its scope declaration/);
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/changed beyond its scope declaration/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it('refuses a scope declaration whose rename source was not observed', () => {
+  const path = join(directory(), 'state.sqlite'), store = open(path), contextWithSource = {
+    ...context, baseEntries: [...context.baseEntries, { path: 'b', kind: 'file' as const }],
+  };
+  const initial = plan(); initial.items.push({ ...structuredClone(initial.items[0]!), id: 'P2', depends_on: ['P1'] });
+  store.createPlan(JSON.stringify(initial), 'json', contextWithSource, oid(1), oid(2));
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: contextWithSource.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.files.push({ path: 'outside', kind: 'rename', renamed_from: 'b', change: 'Rename the observed path' });
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', contextWithSource, 1)).toThrow(/changed beyond its scope declaration/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it('uses configured path identity when matching checkpoint scope declarations', () => {
+  const path = join(directory(), 'state.sqlite'), pathKey = (value: string) => value.toLowerCase();
+  const store = open(path, pathKey), normalizedContext = { ...context, pathKey };
+  store.createPlan(JSON.stringify({ ...plan(), items: [...plan().items, { ...structuredClone(plan().items[0]!), id: 'P2', depends_on: ['P1'] }] }),
+    'json', normalizedContext, oid(1), oid(2));
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.files.push({ path: 'OUTSIDE', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  expect(store.importRevision(JSON.stringify(amended), 'json', normalizedContext, 1).revision).toBe(2);
+  expect(store.continuationProgress(identity)?.next).toBeNull();
+  const identityDrift = store.getPlan(identity);
+  identityDrift.issue = 2;
+  expect(() => store.importRevision(JSON.stringify(identityDrift), 'json', normalizedContext, 2)).toThrow(/Plan issue does not match/);
+  expect(store.getPlan(identity).revision).toBe(2);
+});
+it('validates saved amendments against the checkpoint tree and completed suffix', () => {
+  const path = join(directory(), 'state.sqlite'), store = open(path);
+  const initial: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'Example', questions: [], items: [
+    { id: 'P1', title: 'Create output', intent: 'Create done.ts', files: [{ path: 'done.ts', kind: 'add', renamed_from: null, change: 'Create output' }], acceptance: [{ type: 'check', text: 'Done' }], depends_on: [] },
+    { id: 'P2', title: 'Continue', intent: 'Create later.ts', files: [{ path: 'later.ts', kind: 'add', renamed_from: null, change: 'Create later output' }], acceptance: [{ type: 'check', text: 'Done' }], depends_on: ['P1'] },
+  ] };
+  store.createPlan(JSON.stringify(initial), 'json', { ...context, baseEntries: [] }, oid(1), oid(2));
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra.ts'],
+    baseEntries: [{ path: 'done.ts', kind: 'file' }, { path: 'extra.ts', kind: 'file' }],
+  });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  expect(store.importRevision(JSON.stringify(amended), 'json', {
+    ...context, baseEntries: [{ path: 'done.ts', kind: 'file' }, { path: 'extra.ts', kind: 'file' }],
+  }, 1).revision).toBe(2);
+  expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1'], next: 'P2' });
 });
 it('rejects duplicate source SHA mappings and rolls back every resulting ledger/snapshot write', () => {
   const { store } = fixture(); const before = store.getSnapshot(identity);
