@@ -11,6 +11,7 @@ import type { ReviewService } from '../runner/review.ts';
 import type { RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 import type { AttemptKind } from '../runner/lifecycle.ts';
+import { approveItem } from '../core/approvals.ts';
 
 vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -24,10 +25,11 @@ type App = Awaited<ReturnType<typeof startServer>>;
  * A server with a runner whose preparation always fails: an admitted item ends `failed` without an agent, which is
  * enough to see what start and resume admit. `before` shapes the Store before the runner exists, as recovery would.
  */
-async function serve(options: { kinds?: AttemptKind[]; before?: (service: ReviewService) => void; findings?: (findings: SafetyFindings, service: ReviewService) => void } = {}) {
+async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void; findings?: (findings: SafetyFindings, service: ReviewService) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-start-')); roots.push(root);
   const demo = createDemo(join(root, 'demo'));
   const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+    if (options.approve !== false) approvePlan(service);
     options.before?.(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
@@ -42,11 +44,18 @@ async function serve(options: { kinds?: AttemptKind[]; before?: (service: Review
   return { app, close, database: demo.database, identity: demo.identity, store: app.service.store, items: app.service.store.getPlan(demo.identity).items.map(item => item.id) };
 }
 const view = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
-async function act(app: App, action: string, request: { expectedStateVersion?: number; actionId?: string } = {}) {
-  const { stateVersion } = await view(app);
+async function act(app: App, action: string, request: { expectedStateVersion?: number; expectedReviewVersion?: number; actionId?: string } = {}) {
+  const { stateVersion, reviewVersion } = await view(app);
   const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
-    body: JSON.stringify({ action, expectedStateVersion: request.expectedStateVersion ?? stateVersion, actionId: request.actionId ?? randomUUID() }) });
+    body: JSON.stringify({ action, expectedStateVersion: request.expectedStateVersion ?? stateVersion,
+      expectedReviewVersion: request.expectedReviewVersion ?? reviewVersion, actionId: request.actionId ?? randomUUID() }) });
   return { status: response.status, body: await response.json() as Record<string, any> };
+}
+
+function approvePlan(service: ReviewService) {
+  const view = service.load();
+  service.store.saveReview(service.config.identity, view.expected,
+    view.items.map(item => approveItem(view.plan, view.segments, item.id, service.config.identity, item.count === 0)), []);
 }
 
 /** Before the runner exists: queue the task and leave one execute attempt of its first item, failed. */
@@ -77,9 +86,36 @@ function committedFirstItem(service: ReviewService, unchanged = false, outOfScop
 function revise(service: ReviewService) {
   const s = service.store, id = service.config.identity, plan = s.getPlan(id);
   s.importRevision(JSON.stringify({ ...plan, revision: plan.revision + 1, summary: `${plan.summary} (revised)` }), 'json', service.planContext(), plan.revision);
+  const revised = s.getPlan(id), snapshot = s.getSnapshot(id);
+  s.saveReview(id, { revision: revised.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+    revised.items.map(item => approveItem(revised, [], item.id, id, true)), []);
 }
 
 describe('start (#91 part 2)', () => {
+  it('requires every item of the current plan revision to be approved before start', async () => {
+    const { app, identity, store } = await serve({ approve: false });
+    expect(await view(app)).toMatchObject({ startable: false });
+    expect((await act(app, 'start')).body.error).toMatch(/approve every plan item/i);
+    expect(store.getAttempts(identity)).toEqual([]);
+  });
+  it('requires fresh current-snapshot approvals when the head moves before start', async () => {
+    const { app, identity, store } = await serve();
+    const snapshot = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: store.getPlan(identity).revision, snapshotId: snapshot.id,
+      reviewVersion: store.reviewVersion(identity) }, snapshot.base, 'e'.repeat(40), []);
+    expect(await view(app)).toMatchObject({ startable: false });
+    expect((await act(app, 'start')).body.error).toMatch(/approve every plan item/i);
+    expect(store.getAttempts(identity)).toEqual([]);
+  });
+  it('requires approvals recorded after a later attribution choice', async () => {
+    const { app, identity, store } = await serve();
+    const plan = store.getPlan(identity), snapshot = store.getSnapshot(identity);
+    store.saveReview(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, [],
+      [{ key: 'later-choice', action: 'assign', item: plan.items[0]!.id }]);
+    expect(await view(app)).toMatchObject({ startable: false });
+    approvePlan(app.service);
+    expect(await view(app)).toMatchObject({ startable: true });
+  });
   it('moves a task in review to queued and admits its first item, in one action', async () => {
     const { app, identity, store, items } = await serve();
     expect(store.getTask(identity).status).toBe('in review');
@@ -174,6 +210,15 @@ describe('resume (#91 part 2)', () => {
 });
 
 describe('start and resume refusals and races (#91 part 2)', () => {
+  it('guards start with the review version as well as the task state version', async () => {
+    const { app, identity, store } = await serve();
+    const before = await view(app);
+    store.addReviewNote(identity, { revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id,
+      reviewVersion: before.reviewVersion }, store.getPlan(identity).items[0]!.id, 'question', 'Changed after the runner view.');
+    expect((await act(app, 'start', { expectedStateVersion: before.stateVersion, expectedReviewVersion: before.reviewVersion })).body.error)
+      .toMatch(/Stale review state/);
+    expect(store.getAttempts(identity)).toEqual([]);
+  });
   it('resumes a revised plan from its first item when the earlier revision committed nothing', async () => {
     const { app, identity, store, items } = await serve({ before: service => { failedFirstItem(service); revise(service); } });
     expect(await view(app)).toMatchObject({ startable: false, resumable: true });
@@ -300,6 +345,106 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     // The escalation committed, so the finding is no longer owed.
     expect(held.get(earlier)).toBeUndefined();
   });
+  it('acts on owed safety work before a scope-pause refusal', async () => {
+    let earlier = '';
+    const { app, identity, store } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      committedFirstItem(service, false, ['other.ts']);
+      const attempt = s.getAttempts(id)[0]!;
+      s.pauseForAmendment(id, { revision: attempt.context.planRevision, snapshotId: s.getSnapshot(id).id }, {
+        item: attempt.item!, completedItems: [attempt.item!], baseEntries: [], outOfScopePaths: ['other.ts'],
+      });
+      earlier = attempt.id;
+    }, findings: (findings, service) => {
+      const save = service.store.recordSafetyFinding;
+      service.store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+      findings.record(earlier, 'Safety violation: held after the pause');
+      service.store.recordSafetyFinding = save;
+    } });
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(store.getAttempt(identity, earlier).safetyFinding).toMatch(/held after the pause/);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs human');
+  });
+  it('persists owed safety work before active-merge and pending-cancel refusals', async () => {
+    for (const blocker of ['merge', 'cancel'] as const) {
+      let earlier = '';
+      const { app, identity, store } = await serve({ before: service => {
+        const s = service.store, id = service.config.identity;
+        if (blocker === 'merge') {
+          earlier = failedFirstItem(service).id;
+          s.transitionTask(id, s.getTask(id).stateVersion, 'in review');
+          const snapshot = s.getSnapshot(id);
+          s.beginMergeAttempt(id, { revision: s.getPlan(id).revision, snapshotId: snapshot.id,
+            reviewVersion: s.reviewVersion(id) }, snapshot.head, null, 'direct');
+        } else {
+          s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+          const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+            expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+          s.markRunning(id, attempt.id); s.cancelTask(id, s.getTask(id).stateVersion, randomUUID()); earlier = attempt.id;
+        }
+      }, findings: (findings, service) => {
+        const save = service.store.recordSafetyFinding;
+        service.store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+        findings.record(earlier, `Safety violation: ${blocker}`); service.store.recordSafetyFinding = save;
+      } });
+      expect((await act(app, blocker === 'merge' ? 'start' : 'resume')).body.result).toEqual({ outcome: 'settled' });
+      expect(store.getAttempt(identity, earlier).safetyFinding).toMatch(new RegExp(blocker));
+    }
+  });
+  it('clears a recovery requeue when owed work settles without admitting an attempt', async () => {
+    let interrupted = '';
+    const { app, identity, store } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: s.getPlan(id).items[0]!.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id); s.recoverInterrupted(Date.now()); interrupted = attempt.id;
+    }, findings: (findings, service) => {
+      const save = service.store.recordSafetyFinding;
+      service.store.recordSafetyFinding = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
+      findings.record(interrupted, 'Safety violation: recovered'); service.store.recordSafetyFinding = save;
+    } });
+    expect(store.getTask(identity).requeuePending).toBe(true);
+    expect(await view(app)).toMatchObject({ startable: false, resumable: true });
+    expect((await act(app, 'start')).body.error).toMatch(/recovery left this task to requeue/i);
+    expect(store.getTask(identity).requeuePending).toBe(true);
+    expect(store.getAttempt(identity, interrupted).safetyFinding).toBeNull();
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity)).toMatchObject({ status: 'needs human', requeuePending: false });
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
+  it('refuses resume when the completed prefix no longer ends at the current task head', async () => {
+    const { app, identity, store } = await serve({ before: service => { committedFirstItem(service); } });
+    const snapshot = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: store.getPlan(identity).revision, snapshotId: snapshot.id,
+      reviewVersion: store.reviewVersion(identity) }, snapshot.base, 'e'.repeat(40), []);
+    expect(await view(app)).toMatchObject({ resumable: false });
+    expect((await act(app, 'resume')).body.error).toMatch(/completed plan prefix.*current task head/i);
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
+  it('inherits approvals only from snapshots used by the completed execution prefix', async () => {
+    const inherited = await serve({ before: service => { committedFirstItem(service); } });
+    expect(await view(inherited.app)).toMatchObject({ resumable: true });
+
+    const returned = await serve({ before: service => { committedFirstItem(service, true); } });
+    const { app, identity, store } = returned, atA = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: 1, snapshotId: atA.id, reviewVersion: store.reviewVersion(identity) },
+      atA.base, 'e'.repeat(40), []);
+    const atB = store.getSnapshot(identity);
+    expect(atB.head).toBe('e'.repeat(40));
+    const approvals = store.getReview(identity).approvals.map(({ item, fingerprint }) => ({ item, fingerprint }));
+    store.saveReview(identity, { revision: 1, snapshotId: atB.id, reviewVersion: store.reviewVersion(identity) }, approvals, []);
+    expect(store.getReview(identity).approvals).toHaveLength(store.getPlan(identity).items.length);
+    expect(store.getReview(identity).approvals.every(approval => approval.snapshotId === atB.id)).toBe(true);
+    store.recordHistory(identity, { revision: 1, snapshotId: atB.id, reviewVersion: store.reviewVersion(identity) },
+      atA.base, atA.head, []);
+    expect(await view(app)).toMatchObject({ resumable: false });
+    expect((await act(app, 'resume')).body.error).toMatch(/approve every plan item/i);
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
   it('pauses for an amendment owed from an earlier run instead of admitting, and reports it settled', async () => {
     const { app, identity, store } = await serve({ before: service => { committedFirstItem(service, false, ['other.ts']); } });
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
@@ -308,7 +453,24 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity)).toHaveLength(1);
     expect(await view(app)).toMatchObject({ startable: false, resumable: false });
   });
-  it('moves a task in review to queued and then acts on an owed safety finding, in one action', async () => {
+  it('does not offer scope-only owed work from a state where the pause cannot be recorded', async () => {
+    for (const blocker of ['human', 'merge'] as const) {
+      const { app, identity, store } = await serve({ before: service => {
+        committedFirstItem(service, false, ['other.ts']);
+        const s = service.store, id = service.config.identity;
+        s.transitionTask(id, s.getTask(id).stateVersion, blocker === 'human' ? 'needs human' : 'in review');
+        if (blocker === 'merge') {
+          const snapshot = s.getSnapshot(id);
+          s.beginMergeAttempt(id, { revision: s.getPlan(id).revision, snapshotId: snapshot.id,
+            reviewVersion: s.reviewVersion(id) }, snapshot.head, null, 'direct');
+        }
+      } });
+      expect(await view(app), blocker).toMatchObject({ startable: false, resumable: false });
+      expect((await act(app, 'resume')).status, blocker).toBe(409);
+      expect(store.latestCheckpoint(identity), blocker).toBeNull();
+    }
+  });
+  it('acts on an owed safety finding before moving a task in review to queued', async () => {
     let earlier = '';
     const { app, identity, store } = await serve({ before: service => {
       earlier = failedFirstItem(service).id; revise(service);
@@ -322,9 +484,8 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     } });
     const before = store.getTask(identity).stateVersion, moves = vi.spyOn(store, 'transitionTask');
     expect((await act(app, 'start')).body.result).toEqual({ outcome: 'settled' });
-    // Queued first, then escalated from queued, both in the one action.
-    expect(moves.mock.calls.map(call => [call[1], call[2]])).toEqual([[before, 'queued'], [before + 1, 'needs human']]);
-    expect(store.getTask(identity).status).toBe('needs human');
+    expect(moves).not.toHaveBeenCalled();
+    expect(store.getTask(identity)).toMatchObject({ status: 'needs human', stateVersion: before + 1 });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
   it('replays an action ID, and refuses a second resume made against the old state', async () => {
@@ -336,14 +497,31 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume', { expectedStateVersion: stateVersion })).body.error).toMatch(/Stale task state/);
     expect(store.getAttempts(identity)).toHaveLength(2);
   });
+  it('replays a pre-review-version action, but never creates a new action without the review version', async () => {
+    const actionId = randomUUID(); let stateVersion = 0;
+    const { app, identity, store } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity; stateVersion = s.getTask(id).stateVersion;
+      s.userAction(id, { actionId, kind: 'start', request: { attemptId: undefined, expectedStateVersion: stateVersion } },
+        () => ({ outcome: 'settled' }));
+    } });
+    const post = async (id: string) => {
+      const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
+        body: JSON.stringify({ action: 'start', expectedStateVersion: stateVersion, actionId: id }) });
+      return { status: response.status, body: await response.json() as Record<string, any> };
+    };
+    expect(await post(actionId)).toMatchObject({ status: 200, body: { result: { outcome: 'settled' } } });
+    expect(await post(randomUUID())).toMatchObject({ status: 400, body: { error: expect.stringMatching(/expectedReviewVersion/) } });
+    expect(store.getAttempts(identity)).toEqual([]);
+  });
   it('answers 503 to a start whose body finishes arriving after shutdown began, before any refusal, and records nothing', async () => {
     // A task start would refuse: during shutdown the 503 still comes first, so no refusal is saved under the action ID.
     const { app, close, database, identity } = await serve({ before: service => {
       const s = service.store, id = service.config.identity;
       s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
     } });
-    const { stateVersion } = await view(app), actionId = randomUUID(), url = new URL(app.url);
-    const text = JSON.stringify({ action: 'start', expectedStateVersion: stateVersion, actionId });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID(), url = new URL(app.url);
+    const text = JSON.stringify({ action: 'start', expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId });
     let finish!: () => void;
     const response = new Promise<number>((resolve, reject) => {
       const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
@@ -361,7 +539,8 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     const store = new Store(database); cleanups.push(() => store.close());
     expect(store.getTask(identity).status).toBe('needs human');
     expect(store.getAttempts(identity)).toEqual([]);
-    expect(store.savedAction(identity, { actionId, kind: 'start', request: { attemptId: undefined, expectedStateVersion: stateVersion } })).toBeUndefined();
+    expect(store.savedAction(identity, { actionId, kind: 'start', request: { attemptId: undefined, expectedStateVersion: stateVersion,
+      expectedReviewVersion: reviewVersion } })).toBeUndefined();
   });
   it('answers 503 to a start once the runner stopped admission, and leaves the task in review', async () => {
     const { app, identity, store } = await serve();

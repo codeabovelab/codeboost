@@ -5,6 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store, mergeActionResponse } from '../runner/store.ts';
+import { SafetyFindings } from '../runner/execution.ts';
 import { ActionIdReused, GuardRefusal, classifySettlement, requestHash } from '../runner/lifecycle.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -78,6 +79,33 @@ describe('schema v6', () => {
     expect(() => migrated.feedbackEvents(identity)).toThrow(/after the task closes/);
     // Reopening a migrated v6 store changes nothing.
     expect(open(path).getTask(other).stateVersion).toBe(closed.stateVersion);
+  });
+});
+
+describe('schema v12 review ordering', () => {
+  it('gives legacy choices a finite boundary so a later approval can authorize execution', () => {
+    const { store, path } = fixture();
+    const snapshot = store.getSnapshot(identity);
+    store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
+      [{ item: 'P1', fingerprint: 'legacy-approval' }],
+      [{ key: 'legacy-choice', action: 'assign', item: 'P1' }]);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const legacy = new DatabaseSync(path);
+    legacy.exec(`UPDATE choices SET data=json_remove(data,'$.reviewVersion');
+      UPDATE approvals SET data=json_remove(data,'$.reviewVersion');
+      PRAGMA user_version=11;`);
+    legacy.close();
+
+    const migrated = open(path), migratedVersion = migrated.reviewVersion(identity);
+    expect(migrated.getReview(identity).choices[0]!.reviewVersion).toBe(migratedVersion - 1);
+    // Execution already treats an unversioned approval as invalid. Remove it too, so the review UI renders the item
+    // unreviewed and leaves its approval control available instead of showing an unusable approved state.
+    expect(migrated.getReview(identity).approvals).toEqual([]);
+    expect(migrated.unapprovedExecutionItems(identity, 1)).toEqual(['P1']);
+    migrated.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: migratedVersion },
+      [{ item: 'P1', fingerprint: 'approved-after-upgrade' }], []);
+    expect(migrated.unapprovedExecutionItems(identity, 1)).toEqual([]);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
   });
 });
 
@@ -662,7 +690,33 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
     const reopened = open(path);
     expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+  });
+
+  it('adds the durable owed marker to a version 12 database', () => {
+    const { path, store } = queued();
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE attempts DROP COLUMN safety_owed; PRAGMA user_version=12;'); db.close();
+    const reopened = open(path);
+    expect(reopened.owedSafetyFindings()).toEqual([]);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+  });
+
+  it('restores and clears an escalation owed behind a human gate across real store reopens', () => {
+    const { path, store } = queued(), attempt = admit(store); store.markRunning(identity, attempt.id);
+    settle(store, attempt.id, { exitCode: 1, valid: false });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs approval');
+    expect(store.recordOwedSafetyFinding(identity, attempt.id, 'Safety violation: durable restart')).toBe(false);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+
+    const reopened = open(path), findings = new SafetyFindings(reopened);
+    expect(findings.get(attempt.id)).toBe('Safety violation: durable restart');
+    reopened.transitionTask(identity, reopened.getTask(identity).stateVersion, 'queued');
+    expect(findings.persist(attempt.id)).toBe(true);
+    expect(reopened.getTask(identity).status).toBe('needs human');
+    reopened.close(); stores.splice(stores.indexOf(reopened), 1);
+    expect(new SafetyFindings(open(path)).get(attempt.id)).toBeUndefined();
   });
 });
 
@@ -686,7 +740,7 @@ describe('allocation baseline (#91)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
     const reopened = open(path);
     expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
   });
 });
 describe('publish outcomes (#103)', () => {
@@ -702,7 +756,7 @@ describe('publish outcomes (#103)', () => {
     reopened.recordPublish(identity, { outcome: 'opened', draft: false, message: 'Pull request #1 is open.', number: 1, url: 'https://github.com/o/r/pull/1' });
     expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 1 });
     expect(reopened.getTask(identity)).toEqual(before);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
   });
   it('stamps an outcome with the version the publish saw, and refuses one it cannot have seen (#114)', () => {
     const { store } = queued(), version = store.getTask(identity).stateVersion;

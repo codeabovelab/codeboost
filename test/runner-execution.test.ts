@@ -94,7 +94,7 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   }, sources, RUNNER_OWNER, findings, { diagnostics: { directory: join(dir, 'diagnostics'), capBytes: options.diagnosticsCap }, exportDeadlineMs: options.exportDeadlineMs });
   const runner = new RunnerCoordinator(store, deps, undefined, capability);
   cleanups.push(async () => { await runner.close(); store.close(); });
-  return { store, path, workspace, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners, checks };
+  return { store, path, workspace, sources, findings, runner, executor: new ItemExecutor(store, runner, sources, findings, { capability }), log, commits, prompts, argv, owners, checks };
 }
 
 describe('item execution', () => {
@@ -270,6 +270,24 @@ describe('item execution', () => {
     expect(h.commits.map(c => c.item)).toEqual(['P1']);
     expect(h.runner.status(identity).unresolved).toBeNull();
   });
+  it('stops before the next item when review input changes during the run', async () => {
+    let store!: Store, changed = false;
+    const h = setup({ onLaunch: attemptId => {
+      if (changed || store.getAttempt(identity, attemptId).item !== 'P1') return;
+      changed = true;
+      const snapshot = store.getSnapshot(identity);
+      store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) }, [],
+        [{ key: 'later-choice', action: 'assign', item: 'P1' }]);
+    } });
+    store = h.store;
+    const snapshot = store.getSnapshot(identity), current = store.getPlan(identity);
+    store.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
+      current.items.map(item => ({ item: item.id, fingerprint: `approved-${item.id}` })), []);
+    const begun = h.executor.begin(identity, { expectedReviewVersion: store.reviewVersion(identity) });
+    expect(await begun.outcome).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', completed: ['P1'],
+      reason: expect.stringMatching(/review changed/) });
+    expect(store.getAttempts(identity).map(row => row.item)).toEqual(['P1']);
+  });
   it('still pauses for amendment, bound to where the item ran, when the plan changes after its attempt settled', async () => {
     let store!: Store;
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {
@@ -346,7 +364,8 @@ describe('item execution', () => {
     // Admitted synchronously, inside whatever transaction the caller holds.
     expect(h.store.getAttempts(identity).map(row => [row.id, row.item])).toEqual([[begun.attemptId, 'P1']]);
     expect(await begun.outcome).toEqual({ kind: 'executed', items: ['P1', 'P2'], unchanged: [] });
-    expect(h.executor.progress(identity)).toEqual({ started: true, begun: true, earlierCommits: false, completed: ['P1', 'P2'], next: null });
+    expect(h.executor.progress(identity)).toEqual({ started: true, begun: true, earlierCommits: false, completed: ['P1', 'P2'],
+      prefixHead: oid(101), next: null });
   });
   it('begin throws the admission refusal itself, where runTask reports it as not started', async () => {
     const h = setup();
@@ -520,10 +539,29 @@ describe('item execution', () => {
     store = unsafe.store;
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', reason: expect.stringMatching(/needs approval; it moves to needs human when it next runs/) });
     expect(store.getTask(identity).status).toBe('needs approval');
-    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/needs approval; it moves to needs human/) });
+    const [unsafeAttempt] = store.getAttempts(identity);
+    const retrySave = store.recordOwedSafetyFinding.bind(store);
+    store.recordOwedSafetyFinding = () => { throw Object.assign(new Error('disk full on retry'), { code: 'ERR_SQLITE_ERROR' }); };
+    expect(() => unsafe.executor.begin(identity)).toThrow(/disk full on retry/);
+    expect(store.getTask(identity).status).toBe('needs approval');
+    expect(store.getAttempt(identity, unsafeAttempt!.id).safetyFinding).toMatch(/Git metadata/);
+    expect(unsafe.findings.get(unsafeAttempt!.id)).toMatch(/Git metadata/);
+    store.recordOwedSafetyFinding = retrySave;
+    const gatedBegin = unsafe.executor.begin(identity);
+    expect(gatedBegin.attemptId).toBeNull();
+    expect(await gatedBegin.outcome).toMatchObject({ kind: 'stopped', reason: expect.stringMatching(/needs approval; it moves to needs human/) });
+    expect(store.getTask(identity).status).toBe('needs approval');
+    expect(store.getAttempt(identity, unsafeAttempt!.id).safetyFinding).toMatch(/Git metadata/);
+    expect(unsafe.findings.get(unsafeAttempt!.id)).toMatch(/Git metadata/);
+    // A new process reconstructs the deferred escalation from the durable marker, not the old in-memory map.
+    unsafe.findings.settle(unsafeAttempt!.id);
+    const restartedFindings = new SafetyFindings(store), restarted = new ItemExecutor(store, unsafe.runner, unsafe.sources, restartedFindings);
+    expect(restartedFindings.get(unsafeAttempt!.id)).toMatch(/Git metadata/);
+    expect(await restarted.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'not started', reason: expect.stringMatching(/needs approval; it moves to needs human/) });
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
-    expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(restarted.payOwed(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
+    expect(new SafetyFindings(store).get(unsafeAttempt!.id)).toBeUndefined();
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
   it('never launches an item with a declared link that goes through another link, and sends the task to a person', async () => {
@@ -659,6 +697,27 @@ describe('item execution', () => {
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started' });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
+  it('persists a current run safety finding before clearing its in-memory copy', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    const attemptId = h.store.getAttempts(identity)[0]!.id;
+    expect(h.findings.get(attemptId)).toBeUndefined();
+    const reopened = new Store(h.path); cleanups.push(() => reopened.close());
+    expect(reopened.getAttempt(identity, attemptId).safetyFinding).toMatch(/Git metadata/);
+    expect(reopened.getTask(identity).status).toBe('needs human');
+  });
+  it('keeps a current run safety finding owed when its durable retry fails', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true });
+    const retrySave = h.store.recordOwedSafetyFinding.bind(h.store);
+    h.store.recordOwedSafetyFinding = () => { throw Object.assign(new Error('disk full on retry'), { code: 'ERR_SQLITE_ERROR' }); };
+    await expect(h.executor.runTask(identity)).rejects.toThrow(/disk full on retry/);
+    const attemptId = h.store.getAttempts(identity)[0]!.id;
+    expect(h.store.getAttempt(identity, attemptId).safetyFinding).toBeNull();
+    expect(h.findings.get(attemptId)).toMatch(/Git metadata/);
+    h.store.recordOwedSafetyFinding = retrySave;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.store.getAttempts(identity)).toHaveLength(1);
+  });
   it('keeps task storage when a foreign result\'s terminal write fails', async () => {
     const { runner, executor, log } = setup({ settleError: true, exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'running' });
@@ -785,11 +844,16 @@ describe('item execution', () => {
   });
   it('escalates through the capability after the shutdown write gate closed', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, capability: s => s.shutdownCapability(),
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
+      capability: s => s.shutdownCapability(),
       release: async () => { store.closeWrites(); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
+    const attemptId = store.getAttempts(identity)[0]!.id;
+    const reopened = new Store(h.path); cleanups.push(() => reopened.close());
+    expect(reopened.getAttempt(identity, attemptId).safetyFinding).toMatch(/Git metadata/);
+    expect(new SafetyFindings(reopened).get(attemptId)).toBeUndefined();
   });
   it('settles an owed finding when the task was closed before its next run', async () => {
     let store!: Store;

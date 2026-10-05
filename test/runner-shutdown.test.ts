@@ -237,6 +237,8 @@ describe('/api/runner', () => {
     const version = (await api(app, 'GET', '/api/runner')).body.stateVersion, actionId = randomUUID();
     expect(await api(app, 'POST', '/api/runner', { action: 'bogus', expectedStateVersion: version, actionId })).toMatchObject({ status: 400 });
     expect(await api(app, 'POST', '/api/runner', { action: 'retry', expectedStateVersion: 'x', actionId })).toMatchObject({ status: 400 });
+    expect(await api(app, 'POST', '/api/runner', { action: 'start', expectedStateVersion: version, actionId })).toMatchObject({ status: 400,
+      body: { error: expect.stringMatching(/expectedReviewVersion/) } });
     expect(await api(app, 'POST', '/api/runner', { action: 'cancel-attempt', attemptId: 'x', expectedStateVersion: version, actionId })).toMatchObject({ status: 400 });
     expect(await api(app, 'POST', '/api/runner', { action: 'retry', expectedStateVersion: version, actionId })).toMatchObject({ status: 400 });
     // Nothing was saved under the key, so the corrected request is evaluated, not answered with ActionIdReused.

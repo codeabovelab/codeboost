@@ -84,6 +84,10 @@ export class ReviewService {
       if (approval && (approval.revision !== plan.revision || approval.snapshotId !== snapshot.id ||
           (mergeAttempt.requiresFreshReview && (approval.reviewVersion === undefined || approval.reviewVersion < mergeAttempt.reviewVersion)))) states[item.id] = 'stale';
     }
+    // The execution gate also orders approvals after attribution choices and binds them to the current or executed-prefix
+    // snapshots. Reflect that same gate in the review UI so an approval execution would refuse is available to reapprove.
+    const executionUnapproved = new Set(this.store.unapprovedExecutionItems(identity, plan.revision));
+    for (const item of plan.items) if (states[item.id] === 'approved' && executionUnapproved.has(item.id)) states[item.id] = 'stale';
     for (const item of plan.items) {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
     }
@@ -110,6 +114,7 @@ export class ReviewService {
         ambiguous: segments.filter(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)).map(reviewedDigest),
         dependencies: item.depends_on.map(id => { const dependency = plan.items.find(value => value.id === id); return dependency ? staleKey(dependency) : null; }),
         replacement: replacementReview ? { snapshotId: snapshot.id, revision: plan.revision, requiresFreshReview: mergeAttempt.requiresFreshReview, reviewVersion: mergeAttempt.reviewVersion } : null,
+        execution: executionUnapproved.has(item.id) ? { snapshotId: snapshot.id, choices: saved.choices } : null,
       })).digest('hex');
       staleKeys.set(item.id, key);
       return key;
@@ -129,6 +134,7 @@ export class ReviewService {
         if (before && !isDeepStrictEqual(before.item.acceptance, item.acceptance)) reasons.push('Acceptance checks changed');
         if (before && owned.some(segment => before.segments.some((old: { path: string; content: string; context: string }) => old.path === segment.path && old.content === segment.content && old.context !== segment.context))) reasons.push('Moved to another function');
         for (const dep of item.depends_on) if (states[dep] === 'stale') reasons.push(`Depends on ${dep}, which changed`);
+        if (executionUnapproved.has(item.id)) reasons.push('Execution approval is out of date');
         if (!reasons.length) reasons.push('Code or plan definition changed');
       }
       return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before, staleKey: staleKey(item),

@@ -21,6 +21,7 @@ import { OWED_REFUSAL } from '../runner/publishing.ts';
 import { PullRequestMisplaced, openingMarker, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
+import { approveItem } from '../core/approvals.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -180,6 +181,12 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   let findings: SafetyFindings | undefined;
   const config = { ...w.demo, demo: options.demo ?? false };
   app = await startServer(config, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+    const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
+    if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
+      const review = service.load();
+      service.store.saveReview(identity, review.expected,
+        review.items.map(item => approveItem(review.plan, review.segments, item.id, identity, item.count === 0)), []);
+    }
     options.before?.(service);
     const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
     await ensureCommit(repository, service.store.getSnapshot(service.config.identity).head);
@@ -226,9 +233,10 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
 }
 const view = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
 async function act(app: App, action: string, actionId = randomUUID(), expectedStateVersion?: number) {
-  const { stateVersion } = await view(app);
+  const { stateVersion, reviewVersion } = await view(app);
   const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
-    body: JSON.stringify({ action, expectedStateVersion: expectedStateVersion ?? stateVersion, actionId }) });
+    body: JSON.stringify({ action, expectedStateVersion: expectedStateVersion ?? stateVersion,
+      ...((action === 'start' || action === 'resume') ? { expectedReviewVersion: reviewVersion } : {}), actionId }) });
   return { status: response.status, body: await response.json() as Record<string, any> };
 }
 const publishSettled = (app: App, identity: PlanIdentity) => vi.waitFor(async () => {
@@ -374,14 +382,14 @@ describe('publishing a finished task (#103)', () => {
     expect(w.github.prs[0]!.body).not.toContain(BUDGET);
   });
 
-  it.each(Object.keys(FINDINGS) as FindingSource[])('names an unsaved finding from %s in the draft after the budget runs out', async source => {
+  it.each(Object.keys(FINDINGS) as FindingSource[])('names an initially unsaved finding from %s in the draft after the budget runs out', async source => {
     const w = world();
     const { app, identity, store, findings } = await serve(w, { findingSource: source, startup: false,
       before: service => { service.store.transitionTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, 'queued'); } });
     expect(await app.executor!.runTask(identity)).toMatchObject({ kind: 'needs human', reason: FINDINGS[source] });
     const attempt = store.getAttempts(identity).at(-1)!;
     // Prove which coordinator path produced the attempt; the downstream draft alone would not distinguish the sources.
-    expect(attempt).toMatchObject({ state: 'failed', safetyFinding: null, diagnostic: FINDING_DIAGNOSTICS[source] });
+    expect(attempt).toMatchObject({ state: 'failed', safetyFinding: FINDINGS[source], diagnostic: FINDING_DIAGNOSTICS[source] });
     expect(findings.owedAttempts()).toEqual([]);
     const now = vi.spyOn(Date, 'now').mockReturnValue(store.getTask(identity).budgetDeadline! + 1);
     try {

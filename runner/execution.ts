@@ -69,13 +69,17 @@ export const SAFETY_VIOLATION = 'Safety violation:';
  * them, so agent output (stderr) can never be mistaken for one, and a violation survives a later stale or stop outcome.
  * They are durable (#87 item 3): each is saved on its attempt before the terminal write, which then sends the task to
  * needs human in the same transaction, however the attempt was started; startup recovery does the same for an attempt
- * a crash interrupted. Only a finding whose save failed is held here, in memory, owed until the executor acts on it.
+ * a crash interrupted. A finding whose save failed, or whose later save could not cross a human gate, is held here until
+ * the executor can finish acting on it.
  */
 export class SafetyFindings {
   #store: Store; #write: <T>(fn: () => T) => T;
   #unsaved = new Map<string, string>();
   /** `capability` is the coordinator's: the save is a settlement write, so it still lands after the write gate closes. */
-  constructor(store: Store, capability?: ShutdownCapability) { this.#store = store; this.#write = settleWith(capability); }
+  constructor(store: Store, capability?: ShutdownCapability) {
+    this.#store = store; this.#write = settleWith(capability);
+    for (const owed of store.owedSafetyFindings()) this.#unsaved.set(owed.attemptId, owed.finding);
+  }
   #row(attemptId: string): AttemptRecord | undefined {
     const key = this.#store.attemptOwner(attemptId);
     return key ? this.#store.getAttempt(findIdentity(this.#store, { id: attemptId } as AttemptRecord), attemptId) : undefined;
@@ -88,14 +92,28 @@ export class SafetyFindings {
     } catch { /* not saved: held here instead */ }
     this.#unsaved.set(attemptId, reason);
   }
-  /** The finding still owed: one whose save failed, so nothing but the executor will act on it. */
+  /** The finding still owed; its evidence may already be durable while a human gate defers the escalation. */
   get(attemptId: string): string | undefined { return this.#unsaved.get(attemptId); }
   /** The attempt's finding, owed or already acted on by the terminal write. */
   finding(attemptId: string): string | undefined { return this.#unsaved.get(attemptId) ?? this.#row(attemptId)?.safetyFinding ?? undefined; }
-  /** Whether the finding is only in memory: the Store knows nothing of it, so the executor must act on it itself. */
-  unsaved(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
+  /** Whether the executor still owes the finding's escalation. */
+  owed(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
   settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
-  /** The attempts whose finding is owed (only in memory). Usually none, so a check over them costs nothing. */
+  /** Retry the durable save and, when its human gate is gone, finish the escalation. */
+  persist(attemptId: string, options: { settlement?: boolean } = {}): boolean {
+    const finding = this.#unsaved.get(attemptId);
+    if (!finding) return true;
+    const identity = findIdentity(this.#store, { id: attemptId } as AttemptRecord);
+    const save = () => this.#store.recordOwedSafetyFinding(identity, attemptId, finding,
+      options.settlement ? { deferAction: true } : {});
+    try { if (!(options.settlement ? this.#write(save) : save())) return false; }
+    catch (error) { if (error instanceof ShuttingDownError) return false; throw error; }
+    this.#unsaved.delete(attemptId);
+    // A strict begin usually runs inside userAction's outer transaction. Restore the in-memory debt if that rolls back.
+    this.#store.afterCommit(() => undefined, () => this.#unsaved.set(attemptId, finding));
+    return true;
+  }
+  /** The attempts whose finding is owed, including durable markers restored at construction. Usually none. */
   owedAttempts(): string[] { return [...this.#unsaved.keys()]; }
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
@@ -267,6 +285,7 @@ export type ExecutionOutcome =
 /** A run in progress: its plan, the item it is on and that item's attempt, and what it finished. */
 interface Run {
   plan: ReturnType<Store['getPlan']>; index: number; attempt: AttemptRecord; done: string[]; unchanged: string[];
+  reviewVersion?: number;
   stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome;
 }
 const refusal = (error: unknown) => error instanceof GuardRefusal || error instanceof ShuttingDownError;
@@ -309,7 +328,7 @@ export class ItemExecutor {
    * throws (the refusal itself where admission refused), and the caller's own writes roll back with it. A finding or scope
    * pause owed from an earlier run is acted on instead, as the run's whole outcome, and admits nothing (`attemptId` null).
    */
-  begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean } = {}): { attemptId: string | null; outcome: Promise<ExecutionOutcome> } {
+  begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean; expectedReviewVersion?: number } = {}): { attemptId: string | null; outcome: Promise<ExecutionOutcome> } {
     const key = identityKey(identity);
     if (this.#inFlight.has(key)) throw new GuardRefusal('An earlier run of this task is still finishing; try again when that run has ended.');
     const begun = this.#begin(identity, options, true);
@@ -322,11 +341,13 @@ export class ItemExecutor {
    * reconciled with (#88), the items an execute attempt completed at the current revision, and the first item none did
    * (null when every item has run).
    */
-  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; next: string | null } {
-    const plan = this.#store.getPlan(identity), { started, begun, earlierCommits, finished } = this.#store.executeProgress(identity, plan.revision);
+  progress(identity: PlanIdentity): { started: boolean; begun: boolean; earlierCommits: boolean; completed: string[]; prefixHead: string | null; next: string | null } {
+    const plan = this.#store.getPlan(identity), { started, begun, earlierCommits, finished, finishedHeads } = this.#store.executeProgress(identity, plan.revision);
     const done = new Set(finished);
+    let prefixHead: string | null = null;
+    for (const item of plan.items) { if (!done.has(item.id)) break; prefixHead = finishedHeads[item.id] ?? null; }
     return { started, begun, earlierCommits, completed: plan.items.filter(item => done.has(item.id)).map(item => item.id),
-      next: plan.items.find(item => !done.has(item.id))?.id ?? null };
+      prefixHead, next: plan.items.find(item => !done.has(item.id))?.id ?? null };
   }
   /** Whether a run of this task is still in progress here (its last write may still be to come). */
   busy(identity: PlanIdentity): boolean { return this.#inFlight.has(identityKey(identity)); }
@@ -363,7 +384,10 @@ export class ItemExecutor {
     const stopped = (item: string, state: string, reason: string | null): ExecutionOutcome => ({ kind: 'stopped', item, state, reason, completed: [] });
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);
-      if (finding) return this.#escalate(identity, earlier, finding, stopped, [], true);
+      if (finding) {
+        this.#findings.persist(earlier.id);
+        return this.#escalate(identity, this.#store.getAttempt(identity, earlier.id), finding, stopped, [], true);
+      }
     }
     if (options.scope === false) return null;
     const owed = this.#unpausedScopeFinding(identity);
@@ -386,11 +410,12 @@ export class ItemExecutor {
    * The synchronous start of a run: owed work first, then the first item's admission. With `strict`, a run that cannot
    * admit its first item throws instead of returning a stopped outcome.
    */
-  #begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean }, strict: boolean): { outcome: ExecutionOutcome } | Run {
+  #begin(identity: PlanIdentity, options: { fromItem?: string; claimRequeue?: boolean; expectedReviewVersion?: number }, strict: boolean): { outcome: ExecutionOutcome } | Run {
     const plan = this.#store.getPlan(identity);
     const start = options.fromItem ? plan.items.findIndex(item => item.id === options.fromItem) : 0;
     if (start < 0) throw new Error('Unknown plan item.');
-    const run: Run = { plan, index: start, attempt: undefined!, done: [], unchanged: [], stopped: undefined! };
+    const run: Run = { plan, index: start, attempt: undefined!, done: [], unchanged: [], stopped: undefined!,
+      ...(options.expectedReviewVersion === undefined ? {} : { reviewVersion: options.expectedReviewVersion }) };
     run.stopped = (item, state, reason) => ({ kind: 'stopped', item, state, reason, completed: [...run.done] });
     const notStarted = (reason: string, error?: unknown): { outcome: ExecutionOutcome } => {
       if (strict) throw error ?? new GuardRefusal(reason);
@@ -403,11 +428,26 @@ export class ItemExecutor {
     // A safety finding not yet acted on (a failed write, a human gate at the time) goes to needs human first.
     for (const earlier of this.#store.getAttempts(identity)) {
       const finding = this.#findings.get(earlier.id);
-      if (finding) return this.#settledOrRefused(this.#escalate(identity, earlier, finding, run.stopped, [], true), strict);
+      if (finding) {
+        if (options.claimRequeue) this.#store.claimRequeue(identity, this.#store.getTask(identity).stateVersion);
+        const persisted = this.#findings.persist(earlier.id), current = this.#store.getAttempt(identity, earlier.id);
+        // A pending cancel can leave the original attempt active. Saving the finding is the durable work owed; its
+        // terminal write will apply the cancellation (which wins) without losing the safety evidence.
+        if (persisted && (current.state === 'pending' || current.state === 'running'))
+          return { outcome: run.stopped(current.item!, 'not started', `${finding} The finding is saved and waits for the active attempt to settle.`) };
+        const outcome = this.#escalate(identity, current, finding, run.stopped, [], true);
+        // Persisting terminal evidence at a human gate intentionally leaves the escalation owed. Return the stopped
+        // outcome even for strict begin so its outer user action commits that evidence instead of rolling it back.
+        if (!persisted && HUMAN_GATES.includes(this.#store.getTask(identity).status)) return { outcome };
+        return this.#settledOrRefused(outcome, strict);
+      }
     }
     // A scope finding whose pause was never recorded (a failed write, the write gate, a crash) pauses now, before any item.
     const owed = this.#unpausedScopeFinding(identity);
-    if (owed) return this.#settledOrRefused(this.#pause(identity, owed.row, owed.result, run.stopped, [], true), strict);
+    if (owed) {
+      if (options.claimRequeue) this.#store.claimRequeue(identity, this.#store.getTask(identity).stateVersion);
+      return this.#settledOrRefused(this.#pause(identity, owed.row, owed.result, run.stopped, [], true), strict);
+    }
     // Continuing after a scope pause (plan-format.md: reconcile the executed prefix with the audited head, validate the
     // remaining items from that checkpoint) is not built yet (#88), so a paused task runs no further items: fail closed.
     const checkpoint = this.#store.latestCheckpoint(identity);
@@ -442,6 +482,16 @@ export class ItemExecutor {
     }
     if (expected && !sameContext(current, expected))
       return run.stopped(item.id, 'not started', `The task's snapshot or assignment changed during the run; review it before running ${item.id}.`);
+    if (run.reviewVersion !== undefined) {
+      const changed = this.#store.reviewVersion(identity) !== run.reviewVersion;
+      const unapproved = changed ? [] : this.#store.unapprovedExecutionItems(identity, run.plan.revision);
+      if (changed || unapproved.length) {
+        const reason = changed ? `The review changed during the run; review it before running ${item.id}.`
+          : `Approve every plan item before running ${item.id}. Waiting for: ${unapproved.join(', ')}.`;
+        if (strict) throw new GuardRefusal(reason);
+        return run.stopped(item.id, 'not started', reason);
+      }
+    }
     try {
       return this.#runner.start(identity, {
         expectedStateVersion: this.#store.getTask(identity).stateVersion, kind: 'execute', item: item.id,
@@ -462,7 +512,12 @@ export class ItemExecutor {
       // Only the runner's own audit records a finding; it wins over any later stale or stop outcome. The terminal write
       // has usually acted on it already, so this reads it whether or not it is still owed.
       const violation = this.#findings.finding(attempt.id);
-      if (violation) return this.#escalate(identity, row, violation, stopped, done);
+      if (violation) {
+        // The first save can fail before the terminal write. This run still owns settlement, so retry through its
+        // shutdown capability before escalation can clear the only in-memory copy.
+        this.#findings.persist(attempt.id, { settlement: true });
+        return this.#escalate(identity, this.#store.getAttempt(identity, attempt.id), violation, stopped, done);
+      }
       if (row.state !== 'completed') {
         // Still pending or running: the terminal write failed and the slot is held until restart.
         const unresolved = this.#runner.status(identity).unresolved;
@@ -492,6 +547,7 @@ export class ItemExecutor {
   #escalate(identity: PlanIdentity, row: AttemptRecord, violation: string,
     stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[], owed = false): ExecutionOutcome {
     const item = row.item!, task = this.#store.getTask(identity);
+    const write = owed ? direct : this.#write;
     const remember = () => {
       const current = this.#store.getTask(identity), key = identityKey(identity);
       if (current.status === 'needs human' && current.currentAttemptId === row.id)
@@ -505,17 +561,19 @@ export class ItemExecutor {
     }
     // A saved finding: the terminal write acted on it, so the task went to needs human then (or was closed by a pending
     // cancel), and where it is now is a person's doing.
-    if (!this.#findings.unsaved(row.id)) {
-      if (CLOSED_STATUSES.includes(task.status)) return stopped(item, row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
+    if (!this.#findings.owed(row.id)) {
+      if (CLOSED_STATUSES.includes(task.status)) return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
       remember();
       return { kind: 'needs human', item, reason: violation, completed: [...done] };
     }
     if (CLOSED_STATUSES.includes(task.status)) {
+      write(() => this.#store.settleOwedSafetyFinding(identity, row.id));
       this.#findings.settle(row.id);
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
     }
     // Already where the finding sends it: nothing is owed.
     if (task.status === 'needs human') {
+      write(() => this.#store.settleOwedSafetyFinding(identity, row.id));
       this.#findings.settle(row.id);
       remember();
       return { kind: 'needs human', item, reason: violation, completed: [...done] };
@@ -524,7 +582,10 @@ export class ItemExecutor {
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
     // Settling this run's own attempt writes through the shutdown capability; paying an owed finding at the start of a
     // new run is that run's decision, so it does not, and the closed write gate refuses it like any other.
-    try { (owed ? direct : this.#write)(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
+    try { write(() => {
+      this.#store.transitionTask(identity, task.stateVersion, 'needs human');
+      this.#store.settleOwedSafetyFinding(identity, row.id);
+    }); }
     catch (error) {
       if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);
