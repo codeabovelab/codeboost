@@ -18,7 +18,7 @@ import { baseBranch } from '../runner/production.ts';
 import { MergeCoordinator } from '../runner/merge.ts';
 import type { MergeGateway } from '../github/merge.ts';
 import { OWED_REFUSAL } from '../runner/publishing.ts';
-import { PullRequestMisplaced, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
+import { PullRequestMisplaced, openingMarker, type OpenPullRequestInput, type PullRequestGateway } from '../github/pull-requests.ts';
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 
@@ -417,10 +417,17 @@ describe('publishing a finished task (#103)', () => {
     // Review shows its change in the Unplanned row, and the merge gate blocks until a person assigns or accepts it.
     const view = app.service.load();
     expect(view.segments.filter(segment => segment.row === 'Unplanned').map(segment => segment.path)).toContain('debug.log');
-    const gateway: MergeGateway = { inspect: async () => ({ base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
-      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear' }), merge: async () => { throw new Error('not merged here'); } };
-    const status = await new MergeCoordinator(app.service, gateway).status(view);
+    // The gate inspects the published PR (#121), which GitHub shows as the task's.
+    const pr = store.taskPullRequests(identity).find(record => record.state === 'opened')!;
+    const targets: unknown[] = [];
+    const gateway: MergeGateway = { inspect: async options => { targets.push(options?.target?.pullRequest); return { base: view.snapshot.base, head: view.snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE',
+      rulesKnown: true, atomicBaseGuard: true, mergeQueue: false, requiredChecks: [], alreadyFixed: 'clear', pullRequest: pr.number!, draft: false,
+      published: { headBranch: pr.headBranch, baseBranch: 'main', crossRepository: false, marker: openingMarker(pr.openingId), branchOpen: [{ number: pr.number!, base: 'main' }] } }; },
+      merge: async () => { throw new Error('not merged here'); } };
+    const status = await new MergeCoordinator(app.service, gateway, undefined, undefined, { repository: REPO, baseBranch: 'main' }).status(view);
+    expect(targets).toEqual([pr.number]);
     expect(status).toMatchObject({ ready: false });
+    expect(status.blockers).not.toContainEqual(expect.objectContaining({ code: 'pull-request' }));
     expect(status.blockers).toContainEqual(expect.objectContaining({ code: 'unplanned' }));
   });
 
