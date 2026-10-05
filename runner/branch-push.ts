@@ -37,7 +37,7 @@ const BRANCH = /^codeboost\/[a-z0-9]+(?:-[a-z0-9]+)*$/;
 const REMOTE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const HOST = /^[A-Za-z0-9.-]+(?::[0-9]+)?$/;
 // The variables whose values `gh` may authenticate with; their exact values are removed from error text.
-const TOKEN_VARIABLES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'] as const;
+export const TOKEN_VARIABLES = ['GH_TOKEN', 'GITHUB_TOKEN', 'GH_ENTERPRISE_TOKEN', 'GITHUB_ENTERPRISE_TOKEN'] as const;
 // GitHub token shapes, removed from any text that leaves this module in case a server or proxy echoed one back. No word
 // boundaries: a token glued to other text (a URL, a path) is still removed.
 const TOKEN = /(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,})/g;
@@ -55,6 +55,19 @@ export function pushUrl(remote: string, env: NodeJS.ProcessEnv = process.env): s
   const host = env.GH_HOST || 'github.com';
   if (!HOST.test(host)) throw new Error('GH_HOST is not a host name.');
   return `https://${host}/${remote}.git`;
+}
+
+/**
+ * The push's arguments. The lease pins the exact value read (empty: the branch must not exist), so the remote refuses the
+ * push if anyone moved the branch since, including a newer publish. That is what makes a push left running by a crashed
+ * codeboost harmless (#112): it can land only while the branch holds the value its own run read. The lease compares the
+ * value, not its history, so a branch that returns to that value (moved back by a person, or the same commit pushed again) lets it land (a codeboost
+ * commit; the next publish pushes the task head again). An empty lease matches a branch deleted since, so a run that
+ * read none can recreate a deleted branch at its own head: a stray branch with no PR, overwriting nothing. Only this one ref is sent: no tags, no hooks, no submodules.
+ */
+export function pushArguments(input: { url: string; ref: string; read: string | null; head: string }): string[] {
+  return ['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',
+    `--force-with-lease=${input.ref}:${input.read ?? ''}`, '--', input.url, `${input.head}:${input.ref}`];
 }
 
 /** Remove every configured token value and every known token shape. */
@@ -110,11 +123,9 @@ export class GitBranchPusher implements BranchPusher {
     if (remote !== null && !owned.has(remote))
       throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
     signal?.throwIfAborted();
-    // The lease pins the exact value read above (empty: the branch must not exist), so GitHub refuses the push if anyone
-    // moved the branch since. Only this one ref is sent: no tags, no hooks, no submodules.
+    // Leased to the value read above (pushArguments).
     try {
-      await this.#git(['push', '--porcelain', '--no-verify', '--no-follow-tags', '--recurse-submodules=no',
-        `--force-with-lease=${ref}:${remote ?? ''}`, '--', this.#url, `${input.head}:${ref}`], signal, true);
+      await this.#git(pushArguments({ url: this.#url, ref, read: remote, head: input.head }), signal, true);
     } catch (error) {
       if ((error as { staleLease?: boolean }).staleLease)
         throw new BranchPushRefused(`The branch ${input.branch} moved while codeboost pushed it. Nothing was pushed.`);

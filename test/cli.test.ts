@@ -1,6 +1,6 @@
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { chmodSync, existsSync, renameSync, unlinkSync } from 'node:fs';
 import { BASE_IMAGE, CLAUDE_VERSION, CODEX_VERSION } from '../agents/container/image.ts';
@@ -9,19 +9,20 @@ import { fileURLToPath } from 'node:url';
 import { afterEach, expect, it, vi } from 'vitest';
 import { createDemo } from '../scripts/demo.ts';
 import { Store } from '../runner/store.ts';
-import { RUNNER_CREDENTIAL_MISSING } from '../runner/production.ts';
+import { acquireRunnerLock } from '../runner/recovery.ts';
+import { RUNNER_CREDENTIAL_MISSING, RUNNER_NEEDS_GITHUB } from '../runner/production.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const cli = fileURLToPath(new URL('../web/cli.ts', import.meta.url));
 const roots: string[] = [];
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 /** A non-demo review with a runner block, and a HOME of its own so the lock directory is the test's. */
-function review() {
+function review(github: Record<string, unknown> | null = { baseBranch: 'main' }) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-cli-')); roots.push(root);
   const demo = createDemo(join(root, 'demo')), store = new Store(demo.database), issue = store.getPlan(demo.identity).issue; store.close();
   mkdirSync(join(root, 'runner'), { mode: 0o700 }); mkdirSync(join(root, 'home'), { mode: 0o700 });
   const config = join(root, 'review.json');
-  writeFileSync(config, JSON.stringify({ ...demo, demo: false, github: { repository: 'owner/repo', pullRequest: 1, issue },
+  writeFileSync(config, JSON.stringify({ ...demo, demo: false, ...(github ? { github: { repository: 'owner/repo', pullRequest: 1, issue, ...github } } : {}),
     runner: { root: join(root, 'runner'), committer: { name: 'codeboost', email: 'runner@codeboost.invalid' } } }));
   /**
    * A `docker` that answers every call with nothing (no leftovers, an image that matches the pinned profile) once the hold
@@ -52,7 +53,7 @@ function review() {
     const { CLAUDE_CODE_OAUTH_TOKEN: _token, ...env } = process.env;
     return spawnSync(process.execPath, [cli, '--config', config, ...args], { encoding: 'utf8', env: { ...env, HOME: join(root, 'home') }, timeout: 20_000 });
   };
-  return { run, fakeDocker, start, database: demo.database };
+  return { run, fakeDocker, start, database: demo.database, identity: demo.identity };
 }
 
 it('refuses a runner startup without a token with its message, exit 1 and the lock released', () => {
@@ -63,6 +64,27 @@ it('refuses a runner startup without a token with its message, exit 1 and the lo
     // The second start meets the same refusal, not "Another codeboost runner": the first released the lock.
     expect(result.stderr.trim()).toBe(RUNNER_CREDENTIAL_MISSING);
   }
+});
+it('refuses a runner without github.baseBranch before the lock and before the token check (#103)', () => {
+  for (const github of [{}, { baseBranch: 'refs/heads/main' }]) {
+    // Another runner holds the lock, so a check made after the lock (as the runner's setup also makes it) would report
+    // the lock instead.
+    const { run, database } = review(github);
+    const held = acquireRunnerLock(database, { lockRoot: join(dirname(dirname(database)), 'home', '.codeboost', 'locks') });
+    try {
+      const result = run('--port', '0');
+      expect(result.status).toBe(1);
+      expect(result.stderr.trim()).toMatch(/^The runner publishes pull requests: add github\.baseBranch/);
+    } finally { held.release(); }
+  }
+  // No github block at all: refused as itself, before the lock, too. Another runner holds the lock meanwhile, so a check
+  // made after the lock would report the lock instead.
+  const { run, database } = review(null);
+  const held = acquireRunnerLock(database, { lockRoot: join(dirname(dirname(database)), 'home', '.codeboost', 'locks') });
+  try {
+    const missing = run('--port', '0');
+    expect([missing.status, missing.stderr.trim()]).toEqual([1, RUNNER_NEEDS_GITHUB]);
+  } finally { held.release(); }
 });
 it('refuses a bad port and an unknown preparation with a message, never a stack', () => {
   const { run } = review();
@@ -126,6 +148,34 @@ it('ignores a runner block in a demo configuration opened with --config, and ser
   } finally { child.kill('SIGKILL'); }
 });
 
+it('starts a publish the database owes once startup has verified the lock (#103)', async () => {
+  const { fakeDocker, start, database, identity } = review(), docker = fakeDocker();
+  // A task an earlier process left in needs human with no draft PR yet: a draft publish is owed.
+  const store = new Store(database);
+  try {
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+    const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'execute', item: store.getPlan(identity).items[0]!.id,
+      expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+    store.markRunning(identity, attempt.id);
+    store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+  } finally { store.close(); }
+  // A gh that records each call and fails, so nothing reaches GitHub.
+  const bin = docker.path.split(':')[0]!, calls = join(bin, 'gh-calls');
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$@" >> '${calls}'\nexit 1\n`); chmodSync(join(bin, 'gh'), 0o755);
+  docker.release();
+  const cli = start(docker);
+  try {
+    await cli.until(() => cli.out().includes('Review ready'), 'the server to open');
+    await cli.until(() => existsSync(calls), 'the startup publish to call gh');
+    // Stopped only once that publish has recorded its outcome: a stop while gh runs would record `stopped` instead.
+    await cli.until(() => { const store = new Store(database); try { return store.lastPublish(identity)?.outcome === 'failed'; } finally { store.close(); } }, 'the publish outcome');
+    cli.child.kill('SIGINT');
+    expect(await cli.exited).toBe(0);
+    const reopened = new Store(database);
+    try { expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'failed', draft: true }); } finally { reopened.close(); }
+  } finally { cli.child.kill('SIGKILL'); }
+});
 it('refuses with a message, not a stack, when the database path changes during a runner startup', async () => {
   const { fakeDocker, start, database } = review(), docker = fakeDocker();
   const cli = start(docker);

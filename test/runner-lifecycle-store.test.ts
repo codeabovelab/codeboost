@@ -689,3 +689,35 @@ describe('allocation baseline (#91)', () => {
     expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
   });
 });
+describe('publish outcomes (#103)', () => {
+  it('adds the outcome table to a version 9 database, and records an outcome without moving the task', () => {
+    const { path, store } = queued();
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('DROP TABLE publish_outcomes; PRAGMA user_version=9;'); db.close();
+    const reopened = open(path), before = reopened.getTask(identity);
+    expect(reopened.lastPublish(identity)).toBeNull();
+    expect(reopened.recordPublish(identity, { outcome: 'refused', draft: false, message: 'x'.repeat(3000) }))
+      .toMatchObject({ outcome: 'refused', stateVersion: before.stateVersion, message: 'x'.repeat(2000) });
+    reopened.recordPublish(identity, { outcome: 'opened', draft: false, message: 'Pull request #1 is open.', number: 1, url: 'https://github.com/o/r/pull/1' });
+    expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 1 });
+    expect(reopened.getTask(identity)).toEqual(before);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 11 });
+  });
+  it('stamps an outcome with the version the publish saw, and refuses one it cannot have seen (#114)', () => {
+    const { store } = queued(), version = store.getTask(identity).stateVersion;
+    expect(store.recordPublish(identity, { outcome: 'opened', draft: false, message: 'x' }, undefined, version)).toMatchObject({ stateVersion: version });
+    expect(() => store.recordPublish(identity, { outcome: 'opened', draft: false, message: 'x' }, undefined, store.getTask(identity).stateVersion + 1)).toThrow('Invalid seen state version.');
+    expect(store.lastPublish(identity)).toMatchObject({ stateVersion: version });
+  });
+  it('records a task already running at the upgrade as not published, so the first start publishes nothing for it', () => {
+    const { path, store } = queued(); admit(store);
+    expect(store.getTask(identity).status).toBe('running');
+    const version = store.getTask(identity).stateVersion;
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('DROP TABLE publish_outcomes; PRAGMA user_version=9;'); db.close();
+    expect(open(path).lastPublish(identity)).toMatchObject({ outcome: 'not published', draft: false, stateVersion: version,
+      message: expect.stringMatching(/Use the publish action/) });
+  });
+});

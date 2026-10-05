@@ -100,7 +100,11 @@ export function mentionsIssue(message: string, repository: string, issue: number
     || new RegExp(`(?<![\\w/.-])(?:https?://)?(?:www\\.)?github\\.com/${repo}/issues/${n}(?![\\w])`, 'i').test(message);
 }
 
-export interface GhAlreadyFixedConfig { repository: string; deadlineMs?: number }
+export interface GhAlreadyFixedConfig {
+  repository: string; deadlineMs?: number;
+  /** The environment `gh` reads its allowlisted variables (GH_HOST, tokens) from. Default `process.env`. */
+  env?: NodeJS.ProcessEnv;
+}
 
 /** GitHub CLI adapter. All arguments are literal argv; no shell is involved. */
 export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
@@ -113,7 +117,7 @@ export class GhAlreadyFixedGateway implements AlreadyFixedGateway {
     this.repository = config.repository;
     this.deadlineMs = config.deadlineMs ?? DEFAULT_CHECK_DEADLINE_MS;
     // runWithInput escalates to SIGKILL, so an aborted stage always settles and the check's single deadline holds.
-    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(), killGraceMs: CHECK_KILL_GRACE_MS, pipeGraceMs: CHECK_PIPE_GRACE_MS }));
+    this.run = run ?? ((args, options) => runWithInput('gh', args, { timeout: 30_000, maxBuffer: 8 * 1024 * 1024, signal: options?.signal, env: ghEnvironment(config.env), killGraceMs: CHECK_KILL_GRACE_MS, pipeGraceMs: CHECK_PIPE_GRACE_MS }));
   }
 
   async #json(args: readonly string[], signal?: AbortSignal): Promise<unknown> {
