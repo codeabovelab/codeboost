@@ -10,7 +10,7 @@ import { Store, type PublishRecord } from '../runner/store.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import type { ReviewService } from '../runner/review.ts';
 import type { PreparedAttempt, RunnerDeps } from '../runner/coordinator.ts';
-import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
+import { SafetyFindings, executionDeps, type ExecutionSources, type TaskWorkspace } from '../runner/execution.ts';
 import { GitBranchPusher } from '../runner/branch-push.ts';
 import { PullRequestPublisher } from '../runner/publish.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
@@ -30,6 +30,17 @@ afterEach(async () => {
 });
 const OWNER = 'c'.repeat(32), REPO = 'acme/app';
 type App = Awaited<ReturnType<typeof startServer>>;
+type FindingSource = 'audit' | 'preparation' | 'failed-run audit';
+const FINDINGS: Record<FindingSource, string> = {
+  audit: 'Safety violation: The change inspection refused: "audit inspection failed"',
+  preparation: 'Safety violation: A declared link goes through another link, so a write through it would land outside its target: "retry.ts".',
+  'failed-run audit': 'Safety violation: The change inspection refused: "failed-run inspection failed"',
+};
+const FINDING_DIAGNOSTICS: Record<FindingSource, string> = {
+  audit: FINDINGS.audit,
+  preparation: `Preparation failed: ${JSON.stringify(FINDINGS.preparation)}`,
+  'failed-run audit': '"agent crashed"',
+};
 
 interface Pr { number: number; url: string; draft: boolean; open: boolean; base: string; headBranch: string; marker: string; body: string }
 /**
@@ -157,11 +168,12 @@ function world(): World {
 }
 
 /**
- * A server whose runner completes every item it admits without an agent (each changes nothing), and publishes through the
- * real publisher and the real pusher into `w.remote`, with GitHub faked. `before` shapes the Store before the runner
- * exists, as an earlier process would have left it.
+ * A server whose runner normally completes every item it admits without an agent (each changes nothing), and publishes
+ * through the real publisher and the real pusher into `w.remote`, with GitHub faked. `findingSource` instead drives one
+ * of the three coordinator paths that can raise a finding. `before` shapes the Store before the runner exists, as an
+ * earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -172,11 +184,6 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     const repository = await openRunnerRepository({ runnerRoot: join(w.root, 'runner'), runnerOwner: OWNER, repositoryId: service.config.identity.repositoryId, source: service.config.repository });
     await ensureCommit(repository, service.store.getSnapshot(service.config.identity).head);
     const prepared: PreparedAttempt = { clone: { id: 'clone', taskId: 'task', directory: '/tmp/x', head: 'f'.repeat(40) }, vendor: 'claude', approvedArgv: [] };
-    const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
-      start: input => ({ attemptId: input.attemptId, cancel: () => undefined,
-        // `hold`: the attempt keeps running until the test releases it.
-        settled: (options.hold ?? Promise.resolve()).then(() => ({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' })) }),
-      validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
     const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 3, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     const pusher = new GitBranchPusher({ repository, repositoryId: service.config.identity.repositoryId, remote: REPO, url: w.remote,
       ownedCommits: identity => service.store.getLedger(identity).filter(entry => entry.origin === 'owned').map(entry => entry.sha),
@@ -184,6 +191,30 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
     const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: w.github.checks, pulls: w.github.pulls, pusher, closing }, { repository: REPO, baseBranch: 'main', ...(options.settleMs ? { settleMs: options.settleMs } : {}) });
     branchOf = identity => publisher(() => false).branch(identity);
     findings = new SafetyFindings(service.store);
+    if (options.findingSource) vi.spyOn(service.store, 'recordSafetyFinding').mockImplementation(() => { throw new Error('database is locked'); });
+    const source = options.findingSource;
+    const launch = (input: Parameters<Parameters<typeof executionDeps>[2]>[0]) => ({ attemptId: input.attemptId, cancel: () => undefined,
+      settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: source === 'failed-run audit' ? 1 : 0,
+        signal: null, stdout: '', stderr: source === 'failed-run audit' ? 'agent crashed' : '' }) });
+    const workspace: TaskWorkspace = {
+      async materialize(attempt, head) { return { clone: { id: `clone-${attempt.id}`, taskId: 'task', directory: '/tmp/x', head }, storage: {} }; },
+      async snapshotDeclaredLinks() {
+        return source === 'preparation'
+          ? { links: [{ link: 'retry.ts', status: 'through-link', anchor: { path: 'via', type: 'symlink', mode: '120777', size: 1, ino: 1, ctime: '0', mtime: '0' } }], targets: {} } as never
+          : { links: [], targets: {} } as never;
+      },
+      async checkTree() { return {} as never; },
+      async inspectChanges() { throw new Error(source === 'failed-run audit' ? 'failed-run inspection failed' : 'audit inspection failed'); },
+      async commit() { throw new Error('A finding must never be committed.'); },
+      async release() {},
+    };
+    const deps: RunnerDeps = source
+      ? executionDeps(service.store, workspace, launch, sources, OWNER, findings)
+      : { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => prepared, cleanupPreparation: async () => undefined,
+        start: input => ({ attemptId: input.attemptId, cancel: () => undefined,
+          // `hold`: the attempt keeps running until the test releases it.
+          settled: (options.hold ?? Promise.resolve()).then(() => ({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' })) }),
+        validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
     return { deps, sources, findings, publisher, ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   });
@@ -340,6 +371,43 @@ describe('publishing a finished task (#103)', () => {
     await publishSettled(app, identity);
     expect(w.github.prs).toHaveLength(1);
     expect(w.github.prs[0]!.body).toContain('P1 wrote to a path outside its workspace.');
+    expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+  });
+
+  it.each(Object.keys(FINDINGS) as FindingSource[])('names an unsaved finding from %s in the draft after the budget runs out', async source => {
+    const w = world();
+    const { app, identity, store, findings } = await serve(w, { findingSource: source, startup: false,
+      before: service => { service.store.transitionTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, 'queued'); } });
+    expect(await app.executor!.runTask(identity)).toMatchObject({ kind: 'needs human', reason: FINDINGS[source] });
+    const attempt = store.getAttempts(identity).at(-1)!;
+    // Prove which coordinator path produced the attempt; the downstream draft alone would not distinguish the sources.
+    expect(attempt).toMatchObject({ state: 'failed', safetyFinding: null, diagnostic: FINDING_DIAGNOSTICS[source] });
+    expect(findings.owedAttempts()).toEqual([]);
+    const now = vi.spyOn(Date, 'now').mockReturnValue(store.getTask(identity).budgetDeadline! + 1);
+    try {
+      app.publishing!.actIfOwed(identity);
+      await publishSettled(app, identity);
+    } finally { now.mockRestore(); }
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(FINDINGS[source]) })]);
+    expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+  });
+
+  it('keeps an unsaved finding for a draft retry after the first publish fails', async () => {
+    const w = world(), check = w.github.checks.check;
+    w.github.checks.check = async () => { throw new Error('HTTP 502'); };
+    const { app, identity, store } = await serve(w, { findingSource: 'preparation', startup: false,
+      before: service => { service.store.transitionTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, 'queued'); } });
+    expect(await app.executor!.runTask(identity)).toMatchObject({ kind: 'needs human', reason: FINDINGS.preparation });
+    const now = vi.spyOn(Date, 'now').mockReturnValue(store.getTask(identity).budgetDeadline! + 1);
+    try {
+      app.publishing!.actIfOwed(identity);
+      await publishSettled(app, identity);
+      expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: 'HTTP 502' });
+      w.github.checks.check = check;
+      app.publishing!.actIfOwed(identity);
+      await publishSettled(app, identity);
+    } finally { now.mockRestore(); }
+    expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(FINDINGS.preparation) })]);
     expect(w.github.prs[0]!.body).not.toContain(BUDGET);
   });
 
@@ -926,7 +994,7 @@ describe('publishing a finished task (#103)', () => {
       await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false }), { timeout: 10_000, interval: 50 });
       expect(w.github.prs).toEqual([expect.objectContaining({ draft: false })]);
     });
-    it('names a safety finding whose save failed in the draft, even after the budget ran out', async () => {
+    it('does not classify a safety-looking diagnostic as a finding without an executor escalation', async () => {
       const w = world();
       const finding = 'Safety violation: The item wrote outside its workspace.';
       const before = (service: ReviewService) => {
@@ -936,7 +1004,7 @@ describe('publishing a finished task (#103)', () => {
           expectedContext: s.currentContext(id), deadline: (now ?? Date.now()) + 60_000, ...(now ? { now } : {}) });
         const attempt = admit();
         s.markRunning(id, attempt.id);
-        // The finding's own save failed, so the attempt row carries it only as its diagnostic; the run still escalated.
+        // Diagnostic text alone does not prove that the runner's audit raised a finding; ItemExecutor owns that signal.
         s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 1, valid: false, detail: finding });
         s.transitionTask(id, s.getTask(id).stateVersion, 'needs human');
       };
@@ -946,8 +1014,8 @@ describe('publishing a finished task (#103)', () => {
       app.publishOwed(() => undefined);
       await publishSettled(app, identity);
       vi.mocked(Date.now).mockRestore();
-      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(finding) })]);
-      expect(w.github.prs[0]!.body).not.toContain(BUDGET);
+      expect(w.github.prs).toEqual([expect.objectContaining({ draft: true, body: expect.stringContaining(BUDGET) })]);
+      expect(w.github.prs[0]!.body).not.toContain(finding);
     });
     it('pays no scope pause for a needs-human task, so nothing is logged as unsettled', async () => {
       const w = world();
