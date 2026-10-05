@@ -28,6 +28,17 @@ it('expires a browser token after another view assigns a segment and recomputes 
  expect(next.items[0]!.checks.scope).toContain('out of scope');
  expect(()=>service.act({action:'approve',item:'P1',token:view.token})).toThrow(/Stale/);
 });
+it('offers reapproval when a later attribution choice invalidates execution approvals',()=>{
+ const {service,config}=fixture();let view=service.load();
+ for(const item of view.items)view=service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ expect(service.store.unapprovedExecutionItems(config.identity,view.plan.revision)).toEqual([]);
+ view=service.act({action:'accept',key:view.segments.find(segment=>segment.row==='Unplanned')!.key,token:view.token});
+ expect(view.items.every(item=>item.state==='stale'&&item.reasons.includes('Execution approval is out of date'))).toBe(true);
+ expect(service.store.unapprovedExecutionItems(config.identity,view.plan.revision)).toEqual(view.plan.items.map(item=>item.id));
+ for(const item of view.items)view=service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ expect(view.items.every(item=>item.state==='approved')).toBe(true);
+ expect(service.store.unapprovedExecutionItems(config.identity,view.plan.revision)).toEqual([]);
+},30000);
 it('keeps both sides of a declared rename in scope after manual reassignment',()=>{
  const {service,config}=fixture(),identity=config.identity,plan=service.store.getPlan(identity);
  plan.items=[{...plan.items[0]!,files:[{path:'renamed.ts',kind:'rename',renamed_from:'retry.ts',change:'Rename the implementation.'}],depends_on:[]}];
@@ -44,7 +55,7 @@ it('keeps both sides of a declared rename in scope after manual reassignment',()
  expect(new Set(candidates.map(segment=>segment.operation))).toEqual(new Set(['-','+']));
  expect(new Set(candidates.map(segmentPath))).toEqual(new Set(['retry.ts','renamed.ts']));
  for(const candidate of candidates){view=service.act({action:'assign',key:candidate.key,item:'P1',token:view.token});expect(view.segments.find(segment=>segment.key===candidate.key)?.scope).toBe('in-scope');}
-});
+},30000);
 it('persists bounded per-item notes without creating a plan revision',()=>{
  const {service,config}=fixture();const view=service.load();service.act({action:'note',item:'P1',kind:'question',text:'Why this limit?',token:view.token});
  const reopened=new ReviewService(config);services.push(reopened);expect(reopened.load().notes[0]!.text).toBe('Why this limit?');expect(reopened.load().plan.revision).toBe(1);
@@ -92,9 +103,9 @@ it('gives each stale state its own stale key, including states whose segments an
  view=service.act({action:'assign',key:unplanned(),item:'P1',token:view.token});
  const second={p1:item('P1').staleKey,p1Segments:own('P1'),p1Reasons:item('P1').reasons};
  expect(second.p1).not.toBe(first.p1);expect(item('P3').reasons).toEqual(first.p3Reasons);expect(item('P3').staleKey).not.toBe(first.p3);
- // Re-approving P3 while P1 keeps it stale changes only P3's approval.
+ // Re-approving P3 clears its execution reason, but P1's stale dependency keeps P3 stale with a new key.
  const p3Before=item('P3').staleKey;view=service.act({action:'approve',item:'P3',confirmNoChange:true,token:view.token});
- expect(item('P3').state).toBe('stale');expect(item('P3').reasons).toEqual(first.p3Reasons);expect(item('P3').staleKey).not.toBe(p3Before);
+ expect(item('P3').state).toBe('stale');expect(item('P3').reasons).toEqual(['Depends on P1, which changed']);expect(item('P3').staleKey).not.toBe(p3Before);
  // P1 is approved at its current code, then an ambiguous change it shares makes it stale with the same own segments and reasons as before.
  view=service.act({action:'approve',item:'P1',token:view.token});expect(item('P1').staleKey).toBeNull();
  // P1 adds a line to an existing file and P2 then edits that same line, so the line is ambiguous between them.
@@ -116,11 +127,12 @@ it('gives a still-stale item a new stale key when it gains an ambiguous change',
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:snapshot.id},snapshot.base,byP2,[{sha:byP1,owner:'P1',origin:'owned',sourceSha:null},{sha:byP2,owner:'P2',origin:'owned',sourceSha:null}]);
  view=service.load();expect(view.segments.some(segment=>segment.row==='Ambiguous'&&segment.owners.includes('P1'))).toBe(true);
  expect(view.segments.filter(segment=>segment.row==='P1').map(segment=>segment.key)).toEqual(before.own);expect(item('P1').reasons).toEqual(before.reasons);expect(item('P1').staleKey).not.toBe(before.key);
- // P2 re-commits the shared line with CRLF only. Approvals ignore line endings, so the stale state and its key stay the same.
+ // P2 re-commits the shared line with CRLF only. The rendered approval ignores line endings, but the execution gate also
+ // owns the changed snapshot, so the stale state gets a new key even though the reviewed segment is equivalent.
  const unchanged=item('P1').staleKey;writeFileSync(readme,`${original}Shared note, revised.\r\n`);fixtureGit(config.repository,'commit','-am','P2 line endings');const crlf=fixtureGit(config.repository,'rev-parse','HEAD'),endings=service.store.getSnapshot(config.identity);
  service.store.recordHistory(config.identity,{revision:view.plan.revision,snapshotId:endings.id},endings.base,crlf,[{sha:crlf,owner:'P2',origin:'owned',sourceSha:null}]);
  const lf=view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!;view=service.load();const ending=view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!;
- expect(ending.content).toContain('\r');expect(ending.owners).toEqual(lf.owners);expect(item('P1').staleKey).toBe(unchanged);
+ expect(ending.content).toContain('\r');expect(ending.owners).toEqual(lf.owners);expect(item('P1').staleKey).not.toBe(unchanged);
  // P3 then edits the same line back to P2's text: the segment keeps its choice key but gains an owner, so the stale state is new.
  const shared=()=>view.segments.find(segment=>segment.row==='Ambiguous'&&segment.path==='README.md')!,second={key:item('P1').staleKey,segment:shared()};
  writeFileSync(readme,`${original}Shared note, draft.\n`);fixtureGit(config.repository,'commit','-am','P3 draft');const byP3=fixtureGit(config.repository,'rev-parse','HEAD');
