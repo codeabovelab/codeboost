@@ -678,17 +678,30 @@ export class Store {
   /** Before execution, approvals belong to the current snapshot; after a completed item, this revision's approvals survive its own commits. */
   unapprovedExecutionItems(identity: PlanIdentity, revision: number): string[] {
     const key = identityKey(identity), plan = this.getPlan(identity, revision);
-    const completed = !!this.#get(`SELECT 1 AS found FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
-      AND json_extract(context,'$.planRevision')=? LIMIT 1`, key, revision);
     const snapshotId = this.getSnapshot(identity).id, review = this.getReview(identity);
+    // An approval inherited across runner commits must come from the context of the completed prefix, not merely from
+    // this revision. Otherwise A -> unrelated B approval -> A could reuse B's approval when the prefix-head guard passes.
+    const completedAt: Record<string, string> = Object.create(null);
+    for (const row of this.#db.prepare(`SELECT item,context FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+      AND json_extract(context,'$.planRevision')=? ORDER BY rowid`).all(key, revision)) {
+      const context = decode<InvocationContext>(row.context);
+      if (typeof row.item === 'string' && typeof context.snapshotId === 'string') completedAt[row.item] = context.snapshotId;
+    }
+    const prefixSnapshots = new Set<string>();
+    for (const item of plan.items) {
+      const completedSnapshot = completedAt[item.id];
+      if (!completedSnapshot) break;
+      prefixSnapshots.add(completedSnapshot);
+    }
+    const reviewedExecutionSnapshot = (value: ReviewState) => value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId);
     // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
     // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
     let latestChoiceVersion = -1;
-    for (const choice of review.choices) if (choice.revision === revision && (completed || choice.snapshotId === snapshotId)) {
+    for (const choice of review.choices) if (choice.revision === revision && (prefixSnapshots.size > 0 || choice.snapshotId === snapshotId)) {
       if (choice.reviewVersion === undefined) latestChoiceVersion = Number.MAX_SAFE_INTEGER;
       else if (choice.reviewVersion > latestChoiceVersion) latestChoiceVersion = choice.reviewVersion;
     }
-    const approved = new Set(review.approvals.filter(value => value.revision === revision && (completed || value.snapshotId === snapshotId)
+    const approved = new Set(review.approvals.filter(value => value.revision === revision && reviewedExecutionSnapshot(value)
       && (value.reviewVersion ?? -1) > latestChoiceVersion).map(value => value.item));
     return plan.items.filter(item => !approved.has(item.id)).map(item => item.id);
   }

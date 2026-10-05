@@ -418,6 +418,22 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume')).body.error).toMatch(/completed plan prefix.*current task head/i);
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
+  it('inherits approvals only from snapshots used by the completed execution prefix', async () => {
+    const inherited = await serve({ before: service => { committedFirstItem(service); } });
+    expect(await view(inherited.app)).toMatchObject({ resumable: true });
+
+    const returned = await serve({ before: service => { committedFirstItem(service, true); } });
+    const { app, identity, store } = returned, atA = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: 1, snapshotId: atA.id, reviewVersion: store.reviewVersion(identity) },
+      atA.base, 'e'.repeat(40), []);
+    approvePlan(app.service);
+    const atB = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: 1, snapshotId: atB.id, reviewVersion: store.reviewVersion(identity) },
+      atA.base, atA.head, []);
+    expect(await view(app)).toMatchObject({ resumable: false });
+    expect((await act(app, 'resume')).body.error).toMatch(/approve every plan item/i);
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
   it('pauses for an amendment owed from an earlier run instead of admitting, and reports it settled', async () => {
     const { app, identity, store } = await serve({ before: service => { committedFirstItem(service, false, ['other.ts']); } });
     expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
