@@ -7,6 +7,8 @@ import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
 import type { EditReply } from '../core/plan.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer, type PlanningDeps } from '../web/server.ts';
+import type { ReviewConfig } from '../runner/review.ts';
+import { Store } from '../runner/store.ts';
 
 // The draft API (#124) on the real server and Store, with a stand-in provider.
 vi.setConfig({ testTimeout: 20_000 });
@@ -18,16 +20,22 @@ afterEach(async () => {
 type Answer = (request: AuthorRequest, signal: AbortSignal) => Promise<string>;
 type View = { plan: Record<string, any>; snapshot: { id: string } };
 /** `answer` is made from the review as it was when the server started. */
-async function serve(answer: (view: View) => Answer) {
+async function serve(answer: (view: View) => Answer, options: { describe?: PlanningDeps['describe'];
+  /** Runs on the review's database before the server starts, as an earlier process would have left it. */
+  before?: (config: ReviewConfig) => void } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-drafts-api-')); roots.push(root);
+  const config = createDemo(join(root, 'demo'));
+  options.before?.(config);
   const requests: AuthorRequest[] = [];
   let answering!: Answer;
   const provider: AuthorProvider = { invoke: (request, signal) => { requests.push(request); return answering(request, signal); } };
   let issue = 0;
-  const planning: PlanningDeps = { provider, describe: () => ({ issue: { number: issue, title: 'Retries', body: '', comments: [] },
-    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' } }) };
-  const app = await startServer(createDemo(join(root, 'demo')), 0, async () => 'answer', undefined, 2_000, undefined, undefined, planning);
-  closers.push(() => app.close());
+  const planning: PlanningDeps = { provider, describe: options.describe ?? (() => ({ issue: { number: issue, title: 'Retries', body: '', comments: [] },
+    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' } })) };
+  const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, planning);
+  let closed = false;
+  const close = async () => { if (!closed) { closed = true; await app.close(); } };
+  closers.push(close);
   const api = async (method: string, path: string, body?: unknown) => {
     const response = await fetch(`${new URL(app.url).origin}${path}`, { method, headers: { 'x-codeboost-token': app.token,
       ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined });
@@ -41,7 +49,7 @@ async function serve(answer: (view: View) => Answer) {
     await vi.waitFor(async () => expect((await api('GET', `/api/plan/${kind}/${id}`)).body.state).not.toBe('pending'));
     return (await api('GET', `/api/plan/${kind}/${id}`)).body;
   };
-  return { api, view, requests, start, settled };
+  return { api, view, requests, start, settled, config, close };
 }
 /** The review's plan, redrafted as the next revision with a new summary. */
 const redraft = (view: View): Answer => async request => JSON.stringify({ ...view.plan, revision: request.revision, summary: 'Redrafted by Claude' });
@@ -111,4 +119,57 @@ it('names an unknown ID by the route\'s kind', async () => {
   const served = await serve(redraft), unknown = randomUUID();
   expect(await served.api('POST', `/api/plan/drafts/${unknown}/apply`, { actionId: randomUUID() })).toMatchObject({ status: 409, body: { error: 'Unknown draft request.' } });
   expect(await served.api('POST', `/api/plan/suggestions/${unknown}/cancel`, { actionId: randomUUID() })).toMatchObject({ status: 409, body: { error: 'Unknown suggestion request.' } });
+});
+
+it('reports a GitHub failure before a draft as 502, recording nothing', async () => {
+  const served = await serve(redraft, { describe: async () => { throw new Error('GitHub is unreachable.'); } });
+  expect(await served.start('drafts')).toMatchObject({ status: 502, body: { error: 'The issue could not be read from GitHub: GitHub is unreachable.' } });
+  expect(served.requests).toHaveLength(0);
+});
+
+it('refuses a draft with 503 when shutdown begins while the issue is read', async () => {
+  let resolve!: () => void;
+  const served = await serve(redraft, { describe: () => new Promise(done => { resolve = () => done({ issue: { number: 0, title: '', body: '', comments: [] }, approvedLessons: [], repo: { name: 'r', baseRef: 'main' } }); }) });
+  const started = served.start('drafts');
+  await vi.waitFor(() => expect(resolve).toBeTypeOf('function'));
+  const closing = served.close();
+  resolve();
+  expect(await started).toMatchObject({ status: 503 });
+  await closing;
+});
+
+it('fails, at startup, a draft an earlier process left pending', async () => {
+  let pending = '';
+  const served = await serve(redraft, { before: config => {
+    const store = new Store(config.database);
+    try { pending = store.beginSuggestions(config.identity, { revision: store.getPlan(config.identity).revision, snapshotId: store.getSnapshot(config.identity).id }, 'draft'); }
+    finally { store.close(); }
+  } });
+  expect((await served.api('GET', `/api/plan/drafts/${pending}`)).body)
+    .toMatchObject({ state: 'failed', reason: 'The server stopped before this request finished. Ask again.' });
+  // A new draft starts normally.
+  expect((await served.start('drafts')).status).toBe(200);
+});
+
+it('refuses one cancel action ID on two suggestions', async () => {
+  const served = await serve(view => async () => JSON.stringify(cards(view.plan.revision)));
+  const first = (await served.start('suggestions')).body.result.requestId as string;
+  await served.settled('suggestions', first);
+  const second = (await served.start('suggestions')).body.result.requestId as string;
+  await served.settled('suggestions', second);
+  const cancel = { actionId: randomUUID() };
+  expect(await served.api('POST', `/api/plan/suggestions/${first}/cancel`, cancel)).toMatchObject({ status: 200 });
+  expect(await served.api('POST', `/api/plan/suggestions/${second}/cancel`, cancel)).toMatchObject({ status: 409, body: { error: 'Action ID already used for a different request.' } });
+  expect((await served.api('GET', `/api/plan/suggestions/${second}`)).body.state).toBe('ready');
+});
+
+it('replays a suggestion cancel recorded before #124, whose hash had no request ID', async () => {
+  const served = await serve(redraft), actionId = randomUUID(), id = randomUUID();
+  // What an earlier build recorded for this cancel: the body alone.
+  const store = new Store(served.config.database);
+  try { store.userAction(served.config.identity, { actionId, kind: 'suggestion-cancel', request: {} }, () => ({ state: 'cancelled' })); }
+  finally { store.close(); }
+  expect(await served.api('POST', `/api/plan/suggestions/${id}/cancel`, { actionId })).toEqual({ status: 200, body: { result: { state: 'cancelled' } } });
+  // A draft route has no such history: the same action ID is a different request there.
+  expect(await served.api('POST', `/api/plan/drafts/${id}/cancel`, { actionId })).toMatchObject({ status: 409 });
 });

@@ -56,7 +56,7 @@ export class SuggestionCoordinator {
   start(input: SuggestionInput, mode: PlanningMode = 'suggest'): SuggestionHandle {
     if (this.#closing) throw new Error('Suggestion coordinator is closing.');
     const identity = { ...input.context.identity }, key = identityKey(identity);
-    if (this.#active.has(key)) throw new Error('A suggestion invocation is still active for this plan.');
+    if (this.#active.has(key)) throw new Error('A planning invocation is still active for this plan.');
     const snapshotId = input.snapshotId;
     const previousPlan = this.#store.getPlan(identity), snapshot = this.#store.getSnapshot(identity);
     if (previousPlan.revision !== input.revision) throw new Error('Stale plan revision.');

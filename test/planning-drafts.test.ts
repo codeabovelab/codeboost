@@ -109,8 +109,25 @@ it('refuses to apply a draft under another plan\'s identity or issue', () => {
   const { store } = fixture(), id = readyDraft(store), other = { ...identity, planId: 'other' };
   store.createPlan(JSON.stringify(plan()), 'json', { ...context, identity: other }, oid(1), oid(2));
   expect(() => store.applyDraft(other, id, { ...context, identity: other })).toThrow('Draft is unavailable.');
-  expect(() => store.applyDraft(identity, id, { ...context, issue: 2 })).toThrow();
+  expect(() => store.applyDraft(identity, id, { ...context, issue: 2 })).toThrow('Plan context identity/issue mismatch.');
   expect(store.getDraft(identity, id).state).toBe('ready');
+});
+
+it('invalidates every other ready draft and suggestion when a draft is applied', () => {
+  const { store } = fixture(), applied = readyDraft(store), sibling = readyDraft(store);
+  const suggestion = store.beginSuggestions(identity, state(store), 'suggest');
+  store.completeSuggestions(identity, suggestion, cards());
+  store.applyDraft(identity, applied, context);
+  expect(store.getDraft(identity, sibling)).toMatchObject({ state: 'invalidated', reason: 'Plan revision changed.' });
+  expect(store.getSuggestions(identity, suggestion)).toMatchObject({ state: 'invalidated', reason: 'Plan revision changed.' });
+});
+
+it('fails, at startup, every request an earlier process left pending, and nothing else', () => {
+  const { store } = fixture(), pending = store.beginSuggestions(identity, state(store), 'draft'), ready = readyDraft(store);
+  expect(store.settleInterruptedRequests()).toBe(1);
+  expect(store.getDraft(identity, pending)).toMatchObject({ state: 'failed', reason: 'The server stopped before this request finished. Ask again.' });
+  expect(store.getDraft(identity, ready).state).toBe('ready');
+  expect(store.settleInterruptedRequests()).toBe(0);
 });
 
 it('dismisses a ready draft', () => {
@@ -195,7 +212,7 @@ it.each([['draft', 'suggest'], ['suggest', 'draft']] as const)('runs one plannin
     await held; return JSON.stringify(request.mode === 'draft' ? redraft() : cards()); } });
   try {
     const running = slow.start(input, first);
-    expect(() => slow.start(input, second)).toThrow('A suggestion invocation is still active for this plan.');
+    expect(() => slow.start(input, second)).toThrow('A planning invocation is still active for this plan.');
     release();
     expect(await running.result).toMatchObject({ state: 'completed' });
   } finally { await slow.close(); }

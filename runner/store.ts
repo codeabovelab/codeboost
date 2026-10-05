@@ -473,6 +473,15 @@ export class Store {
     return { mode, state: row.state as SuggestionState, revision: row.revision as number, snapshotId: row.snapshot_id as string | null,
       reply: row.reply === null || mode === 'draft' ? null : decode<EditReply>(row.reply), reason: row.reason as string | null };
   }
+  /**
+   * Fail every request still pending from an earlier process. Call once at startup, under the single-runner lock, before
+   * any request starts: a pending request's provider ran in that process's planning worker, so nothing can complete it.
+   * Returns how many were settled.
+   */
+  settleInterruptedRequests(): number {
+    return this.#run("UPDATE requests SET state='failed', reason=? WHERE state='pending'",
+      'The server stopped before this request finished. Ask again.').changes as number;
+  }
   /** A draft request (#124). Refuses a suggestion request's ID. */
   getDraft(identity: PlanIdentity, id: string): DraftRequest {
     const row = this.#get("SELECT * FROM requests WHERE key=? AND id=? AND mode='draft'", identityKey(identity), id);

@@ -11,7 +11,7 @@ import { ItemExecutor } from '../runner/execution.ts';
 import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
-import { BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
+import { ActionIdReused, BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
@@ -80,6 +80,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       getSuggestions: (identity, id) => store.getSuggestions(identity, id),
     };
     planning = typeof planningInput === 'function' ? planningInput(service) : planningInput;
+    // A suggestion or draft still pending belonged to a process that ended; nothing can complete it now (#124).
+    service.store.settleInterruptedRequests();
     // One budget for a suggestion, setup included: lane D's cap, which the provider's own deadline stays inside (#117).
     suggestions = planning ? new SuggestionCoordinator(suggestionStore, planning.provider, PLANNING_BUDGET_MS) : null;
   } catch (error) { service.close(); throw error; }
@@ -274,6 +276,17 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const mode: PlanningMode = route?.[1] === 'drafts' ? 'draft' : 'suggest', noun = mode === 'draft' ? 'draft' : 'suggestion';
     const started = !imported && !route![2];
     const kind = imported ? 'plan-import' : started ? `${noun}-start` : `${noun}-${route![3]}`;
+    // A suggestion cancel or apply recorded before #124 hashed the body alone: its replay still returns the saved outcome
+    // (or refusal). Drafts are new, so none was recorded that way.
+    if (route?.[2] && mode === 'suggest') {
+      try { service.store.savedAction(identity, { actionId, kind, request }); }
+      catch (error) {
+        if (!(error instanceof ActionIdReused)) throw error;
+        const legacy = service.store.savedAction<unknown>(identity, { actionId, kind, request: body });
+        if (!legacy) throw error;
+        return legacy.response;
+      }
+    }
     // The issue comes from GitHub (#117), so it is read before the recorded action, which runs synchronously. A replay
     // returns its saved outcome without reading GitHub again, and a start the recorded action would refuse anyway (no
     // planning, shutdown, stale revision or snapshot) does not read it at all.
