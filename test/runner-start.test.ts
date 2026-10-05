@@ -426,8 +426,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     const { app, identity, store } = returned, atA = store.getSnapshot(identity);
     store.recordHistory(identity, { revision: 1, snapshotId: atA.id, reviewVersion: store.reviewVersion(identity) },
       atA.base, 'e'.repeat(40), []);
-    approvePlan(app.service);
     const atB = store.getSnapshot(identity);
+    expect(atB.head).toBe('e'.repeat(40));
+    const approvals = store.getReview(identity).approvals.map(({ item, fingerprint }) => ({ item, fingerprint }));
+    store.saveReview(identity, { revision: 1, snapshotId: atB.id, reviewVersion: store.reviewVersion(identity) }, approvals, []);
+    expect(store.getReview(identity).approvals).toHaveLength(store.getPlan(identity).items.length);
+    expect(store.getReview(identity).approvals.every(approval => approval.snapshotId === atB.id)).toBe(true);
     store.recordHistory(identity, { revision: 1, snapshotId: atB.id, reviewVersion: store.reviewVersion(identity) },
       atA.base, atA.head, []);
     expect(await view(app)).toMatchObject({ resumable: false });
