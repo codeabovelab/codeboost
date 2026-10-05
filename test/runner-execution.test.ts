@@ -544,7 +544,7 @@ describe('item execution', () => {
     store.recordOwedSafetyFinding = () => { throw Object.assign(new Error('disk full on retry'), { code: 'ERR_SQLITE_ERROR' }); };
     expect(() => unsafe.executor.begin(identity)).toThrow(/disk full on retry/);
     expect(store.getTask(identity).status).toBe('needs approval');
-    expect(store.getAttempt(identity, unsafeAttempt!.id).safetyFinding).toBeNull();
+    expect(store.getAttempt(identity, unsafeAttempt!.id).safetyFinding).toMatch(/Git metadata/);
     expect(unsafe.findings.get(unsafeAttempt!.id)).toMatch(/Git metadata/);
     store.recordOwedSafetyFinding = retrySave;
     const gatedBegin = unsafe.executor.begin(identity);
@@ -697,6 +697,27 @@ describe('item execution', () => {
     expect(await unsafe.executor.runTask(identity)).toMatchObject({ kind: 'stopped', state: 'not started' });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
+  it('persists a current run safety finding before clearing its in-memory copy', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    const attemptId = h.store.getAttempts(identity)[0]!.id;
+    expect(h.findings.get(attemptId)).toBeUndefined();
+    const reopened = new Store(h.path); cleanups.push(() => reopened.close());
+    expect(reopened.getAttempt(identity, attemptId).safetyFinding).toMatch(/Git metadata/);
+    expect(reopened.getTask(identity).status).toBe('needs human');
+  });
+  it('keeps a current run safety finding owed when its durable retry fails', async () => {
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true });
+    const retrySave = h.store.recordOwedSafetyFinding.bind(h.store);
+    h.store.recordOwedSafetyFinding = () => { throw Object.assign(new Error('disk full on retry'), { code: 'ERR_SQLITE_ERROR' }); };
+    await expect(h.executor.runTask(identity)).rejects.toThrow(/disk full on retry/);
+    const attemptId = h.store.getAttempts(identity)[0]!.id;
+    expect(h.store.getAttempt(identity, attemptId).safetyFinding).toBeNull();
+    expect(h.findings.get(attemptId)).toMatch(/Git metadata/);
+    h.store.recordOwedSafetyFinding = retrySave;
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
+    expect(h.store.getAttempts(identity)).toHaveLength(1);
+  });
   it('keeps task storage when a foreign result\'s terminal write fails', async () => {
     const { runner, executor, log } = setup({ settleError: true, exit: { P1: { attemptId: '00000000-0000-4000-8000-000000000000' } } });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'running' });
@@ -823,11 +844,16 @@ describe('item execution', () => {
   });
   it('escalates through the capability after the shutdown write gate closed', async () => {
     let store!: Store;
-    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, capability: s => s.shutdownCapability(),
+    const h = setup({ manifests: { P1: manifest([change('a.ts')], { metadataChanged: true }) }, findingSaveError: true,
+      capability: s => s.shutdownCapability(),
       release: async () => { store.closeWrites(); } });
     store = h.store;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'needs human', item: 'P1' });
     expect(store.getTask(identity).status).toBe('needs human');
+    const attemptId = store.getAttempts(identity)[0]!.id;
+    const reopened = new Store(h.path); cleanups.push(() => reopened.close());
+    expect(reopened.getAttempt(identity, attemptId).safetyFinding).toMatch(/Git metadata/);
+    expect(new SafetyFindings(reopened).get(attemptId)).toBeUndefined();
   });
   it('settles an owed finding when the task was closed before its next run', async () => {
     let store!: Store;

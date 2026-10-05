@@ -100,11 +100,13 @@ export class SafetyFindings {
   owed(attemptId: string): boolean { return this.#unsaved.has(attemptId); }
   settle(attemptId: string): void { this.#unsaved.delete(attemptId); }
   /** Retry the durable save and, when its human gate is gone, finish the escalation. */
-  persist(attemptId: string): boolean {
+  persist(attemptId: string, options: { settlement?: boolean } = {}): boolean {
     const finding = this.#unsaved.get(attemptId);
     if (!finding) return true;
     const identity = findIdentity(this.#store, { id: attemptId } as AttemptRecord);
-    try { if (!this.#store.recordOwedSafetyFinding(identity, attemptId, finding)) return false; }
+    const save = () => this.#store.recordOwedSafetyFinding(identity, attemptId, finding,
+      options.settlement ? { deferAction: true } : {});
+    try { if (!(options.settlement ? this.#write(save) : save())) return false; }
     catch (error) { if (error instanceof ShuttingDownError) return false; throw error; }
     this.#unsaved.delete(attemptId);
     // A strict begin usually runs inside userAction's outer transaction. Restore the in-memory debt if that rolls back.
@@ -510,7 +512,12 @@ export class ItemExecutor {
       // Only the runner's own audit records a finding; it wins over any later stale or stop outcome. The terminal write
       // has usually acted on it already, so this reads it whether or not it is still owed.
       const violation = this.#findings.finding(attempt.id);
-      if (violation) return this.#escalate(identity, row, violation, stopped, done);
+      if (violation) {
+        // The first save can fail before the terminal write. This run still owns settlement, so retry through its
+        // shutdown capability before escalation can clear the only in-memory copy.
+        this.#findings.persist(attempt.id, { settlement: true });
+        return this.#escalate(identity, this.#store.getAttempt(identity, attempt.id), violation, stopped, done);
+      }
       if (row.state !== 'completed') {
         // Still pending or running: the terminal write failed and the slot is held until restart.
         const unresolved = this.#runner.status(identity).unresolved;
@@ -540,6 +547,7 @@ export class ItemExecutor {
   #escalate(identity: PlanIdentity, row: AttemptRecord, violation: string,
     stopped: (item: string, state: string, reason: string | null) => ExecutionOutcome, done: string[], owed = false): ExecutionOutcome {
     const item = row.item!, task = this.#store.getTask(identity);
+    const write = owed ? direct : this.#write;
     const remember = () => {
       const current = this.#store.getTask(identity), key = identityKey(identity);
       if (current.status === 'needs human' && current.currentAttemptId === row.id)
@@ -559,11 +567,13 @@ export class ItemExecutor {
       return { kind: 'needs human', item, reason: violation, completed: [...done] };
     }
     if (CLOSED_STATUSES.includes(task.status)) {
+      write(() => this.#store.settleOwedSafetyFinding(identity, row.id));
       this.#findings.settle(row.id);
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}, so it was not moved to needs human.`);
     }
     // Already where the finding sends it: nothing is owed.
     if (task.status === 'needs human') {
+      write(() => this.#store.settleOwedSafetyFinding(identity, row.id));
       this.#findings.settle(row.id);
       remember();
       return { kind: 'needs human', item, reason: violation, completed: [...done] };
@@ -572,7 +582,10 @@ export class ItemExecutor {
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task is ${task.status}; it moves to needs human when it next runs.`);
     // Settling this run's own attempt writes through the shutdown capability; paying an owed finding at the start of a
     // new run is that run's decision, so it does not, and the closed write gate refuses it like any other.
-    try { (owed ? direct : this.#write)(() => this.#store.transitionTask(identity, task.stateVersion, 'needs human')); }
+    try { write(() => {
+      this.#store.transitionTask(identity, task.stateVersion, 'needs human');
+      this.#store.settleOwedSafetyFinding(identity, row.id);
+    }); }
     catch (error) {
       if (!(error instanceof GuardRefusal) && !(owed && error instanceof ShuttingDownError)) throw error;
       return stopped(item, owed ? 'not started' : row.state, `${violation} The task could not be moved to needs human yet: ${(error as Error).message}`);

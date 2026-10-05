@@ -382,14 +382,14 @@ describe('publishing a finished task (#103)', () => {
     expect(w.github.prs[0]!.body).not.toContain(BUDGET);
   });
 
-  it.each(Object.keys(FINDINGS) as FindingSource[])('names an unsaved finding from %s in the draft after the budget runs out', async source => {
+  it.each(Object.keys(FINDINGS) as FindingSource[])('names an initially unsaved finding from %s in the draft after the budget runs out', async source => {
     const w = world();
     const { app, identity, store, findings } = await serve(w, { findingSource: source, startup: false,
       before: service => { service.store.transitionTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, 'queued'); } });
     expect(await app.executor!.runTask(identity)).toMatchObject({ kind: 'needs human', reason: FINDINGS[source] });
     const attempt = store.getAttempts(identity).at(-1)!;
     // Prove which coordinator path produced the attempt; the downstream draft alone would not distinguish the sources.
-    expect(attempt).toMatchObject({ state: 'failed', safetyFinding: null, diagnostic: FINDING_DIAGNOSTICS[source] });
+    expect(attempt).toMatchObject({ state: 'failed', safetyFinding: FINDINGS[source], diagnostic: FINDING_DIAGNOSTICS[source] });
     expect(findings.owedAttempts()).toEqual([]);
     const now = vi.spyOn(Date, 'now').mockReturnValue(store.getTask(identity).budgetDeadline! + 1);
     try {

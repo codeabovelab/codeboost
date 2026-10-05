@@ -902,7 +902,7 @@ export class Store {
     });
   }
   /** Retry a finding whose original durable save failed. False keeps its escalation owed behind a human gate. */
-  recordOwedSafetyFinding(identity: PlanIdentity, id: string, finding: string): boolean {
+  recordOwedSafetyFinding(identity: PlanIdentity, id: string, finding: string, options: { deferAction?: boolean } = {}): boolean {
     if (typeof finding !== 'string' || !finding.trim()) throw new GuardRefusal('A safety finding needs its reason.');
     const key = identityKey(identity);
     return this.#transaction(() => {
@@ -915,15 +915,24 @@ export class Store {
       }
       const before = this.#task(key).status as TaskStatus;
       const terminal = TERMINAL_STATES.includes(row.state as AttemptState);
-      const acted = !terminal || !HUMAN_GATES.includes(before);
+      // A run that has just settled first makes the evidence durable, then lets the executor apply every current-state
+      // precondition (including an active merge) before it clears the debt. Recovery and later runs may act here.
+      const acted = !terminal || (!options.deferAction && !HUMAN_GATES.includes(before));
       const owed = terminal && !acted ? 1 : 0;
       if (row.safety_owed !== owed) {
         this.#run('UPDATE attempts SET safety_owed=? WHERE plan_key=? AND id=?', owed, key, id);
         changed = true;
       }
-      if (terminal && acted) this.#actOnFinding(key);
+      if (terminal && acted && !options.deferAction) this.#actOnFinding(key);
       if (changed || this.#task(key).status !== before) this.#touch(key);
       return acted;
+    });
+  }
+  /** Clear a durable escalation debt only in the same write that successfully acts on it. */
+  settleOwedSafetyFinding(identity: PlanIdentity, id: string): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      if (this.#run('UPDATE attempts SET safety_owed=0 WHERE plan_key=? AND id=? AND safety_owed=1', key, id).changes === 1) this.#touch(key);
     });
   }
   /** Terminal findings whose evidence is durable but whose escalation is still blocked by a human gate. */
