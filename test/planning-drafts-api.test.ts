@@ -243,3 +243,26 @@ it('refuses a draft against a stale revision or snapshot, starting nothing', asy
       .toMatchObject({ status: 409, body: { error: 'Stale plan revision or snapshot. Reload before asking for a draft.' } });
   expect(served.requests).toHaveLength(0);
 });
+
+it('replays a draft start without reading GitHub again', async () => {
+  let reads = 0, issue = 0;
+  const served = await serve(redraft, { describe: () => { reads++; return { issue: { number: issue, title: 'Retries', body: '', comments: [] },
+    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' } }; } });
+  issue = served.view.plan.issue;
+  const body = { expectedRevision: served.view.plan.revision, snapshotId: served.view.snapshot.id, feedback: '', actionId: randomUUID() };
+  const first = await served.api('POST', '/api/plan/drafts', body);
+  expect(first.status).toBe(200);
+  expect(await served.api('POST', '/api/plan/drafts', body)).toEqual(first);
+  expect(reads).toBe(1);
+});
+
+it('refuses one apply action ID on two drafts', async () => {
+  const served = await serve(redraft);
+  const first = (await served.start('drafts')).body.result.requestId as string;
+  await served.settled('drafts', first);
+  const second = (await served.start('drafts')).body.result.requestId as string;
+  await served.settled('drafts', second);
+  const apply = { actionId: randomUUID() };
+  expect((await served.api('POST', `/api/plan/drafts/${first}/apply`, apply)).status).toBe(200);
+  expect(await served.api('POST', `/api/plan/drafts/${second}/apply`, apply)).toMatchObject({ status: 409, body: { error: 'Action ID already used for a different request.' } });
+});
