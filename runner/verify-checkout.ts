@@ -35,6 +35,21 @@ const splitPath = (path: Buffer): Buffer[] => {
 const objectId = (algorithm: 'sha1' | 'sha256', bytes: Buffer): string =>
   createHash(algorithm).update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex');
 
+/** Hash index-only gitlink entries without entering or reading their nested repositories. */
+export function gitlinkIndexDigest(root = process.cwd(), executable = 'git'): string {
+  const rawOutput = git(executable, ['-C', root, 'ls-files', '--stage', '-z']);
+  if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
+  const raw = split0(rawOutput);
+  if (raw.length > MAX_DIRECTORY_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
+  const hash = createHash('sha256');
+  for (const record of raw) {
+    const tab = record.indexOf(0x09), header = record.subarray(0, tab).toString('ascii').split(' ');
+    if (tab < 0 || header.length !== 3 || !/^[0-3]$/.test(header[2]!)) throw new Error('Git returned an invalid index record.');
+    if (header[0] === '160000') hash.update(record).update('\0');
+  }
+  return hash.digest('hex');
+}
+
 /** Byte-exact, content-based proof that the disposable worktree represents its index. Gitlinks stay index-only. */
 export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
   const repositoryGit = (args: readonly string[], input?: Buffer) => git(executable, ['-C', root, ...args], input);
@@ -105,5 +120,7 @@ export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (!process.argv[2]) throw new Error('Checkout verification requires a pinned Git executable.');
-  verifyCheckout(process.cwd(), process.argv[2]);
+  if (process.argv[3] === 'gitlinks') process.stdout.write(gitlinkIndexDigest(process.cwd(), process.argv[2]));
+  else if (process.argv[3] === undefined) verifyCheckout(process.cwd(), process.argv[2]);
+  else throw new Error('Unknown checkout verification mode.');
 }

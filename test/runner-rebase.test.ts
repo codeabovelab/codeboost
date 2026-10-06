@@ -372,6 +372,36 @@ describe('trusted pre-merge rebase', () => {
       ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
   });
 
+  it('preserves an unchanged gitlink from the conflicted commit', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.base},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+    } });
+    const result = await runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] });
+    expect(git(s.repository.path, 'ls-tree', result.head, '--', 'submodule')).toContain(`commit ${s.base}\tsubmodule`);
+  });
+
+  it('refuses a resolver index-only change to a gitlink outside the conflict', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.base},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      git(input.repository, 'update-index', '--cacheinfo', `160000,${s.onto},submodule`);
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+  });
+
   it('refuses a resolver edit outside the exact conflicted files and drops the partial rewrite', async () => {
     const s = await setup('foreign'), attemptId = randomUUID();
     const runner = createRebaser(s, { resolveForeignConflict: async input => {

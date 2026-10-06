@@ -338,6 +338,12 @@ export class GitRebaser {
   }
 
   async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, scope: CallScope): Promise<string> {
+    const verifier = fileURLToPath(new URL('./verify-checkout.ts', import.meta.url));
+    const gitlinks = await this.#process(process.execPath, [verifier, this.#gitExecutable, 'gitlinks'], repository,
+      this.#gitEnvironment, scope, false, 64 * 1024);
+    this.#throwIfCancelled(gitlinks, scope);
+    if (gitlinks.status !== 0 || !/^[0-9a-f]{64}$/.test(gitlinks.stdout))
+      throw this.#failure('gitlink index audit', gitlinks, 'node');
     const changed = new Set([
       ...await this.#paths(repository, ['diff', '--name-only', '--ignore-submodules=all', '-z', 'HEAD', '--'], scope),
       ...await this.#paths(repository, ['ls-files', '--others', '-z', '--'], scope),
@@ -347,7 +353,7 @@ export class GitRebaser {
       const index = await this.#git(repository, ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', path], scope);
       entries.push([path, index, this.#worktreeFingerprint(repository, path)]);
     }
-    return JSON.stringify(entries);
+    return JSON.stringify([gitlinks.stdout, entries]);
   }
 
   #worktreeFingerprint(repository: string, path: string): string {
