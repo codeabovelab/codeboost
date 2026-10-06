@@ -739,6 +739,22 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     // Not recorded: the same action ID is refused afresh (503 again), never replayed as a saved refusal.
     expect((await act(app, 'start', { actionId })).status).toBe(503);
   });
+  it('keeps continuation approval retryable once the runner stopped admission', async () => {
+    const { app, identity, store } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
+      s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: s.getPlan(id).items[0]!.id, completedItems: [s.getPlan(id).items[0]!.id], outOfScopePaths: ['other.ts'],
+        baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
+      });
+    } });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    app.runner!.rejectAdmission();
+    expect(await act(app, 'approve-continuation', { actionId })).toMatchObject({ status: 503 });
+    expect(store.savedAction(identity, { actionId, kind: 'approve-continuation', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeUndefined();
+  });
   it('answers 503 to a stale continuation approval whose body finishes arriving after shutdown began, without saving the action refusal', async () => {
     const { app, close, database, identity } = await serve({ before: service => {
       committedFirstItem(service, false, ['other.ts']);
@@ -767,6 +783,35 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     await closing;
     const store = new Store(database); cleanups.push(() => store.close());
     expect(store.savedAction(identity, { actionId, kind: 'approve-continuation', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeUndefined();
+  });
+  it('keeps a continuation approval retryable during shutdown when no runner is configured', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-no-runner-')); roots.push(root);
+    const demo = createDemo(join(root, 'demo'));
+    const app = await startServer({ ...demo, demo: false }, 0, undefined, undefined, 2_000);
+    let closed = false;
+    const close = async () => { if (!closed) { closed = true; await app.close(); } };
+    cleanups.push(close);
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID(), url = new URL(app.url);
+    const text = JSON.stringify({ action: 'approve-continuation', expectedStateVersion: stateVersion,
+      expectedReviewVersion: reviewVersion, actionId });
+    let finish!: () => void;
+    const response = new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)); });
+      req.on('error', reject);
+      req.write(text.slice(0, 5));
+      finish = () => req.end(text.slice(5));
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    finish();
+    expect(await response).toBe(503);
+    await closing;
+    const store = new Store(demo.database); cleanups.push(() => store.close());
+    expect(store.savedAction(demo.identity, { actionId, kind: 'approve-continuation', request: {
       attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
     } })).toBeUndefined();
   });

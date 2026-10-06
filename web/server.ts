@@ -297,8 +297,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     function act() { return actWithReplayState().response; }
     function actWithReplayState() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => {
       // A saved replay is returned by userAction before this callback. A new continuation approval admitted before
-      // shutdown but parsed during the drain must remain retryable, even when its supplied versions are stale.
-      if (action === 'approve-continuation' && runner?.closing) throw new ShuttingDownError();
+      // shutdown but parsed during the drain must remain retryable, even when no runner exists or its supplied versions
+      // are stale.
+      if (action === 'approve-continuation' && (stopping || runner?.closing)) throw new ShuttingDownError();
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if ((action === 'start' || action === 'resume' || action === 'approve-continuation') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
