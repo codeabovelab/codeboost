@@ -1,5 +1,5 @@
-import { lstatSync } from 'node:fs';
-import { join } from 'node:path';
+import { accessSync, constants, lstatSync, realpathSync, statSync } from 'node:fs';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import type { DockerOutcome } from '../agents/docker.ts';
@@ -32,6 +32,24 @@ export interface GitRebaserOptions {
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
 
+const configuredGit = (): { executable: string; environment: NodeJS.ProcessEnv } => {
+  const source = process.env.PATH;
+  if (!source) throw new Error('Git requires a configured PATH.');
+  // Resolve relative and empty entries while still in the runner's trusted working directory. Carrying them into an
+  // agent-controlled worktree would let that checkout supply the `git` executable used to verify itself.
+  const path = source.split(delimiter).map(entry => resolve(process.cwd(), entry || '.')).join(delimiter);
+  for (const directory of path.split(delimiter)) {
+    const candidate = join(directory, 'git');
+    try {
+      const executable = realpathSync(candidate);
+      if (!statSync(executable).isFile()) continue;
+      accessSync(executable, constants.X_OK);
+      return { executable, environment: { ...gitEnvironment(), PATH: path } };
+    } catch { /* This PATH entry does not provide an executable Git. */ }
+  }
+  throw new Error('Git is not executable on the configured PATH.');
+};
+
 /** A conflict is a review outcome, not an infrastructure failure. No rewritten ref is retained. */
 export class RebaseConflict extends Error {}
 
@@ -49,6 +67,8 @@ export function rebaseRef(attemptId: string): string {
 export class GitRebaser {
   readonly #options: GitRebaserOptions;
   readonly #root: string;
+  readonly #gitExecutable: string;
+  readonly #gitEnvironment: NodeJS.ProcessEnv;
 
   constructor(options: GitRebaserOptions) {
     if (!/^[0-9a-f]{32}$/.test(options.runnerOwner)) throw new Error('Invalid runner owner token.');
@@ -57,7 +77,10 @@ export class GitRebaser {
     if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) ||
         options.timeoutMs < MIN_REBASE_TIMEOUT_MS || options.timeoutMs > 120_000))
       throw new Error('Invalid rebase deadline.');
+    const git = configuredGit();
     this.#options = options;
+    this.#gitExecutable = git.executable;
+    this.#gitEnvironment = git.environment;
     this.#root = ownerOnlyDirectory(options.runnerRoot, options.runnerOwner, 'rebases');
   }
 
@@ -209,7 +232,8 @@ export class GitRebaser {
 
   async #assertCheckout(repository: string, commit: string, label: string, scope: CallScope): Promise<void> {
     const verifier = fileURLToPath(new URL('./verify-checkout.ts', import.meta.url));
-    const verified = await this.#process(process.execPath, [verifier], repository, gitEnvironment(), scope, false, 64 * 1024);
+    const verified = await this.#process(process.execPath, [verifier, this.#gitExecutable], repository,
+      this.#gitEnvironment, scope, false, 64 * 1024);
     this.#throwIfCancelled(verified, scope);
     if (verified.status !== 0) throw new Error(`The host filesystem cannot faithfully check out the ${label}.`,
       { cause: this.#failure('checkout verification', verified, 'node') });
@@ -262,13 +286,13 @@ export class GitRebaser {
   async #call(repository: string, args: readonly string[], scope: CallScope, cleanup = false, discardExcessOutput = false,
     input?: Buffer) {
     const env = {
-      ...gitEnvironment(),
+      ...this.#gitEnvironment,
       GIT_COMMITTER_NAME: this.#options.committer.name,
       GIT_COMMITTER_EMAIL: this.#options.committer.email,
       GIT_EDITOR: 'true',
       GIT_SEQUENCE_EDITOR: 'true',
     };
-    return this.#process('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], repository,
+    return this.#process(this.#gitExecutable, [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args], repository,
       env, scope, cleanup, discardExcessOutput ? 64 * 1024 : 8 * 1024 * 1024, input, discardExcessOutput);
   }
 

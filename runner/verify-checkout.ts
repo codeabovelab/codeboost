@@ -9,8 +9,8 @@ const MAX_DIRECTORY_ENTRIES = 262_144;
 // A C-quoted path can expand every input byte to four bytes. Keep transport above every accepted index listing;
 // accepted input is then rejected by our explicit bounds, never by spawnSync's smaller implementation limit.
 const MAX_GIT_OUTPUT_BYTES = MAX_INDEX_BYTES * 4 + 1024;
-const git = (args: readonly string[], input?: Buffer): Buffer => {
-  const result = spawnSync('git', [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args],
+const git = (executable: string, args: readonly string[], input?: Buffer): Buffer => {
+  const result = spawnSync(executable, [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...args],
     { env: gitEnvironment(), input, maxBuffer: MAX_GIT_OUTPUT_BYTES, stdio: [input ? 'pipe' : 'ignore', 'pipe', 'pipe'] });
   if (result.status !== 0 || result.error) throw result.error ?? new Error(`git ${args[0]} failed while verifying the checkout.`);
   return result.stdout;
@@ -36,8 +36,8 @@ const objectId = (algorithm: 'sha1' | 'sha256', bytes: Buffer): string =>
   createHash(algorithm).update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex');
 
 /** Byte-exact, content-based proof that the disposable worktree represents its index. Gitlinks stay index-only. */
-export function verifyCheckout(root = process.cwd()): void {
-  const repositoryGit = (args: readonly string[], input?: Buffer) => git(['-C', root, ...args], input);
+export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
+  const repositoryGit = (args: readonly string[], input?: Buffer) => git(executable, ['-C', root, ...args], input);
   const rawOutput = repositoryGit(['ls-files', '--stage', '-z']);
   if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
   const raw = split0(rawOutput);
@@ -103,4 +103,7 @@ export function verifyCheckout(root = process.cwd()): void {
   }
 }
 
-if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) verifyCheckout();
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
+  if (!process.argv[2]) throw new Error('Checkout verification requires a pinned Git executable.');
+  verifyCheckout(process.cwd(), process.argv[2]);
+}

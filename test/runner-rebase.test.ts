@@ -59,8 +59,41 @@ describe('trusted pre-merge rebase', () => {
     const path = process.env.PATH;
     process.env.PATH = `${bin}:${path ?? ''}`;
     try {
-      await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
+      const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
+        committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+        onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+        onResultPrepared: () => {}, onResultState: () => {} });
+      await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
       expect(existsSync(marker)).toBe(true);
+    } finally {
+      if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+    }
+  });
+
+  it('never resolves Git from a relative PATH component inside the untrusted checkout', async () => {
+    const s = await setup(), attemptId = randomUUID(), marker = join(s.root, 'untrusted-git-ran');
+    const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    const quote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+    git(s.source, 'switch', '-q', 'feature');
+    mkdirSync(join(s.source, 'bin'));
+    writeFileSync(join(s.source, 'bin', 'git'), [
+      '#!/bin/sh',
+      `: > ${quote(marker)}`,
+      `exec ${quote(realGit)} "$@"`,
+    ].join('\n'), { mode: 0o755 });
+    git(s.source, 'add', '--', 'bin/git');
+    git(s.source, 'commit', '-qm', 'add untrusted git');
+    const head = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, head);
+    const path = process.env.PATH;
+    process.env.PATH = `bin:${path ?? ''}`;
+    try {
+      const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
+        committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+        onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+        onResultPrepared: () => {}, onResultState: () => {} });
+      await rebaser.run({ attemptId, oldBase: s.base, oldHead: head, oldHistory: [...s.history, head], onto: s.onto });
+      expect(existsSync(marker)).toBe(false);
     } finally {
       if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
     }
