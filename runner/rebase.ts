@@ -27,6 +27,7 @@ export interface GitRebaserOptions {
   onProcessGroup: (attemptId: string, group: ProcessGroup) => void;
   onProcessGroupSettled: (attemptId: string, group: ProcessGroup | 'spawning') => void;
   onProcessUnsettled: (attemptId: string, group: ProcessGroup) => void;
+  onResult: (attemptId: string, retainedHead: string | null, mappings: readonly { oldSha: string; newSha: string }[]) => void;
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
 
@@ -65,16 +66,22 @@ export class GitRebaser {
     for (const value of [oldBase, oldHead, onto]) if (!COMMIT_ID.test(value)) throw new Error('A full commit ID is required for rebasing.');
     signal?.throwIfAborted();
     const scope = this.#scope(attemptId, signal);
-    const old = await this.#history(this.#options.repository.path, oldBase, oldHead, scope);
-    if (onto === oldBase) return { oldHead, base: onto, head: oldHead, mappings: old.map(sha => ({ oldSha: sha, newSha: sha })) };
-
-    const path = this.#path(attemptId);
-    if (lstatSync(path, { throwIfNoEntry: false })) throw new Error('The rebase workspace already exists.');
     const ref = rebaseRef(attemptId);
     const existing = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope);
     this.#throwIfCancelled(existing, scope);
     if (existing.status === 0) throw new Error('This rebase attempt already has a retained result.');
     if (existing.status !== 1) throw this.#failure('show-ref', existing);
+    const old = await this.#history(this.#options.repository.path, oldBase, oldHead, scope);
+    if (onto === oldBase) {
+      const mappings = old.map(sha => ({ oldSha: sha, newSha: sha }));
+      this.#assertResultCurrent(scope);
+      this.#options.onResult(attemptId, null, mappings);
+      this.#assertResultCurrent(scope);
+      return { oldHead, base: onto, head: oldHead, mappings };
+    }
+
+    const path = this.#path(attemptId);
+    if (lstatSync(path, { throwIfNoEntry: false })) throw new Error('The rebase workspace already exists.');
     let added = false, retained = false, uncertainRef = false, attemptedRef: string | undefined;
     let result: RebaseResult | undefined, primary: unknown;
     try {
@@ -110,7 +117,11 @@ export class GitRebaser {
         // attempted value. A normal nonzero exit proves atomic creation refused and must preserve the winning ref.
         throw this.#failure('update-ref', created);
       }
-      result = { oldHead, base: onto, head, mappings: old.map((oldSha, index) => ({ oldSha, newSha: next[index]! })) };
+      const mappings = old.map((oldSha, index) => ({ oldSha, newSha: next[index]! }));
+      this.#assertResultCurrent(scope);
+      this.#options.onResult(attemptId, head, mappings);
+      this.#assertResultCurrent(scope);
+      result = { oldHead, base: onto, head, mappings };
     } catch (error) { primary = error; }
     const cleanupFailures: unknown[] = [];
     if (added || lstatSync(path, { throwIfNoEntry: false })) {
@@ -121,7 +132,7 @@ export class GitRebaser {
     if (!primary && signal?.aborted) {
       primary = signal.reason;
     }
-    if ((retained && primary && signal?.aborted) || (!retained && uncertainRef)) {
+    if ((retained && primary) || (!retained && uncertainRef)) {
       try { await this.#git(this.#options.repository.path, ['update-ref', '-d', ref, attemptedRef!], scope, true); retained = false; }
       catch (error) { cleanupFailures.push(error); }
     }
@@ -133,12 +144,14 @@ export class GitRebaser {
   }
 
   /** Startup/live recovery for an attempt whose Store marker still exists. */
-  async abort(attemptId: string): Promise<void> {
+  async abort(attemptId: string, resultHead?: string): Promise<void> {
     const ref = rebaseRef(attemptId), path = this.#path(attemptId), stat = lstatSync(path, { throwIfNoEntry: false });
+    if (resultHead !== undefined && !COMMIT_ID.test(resultHead)) throw new Error('A full retained result ID is required.');
     const scope = this.#scope(attemptId);
     if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) throw new Error('The rebase workspace is not a plain directory.');
     await this.#remove(path, scope);
-    await this.#git(this.#options.repository.path, ['update-ref', '-d', ref], scope, true);
+    if (resultHead !== undefined)
+      await this.#git(this.#options.repository.path, ['update-ref', '-d', ref, resultHead], scope, true);
   }
 
   async #history(repository: string, base: string, head: string, scope: CallScope): Promise<string[]> {
@@ -292,6 +305,12 @@ export class GitRebaser {
   #scope(attemptId: string, signal?: AbortSignal): CallScope {
     const timeout = this.#options.timeoutMs ?? 120_000, deadline = performance.now() + timeout;
     return { attemptId, signal, deadline, workDeadline: deadline - CLEANUP_RESERVE_MS };
+  }
+
+  #assertResultCurrent(scope: CallScope): void {
+    scope.signal?.throwIfAborted();
+    if (performance.now() >= scope.workDeadline)
+      throw Object.assign(new Error('The rebase deadline expired while recording its result.'), { code: 'ETIMEDOUT' });
   }
 
   #failure(command: string, outcome: DockerOutcome, program = 'git'): Error {

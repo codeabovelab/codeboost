@@ -1,8 +1,9 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, opendirSync, readdirSync, realpathSync, rmSync, statSync, statfsSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, statfsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
 import type { RebaseMarker, Store } from './store.ts';
 import { WRITABLE_KINDS, isUuidV4 } from './lifecycle.ts';
@@ -148,6 +149,24 @@ export interface RecoveryReport {
   finalized: { attemptId: string; planKey: string; state: string; requeued: boolean }[];
   requeue: string[]; removedDirectories: string[]; unknownEntries: string[]; unmatchedStorage: string[]; repairedMerges: string[];
 }
+function validRebaseResult(marker: Partial<RebaseMarker>, head: unknown, mappings: unknown): boolean {
+  if (mappings === null) return head === null;
+  if (!Array.isArray(mappings) || mappings.length > 500 ||
+      (marker.onto === marker.oldBase) !== (head === null)) return false;
+  const sources = new Set<string>(), destinations = new Set<string>();
+  for (const mapping of mappings as unknown[]) {
+    if (!mapping || typeof mapping !== 'object') return false;
+    const { oldSha, newSha } = mapping as { oldSha?: unknown; newSha?: unknown };
+    if (typeof oldSha !== 'string' || typeof newSha !== 'string' ||
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oldSha) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(newSha) ||
+        sources.has(oldSha) || destinations.has(newSha)) return false;
+    sources.add(oldSha); destinations.add(newSha);
+  }
+  if (marker.oldHead === marker.oldBase) return mappings.length === 0;
+  const endpoint = mappings.at(-1) as { oldSha: string; newSha: string } | undefined;
+  return !!endpoint && endpoint.oldSha === marker.oldHead &&
+    (head === null ? endpoint.newSha === marker.oldHead && mappings.every(mapping => mapping.oldSha === mapping.newSha) : endpoint.newSha === head);
+}
 const EXPORT_LIMIT = 1024 * 1024;
 
 /**
@@ -201,11 +220,13 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   for (const rebase of o.store.rebasesInProgress()) {
     if (!o.deps.abortRebase) throw new RecoveryBlocked('An interrupted rebase needs F3 to abort it', [rebase.planKey]);
     const marker = rebase.marker as Partial<RebaseMarker> | null;
-    const processGroup = marker?.processGroup;
+    const processGroup = marker?.processGroup, resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null;
     if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
         !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
+        (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
+        !validRebaseResult(marker, resultHead, resultMappings) ||
         (processGroup !== null && (!processGroup || typeof processGroup === 'string' || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
           !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0)))
       throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', [rebase.planKey]);
@@ -221,7 +242,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
       if (users.length) throw new RecoveryBlocked('A process still uses an interrupted rebase workspace', users);
       o.store.setRebaseProcessGroup(rebase.planKey, marker.attemptId, processGroup, null);
     }
-    await o.deps.abortRebase(rebase.planKey, { ...marker, processGroup: null });
+    await o.deps.abortRebase(rebase.planKey, { ...marker, resultHead, resultMappings, processGroup: null });
     if (!o.store.abortRebase(rebase.planKey, marker.attemptId))
       throw new RecoveryBlocked('An interrupted rebase changed while recovery aborted it', [rebase.planKey]);
   }
@@ -291,46 +312,52 @@ const OPEN_FILES_DEADLINE_MS = 15_000;
 const MAX_PROC_ENTRIES = 100_000;
 const MAX_FD_ENTRIES = 1_000_000;
 type OpenFilesRun = (file: string, args: readonly string[], options: Parameters<typeof runInProcessGroup>[2]) => Promise<DockerOutcome>;
+function linuxOpenFiles(dir: string): string[] {
+  dir = realpathSync(dir);
+  const users: string[] = [], disappeared = (error: unknown) => ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
+  let processes = 0, descriptors = 0;
+  const proc = opendirSync('/proc');
+  try {
+    for (let entry = proc.readSync(); entry; entry = proc.readSync()) {
+      if (!/^\d+$/.test(entry.name)) continue;
+      if (++processes > MAX_PROC_ENTRIES) throw new Error('Open-file probe exceeded its process bound.');
+      const pid = entry.name, links: string[] = [];
+      try { if (process.getuid && lstatSync(`/proc/${pid}`).uid !== process.getuid()) continue; }
+      catch (error) { if (disappeared(error)) continue; throw error; }
+      try { links.push(realpathSync(`/proc/${pid}/cwd`)); }
+      catch (error) { if (!disappeared(error)) throw error; }
+      let fds: ReturnType<typeof opendirSync> | undefined;
+      try { fds = opendirSync(`/proc/${pid}/fd`); }
+      catch (error) { if (disappeared(error)) continue; throw error; }
+      try {
+        for (let fd = fds.readSync(); fd; fd = fds.readSync()) {
+          if (++descriptors > MAX_FD_ENTRIES) throw new Error('Open-file probe exceeded its descriptor bound.');
+          try { links.push(realpathSync(`/proc/${pid}/fd/${fd.name}`)); }
+          catch (error) { if (!disappeared(error)) throw error; }
+        }
+      } finally { fds.closeSync(); }
+      if (links.some(link => link === dir || link.startsWith(`${dir}/`))) users.push(pid);
+    }
+  } finally { proc.closeSync(); }
+  return users;
+}
 /** Recovery's bounded variant. Its lsof process and pipes settle inside the overall deadline before startup proceeds. */
 export async function hostOpenFilesBounded(dir: string, options: { timeoutMs?: number; platform?: NodeJS.Platform;
   now?: () => number; run?: OpenFilesRun } = {}): Promise<string[]> {
-  dir = realpathSync(dir);
   const timeoutMs = options.timeoutMs ?? OPEN_FILES_DEADLINE_MS, now = options.now ?? performance.now.bind(performance);
   if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 12_001) throw new Error('Invalid open-file probe deadline.');
   const deadline = now() + timeoutMs;
   if ((options.platform ?? process.platform) === 'linux') {
-    const users: string[] = [], disappeared = (error: unknown) => ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
-    let processes = 0, descriptors = 0;
-    const proc = opendirSync('/proc');
-    try {
-      for (let entry = proc.readSync(); entry; entry = proc.readSync()) {
-        if (!/^\d+$/.test(entry.name)) continue;
-        if (++processes > MAX_PROC_ENTRIES || now() >= deadline)
-          throw new Error('Open-file probe exceeded its bound. Refusing to recover the rebase workspace.');
-        const pid = entry.name, links: string[] = [];
-        try { if (process.getuid && lstatSync(`/proc/${pid}`).uid !== process.getuid()) continue; }
-        catch (error) { if (disappeared(error)) continue; throw error; }
-        try { links.push(realpathSync(`/proc/${pid}/cwd`)); }
-        catch (error) { if (!disappeared(error)) throw new Error(`Could not inspect process ${pid}. Refusing to recover the rebase workspace.`, { cause: error }); }
-        let fds: ReturnType<typeof opendirSync> | undefined;
-        try { fds = opendirSync(`/proc/${pid}/fd`); }
-        catch (error) {
-          if (disappeared(error)) continue;
-          throw new Error(`Could not inspect process ${pid}. Refusing to recover the rebase workspace.`, { cause: error });
-        }
-        try {
-          for (let fd = fds.readSync(); fd; fd = fds.readSync()) {
-            if (++descriptors > MAX_FD_ENTRIES || now() >= deadline)
-              throw new Error('Open-file probe exceeded its bound. Refusing to recover the rebase workspace.');
-            try { links.push(realpathSync(`/proc/${pid}/fd/${fd.name}`)); }
-            catch (error) { if (!disappeared(error)) throw new Error(`Could not inspect process ${pid}. Refusing to recover the rebase workspace.`, { cause: error }); }
-          }
-        } finally { fds.closeSync(); }
-        if (links.some(link => link === dir || link.startsWith(`${dir}/`))) users.push(pid);
-      }
-    } finally { proc.closeSync(); }
+    const childTimeoutMs = timeoutMs - 12_000;
+    const outcome = await (options.run ?? runInProcessGroup)(process.execPath,
+      [fileURLToPath(import.meta.url), '--scan-open-files'], { env: { PATH: process.env.PATH ?? '' }, input: Buffer.from(dir),
+        timeoutMs: childTimeoutMs, graceMs: 1_000, maxBuffer: 1024 * 1024 });
     if (now() >= deadline) throw new Error('Open-file probe timed out. Refusing to recover the rebase workspace.');
-    return users;
+    if (outcome.status === 0 && !outcome.stderr.trim()) {
+      const users = outcome.stdout.split('\n').filter(Boolean);
+      if (users.every(pid => /^\d+$/.test(pid))) return users;
+    }
+    throw new Error('Could not check which processes use the rebase workspace. Refusing to recover it.');
   }
   // runInProcessGroup may spend 1 s on SIGTERM, 10 s draining the group, and 1 s draining pipes after its timer.
   const childTimeoutMs = timeoutMs - 12_000;
@@ -341,3 +368,6 @@ export async function hostOpenFilesBounded(dir: string, options: { timeoutMs?: n
   if (outcome.status === 1 && !outcome.stdout && !outcome.stderr.trim() && !outcome.error) return [];
   throw new Error('Could not check which processes use the rebase workspace. Refusing to recover it.');
 }
+
+if (process.argv[1] === fileURLToPath(import.meta.url) && process.argv[2] === '--scan-open-files')
+  process.stdout.write(`${linuxOpenFiles(readFileSync(0, 'utf8')).join('\n')}\n`);

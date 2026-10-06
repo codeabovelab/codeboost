@@ -39,7 +39,8 @@ async function setup(conflict = false) {
   await ensureCommit(repository, foreign); await ensureCommit(repository, onto);
   const rebaser = new GitRebaser({ repository, runnerRoot, runnerOwner: OWNER,
     committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
-    onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {} });
+    onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+    onResult: () => {} });
   return { root, source, runnerRoot, repository, rebaser, base, owned, foreign, onto };
 }
 
@@ -67,6 +68,17 @@ describe('trusted pre-merge rebase', () => {
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
   });
 
+  it('rejects a result callback that blocks past the operation deadline', async () => {
+    const s = await setup(), attemptId = randomUUID();
+    const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
+      committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+      onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+      onResult: () => vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER) });
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
+      .rejects.toThrow(/deadline expired while recording its result/);
+    expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
+  });
+
   it('never overwrites or deletes a retained result when an attempt ID is reused', async () => {
     const s = await setup(), attemptId = randomUUID();
     const first = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
@@ -77,6 +89,7 @@ describe('trusted pre-merge rebase', () => {
       .rejects.toThrow(/already has a retained result/);
     await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
       .rejects.toThrow(/already has a retained result/);
+    await s.rebaser.abort(attemptId); // A reused live/startup marker has no ownership value for the earlier result.
     expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(first.head);
   });
 
@@ -134,7 +147,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroupSettled: (ownedAttempt, group) => {
         expect(ownedAttempt).toBe(attemptId);
         if (group !== 'spawning') { expect(active.get(group.pgid)).toBe(group.startedAt); active.delete(group.pgid); }
-      }, onProcessUnsettled: () => {} });
+      }, onProcessUnsettled: () => {}, onResult: () => {} });
     await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
     expect(seen.length).toBeGreaterThan(1);
     expect(active.size).toBe(0);
@@ -144,7 +157,8 @@ describe('trusted pre-merge rebase', () => {
     const s = await setup();
     expect(() => new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, timeoutMs: 43_000,
-      onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {} })).toThrow(/Invalid rebase deadline/);
+      onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+      onResult: () => {} })).toThrow(/Invalid rebase deadline/);
   });
 
   it('does not start Git when a synchronous ownership hook exhausts the work deadline', async () => {
@@ -154,7 +168,8 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, timeoutMs: 43_001,
       onProcessStarting: () => { starts++; const until = performance.now() + 2; while (performance.now() < until) { /* block */ } },
       onProcessGroup: () => { throw new Error('Git must not spawn after the deadline.'); },
-      onProcessGroupSettled: (_attempt, group) => { if (group === 'spawning') settled++; }, onProcessUnsettled: () => {} });
+      onProcessGroupSettled: (_attempt, group) => { if (group === 'spawning') settled++; }, onProcessUnsettled: () => {},
+      onResult: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })).rejects.toThrow(/deadline expired/);
     expect({ starts, settled }).toEqual({ starts: 1, settled: 1 });
   });
@@ -169,7 +184,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroupSettled: () => {
         if (firstSettlement) { expect(groups).toBe(0); firstSettlement = false; }
         expect(owner).not.toBe('none'); owner = 'none';
-      }, onProcessUnsettled: () => {} });
+      }, onProcessUnsettled: () => {}, onResult: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto }))
       .rejects.toThrow('ownership commit outcome unknown');
     expect(owner).toBe('none');
@@ -182,7 +197,8 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, timeoutMs: 43_001,
       onProcessStarting: () => { const until = performance.now() + 2; while (performance.now() < until) { /* block */ } },
       onProcessGroup: () => { throw new Error('Git must not spawn after the deadline.'); },
-      onProcessGroupSettled: () => { throw new Error('settlement write failed'); }, onProcessUnsettled: () => {} });
+      onProcessGroupSettled: () => { throw new Error('settlement write failed'); }, onProcessUnsettled: () => {},
+      onResult: () => {} });
     const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
@@ -201,7 +217,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroupSettled: () => {
         if (++settled === 2 && !overran) { overran = true; vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER); }
       },
-      onProcessUnsettled: () => {} });
+      onProcessUnsettled: () => {}, onResult: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
       .rejects.toThrow(/deadline expired while recording process settlement/);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -215,7 +231,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroup: () => { processes++; },
       onProcessGroupSettled: () => {
         if (processes === 7 && !overran) { overran = true; vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER); }
-      }, onProcessUnsettled: () => {} });
+      }, onProcessUnsettled: () => {}, onResult: () => {} });
     const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
@@ -290,7 +306,7 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => {},
       onProcessGroup: () => { if (++processes === 7) stop.abort(new Error('cancelled during rebase')); },
-      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {} });
+      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled during rebase');
     expect(processes).toBeGreaterThanOrEqual(9); // stopped rebase, worktree removal, then pruning
@@ -304,7 +320,7 @@ describe('trusted pre-merge rebase', () => {
     const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, onProcessStarting: () => {},
       onProcessGroup: () => { if (++processes === 8) stop.abort(new Error('cancelled during conflict classification')); },
-      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {} });
+      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled during conflict classification');
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -317,7 +333,7 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => {}, onProcessGroup: () => stop.abort(new Error('cancelled by caller')),
       onProcessGroupSettled: () => { if (!failed) { failed = true; throw new Error('settlement write failed'); } },
-      onProcessUnsettled: () => {} });
+      onProcessUnsettled: () => {}, onResult: () => {} });
     const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
@@ -334,7 +350,7 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => { if (++starts === 8) throw new Error('cleanup record failed'); },
       onProcessGroup: () => { if (++processes === 7) stop.abort(new Error('original cancellation')); },
-      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {} });
+      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
     const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
@@ -351,7 +367,7 @@ describe('trusted pre-merge rebase', () => {
     const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, onProcessStarting: () => {},
       onProcessGroup: () => { if (++processes === 14) stop.abort(new Error('cancelled during cleanup')); },
-      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {} });
+      onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled during cleanup');
     expect(processes).toBeGreaterThanOrEqual(16); // result ref, worktree cleanup, prune, then result-ref deletion
@@ -372,7 +388,7 @@ describe('trusted pre-merge rebase', () => {
           throw new Error('result ref outcome unknown');
         }
       },
-      onProcessUnsettled: () => {} });
+      onProcessUnsettled: () => {}, onResult: () => {} });
     const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
@@ -383,13 +399,27 @@ describe('trusted pre-merge rebase', () => {
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).not.toThrow();
   });
 
-  it('aborts only the validated attempt workspace and ref', async () => {
+  it('aborts only a retained ref whose exact value is durably owned by the attempt', async () => {
     const s = await setup(), attemptId = randomUUID();
     const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
     expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(result.head);
     await s.rebaser.abort(attemptId);
+    expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(result.head);
+    await s.rebaser.abort(attemptId, result.head);
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
     await expect(s.rebaser.abort('../other')).rejects.toThrow(/UUID v4/);
+  });
+
+  it('removes its retained ref when durable result ownership cannot be recorded', async () => {
+    const s = await setup(), attemptId = randomUUID();
+    const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
+      committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+      onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+      onResult: () => { throw new Error('result ownership write failed'); } });
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto }))
+      .rejects.toThrow('result ownership write failed');
+    expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
   });
 
   it('prunes an exact stale worktree registration even when its directory is already gone', async () => {

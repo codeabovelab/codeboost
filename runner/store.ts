@@ -89,6 +89,8 @@ export interface RebaseMarker {
   oldHead: string;
   onto: string;
   startedAt: number;
+  resultHead: string | null;
+  resultMappings: { oldSha: string; newSha: string }[] | null;
   processGroup: { pgid: number; startedAt: number } | 'spawning' | 'unsettled' | null;
 }
 export interface AttemptRecord {
@@ -718,7 +720,8 @@ export class Store {
     const attemptId = input.attemptId ?? randomUUID(), startedAt = input.startedAt ?? Date.now();
     assertUuidV4(attemptId, 'Rebase attempt ID');
     if (!Number.isSafeInteger(startedAt) || startedAt < 0) throw new Error('Invalid rebase start time.');
-    const marker: RebaseMarker = { attemptId, oldBase: input.oldBase, oldHead: input.oldHead, onto: input.onto, startedAt, processGroup: null };
+    const marker: RebaseMarker = { attemptId, oldBase: input.oldBase, oldHead: input.oldHead, onto: input.onto, startedAt,
+      resultHead: null, resultMappings: null, processGroup: null };
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
@@ -754,6 +757,33 @@ export class Store {
         throw new GuardRefusal('This rebase attempt no longer owns the task.');
     });
   }
+  /** Bind the complete result and its exact retained ref value before the rebaser can return it to its caller. */
+  setRebaseResult(planKey: string, attemptId: string, head: string | null,
+    mappings: readonly { oldSha: string; newSha: string }[]): void {
+    assertUuidV4(attemptId, 'Rebase attempt ID'); if (head !== null) sha(head);
+    if (mappings.length > 500) throw new Error('Rebase history exceeds 500 commits.');
+    const sources = new Set<string>(), destinations = new Set<string>();
+    for (const mapping of mappings) {
+      sha(mapping.oldSha); sha(mapping.newSha);
+      if (sources.has(mapping.oldSha) || destinations.has(mapping.newSha)) throw new Error('Rebase mappings must be one-to-one.');
+      sources.add(mapping.oldSha); destinations.add(mapping.newSha);
+    }
+    this.#transaction(() => {
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
+      if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if ((marker.onto === marker.oldBase) !== (head === null)) throw new GuardRefusal('The retained rebase result does not match its target.');
+      const endpoint = mappings.at(-1);
+      if (marker.oldHead === marker.oldBase ? mappings.length !== 0 : !endpoint || endpoint.oldSha !== marker.oldHead ||
+          (head === null ? endpoint.newSha !== marker.oldHead || mappings.some(mapping => mapping.oldSha !== mapping.newSha) : endpoint.newSha !== head))
+        throw new GuardRefusal('The retained rebase history does not end at its captured head.');
+      if (marker.resultMappings !== null && (marker.resultHead !== head || stable(marker.resultMappings) !== stable(mappings)))
+        throw new GuardRefusal('Another result owns this rebase.');
+      if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
+        encode({ ...marker, resultHead: head, resultMappings: [...mappings] }), planKey, task.rebase_in_progress as string).changes !== 1)
+        throw new GuardRefusal('This rebase attempt no longer owns the task.');
+    });
+  }
   /** Publish a rebase only while every review and task counter captured by its attempt is still current. */
   finishRebase(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, expectedTaskStateVersion: number,
     attemptId: string, base: string, head: string, mappings: readonly { oldSha: string; newSha: string }[]): Snapshot {
@@ -768,13 +798,15 @@ export class Store {
       if (task.state_version !== expectedTaskStateVersion + 1) throw new GuardRefusal('The task changed during the rebase. Discard its result.');
       if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
       if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.resultMappings === null || (marker.onto === marker.oldBase ? marker.resultHead !== null : marker.resultHead !== head))
+        throw new GuardRefusal('The rebase result does not own its retained ref.');
       const captured = this.getSnapshot(identity);
       if (marker.oldBase !== captured.base || marker.oldHead !== captured.head || marker.onto !== base)
         throw new GuardRefusal('The rebase result does not match its captured base and head.');
       const endpoint = mappings.at(-1);
       if (marker.oldHead === marker.oldBase
         ? mappings.length !== 0 || head !== base
-        : !endpoint || endpoint.oldSha !== marker.oldHead || endpoint.newSha !== head)
+        : !endpoint || endpoint.oldSha !== marker.oldHead || endpoint.newSha !== head || stable(mappings) !== stable(marker.resultMappings))
         throw new GuardRefusal('The rebase mapping does not end at the captured and rewritten heads.');
       this.#assertContextWritable(key);
       const snapshot = this.#applyRebase(identity, key, base, head, mappings);

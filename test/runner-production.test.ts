@@ -228,12 +228,18 @@ describe('recovery warnings', () => {
 
 describe('D adapters', () => {
   it('routes an interrupted rebase marker to the production rebaser before Store recovery clears it', async () => {
-    const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID() };
+    const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID(), resultHead: '7'.repeat(40) };
     const deps = dRecoveryDeps(() => 'sha256:x', { abort } as unknown as GitRebaser, 'plan-key');
     await deps.abortRebase!('plan-key', marker);
-    expect(abort).toHaveBeenCalledWith(marker.attemptId);
+    expect(abort).toHaveBeenCalledWith(marker.attemptId, marker.resultHead);
     await expect(deps.abortRebase!('another-plan', marker)).rejects.toThrow(/another configured plan/);
     expect(abort).toHaveBeenCalledTimes(1);
+  });
+  it('does not grant a reused or legacy recovery marker ownership of an existing result ref', async () => {
+    const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID(), resultHead: null };
+    const deps = dRecoveryDeps(() => 'sha256:x', { abort } as unknown as GitRebaser, 'plan-key');
+    await deps.abortRebase!('plan-key', marker);
+    expect(abort).toHaveBeenCalledWith(marker.attemptId, undefined);
   });
   it('passes D\'s own handles through, and turns every unowned object into the command that removes it', async () => {
     const handle = Object.freeze({ runnerOwner: OWNER, attemptId: randomUUID(), allocationId: randomUUID() });

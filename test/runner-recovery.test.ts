@@ -257,6 +257,34 @@ describe('startup recovery sequence', () => {
     expect(calls).toEqual(['recover', 'terminate:5151', 'abort-rebase']);
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
+  it('passes only the exact durably owned result ref to rebase recovery', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123 });
+    store.setRebaseResult(store.getTask(id(1)).planKey, marker.attemptId, oid(4),
+      [{ oldSha: snapshot.head, newSha: oid(4) }]);
+    const abortRebase = vi.fn(async () => undefined);
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d });
+    expect(abortRebase).toHaveBeenCalledWith(store.getTask(id(1)).planKey,
+      expect.objectContaining({ attemptId: marker.attemptId, resultHead: oid(4),
+        resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }], processGroup: null }));
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('normalizes a legacy rebase marker without result ownership and preserves its ref during recovery', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123, processGroup: null };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const abortRebase = vi.fn(async () => undefined);
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d });
+    expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, resultHead: null, resultMappings: null });
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
   it('retains a dead-group marker while another process still uses its rebase workspace', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
@@ -459,6 +487,16 @@ describe('host process checks', () => {
     await expect(hostOpenFilesBounded(root, { platform: 'darwin', now: () => at,
       run: async () => { at = 15_000; return { status: 0, stdout: '', stderr: '' }; } }))
       .rejects.toThrow(/timed out/);
+  });
+  it('runs the Linux proc walk in the owned subprocess whose settlement is inside the deadline', async () => {
+    const root = dir(); let at = 0, seen: { input?: Buffer; timeoutMs: number } | undefined;
+    await expect(hostOpenFilesBounded(root, { platform: 'linux', now: () => at,
+      run: async (file, args, options) => {
+        expect(file).toBe(process.execPath); expect(args).toContain('--scan-open-files'); seen = options;
+        at = 15_000; return { status: 0, stdout: '123\n', stderr: '' };
+      } })).rejects.toThrow(/timed out/);
+    expect(seen?.input?.toString()).toBe(root);
+    expect(seen?.timeoutMs).toBe(3_000);
   });
   it('does not treat an incomplete lsof scan as proving that the workspace is unused', async () => {
     const root = dir();
