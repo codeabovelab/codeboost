@@ -1,6 +1,5 @@
-import { createHash } from 'node:crypto';
-import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
-import { delimiter, join, resolve, sep } from 'node:path';
+import { accessSync, constants, lstatSync, realpathSync, statSync } from 'node:fs';
+import { delimiter, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import type { DockerOutcome } from '../agents/docker.ts';
@@ -339,10 +338,9 @@ export class GitRebaser {
     await this.#git(this.#options.repository.path, ['worktree', 'prune'], scope, true);
   }
 
-  async #pathRecords(repository: string, mode: 'conflicts' | 'changed' | 'untracked' | 'unmerged', scope: CallScope,
-    head?: string): Promise<string[]> {
+  async #pathRecords(repository: string, mode: 'conflicts' | 'unmerged', scope: CallScope): Promise<string[]> {
     const helper = fileURLToPath(new URL('./list-git-paths.ts', import.meta.url));
-    const args = [helper, this.#gitExecutable, mode, ...(head ? [head] : [])];
+    const args = [helper, this.#gitExecutable, mode];
     // Base64 expands the explicitly bounded 32 MiB raw stream by four thirds.
     const outcome = await this.#process(process.execPath, args, repository, this.#gitEnvironment, scope, false,
       Math.ceil(MAX_INDEX_BYTES / 3) * 4 + 4);
@@ -358,8 +356,8 @@ export class GitRebaser {
     catch { throw new RebaseConflict('A Git path cannot be represented safely; resolve it manually.'); }
   }
 
-  async #paths(repository: string, mode: 'conflicts' | 'changed' | 'untracked', scope: CallScope, head?: string): Promise<string[]> {
-    const paths = await this.#pathRecords(repository, mode, scope, head);
+  async #paths(repository: string, mode: 'conflicts', scope: CallScope): Promise<string[]> {
+    const paths = await this.#pathRecords(repository, mode, scope);
     if (paths.some(path => !path || path.includes('\0'))) throw new RebaseConflict('Git returned an invalid path.');
     return paths;
   }
@@ -395,37 +393,14 @@ export class GitRebaser {
   }
 
   async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, head: string, scope: CallScope): Promise<string> {
-    const changed = new Set([
-      ...await this.#paths(repository, 'changed', scope, head),
-      ...await this.#paths(repository, 'untracked', scope),
-    ]);
-    const entries: string[][] = [];
-    for (const path of [...changed].filter(value => !allowed.has(value)).sort()) {
-      const index = await this.#git(repository, ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', path], scope);
-      entries.push([path, index, this.#worktreeFingerprint(repository, path)]);
-    }
-    return JSON.stringify(entries);
-  }
-
-  #worktreeFingerprint(repository: string, path: string): string {
-    const full = resolve(repository, path), root = `${resolve(repository)}${sep}`;
-    if (!full.startsWith(root)) throw new RebaseConflict('Git returned a path outside the rebase workspace.');
-    const before = lstatSync(full, { throwIfNoEntry: false });
-    if (!before) return 'missing';
-    if (before.isSymbolicLink()) return `link:${before.mode}:${readlinkSync(full, { encoding: 'buffer' }).toString('hex')}`;
-    if (!before.isFile()) throw new RebaseConflict('A changed path is not a regular file or symbolic link.');
-    const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW);
-    try {
-      const stat = fstatSync(fd);
-      if (!stat.isFile()) throw new RebaseConflict('A changed path changed type while it was audited.');
-      const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(64 * 1024);
-      for (;;) {
-        const length = readSync(fd, buffer, 0, buffer.length, null);
-        if (!length) break;
-        hash.update(buffer.subarray(0, length));
-      }
-      return `file:${stat.mode}:${hash.digest('hex')}`;
-    } finally { closeSync(fd); }
+    const helper = fileURLToPath(new URL('./hash-outside-conflict.ts', import.meta.url));
+    const paths = Buffer.from(`${[...allowed].join('\0')}\0`);
+    const outcome = await this.#process(process.execPath, [helper, this.#gitExecutable, head], repository,
+      this.#gitEnvironment, scope, false, 64 * 1024, paths);
+    this.#throwIfCancelled(outcome, scope);
+    if (outcome.status !== 0 || !/^[0-9a-f]{64}$/.test(outcome.stdout))
+      throw this.#failure('outside-conflict audit', outcome, 'node');
+    return outcome.stdout;
   }
 
   async #resolveConflict(input: Omit<RebaseConflictInput, 'signal'>, scope: CallScope): Promise<void> {
