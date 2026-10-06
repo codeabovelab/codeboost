@@ -48,7 +48,11 @@ async function setup(agent: Record<string, string>) {
   const repository = await openRunnerRepository({ runnerRoot, runnerOwner: RUNNER_OWNER, repositoryId: identity.repositoryId, source });
   const workspace = createTaskWorkspace({ store, runnerRoot, runnerOwner: RUNNER_OWNER, repository, imageId, limits: LIMITS,
     committer: { name: 'codeboost', email: 'runner@codeboost.invalid' }, now: () => 1_700_000_000_000 });
-  const sources: ExecutionSources = { planContext: () => context, issue: () => ({ number: 1, title: 'Issue', body: 'Fix', comments: [] }),
+  const sources: ExecutionSources = { planContext: () => context, checkpointContext: (_identity, commit) => {
+    const review = new ReviewService({ database: join(root, 'state.sqlite'), repository: source, runnerRepository: repository.path,
+      identity, pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
+    try { return review.planContextAt(commit); } finally { review.close(); }
+  }, issue: () => ({ number: 1, title: 'Issue', body: 'Fix', comments: [] }),
     lessons: () => [], vendor: () => 'claude' };
   const findings = new SafetyFindings(store);
   // The agent: a container that edits the work volume, mounted as an agent container mounts it (metadata read-only).
@@ -125,17 +129,19 @@ describe('real task workspace (#87)', () => {
     const outcome = await s.executor.runTask(identity) as { kind: string; checkpointId: string };
     expect(outcome).toMatchObject({ kind: 'needs amendment', item: 'P1', outOfScope: ['extra.ts'] });
     const checkpoint = s.store.getCheckpoint(identity, outcome.checkpointId);
+    expect(checkpoint.baseEntries).toContainEqual({ path: 'extra.ts', kind: 'file' });
     // The review load reads the runner commit at the recorded head: it does not replace the checkpoint's snapshot.
     const review = new ReviewService({ database: join(s.root, 'state.sqlite'), repository: s.source, runnerRepository: s.repository.path,
       identity, pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
-    try { expect(review.load().snapshot.id).toBe(checkpoint.snapshotId); } finally { review.close(); }
+    expect(review.load().snapshot.id).toBe(checkpoint.snapshotId);
     // A person amends the plan to declare the extra file, then approves continuing from the audited checkpoint.
     const amended = { ...plan, items: [{ ...plan.items[0]!, files: [...plan.items[0]!.files, { path: 'extra.ts', kind: 'add' as const, renamed_from: null, change: 'z' }] }, plan.items[1]!] };
     s.store.importRevision(JSON.stringify(amended), 'json', { identity, issue: 1, pathKey: p => p, allowedCommands: [],
       baseEntries: [{ path: 'a.ts', kind: 'file' }, { path: 'b.ts', kind: 'file' }] }, 1);
     const revision = s.store.getPlan(identity).revision;
     expect(() => s.store.approveContinuation(identity, outcome.checkpointId, { revision, snapshotId: checkpoint.snapshotId,
-      reviewVersion: s.store.reviewVersion(identity) })).not.toThrow();
+      reviewVersion: s.store.reviewVersion(identity) }, review.planContextAt(s.store.getSnapshot(identity).head))).not.toThrow();
     expect(s.store.continuationRevision(identity, outcome.checkpointId)).toBe(revision);
+    review.close();
   }, 600_000);
 });

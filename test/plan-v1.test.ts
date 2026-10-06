@@ -1,7 +1,7 @@
 import { parseV1 } from '../core/parse-v1.ts';
 import { describe, expect, it } from 'vitest';
 import { stringify } from 'yaml';
-import { commandAllowed, commandArgv, importPlan, validatePlan, type Plan } from '../core/plan.ts';
+import { commandAllowed, commandArgv, importPlan, validateContinuationPlan, validatePlan, type Plan } from '../core/plan.ts';
 const plan = (): Plan => ({ schema_version: 1, issue: 1, revision: 1, summary: 'Example', questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
 const context = { identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, issue: 1, baseFiles: ['a'], baseEntries: [{ path: 'a', kind: 'file' as const }], pathKey: (p: string) => p, allowedCommands: [] };
 describe('frozen v1 input contract', () => {
@@ -18,6 +18,10 @@ describe('frozen v1 input contract', () => {
  it('rejects decoded duplicate JSON keys', () => {
   const input = JSON.stringify(plan()).replace('"issue":1', '"issue":2,"iss\\u0075e":1');
   expect(() => importPlan(input, 'json', context, 2)).toThrow(/duplicate/i);
+ });
+ it('rejects an amended suffix that reuses a completed item ID', () => {
+  const value = plan(); value.items.push({ ...structuredClone(value.items[0]!), title: 'Different P1 work', intent: 'Must not shadow completed P1', depends_on: ['P1'] });
+  expect(validateContinuationPlan(value, context, ['P1'], true).errors).toContainEqual(expect.objectContaining({ code: 'duplicate-id' }));
  });
  it.each(['&unused Example', '!!str Example', '', '.nan', '0x10', '1_000'])('rejects prohibited YAML scalar %s before schema checks', scalar => {
   const input = stringify(plan()).replace('summary: Example', 'summary: '+scalar);

@@ -33,7 +33,8 @@ async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before
     options.before?.(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
-    const sources: ExecutionSources = { planContext: () => service.planContext(), issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+    const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
+      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
     const findings = new SafetyFindings(service.store);
     options.findings?.(findings, service);
     return { deps, sources, findings, recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
@@ -81,6 +82,7 @@ function committedFirstItem(service: ReviewService, unchanged = false, outOfScop
   if (unchanged) s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
   else s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true, result: { head, unchanged: false, inScope: [], outOfScope },
     history: { base: snapshot.base, head, entries: [{ sha: head, owner: item, origin: 'owned', sourceSha: null }] } });
+  return attempt.id;
 }
 /** Save a new plan revision, as a person editing the plan does. */
 function revise(service: ReviewService) {
@@ -210,6 +212,98 @@ describe('resume (#91 part 2)', () => {
 });
 
 describe('start and resume refusals and races (#91 part 2)', () => {
+  it('retains current-revision approvals over completed continuation items and starts the next suffix item', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), itemIds = s.getPlan(id).items.map(item => item.id);
+      const entries = [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: itemIds[0]!, completedItems: [itemIds[0]!], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the observed file' });
+      const context = { ...service.planContext(), baseEntries: entries };
+      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
+      const next = s.getPlan(id);
+      s.saveReview(id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+        next.items.map(item => approveItem(next, [], item.id, id, true)), []);
+      service.planContextAt = () => context;
+      s.approveContinuation(id, checkpoint.id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, context);
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: itemIds[1]!,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id);
+      const committedHead = 'd'.repeat(40);
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head: committedHead, unchanged: false, inScope: [], outOfScope: [] },
+        history: { base: snapshot.base, head: committedHead, entries: [{ sha: committedHead, owner: itemIds[1]!, origin: 'owned', sourceSha: null }] } });
+    } });
+    expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+    expect(await view(app)).toMatchObject({ resumable: true, continuation: { completedItems: [items[0], items[1]], next: items[2], approved: true } });
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[2] });
+    expect(store.getAttempts(identity).at(-1)?.item).toBe(items[2]);
+  });
+  it('does not skip a completed continuation item edited without changing its ID', async () => {
+    let baseContext: ReturnType<ReviewService['planContext']> | undefined;
+    const { identity, store } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), itemIds = s.getPlan(id).items.map(item => item.id);
+      baseContext = service.planContext();
+      // Keep the import context so the regression can restore the executed definition with different object-key order.
+      const entries = [...baseContext.baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: itemIds[0]!, completedItems: [itemIds[0]!], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the observed file' });
+      const context = { ...service.planContext(), baseEntries: entries };
+      s.importRevision(JSON.stringify(amended), 'json', baseContext, 1);
+      const next = s.getPlan(id);
+      s.saveReview(id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+        next.items.map(item => approveItem(next, [], item.id, id, true)), []);
+      service.planContextAt = () => context;
+      s.approveContinuation(id, checkpoint.id, { revision: next.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, context);
+      const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: itemIds[1]!,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, attempt.id);
+      s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+      const changed = s.getPlan(id);
+      changed.items[1]!.intent += ' (revised after execution)';
+      expect(() => s.importRevision(JSON.stringify(changed), 'json', baseContext!, next.revision))
+        .toThrow(/Completed item P2 changed after it ran/);
+      expect(s.getPlan(id).revision).toBe(next.revision);
+    } });
+    const restored = store.getPlan(identity), item = restored.items[1]!;
+    restored.items[1] = { acceptance: item.acceptance, files: item.files, id: item.id, title: item.title, intent: item.intent, depends_on: item.depends_on };
+    store.importRevision(JSON.stringify(restored), 'json', baseContext!, store.getPlan(identity).revision);
+    expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1', 'P2'], next: 'P3' });
+  });
+  it('requires explicit continuation approval and resumes at the audited suffix through the API', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
+      const entries = [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      s.pauseForAmendment(id, { revision: 1, snapshotId: snapshot.id }, {
+        item: s.getPlan(id).items[0]!.id, completedItems: [s.getPlan(id).items[0]!.id], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the observed file' });
+      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), 1);
+      const next = s.getPlan(id);
+      s.saveReview(id, { revision: next.revision, snapshotId: s.getSnapshot(id).id, reviewVersion: s.reviewVersion(id) },
+        next.items.map(item => approveItem(next, [], item.id, id, true)), []);
+      const baseContext = service.planContext();
+      service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+    } });
+    expect(await view(app)).toMatchObject({ resumable: false, startable: false });
+    expect((await act(app, 'resume')).body.error).toMatch(/Approve the amended plan continuation/);
+    const approved = await act(app, 'approve-continuation');
+    expect(approved).toMatchObject({ status: 200, body: { result: { outcome: 'approved', next: items[1] } } });
+    expect(store.getTask(identity).status).toBe('queued');
+    expect(await view(app)).toMatchObject({ resumable: true, startable: false });
+    expect((await act(app, 'resume')).body.result).toMatchObject({ outcome: 'started', item: items[1] });
+    expect(store.getAttempts(identity).map(row => row.item)).toEqual([items[0], items[1]]);
+  });
   it('guards start with the review version as well as the task state version', async () => {
     const { app, identity, store } = await serve();
     const before = await view(app);
@@ -256,12 +350,12 @@ describe('start and resume refusals and races (#91 part 2)', () => {
   it('refuses both, in the view and the action alike, once an earlier revision left commits (#88)', async () => {
     const { app } = await serve({ before: service => { committedFirstItem(service); revise(service); } });
     expect(await view(app)).toMatchObject({ startable: false, resumable: false });
-    expect((await act(app, 'resume')).body.error).toMatch(/revised after items of it were committed.*#88/);
-    expect((await act(app, 'start')).body.error).toMatch(/revised after items of it were committed.*#88/);
+    expect((await act(app, 'resume')).body.error).toMatch(/plan changed after runner commits without a scope checkpoint/);
+    expect((await act(app, 'start')).body.error).toMatch(/plan changed after runner commits without a scope checkpoint/);
   });
   it('counts a fix attempt\'s commit at an earlier revision too (#88)', async () => {
     const { app } = await serve({ before: service => { committedFirstItem(service, false, [], 'fix'); revise(service); } });
-    expect((await act(app, 'start')).body.error).toMatch(/revised after items of it were committed.*#88/);
+    expect((await act(app, 'start')).body.error).toMatch(/plan changed after runner commits without a scope checkpoint/);
   });
   it('lets admission refuse a spent budget, which moves the idle task to needs human; the view offers nothing', async () => {
     const { app, identity, store } = await serve({ before: service => { failedFirstItem(service, 1); } });
@@ -296,6 +390,53 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     } });
     expect(await view(app)).toMatchObject({ startable: false, resumable: false });
     expect((await act(app, 'start')).body.error).toMatch(/The task is running; start runs a task that is in review or queued/);
+    expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
+  });
+  it('clears a recovery requeue when an amended suffix removes the interrupted final item', async () => {
+    const { app, identity, store } = await serve({ before: service => {
+      const s = service.store, id = service.config.identity;
+      const plan = s.getPlan(id), firstTwo = plan.items.slice(0, 2).map(item => item.id), firstSnapshot = s.getSnapshot(id);
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      for (const item of plan.items.slice(0, 2)) {
+        const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: item.id,
+          expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+        s.markRunning(id, attempt.id);
+        const last = item.id === firstTwo[0];
+        s.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+          result: { head: firstSnapshot.head, unchanged: true, inScope: [], outOfScope: last ? ['extra.ts'] : [] } });
+        if (last) {
+          const entries = [...service.planContext().baseEntries, { path: 'extra.ts', kind: 'file' as const }];
+          const checkpoint = s.recordCheckpoint(id, { revision: plan.revision, snapshotId: firstSnapshot.id, reviewVersion: s.reviewVersion(id) }, {
+            item: item.id, completedItems: [item.id], outOfScopePaths: ['extra.ts'], baseEntries: entries,
+          });
+          const amended = s.getPlan(id);
+          amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare observed output' });
+          s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
+          const current = s.getPlan(id), snapshot = s.getSnapshot(id);
+          approvePlan(service);
+          const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
+          service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });
+          s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+            { ...checkpointContext, baseEntries: entries });
+        } else if (item.id === firstTwo[1]) {
+          // The preceding checkpoint is approved; this is continuation work P2.
+        }
+      }
+      const p3 = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: 'P3',
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, p3.id); s.recoverInterrupted(Date.now());
+      const checkpoint = s.latestCheckpoint(id)!, amended = s.getPlan(id);
+      amended.items = amended.items.slice(0, 2);
+      s.importRevision(JSON.stringify({ ...amended, revision: amended.revision + 1 }), 'json', service.planContext(), amended.revision);
+      const current = s.getPlan(id), snapshot = s.getSnapshot(id);
+      approvePlan(service);
+      const entries = checkpoint.baseEntries;
+      const checkpointContext = { ...service.planContext(), baseEntries: checkpoint.baseEntries };
+      service.planContextAt = () => ({ ...checkpointContext, baseEntries: entries });
+      s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) },
+        { ...checkpointContext, baseEntries: entries });
+    } });
+    expect(store.getTask(identity).requeuePending).toBe(false);
     expect((await act(app, 'resume')).body.error).toMatch(/Every item of this plan has run/);
   });
   it('neither offers nor admits start or resume while a run of the task is still finishing between items', async () => {
@@ -488,6 +629,50 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getTask(identity)).toMatchObject({ status: 'needs human', stateVersion: before + 1 });
     expect(store.getAttempts(identity)).toHaveLength(1);
   });
+  it('settles owed safety evidence before continuation reconciliation can refuse resume', async () => {
+    let earlier = '';
+    const { app, identity, store } = await serve({ before: service => {
+      earlier = committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id), plan = s.getPlan(id);
+      s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: plan.items[0]!.id, completedItems: [plan.items[0]!.id], outOfScopePaths: ['other.ts'],
+        baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
+      });
+    }, findings: findings => findings.record(earlier, 'Safety violation: checkpoint reconciliation regression') });
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs human');
+    expect(store.getAttempts(identity)[0]!.safetyFinding).toMatch(/checkpoint reconciliation regression/);
+  });
+  it('records an owed later scope pause before continuation reconciliation', async () => {
+    const { app, identity, store, items } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, firstSnapshot = s.getSnapshot(id), baseContext = service.planContext();
+      const entries = [...baseContext.baseEntries, { path: 'other.ts', kind: 'file' as const }];
+      const firstItem = s.getPlan(id).items[0]!.id;
+      const checkpoint = s.recordCheckpoint(id, { revision: 1, snapshotId: firstSnapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: firstItem, completedItems: [firstItem], outOfScopePaths: ['other.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'other.ts', kind: 'add', renamed_from: null, change: 'Declare the first observed path' });
+      s.importRevision(JSON.stringify(amended), 'json', baseContext, 1);
+      const current = s.getPlan(id), reviewSnapshot = s.getSnapshot(id);
+      s.saveReview(id, { revision: current.revision, snapshotId: reviewSnapshot.id, reviewVersion: s.reviewVersion(id) },
+        current.items.map(item => approveItem(current, [], item.id, id, true)), []);
+      service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+      s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: reviewSnapshot.id, reviewVersion: s.reviewVersion(id) },
+        { ...baseContext, baseEntries: entries });
+      const before = s.getSnapshot(id), second = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute',
+        item: current.items[1]!.id, expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, second.id);
+      const head = 'd'.repeat(40);
+      s.settleAttempt(id, second.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head, unchanged: false, inScope: [], outOfScope: ['later.ts'] },
+        history: { base: before.base, head, entries: [{ sha: head, owner: current.items[1]!.id, origin: 'owned', sourceSha: null }] } });
+    } });
+    expect((await act(app, 'resume')).body.result).toEqual({ outcome: 'settled' });
+    expect(store.getTask(identity).status).toBe('needs amendment');
+    expect(store.latestCheckpoint(identity)).toMatchObject({ item: items[1], completedItems: items.slice(0, 2), outOfScopePaths: ['later.ts'] });
+  });
   it('replays an action ID, and refuses a second resume made against the old state', async () => {
     const { app, identity, store } = await serve({ before: service => { failedFirstItem(service); } });
     const { stateVersion } = await view(app), actionId = randomUUID();
@@ -553,5 +738,81 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.getAttempts(identity)).toEqual([]);
     // Not recorded: the same action ID is refused afresh (503 again), never replayed as a saved refusal.
     expect((await act(app, 'start', { actionId })).status).toBe(503);
+  });
+  it('keeps continuation approval retryable once the runner stopped admission', async () => {
+    const { app, identity, store } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
+      s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: s.getPlan(id).items[0]!.id, completedItems: [s.getPlan(id).items[0]!.id], outOfScopePaths: ['other.ts'],
+        baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
+      });
+    } });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    app.runner!.rejectAdmission();
+    expect(await act(app, 'approve-continuation', { actionId })).toMatchObject({ status: 503 });
+    expect(store.savedAction(identity, { actionId, kind: 'approve-continuation', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeUndefined();
+  });
+  it('answers 503 to a stale continuation approval whose body finishes arriving after shutdown began, without saving the action refusal', async () => {
+    const { app, close, database, identity } = await serve({ before: service => {
+      committedFirstItem(service, false, ['other.ts']);
+      const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
+      s.recordCheckpoint(id, { revision: 1, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: s.getPlan(id).items[0]!.id, completedItems: [s.getPlan(id).items[0]!.id], outOfScopePaths: ['other.ts'],
+        baseEntries: [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' }],
+      });
+    } });
+    const current = await view(app), stateVersion = current.stateVersion - 1, reviewVersion = current.reviewVersion - 1;
+    const actionId = randomUUID(), url = new URL(app.url);
+    const text = JSON.stringify({ action: 'approve-continuation', expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId });
+    let finish!: () => void;
+    const response = new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)); });
+      req.on('error', reject);
+      req.write(text.slice(0, 5));
+      finish = () => req.end(text.slice(5));
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    finish();
+    expect(await response).toBe(503);
+    await closing;
+    const store = new Store(database); cleanups.push(() => store.close());
+    expect(store.savedAction(identity, { actionId, kind: 'approve-continuation', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeUndefined();
+  });
+  it('keeps a continuation approval retryable during shutdown when no runner is configured', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-no-runner-')); roots.push(root);
+    const demo = createDemo(join(root, 'demo'));
+    const app = await startServer({ ...demo, demo: false }, 0, undefined, undefined, 2_000);
+    let closed = false;
+    const close = async () => { if (!closed) { closed = true; await app.close(); } };
+    cleanups.push(close);
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID(), url = new URL(app.url);
+    const text = JSON.stringify({ action: 'approve-continuation', expectedStateVersion: stateVersion,
+      expectedReviewVersion: reviewVersion, actionId });
+    let finish!: () => void;
+    const response = new Promise<number>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)); });
+      req.on('error', reject);
+      req.write(text.slice(0, 5));
+      finish = () => req.end(text.slice(5));
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    finish();
+    expect(await response).toBe(503);
+    await closing;
+    const store = new Store(demo.database); cleanups.push(() => store.close());
+    expect(store.savedAction(demo.identity, { actionId, kind: 'approve-continuation', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeUndefined();
   });
 });

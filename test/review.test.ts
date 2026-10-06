@@ -7,6 +7,7 @@ import { createDemo } from '../scripts/demo.ts';
 import { ReviewService } from '../runner/review.ts';
 import { startServer } from '../web/server.ts';
 import { approveItem, reviewedSegment } from '../core/approvals.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 import { fixtureGit } from './fixtures/git.ts';
 // A passthrough, so the stale-key test can count how often load() serializes a segment.
 vi.mock('../core/approvals.ts', async original => { const actual = await original<typeof import('../core/approvals.ts')>(); return { ...actual, reviewedSegment: vi.fn(actual.reviewedSegment) }; });
@@ -39,6 +40,14 @@ it('offers reapproval when a later attribution choice invalidates execution appr
  expect(view.items.every(item=>item.state==='approved')).toBe(true);
  expect(service.store.unapprovedExecutionItems(config.identity,view.plan.revision)).toEqual([]);
 },30000);
+it('keeps review load available when continuation reconciliation refuses', () => {
+ const {service,config}=fixture();let view=service.load();
+ for(const item of view.items)view=service.act({action:'approve',item:item.id,confirmNoChange:item.count===0,token:view.token});
+ vi.spyOn(service.store,'unapprovedExecutionItems').mockImplementation(()=>{throw new GuardRefusal('Invalid continuation prefix.');});
+ expect(()=>service.load()).not.toThrow();
+ expect(service.load().items.every(item=>item.state==='stale')).toBe(true);
+ expect(service.store.getPlan(config.identity).items.map(item=>item.id)).toEqual(view.plan.items.map(item=>item.id));
+});
 it('keeps both sides of a declared rename in scope after manual reassignment',()=>{
  const {service,config}=fixture(),identity=config.identity,plan=service.store.getPlan(identity);
  plan.items=[{...plan.items[0]!,files:[{path:'renamed.ts',kind:'rename',renamed_from:'retry.ts',change:'Rename the implementation.'}],depends_on:[]}];

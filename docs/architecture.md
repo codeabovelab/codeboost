@@ -43,7 +43,7 @@ Writing standard: plain language, ISO 24495-1:2023
   - **In use:** plan and linking library, SQLite store, review screen, Ask (questions to a Claude agent), guarded merge with merge-queue support, ranked Issues screen, agent isolation boundary, and the single-runner lock.
   - **In use for a non-demo review with a `github` block:** planning. `/api/plan/suggestions` and `/api/plan/drafts` ask Claude, through lane D, for suggestion cards or a whole next plan revision (#117, #124). Nothing becomes a revision until you apply it.
   - **In use with an opt-in `runner` block in `review.json`:** the whole loop after planning. `start` and `resume` on `/api/runner` run a task's plan item by item with a Claude agent (#91). They require current plan-item approvals, bind both the task state and review version, recheck approvals before each later item, and refuse when a completed prefix no longer ends at the task's current head (#107). When a run ends, codeboost publishes the task's pull request, a draft if the task needs a person (#103). Approve & merge merges that pull request (#121). Cancelling a task closes its pull requests (#111). These are API actions; the screen has no buttons for them yet.
-  - **Not built:** the "trust this issue" action and its runner guard (#108), screens for planning and the runner actions, rebasing, running `cmd:` checks, review rounds, continuing after a scope pause (#88, in review as PR #134), and the Planning, Queue and Learning screens.
+  - **Not built:** the "trust this issue" action and its runner guard (#108), screens for planning and the runner actions, rebasing, running `cmd:` checks, review rounds, and the Planning, Queue and Learning screens.
 
 ## Terms used
 
@@ -276,7 +276,7 @@ sequenceDiagram
 
 ### Flow 4: carry out a plan and open the pull request (in use with the `runner` block)
 
-With the opt-in `runner` block, production runs the execution part of this flow: `POST /api/runner` with `start` (a task in review or queued) or `resume` (a task that stopped between items, or that recovery left to requeue) runs the plan from the first item the current revision has not completed (#91). Both refuse a closed task, a pending cancel, active work, a scope pause, and a plan revised after earlier runner commits; the last two wait for #88. When the run ends, `TaskPublishing` publishes by task status: a ready pull request when every item completed, a draft listing the problems when the task needs a person (#103). It also publishes on the `publish` action and once at start-up, and records the last outcome. The published head includes any commits that were on your branch before the runner's first commit; review shows them as Unplanned and the merge gate blocks until each is assigned or accepted (#113).
+With the opt-in `runner` block, production runs the execution part of this flow: `POST /api/runner` with `start` (a task in review or queued) or `resume` runs the plan from its first unfinished item (#91). A scope pause requires a revised plan that declares each changed path and passes validation against the runner commit's actual tree; `approve-continuation` records a person’s approval against the current revision and snapshot. Resume then reconciles every completed item after that checkpoint and starts only the remaining suffix. A later plan revision needs another continuation approval before more work starts. Both actions refuse a closed task, a pending cancel, active work, an unapproved continuation, or unrelated commits that cannot be reconciled. When the run ends, `TaskPublishing` publishes by task status: a ready pull request when every item completed, a draft listing the problems when the task needs a person (#103). It also publishes on the `publish` action and once at start-up, and records the last outcome. The published head includes any commits that were on your branch before the runner's first commit; review shows them as Unplanned and the merge gate blocks until each is assigned or accepted (#113).
 
 ```mermaid
 sequenceDiagram
@@ -356,11 +356,11 @@ The diagram shows the designed transitions. With the `runner` block, running, ne
 
 ### Stored data
 
-All state is in one SQLite file, opened with WAL and full synchronization. Each write takes an immediate write lock. The schema version is `PRAGMA user_version`, and migrations run in explicit steps (version 13 today); an unknown version fails.
+All state is in one SQLite file, opened with WAL and full synchronization. Each write takes an immediate write lock. The schema version is `PRAGMA user_version`, and migrations run in explicit steps (version 15 today); an unknown version fails.
 
 | Group | Tables | Notes |
 |---|---|---|
-| Plans | `plans`, `revisions`, `requests` | SQLite allocates revision numbers. Old revisions are never changed. Suggestion and draft requests (`mode`, #124) are bound to a revision and snapshot. |
+| Plans | `plans`, `revisions`, `requests` | SQLite allocates revision numbers. Old revisions are never changed. Suggestion and draft requests (`mode`, #124) are bound to a revision and snapshot; continuation requests also retain their checkpoint, audited head and completed prefix. |
 | Code history | `snapshots`, `ledger`, `rewrites` | Ledger entries are immutable. Rebase mappings record which old commit became which new one; foreign stays foreign. |
 | Review | `approvals`, `choices`, `review_notes`, `checkpoints`, `continuations` | Stored approvals are claims about a past snapshot. Freshness is recomputed every time. |
 | Runner | `tasks`, `attempts`, `user_actions`, `feedback_events`, `merge_attempts`, `app_settings` | User actions carry idempotency keys. Feedback events are append-only and feed the future learning feature. An attempt carries its safety finding and diagnostic reference. `app_settings` holds the runner, Ask and planning owner tokens. |

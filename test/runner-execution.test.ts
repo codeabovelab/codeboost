@@ -80,7 +80,11 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
     },
   };
   const auditContext: PlanContext = options.pathKeyError ? { ...context, pathKey: () => { throw options.pathKeyError; } } : context;
-  const sources: ExecutionSources = { planContext: () => auditContext, issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
+  const sources: ExecutionSources = { planContext: () => auditContext,
+    checkpointContext: () => ({ ...auditContext, baseEntries: [...auditContext.baseEntries,
+      ...Object.values(options.manifests ?? {}).flatMap(value => value.changes.filter(change => change.kind === 'add' && change.path === 'extra.ts')
+        .map(change => ({ path: change.path, kind: 'file' as const })))] }),
+    issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [], checks: unknown[] = [];
   const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
@@ -634,24 +638,58 @@ describe('item execution', () => {
     expect(store.getTask(identity).status).toBe('needs amendment');
     expect(h.commits.map(c => c.item)).toEqual(['P1']);
   });
-  it('runs no further items once a task has a scope checkpoint, even after an approved continuation (not supported yet)', async () => {
+  it('resumes only the remaining item after an audited, approved scope amendment', async () => {
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) } });
     const paused = await h.executor.runTask(identity);
     expect(paused).toMatchObject({ kind: 'needs amendment', item: 'P1' });
     const store = h.store;
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
-    const refused = { kind: 'stopped', state: 'not started', reason: expect.stringMatching(/Continuing after a scope pause is not supported yet/) };
+    const refused = { kind: 'stopped', state: 'not started', reason: expect.stringMatching(/needs an approved continuation/) };
     expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject(refused);
     const amended = { ...plan, revision: 2, items: [{ ...plan.items[0]!, files: [...plan.items[0]!.files, { path: 'extra.ts', kind: 'add', renamed_from: null, change: 'z' }] }, plan.items[1]!] };
     store.importRevision(JSON.stringify(amended), 'json', context, 1);
-    store.approveContinuation(identity, (paused as { checkpointId: string }).checkpointId, { revision: 2, snapshotId: store.getSnapshot(identity).id });
-    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject(refused);
+    store.approveContinuation(identity, (paused as { checkpointId: string }).checkpointId, { revision: 2, snapshotId: store.getSnapshot(identity).id },
+      h.sources.checkpointContext(identity, store.getSnapshot(identity).head));
+    expect(store.getCheckpoint(identity, (paused as { checkpointId: string }).checkpointId).baseEntries).toContainEqual({ path: 'extra.ts', kind: 'file' });
+    expect(await h.executor.runTask(identity, { fromItem: 'P1' })).toMatchObject({ kind: 'stopped', state: 'not started', reason: expect.stringMatching(/must start with P2/) });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'executed', items: ['P2'] });
+    expect(h.commits.map(c => c.item)).toEqual(['P1', 'P2']);
+    expect((await h.executor.runTask(identity)).kind).toBe('stopped');
     // A later snapshot with the same head does not make the recorded pause owed again.
     const snapshot = store.getSnapshot(identity);
     store.recordHistory(identity, { revision: 2, snapshotId: snapshot.id }, snapshot.base, snapshot.head, []);
-    expect(await h.executor.runTask(identity, { fromItem: 'P2' })).toMatchObject(refused);
-    expect(store.getTask(identity).status).toBe('queued');
-    expect(h.commits.map(c => c.item)).toEqual(['P1']);
+    expect((await h.executor.runTask(identity)).kind).toBe('stopped');
+    expect(h.commits.map(c => c.item)).toEqual(['P1', 'P2']);
+  });
+  it('requires a new continuation approval after a later revision consumes the original checkpoint', async () => {
+    const three: Plan = { ...structuredClone(plan), items: [...structuredClone(plan.items), {
+      id: 'P3', title: 'Third', intent: 'Finish a', files: [{ path: 'a.ts', kind: 'edit', renamed_from: null, change: 'finish' }],
+      acceptance: [{ type: 'check', text: 'a reads well' }], depends_on: ['P2'],
+    }] };
+    let h: ReturnType<typeof setup>;
+    let revised = false;
+    h = setup({ plan: three, manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]),
+      P3: manifest([change('a.ts')]) },
+      release: async () => {
+        if (revised || h.store.getAttempts(identity).at(-1)?.item !== 'P2') return;
+        revised = true;
+        const current = h.store.getPlan(identity);
+        h.store.importRevision(JSON.stringify(current), 'json', context, current.revision);
+      } });
+    const pause = await h.executor.runTask(identity) as { checkpointId: string };
+    const amended = h.store.getPlan(identity);
+    amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'observed' });
+    h.store.importRevision(JSON.stringify(amended), 'json', context, 1);
+    h.store.approveContinuation(identity, pause.checkpointId, { revision: 2, snapshotId: h.store.getSnapshot(identity).id },
+      h.sources.checkpointContext(identity, h.store.getSnapshot(identity).head));
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P3', reason: expect.stringMatching(/plan changed/) });
+    expect(h.store.getPlan(identity).revision).toBe(3);
+    expect(h.store.continuationProgress(identity)?.completed).toEqual(['P1', 'P2']);
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P3', reason: expect.stringMatching(/approved continuation/) });
+    h.store.approveContinuation(identity, pause.checkpointId, { revision: 3, snapshotId: h.store.getSnapshot(identity).id },
+      h.sources.checkpointContext(identity, h.store.getSnapshot(identity).head));
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'executed', items: ['P3'] });
+    expect(h.commits.map(commit => commit.item)).toEqual(['P1', 'P2', 'P3']);
   });
   it('fails the attempt when the workspace makes no new commit for a changed item', async () => {
     const { store, executor } = setup({ commitHead: oid(2) });

@@ -102,6 +102,35 @@ it('validates cards independently and rejects a batch with even one dependent in
   const value = reply(); value.edits.push({ ...value.edits[0]!, item: 'P2' });
   expect(() => prepareSuggestions({ ...input(), previousPlan: plan() }).validate(JSON.stringify(value))).toThrow(/Target item/);
 });
+it('validates follow-up drafts and cards only against the audited unfinished suffix', () => {
+  const previous = plan();
+  previous.items[0]!.files = [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Original planned output' }];
+  previous.items.push({ id: 'P2', title: 'Finish planned output', intent: 'Create the file that P1 did not produce',
+    files: [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'Create planned output' }],
+    acceptance: [{ type: 'check', text: 'The file exists' }], depends_on: ['P1'] });
+  const value = { ...input(), context: { ...input().context, baseEntries: [] }, completedItems: ['P1'], previousPlan: previous,
+    continuationContext: { checkpointId: 'cp-1', head: 'a'.repeat(40), completedItems: ['P1'], ownerItem: 'P1', outOfScopePaths: ['debug.log'] } };
+  const draft = { ...previous, revision: 2 };
+  expect(prepareDraft({ ...value, revision: 2 }).validate(JSON.stringify(draft)).value).toEqual(draft);
+  const suggestion = reply(); suggestion.edits[0]!.item = 'P2';
+  expect(prepareSuggestions(value).validate(JSON.stringify(suggestion)).value).toEqual(suggestion);
+});
+it('gives continuation authors checkpoint constraints and permits correction of an invalid unfinished suffix', () => {
+  const previous = plan();
+  previous.items[0]!.files = [{ path: 'planned.ts', kind: 'add', renamed_from: null, change: 'P1 planned output' }];
+  previous.items.push({ id: 'P2', title: 'Edit missing output', intent: 'Update the output',
+    files: [{ path: 'planned.ts', kind: 'edit', renamed_from: null, change: 'Update it' }],
+    acceptance: [{ type: 'check', text: 'The output exists' }], depends_on: ['P1'] });
+  const value = { ...input(), revision: 1, context: { ...input().context, baseEntries: [] }, completedItems: ['P1'], previousPlan: previous,
+    continuationContext: { checkpointId: 'cp-1', head: 'a'.repeat(40), completedItems: ['P1'], ownerItem: 'P1', outOfScopePaths: ['extra.ts'] } };
+  const prepared = prepareSuggestions(value);
+  expect(prepared.request.prompt).toContain('"completedItems"');
+  expect(prepared.request.prompt).toContain('"ownerItem":"P1"');
+  expect(prepared.request.prompt).toContain('"outOfScopePaths":["extra.ts"]');
+  const correction = { ...previous, revision: 2, items: structuredClone(previous.items) };
+  correction.items[1]!.files[0]!.kind = 'add';
+  expect(prepareDraft({ ...value, revision: 2 }).validate(JSON.stringify(correction)).value).toEqual(correction);
+});
 it('serializes only the four issue contract fields, excluding API metadata', () => {
   const value = input();
   value.issue = { ...value.issue, privateMetadata: 'must not reach provider' } as typeof value.issue;

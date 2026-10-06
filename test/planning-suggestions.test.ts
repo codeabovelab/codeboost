@@ -1,4 +1,5 @@
 import { mkdtempSync, rmSync } from 'node:fs';
+import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
@@ -35,6 +36,23 @@ function fixture(provider?: AuthorProvider) {
   const coordinator = new SuggestionCoordinator(store, provider ?? { invoke(request, signal) { calls.push({ request, signal }); return pending.promise; } }, 100);
   return { store, path: join(dir, 'state.sqlite'), value, identity, pending, calls, coordinator };
 }
+function checkpointFixture() {
+  const f = fixture(), next = f.store.getPlan(f.identity);
+  f.value.context.baseEntries = [...f.value.context.baseEntries, { path: 'b', kind: 'file' }];
+  next.items.push({ id: 'P2', title: 'Second', intent: 'Edit b', files: [{ path: 'b', kind: 'edit', renamed_from: null, change: 'Change b' }],
+    acceptance: [{ type: 'check', text: 'Works' }], depends_on: ['P1'] });
+  f.store.importRevision(JSON.stringify(next), 'json', f.value.context, 1);
+  f.value.revision = 2;
+  const snapshot = f.store.getSnapshot(f.identity), checkpoint = f.store.recordCheckpoint(f.identity, {
+    revision: 2, snapshotId: snapshot.id,
+  }, { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra'], baseEntries: f.value.context.baseEntries });
+  const basis = f.store.continuationBasis(f.identity)!;
+  f.value.completedItems = basis.completed;
+  f.value.continuationBinding = { checkpointId: checkpoint.id, head: basis.head, completedItems: basis.completed };
+  f.value.continuationContext = { checkpointId: checkpoint.id, head: basis.head, completedItems: basis.completed,
+    ownerItem: checkpoint.item, outOfScopePaths: checkpoint.outOfScopePaths };
+  return f;
+}
 it('binds the store request before invocation and publishes only valid replies', async () => {
   const f = fixture(); const handle = f.coordinator.start(f.value);
   expect(f.store.getSuggestions(f.identity, handle.id).state).toBe('pending');
@@ -64,6 +82,54 @@ it('rejects a changed snapshot even if the plan revision is unchanged', async ()
   expect(await handle.result).toMatchObject({ state: 'stale' });
   expect(f.store.getSuggestions(f.identity, handle.id)).toMatchObject({ state: 'invalidated', reason: 'Repository snapshot changed.', reply: null });
   expect(f.store.getPlan(f.identity).revision).toBe(1);
+  await f.coordinator.close();
+});
+it('invalidates a planning reply when its checkpoint lineage changes while the provider is running', async () => {
+  const f = checkpointFixture(), handle = f.coordinator.start(f.value, 'draft'); await Promise.resolve();
+  const snapshot = f.store.getSnapshot(f.identity);
+  f.store.recordCheckpoint(f.identity, { revision: 2, snapshotId: snapshot.id }, {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra'], baseEntries: f.value.context.baseEntries,
+  });
+  f.pending.resolve(JSON.stringify({ ...f.store.getPlan(f.identity), revision: 3 }));
+  expect(await handle.result).toMatchObject({ state: 'stale' });
+  expect(f.store.getDraft(f.identity, handle.id)).toMatchObject({ state: 'invalidated', plan: null });
+  await f.coordinator.close();
+});
+it('refuses to apply a ready planning reply after its checkpoint lineage changes', async () => {
+  const f = checkpointFixture(), handle = f.coordinator.start(f.value, 'draft');
+  f.pending.resolve(JSON.stringify({ ...f.store.getPlan(f.identity), revision: 3 }));
+  expect(await handle.result).toMatchObject({ state: 'completed' });
+  const snapshot = f.store.getSnapshot(f.identity);
+  f.store.recordCheckpoint(f.identity, { revision: 2, snapshotId: snapshot.id }, {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra'], baseEntries: f.value.context.baseEntries,
+  });
+  expect(() => f.store.applyDraft(f.identity, handle.id, f.value.context)).toThrow(/unavailable/i);
+  expect(f.store.getDraft(f.identity, handle.id).state).toBe('invalidated');
+  await f.coordinator.close();
+});
+it.each(['draft', 'suggest'] as const)('commits %s invalidation and the saved refusal when a nested apply sees changed checkpoint lineage', async mode => {
+  const f = checkpointFixture(), handle = f.coordinator.start(f.value, mode);
+  const suggestion = reply(); suggestion.base_revision = 2; suggestion.edits[0]!.item = 'P2';
+  f.pending.resolve(mode === 'draft' ? JSON.stringify({ ...f.store.getPlan(f.identity), revision: 3 }) : JSON.stringify(suggestion));
+  expect(await handle.result).toMatchObject({ state: 'completed' });
+  f.store.recordCheckpoint(f.identity, { revision: 2, snapshotId: f.store.getSnapshot(f.identity).id }, {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra'], baseEntries: f.value.context.baseEntries,
+  });
+  const action = { actionId: randomUUID(), kind: mode === 'draft' ? 'draft-apply' : 'suggestion-apply', request: { id: handle.id, index: 0 } };
+  expect(() => f.store.userAction(f.identity, action, () => mode === 'draft'
+    ? f.store.applyDraft(f.identity, handle.id, f.value.context)
+    : f.store.applySuggestion(f.identity, handle.id, 0, f.value.context))).toThrow(/unavailable/i);
+  expect(f.store.getSuggestions(f.identity, handle.id).state).toBe('invalidated');
+  expect(() => f.store.savedAction(f.identity, action)).toThrow(/unavailable/i);
+  await f.coordinator.close();
+});
+it('does not publish a continuation reply whose candidate changes an executed item', async () => {
+  const f = checkpointFixture(), handle = f.coordinator.start(f.value, 'draft');
+  const candidate = { ...f.store.getPlan(f.identity), revision: 3,
+    items: f.store.getPlan(f.identity).items.map(item => item.id === 'P1' ? { ...item, title: 'Changed after execution' } : item) };
+  f.pending.resolve(JSON.stringify(candidate));
+  expect(await handle.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/completed|checkpoint/i) });
+  expect(f.store.getDraft(f.identity, handle.id)).toMatchObject({ state: 'failed', plan: null });
   await f.coordinator.close();
 });
 it('retains ownership after timeout until provider termination, even across clock jumps', async () => {
@@ -185,7 +251,7 @@ it.each(['cancelled', 'stale'] as const)('classifies a publication CAS race as %
     else f.store.importRevision(JSON.stringify({ ...plan(), summary: 'New draft before publication' }), 'json', f.value.context, 1);
     // Assert the disputed state at the actual publication boundary, not just the outcome.
     expect(f.store.getSuggestions(identity, id).state).toBe(expected === 'cancelled' ? 'cancelled' : 'invalidated');
-    complete(identity, id, reply);
+    return complete(identity, id, reply);
   });
   const request = f.coordinator.start(f.value); f.pending.resolve(JSON.stringify(reply()));
   expect(await request.result).toMatchObject({ state: expected });

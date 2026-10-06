@@ -2,7 +2,8 @@ import type { DatabaseSync, SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
-import { importPlan, applySuggestion, assertEditReply, assertPlan, type Plan, type PlanContext, type EditReply } from '../core/plan.ts';
+import { importPlan, applySuggestion, assertEditReply, assertPlan, isRepoPath, validateContinuationPlan, type ContinuationBinding, type Plan, type PlanContext, type PlanItem, type EditReply } from '../core/plan.ts';
+import { stable } from '../core/approvals.ts';
 import type { PlanningMode } from '../core/planning-suggestions.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
@@ -109,7 +110,10 @@ export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
   /** Runner-audited actual tree, retained separately from the declared plan. */
   baseEntries: PlanContext['baseEntries']; completedItems: string[]; outOfScopePaths: string[];
+  /** Present on new checkpoints; absent on pre-continuation rows whose saved tree was only the original base tree. */
+  treeHead?: string;
 }
+type ExecutionResultLike = { head?: unknown; unchanged?: unknown };
 const encode = (value: unknown) => JSON.stringify(value);
 const decode = <T>(value: unknown): T => JSON.parse(value as string) as T;
 function sha(value: string): void {
@@ -121,21 +125,38 @@ function sha(value: string): void {
  */
 export class Store {
   #db: DatabaseSync;
-  constructor(path: string) {
+  #pathKey: (path: string) => string;
+  #assertValidItemPaths(item: PlanItem): void {
+    const paths: string[] = [];
+    for (const file of item.files) {
+      if ((file.kind === 'rename') !== (file.renamed_from !== null))
+        throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
+      for (const path of file.kind === 'rename' ? [file.path, file.renamed_from!] : [file.path]) {
+        if (!isRepoPath(path))
+          throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
+        const key = this.#pathKey(path);
+        if (paths.some(other => other === key || other.startsWith(`${key}/`) || key.startsWith(`${other}/`)))
+          throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
+        paths.push(key);
+      }
+    }
+  }
+  constructor(path: string, pathKey: (path: string) => string = value => value) {
     requireSupportedNode();
+    this.#pathKey = pathKey;
     const { DatabaseSync } = createRequire(import.meta.url)('node:sqlite') as typeof import('node:sqlite');
     this.#db = new DatabaseSync(path, { timeout: 5000 });
     try {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 13) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 15) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
           CREATE TABLE snapshots (key TEXT NOT NULL REFERENCES plans(key), id TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,id));
-          CREATE TABLE requests (id TEXT PRIMARY KEY, key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, state TEXT NOT NULL, reply TEXT);
+          CREATE TABLE requests (id TEXT PRIMARY KEY, key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, state TEXT NOT NULL, reply TEXT, continuation TEXT);
           CREATE TABLE ledger (key TEXT NOT NULL REFERENCES plans(key), sha TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,sha));
           CREATE TABLE rewrites (key TEXT NOT NULL REFERENCES plans(key), snapshot_id TEXT NOT NULL, old_sha TEXT NOT NULL, new_sha TEXT NOT NULL, PRIMARY KEY(key,snapshot_id,old_sha));
           CREATE TABLE approvals (key TEXT NOT NULL REFERENCES plans(key), item TEXT NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,item));
@@ -218,6 +239,18 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'safety_owed'))
             this.#db.exec('ALTER TABLE attempts ADD COLUMN safety_owed INTEGER NOT NULL DEFAULT 0 CHECK (safety_owed IN (0,1))');
           this.#db.exec('PRAGMA user_version=13');
+        }
+        // Bind a continuation decision to the reviewed snapshot. Old rows had no such binding and cannot admit work.
+        if (version < 14) {
+          if (!this.#db.prepare('PRAGMA table_info(continuations)').all().some(column => column.name === 'snapshot_id'))
+            this.#db.exec('ALTER TABLE continuations ADD COLUMN snapshot_id TEXT');
+          this.#db.exec('PRAGMA user_version=14');
+        }
+        // Planning output is bound to the checkpoint tree/prefix used to validate it.
+        if (version < 15) {
+          if (!this.#db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'continuation'))
+            this.#db.exec('ALTER TABLE requests ADD COLUMN continuation TEXT');
+          this.#db.exec('PRAGMA user_version=15');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -347,7 +380,9 @@ export class Store {
     return this.#transaction(() => {
       this.#context(key, context);
       if (this.#current(key).revision !== expected) throw new Error('Stale plan revision.');
-      const plan = importPlan(source, format, context, expected + 1).plan;
+      const progress = this.continuationBasis(context.identity);
+      const plan = importPlan(source, format, context, expected + 1, progress?.completed).plan;
+      if (progress) this.continuationProgress(context.identity, plan);
       this.#savePlan(key, plan, expected); return plan;
     });
   }
@@ -368,28 +403,45 @@ export class Store {
     return decode<Snapshot>(row.data);
   }
   /** `mode` is required, so a caller cannot record a draft as a suggestion by leaving it out (#124). */
-  beginSuggestions(identity: PlanIdentity, expected: ReviewState, mode: PlanningMode): string {
+  beginSuggestions(identity: PlanIdentity, expected: ReviewState, mode: PlanningMode, continuation: ContinuationBinding | null = null): string {
     if (mode !== 'suggest' && mode !== 'draft') throw new Error('Invalid planning request mode.');
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
+      const basis = this.continuationBasis(identity), currentBinding = basis ? { checkpointId: basis.checkpoint.id, head: basis.head, completedItems: basis.completed } : null;
+      if (stable(continuation) !== stable(currentBinding)) throw new Error('Stale continuation context. Reload before requesting planning.');
       const id = randomUUID();
-      this.#run("INSERT INTO requests (id,key,revision,state,reply,snapshot_id,reason,mode) VALUES (?,?,?,'pending',NULL,?,NULL,?)", id, key, expected.revision, expected.snapshotId, mode); return id;
+      this.#run("INSERT INTO requests (id,key,revision,state,reply,snapshot_id,reason,mode,continuation) VALUES (?,?,?,'pending',NULL,?,NULL,?,?)",
+        id, key, expected.revision, expected.snapshotId, mode, continuation === null ? null : encode(continuation)); return id;
     });
   }
   /**
    * Publish a request's validated reply, by the request's own mode: suggestion cards against the current revision, or
    * a draft plan of the next revision for the plan's issue. The full plan checks run again when a draft is applied.
    */
-  completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void {
+  completeSuggestions(identity: PlanIdentity, id: string, reply: unknown, candidatePlans?: Plan[]): boolean {
     const key = identityKey(identity);
-    this.#transaction(() => {
+    return this.#transaction(() => {
       const current = this.#current(key);
-      const row = this.#get('SELECT mode FROM requests WHERE id=? AND key=?', id, key);
+      const row = this.#get('SELECT mode,continuation FROM requests WHERE id=? AND key=? AND state=\'pending\'', id, key);
+      if (!row) throw new Error('Planning request is stale, cancelled, or complete.');
+      const binding = row.continuation === null ? null : decode<ContinuationBinding>(row.continuation);
+      const basis = this.continuationBasis(identity), currentBinding = basis ? { checkpointId: basis.checkpoint.id, head: basis.head, completedItems: basis.completed } : null;
+      if (stable(binding) !== stable(currentBinding)) {
+        this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed during authoring.' WHERE id=? AND key=? AND state='pending'", id, key);
+        return false;
+      }
+      if (binding !== null) {
+        const candidates = candidatePlans ?? [];
+        const expectedCount = row.mode === 'draft' ? 1 : (assertEditReply(reply), reply.edits.length);
+        if (candidates.length !== expectedCount) throw new Error('Validated continuation candidates are required before publishing this reply.');
+        for (const candidate of candidates) this.continuationProgress(identity, candidate);
+      }
       const fits = row?.mode === 'draft' ? (assertPlan(reply), reply.revision === (current.revision as number) + 1 && reply.issue === current.issue)
         : (assertEditReply(reply), reply.base_revision === current.revision);
       if (!fits || this.#run("UPDATE requests SET state='ready',reply=?,reason=NULL WHERE id=? AND key=? AND revision=? AND snapshot_id=? AND state='pending'", encode(reply), id, key, current.revision!, current.snapshot_id!).changes !== 1)
         throw new Error(`${row?.mode === 'draft' ? 'Draft' : 'Suggestion'} request is stale, cancelled, or complete.`);
+      return true;
     });
   }
   settleSuggestion(identity: PlanIdentity, id: string, expected: ReviewState, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean {
@@ -547,33 +599,60 @@ export class Store {
    */
   applyDraft(identity: PlanIdentity, id: string, context: PlanContext): Plan {
     const key = identityKey(identity);
-    return this.#transaction(() => {
+    let applied: Plan | null;
+    try { applied = this.#transaction(() => {
       this.#context(key, context);
       const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready' AND mode='draft'", id, key);
       if (!request) throw new Error('Draft is unavailable.');
       const current = this.#current(key);
       if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Draft is unavailable.');
+      const progress = this.continuationBasis(identity), currentBinding = progress ? { checkpointId: progress.checkpoint.id, head: progress.head, completedItems: progress.completed } : null;
+      const requestBinding = request.continuation === null ? null : decode<ContinuationBinding>(request.continuation);
+      if (stable(requestBinding) !== stable(currentBinding)) {
+        const invalidate = () => this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed before application.' WHERE id=? AND key=? AND state='ready'", id, key);
+        throw new RefusalWithEffect('Draft is unavailable.', invalidate);
+      }
       const revision = current.revision as number;
-      const plan = importPlan(request.reply as string, 'json', context, revision + 1).plan;
+      const plan = importPlan(request.reply as string, 'json', context, revision + 1, progress?.completed).plan;
+      if (progress) this.continuationProgress(identity, plan);
       this.#savePlan(key, plan, revision);
       this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return plan;
-    });
+    }); } catch (error) {
+      if (error instanceof RefusalWithEffect && this.#depth === 0) this.#transaction(error.effect);
+      throw error;
+    }
+    if (!applied) throw new Error('Draft is unavailable.');
+    return applied;
   }
   applySuggestion(identity: PlanIdentity, id: string, index: number, context: PlanContext): Plan {
     const key = identityKey(identity);
-    return this.#transaction(() => {
+    let applied: Plan | null;
+    try { applied = this.#transaction(() => {
       this.#context(key, context);
       const request = this.#get("SELECT * FROM requests WHERE id=? AND key=? AND state='ready' AND mode='suggest'", id, key);
       if (!request) throw new Error('Suggestion is unavailable.');
       const current = this.#current(key);
       if (request.revision !== current.revision || request.snapshot_id !== current.snapshot_id) throw new Error('Suggestion is unavailable.');
       const plan = this.getPlan(identity);
+      const progress = this.continuationBasis(identity);
+      const currentBinding = progress ? { checkpointId: progress.checkpoint.id, head: progress.head, completedItems: progress.completed } : null;
+      const requestBinding = request.continuation === null ? null : decode<ContinuationBinding>(request.continuation);
+      if (stable(requestBinding) !== stable(currentBinding)) {
+        const invalidate = () => this.#run("UPDATE requests SET state='invalidated',reason='Checkpoint continuation changed before application.' WHERE id=? AND key=? AND state='ready'", id, key);
+        throw new RefusalWithEffect('Suggestion is unavailable.', invalidate);
+      }
       const next = applySuggestion(plan, decode<EditReply>(request.reply), index, context, {
         identity, schemaVersion: plan.schema_version, baseRevision: request.revision as number, issue: plan.issue,
-      });
+      }, progress?.completed);
+      if (progress) this.continuationProgress(identity, next);
       this.#savePlan(key, next, request.revision as number);
       this.#run("UPDATE requests SET state='consumed',reason=NULL WHERE id=?", id); return next;
-    });
+    }); } catch (error) {
+      if (error instanceof RefusalWithEffect && this.#depth === 0) this.#transaction(error.effect);
+      throw error;
+    }
+    if (!applied) throw new Error('Suggestion is unavailable.');
+    return applied;
   }
   #entry(key: string, entry: LedgerEntry): void {
     sha(entry.sha); if (entry.sourceSha !== null) sha(entry.sourceSha);
@@ -720,6 +799,22 @@ export class Store {
       if (!completedSnapshot) break;
       prefixSnapshots.add(completedSnapshot);
     }
+    // A continuation approval starts a new reviewed ancestry at its audited snapshot. The checkpoint's completed
+    // prefix belongs to earlier plan revisions, so those attempts cannot identify the snapshots its approvals survive.
+    const checkpoint = this.latestCheckpoint(identity), continuation = checkpoint ? this.continuationProgress(identity) : null;
+    if (continuation && this.continuationApproved(identity, continuation)) {
+      const approvalSnapshot = this.continuationApproval(identity, checkpoint!.id, revision);
+      if (approvalSnapshot) {
+        prefixSnapshots.add(approvalSnapshot);
+        const afterCheckpoint = new Set(continuation.completed.slice(checkpoint!.completedItems.length));
+        for (const row of this.#db.prepare(`SELECT item,context FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+          AND json_extract(context,'$.planRevision')=? ORDER BY rowid`).all(key, revision)) {
+          const context = decode<InvocationContext>(row.context);
+          if (typeof row.item === 'string' && afterCheckpoint.has(row.item) && typeof context.snapshotId === 'string')
+            prefixSnapshots.add(context.snapshotId);
+        }
+      }
+    }
     const reviewedExecutionSnapshot = (value: ReviewState) => value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId);
     // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
     // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
@@ -739,7 +834,7 @@ export class Store {
       this.#expect(key, expected);
       const plan = this.getPlan(identity), ids = plan.items.map(item => item.id);
       if (!ids.includes(evidence.item) || evidence.completedItems.at(-1) !== evidence.item || new Set(evidence.completedItems).size !== evidence.completedItems.length || evidence.completedItems.some((item, i) => item !== ids[i])) throw new Error('Checkpoint must describe the executed plan prefix.');
-      const checkpoint = { ...evidence, ...expected, id: randomUUID() };
+      const checkpoint = { ...evidence, ...expected, treeHead: this.getSnapshot(identity, expected.snapshotId).head, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint)); return checkpoint;
     });
   }
@@ -763,7 +858,8 @@ export class Store {
       const pausable = status === 'running' || status === 'in review' || status === 'approved but merge blocked' || (options.owed === true && status === 'queued');
       if (!pausable) throw new GuardRefusal(`The task is ${status}, so it was not paused for amendment.`);
       this.transitionTask(identity, this.#task(key).state_version as number, 'needs amendment');
-      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId, id: randomUUID() };
+      const checkpoint = { ...evidence, revision: ranAt.revision, snapshotId: ranAt.snapshotId,
+        treeHead: this.getSnapshot(identity, ranAt.snapshotId).head, id: randomUUID() };
       this.#run('INSERT INTO checkpoints VALUES (?,?,?)', key, checkpoint.id, encode(checkpoint));
       return checkpoint;
     });
@@ -794,13 +890,145 @@ export class Store {
     const row = this.#get('SELECT data FROM checkpoints WHERE key=? AND id=?', identityKey(identity), id);
     if (!row) throw new Error('Unknown checkpoint.'); return decode<Checkpoint>(row.data);
   }
-  /** Persist a person's approval only after the runner reconciles the prefix and validates the suffix. */
-  approveContinuation(identity: PlanIdentity, checkpointId: string, expected: ReviewState): void {
+  /** Derive audited completion from the checkpoint and attempt chain without trusting the editable current plan. */
+  continuationBasis(identity: PlanIdentity): { checkpoint: Checkpoint; completed: string[]; completedDefinitions: PlanItem[]; head: string } | null {
+    const checkpoint = this.latestCheckpoint(identity);
+    if (!checkpoint) return null;
+    const checkpointPlan = this.getPlan(identity, checkpoint.revision);
+    const completed = [...checkpoint.completedItems], completedDefinitions = checkpointPlan.items.slice(0, completed.length);
+    if (completedDefinitions.length !== completed.length || completedDefinitions.some((item, index) => item.id !== completed[index]))
+      throw new GuardRefusal('The checkpoint does not match its saved plan revision.');
+    let head = this.getSnapshot(identity, checkpoint.snapshotId).head;
+    const key = identityKey(identity);
+    const origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed' AND item=?
+      AND json_extract(context,'$.planRevision')=? AND json_extract(result,'$.head')=? ORDER BY rowid DESC LIMIT 1`,
+      key, checkpoint.item, checkpoint.revision, head)?.rowid as number | undefined;
+    if (origin === undefined && this.#get('SELECT 1 AS found FROM attempts WHERE plan_key=? LIMIT 1', key))
+      throw new GuardRefusal('The checkpoint has no completed execute attempt at its audited head.');
+    const later = origin === undefined ? [] : this.#db.prepare(`SELECT * FROM attempts WHERE plan_key=? AND rowid>?
+      AND state='completed' AND kind IN (${WRITABLE_KINDS.map(() => '?').join(',')}) ORDER BY rowid LIMIT 10001`)
+      .all(key, origin, ...WRITABLE_KINDS);
+    if (later.length > 10000) throw new GuardRefusal('Too many completed attempts follow the checkpoint to reconcile safely.');
+    for (const stored of later) {
+      const row = this.#attemptRecord(stored);
+      const result = row.result as ExecutionResultLike | null;
+      const executedPlan = this.getPlan(identity, row.context.planRevision);
+      if (row.kind !== 'execute' || !result || typeof result.head !== 'string' || !row.item ||
+        this.getSnapshot(identity, row.context.snapshotId).head !== head ||
+        executedPlan.items.slice(0, completed.length).some((item, index) => item.id !== completed[index]) ||
+        executedPlan.items[completed.length]?.id !== row.item ||
+        !this.continuationApproval(identity, checkpoint.id, row.context.planRevision))
+        throw new GuardRefusal('Work after the checkpoint cannot be reconciled with the amended plan.');
+      const executedItem = executedPlan.items[completed.length];
+      if (!executedItem || executedItem.id !== row.item) throw new GuardRefusal(`Completed item ${row.item} is absent from its execution revision.`);
+      completedDefinitions.push(executedItem);
+      head = result.head;
+      completed.push(row.item);
+    }
+    if (head !== this.getSnapshot(identity).head)
+      throw new GuardRefusal('The task head no longer ends at the audited completed prefix.');
+    return { checkpoint, completed, completedDefinitions, head };
+  }
+  /** Reconcile audited completion against the current or proposed plan definition. */
+  continuationProgress(identity: PlanIdentity, candidate?: Plan): { checkpoint: Checkpoint; completed: string[]; next: string | null; head: string } | null {
+    const basis = this.continuationBasis(identity);
+    if (!basis) return null;
+    const plan = candidate ?? this.getPlan(identity), { checkpoint, completed, completedDefinitions } = basis;
+    const prefix = plan.items.slice(0, completed.length);
+    if (prefix.length !== completed.length || prefix.some((item, index) => item.id !== completed[index]))
+      throw new GuardRefusal('The amended plan changed the completed checkpoint prefix.');
+    const checkpointPlan = this.getPlan(identity, checkpoint.revision);
+    for (let index = 0; index < checkpoint.completedItems.length; index++) {
+      const before = checkpointPlan.items[index], current = plan.items[index];
+      if (!before || !current) throw new GuardRefusal(`Completed item ${checkpoint.completedItems[index]} changed before the audited checkpoint.`);
+      if (index < checkpoint.completedItems.length - 1) {
+        if (stable(before) !== stable(current))
+          throw new GuardRefusal(`Completed item ${checkpoint.completedItems[index]} changed before the audited checkpoint.`);
+        continue;
+      }
+      const observed = new Set(checkpoint.outOfScopePaths.map(this.#pathKey));
+      const existingFiles = current.files.slice(0, before.files.length);
+      const addedFiles = current.files.slice(before.files.length);
+      this.#assertValidItemPaths(current);
+      if (stable({ ...current, files: existingFiles }) !== stable(before) ||
+          addedFiles.some(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])].some(path => !observed.has(this.#pathKey(path)))))
+        throw new GuardRefusal(`Completed checkpoint item ${checkpoint.completedItems[index]} changed beyond its scope declaration.`);
+    }
+    for (let index = checkpoint.completedItems.length; index < completed.length; index++) {
+      if (stable(plan.items[index]) !== stable(completedDefinitions[index]))
+        throw new GuardRefusal(`Completed item ${completed[index]} changed after it ran; review and rerun it before continuing.`);
+    }
+    return { checkpoint, completed, next: plan.items[completed.length]?.id ?? null, head: basis.head };
+  }
+  continuationApproval(identity: PlanIdentity, checkpointId: string, revision: number): string | null {
+    const row = this.#get('SELECT snapshot_id FROM continuations WHERE key=? AND checkpoint_id=? AND revision=?', identityKey(identity), checkpointId, revision);
+    return typeof row?.snapshot_id === 'string' ? row.snapshot_id : null;
+  }
+  /** An approval still covers this head only when its own revision's completed attempts connect it to the current head. */
+  continuationApproved(identity: PlanIdentity, progress: NonNullable<ReturnType<Store['continuationProgress']>>): boolean {
+    const revision = this.getPlan(identity).revision;
+    const snapshotId = this.continuationApproval(identity, progress.checkpoint.id, revision);
+    if (!snapshotId) return false;
+    if (snapshotId === this.getSnapshot(identity).id) return true;
+    let head = this.getSnapshot(identity, snapshotId).head, advanced = false;
+    const key = identityKey(identity), origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
+      AND item=? AND json_extract(context,'$.planRevision')=? AND json_extract(result,'$.head')=? ORDER BY rowid DESC LIMIT 1`,
+      key, progress.checkpoint.item, progress.checkpoint.revision, this.getSnapshot(identity, progress.checkpoint.snapshotId).head)?.rowid as number | undefined;
+    if (origin === undefined) return false;
+    const attempts = this.#db.prepare(`SELECT * FROM attempts WHERE plan_key=? AND rowid>? AND kind='execute' AND state='completed'
+      AND json_extract(context,'$.planRevision')=? ORDER BY rowid LIMIT 10001`).all(key, origin, revision);
+    if (attempts.length > 10000) return false;
+    for (const stored of attempts) {
+      const row = this.#attemptRecord(stored);
+      if (this.getSnapshot(identity, row.context.snapshotId).head !== head) continue;
+      const result = row.result as ExecutionResultLike | null;
+      if (!result || typeof result.head !== 'string') return false;
+      head = result.head; advanced = true;
+    }
+    return advanced && head === progress.head;
+  }
+  /** Persist a person's approval after reconciling the prefix and validating the suffix at its actual tree. */
+  approveContinuation(identity: PlanIdentity, checkpointId: string, expected: ReviewState, context: PlanContext): void {
     const key = identityKey(identity);
     this.#transaction(() => {
       this.#expect(key, expected); const checkpoint = this.getCheckpoint(identity, checkpointId);
-      if (!checkpoint.outOfScopePaths.length || checkpoint.snapshotId !== expected.snapshotId || expected.revision <= checkpoint.revision) throw new Error('Continuation requires an amended plan at the audited checkpoint.');
-      this.#run('INSERT INTO continuations VALUES (?,?,?) ON CONFLICT(key,checkpoint_id,revision) DO NOTHING', key, checkpointId, expected.revision);
+      this.#context(key, context);
+      const progress = this.continuationProgress(identity);
+      if (!progress || progress.checkpoint.id !== checkpointId || !checkpoint.outOfScopePaths.length || expected.revision <= checkpoint.revision)
+        throw new GuardRefusal('Continuation requires an amended plan at the audited checkpoint.');
+      if (this.getSnapshot(identity).head !== progress.head ||
+          (progress.completed.length === checkpoint.completedItems.length && checkpoint.snapshotId !== expected.snapshotId))
+        throw new GuardRefusal('The audited checkpoint tree or snapshot changed; review it before continuing.');
+      // New checkpoint rows bind the saved entries to their immutable commit tree. Legacy rows saved the original base
+      // tree instead; the caller re-reads the actual tree at progress.head, so comparing it to that old evidence rejects
+      // valid amendments and is not an integrity check.
+      if (checkpoint.treeHead === progress.head && JSON.stringify(context.baseEntries) !== JSON.stringify(checkpoint.baseEntries))
+        throw new GuardRefusal('The audited checkpoint tree changed; review it before continuing.');
+      const amendedItem = this.getPlan(identity).items[checkpoint.completedItems.length - 1]!;
+      const declared = new Set(amendedItem.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(context.pathKey));
+      if (checkpoint.outOfScopePaths.some(path => !declared.has(context.pathKey(path))))
+        throw new GuardRefusal('The amended checkpoint item must declare every out-of-scope path it changed.');
+      if (progress.next) {
+        const validation = validateContinuationPlan(this.getPlan(identity), context, progress.completed);
+        if (validation.errors.length) throw new GuardRefusal(`The remaining plan is invalid at the audited head: ${validation.errors.map(error => error.message).join(' ')}`);
+      }
+      const status = this.getTask(identity).status;
+      if (!['needs amendment', 'queued', 'running'].includes(status)) throw new GuardRefusal(`The task is ${status}; continuation cannot be approved.`);
+      const task = this.#task(key);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      if (status === 'needs amendment' && progress.next) this.transitionTask(identity, this.getTask(identity).stateVersion, 'queued');
+      else if (!progress.next && status !== 'running') {
+        this.#run("UPDATE tasks SET status='running' WHERE plan_key=?", key);
+        this.#touch(key);
+      }
+      if (!progress.next && task.requeue_pending === 1) {
+        this.#run('UPDATE tasks SET requeue_pending=0 WHERE plan_key=?', key);
+        this.#touch(key);
+      }
+      this.#run(`INSERT INTO continuations (key,checkpoint_id,revision,snapshot_id) VALUES (?,?,?,?)
+        ON CONFLICT(key,checkpoint_id,revision) DO UPDATE SET snapshot_id=excluded.snapshot_id`, key, checkpointId, expected.revision, expected.snapshotId);
     });
   }
   continuationRevision(identity: PlanIdentity, checkpointId: string): number | null {
@@ -1333,7 +1561,8 @@ export class Store {
     return row ? { id: row.id as string, snapshotId: row.snapshot_id as string, result: decode<AlreadyFixedResult>(row.result), stateVersion: row.state_version as number, reviewVersion: row.review_version as number, checkedAt: row.checked_at as string } : null;
   }
   /** Publishing runs after the task's last attempt settled, while the task is running, or in needs human for a draft PR. */
-  #assertPublishable(key: string, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
+  #assertPublishable(identity: PlanIdentity, task: Record<string, SQLOutputValue>, expectedStateVersion: number, draft: boolean): void {
+    const key = identityKey(identity);
     if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
     if (task.status !== (draft ? 'needs human' : 'running')) throw new GuardRefusal(`A ${draft ? 'draft ' : ''}pull request cannot be opened while the task is ${task.status}.`);
     if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
@@ -1348,6 +1577,11 @@ export class Store {
       const items = decode<Plan>(this.#get('SELECT data FROM revisions WHERE key=? AND revision=?', key, revision)!.data).items;
       const finished = new Set(this.#db.prepare(`SELECT DISTINCT item FROM attempts WHERE plan_key=? AND kind='execute' AND item IS NOT NULL
         AND state='completed' AND json_extract(context,'$.planRevision') = ?`).all(key, revision).map(entry => entry.item as string));
+      const checkpoint = this.latestCheckpoint(identity), continuation = checkpoint ? this.continuationProgress(identity) : null;
+      if (continuation) {
+        if (!this.continuationApproved(identity, continuation)) throw new GuardRefusal('The current continuation revision is not approved for publishing.');
+        for (const item of continuation.completed) finished.add(item);
+      }
       const unrun = items.find(item => !finished.has(item.id));
       if (unrun) throw new GuardRefusal(`${unrun.id} has not run yet; publish once every plan item has run.`);
     }
@@ -1361,7 +1595,7 @@ export class Store {
     const key = identityKey(identity);
     return this.#transaction(() => {
       const task = this.#task(key);
-      this.#assertPublishable(key, task, expectedStateVersion, input.draft);
+      this.#assertPublishable(identity, task, expectedStateVersion, input.draft);
       if (this.#current(key).snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');
       if (input.result.outcome !== 'clear' && !input.draft) this.#run("UPDATE tasks SET status='possibly already fixed' WHERE plan_key=?", key);
       this.#touch(key);
@@ -1437,7 +1671,7 @@ export class Store {
     this.#transaction(() => {
       const row = this.#get("SELECT refresh_version, refresh_review_version FROM task_pull_requests WHERE plan_key=? AND opening_id=? AND refresh_head IS NOT NULL", key, openingId);
       if (!row) throw new GuardRefusal('No update of this pull request is in flight.');
-      this.#assertPublishable(key, this.#task(key), row.refresh_version as number, draft);
+      this.#assertPublishable(identity, this.#task(key), row.refresh_version as number, draft);
       if (this.#current(key).review_version !== row.refresh_review_version) throw new GuardRefusal('The review changed after the check. Reload before writing.');
     });
   }
@@ -1448,7 +1682,7 @@ export class Store {
   #assertCheckedHead(identity: PlanIdentity, input: { checkId: string; headSha: string; draft: boolean }): void {
     const key = identityKey(identity), task = this.#task(key), check = this.latestAlreadyFixed(identity);
     if (!check || check.id !== input.checkId || check.result.outcome !== 'clear') throw new GuardRefusal('A clear already-fixed check must come right before opening a pull request.');
-    this.#assertPublishable(key, task, check.stateVersion, input.draft);
+    this.#assertPublishable(identity, task, check.stateVersion, input.draft);
     if (this.#current(key).review_version !== check.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
     const snapshot = this.getSnapshot(identity);
     if (snapshot.id !== check.snapshotId || snapshot.head !== input.headSha) throw new GuardRefusal('The task head changed after the check.');
@@ -1554,19 +1788,19 @@ export class Store {
   /** Whether the task can be published in this mode right now (status, no attempt, merge, requeue or rebase). */
   canPublish(identity: PlanIdentity, draft: boolean): boolean {
     const key = identityKey(identity), task = this.#task(key);
-    try { this.#assertPublishable(key, task, task.state_version as number, draft); return true; }
+    try { this.#assertPublishable(identity, task, task.state_version as number, draft); return true; }
     catch (error) { if (error instanceof GuardRefusal) return false; throw error; }
   }
   /** The full publish guard at the current state version, before any GitHub call: refuse early, with its reason. */
   assertPublishableNow(identity: PlanIdentity, draft: boolean): void {
     const key = identityKey(identity), task = this.#task(key);
-    this.#assertPublishable(key, task, task.state_version as number, draft);
+    this.#assertPublishable(identity, task, task.state_version as number, draft);
   }
   /** The task, its review and its head are exactly as a publish read them before its last await. */
   assertUnchangedSince(identity: PlanIdentity, input: { stateVersion: number; reviewVersion: number; snapshotId: string; draft: boolean }): void {
     const key = identityKey(identity);
     this.#transaction(() => {
-      this.#assertPublishable(key, this.#task(key), input.stateVersion, input.draft);
+      this.#assertPublishable(identity, this.#task(key), input.stateVersion, input.draft);
       const plan = this.#current(key);
       if (plan.review_version !== input.reviewVersion) throw new GuardRefusal('The review changed after the check. Reload before writing.');
       if (plan.snapshot_id !== input.snapshotId) throw new GuardRefusal('The task head changed during the check.');

@@ -11,6 +11,7 @@ import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
+import { GuardRefusal } from './lifecycle.ts';
 
 export interface ReviewConfig { database: string; repository: string;
   /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
@@ -26,9 +27,16 @@ export class ReviewService {
    * base reuses it instead of running Git again on the server's thread (each runner item asks for it, #91).
    */
   #baseEntries: { base: string; entries: readonly BaseEntry[] } | null = null;
+  #pathKey: (path: string) => string;
   constructor(config: ReviewConfig) {
     if (typeof config.pathIdentity?.caseSensitive !== 'boolean' || !['none', 'NFC'].includes(config.pathIdentity.unicodeNormalization)) throw new Error('Known checkout path identity is required.');
-    this.config = config; this.store = new Store(config.database);
+    this.config = config;
+    this.#pathKey = path => {
+      if (!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
+      const normalized = config.pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
+      return config.pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
+    };
+    this.store = new Store(config.database, this.#pathKey);
   }
   close() { this.store.close(); }
   /**
@@ -43,7 +51,7 @@ export class ReviewService {
     return { path: this.config.runnerRepository, runnerOwned: true };
   }
   load() {
-    const { identity, pathIdentity } = this.config;
+    const { identity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
     let snapshot = this.store.getSnapshot(identity);
@@ -53,11 +61,7 @@ export class ReviewService {
     // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
     const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
-    const pathKey = (path: string) => {
-      if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
-      const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
-      return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
-    };
+    const pathKey = this.#pathKey;
     const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey);
     const saved = this.store.getReview(identity), keys = choiceKeys(raw, identity);
     const deltas = new Map(history.final.map(file => [JSON.stringify([file.newPath ?? file.oldPath, file.oldPath]), file]));
@@ -86,7 +90,14 @@ export class ReviewService {
     }
     // The execution gate also orders approvals after attribution choices and binds them to the current or executed-prefix
     // snapshots. Reflect that same gate in the review UI so an approval execution would refuse is available to reapprove.
-    const executionUnapproved = new Set(this.store.unapprovedExecutionItems(identity, plan.revision));
+    let executionUnapproved: Set<string>;
+    try { executionUnapproved = new Set(this.store.unapprovedExecutionItems(identity, plan.revision)); }
+    catch (error) {
+      if (!(error instanceof GuardRefusal)) throw error;
+      // Keep the review available when checkpoint reconciliation refuses. Surface every saved approval as stale;
+      // execution remains fail-closed in Store.unapprovedExecutionItems and resume.
+      executionUnapproved = new Set(plan.items.map(item => item.id));
+    }
     for (const item of plan.items) if (states[item.id] === 'approved' && executionUnapproved.has(item.id)) states[item.id] = 'stale';
     for (const item of plan.items) {
       if (states[item.id] === 'approved' && (segments.some(segment => segment.row === 'Ambiguous' && segment.owners.includes(item.id)) || item.depends_on.some(id => states[id] === 'stale'))) states[item.id] = 'stale';
@@ -144,29 +155,50 @@ export class ReviewService {
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
     return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
-  /** The trusted plan context for import and Apply: base entries from the snapshot's base tree, and the configured path identity. */
-  planContext(): PlanContext {
-    const { identity, repository, pathIdentity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
-    const pathKey = (path: string) => {
-      if (!pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
-      const normalized = pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
-      return pathIdentity.caseSensitive ? normalized : normalized.toLowerCase();
-    };
+  /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */
+  planContextAt(head?: string): PlanContext {
+    const { identity, repository } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const pathKey = this.#pathKey;
     // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
-    const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], { cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer, stdio: ['ignore', 'pipe', 'pipe'] });
-    if (this.#baseEntries?.base !== snapshot.base) {
-      const listing = git(['ls-tree', '-rz', snapshot.base], 64 * 1024 * 1024);
+    const treeHead = head ?? snapshot.base;
+    if (head && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Expected a full checkpoint head.');
+    const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], {
+      cwd: head ? this.reviewRepository().path : repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    if (this.#baseEntries?.base !== treeHead) {
+      const listing = git(['ls-tree', '-rz', treeHead], 64 * 1024 * 1024);
       const entries: BaseEntry[] = listing.split('\0').filter(Boolean).map(record => {
         const split = record.indexOf('\t'), [mode, , oid] = record.slice(0, split).split(' '), path = record.slice(split + 1);
         if (mode === '160000') return { path, kind: 'gitlink' };
-        if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!]) };
+        if (mode === '120000') return { path, kind: 'symlink', target: git(['cat-file', 'blob', oid!], 64 * 1024 * 1024) };
         return { path, kind: 'file' };
       });
-      this.#baseEntries = { base: snapshot.base, entries };
+      this.#baseEntries = { base: treeHead, entries };
     }
     // Copies: callers own what they are given, and the cached listing stays as Git reported it.
     const baseEntries = this.#baseEntries.entries.map(entry => ({ ...entry }));
     return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
+  }
+  planContext(): PlanContext { return this.planContextAt(); }
+  /** When a checkpoint exists, edits are validated against the audited task head and completed work is excluded. */
+  planContextForAmendment(): PlanContext {
+    const checkpoint = this.store.latestCheckpoint(this.config.identity);
+    if (!checkpoint) return this.planContext();
+    const progress = this.store.continuationBasis(this.config.identity);
+    if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
+    return this.planContextAt(progress.head);
+  }
+  planningContextForAmendment(): { context: PlanContext; completedItems: string[]; continuation: { checkpointId: string; head: string; completedItems: string[] } | null;
+    continuationContext: { checkpointId: string; head: string; completedItems: string[]; ownerItem: string; outOfScopePaths: string[] } | null } {
+    const checkpoint = this.store.latestCheckpoint(this.config.identity);
+    if (!checkpoint) return { context: this.planContext(), completedItems: [], continuation: null, continuationContext: null };
+    const progress = this.store.continuationBasis(this.config.identity);
+    if (!progress) throw new Error('The scope checkpoint could not be reconciled.');
+    return { context: this.planContextAt(progress.head), completedItems: progress.completed,
+      continuation: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed },
+      continuationContext: { checkpointId: checkpoint.id, head: progress.head, completedItems: progress.completed, ownerItem: checkpoint.item,
+        outOfScopePaths: checkpoint.outOfScopePaths } };
   }
   /** With an actionId (inside Store.userAction), feedback-producing actions record their event in the same transaction. */
   act(input: unknown, actionId?: string) {

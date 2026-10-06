@@ -1,7 +1,7 @@
 import { readFileSync } from 'node:fs';
 import { identityKey, type PlanIdentity } from './identity.ts';
 import { parseV1 } from './parse-v1.ts';
-import { applySuggestion, assertEditReply, importPlan, validatePlan, PlanError,
+import { applySuggestion, assertEditReply, importPlan, validateContinuationPlan, validatePlan, PlanError,
   type Diagnostic, type EditReply, type Plan, type PlanContext } from './plan.ts';
 import registry from '../schema/versions.json' with { type: 'json' };
 
@@ -19,6 +19,8 @@ export interface AuthorInput {
   approvedLessons: readonly string[];
   feedback: string;
   previousPlan?: Plan;
+  completedItems?: readonly string[];
+  continuationContext?: { checkpointId: string; head: string; completedItems: readonly string[]; ownerItem: string; outOfScopePaths: readonly string[] } | null;
 }
 export interface AuthorRequest {
   readonly mode: 'draft' | 'suggest';
@@ -39,7 +41,7 @@ export interface AuthorProvider {
 }
 export interface PreparedAuthor<T> {
   readonly request: AuthorRequest;
-  validate(source: string | Uint8Array): { value: T; warnings: Diagnostic[] };
+  validate(source: string | Uint8Array): { value: T; warnings: Diagnostic[]; candidatePlans: Plan[] };
 }
 
 function integer(value: number, label: string): void {
@@ -93,8 +95,17 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
   const context: PlanContext = { ...input.context, identity: { repositoryId, taskId, planId },
     baseEntries: structuredClone(input.context.baseEntries), allowedCommands: structuredClone(input.context.allowedCommands) };
   const previous = input.previousPlan ? structuredClone(input.previousPlan) : undefined;
+  const completedItems = input.completedItems === undefined || input.completedItems.length === 0
+    ? undefined : structuredClone([...input.completedItems]);
+  if (completedItems && (!input.continuationContext || input.continuationContext.completedItems.length !== completedItems.length ||
+      input.continuationContext.completedItems.some((item, index) => item !== completedItems[index])))
+    throw new Error('Planning continuation context does not match its completed prefix.');
   if (previous) {
-    const result = validatePlan(previous, context);
+    // The existing suffix is context for the provider to repair, not a candidate. Validate its structure and the
+    // checkpoint-owned prefix here; require the proposed candidate to pass full suffix semantics below.
+    const result = completedItems === undefined ? validatePlan(previous, context) : validateContinuationPlan({
+      ...previous, items: previous.items.slice(0, completedItems.length),
+    }, context, completedItems, true);
     if (result.errors.length) throw new PlanError(result.errors);
     if (input.revision !== previous.revision + (mode === 'draft' ? 1 : 0)) throw new Error('Previous plan revision mismatch.');
   } else if (mode === 'suggest') throw new Error('Suggestions require a previous plan.');
@@ -115,6 +126,9 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
     lessons_data_json: dataJSON(input.approvedLessons, 'Lessons'),
     feedback_data_json: dataJSON(input.feedback, 'Feedback'),
     previous_plan_json: dataJSON(previous ?? null, 'Previous plan'),
+    continuation_context_instruction: input.continuationContext
+      ? `Checkpoint continuation context:\n<continuation_context>\n${dataJSON(input.continuationContext, 'Continuation context')}\n</continuation_context>\nWhen this context is present, preserve the completed item IDs. Only the checkpoint owner may be amended to declare the observed paths. Do not rewrite completed work or claim unfinished work already ran. The unfinished suffix is context for correction and may currently fail validation against the audited tree; the candidate you return must correct it so the entire remaining suffix is valid against that tree.\n`
+      : '',
   };
   const conditional = template.replace(/\{\{#if previous_plan\}\}([\s\S]*?)\{\{\/if\}\}/gu, (_, block: string) => previous ? block : '');
   // One pass over trusted template only: inserted data is never interpreted again.
@@ -130,18 +144,20 @@ function prepare(input: AuthorInput, mode: AuthorRequest['mode']): PreparedAutho
       // importPlan replaces a revision for user imports; provider output must match it first.
       const data = parseV1(source, 'json');
       if ((data as Plan | null)?.revision !== request.revision) throw new Error('Response revision mismatch.');
-      const result = importPlan(source, 'json', context, request.revision);
-      return { value: result.plan, warnings: result.warnings };
+      const result = importPlan(source, 'json', context, request.revision, completedItems);
+      return { value: result.plan, warnings: result.warnings, candidatePlans: [result.plan] };
     }
     const reply = parseV1(source, 'json'); assertEditReply(reply);
     if (reply.base_revision !== request.revision) throw new Error('Response revision mismatch.');
     const warnings: Diagnostic[] = [];
+    const candidatePlans: Plan[] = [];
     // Validate every independent card against the captured plan before exposing any card.
     for (let index = 0; index < reply.edits.length; index++) {
       const next = applySuggestion(previous!, reply, index, context, { identity: context.identity,
-        schemaVersion: previous!.schema_version, baseRevision: request.revision, issue: context.issue });
-      warnings.push(...validatePlan(next, context).warnings);
+        schemaVersion: previous!.schema_version, baseRevision: request.revision, issue: context.issue }, completedItems);
+      candidatePlans.push(next);
+      warnings.push(...(completedItems === undefined ? validatePlan(next, context) : validateContinuationPlan(next, context, completedItems, true)).warnings);
     }
-    return { value: reply, warnings };
+    return { value: reply, warnings, candidatePlans };
   } });
 }

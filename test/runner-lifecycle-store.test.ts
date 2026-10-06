@@ -105,7 +105,7 @@ describe('schema v12 review ordering', () => {
     migrated.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: migratedVersion },
       [{ item: 'P1', fingerprint: 'approved-after-upgrade' }], []);
     expect(migrated.unapprovedExecutionItems(identity, 1)).toEqual([]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
   });
 });
 
@@ -690,7 +690,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
     const reopened = open(path);
     expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
   });
 
   it('adds the durable owed marker to a version 12 database', () => {
@@ -700,7 +700,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_owed; PRAGMA user_version=12;'); db.close();
     const reopened = open(path);
     expect(reopened.owedSafetyFindings()).toEqual([]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
   });
 
   it('restores and clears an escalation owed behind a human gate across real store reopens', () => {
@@ -740,7 +740,7 @@ describe('allocation baseline (#91)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
     const reopened = open(path);
     expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
   });
 });
 describe('publish outcomes (#103)', () => {
@@ -756,7 +756,7 @@ describe('publish outcomes (#103)', () => {
     reopened.recordPublish(identity, { outcome: 'opened', draft: false, message: 'Pull request #1 is open.', number: 1, url: 'https://github.com/o/r/pull/1' });
     expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 1 });
     expect(reopened.getTask(identity)).toEqual(before);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 13 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
   });
   it('stamps an outcome with the version the publish saw, and refuses one it cannot have seen (#114)', () => {
     const { store } = queued(), version = store.getTask(identity).stateVersion;

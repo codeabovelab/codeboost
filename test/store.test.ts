@@ -19,9 +19,12 @@ const reply = (revision = 1): EditReply => ({ schema_version: 1, base_revision: 
 const dirs: string[] = [], stores: Store[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const dir of dirs.splice(0)) rmSync(dir, { recursive: true, force: true }); });
 function directory() { const dir = mkdtempSync(join(tmpdir(), 'codeboost-store-')); dirs.push(dir); return dir; }
-function open(path: string) { const store = new Store(path); stores.push(store); return store; }
+function open(path: string, pathKey: (path: string) => string = p => p) { const store = new Store(path, pathKey); stores.push(store); return store; }
 function close(store: Store) { store.close(); stores.splice(stores.indexOf(store), 1); }
-function fixture() { const path = join(directory(), 'state.sqlite'); const store = open(path); store.createPlan(JSON.stringify(plan()), 'json', context, oid(1), oid(2)); return { path, store }; }
+function fixture(two = false) { const path = join(directory(), 'state.sqlite'); const store = open(path);
+  const initial = plan();
+  if (two) initial.items.push({ ...structuredClone(initial.items[0]!), id: 'P2', depends_on: ['P1'] });
+  store.createPlan(JSON.stringify(initial), 'json', context, oid(1), oid(2)); return { path, store }; }
 const state = (store: Store) => ({ revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id });
 function ready(store: Store) { const id = store.beginSuggestions(identity, state(store), 'suggest'); store.completeSuggestions(identity, id, reply()); return id; }
 it('allocates revisions in SQLite, survives reopen, and keeps old revisions and snapshots immutable', () => {
@@ -197,13 +200,17 @@ it('retains typed file-card approvals/choices while fingerprints detect later me
   expect(approvalStates(store.getPlan(identity), [segment], store.getReview(identity).approvals, identity).P1).toBe('stale');
 });
 it('retains checkpoint scope evidence after amended continuation and rejects a moved head', () => {
-  const { store, path } = fixture(); const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }] });
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).toThrow(/amended/);
-  store.importRevision(JSON.stringify(plan()), 'json', context, 1);
-  store.approveContinuation(identity, checkpoint.id, state(store));
+  const { store, path } = fixture(true); store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const entries = [...context.baseEntries, { path: 'outside', kind: 'file' as const }];
+  const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: entries });
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: entries })).toThrow(/amended/);
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: entries });
   const recovered = open(path); expect(recovered.getCheckpoint(identity, checkpoint.id)).toEqual(checkpoint); expect(recovered.continuationRevision(identity, checkpoint.id)).toBe(2);
   store.recordHistory(identity, state(store), oid(1), oid(3), []);
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).toThrow(/checkpoint/);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: entries })).toThrow(/head|checkpoint/);
 });
 it('rejects unsupported Node versions and opens SQLite without warnings', () => {
   expect(() => requireSupportedNode('24.0.0')).toThrow(/Upgrade Node/); expect(() => requireSupportedNode('26.6.0')).toThrow();
@@ -267,13 +274,198 @@ it('allows historical ledger retries after the owning item is removed, but rejec
   expect(store.getLedger(identity).find(entry => entry.sha === oid(5))!.owner).toBe('P1');
 });
 it('allows a later amended revision to receive a fresh continuation approval', () => {
-  const { store } = fixture(); const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
-  store.importRevision(JSON.stringify(plan()), 'json', context, 1); store.approveContinuation(identity, checkpoint.id, state(store));
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).not.toThrow();
-  store.importRevision(JSON.stringify(plan()), 'json', context, 2);
+  const { store } = fixture(true); store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1); store.approveContinuation(identity, checkpoint.id, state(store), context);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), context)).not.toThrow();
+  store.importRevision(JSON.stringify(store.getPlan(identity)), 'json', context, 2);
   expect(store.continuationRevision(identity, checkpoint.id)).toBe(2);
-  expect(() => store.approveContinuation(identity, checkpoint.id, state(store))).not.toThrow();
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), context)).not.toThrow();
   expect(store.continuationRevision(identity, checkpoint.id)).toBe(3);
+});
+it('refuses a suffix that is invalid against the audited tree despite a valid base-tree plan', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const checkpoint = store.recordCheckpoint(identity, state(store), {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: [],
+  });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  expect(() => store.approveContinuation(identity, checkpoint.id, state(store), { ...context, baseEntries: [] }))
+    .toThrow(/remaining plan is invalid.*Missing source: a/);
+  expect(store.continuationRevision(identity, checkpoint.id)).toBeNull();
+});
+it('re-reads the actual checkpoint tree for legacy checkpoint rows', () => {
+  const { store, path } = fixture(true); store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const checkpoint = store.recordCheckpoint(identity, state(store), {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  close(store);
+  const db = new DatabaseSync(path);
+  db.prepare('UPDATE checkpoints SET data=? WHERE key=? AND id=?').run(
+    JSON.stringify({ ...checkpoint, treeHead: undefined }), JSON.stringify([identity.repositoryId, identity.taskId, identity.planId]), checkpoint.id);
+  db.close();
+  const reopened = open(path), amended = reopened.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  reopened.importRevision(JSON.stringify(amended), 'json', context, 1);
+  expect(() => reopened.approveContinuation(identity, checkpoint.id, state(reopened), {
+    ...context, baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
+  })).not.toThrow();
+});
+it('refuses edits to completed items before the checkpoint owner', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.intent += ' revised after completion';
+  amended.items[1]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/Completed item P1 changed before the audited checkpoint/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it('refuses checkpoint-owner edits beyond declaring the observed scope finding', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.intent += ' changed after it completed';
+  amended.items[1]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/changed beyond its scope declaration/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it('refuses a scope declaration whose rename source was not observed', () => {
+  const path = join(directory(), 'state.sqlite'), store = open(path), contextWithSource = {
+    ...context, baseEntries: [...context.baseEntries, { path: 'b', kind: 'file' as const }],
+  };
+  const initial = plan(); initial.items.push({ ...structuredClone(initial.items[0]!), id: 'P2', depends_on: ['P1'] });
+  store.createPlan(JSON.stringify(initial), 'json', contextWithSource, oid(1), oid(2));
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: contextWithSource.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.files.push({ path: 'outside', kind: 'rename', renamed_from: 'b', change: 'Rename the observed path' });
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', contextWithSource, 1)).toThrow(/changed beyond its scope declaration/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it.each([
+  {
+    name: 'duplicate operations', outOfScopePaths: ['outside'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: null, change: 'Declare the observed add' },
+      { path: 'outside', kind: 'delete' as const, renamed_from: null, change: 'Declare the observed delete' },
+    ],
+  },
+  {
+    name: 'parent and child paths', outOfScopePaths: ['outside', 'outside/child'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: null, change: 'Declare the observed parent' },
+      { path: 'outside/child', kind: 'add' as const, renamed_from: null, change: 'Declare the observed child' },
+    ],
+  },
+  {
+    name: 'a duplicated rename source', outOfScopePaths: ['outside', 'moved'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: null, change: 'Declare the observed add' },
+      { path: 'moved', kind: 'rename' as const, renamed_from: 'outside', change: 'Declare the observed rename' },
+    ],
+  },
+  {
+    name: 'a rename source on a non-rename operation', outOfScopePaths: ['outside', 'source'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: 'source', change: 'Declare the observed add' },
+    ],
+  },
+  {
+    name: 'an unsafe canonical path', outOfScopePaths: ['bad:name'],
+    files: [
+      { path: 'bad:name', kind: 'add' as const, renamed_from: null, change: 'Declare the observed path' },
+    ],
+  },
+])('refuses checkpoint scope declarations with $name', ({ outOfScopePaths, files }) => {
+  const { store } = fixture(true);
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths, baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.files.push(...files);
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/file declarations/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it('uses configured path identity when matching checkpoint scope declarations', () => {
+  const path = join(directory(), 'state.sqlite'), pathKey = (value: string) => value.toLowerCase();
+  const store = open(path, pathKey), normalizedContext = { ...context, pathKey };
+  store.createPlan(JSON.stringify({ ...plan(), items: [...plan().items, { ...structuredClone(plan().items[0]!), id: 'P2', depends_on: ['P1'] }] }),
+    'json', normalizedContext, oid(1), oid(2));
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.files.push({ path: 'OUTSIDE', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  expect(store.importRevision(JSON.stringify(amended), 'json', normalizedContext, 1).revision).toBe(2);
+  expect(store.continuationProgress(identity)?.next).toBeNull();
+  const identityCollision = store.getPlan(identity);
+  identityCollision.items[1]!.files.push({ path: 'outside', kind: 'delete', renamed_from: null, change: 'Duplicate the observed path' });
+  expect(() => store.importRevision(JSON.stringify(identityCollision), 'json', normalizedContext, 2))
+    .toThrow(/file declarations/);
+  expect(store.getPlan(identity).revision).toBe(2);
+  const identityDrift = store.getPlan(identity);
+  identityDrift.issue = 2;
+  expect(() => store.importRevision(JSON.stringify(identityDrift), 'json', normalizedContext, 2)).toThrow(/Plan issue does not match/);
+  expect(store.getPlan(identity).revision).toBe(2);
+});
+it('can restore an executed definition after a transient pre-checkpoint amendment', () => {
+  const { store } = fixture(true), id = identity;
+  store.transitionTask(id, store.getTask(id).stateVersion, 'queued');
+  const start = store.getSnapshot(id), attempt = store.admitAttempt(id, { expectedStateVersion: store.getTask(id).stateVersion,
+    kind: 'execute', item: 'P1', expectedContext: store.currentContext(id), deadline: Date.now() + 60_000 });
+  store.markRunning(id, attempt.id);
+  const head = oid(7);
+  store.settleAttempt(id, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { head, unchanged: false, inScope: [], outOfScope: ['outside'] },
+    history: { base: start.base, head, entries: [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }] } });
+  const transient = store.getPlan(id); transient.items[0]!.intent += ' transient edit';
+  store.importRevision(JSON.stringify(transient), 'json', context, 1);
+  store.pauseForAmendment(id, { revision: 1, snapshotId: store.getSnapshot(id).id }, {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'],
+    baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
+  }, { owed: true });
+  const restore = store.getPlan(id); restore.items[0]!.intent = plan().items[0]!.intent;
+  restore.items[0]!.files.push({ path: 'outside', kind: 'edit', renamed_from: null, change: 'Declare observed file' });
+  expect(() => store.importRevision(JSON.stringify(restore), 'json', {
+    ...context, baseEntries: [...context.baseEntries, { path: 'outside', kind: 'file' }],
+  }, 2)).not.toThrow();
+  expect(store.continuationProgress(id)).toMatchObject({ completed: ['P1'], next: 'P2', head });
+});
+it('refuses a suffix ID collision with the completed checkpoint prefix without saving it', () => {
+  const { store } = fixture(true);
+  store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'], outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  const amended = store.getPlan(identity); amended.items[1]!.id = 'P1';
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/Duplicate item ID P1/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
+it('validates saved amendments against the checkpoint tree and completed suffix', () => {
+  const path = join(directory(), 'state.sqlite'), store = open(path);
+  const initial: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'Example', questions: [], items: [
+    { id: 'P1', title: 'Create output', intent: 'Create done.ts', files: [{ path: 'done.ts', kind: 'add', renamed_from: null, change: 'Create output' }], acceptance: [{ type: 'check', text: 'Done' }], depends_on: [] },
+    { id: 'P2', title: 'Continue', intent: 'Create later.ts', files: [{ path: 'later.ts', kind: 'add', renamed_from: null, change: 'Create later output' }], acceptance: [{ type: 'check', text: 'Done' }], depends_on: ['P1'] },
+  ] };
+  store.createPlan(JSON.stringify(initial), 'json', { ...context, baseEntries: [] }, oid(1), oid(2));
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P1', completedItems: ['P1'], outOfScopePaths: ['extra.ts'],
+    baseEntries: [{ path: 'done.ts', kind: 'file' }, { path: 'extra.ts', kind: 'file' }],
+  });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
+  expect(store.importRevision(JSON.stringify(amended), 'json', {
+    ...context, baseEntries: [{ path: 'done.ts', kind: 'file' }, { path: 'extra.ts', kind: 'file' }],
+  }, 1).revision).toBe(2);
+  expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1'], next: 'P2' });
 });
 it('rejects duplicate source SHA mappings and rolls back every resulting ledger/snapshot write', () => {
   const { store } = fixture(); const before = store.getSnapshot(identity);

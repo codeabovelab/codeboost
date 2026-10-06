@@ -1,13 +1,13 @@
 import { identityKey, type PlanIdentity } from './identity.ts';
 import { prepareDraft, prepareSuggestions, type AuthorInput, type AuthorProvider, type PreparedAuthor } from './planning-author.ts';
-import type { Diagnostic, EditReply, Plan } from './plan.ts';
+import type { ContinuationBinding, Diagnostic, EditReply, Plan } from './plan.ts';
 
 /** Implemented by the existing Store. No SQL or second persistence writer in core. */
 export interface SuggestionStore {
   getPlan(identity: PlanIdentity): Plan;
   getSnapshot(identity: PlanIdentity): { id: string; base: string; head: string };
-  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }, mode: PlanningMode): string;
-  completeSuggestions(identity: PlanIdentity, id: string, reply: unknown): void;
+  beginSuggestions(identity: PlanIdentity, expected: { revision: number; snapshotId: string }, mode: PlanningMode, continuation?: ContinuationBinding | null): string;
+  completeSuggestions(identity: PlanIdentity, id: string, reply: unknown, candidatePlans?: Plan[]): boolean | void;
   settleSuggestion(identity: PlanIdentity, id: string, expected: { revision: number; snapshotId: string }, outcome: { state: 'failed' | 'cancelled' | 'invalidated'; reason: string }): boolean;
   getSuggestions(identity: PlanIdentity, id: string): { state: string; revision: number; snapshotId: string | null; reply: EditReply | null; reason: string | null };
 }
@@ -16,7 +16,7 @@ export interface SuggestionStore {
  * in the input is always the current revision the request is bound to.
  */
 export type PlanningMode = 'suggest' | 'draft';
-export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'> & { snapshotId: string };
+export type SuggestionInput = Omit<AuthorInput, 'requestId' | 'previousPlan'> & { snapshotId: string; continuationBinding?: ContinuationBinding | null };
 export type SuggestionOutcome =
   | { state: 'completed'; id: string; warnings: Diagnostic[] }
   | { state: 'failed' | 'cancelled' | 'stale'; id: string; reason: string };
@@ -57,6 +57,11 @@ export class SuggestionCoordinator {
     if (this.#closing) throw new Error('Planning coordinator is closing.');
     const identity = { ...input.context.identity }, key = identityKey(identity);
     if (this.#active.has(key)) throw new Error('A planning invocation is still active for this plan.');
+    const completed = input.completedItems ?? [];
+    if ((input.continuationBinding === null || input.continuationBinding === undefined) !== (completed.length === 0) ||
+        (input.continuationBinding && (input.continuationBinding.completedItems.length !== completed.length ||
+          input.continuationBinding.completedItems.some((item, index) => item !== completed[index]))))
+      throw new Error('Planning continuation binding does not match its completed prefix.');
     const snapshotId = input.snapshotId;
     const previousPlan = this.#store.getPlan(identity), snapshot = this.#store.getSnapshot(identity);
     if (previousPlan.revision !== input.revision) throw new Error('Stale plan revision.');
@@ -67,7 +72,7 @@ export class SuggestionCoordinator {
       : prepareSuggestions({ ...input, requestId: 'pending', previousPlan });
     const expected = Object.freeze({ revision: input.revision, snapshotId });
     const noun = mode === 'draft' ? 'Draft' : 'Suggestion';
-    const id = this.#store.beginSuggestions(identity, expected, mode);
+    const id = this.#store.beginSuggestions(identity, expected, mode, input.continuationBinding ?? null);
     const request = Object.freeze({ ...prepared.request, requestId: id });
     const controller = new AbortController();
     let stopped: Omit<TerminalOutcome, 'id'> | undefined;
@@ -119,8 +124,9 @@ export class SuggestionCoordinator {
               outcome = { id, state: current.state === 'cancelled' ? 'cancelled' : 'stale', reason: `${noun} request is ${current.state}.` };
             } else {
               const validated = prepared.validate(source);
-              this.#store.completeSuggestions(identity, id, validated.value);
-              outcome = { id, state: 'completed', warnings: validated.warnings };
+              const saved = this.#store.completeSuggestions(identity, id, validated.value, validated.candidatePlans);
+              outcome = saved === false ? { id, state: 'stale', reason: 'Checkpoint continuation changed during authoring.' }
+                : { id, state: 'completed', warnings: validated.warnings };
             }
           }
         }

@@ -80,8 +80,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const store = service.store;
     const suggestionStore: SuggestionStore = {
       getPlan: identity => store.getPlan(identity), getSnapshot: identity => store.getSnapshot(identity),
-      beginSuggestions: (identity, expected, mode) => store.beginSuggestions(identity, expected, mode),
-      completeSuggestions: (identity, id, reply) => capability.run(() => store.completeSuggestions(identity, id, reply)),
+      beginSuggestions: (identity, expected, mode, continuation) => store.beginSuggestions(identity, expected, mode, continuation),
+      completeSuggestions: (identity, id, reply, candidatePlans) => capability.run(() => store.completeSuggestions(identity, id, reply, candidatePlans)),
       settleSuggestion: (identity, id, expected, outcome) => capability.run(() => store.settleSuggestion(identity, id, expected, outcome)),
       getSuggestions: (identity, id) => store.getSuggestions(identity, id),
     };
@@ -117,7 +117,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     if (!executor || !progress) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
     // Shutdown began: answer 503 before any refusal, so nothing is recorded under the action ID and the UI may resend.
     if (!forView && runner!.closing) throw new ShuttingDownError();
-    const task = service.store.getTask(identity), { started, begun, earlierCommits, completed, prefixHead, next } = progress;
+    const task = service.store.getTask(identity), { started, begun, earlierCommits } = progress;
+    // Safety evidence must settle before reconciliation can refuse on a stale prefix or head.
+    const safetyOwed = executor.owes(identity, { scope: false });
+    const anyFindingOwed = executor.owes(identity);
+    const continuation = anyFindingOwed ? null : service.store.continuationProgress(identity);
+    const completed = continuation?.completed ?? progress.completed;
+    const prefixHead = continuation?.head ?? progress.prefixHead;
+    const next = continuation ? continuation.next : progress.next;
     // Checked in the order a person can act on: a closed task first, then what admission would refuse.
     if (task.status === 'merged' || task.status === 'cancelled') throw new GuardRefusal(`The task is ${task.status}.`);
     if (!runner!.runs('execute')) throw new GuardRefusal('The runner cannot run execute attempts yet.');
@@ -130,7 +137,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // consume it and strand the task behind the resulting human gate.
     if (action === 'start' && task.requeuePending) throw new GuardRefusal('Recovery left this task to requeue; it cannot start until Resume resolves that claim.');
     // A failed durable save must not let an ordinary refusal strand an in-memory safety finding until restart loses it.
-    if (executor.owes(identity, { scope: false })) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
+    if (safetyOwed) return { fromItem: next ?? service.store.getPlan(identity).items[0]!.id,
       claimRequeue: task.requeuePending, queue: false, owed: true };
     const merge = service.store.getMergeAttempt(identity);
     const activeMerge = !!merge && (merge.state === 'submitting' || merge.state === 'queued');
@@ -145,12 +152,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // Only the view stops here: the action lets admission refuse, because its refusal also moves the idle task to needs
     // human (the time-limit mapping), and nothing else would.
     if (forView && task.budgetDeadline !== null && task.budgetDeadline <= Date.now()) throw new GuardRefusal('The task time budget has run out; it needs a person.');
-    if (service.store.latestCheckpoint(identity)) throw new GuardRefusal('The task paused for a scope amendment; continuing after one is not supported yet (#88).');
-    // Commits an earlier revision's items made have not been reconciled with the revised plan (plan-format.md): rerunning
-    // the plan on top of them could redo or contradict that work, so it waits for #88 rather than guessing. Earlier
-    // attempts that committed nothing (failed, stopped, stale or unchanged) leave nothing to reconcile.
-    if (!begun && earlierCommits) throw new GuardRefusal('The plan was revised after items of it were committed; running a revised plan on top of those commits is not supported yet (#88).');
+    if (continuation && !service.store.continuationApproved(identity, continuation))
+      throw new GuardRefusal('Approve the amended plan continuation before resuming the task.');
+    // Commits from another revision without a scope checkpoint have no audited continuation prefix to reconcile; rerunning
+    // the plan on top of them could redo or contradict that work. Earlier attempts that committed nothing leave none.
+    if (!continuation && !begun && earlierCommits) throw new GuardRefusal('The plan changed after runner commits without a scope checkpoint; those commits cannot be reconciled safely.');
     if (action === 'start') {
+      if (continuation) throw new GuardRefusal('This task has a scope checkpoint; resume it after approving the amended continuation.');
       // Point to resume wherever resume could run (a running task that ran any revision too); any other status is named as it is.
       const ran = begun || task.requeuePending;
       if (next !== null && ((ran && task.status === 'queued') || (task.status === 'running' && (started || task.requeuePending))))
@@ -194,8 +202,22 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const free = !!runner && !runner.closing && !status.unresolved && !runner.unreleased;
     // One progress read per poll, shared by both flags.
     const progress = free && executor ? executor.progress(identity) : undefined;
+    const checkpoint = service.store.latestCheckpoint(identity);
+    let continuation: Record<string, unknown> | null = null;
+    if (checkpoint) {
+      try {
+        const current = service.store.continuationProgress(identity)!;
+        continuation = { checkpointId: checkpoint.id, item: checkpoint.item, completedItems: current.completed,
+          outOfScopePaths: checkpoint.outOfScopePaths, next: current.next, approved: service.store.continuationApproved(identity, current) };
+      } catch (error) {
+        continuation = { checkpointId: checkpoint.id, item: checkpoint.item, completedItems: checkpoint.completedItems,
+          outOfScopePaths: checkpoint.outOfScopePaths, next: null, approved: false,
+          reason: error instanceof Error ? error.message : String(error) };
+      }
+    }
     return { available: !!runner, task, attempts, startable: !!progress && offered('start', progress), resumable: !!progress && offered('resume', progress),
-      stateVersion: task.stateVersion, reviewVersion: service.store.reviewVersion(identity), retryable, stopRequested: status.stopRequested, unresolved: status.unresolved, publish: publishView(progress) };
+      stateVersion: task.stateVersion, reviewVersion: service.store.reviewVersion(identity), retryable, stopRequested: status.stopRequested,
+      unresolved: status.unresolved, continuation, publish: publishView(progress) };
   };
   /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
   const publishView = (progress?: ReturnType<ItemExecutor['progress']>) => {
@@ -214,24 +236,44 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   const runnerAction = (input: Record<string, unknown>) => {
     const { action, attemptId, expectedStateVersion, expectedReviewVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
-    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'publish', 'close-pull-requests'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
+    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'approve-continuation', 'publish', 'close-pull-requests'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
     if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
-    if ((action === 'start' || action === 'resume') && !Number.isSafeInteger(expectedReviewVersion)) {
+    if ((action === 'start' || action === 'resume' || action === 'approve-continuation') && !Number.isSafeInteger(expectedReviewVersion)) {
       // Actions saved before #107 had no review version in their request hash. They remain replayable, but this shape
       // can never create a new action now: a miss falls through to the new-field validation below.
       const legacy = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string,
         request: { attemptId, expectedStateVersion } });
       if (legacy) return legacy.response;
-      throw new BadRequest('expectedReviewVersion must be an integer for start and resume.');
+      throw new BadRequest('expectedReviewVersion must be an integer for start, resume and continuation approval.');
     }
     if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
-    const request = { attemptId, expectedStateVersion, ...((action === 'start' || action === 'resume') ? { expectedReviewVersion } : {}) };
+    const request = { attemptId, expectedStateVersion, ...((action === 'start' || action === 'resume' || action === 'approve-continuation') ? { expectedReviewVersion } : {}) };
     // A refused start or resume can still move the task to needs human (an expired budget is committed with the refusal),
     // and a task that moves there is owed a draft PR (#103). Only that move publishes: a person who pressed resume on a
     // task already in needs human asked for no publish.
     if (action === 'start' || action === 'resume') {
       const before = service.store.getTask(identity).status;
       try { return act(); } finally { if (service.store.getTask(identity).status !== before) publishing?.actIfOwed(identity, { personAsked: true }); }
+    }
+    // A final-item scope amendment can finish the plan without another runner attempt; its approval moves the task to
+    // running, after which the ordinary publishing gate can open the ready pull request.
+    if (action === 'approve-continuation') {
+      // A recovered run may already have left the task running. In that case approving removal of its interrupted last
+      // item does not change task status, but it does make a ready publish newly possible. Publish only for a newly
+      // committed action: a replay or refusal must not restart external work.
+      let committed = false;
+      try {
+        const result = actWithReplayState();
+        committed = !result.replayed;
+        return result.response;
+      } finally {
+        if (committed) {
+          const task = service.store.getTask(identity);
+          const progress = task.status === 'running' ? service.store.continuationProgress(identity) : null;
+          if (progress?.next === null && service.store.continuationApproved(identity, progress))
+            publishing?.actIfOwed(identity, { personAsked: true });
+        }
+      }
     }
     // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
     // stopping an attempt closes the task when the attempt settles; the run's end then closes them (afterRun).
@@ -252,12 +294,34 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.actIfOwed(identity, { personAsked: true }); throw error; }
     }
     return act();
-    function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => {
+    function act() { return actWithReplayState().response; }
+    function actWithReplayState() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => {
+      // A saved replay is returned by userAction before this callback. A new continuation approval admitted before
+      // shutdown but parsed during the drain must remain retryable, even when no runner exists or its supplied versions
+      // are stale.
+      if (action === 'approve-continuation' && (stopping || runner?.closing)) throw new ShuttingDownError();
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
-      if ((action === 'start' || action === 'resume') && service.store.reviewVersion(identity) !== expectedReviewVersion)
+      if ((action === 'start' || action === 'resume' || action === 'approve-continuation') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
+      if (action === 'approve-continuation') {
+        if (!executor || runner.isActive(identity) || executor.busy(identity) || publishing?.busy(identity))
+          throw new GuardRefusal('The runner is busy or closing; continuation cannot be approved yet.');
+        const progress = service.store.continuationProgress(identity);
+        if (!progress) throw new GuardRefusal('This task has no scope checkpoint.');
+        if (executor.owes(identity)) throw new GuardRefusal('A scope or safety finding must settle before continuation approval.');
+        const task = service.store.getTask(identity), merge = service.store.getMergeAttempt(identity);
+        if (!['needs amendment', 'queued', 'running'].includes(task.status) || task.cancelRequested !== null ||
+            (merge && (merge.state === 'submitting' || merge.state === 'queued')))
+          throw new GuardRefusal('The task status, cancellation or merge state prevents continuation approval.');
+        const context = service.planContextAt(progress.head);
+        service.store.approveContinuation(identity, progress.checkpoint.id, {
+          revision: service.store.getPlan(identity).revision, snapshotId: service.store.getSnapshot(identity).id,
+          reviewVersion: expectedReviewVersion as number,
+        }, context);
+        return { outcome: 'approved', checkpointId: progress.checkpoint.id, next: progress.next };
+      }
       if (action === 'start' || action === 'resume') {
         const choice = runChoice(action);
         // In this transaction with the admission: a refused admission rolls the move to queued back with it.
@@ -297,7 +361,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       void runner.settled(identity).then(() => { if (service.store.getTask(identity).status === 'cancelled') publishing?.actIfOwed(identity); })
         .catch(error => console.error(`Could not start closing pull requests: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`));
       return { outcome: 'started', attemptId: retry.id };
-    }).response; }
+    }); }
   };
   /** Handles of suggestion requests started by this process, removed once their outcome settles. */
   const suggestionHandles = new Map<string, SuggestionHandle>();
@@ -344,7 +408,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     return service.store.userAction(identity, { actionId, kind, request }, () => {
       if (imported) {
         if (typeof input.source !== 'string' || !['json', 'yaml'].includes(input.format as string) || !Number.isSafeInteger(input.expectedRevision)) throw new BadRequest('source, format and expectedRevision are required.');
-        return { revision: service.store.importRevision(input.source, input.format as 'json' | 'yaml', service.planContext(), input.expectedRevision as number).revision };
+        return { revision: service.store.importRevision(input.source, input.format as 'json' | 'yaml', service.planContextForAmendment(), input.expectedRevision as number).revision };
       }
       if (started) {
         // Like Ask and the runner, no new agent starts once shutdown began; 503 is not recorded, so the UI may resend.
@@ -355,8 +419,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (typeof input.feedback !== 'string' || input.feedback.length > 4000) throw new BadRequest('feedback must be text of 4000 characters or fewer.');
         // Read above whenever the checks before this line pass; they cannot change across the synchronous action.
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
-        const context = service.planContext();
-        const handle = suggestions.start({ context, revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
+        const amendment = service.planningContextForAmendment(), context = amendment.context;
+        const handle = suggestions.start({ context, completedItems: amendment.completedItems, continuationBinding: amendment.continuation,
+          continuationContext: amendment.continuationContext,
+          revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
           repo: { ...described.repo, baseSha: snapshot.base, paths: context.baseEntries.map(entry => entry.path) } }, mode);
         suggestionHandles.set(handle.id, handle);
         void handle.result.finally(() => suggestionHandles.delete(handle.id));
@@ -375,9 +441,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         service.store.cancelSuggestions(identity, id, 'Cancelled by the user.');
         return { state: service.store.getSuggestions(identity, id).state };
       }
-      if (mode === 'draft') return { revision: service.store.applyDraft(identity, id, service.planContext()).revision };
+      if (mode === 'draft') return { revision: service.store.applyDraft(identity, id, service.planContextForAmendment()).revision };
       if (!Number.isSafeInteger(input.index)) throw new BadRequest('index is required.');
-      return { revision: service.store.applySuggestion(identity, id, input.index as number, service.planContext()).revision };
+      return { revision: service.store.applySuggestion(identity, id, input.index as number, service.planContextForAmendment()).revision };
     }).response;
   };
   let stopping = false;

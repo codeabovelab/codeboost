@@ -42,6 +42,7 @@ export interface PlanContext {
   allowedCommands: readonly (readonly string[])[];
   issue: number;
 }
+export interface ContinuationBinding { checkpointId: string; head: string; completedItems: readonly string[] }
 export interface Validation { errors: Diagnostic[]; warnings: Diagnostic[] }
 export class PlanError extends Error {
   readonly diagnostics: Diagnostic[];
@@ -135,6 +136,39 @@ export function validatePlan(value: unknown, context: PlanContext): Validation {
   const validator = validators[registry.versions[value.schema_version].validator];
   if (!validator) return { errors: [{ code: 'version', message: 'Unsupported semantic validator.' }], warnings: [] };
   return validator(value, context);
+}
+
+/** Validate only work still to run, starting with the runner-audited tree at its checkpoint. */
+export function validateContinuationPlan(plan: Plan, context: PlanContext, completedItems: readonly string[], allowEmptySuffix = false): Validation {
+  try { assertPlan(plan); } catch (error) {
+    if (error instanceof PlanError) return { errors: error.diagnostics, warnings: [] };
+    throw error;
+  }
+  const prefix = plan.items.slice(0, completedItems.length).map(item => item.id);
+  if (!completedItems.length || prefix.length !== completedItems.length || prefix.some((id, index) => id !== completedItems[index]) ||
+      completedItems.length > plan.items.length || (!allowEmptySuffix && completedItems.length === plan.items.length))
+    return { errors: [{ code: 'continuation-prefix', message: 'The amended plan must retain the completed item prefix and have a remaining item.' }], warnings: [] };
+  const ids = new Set<string>();
+  for (const item of plan.items) {
+    if (ids.has(item.id)) return { errors: [{ code: 'duplicate-id', message: `Duplicate item ID ${item.id}.`, item: item.id }], warnings: [] };
+    if (new Set(item.depends_on).size !== item.depends_on.length)
+      return { errors: [{ code: 'dependency', message: 'Dependencies must be unique.', item: item.id }], warnings: [] };
+    ids.add(item.id);
+  }
+  // There is no executable suffix to validate, but the plan remains bound to
+  // the selected issue even after every item has completed.
+  if (completedItems.length === plan.items.length) {
+    if (!Number.isSafeInteger(context.issue) || context.issue < 1)
+      return { errors: [{ code: 'context', message: 'A selected issue is required.' }], warnings: [] };
+    if (plan.issue !== context.issue)
+      return { errors: [{ code: 'issue', message: 'Plan issue does not match the selected issue.' }], warnings: [] };
+    return { errors: [], warnings: [] };
+  }
+  const completed = new Set(completedItems);
+  const suffix: Plan = { ...plan, items: plan.items.slice(completedItems.length).map(item => ({
+    ...item, depends_on: item.depends_on.filter(id => !completed.has(id)),
+  })) };
+  return validatePlan(suffix, context);
 }
 
 function validateV1(value: Plan, context: PlanContext): Validation {
@@ -273,15 +307,17 @@ function validateV1(value: Plan, context: PlanContext): Validation {
   return { errors, warnings };
 }
 
-export function importPlan(source: string | Uint8Array, format: 'json' | 'yaml', context: PlanContext, revision: number): { plan: Plan; warnings: Diagnostic[] } {
+export function importPlan(source: string | Uint8Array, format: 'json' | 'yaml', context: PlanContext, revision: number,
+  completedItems?: readonly string[]): { plan: Plan; warnings: Diagnostic[] } {
   if (!Number.isSafeInteger(revision) || revision < 1) fail('revision', 'Revision must be a positive safe integer.');
   let data: unknown;
   try { data = parseV1(source, format); }
   catch (error) { fail('parse', `Cannot parse plan: ${(error as Error).message}`); }
   assertPlan(data); // No migrations exist yet: only released v1 is accepted.
-  const result = validatePlan(data, context);
+  const plan = { ...data, revision };
+  const result = completedItems === undefined ? validatePlan(data, context) : validateContinuationPlan(plan, context, completedItems, true);
   if (result.errors.length) throw new PlanError(result.errors);
-  return { plan: { ...data, revision }, warnings: result.warnings };
+  return { plan, warnings: result.warnings };
 }
 
 const payloads = ['field', 'value', 'file', 'check', 'check_index', 'depends_on', 'new_item'] as const;
@@ -297,7 +333,8 @@ export interface SuggestionBinding {
 /** Pure transformation. The store must load this binding by opaque suggestion ID,
  * verify cancellation/consumption, and CAS revision plus consume/invalidate IDs atomically.
  * This function cannot provide persistence, replay prevention, or concurrency control. */
-export function applySuggestion(plan: Plan, reply: unknown, index: number, context: PlanContext, binding: SuggestionBinding): Plan {
+export function applySuggestion(plan: Plan, reply: unknown, index: number, context: PlanContext, binding: SuggestionBinding,
+  completedItems?: readonly string[]): Plan {
   assertPlan(plan); assertEditReply(reply);
   if (!binding || identityKey(binding.identity) !== identityKey(context.identity) ||
       binding.schemaVersion !== plan.schema_version || binding.baseRevision !== reply.base_revision ||
@@ -339,7 +376,7 @@ export function applySuggestion(plan: Plan, reply: unknown, index: number, conte
       case 'set_depends': item.depends_on = edit.depends_on!; break;
     }
   }
-  const result = validatePlan(next, context);
+  const result = completedItems === undefined ? validatePlan(next, context) : validateContinuationPlan(next, context, completedItems, true);
   if (result.errors.length) throw new PlanError(result.errors);
   if (!Number.isSafeInteger(next.revision + 1)) fail('revision', 'Revision limit reached.');
   next.revision++;
