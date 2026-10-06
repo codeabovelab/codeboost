@@ -532,6 +532,121 @@ describe('user actions', () => {
   });
 });
 
+describe('pre-merge rebase ownership', () => {
+  const reviewed = (store: Store) => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+
+  it('claims one exact attempt and blocks merge and runner admission until it settles', () => {
+    const { store } = fixture(), expected = reviewed(store), taskVersion = store.getTask(identity).stateVersion;
+    store.transitionTask(identity, taskVersion, 'approved but merge blocked');
+    const readyVersion = store.getTask(identity).stateVersion;
+    expect(() => store.beginRebase(identity, { revision: expected.revision, snapshotId: expected.snapshotId } as typeof expected,
+      readyVersion, { oldBase: oid(1), oldHead: oid(2), onto: oid(3) })).toThrow(/current review version/);
+    const marker = store.beginRebase(identity, expected, readyVersion, { oldBase: oid(1), oldHead: oid(2), onto: oid(3), startedAt: 123 });
+    expect(store.getTask(identity).rebaseInProgress).toEqual({ attemptId: marker.attemptId, oldBase: oid(1), oldHead: oid(2), onto: oid(3), startedAt: 123,
+      processGroup: null });
+    const group = { pgid: 4242, startedAt: 456 };
+    expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
+      { pgid: 1, startedAt: 456 })).toThrow(/Invalid rebase process group/);
+    store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, 'spawning');
+    expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, group)).toThrow(/Another Git process/);
+    store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, 'spawning', group);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ processGroup: { pgid: 4242, startedAt: 456 } });
+    expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
+      { pgid: 5252, startedAt: 567 })).toThrow(/Another Git process/);
+    expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId,
+      { pgid: 3131, startedAt: 345 }, null)).toThrow(/Another Git process/);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ processGroup: group });
+    expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, randomUUID(), null, null)).toThrow(/no longer owns/);
+    store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, group, null);
+    expect(() => store.beginRebase(identity, expected, store.getTask(identity).stateVersion,
+      { oldBase: oid(1), oldHead: oid(2), onto: oid(3) })).toThrow(/already in progress/);
+    expect(() => store.beginMergeAttempt(identity, expected, oid(2), null, 'direct')).toThrow(/rebase is in progress/);
+    expect(() => store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued')).toThrow(/rebase is in progress/);
+    expect(() => store.setAssignment(identity, store.getTask(identity).stateVersion, 'other', 'other-head')).toThrow(/rebase is in progress/);
+  });
+
+  it('publishes only a current attempt and preserves owned and foreign ledger provenance', () => {
+    const { store } = fixture();
+    store.recordHistory(identity, { revision: 1, snapshotId: store.getSnapshot(identity).id }, oid(1), oid(4), [
+      { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+      { sha: oid(4), owner: null, origin: 'foreign', sourceSha: null },
+    ]);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
+    const expected = reviewed(store), taskVersion = store.getTask(identity).stateVersion;
+    const marker = store.beginRebase(identity, expected, taskVersion, { oldBase: oid(1), oldHead: oid(4), onto: oid(5) });
+    expect(() => store.finishRebase(identity, { revision: expected.revision, snapshotId: expected.snapshotId } as typeof expected,
+      taskVersion, marker.attemptId, oid(5), oid(7), [
+        { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
+      ])).toThrow(/current review version/);
+    expect(() => store.finishRebase(identity, expected, taskVersion, randomUUID(), oid(5), oid(7), [
+      { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
+    ])).toThrow(/no longer owns/);
+    const group = { pgid: 4242, startedAt: 456 };
+    store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, 'spawning', group);
+    expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
+      { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
+    ])).toThrow(/has not settled/);
+    store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, group, null);
+    const snapshot = store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
+      { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
+    ]);
+    expect(snapshot).toMatchObject({ base: oid(5), head: oid(7) });
+    expect(store.getTask(identity).rebaseInProgress).toBeNull();
+    expect(store.getLedger(identity)).toEqual(expect.arrayContaining([
+      { sha: oid(6), owner: 'P1', origin: 'owned', sourceSha: oid(3) },
+      { sha: oid(7), owner: null, origin: 'foreign', sourceSha: oid(4) },
+    ]));
+    expect(store.getRewrites(identity, snapshot.id)).toEqual([
+      { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
+    ]);
+  });
+
+  it('fails closed when review state changes, and clears only by the exact recovery handle', () => {
+    const { store } = fixture();
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
+    const expected = reviewed(store), taskVersion = store.getTask(identity).stateVersion;
+    const marker = store.beginRebase(identity, expected, taskVersion, { oldBase: oid(1), oldHead: oid(2), onto: oid(3) });
+    store.addReviewNote(identity, expected, 'P1', 'change', 'Review changed while Git was running.');
+    expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(3), oid(4), [
+      { oldSha: oid(2), newSha: oid(4) },
+    ])).toThrow(/Stale review state/);
+    expect(store.abortRebase(store.getTask(identity).planKey, randomUUID())).toBe(false);
+    expect(store.getTask(identity).rebaseInProgress).not.toBeNull();
+    expect(store.abortRebase(store.getTask(identity).planKey, marker.attemptId)).toBe(true);
+    expect(store.abortRebase(store.getTask(identity).planKey, marker.attemptId)).toBe(false);
+    expect(store.getTask(identity).rebaseInProgress).toBeNull();
+  });
+
+  it('rejects a result after another durable task change without erasing its recovery marker', () => {
+    const { store } = fixture();
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
+    const expected = reviewed(store), taskVersion = store.getTask(identity).stateVersion;
+    const marker = store.beginRebase(identity, expected, taskVersion, { oldBase: oid(1), oldHead: oid(2), onto: oid(3) });
+    expect(store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+    expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(3), oid(4), [
+      { oldSha: oid(2), newSha: oid(4) },
+    ])).toThrow(/task changed during the rebase/);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ attemptId: marker.attemptId });
+    expect(store.abortRebase(store.getTask(identity).planKey, marker.attemptId)).toBe(true);
+    expect(store.getTask(identity)).toMatchObject({ status: 'cancelled', rebaseInProgress: null });
+  });
+
+  it('binds a claim to both ends of the reviewed snapshot and blocks the legacy rewrite path', () => {
+    const { store } = fixture();
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
+    const expected = reviewed(store), taskVersion = store.getTask(identity).stateVersion;
+    expect(() => store.beginRebase(identity, expected, taskVersion,
+      { oldBase: oid(9), oldHead: oid(2), onto: oid(3) })).toThrow(/base or head changed/);
+    const marker = store.beginRebase(identity, expected, taskVersion,
+      { oldBase: oid(1), oldHead: oid(2), onto: oid(3) });
+    expect(() => store.recordRebase(identity, expected, oid(3), oid(4), [
+      { oldSha: oid(2), newSha: oid(4) },
+    ])).toThrow(/claimed rebase is in progress/);
+    expect(store.abortRebase(store.getTask(identity).planKey, marker.attemptId)).toBe(true);
+  });
+});
+
 describe('runner commits and preparation groups (#87)', () => {
   it('knows a task has a runner commit only from a completed writable attempt whose result made one', () => {
     const { store } = queued();

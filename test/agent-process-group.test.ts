@@ -138,6 +138,14 @@ describe('runInProcessGroup', () => {
     expect(outcome.stdout.length).toBeLessThanOrEqual(1024);
   });
 
+  it('can retain a bounded prefix without stopping when callers classify from exit status or durable state', async () => {
+    const outcome = await runInProcessGroup(process.execPath, ['-e', "process.stdout.write('x'.repeat(4096))"],
+      { env, timeoutMs: 5_000, maxBuffer: 1024, discardExcessOutput: true });
+    expect(outcome.status).toBe(0);
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.stdout).toBe('x'.repeat(1024));
+  });
+
   it('resolves, never rejects, when spawn itself throws', async () => {
     let reported = false;
     // A NUL byte in an argument makes spawn throw synchronously, as ENOMEM or E2BIG from the spawn itself would.

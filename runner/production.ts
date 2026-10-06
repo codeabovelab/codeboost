@@ -18,7 +18,8 @@ import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport,
 import { GitBranchPusher, pushUrl } from './branch-push.ts';
 import { PullRequestPublisher } from './publish.ts';
 import type { ReviewService } from './review.ts';
-import { openRunnerRepository, ownerOnlyDirectory } from './runner-repository.ts';
+import { openRunnerRepository, ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
+import { GitRebaser } from './rebase.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
 
 /**
@@ -88,7 +89,7 @@ export function parseRunnerConfig(value: unknown): RunnerConfig {
  * storage during a long build, and before any export's deadline starts: the build blocks, and a timer armed before it
  * would fire as soon as it returned.
  */
-export function dRecoveryDeps(image: () => string): RecoveryDeps {
+export function dRecoveryDeps(image: () => string, rebaser?: Pick<GitRebaser, 'abort'>, rebasePlanKey?: string): RecoveryDeps {
   return {
     async recoverLeftovers(runnerOwner) {
       const report = await recoverLeftovers(runnerOwner, 120_000);
@@ -104,6 +105,13 @@ export function dRecoveryDeps(image: () => string): RecoveryDeps {
     exportTaskDiff: (handle, input, maxBytes, signal) =>
       exportTaskDiff(handle as Parameters<typeof exportTaskDiff>[0], { base: input.base, metadataBaseline: input.metadataBaseline, imageId: image(), maxBytes, signal }),
     removeTaskFilesystems: handle => removeTaskFilesystemsAsync(handle as Parameters<typeof removeTaskFilesystemsAsync>[0]),
+    ...(rebaser ? { abortRebase: async (planKey: string, marker: unknown) => {
+      if (!rebasePlanKey || planKey !== rebasePlanKey)
+        throw new Error('The interrupted rebase belongs to another configured plan; start that plan to recover it.');
+      const attemptId = (marker as { attemptId?: unknown } | null)?.attemptId;
+      if (typeof attemptId !== 'string') throw new Error('The interrupted rebase has no attempt ID.');
+      await rebaser.abort(attemptId);
+    } } : {}),
   };
 }
 
@@ -184,15 +192,28 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   o.onSlowStart?.();
   let built: string | undefined;
   const image = () => built ??= (o.buildImage ?? buildAgentImage)();
-  const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
-    diagnosticsCapBytes: config.diagnosticsCapBytes, deps: (o.recovery ?? dRecoveryDeps)(image) });
-  const imageId = image();
   const identity = review.identity;
-  const repository = await openRunnerRepository({ runnerRoot: config.root, runnerOwner, repositoryId: identity.repositoryId, source: review.repository });
-  // The review reads runner commits from the same repository the runner writes; a configured path must agree.
-  if (review.runnerRepository !== undefined && review.runnerRepository !== repository.path)
-    throw new Error(`runnerRepository (${review.runnerRepository}) is not the runner's repository (${repository.path}); remove it from the configuration.`);
-  review.runnerRepository = repository.path;
+  const rebasePlanKey = identityKey(identity);
+  let repositoryPromise: Promise<RunnerRepository> | undefined, rebaserPromise: Promise<GitRebaser> | undefined;
+  const getRepository = () => repositoryPromise ??= openRunnerRepository({ runnerRoot: config.root, runnerOwner,
+    repositoryId: identity.repositoryId, source: review.repository }).then(repository => {
+      // The review and rebase recovery read the same runner-owned repository that execution writes.
+      if (review.runnerRepository !== undefined && review.runnerRepository !== repository.path)
+        throw new Error(`runnerRepository (${review.runnerRepository}) is not the runner's repository (${repository.path}); remove it from the configuration.`);
+      review.runnerRepository = repository.path;
+      return repository;
+    });
+  const getRebaser = () => rebaserPromise ??= getRepository().then(repository => new GitRebaser({ repository,
+    runnerRoot: config.root, runnerOwner, committer: config.committer,
+    onProcessStarting: attemptId => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, null, 'spawning'),
+    onProcessGroup: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, 'spawning', group),
+    onProcessGroupSettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, null),
+    onProcessUnsettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, 'unsettled') }));
+  const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
+    diagnosticsCapBytes: config.diagnosticsCapBytes,
+    deps: o.recovery ? o.recovery(image) : dRecoveryDeps(image, { abort: async attemptId => (await getRebaser()).abort(attemptId) }, rebasePlanKey) });
+  const repository = await getRepository();
+  const imageId = image();
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,
     limits: { ...EXECUTE_STORAGE, ...config.limits }, committer: config.committer });
   const issues = new GhIssueGateway(review.github.repository);
@@ -225,8 +246,8 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     { diagnostics: { directory: diagnosticsDir, capBytes: config.diagnosticsCapBytes ?? DEFAULT_DIAGNOSTICS_CAP_BYTES } });
   const github = review.github;
   // Never a `url` here (#101 review, finding 6): the push goes to the configured repository on GH_HOST, from the runner's
-  // own repository. Only commits the ledger records as codeboost's may be overwritten; before #22 adds rebasing, the
-  // ledger has no other kind of commit codeboost pushes (only recordRebase writes foreign entries).
+  // own repository. Only commits the ledger records as codeboost's may be overwritten. The F3 rebase foundation can
+  // write mapped foreign entries, but #22 does not wire their external push until its later durable-action slice.
   const pusher = new GitBranchPusher({ repository, repositoryId: identity.repositoryId, remote: github.repository, env: o.env as NodeJS.ProcessEnv,
     ownedCommits: requested => service.store.getLedger(requested).filter(entry => entry.origin === 'owned').map(entry => entry.sha) });
   // The same environment as the push, so the PR calls go to the same GH_HOST with the same credentials.

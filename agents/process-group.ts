@@ -20,6 +20,8 @@ export interface ProcessGroupOptions {
   readonly graceMs?: number;
   /** Bytes kept of each of stdout and stderr; more stops the group. Default 16 MiB. */
   readonly maxBuffer?: number;
+  /** Keep only the bounded prefix instead of stopping on excess output. Use only when exit status/state decides meaning. */
+  readonly discardExcessOutput?: boolean;
   /**
    * Written to the leader's stdin, which is then closed; without it stdin is not connected. A leader that exits before
    * reading it all is not an error: what it did is in its status and output.
@@ -114,15 +116,16 @@ export function runInProcessGroup(file: string, args: readonly string[],
     let unrecorded: unknown;
     try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
     catch (error) { unrecorded = error; }
-    // Output past the limit stops a running group; once the leader has exited it only drops the excess. Either way the
-    // output is incomplete, so the call settles as ENOBUFS, never as a success.
+    // Normally output past the limit stops the group and settles as ENOBUFS. A caller that classifies from durable state
+    // may explicitly keep a bounded prefix and let the process finish instead.
     let truncated = false;
-    const collect = (chunks: Buffer[], add: (bytes: number) => number) => (chunk: Buffer) => {
-      if (add(chunk.length) > maxBuffer) { truncated = true; stop('output-limit'); }
-      else chunks.push(chunk);
+    const collect = (chunks: Buffer[], used: () => number, add: (bytes: number) => number) => (chunk: Buffer) => {
+      const room = Math.max(0, maxBuffer - used());
+      if (room > 0) chunks.push(chunk.subarray(0, room));
+      if (add(chunk.length) > maxBuffer) { truncated = true; if (!options.discardExcessOutput) stop('output-limit'); }
     };
-    child.stdout!.on('data', collect(out, bytes => (outBytes += bytes)));
-    child.stderr!.on('data', collect(err, bytes => (errBytes += bytes)));
+    child.stdout!.on('data', collect(out, () => outBytes, bytes => (outBytes += bytes)));
+    child.stderr!.on('data', collect(err, () => errBytes, bytes => (errBytes += bytes)));
     const onAbort = () => stop('cancelled');
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (unrecorded !== undefined) { stopped = 'unrecorded'; signalGroup(pgid, 'SIGKILL'); }
@@ -178,7 +181,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
             { name: 'AbortError', code: 'ABORT_ERR' }) });
           return;
         }
-        if (truncated && !stopped) {
+        if (truncated && !stopped && !options.discardExcessOutput) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
             new Error(`${file} ${args[0] ?? ''} exceeded its output limit.`), { code: 'ENOBUFS' }) });
           return;

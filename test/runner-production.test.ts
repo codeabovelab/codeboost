@@ -15,6 +15,7 @@ import { recoverLeftovers } from '../agents/recovery.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/storage.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
+import type { GitRebaser } from '../runner/rebase.ts';
 
 vi.mock('../agents/recovery.ts', async original => ({ ...await original<typeof import('../agents/recovery.ts')>(), recoverLeftovers: vi.fn() }));
 const issueReads: number[] = [];
@@ -226,6 +227,14 @@ describe('recovery warnings', () => {
 });
 
 describe('D adapters', () => {
+  it('routes an interrupted rebase marker to the production rebaser before Store recovery clears it', async () => {
+    const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID() };
+    const deps = dRecoveryDeps(() => 'sha256:x', { abort } as unknown as GitRebaser, 'plan-key');
+    await deps.abortRebase!('plan-key', marker);
+    expect(abort).toHaveBeenCalledWith(marker.attemptId);
+    await expect(deps.abortRebase!('another-plan', marker)).rejects.toThrow(/another configured plan/);
+    expect(abort).toHaveBeenCalledTimes(1);
+  });
   it('passes D\'s own handles through, and turns every unowned object into the command that removes it', async () => {
     const handle = Object.freeze({ runnerOwner: OWNER, attemptId: randomUUID(), allocationId: randomUUID() });
     const spy = vi.mocked(recoverLeftovers).mockResolvedValue({ removed: [], storage: [handle], unowned: [
