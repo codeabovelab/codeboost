@@ -75,6 +75,8 @@ describe('trusted pre-merge rebase', () => {
     await ensureCommit(s.repository, nextBase);
     await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: nextBase }))
       .rejects.toThrow(/already has a retained result/);
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
+      .rejects.toThrow(/already has a retained result/);
     expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(first.head);
   });
 
@@ -192,12 +194,12 @@ describe('trusted pre-merge rebase', () => {
 
   it('rejects a successful Git call when its settlement hook exhausts the work deadline', async () => {
     const s = await setup(), attemptId = randomUUID();
-    let overran = false;
+    let settled = 0, overran = false;
     const rebaser = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => {}, onProcessGroup: () => {},
       onProcessGroupSettled: () => {
-        if (!overran) { overran = true; vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER); }
+        if (++settled === 2 && !overran) { overran = true; vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER); }
       },
       onProcessUnsettled: () => {} });
     await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
