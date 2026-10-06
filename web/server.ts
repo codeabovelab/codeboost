@@ -258,9 +258,21 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     // A final-item scope amendment can finish the plan without another runner attempt; its approval moves the task to
     // running, after which the ordinary publishing gate can open the ready pull request.
     if (action === 'approve-continuation') {
-      const before = service.store.getTask(identity).status;
-      try { return act(); } finally {
-        if (before !== 'running' && service.store.getTask(identity).status === 'running') publishing?.actIfOwed(identity, { personAsked: true });
+      // A recovered run may already have left the task running. In that case approving removal of its interrupted last
+      // item does not change task status, but it does make a ready publish newly possible. Publish only for a newly
+      // committed action: a replay or refusal must not restart external work.
+      let committed = false;
+      try {
+        const result = actWithReplayState();
+        committed = !result.replayed;
+        return result.response;
+      } finally {
+        if (committed) {
+          const task = service.store.getTask(identity);
+          const progress = task.status === 'running' ? service.store.continuationProgress(identity) : null;
+          if (progress?.next === null && service.store.continuationApproved(identity, progress))
+            publishing?.actIfOwed(identity, { personAsked: true });
+        }
       }
     }
     // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
@@ -282,7 +294,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       catch (error) { if (!replay && error instanceof GuardRefusal && error.message === OWED_REFUSAL) publishing?.actIfOwed(identity, { personAsked: true }); throw error; }
     }
     return act();
-    function act() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => {
+    function act() { return actWithReplayState().response; }
+    function actWithReplayState() { return service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => {
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if ((action === 'start' || action === 'resume' || action === 'approve-continuation') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
@@ -345,7 +358,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       void runner.settled(identity).then(() => { if (service.store.getTask(identity).status === 'cancelled') publishing?.actIfOwed(identity); })
         .catch(error => console.error(`Could not start closing pull requests: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`));
       return { outcome: 'started', attemptId: retry.id };
-    }).response; }
+    }); }
   };
   /** Handles of suggestion requests started by this process, removed once their outcome settles. */
   const suggestionHandles = new Map<string, SuggestionHandle>();

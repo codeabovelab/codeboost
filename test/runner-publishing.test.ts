@@ -286,8 +286,8 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
   return { app, close, identity, store: app.service.store, branch: branchOf(identity), head: app.service.store.getSnapshot(identity).head, findings: findings! };
 }
 const view = async (app: App) => (await fetch(`${new URL(app.url).origin}/api/runner`, { headers: { 'x-codeboost-token': app.token } })).json() as Promise<Record<string, any>>;
-async function act(app: App, action: string, actionId = randomUUID(), expectedStateVersion?: number) {
-  const { stateVersion, reviewVersion } = await view(app);
+async function act(app: App, action: string, actionId = randomUUID(), expectedStateVersion?: number, expectedReviewVersion?: number) {
+  const current = await view(app), stateVersion = expectedStateVersion ?? current.stateVersion, reviewVersion = expectedReviewVersion ?? current.reviewVersion;
   const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
     body: JSON.stringify({ action, expectedStateVersion: expectedStateVersion ?? stateVersion,
       ...((action === 'start' || action === 'resume' || action === 'approve-continuation') ? { expectedReviewVersion: reviewVersion } : {}), actionId }) });
@@ -306,6 +306,67 @@ describe('publishing a finished task (#103)', () => {
     expect((await act(app, 'approve-continuation')).status).toBe(200);
     expect(store.getTask(identity).status).toBe('running');
     await publishSettled(app, identity);
+    expect(w.github.calls).toContain('open ready');
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false });
+  });
+  it('publishes after approval removes an interrupted final item from an already-running task', async () => {
+    const w = world(), { app, identity, store } = await serve(w, { startup: false, before: service => {
+      const s = service.store, id = service.config.identity, plan = s.getPlan(id), snapshot = s.getSnapshot(id);
+      s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
+      const first = plan.items[0]!;
+      const firstAttempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: first.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, firstAttempt.id);
+      s.settleAttempt(id, firstAttempt.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head: snapshot.head, unchanged: true, inScope: [], outOfScope: ['extra.ts'] } });
+      const entries = [...service.planContext().baseEntries, { path: 'extra.ts', kind: 'file' as const }];
+      const checkpoint = s.recordCheckpoint(id, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion: s.reviewVersion(id) }, {
+        item: first.id, completedItems: [first.id], outOfScopePaths: ['extra.ts'], baseEntries: entries,
+      });
+      const amended = s.getPlan(id);
+      amended.items[0]!.files.push({ path: 'extra.ts', kind: 'add', renamed_from: null, change: 'Declare observed output' });
+      s.importRevision(JSON.stringify(amended), 'json', service.planContext(), amended.revision);
+      let current = s.getPlan(id), currentSnapshot = s.getSnapshot(id);
+      s.saveReview(id, { revision: current.revision, snapshotId: currentSnapshot.id, reviewVersion: s.reviewVersion(id) },
+        current.items.map(item => approveItem(current, [], item.id, id, true)), []);
+      const context = { ...service.planContext(), baseEntries: entries };
+      service.planContextAt = () => ({ ...context, baseEntries: entries });
+      s.approveContinuation(id, checkpoint.id, { revision: current.revision, snapshotId: currentSnapshot.id, reviewVersion: s.reviewVersion(id) }, context);
+
+      const second = current.items[1]!;
+      const secondAttempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: second.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, secondAttempt.id);
+      s.settleAttempt(id, secondAttempt.id, { firstReason: null, exitCode: 0, valid: true,
+        result: { head: currentSnapshot.head, unchanged: true, inScope: [], outOfScope: [] } });
+
+      const third = current.items[2]!;
+      const thirdAttempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind: 'execute', item: third.id,
+        expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
+      s.markRunning(id, thirdAttempt.id);
+      s.recoverInterrupted(Date.now());
+      expect(s.getTask(id)).toMatchObject({ status: 'running', requeuePending: true });
+
+      const checkpointNow = s.latestCheckpoint(id)!, shortened = s.getPlan(id);
+      shortened.items = shortened.items.slice(0, 2);
+      s.importRevision(JSON.stringify({ ...shortened, revision: shortened.revision + 1 }), 'json', service.planContext(), shortened.revision);
+      current = s.getPlan(id); currentSnapshot = s.getSnapshot(id);
+      s.saveReview(id, { revision: current.revision, snapshotId: currentSnapshot.id, reviewVersion: s.reviewVersion(id) },
+        current.items.map(item => approveItem(current, [], item.id, id, true)), []);
+      service.planContextAt = () => ({ ...context, baseEntries: checkpointNow.baseEntries });
+    } });
+
+    expect(store.getTask(identity)).toMatchObject({ status: 'running', requeuePending: true });
+    expect(store.continuationProgress(identity)?.next).toBeNull();
+    expect(store.continuationApproved(identity, store.continuationProgress(identity)!)).toBe(false);
+    const beforeApproval = await view(app);
+    const approvalActionId = randomUUID();
+    expect((await act(app, 'approve-continuation', approvalActionId, beforeApproval.stateVersion, beforeApproval.reviewVersion)).status).toBe(200);
+    expect((await act(app, 'approve-continuation', approvalActionId, beforeApproval.stateVersion, beforeApproval.reviewVersion)).status).toBe(200);
+    await publishSettled(app, identity);
+    const calls = [...w.github.calls];
+    expect((await act(app, 'approve-continuation')).status).toBe(409);
+    expect(w.github.calls).toEqual(calls);
     expect(w.github.calls).toContain('open ready');
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', draft: false });
   });
