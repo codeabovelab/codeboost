@@ -530,19 +530,20 @@ describe('trusted pre-merge rebase', () => {
   it('does not enter the conflict resolver after its work deadline has already elapsed', async () => {
     const s = await setup('foreign'), attemptId = randomUUID();
     const realNow = performance.now.bind(performance);
-    let expire = false, entered = 0;
+    let expire = false, entered = 0, resolverReads = 0;
     vi.spyOn(performance, 'now').mockImplementation(() => expire ? Number.MAX_SAFE_INTEGER : realNow());
     const runner = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
       onResultPrepared: () => {}, onResultState: () => {},
       get resolveForeignConflict() {
-        expire = true;
+        if (++resolverReads === 2) expire = true;
         return async () => { entered++; };
       } });
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
       ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/deadline expired/);
     expect(entered).toBe(0);
+    expect(resolverReads).toBe(2);
   });
 
   it('never sends an owned conflict through the foreign resolver', async () => {
