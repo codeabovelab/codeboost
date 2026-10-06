@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { GIT_OPTIONS, gitEnvironment } from '../git/clone.ts';
 
-const MAX_INDEX_BYTES = 32 * 1024 * 1024;
-const MAX_DIRECTORY_ENTRIES = 262_144;
+export const MAX_INDEX_BYTES = 32 * 1024 * 1024;
+export const MAX_INDEX_ENTRIES = 262_144;
 // A C-quoted path can expand every input byte to four bytes. Keep transport above every accepted index listing;
 // accepted input is then rejected by our explicit bounds, never by spawnSync's smaller implementation limit.
 const MAX_GIT_OUTPUT_BYTES = MAX_INDEX_BYTES * 4 + 1024;
@@ -40,7 +40,7 @@ export function gitlinkIndexDigest(root = process.cwd(), executable = 'git'): st
   const rawOutput = git(executable, ['-C', root, 'ls-files', '--stage', '-z']);
   if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
   const raw = split0(rawOutput);
-  if (raw.length > MAX_DIRECTORY_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
+  if (raw.length > MAX_INDEX_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
   const hash = createHash('sha256');
   for (const record of raw) {
     const tab = record.indexOf(0x09), header = record.subarray(0, tab).toString('ascii').split(' ');
@@ -56,7 +56,7 @@ export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
   const rawOutput = repositoryGit(['ls-files', '--stage', '-z']);
   if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
   const raw = split0(rawOutput);
-  if (raw.length > MAX_DIRECTORY_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
+  if (raw.length > MAX_INDEX_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
   const quotedOutput = repositoryGit(['ls-files', '--stage']).toString('utf8');
   if (quotedOutput && !quotedOutput.endsWith('\n')) throw new Error('Git returned an unterminated quoted index listing.');
   const quoted = quotedOutput ? quotedOutput.slice(0, -1).split('\n') : [];
@@ -77,7 +77,7 @@ export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
     const names = new Set<string>();
     try {
       for (let entry = opened.readSync(); entry; entry = opened.readSync()) {
-        if (++entries > MAX_DIRECTORY_ENTRIES) throw new Error('Checkout verification exceeded its directory-entry bound.');
+        if (++entries > MAX_INDEX_ENTRIES) throw new Error('Checkout verification exceeded its directory-entry bound.');
         names.add((entry.name as unknown as Buffer).toString('hex'));
       }
     } finally { opened.closeSync(); }

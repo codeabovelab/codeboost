@@ -7,6 +7,7 @@ import type { DockerOutcome } from '../agents/docker.ts';
 import { GIT_OPTIONS, gitEnvironment } from '../git/clone.ts';
 import { isUuidV4 } from './lifecycle.ts';
 import { ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
+import { MAX_INDEX_BYTES } from './verify-checkout.ts';
 
 const COMMIT_ID = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const MAX_REBASE_COMMITS = 500;
@@ -164,16 +165,21 @@ export class GitRebaser {
           throw new RebaseConflict('An owned commit conflict needs its plan-item resolver.');
         if (!this.#options.resolveForeignConflict)
           throw new RebaseConflict('A foreign commit conflict needs review.');
-        const files = Object.freeze(await this.#paths(path, ['diff', '--name-only', '--diff-filter=U', '-z', '--'], scope));
+        const files = Object.freeze(await this.#paths(path, 'conflicts', scope));
         if (!files.length) throw new RebaseConflict('Git reported a conflict without any conflicted files.');
+        if (await this.#hasUnmergedGitlink(path, scope))
+          throw new RebaseConflict('A gitlink conflict needs manual resolution.');
         const allowed = new Set(files);
-        const outsideBefore = await this.#outsideConflictState(path, allowed, scope);
+        const priorHead = await this.#git(path, ['rev-parse', '--verify', 'HEAD^{commit}'], scope);
+        const outsideBefore = await this.#outsideConflictState(path, allowed, priorHead, scope);
         this.#assertResultCurrent(scope);
         await this.#resolveConflict({ attemptId, commit, files, repository: path }, scope);
         this.#assertResultCurrent(scope);
         if (await this.#git(path, ['rev-parse', '--verify', 'REBASE_HEAD^{commit}'], scope) !== commit)
           throw new RebaseConflict('The conflict resolver changed the rebase operation.');
-        if (await this.#outsideConflictState(path, allowed, scope) !== outsideBefore)
+        if (await this.#git(path, ['rev-parse', '--verify', 'HEAD^{commit}'], scope) !== priorHead)
+          throw new RebaseConflict('The conflict resolver changed the rebase operation.');
+        if (await this.#outsideConflictState(path, allowed, priorHead, scope) !== outsideBefore)
           throw new RebaseConflict('The conflict resolver changed a file outside the conflicted set.');
         const pathspec = Buffer.from(`${files.join('\0')}\0`);
         await this.#git(path, ['--literal-pathspecs', 'add', '--all', '--pathspec-from-file=-', '--pathspec-file-nul'], scope, false, pathspec);
@@ -325,19 +331,42 @@ export class GitRebaser {
     await this.#git(this.#options.repository.path, ['worktree', 'prune'], scope, true);
   }
 
-  async #paths(repository: string, args: readonly string[], scope: CallScope): Promise<string[]> {
-    const outcome = await this.#call(repository, args, scope);
+  async #pathRecords(repository: string, mode: 'conflicts' | 'changed' | 'untracked' | 'unmerged', scope: CallScope,
+    head?: string): Promise<string[]> {
+    const helper = fileURLToPath(new URL('./list-git-paths.ts', import.meta.url));
+    const args = [helper, this.#gitExecutable, mode, ...(head ? [head] : [])];
+    // Base64 expands the explicitly bounded 32 MiB raw stream by four thirds.
+    const outcome = await this.#process(process.execPath, args, repository, this.#gitEnvironment, scope, false,
+      Math.ceil(MAX_INDEX_BYTES / 3) * 4 + 4);
     this.#throwIfCancelled(outcome, scope);
-    if (outcome.status !== 0) throw this.#failure(args[0] ?? 'git', outcome);
-    // Lane D's path APIs are strings. Refuse undecodable names rather than let UTF-8 replacement alias two paths.
-    if (outcome.stdout.includes('\ufffd') || (outcome.stdout && !outcome.stdout.endsWith('\0')))
-      throw new RebaseConflict('A conflicted path cannot be represented safely; resolve it manually.');
-    const paths = outcome.stdout ? outcome.stdout.slice(0, -1).split('\0') : [];
-    if (paths.some(path => !path || path.includes('\0'))) throw new RebaseConflict('Git returned an invalid conflicted path.');
+    if (outcome.status !== 0) throw this.#failure('path listing', outcome, 'node');
+    const encoded = outcome.stdout;
+    const raw = Buffer.from(encoded, 'base64');
+    if (raw.toString('base64') !== encoded || (raw.length && raw[raw.length - 1] !== 0))
+      throw new RebaseConflict('Git returned an invalid path listing.');
+    const records = raw.length ? raw.subarray(0, -1).toString('binary').split('\0').map(value => Buffer.from(value, 'binary')) : [];
+    const decoder = new TextDecoder('utf-8', { fatal: true });
+    try { return records.map(record => decoder.decode(record)); }
+    catch { throw new RebaseConflict('A Git path cannot be represented safely; resolve it manually.'); }
+  }
+
+  async #paths(repository: string, mode: 'conflicts' | 'changed' | 'untracked', scope: CallScope, head?: string): Promise<string[]> {
+    const paths = await this.#pathRecords(repository, mode, scope, head);
+    if (paths.some(path => !path || path.includes('\0'))) throw new RebaseConflict('Git returned an invalid path.');
     return paths;
   }
 
-  async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, scope: CallScope): Promise<string> {
+  async #hasUnmergedGitlink(repository: string, scope: CallScope): Promise<boolean> {
+    const records = await this.#pathRecords(repository, 'unmerged', scope);
+    return records.some(record => {
+      const tab = record.indexOf('\t'), header = record.slice(0, tab).split(' ');
+      if (tab < 0 || header.length !== 3 || !/^[0-3]$/.test(header[2]!))
+        throw new RebaseConflict('Git returned an invalid unmerged index record.');
+      return header[0] === '160000';
+    });
+  }
+
+  async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, head: string, scope: CallScope): Promise<string> {
     const verifier = fileURLToPath(new URL('./verify-checkout.ts', import.meta.url));
     const gitlinks = await this.#process(process.execPath, [verifier, this.#gitExecutable, 'gitlinks'], repository,
       this.#gitEnvironment, scope, false, 64 * 1024);
@@ -345,8 +374,8 @@ export class GitRebaser {
     if (gitlinks.status !== 0 || !/^[0-9a-f]{64}$/.test(gitlinks.stdout))
       throw this.#failure('gitlink index audit', gitlinks, 'node');
     const changed = new Set([
-      ...await this.#paths(repository, ['diff', '--name-only', '--ignore-submodules=all', '-z', 'HEAD', '--'], scope),
-      ...await this.#paths(repository, ['ls-files', '--others', '-z', '--'], scope),
+      ...await this.#paths(repository, 'changed', scope, head),
+      ...await this.#paths(repository, 'untracked', scope),
     ]);
     const entries: string[][] = [];
     for (const path of [...changed].filter(value => !allowed.has(value)).sort()) {

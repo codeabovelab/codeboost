@@ -24,20 +24,20 @@ function commit(repository: string, path: string, text: string, message: string)
   return git(repository, 'rev-parse', 'HEAD');
 }
 
-async function setup(conflict: boolean | 'foreign' = false) {
+async function setup(conflict: boolean | 'foreign' = false, conflictPath = 'a.txt') {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-rebase-')); roots.push(root);
   const source = join(root, 'source');
   git(root, 'init', '-q', '-b', 'main', source);
   git(source, 'config', 'user.name', 'Source'); git(source, 'config', 'user.email', 'source@example.invalid');
-  const base = commit(source, 'a.txt', 'base\n', 'base');
+  const base = commit(source, conflictPath, 'base\n', 'base');
   git(source, 'switch', '-qc', 'feature');
-  const owned = commit(source, conflict === 'foreign' ? 'owned.txt' : 'a.txt', 'feature\n', 'owned');
+  const owned = commit(source, conflict === 'foreign' ? 'owned.txt' : conflictPath, 'feature\n', 'owned');
   if (conflict === 'foreign') { git(source, 'config', 'user.name', 'Collaborator'); git(source, 'config', 'user.email', 'collaborator@example.invalid'); }
-  const foreign = commit(source, conflict === 'foreign' ? 'a.txt' : 'feature.txt', 'collaborator\n',
+  const foreign = commit(source, conflict === 'foreign' ? conflictPath : 'feature.txt', 'collaborator\n',
     conflict === 'foreign' ? 'foreign\n\nPlan-Item: P1' : 'foreign');
   git(source, 'config', 'user.name', 'Source'); git(source, 'config', 'user.email', 'source@example.invalid');
   git(source, 'switch', '-q', 'main');
-  const onto = commit(source, conflict ? 'a.txt' : 'base.txt', conflict ? 'main\n' : 'main moved\n', 'move base');
+  const onto = commit(source, conflict ? conflictPath : 'base.txt', conflict ? 'main\n' : 'main moved\n', 'move base');
   const runnerRoot = join(root, 'runner');
   const repository = await openRunnerRepository({ runnerRoot, runnerOwner: OWNER, repositoryId: 'repo', source });
   await ensureCommit(repository, foreign); await ensureCommit(repository, onto);
@@ -400,6 +400,46 @@ describe('trusted pre-merge rebase', () => {
     } });
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
       ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+  });
+
+  it('refuses a resolver commit that moves HEAD and smuggles an outside file', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      writeFileSync(join(input.repository, 'smuggled.txt'), 'outside conflict\n');
+      git(input.repository, 'add', '--all');
+      git(input.repository, '-c', 'user.name=Resolver', '-c', 'user.email=resolver@example.invalid', 'commit', '-qm', 'smuggle');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/changed the rebase operation/);
+  });
+
+  it('routes a gitlink conflict to manual review without invoking the file resolver', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.base},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    git(s.source, 'switch', '-q', 'main');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.owned},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const onto = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign); await ensureCommit(s.repository, onto);
+    const resolveForeignConflict = vi.fn(async () => {});
+    const runner = createRebaser(s, { resolveForeignConflict });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink conflict needs manual/);
+    expect(resolveForeignConflict).not.toHaveBeenCalled();
+  });
+
+  it('passes a literal replacement character in a valid UTF-8 conflict path to the resolver', async () => {
+    const name = '\ufffd.txt', s = await setup('foreign', name), attemptId = randomUUID();
+    const resolveForeignConflict = vi.fn(async input => { writeFileSync(join(input.repository, name), 'resolved\n'); });
+    const runner = createRebaser(s, { resolveForeignConflict });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).resolves.toMatchObject({ resolvedConflicts: [s.foreign] });
+    expect(resolveForeignConflict).toHaveBeenCalledOnce();
+    expect(resolveForeignConflict.mock.calls[0]![0].files).toEqual([name]);
   });
 
   it('refuses a resolver edit outside the exact conflicted files and drops the partial rewrite', async () => {
