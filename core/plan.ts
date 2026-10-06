@@ -151,6 +151,8 @@ export function validateContinuationPlan(plan: Plan, context: PlanContext, compl
   const ids = new Set<string>();
   for (const item of plan.items) {
     if (ids.has(item.id)) return { errors: [{ code: 'duplicate-id', message: `Duplicate item ID ${item.id}.`, item: item.id }], warnings: [] };
+    if (new Set(item.depends_on).size !== item.depends_on.length)
+      return { errors: [{ code: 'dependency', message: 'Dependencies must be unique.', item: item.id }], warnings: [] };
     ids.add(item.id);
   }
   // There is no executable suffix to validate, but the plan remains bound to

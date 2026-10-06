@@ -116,6 +116,13 @@ describe('suggestions', () => {
     expect(() => applySuggestion(plan, reply('add_item', { item: 'P31', new_item: newItem }), 0,
       { ...context, baseEntries: [] }, ['P1'])).toThrow(/must NOT have more than 30 items/);
   });
+  it('rejects duplicate dependencies on a completed continuation item', () => {
+    const plan = basePlan();
+    plan.items.push({ ...structuredClone(plan.items[0]!), id: 'P2', depends_on: ['P1'],
+      files: [{ path: 'b.txt', kind: 'add', renamed_from: null, change: 'Create output.' }] });
+    expect(() => applySuggestion(plan, reply('set_depends', { item: 'P2', depends_on: ['P1', 'P1'] }), 0,
+      context, ['P1'])).toThrow(/Dependencies must be unique/);
+  });
 });
 it('rejects file/parent collisions declared within the same item', () => {
   const plan = basePlan(); plan.items[0]!.files = ['new', 'new/child'].map(path => ({ path, kind: 'add', renamed_from: null, change: 'Create' }));
