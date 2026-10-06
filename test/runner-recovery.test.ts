@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, recoverStartup, releasePreparation, startTimeMatches, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
+import { processIdentity } from '../agents/process-group.ts';
+import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup, releasePreparation, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -213,15 +214,19 @@ describe('startup recovery sequence', () => {
     const { d: root, store, admit, allocate } = fixture(2);
     const writable = admit(id(1)); const w = allocate(id(1), writable.id, 'w'); store.markRunning(id(1), writable.id);
     const readOnly = admit(id(2), { kind: 'review' });
-    store.markPreparationStarting(id(2), readOnly.id, Date.now()); store.recordPreparationGroup(id(2), readOnly.id, 4242);
+    const preparationIdentity = 'linux:00000000-0000-0000-0000-000000000000:42';
+    store.markPreparationStarting(id(2), readOnly.id, Date.now());
+    store.recordPreparationGroup(id(2), readOnly.id, 4242, Date.now(), preparationIdentity);
     const r = allocate(id(2), readOnly.id, 'r');
-    const inputs: unknown[] = [];
+    const inputs: unknown[] = [], terminate = vi.fn(async (pgid: number) => { calls.push(`terminate:${pgid}`); });
     const { d, calls } = deps({
       recoverLeftovers: async () => { calls.push('recover'); return { storage: [w, r], unowned: [] }; },
       exportTaskDiff: async (_h, input) => { inputs.push(input); calls.push(`export:${store.getAttempt(id(1), writable.id).state}`); return { diff: Buffer.from('partial'), truncated: false }; },
+      processes: { isAlive: () => true, terminate },
     });
     const report = await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'runner'), diagnosticsDir: join(root, 'diag'), deps: d });
     expect(calls).toEqual(['terminate:4242', 'recover', 'export:running', 'remove:w', 'remove:r']);
+    expect(terminate).toHaveBeenCalledWith(4242, preparationIdentity, 5_000);
     const finalized = store.getAttempt(id(1), writable.id);
     expect(finalized).toMatchObject({ state: 'failed', diagnosticRef: join(root, 'diag', `${writable.id}.diff`) });
     expect(readFileSync(finalized.diagnosticRef!, 'utf8')).toBe('partial');
@@ -237,6 +242,157 @@ describe('startup recovery sequence', () => {
       await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: deps({ recoverLeftovers }).d })).rejects.toThrow(/docker down|cannot identify/);
       expect(store.getAttempt(id(1), attempt.id).state).toBe('running');
     }
+  });
+  it('aborts each exact interrupted rebase before clearing its durable ownership marker', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123 });
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning',
+      { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' });
+    const owned = store.getTask(id(1)).rebaseInProgress;
+    const cleared = { ...(owned as object), processGroup: null };
+    const seen: unknown[] = [];
+    const { d, calls } = deps({ abortRebase: async (planKey, value) => {
+      calls.push('abort-rebase'); seen.push({ planKey, value, stillOwned: store.getTask(id(1)).rebaseInProgress });
+    } });
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d });
+    expect(seen).toEqual([{ planKey: store.getTask(id(1)).planKey, value: cleared, stillOwned: cleared }]);
+    expect(calls).toEqual(['recover', 'terminate:5151', 'abort-rebase']);
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('passes only the exact durably owned result ref to rebase recovery', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123 });
+    store.prepareRebaseResult(store.getTask(id(1)).planKey, marker.attemptId, oid(4), [oid(4)]);
+    store.completeRebaseResult(store.getTask(id(1)).planKey, marker.attemptId);
+    const abortRebase = vi.fn(async () => undefined);
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d });
+    expect(abortRebase).toHaveBeenCalledWith(store.getTask(id(1)).planKey,
+      expect.objectContaining({ attemptId: marker.attemptId, resultState: 'ready', resultHead: oid(4),
+        resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }], processGroup: null }));
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('normalizes a legacy rebase marker without result ownership and preserves its ref during recovery', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123, processGroup: null };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const abortRebase = vi.fn(async () => undefined);
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d });
+    expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultState: 'none',
+      resultHead: null, resultMappings: null });
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('rejects incomplete and cleanup-only markers that claim retained-result ownership', async () => {
+    for (const shape of ['missing-state', 'missing-history'] as const) {
+      const { d: root, store, raw } = fixture();
+      store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+      const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+      const result = { resultHead: oid(4), resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }] };
+      const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123,
+        ...(shape === 'missing-state' ? { oldHistory: [snapshot.head], ...result } : { resultState: 'ready', ...result }),
+        processGroup: null };
+      raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+      const abortRebase = vi.fn(async () => undefined);
+      await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+        deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+      expect(abortRebase).not.toHaveBeenCalled();
+      expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
+    }
+  });
+  it('retains a dead-group marker while another process still uses its rebase workspace', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
+    const group = { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', group);
+    mkdirSync(join(root, 'r', token, 'rebases', marker.attemptId), { recursive: true });
+    const abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, processes: { isAlive: () => false, terminate: async () => undefined } }).d,
+      openFiles: () => ['escaped-child'] })).rejects.toThrow(/still uses/);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: group });
+  });
+  it('retains a terminated-group marker while an escaped descendant still uses its rebase workspace', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
+    const group = { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', group);
+    mkdirSync(join(root, 'r', token, 'rebases', marker.attemptId), { recursive: true });
+    const terminate = vi.fn(async () => undefined), abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, processes: { isAlive: () => true, terminate } }).d,
+      openFiles: () => ['escaped-child'] })).rejects.toThrow(/still uses/);
+    expect(terminate).toHaveBeenCalledWith(group.pgid, group.identity, 5_000);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: group });
+  });
+  it('fails closed and retains an interrupted rebase when no recovery implementation is present', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: deps().d }))
+      .rejects.toThrow(/needs F3 to abort/);
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
+  });
+  it('fails closed without cleanup when a crash left the spawned process identity unknown', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1));
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
+    const abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'spawning' });
+  });
+  it('rejects process-group ID 1 without sending any recovery signal', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123,
+      processGroup: { pgid: 1, startedAt: 456, identity: null } };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const terminate = vi.fn(async () => undefined), abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, processes: { isAlive: () => true, terminate } }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(terminate).not.toHaveBeenCalled();
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
+  });
+  it('rejects an empty-history result bound to a head other than its target before cleanup', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.base, onto: oid(5), oldHistory: [], startedAt: 123,
+      resultState: 'ready', resultHead: oid(6), resultMappings: [], processGroup: null };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
   });
   it('records an export timeout as a diagnostic and still finalizes and removes the storage', async () => {
     const { d: root, store, admit, allocate } = fixture();
@@ -348,12 +504,61 @@ describe('startup recovery sequence', () => {
 });
 
 describe('host process checks', () => {
-  it('treats a start time it cannot read as a match, so a live group is still stopped', () => {
-    const at = Date.parse('Sat Sep 26 02:01:04 2026');
-    expect(startTimeMatches('Sat Sep 26 02:01:04 2026\n', at)).toBe(true);
-    expect(startTimeMatches('Sat Sep 26 02:01:04 2026', at + 60_000)).toBe(false);
-    // procps under a Japanese locale; Date.parse cannot read it.
-    expect(startTimeMatches('土  9月 26 02:01:04 2026', at + 60_000)).toBe(true);
+  it('treats a permission-denied liveness probe as alive instead of releasing ownership', () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    expect(hostProcesses.isAlive(4242)).toBe(true);
+  });
+
+  it('uses a kernel identity and never runs a PATH-selected ps with runner secrets', async () => {
+    const root = dir(), marker = join(root, 'ps-ran'), ps = join(root, 'ps'), path = process.env.PATH;
+    writeFileSync(ps, `#!/bin/sh\nprintf '%s' "$CODEBOOST_TEST_SECRET" > '${marker}'\n`, { mode: 0o755 });
+    process.env.PATH = `${root}:${path ?? ''}`; process.env.CODEBOOST_TEST_SECRET = 'must-not-leak';
+    try {
+      vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+      expect(hostProcesses.isAlive(4242)).toBe(true);
+      await expect(hostProcesses.terminate(4242, null, 10)).rejects.toThrow(/prove the recorded process group/);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+      delete process.env.CODEBOOST_TEST_SECRET;
+    }
+  });
+
+  it('revalidates the exact kernel identity before signalling a process group', async () => {
+    const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
+    children.push(child);
+    await once(child, 'spawn');
+    const pgid = child.pid!;
+    try {
+      expect(hostProcesses.isAlive(pgid)).toBe(true);
+      const identity = processIdentity(pgid), wrong = identity === null ? 'linux:00000000-0000-0000-0000-000000000000:1'
+        : `${identity}0`;
+      await expect(hostProcesses.terminate(pgid, wrong, 10)).rejects.toThrow(/identity|recorded process group/);
+      expect(() => process.kill(pgid, 0)).not.toThrow();
+    } finally {
+      try { process.kill(-pgid, 'SIGKILL'); } catch {}
+      await once(child, 'exit');
+      children.splice(children.indexOf(child), 1);
+    }
+  });
+
+  it.skipIf(process.platform !== 'linux')('bounds settlement after SIGKILL and retains ownership on failure', async () => {
+    const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
+    children.push(child); await once(child, 'spawn');
+    const pgid = child.pid!, identity = processIdentity(pgid)!;
+    vi.useFakeTimers();
+    const signal = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const wallClock = vi.spyOn(Date, 'now').mockImplementation(() => 1_000_000 - performance.now());
+    try {
+      const pending = hostProcesses.terminate(pgid, identity, 100);
+      const rejected = expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
+      await vi.advanceTimersByTimeAsync(500);
+      await rejected;
+    } finally {
+      wallClock.mockRestore(); signal.mockRestore(); vi.useRealTimers();
+      try { process.kill(-pgid, 'SIGKILL'); } catch {}
+      await once(child, 'exit'); children.splice(children.indexOf(child), 1);
+    }
   });
   it('finds a process working in the attempt directory when the path goes through a symlink', async () => {
     const root = dir(), real = join(root, 'real'), attempt = join(real, 'attempt');
@@ -361,5 +566,28 @@ describe('host process checks', () => {
     const child = spawn('sleep', ['30'], { cwd: attempt, stdio: 'ignore' }); children.push(child);
     await once(child, 'spawn');
     expect(hostOpenFiles(join(root, 'link', 'attempt'))).toContain(String(child.pid));
+  });
+  it('fails closed when the bounded recovery probe exceeds its overall deadline', async () => {
+    const root = dir();
+    let at = 0;
+    await expect(hostOpenFilesBounded(root, { platform: 'darwin', now: () => at,
+      run: async () => { at = 15_000; return { status: 0, stdout: '', stderr: '' }; } }))
+      .rejects.toThrow(/timed out/);
+  });
+  it('runs the Linux proc walk in the owned subprocess whose settlement is inside the deadline', async () => {
+    const root = dir(); let at = 0, seen: { input?: Buffer; timeoutMs: number } | undefined;
+    await expect(hostOpenFilesBounded(root, { platform: 'linux', now: () => at,
+      run: async (file, args, options) => {
+        expect(file).toBe(process.execPath); expect(args).toContain('--scan-open-files'); seen = options;
+        at = 15_000; return { status: 0, stdout: '123\n', stderr: '' };
+      } })).rejects.toThrow(/timed out/);
+    expect(seen?.input?.toString()).toBe(root);
+    expect(seen?.timeoutMs).toBe(3_000);
+  });
+  it('does not treat an incomplete lsof scan as proving that the workspace is unused', async () => {
+    const root = dir();
+    await expect(hostOpenFilesBounded(root, { platform: 'darwin',
+      run: async () => ({ status: 1, stdout: '', stderr: 'lsof: WARNING: cannot stat() path' }) }))
+      .rejects.toThrow(/Could not check/);
   });
 });

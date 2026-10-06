@@ -50,7 +50,10 @@ export function createTaskWorkspace(options: WorkspaceOptions): TaskWorkspace {
       // running.
       store.markPreparationStarting(identity, attempt.id, Date.now());
       let recorded = false;
-      const record = (group: ProcessGroup) => { store.recordPreparationGroup(identity, attempt.id, group.pgid, group.startedAt); recorded = true; };
+      const record = (group: ProcessGroup) => {
+        store.recordPreparationGroup(identity, attempt.id, group.pgid, group.startedAt, group.identity);
+        recorded = true;
+      };
       try {
         await ensureCommit(repository, head, { signal, onProcessGroup: record });
         ownerOnlyDirectory(options.runnerRoot, options.runnerOwner, 'attempts');

@@ -20,6 +20,8 @@ describe('runInProcessGroup', () => {
     // Synchronously, before anything else can run: the caller can record it before a crash could lose it.
     expect(reported?.pgid).toBeGreaterThan(1);
     expect(Math.abs(reported!.startedAt - Date.now())).toBeLessThan(5_000);
+    if (process.platform === 'linux') expect(reported!.identity).toMatch(/^linux:[0-9a-f-]{36}:\d+$/);
+    else expect(reported!.identity).toBeNull();
     expect(await pending).toMatchObject({ status: 3, stdout: 'out\n', stderr: 'err\n' });
     expect(groupAlive(reported!.pgid)).toBe(false);
   });
@@ -136,6 +138,14 @@ describe('runInProcessGroup', () => {
       { env, timeoutMs: 30_000, maxBuffer: 1024 });
     expect((outcome.error as NodeJS.ErrnoException).code).toBe('ENOBUFS');
     expect(outcome.stdout.length).toBeLessThanOrEqual(1024);
+  });
+
+  it('can retain a bounded prefix without stopping when callers classify from exit status or durable state', async () => {
+    const outcome = await runInProcessGroup(process.execPath, ['-e', "process.stdout.write('x'.repeat(4096))"],
+      { env, timeoutMs: 5_000, maxBuffer: 1024, discardExcessOutput: true });
+    expect(outcome.status).toBe(0);
+    expect(outcome.error).toBeUndefined();
+    expect(outcome.stdout).toBe('x'.repeat(1024));
   });
 
   it('resolves, never rejects, when spawn itself throws', async () => {

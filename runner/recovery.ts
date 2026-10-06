@@ -1,13 +1,16 @@
-import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, readdirSync, realpathSync, rmSync, statSync, statfsSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, mkdirSync, openSync, opendirSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, statfsSync } from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { execFileSync } from 'node:child_process';
 import { createRequire } from 'node:module';
+import { fileURLToPath } from 'node:url';
 import type { DatabaseSync } from 'node:sqlite';
-import type { Store } from './store.ts';
+import type { RebaseMarker, Store } from './store.ts';
 import { WRITABLE_KINDS, isUuidV4 } from './lifecycle.ts';
 import { partialOutput, saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
+import { processIdentity, runInProcessGroup } from '../agents/process-group.ts';
+import type { DockerOutcome } from '../agents/docker.ts';
 
 /**
  * Startup recovery and the single-runner lock. See docs/implementation/runner-lifecycle.md,
@@ -95,32 +98,40 @@ export function acquireRunnerLock(databasePath: string, options: { lockRoot?: st
 }
 
 export interface ProcessControl {
-  /** The group leader is alive and started at the recorded time (guards against PID reuse). */
-  isAlive(pgid: number, startedAt: number): boolean;
-  /** SIGTERM the group, SIGKILL after the grace period, and resolve only once it has exited. */
-  terminate(pgid: number, graceMs: number): Promise<void>;
+  /** The numeric group still exists. Exact ownership is revalidated only at the signal boundary. */
+  isAlive(pgid: number): boolean;
+  /** Revalidate its kernel identity, SIGTERM, SIGKILL after grace, and resolve only once the group has exited. */
+  terminate(pgid: number, identity: string | null, graceMs: number): Promise<void>;
 }
+const groupAlive = (pgid: number) => {
+  try { process.kill(-pgid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+};
+const ownsGroupAtSignal = (pgid: number, identity: string | null): boolean => {
+  if (!groupAlive(pgid)) return false;
+  const current = processIdentity(pgid);
+  if (identity === null || current === null)
+    throw new Error('Could not prove the recorded process group still owns its ID; refusing to signal it.');
+  if (current !== identity) throw new Error('The recorded process group identity changed before recovery could signal it.');
+  return true;
+};
 export const hostProcesses: ProcessControl = {
-  isAlive(pgid, startedAt) {
-    try { process.kill(-pgid, 0); } catch { return false; }
-    try { return startTimeMatches(execFileSync('ps', ['-o', 'lstart=', '-p', String(pgid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }), startedAt); }
-    catch { return true; } // Alive but unreadable: treat as ours and stop it (fail closed).
-  },
-  async terminate(pgid, graceMs) {
-    const alive = () => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
-    try { process.kill(-pgid, 'SIGTERM'); } catch { return; }
-    const until = Date.now() + graceMs;
-    while (alive() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
-    if (alive()) { try { process.kill(-pgid, 'SIGKILL'); } catch {} }
-    while (alive()) await new Promise(resolve => setTimeout(resolve, 50));
+  isAlive(pgid) { return groupAlive(pgid); },
+  async terminate(pgid, identity, graceMs) {
+    if (!ownsGroupAtSignal(pgid, identity)) return;
+    try { process.kill(-pgid, 'SIGTERM'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error; }
+    const until = performance.now() + graceMs;
+    while (groupAlive(pgid) && performance.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
+    if (ownsGroupAtSignal(pgid, identity)) {
+      try { process.kill(-pgid, 'SIGKILL'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    }
+    const settlement = performance.now() + graceMs;
+    while (groupAlive(pgid) && performance.now() < settlement) await new Promise(resolve => setTimeout(resolve, 50));
+    if (groupAlive(pgid)) throw new Error('The recorded process group did not exit after SIGKILL; retaining its ownership.');
   },
 };
-
-/** Whether `ps -o lstart=` output names the recorded start time. An unreadable time counts as a match (fail closed). */
-export function startTimeMatches(lstart: string, startedAt: number): boolean {
-  const started = Date.parse(lstart.trim());
-  return !Number.isFinite(started) || Math.abs(started - startedAt) < 2_000;
-}
 
 export interface RecoveredStorage { readonly attemptId: string; readonly allocationId: string; readonly handle: unknown }
 export interface RecoveryDeps {
@@ -138,13 +149,41 @@ export interface RecoveryDeps {
 }
 export interface RecoveryOptions {
   store: Store; runnerOwner: string; runnerRoot: string; diagnosticsDir: string; deps: RecoveryDeps;
-  now?: () => number; exportDeadlineMs?: number; graceMs?: number;
+  now?: () => number; exportDeadlineMs?: number; graceMs?: number; openFiles?: (dir: string) => string[] | Promise<string[]>;
   /** The diagnostics directory's total byte cap; retention as on the live path (`saveDiagnostic`). */
   diagnosticsCapBytes?: number;
 }
 export interface RecoveryReport {
   finalized: { attemptId: string; planKey: string; state: string; requeued: boolean }[];
   requeue: string[]; removedDirectories: string[]; unknownEntries: string[]; unmatchedStorage: string[]; repairedMerges: string[];
+}
+function validOldHistory(marker: Partial<RebaseMarker>, history: unknown): boolean {
+  if (history === null) return true; // A pre-field marker owns no result and is cleanup-only.
+  if (!Array.isArray(history) || history.length > 500 ||
+      history.some(value => typeof value !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value)) ||
+      new Set(history).size !== history.length) return false;
+  return marker.oldHead === marker.oldBase ? history.length === 0 : history.at(-1) === marker.oldHead;
+}
+function validRebaseResult(marker: Partial<RebaseMarker>, history: unknown, head: unknown, mappings: unknown): boolean {
+  if (mappings === null) return head === null;
+  if (!Array.isArray(mappings) || mappings.length > 500 ||
+      (marker.onto === marker.oldBase) !== (head === null)) return false;
+  const sources = new Set<string>(), destinations = new Set<string>();
+  for (const mapping of mappings as unknown[]) {
+    if (!mapping || typeof mapping !== 'object') return false;
+    const { oldSha, newSha } = mapping as { oldSha?: unknown; newSha?: unknown };
+    if (typeof oldSha !== 'string' || typeof newSha !== 'string' ||
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(oldSha) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(newSha) ||
+        sources.has(oldSha) || destinations.has(newSha)) return false;
+    sources.add(oldSha); destinations.add(newSha);
+  }
+  if (Array.isArray(history) && (history.length !== mappings.length ||
+      history.some((source, index) => mappings[index]?.oldSha !== source))) return false;
+  if (marker.oldHead === marker.oldBase)
+    return mappings.length === 0 && head === (marker.onto === marker.oldBase ? null : marker.onto);
+  const endpoint = mappings.at(-1) as { oldSha: string; newSha: string } | undefined;
+  return !!endpoint && endpoint.oldSha === marker.oldHead &&
+    (head === null ? endpoint.newSha === marker.oldHead && mappings.every(mapping => mapping.oldSha === mapping.newSha) : endpoint.newSha === head);
 }
 const EXPORT_LIMIT = 1024 * 1024;
 
@@ -159,8 +198,8 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   // Step 7's input is taken before finalization: an interrupted attempt that started preparation but never saved its group.
   const unowned = interrupted.filter(a => a.preparationStartedAt !== null && a.preparationPgid === null).map(a => a.id);
   // 2b. Stop leftover preparation before D's recovery or any storage work.
-  for (const a of interrupted) if (a.preparationPgid !== null && a.preparationStartedAt !== null && processes.isAlive(a.preparationPgid, a.preparationStartedAt))
-    await processes.terminate(a.preparationPgid, o.graceMs ?? 5_000);
+  for (const a of interrupted) if (a.preparationPgid !== null && a.preparationStartedAt !== null && processes.isAlive(a.preparationPgid))
+    await processes.terminate(a.preparationPgid, a.preparationIdentity, o.graceMs ?? 5_000);
   // 2c/2d. D's recovery; a rejection propagates and stops startup.
   const recovered = await o.deps.recoverLeftovers(o.runnerOwner);
   if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned);
@@ -198,7 +237,41 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   // 4. Rebases, storage removal (every matched handle), then attempt directories.
   for (const rebase of o.store.rebasesInProgress()) {
     if (!o.deps.abortRebase) throw new RecoveryBlocked('An interrupted rebase needs F3 to abort it', [rebase.planKey]);
-    await o.deps.abortRebase(rebase.planKey, rebase.marker);
+    const marker = rebase.marker as Partial<RebaseMarker> | null;
+    const processGroup = marker?.processGroup, processGroupIdentity = processGroup && typeof processGroup === 'object'
+      ? processGroup.identity ?? null : null, oldHistory = marker?.oldHistory ?? null,
+      resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null,
+      resultState = marker?.resultState ?? 'none';
+    if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
+        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
+        !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
+        !validOldHistory(marker, oldHistory) ||
+        (oldHistory === null && (resultState !== 'none' || resultHead !== null || resultMappings !== null)) ||
+        (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
+        !['none', 'prepared', 'uncertain', 'refused', 'ready'].includes(resultState) ||
+        (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
+        !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
+        (processGroup !== null && (!processGroup || typeof processGroup === 'string' || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
+          !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0 ||
+          (processGroupIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processGroupIdentity)))))
+      throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', [rebase.planKey]);
+    if (processGroup) {
+      if (processes.isAlive(processGroup.pgid))
+        await processes.terminate(processGroup.pgid, processGroupIdentity, o.graceMs ?? 5_000);
+      // A descendant can escape the recorded process group before it is terminated. Whether the group was initially
+      // alive or dead, prove that no process still uses the workspace before releasing its durable owner.
+      const workspace = join(o.runnerRoot, o.runnerOwner, 'rebases', marker.attemptId);
+      const stat = lstatSync(workspace, { throwIfNoEntry: false });
+      if (stat && (!stat.isDirectory() || stat.isSymbolicLink()))
+        throw new RecoveryBlocked('An interrupted rebase workspace is not a plain directory', [workspace]);
+      const users = stat ? await (o.openFiles ? o.openFiles(workspace) : hostOpenFilesBounded(workspace)) : [];
+      if (users.length) throw new RecoveryBlocked('A process still uses an interrupted rebase workspace', users);
+      o.store.setRebaseProcessGroup(rebase.planKey, marker.attemptId, processGroup, null);
+    }
+    await o.deps.abortRebase(rebase.planKey, { ...marker, oldHistory, resultState, resultHead, resultMappings, processGroup: null });
+    if (!o.store.abortRebase(rebase.planKey, marker.attemptId))
+      throw new RecoveryBlocked('An interrupted rebase changed while recovery aborted it', [rebase.planKey]);
   }
   for (const storage of matched) await o.deps.removeTaskFilesystems(storage.handle);
   // Step 7's set, read after finalization so it also holds preparations an earlier startup already finalized.
@@ -261,3 +334,67 @@ export function hostOpenFiles(dir: string): string[] {
     throw new Error('Could not check which processes use the attempt directory. Refusing to release it.');
   }
 }
+
+const OPEN_FILES_DEADLINE_MS = 15_000;
+const MAX_PROC_ENTRIES = 100_000;
+const MAX_FD_ENTRIES = 1_000_000;
+type OpenFilesRun = (file: string, args: readonly string[], options: Parameters<typeof runInProcessGroup>[2]) => Promise<DockerOutcome>;
+function linuxOpenFiles(dir: string): string[] {
+  dir = realpathSync(dir);
+  const users: string[] = [], disappeared = (error: unknown) => ['ENOENT', 'ESRCH'].includes((error as NodeJS.ErrnoException).code ?? '');
+  let processes = 0, descriptors = 0;
+  const proc = opendirSync('/proc');
+  try {
+    for (let entry = proc.readSync(); entry; entry = proc.readSync()) {
+      if (!/^\d+$/.test(entry.name)) continue;
+      if (++processes > MAX_PROC_ENTRIES) throw new Error('Open-file probe exceeded its process bound.');
+      const pid = entry.name, links: string[] = [];
+      try { if (process.getuid && lstatSync(`/proc/${pid}`).uid !== process.getuid()) continue; }
+      catch (error) { if (disappeared(error)) continue; throw error; }
+      try { links.push(realpathSync(`/proc/${pid}/cwd`)); }
+      catch (error) { if (!disappeared(error)) throw error; }
+      let fds: ReturnType<typeof opendirSync> | undefined;
+      try { fds = opendirSync(`/proc/${pid}/fd`); }
+      catch (error) { if (disappeared(error)) continue; throw error; }
+      try {
+        for (let fd = fds.readSync(); fd; fd = fds.readSync()) {
+          if (++descriptors > MAX_FD_ENTRIES) throw new Error('Open-file probe exceeded its descriptor bound.');
+          try { links.push(realpathSync(`/proc/${pid}/fd/${fd.name}`)); }
+          catch (error) { if (!disappeared(error)) throw error; }
+        }
+      } finally { fds.closeSync(); }
+      if (links.some(link => link === dir || link.startsWith(`${dir}/`))) users.push(pid);
+    }
+  } finally { proc.closeSync(); }
+  return users;
+}
+/** Recovery's bounded variant. Its lsof process and pipes settle inside the overall deadline before startup proceeds. */
+export async function hostOpenFilesBounded(dir: string, options: { timeoutMs?: number; platform?: NodeJS.Platform;
+  now?: () => number; run?: OpenFilesRun } = {}): Promise<string[]> {
+  const timeoutMs = options.timeoutMs ?? OPEN_FILES_DEADLINE_MS, now = options.now ?? performance.now.bind(performance);
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 12_001) throw new Error('Invalid open-file probe deadline.');
+  const deadline = now() + timeoutMs;
+  if ((options.platform ?? process.platform) === 'linux') {
+    const childTimeoutMs = timeoutMs - 12_000;
+    const outcome = await (options.run ?? runInProcessGroup)(process.execPath,
+      [fileURLToPath(import.meta.url), '--scan-open-files'], { env: { PATH: process.env.PATH ?? '' }, input: Buffer.from(dir),
+        timeoutMs: childTimeoutMs, graceMs: 1_000, maxBuffer: 1024 * 1024 });
+    if (now() >= deadline) throw new Error('Open-file probe timed out. Refusing to recover the rebase workspace.');
+    if (outcome.status === 0 && !outcome.stderr.trim()) {
+      const users = outcome.stdout.split('\n').filter(Boolean);
+      if (users.every(pid => /^\d+$/.test(pid))) return users;
+    }
+    throw new Error('Could not check which processes use the rebase workspace. Refusing to recover it.');
+  }
+  // runInProcessGroup may spend 1 s on SIGTERM, 10 s draining the group, and 1 s draining pipes after its timer.
+  const childTimeoutMs = timeoutMs - 12_000;
+  const outcome = await (options.run ?? runInProcessGroup)('/usr/sbin/lsof', ['-t', '+D', dir],
+    { env: { LC_ALL: 'C' }, timeoutMs: childTimeoutMs, graceMs: 1_000, maxBuffer: 1024 * 1024 });
+  if (now() >= deadline) throw new Error('Open-file probe timed out. Refusing to recover the rebase workspace.');
+  if (outcome.status === 0 && !outcome.stderr.trim()) return outcome.stdout.split('\n').filter(Boolean);
+  if (outcome.status === 1 && !outcome.stdout && !outcome.stderr.trim() && !outcome.error) return [];
+  throw new Error('Could not check which processes use the rebase workspace. Refusing to recover it.');
+}
+
+if (process.argv[1] === fileURLToPath(import.meta.url) && process.argv[2] === '--scan-open-files')
+  process.stdout.write(`${linuxOpenFiles(readFileSync(0, 'utf8')).join('\n')}\n`);

@@ -83,6 +83,18 @@ export interface TaskRecord {
   currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
   createdAt: string; updatedAt: string;
 }
+export interface RebaseMarker {
+  attemptId: string;
+  oldBase: string;
+  oldHead: string;
+  onto: string;
+  oldHistory: string[] | null;
+  startedAt: number;
+  resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready';
+  resultHead: string | null;
+  resultMappings: { oldSha: string; newSha: string }[] | null;
+  processGroup: { pgid: number; startedAt: number; identity: string | null } | 'spawning' | 'unsettled' | null;
+}
 export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
   firstReason: FirstReason | null; stopReason: StopReason | null; exitCode: number | null; signal: string | null; result: unknown;
@@ -95,7 +107,8 @@ export interface AttemptRecord {
 }
 /** A non-terminal attempt at startup, with what recovery needs to stop its preparation and export its storage. */
 export interface InterruptedAttempt extends AttemptRecord {
-  planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; allocationId: string | null;
+  planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; preparationIdentity: string | null;
+  allocationId: string | null;
   /** Saved after D's allocation returned (#91); null when it never did. */
   metadataBaseline: string | null; storageBase: string | null;
 }
@@ -150,8 +163,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 15) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 16) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -251,6 +264,12 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'continuation'))
             this.#db.exec('ALTER TABLE requests ADD COLUMN continuation TEXT');
           this.#db.exec('PRAGMA user_version=15');
+        }
+        // A process group can be signalled after a crash only when its exact kernel identity still matches.
+        if (version < 16) {
+          if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'preparation_identity'))
+            this.#db.exec('ALTER TABLE attempts ADD COLUMN preparation_identity TEXT');
+          this.#db.exec('PRAGMA user_version=16');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -479,6 +498,7 @@ export class Store {
       const task = this.#task(key);
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be merged.`);
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be merged.');
+      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
       if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
       if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
@@ -696,20 +716,176 @@ export class Store {
     return this.#transaction(() => {
       this.#expect(key, expected);
       this.#assertContextWritable(key);
-      const ledger = new Map(this.getLedger(identity).map(entry => [entry.sha, entry]));
-      const snapshot = this.#snapshot(key, base, head);
-      const destinations = new Set<string>();
-      for (const { oldSha, newSha } of mappings) {
-        sha(oldSha); sha(newSha);
-        if (destinations.has(newSha)) throw new Error('Rebase mappings must be one-to-one.');
-        destinations.add(newSha);
-        const source = ledger.get(oldSha);
-        if (oldSha !== newSha) this.#entry(key, { sha: newSha, owner: source?.owner ?? null, origin: source?.origin ?? 'foreign', sourceSha: oldSha });
-        else if (!source) this.#entry(key, { sha: newSha, owner: null, origin: 'foreign', sourceSha: null });
-        this.#run('INSERT INTO rewrites VALUES (?,?,?,?)', key, snapshot.id, oldSha, newSha);
+      if (this.#task(key).rebase_in_progress !== null) throw new GuardRefusal('A claimed rebase is in progress; wait for it to settle.');
+      return this.#applyRebase(identity, key, base, head, mappings);
+    });
+  }
+  /** Claim the pre-merge rebase before its first Git process starts. */
+  beginRebase(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, expectedTaskStateVersion: number,
+    input: { oldBase: string; oldHead: string; onto: string; oldHistory: readonly string[]; attemptId?: string; startedAt?: number }): RebaseMarker {
+    sha(input.oldBase); sha(input.oldHead); sha(input.onto);
+    if (input.oldHistory.length > 500) throw new Error('Rebase history exceeds 500 commits.');
+    const oldHistory = [...input.oldHistory];
+    for (const value of oldHistory) sha(value);
+    if (new Set(oldHistory).size !== oldHistory.length ||
+        (input.oldHead === input.oldBase ? oldHistory.length !== 0 : oldHistory.at(-1) !== input.oldHead))
+      throw new Error('The rebase history must be complete, ordered, and end at the captured head.');
+    if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for rebasing.');
+    if (!Number.isSafeInteger(expectedTaskStateVersion) || expectedTaskStateVersion < 0) throw new Error('Invalid expected task state version.');
+    const attemptId = input.attemptId ?? randomUUID(), startedAt = input.startedAt ?? Date.now();
+    assertUuidV4(attemptId, 'Rebase attempt ID');
+    if (!Number.isSafeInteger(startedAt) || startedAt < 0) throw new Error('Invalid rebase start time.');
+    const marker: RebaseMarker = { attemptId, oldBase: input.oldBase, oldHead: input.oldHead, onto: input.onto, oldHistory, startedAt,
+      resultState: 'none', resultHead: null, resultMappings: null, processGroup: null };
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#expect(key, expected);
+      const task = this.#task(key);
+      if (task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; it cannot be rebased.`);
+      if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; rebase it from review.`);
+      if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled; it cannot be rebased.');
+      if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be rebased.');
+      if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is already in progress for this task.');
+      const snapshot = this.getSnapshot(identity);
+      if (snapshot.base !== input.oldBase || snapshot.head !== input.oldHead)
+        throw new GuardRefusal('The reviewed base or head changed before the rebase started.');
+      this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=?', encode(marker), key);
+      this.#touch(key);
+      return marker;
+    });
+  }
+  /** Record or clear the exact Git process group currently owned by a rebase. This does not advance task context. */
+  setRebaseProcessGroup(planKey: string, attemptId: string,
+    expected: RebaseMarker['processGroup'], group: RebaseMarker['processGroup']): void {
+    assertUuidV4(attemptId, 'Rebase attempt ID');
+    for (const value of [expected, group]) if (value && value !== 'spawning' && value !== 'unsettled' &&
+        (!Number.isSafeInteger(value.pgid) || value.pgid <= 1 || !Number.isSafeInteger(value.startedAt) || value.startedAt < 0 ||
+          (value.identity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(value.identity))))
+      throw new Error('Invalid rebase process group.');
+    this.#transaction(() => {
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
+      if (stable(marker.processGroup) !== stable(expected)) throw new GuardRefusal('Another Git process owns this rebase.');
+      if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
+        encode({ ...marker, processGroup: group }), planKey, task.rebase_in_progress as string).changes !== 1)
+        throw new GuardRefusal('This rebase attempt no longer owns the task.');
+    });
+  }
+  /** Persist the complete intended result before the rebaser's first ref write. */
+  prepareRebaseResult(planKey: string, attemptId: string, head: string | null, rewrittenHistory: readonly string[]): void {
+    assertUuidV4(attemptId, 'Rebase attempt ID'); if (head !== null) sha(head);
+    if (rewrittenHistory.length > 500) throw new Error('Rebase history exceeds 500 commits.');
+    for (const value of rewrittenHistory) sha(value);
+    if (new Set(rewrittenHistory).size !== rewrittenHistory.length) throw new Error('Rebase history must not repeat a commit.');
+    this.#transaction(() => {
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
+      if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.oldHistory === null || rewrittenHistory.length !== marker.oldHistory.length)
+        throw new GuardRefusal('The rebase result does not cover the complete captured history.');
+      if ((marker.onto === marker.oldBase) !== (head === null)) throw new GuardRefusal('The retained rebase result does not match its target.');
+      const rewrittenHead = rewrittenHistory.at(-1);
+      if (marker.oldHead === marker.oldBase ? rewrittenHistory.length !== 0 :
+          (head === null ? stable(rewrittenHistory) !== stable(marker.oldHistory) : rewrittenHead !== head))
+        throw new GuardRefusal('The retained rebase history does not end at its captured head.');
+      if (marker.oldHead === marker.oldBase && head !== (marker.onto === marker.oldBase ? null : marker.onto))
+        throw new GuardRefusal('An empty rebase history must resolve exactly to its target base.');
+      const mappings = marker.oldHistory.map((oldSha, index) => ({ oldSha, newSha: rewrittenHistory[index]! }));
+      if (marker.resultState !== 'none') {
+        if (marker.resultHead !== head || stable(marker.resultMappings) !== stable(mappings))
+          throw new GuardRefusal('Another result owns this rebase.');
+        return;
       }
+      if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
+        encode({ ...marker, resultState: 'prepared', resultHead: head, resultMappings: [...mappings] }),
+        planKey, task.rebase_in_progress as string).changes !== 1)
+        throw new GuardRefusal('This rebase attempt no longer owns the task.');
+    });
+  }
+  /** Record the external ref-write outcome before live cleanup or recovery can interpret the prepared intent. */
+  setRebaseResultState(planKey: string, attemptId: string, state: 'uncertain' | 'refused' | 'ready'): void {
+    assertUuidV4(attemptId, 'Rebase attempt ID');
+    this.#transaction(() => {
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
+      if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.resultState === state) return;
+      if (marker.resultState !== 'prepared' || marker.resultMappings === null)
+        throw new GuardRefusal('The rebase result was not prepared before its ref write.');
+      if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
+        encode({ ...marker, resultState: state }), planKey, task.rebase_in_progress as string).changes !== 1)
+        throw new GuardRefusal('This rebase attempt no longer owns the task.');
+    });
+  }
+  /** Confirm that the prepared result's ref write succeeded (or that the no-op needs no ref). */
+  completeRebaseResult(planKey: string, attemptId: string): void {
+    this.setRebaseResultState(planKey, attemptId, 'ready');
+  }
+  /** Publish a rebase only while every review and task counter captured by its attempt is still current. */
+  finishRebase(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, expectedTaskStateVersion: number,
+    attemptId: string, base: string, head: string, mappings: readonly { oldSha: string; newSha: string }[]): Snapshot {
+    assertUuidV4(attemptId, 'Rebase attempt ID');
+    if (!Number.isSafeInteger(expected.reviewVersion) || expected.reviewVersion < 0) throw new Error('A current review version is required for rebasing.');
+    if (!Number.isSafeInteger(expectedTaskStateVersion) || expectedTaskStateVersion < 0) throw new Error('Invalid expected task state version.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      this.#expect(key, expected);
+      const task = this.#task(key), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      // beginRebase itself advances the task version once; nothing else may have advanced it before this result lands.
+      if (task.state_version !== expectedTaskStateVersion + 1) throw new GuardRefusal('The task changed during the rebase. Discard its result.');
+      if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
+      if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.resultState !== 'ready' || marker.resultMappings === null ||
+          (marker.onto === marker.oldBase ? marker.resultHead !== null : marker.resultHead !== head))
+        throw new GuardRefusal('The rebase result does not own its retained ref.');
+      const captured = this.getSnapshot(identity);
+      if (marker.oldBase !== captured.base || marker.oldHead !== captured.head || marker.onto !== base)
+        throw new GuardRefusal('The rebase result does not match its captured base and head.');
+      const endpoint = mappings.at(-1);
+      if (marker.oldHead === marker.oldBase
+        ? mappings.length !== 0 || head !== base
+        : !endpoint || endpoint.oldSha !== marker.oldHead || endpoint.newSha !== head || stable(mappings) !== stable(marker.resultMappings))
+        throw new GuardRefusal('The rebase mapping does not end at the captured and rewritten heads.');
+      this.#assertContextWritable(key);
+      const snapshot = this.#applyRebase(identity, key, base, head, mappings);
+      this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=?', key);
       return snapshot;
     });
+  }
+  /** Clear only the matching rebase, after the live operation settles or recovery removes its resources. */
+  abortRebase(planKey: string, attemptId: string): boolean {
+    assertUuidV4(attemptId, 'Rebase attempt ID');
+    return this.#transaction(() => {
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId) return false;
+      if (marker.processGroup !== null) return false;
+      const encoded = task.rebase_in_progress as string;
+      if (this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=? AND rebase_in_progress=?', planKey, encoded).changes !== 1) return false;
+      if (task.cancel_requested !== null && !this.#closed(task.status as TaskStatus)) this.#closeTask(planKey, 'cancelled', task.cancel_requested as string);
+      else this.#touch(planKey);
+      return true;
+    });
+  }
+  #applyRebase(identity: PlanIdentity, key: string, base: string, head: string,
+    mappings: readonly { oldSha: string; newSha: string }[]): Snapshot {
+    const ledger = new Map(this.getLedger(identity).map(entry => [entry.sha, entry]));
+    const sources = new Set<string>(), destinations = new Set<string>();
+    // Validate the complete response before the snapshot or ledger changes.
+    for (const { oldSha, newSha } of mappings) {
+      sha(oldSha); sha(newSha);
+      if (sources.has(oldSha) || destinations.has(newSha)) throw new Error('Rebase mappings must be one-to-one.');
+      sources.add(oldSha); destinations.add(newSha);
+    }
+    const snapshot = this.#snapshot(key, base, head);
+    for (const { oldSha, newSha } of mappings) {
+      const source = ledger.get(oldSha);
+      if (oldSha !== newSha) this.#entry(key, { sha: newSha, owner: source?.owner ?? null, origin: source?.origin ?? 'foreign', sourceSha: oldSha });
+      else if (!source) this.#entry(key, { sha: newSha, owner: null, origin: 'foreign', sourceSha: null });
+      this.#run('INSERT INTO rewrites VALUES (?,?,?,?)', key, snapshot.id, oldSha, newSha);
+    }
+    return snapshot;
   }
   getRewrites(identity: PlanIdentity, snapshotId: string): { oldSha: string; newSha: string }[] {
     this.getSnapshot(identity, snapshotId);
@@ -1270,6 +1446,7 @@ export class Store {
       if (task.state_version !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if (this.#closed(task.status as TaskStatus)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
       this.#run('UPDATE tasks SET assignment_id=?, referenced_code_hash=? WHERE plan_key=?', assignmentId, referencedCodeHash, key);
       this.#bumpContext(key);
     });
@@ -1284,6 +1461,7 @@ export class Store {
       if (this.#closed(task.status)) throw new GuardRefusal('A closed task never changes.');
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task.');
       if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+      if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
       this.#run('UPDATE tasks SET status=? WHERE plan_key=?', to, key);
       this.#touch(key);
     });
@@ -1326,6 +1504,7 @@ export class Store {
         if (task.cancel_requested !== null) throw new GuardRefusal('The task is being cancelled.');
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
         if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+        if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
         // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
         if (task.budget_deadline !== null && (task.budget_deadline as number) <= now)
           throw new RefusalWithEffect('The task time budget has run out; it needs a person.', expire);
@@ -1430,6 +1609,12 @@ export class Store {
       if (merge && (merge.state === 'submitting' || merge.state === 'queued'))
         throw new GuardRefusal('A merge is in progress. Cancel the task after it finishes or fails.');
       const active = this.#activeAttempt(key);
+      if (task.rebase_in_progress !== null) {
+        if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
+        this.#run('UPDATE tasks SET cancel_requested=? WHERE plan_key=?', actionId, key);
+        this.#touch(key);
+        return 'stopping';
+      }
       if (!active) { this.#closeTask(key, 'cancelled', actionId); return 'closed'; }
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
       this.#run(`UPDATE attempts SET first_reason='cancelled' WHERE id=? AND first_reason IS NULL`, active.id!);
@@ -1908,14 +2093,16 @@ export class Store {
   }
   /**
    * Saved in the same synchronous turn as the spawn. Preparation can run several subprocesses in turn: each one replaces
-   * the last, with its own start time when given, so startup recovery's start-time check (which guards against PID reuse)
-   * matches the group it finds.
+   * the last, with its own start time and kernel identity when given, so startup recovery can prove that the numeric ID
+   * still names the group it recorded.
    */
-  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number, startedAt?: number): void {
+  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number, startedAt?: number, processIdentity: string | null = null): void {
     if (!Number.isSafeInteger(pgid) || pgid < 2) throw new GuardRefusal('Invalid process group.');
     if (startedAt !== undefined && !Number.isSafeInteger(startedAt)) throw new GuardRefusal('Invalid process start time.');
-    if (this.#run(`UPDATE attempts SET preparation_pgid=?, preparation_started_at=COALESCE(?, preparation_started_at) WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`,
-      pgid, startedAt ?? null, identityKey(identity), id).changes !== 1)
+    if (processIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processIdentity))
+      throw new GuardRefusal('Invalid process identity.');
+    if (this.#run(`UPDATE attempts SET preparation_pgid=?, preparation_started_at=COALESCE(?, preparation_started_at), preparation_identity=? WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`,
+      pgid, startedAt ?? null, processIdentity, identityKey(identity), id).changes !== 1)
       throw new GuardRefusal('Preparation was not marked as starting.');
   }
   /** F chooses the allocation ID and saves it before the asynchronous allocation starts. */
@@ -1940,7 +2127,8 @@ export class Store {
   interruptedAttempts(): InterruptedAttempt[] {
     return this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => ({
       ...this.#attemptRecord(row), planKey: row.plan_key as string, preparationPgid: row.preparation_pgid as number | null,
-      preparationStartedAt: row.preparation_started_at as number | null, allocationId: row.allocation_id as string | null,
+      preparationStartedAt: row.preparation_started_at as number | null, preparationIdentity: row.preparation_identity as string | null,
+      allocationId: row.allocation_id as string | null,
       metadataBaseline: row.metadata_baseline as string | null, storageBase: row.storage_base as string | null,
     }));
   }

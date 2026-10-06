@@ -356,7 +356,7 @@ The diagram shows the designed transitions. With the `runner` block, running, ne
 
 ### Stored data
 
-All state is in one SQLite file, opened with WAL and full synchronization. Each write takes an immediate write lock. The schema version is `PRAGMA user_version`, and migrations run in explicit steps (version 15 today); an unknown version fails.
+All state is in one SQLite file, opened with WAL and full synchronization. Each write takes an immediate write lock. The schema version is `PRAGMA user_version`, and migrations run in explicit steps (version 16 today); an unknown version fails.
 
 | Group | Tables | Notes |
 |---|---|---|

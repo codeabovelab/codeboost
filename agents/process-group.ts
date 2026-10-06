@@ -1,12 +1,28 @@
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { NOT_STARTED, type DockerOutcome } from './docker.ts';
 
 /** A subprocess's process group, reported as soon as it exists so the caller can record it durably. */
 export interface ProcessGroup {
   /** The group ID, which is the leader's PID. */
   readonly pgid: number;
-  /** `Date.now()` right after the spawn; with the ID, it tells this group from a later one that reuses the ID. */
+  /** `Date.now()` right after the spawn, retained for lifecycle timing and diagnostics. */
   readonly startedAt: number;
+  /** Linux boot ID plus kernel start ticks. Null means crash recovery must not signal this group automatically. */
+  readonly identity: string | null;
+}
+
+/** A kernel-backed identity that changes across both PID reuse and host reboot. */
+export function processIdentity(pid: number): string | null {
+  if (process.platform !== 'linux') return null;
+  try {
+    const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'ascii').trim();
+    const stat = readFileSync(`/proc/${pid}/stat`, 'ascii'), close = stat.lastIndexOf(')');
+    const fields = close < 0 ? [] : stat.slice(close + 2).trim().split(/ +/);
+    const ticks = fields[19]; // field 22 overall; fields starts with field 3 (`state`).
+    if (!/^[0-9a-f-]{36}$/.test(boot) || !ticks || !/^\d+$/.test(ticks)) return null;
+    return `linux:${boot}:${ticks}`;
+  } catch { return null; }
 }
 export interface ProcessGroupOptions {
   readonly env: NodeJS.ProcessEnv;
@@ -20,6 +36,8 @@ export interface ProcessGroupOptions {
   readonly graceMs?: number;
   /** Bytes kept of each of stdout and stderr; more stops the group. Default 16 MiB. */
   readonly maxBuffer?: number;
+  /** Keep only the bounded prefix instead of stopping on excess output. Use only when exit status/state decides meaning. */
+  readonly discardExcessOutput?: boolean;
   /**
    * Written to the leader's stdin, which is then closed; without it stdin is not connected. A leader that exits before
    * reading it all is not an error: what it did is in its status and output.
@@ -112,17 +130,18 @@ export function runInProcessGroup(file: string, args: readonly string[],
     // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
     // the call still settles only after the group has exited, with the caller's error.
     let unrecorded: unknown;
-    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
+    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now(), identity: processIdentity(pgid) })); }
     catch (error) { unrecorded = error; }
-    // Output past the limit stops a running group; once the leader has exited it only drops the excess. Either way the
-    // output is incomplete, so the call settles as ENOBUFS, never as a success.
+    // Normally output past the limit stops the group and settles as ENOBUFS. A caller that classifies from durable state
+    // may explicitly keep a bounded prefix and let the process finish instead.
     let truncated = false;
-    const collect = (chunks: Buffer[], add: (bytes: number) => number) => (chunk: Buffer) => {
-      if (add(chunk.length) > maxBuffer) { truncated = true; stop('output-limit'); }
-      else chunks.push(chunk);
+    const collect = (chunks: Buffer[], used: () => number, add: (bytes: number) => number) => (chunk: Buffer) => {
+      const room = Math.max(0, maxBuffer - used());
+      if (room > 0) chunks.push(chunk.subarray(0, room));
+      if (add(chunk.length) > maxBuffer) { truncated = true; if (!options.discardExcessOutput) stop('output-limit'); }
     };
-    child.stdout!.on('data', collect(out, bytes => (outBytes += bytes)));
-    child.stderr!.on('data', collect(err, bytes => (errBytes += bytes)));
+    child.stdout!.on('data', collect(out, () => outBytes, bytes => (outBytes += bytes)));
+    child.stderr!.on('data', collect(err, () => errBytes, bytes => (errBytes += bytes)));
     const onAbort = () => stop('cancelled');
     options.signal?.addEventListener('abort', onAbort, { once: true });
     if (unrecorded !== undefined) { stopped = 'unrecorded'; signalGroup(pgid, 'SIGKILL'); }
@@ -178,7 +197,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
             { name: 'AbortError', code: 'ABORT_ERR' }) });
           return;
         }
-        if (truncated && !stopped) {
+        if (truncated && !stopped && !options.discardExcessOutput) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
             new Error(`${file} ${args[0] ?? ''} exceeded its output limit.`), { code: 'ENOBUFS' }) });
           return;
