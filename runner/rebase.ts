@@ -171,7 +171,9 @@ export class GitRebaser {
           throw new RebaseConflict('A gitlink conflict needs manual resolution.');
         const allowed = new Set(files);
         const priorHead = await this.#git(path, ['rev-parse', '--verify', 'HEAD^{commit}'], scope);
+        const gitlinksBefore = await this.#gitlinkState(path, scope);
         const outsideBefore = await this.#outsideConflictState(path, allowed, priorHead, scope);
+        const operationBefore = await this.#rebaseState(path, scope);
         this.#assertResultCurrent(scope);
         await this.#resolveConflict({ attemptId, commit, files, repository: path }, scope);
         this.#assertResultCurrent(scope);
@@ -179,10 +181,16 @@ export class GitRebaser {
           throw new RebaseConflict('The conflict resolver changed the rebase operation.');
         if (await this.#git(path, ['rev-parse', '--verify', 'HEAD^{commit}'], scope) !== priorHead)
           throw new RebaseConflict('The conflict resolver changed the rebase operation.');
+        if (await this.#rebaseState(path, scope) !== operationBefore)
+          throw new RebaseConflict('The conflict resolver changed the rebase operation.');
+        if (await this.#gitlinkState(path, scope) !== gitlinksBefore)
+          throw new RebaseConflict('The conflict resolver changed a gitlink outside the conflicted file set.');
         if (await this.#outsideConflictState(path, allowed, priorHead, scope) !== outsideBefore)
           throw new RebaseConflict('The conflict resolver changed a file outside the conflicted set.');
         const pathspec = Buffer.from(`${files.join('\0')}\0`);
         await this.#git(path, ['--literal-pathspecs', 'add', '--all', '--pathspec-from-file=-', '--pathspec-file-nul'], scope, false, pathspec);
+        if (await this.#gitlinkState(path, scope) !== gitlinksBefore)
+          throw new RebaseConflict('Conflict resolution cannot add or change a gitlink.');
         const unresolved = await this.#call(path, ['diff', '--quiet', '--ignore-submodules=all', '--diff-filter=U', '--'], scope);
         this.#throwIfCancelled(unresolved, scope);
         if (unresolved.status !== 0) {
@@ -366,13 +374,27 @@ export class GitRebaser {
     });
   }
 
-  async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, head: string, scope: CallScope): Promise<string> {
-    const verifier = fileURLToPath(new URL('./verify-checkout.ts', import.meta.url));
-    const gitlinks = await this.#process(process.execPath, [verifier, this.#gitExecutable, 'gitlinks'], repository,
+  async #rebaseState(repository: string, scope: CallScope): Promise<string> {
+    const helper = fileURLToPath(new URL('./hash-rebase-state.ts', import.meta.url));
+    const outcome = await this.#process(process.execPath, [helper, this.#gitExecutable], repository,
       this.#gitEnvironment, scope, false, 64 * 1024);
-    this.#throwIfCancelled(gitlinks, scope);
-    if (gitlinks.status !== 0 || !/^[0-9a-f]{64}$/.test(gitlinks.stdout))
-      throw this.#failure('gitlink index audit', gitlinks, 'node');
+    this.#throwIfCancelled(outcome, scope);
+    if (outcome.status !== 0 || !/^[0-9a-f]{64}$/.test(outcome.stdout))
+      throw this.#failure('rebase-state audit', outcome, 'node');
+    return outcome.stdout;
+  }
+
+  async #gitlinkState(repository: string, scope: CallScope): Promise<string> {
+    const verifier = fileURLToPath(new URL('./verify-checkout.ts', import.meta.url));
+    const outcome = await this.#process(process.execPath, [verifier, this.#gitExecutable, 'gitlinks'], repository,
+      this.#gitEnvironment, scope, false, 64 * 1024);
+    this.#throwIfCancelled(outcome, scope);
+    if (outcome.status !== 0 || !/^[0-9a-f]{64}$/.test(outcome.stdout))
+      throw this.#failure('gitlink index audit', outcome, 'node');
+    return outcome.stdout;
+  }
+
+  async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, head: string, scope: CallScope): Promise<string> {
     const changed = new Set([
       ...await this.#paths(repository, 'changed', scope, head),
       ...await this.#paths(repository, 'untracked', scope),
@@ -382,7 +404,7 @@ export class GitRebaser {
       const index = await this.#git(repository, ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', path], scope);
       entries.push([path, index, this.#worktreeFingerprint(repository, path)]);
     }
-    return JSON.stringify([gitlinks.stdout, entries]);
+    return JSON.stringify(entries);
   }
 
   #worktreeFingerprint(repository: string, path: string): string {

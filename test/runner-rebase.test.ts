@@ -399,7 +399,7 @@ describe('trusted pre-merge rebase', () => {
       git(input.repository, 'update-index', '--cacheinfo', `160000,${s.onto},submodule`);
     } });
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
-      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink/);
   });
 
   it('refuses a resolver commit that moves HEAD and smuggles an outside file', async () => {
@@ -411,6 +411,23 @@ describe('trusted pre-merge rebase', () => {
       git(input.repository, '-c', 'user.name=Resolver', '-c', 'user.email=resolver@example.invalid', 'commit', '-qm', 'smuggle');
     } });
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/changed the rebase operation/);
+  });
+
+  it('refuses a resolver change to the remaining rebase operation', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    const later = commit(s.source, 'later.txt', 'expected later change\n', 'later');
+    git(s.source, 'switch', '-qc', 'alternate', s.foreign);
+    const alternate = commit(s.source, 'smuggled.txt', 'substituted change\n', 'alternate');
+    await ensureCommit(s.repository, later); await ensureCommit(s.repository, alternate);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      const todo = git(input.repository, 'rev-parse', '--path-format=absolute', '--git-path', 'rebase-merge/git-rebase-todo');
+      writeFileSync(todo, `pick ${alternate} alternate\n`);
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: later,
+      oldHistory: [s.owned, s.foreign, later], onto: s.onto,
       ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/changed the rebase operation/);
   });
 
@@ -430,6 +447,19 @@ describe('trusted pre-merge rebase', () => {
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto,
       ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink conflict needs manual/);
     expect(resolveForeignConflict).not.toHaveBeenCalled();
+  });
+
+  it('refuses replacing an allowed conflicted file with an embedded repository', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      const nested = join(input.repository, 'a.txt');
+      rmSync(nested); mkdirSync(nested);
+      git(nested, 'init', '-q', '-b', 'main');
+      git(nested, 'config', 'user.name', 'Nested'); git(nested, 'config', 'user.email', 'nested@example.invalid');
+      commit(nested, 'nested.txt', 'nested\n', 'nested');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink/);
   });
 
   it('passes a literal replacement character in a valid UTF-8 conflict path to the resolver', async () => {
