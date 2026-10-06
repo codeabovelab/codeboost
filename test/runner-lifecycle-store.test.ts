@@ -581,6 +581,9 @@ describe('pre-merge rebase ownership', () => {
     expect(() => store.finishRebase(identity, expected, taskVersion, randomUUID(), oid(5), oid(7), [
       { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
     ])).toThrow(/no longer owns/);
+    expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
+      { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(8) },
+    ])).toThrow(/does not end/);
     const group = { pgid: 4242, startedAt: 456 };
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, 'spawning');
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, 'spawning', group);
@@ -616,6 +619,19 @@ describe('pre-merge rebase ownership', () => {
     expect(store.abortRebase(store.getTask(identity).planKey, marker.attemptId)).toBe(true);
     expect(store.abortRebase(store.getTask(identity).planKey, marker.attemptId)).toBe(false);
     expect(store.getTask(identity).rebaseInProgress).toBeNull();
+  });
+
+  it('accepts an empty mapping only when the captured history and rewritten result are both empty', () => {
+    const { store } = fixture();
+    const current = store.getSnapshot(identity);
+    store.recordHistory(identity, { revision: 1, snapshotId: current.id }, oid(1), oid(1), []);
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
+    const expected = reviewed(store), taskVersion = store.getTask(identity).stateVersion;
+    const marker = store.beginRebase(identity, expected, taskVersion, { oldBase: oid(1), oldHead: oid(1), onto: oid(5) });
+    expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(6), []))
+      .toThrow(/does not end/);
+    expect(store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(5), []))
+      .toMatchObject({ base: oid(5), head: oid(5) });
   });
 
   it('rejects a result after another durable task change without erasing its recovery marker', () => {

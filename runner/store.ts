@@ -771,6 +771,11 @@ export class Store {
       const captured = this.getSnapshot(identity);
       if (marker.oldBase !== captured.base || marker.oldHead !== captured.head || marker.onto !== base)
         throw new GuardRefusal('The rebase result does not match its captured base and head.');
+      const endpoint = mappings.at(-1);
+      if (marker.oldHead === marker.oldBase
+        ? mappings.length !== 0 || head !== base
+        : !endpoint || endpoint.oldSha !== marker.oldHead || endpoint.newSha !== head)
+        throw new GuardRefusal('The rebase mapping does not end at the captured and rewritten heads.');
       this.#assertContextWritable(key);
       const snapshot = this.#applyRebase(identity, key, base, head, mappings);
       this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=?', key);

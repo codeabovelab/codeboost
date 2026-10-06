@@ -70,7 +70,13 @@ export class GitRebaser {
 
     const path = this.#path(attemptId);
     if (lstatSync(path, { throwIfNoEntry: false })) throw new Error('The rebase workspace already exists.');
-    let added = false, retained = false, result: RebaseResult | undefined, primary: unknown;
+    const ref = rebaseRef(attemptId);
+    const existing = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope);
+    this.#throwIfCancelled(existing, scope);
+    if (existing.status === 0) throw new Error('This rebase attempt already has a retained result.');
+    if (existing.status !== 1) throw this.#failure('show-ref', existing);
+    let added = false, retained = false, uncertainRef = false, attemptedRef: string | undefined;
+    let result: RebaseResult | undefined, primary: unknown;
     try {
       await this.#git(this.#options.repository.path, ['worktree', 'add', '--detach', '--', path, oldHead], scope);
       added = true;
@@ -94,8 +100,16 @@ export class GitRebaser {
       await this.#assertCheckout(path, head, 'rebased head', scope);
       const next = await this.#history(path, onto, head, scope);
       if (next.length !== old.length) throw new Error('The rebase did not preserve one commit for every task commit.');
-      await this.#git(this.#options.repository.path, ['update-ref', rebaseRef(attemptId), head], scope);
-      retained = true;
+      attemptedRef = head;
+      const created = await this.#call(this.#options.repository.path, ['update-ref', ref, head, '0'.repeat(head.length)], scope);
+      if (created.status === 0) retained = true;
+      else if (created.status === null) uncertainRef = true;
+      this.#throwIfCancelled(created, scope);
+      if (created.status !== 0) {
+        // A null status can mean the ref write landed but its settlement record did not. Cleanup reconciles that exact
+        // attempted value. A normal nonzero exit proves atomic creation refused and must preserve the winning ref.
+        throw this.#failure('update-ref', created);
+      }
       result = { oldHead, base: onto, head, mappings: old.map((oldSha, index) => ({ oldSha, newSha: next[index]! })) };
     } catch (error) { primary = error; }
     const cleanupFailures: unknown[] = [];
@@ -106,13 +120,9 @@ export class GitRebaser {
     // Drop a completed rewrite before reporting that cancellation so no caller can apply a cancelled result.
     if (!primary && signal?.aborted) {
       primary = signal.reason;
-      if (retained) {
-        try { await this.#git(this.#options.repository.path, ['update-ref', '-d', rebaseRef(attemptId)], scope, true); }
-        catch (error) { cleanupFailures.push(error); }
-      }
     }
-    if (!retained) {
-      try { await this.#git(this.#options.repository.path, ['update-ref', '-d', rebaseRef(attemptId)], scope, true); }
+    if ((retained && primary && signal?.aborted) || (!retained && uncertainRef)) {
+      try { await this.#git(this.#options.repository.path, ['update-ref', '-d', ref, attemptedRef!], scope, true); retained = false; }
       catch (error) { cleanupFailures.push(error); }
     }
     const cleanup = cleanupFailures.length > 1 ? new AggregateError(cleanupFailures, 'Rebase cleanup failed.') : cleanupFailures[0];
