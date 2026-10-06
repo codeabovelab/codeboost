@@ -90,7 +90,7 @@ export interface RebaseMarker {
   onto: string;
   oldHistory: string[] | null;
   startedAt: number;
-  resultState: 'none' | 'prepared' | 'ready';
+  resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready';
   resultHead: string | null;
   resultMappings: { oldSha: string; newSha: string }[] | null;
   processGroup: { pgid: number; startedAt: number } | 'spawning' | 'unsettled' | null;
@@ -782,6 +782,8 @@ export class Store {
       if (marker.oldHead === marker.oldBase ? rewrittenHistory.length !== 0 :
           (head === null ? stable(rewrittenHistory) !== stable(marker.oldHistory) : rewrittenHead !== head))
         throw new GuardRefusal('The retained rebase history does not end at its captured head.');
+      if (marker.oldHead === marker.oldBase && head !== (marker.onto === marker.oldBase ? null : marker.onto))
+        throw new GuardRefusal('An empty rebase history must resolve exactly to its target base.');
       const mappings = marker.oldHistory.map((oldSha, index) => ({ oldSha, newSha: rewrittenHistory[index]! }));
       if (marker.resultState !== 'none') {
         if (marker.resultHead !== head || stable(marker.resultMappings) !== stable(mappings))
@@ -794,20 +796,24 @@ export class Store {
         throw new GuardRefusal('This rebase attempt no longer owns the task.');
     });
   }
-  /** Confirm that the prepared result's ref write succeeded (or that the no-op needs no ref). */
-  completeRebaseResult(planKey: string, attemptId: string): void {
+  /** Record the external ref-write outcome before live cleanup or recovery can interpret the prepared intent. */
+  setRebaseResultState(planKey: string, attemptId: string, state: 'uncertain' | 'refused' | 'ready'): void {
     assertUuidV4(attemptId, 'Rebase attempt ID');
     this.#transaction(() => {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
       if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
       if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
-      if (marker.resultState === 'ready') return;
+      if (marker.resultState === state) return;
       if (marker.resultState !== 'prepared' || marker.resultMappings === null)
         throw new GuardRefusal('The rebase result was not prepared before its ref write.');
       if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
-        encode({ ...marker, resultState: 'ready' }), planKey, task.rebase_in_progress as string).changes !== 1)
+        encode({ ...marker, resultState: state }), planKey, task.rebase_in_progress as string).changes !== 1)
         throw new GuardRefusal('This rebase attempt no longer owns the task.');
     });
+  }
+  /** Confirm that the prepared result's ref write succeeded (or that the no-op needs no ref). */
+  completeRebaseResult(planKey: string, attemptId: string): void {
+    this.setRebaseResultState(planKey, attemptId, 'ready');
   }
   /** Publish a rebase only while every review and task counter captured by its attempt is still current. */
   finishRebase(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, expectedTaskStateVersion: number,

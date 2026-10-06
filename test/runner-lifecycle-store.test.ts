@@ -670,6 +670,9 @@ describe('pre-merge rebase ownership', () => {
       { oldBase: oid(1), oldHead: oid(1), onto: oid(5), oldHistory: [] });
     expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(6), []))
       .toThrow(/does not own/);
+    expect(() => store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(6), []))
+      .toThrow(/target base/);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ resultState: 'none', resultHead: null, resultMappings: null });
     store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(5), []);
     store.completeRebaseResult(store.getTask(identity).planKey, marker.attemptId);
     expect(store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(5), []))

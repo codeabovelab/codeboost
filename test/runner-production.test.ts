@@ -231,7 +231,7 @@ describe('D adapters', () => {
     const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID(), resultHead: '7'.repeat(40) };
     const deps = dRecoveryDeps(() => 'sha256:x', { abort } as unknown as GitRebaser, 'plan-key');
     await deps.abortRebase!('plan-key', marker);
-    expect(abort).toHaveBeenCalledWith(marker.attemptId, marker.resultHead, false);
+    expect(abort).toHaveBeenCalledWith(marker.attemptId, marker.resultHead, 'none');
     await expect(deps.abortRebase!('another-plan', marker)).rejects.toThrow(/another configured plan/);
     expect(abort).toHaveBeenCalledTimes(1);
   });
@@ -239,13 +239,13 @@ describe('D adapters', () => {
     const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID(), resultHead: null };
     const deps = dRecoveryDeps(() => 'sha256:x', { abort } as unknown as GitRebaser, 'plan-key');
     await deps.abortRebase!('plan-key', marker);
-    expect(abort).toHaveBeenCalledWith(marker.attemptId, undefined, false);
+    expect(abort).toHaveBeenCalledWith(marker.attemptId, undefined, 'none');
   });
   it('lets prepared recovery preserve a different pre-existing ref while clearing its marker', async () => {
     const abort = vi.fn(async () => undefined), marker = { attemptId: randomUUID(), resultState: 'prepared', resultHead: '7'.repeat(40) };
     const deps = dRecoveryDeps(() => 'sha256:x', { abort } as unknown as GitRebaser, 'plan-key');
     await deps.abortRebase!('plan-key', marker);
-    expect(abort).toHaveBeenCalledWith(marker.attemptId, marker.resultHead, true);
+    expect(abort).toHaveBeenCalledWith(marker.attemptId, marker.resultHead, 'prepared');
   });
   it('passes D\'s own handles through, and turns every unowned object into the command that removes it', async () => {
     const handle = Object.freeze({ runnerOwner: OWNER, attemptId: randomUUID(), allocationId: randomUUID() });

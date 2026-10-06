@@ -171,7 +171,8 @@ function validRebaseResult(marker: Partial<RebaseMarker>, history: unknown, head
   }
   if (Array.isArray(history) && (history.length !== mappings.length ||
       history.some((source, index) => mappings[index]?.oldSha !== source))) return false;
-  if (marker.oldHead === marker.oldBase) return mappings.length === 0;
+  if (marker.oldHead === marker.oldBase)
+    return mappings.length === 0 && head === (marker.onto === marker.oldBase ? null : marker.onto);
   const endpoint = mappings.at(-1) as { oldSha: string; newSha: string } | undefined;
   return !!endpoint && endpoint.oldSha === marker.oldHead &&
     (head === null ? endpoint.newSha === marker.oldHead && mappings.every(mapping => mapping.oldSha === mapping.newSha) : endpoint.newSha === head);
@@ -238,7 +239,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
         !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
         !validOldHistory(marker, oldHistory) ||
         (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
-        !['none', 'prepared', 'ready'].includes(resultState) ||
+        !['none', 'prepared', 'uncertain', 'refused', 'ready'].includes(resultState) ||
         (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
         !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
         (processGroup !== null && (!processGroup || typeof processGroup === 'string' || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||

@@ -28,7 +28,7 @@ export interface GitRebaserOptions {
   onProcessGroupSettled: (attemptId: string, group: ProcessGroup | 'spawning') => void;
   onProcessUnsettled: (attemptId: string, group: ProcessGroup) => void;
   onResultPrepared: (attemptId: string, intendedHead: string | null, rewrittenHistory: readonly string[]) => void;
-  onResultReady: (attemptId: string) => void;
+  onResultState: (attemptId: string, state: 'uncertain' | 'refused' | 'ready') => void;
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
 
@@ -80,7 +80,7 @@ export class GitRebaser {
       this.#assertResultCurrent(scope);
       this.#options.onResultPrepared(attemptId, null, old);
       this.#assertResultCurrent(scope);
-      this.#options.onResultReady(attemptId);
+      this.#options.onResultState(attemptId, 'ready');
       this.#assertResultCurrent(scope);
       return { oldHead, base: onto, head: oldHead, mappings };
     }
@@ -119,7 +119,10 @@ export class GitRebaser {
       this.#assertResultCurrent(scope);
       const created = await this.#call(this.#options.repository.path, ['update-ref', ref, head, '0'.repeat(head.length)], scope);
       if (created.status === 0) retained = true;
-      else if (created.status === null) uncertainRef = true;
+      else if (created.status === null) {
+        uncertainRef = true;
+        this.#options.onResultState(attemptId, 'uncertain');
+      } else this.#options.onResultState(attemptId, 'refused');
       this.#throwIfCancelled(created, scope);
       if (created.status !== 0) {
         // A null status can mean the ref write landed but its settlement record did not. Cleanup reconciles that exact
@@ -127,7 +130,7 @@ export class GitRebaser {
         throw this.#failure('update-ref', created);
       }
       this.#assertResultCurrent(scope);
-      this.#options.onResultReady(attemptId);
+      this.#options.onResultState(attemptId, 'ready');
       this.#assertResultCurrent(scope);
       result = { oldHead, base: onto, head, mappings };
     } catch (error) { primary = error; }
@@ -152,12 +155,14 @@ export class GitRebaser {
   }
 
   /** Startup/live recovery for an attempt whose Store marker still exists. */
-  async abort(attemptId: string, resultHead?: string, prepared = false): Promise<void> {
+  async abort(attemptId: string, resultHead?: string,
+    resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready' = 'ready'): Promise<void> {
     const ref = rebaseRef(attemptId), path = this.#path(attemptId), stat = lstatSync(path, { throwIfNoEntry: false });
     if (resultHead !== undefined && !COMMIT_ID.test(resultHead)) throw new Error('A full retained result ID is required.');
     const scope = this.#scope(attemptId);
     if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) throw new Error('The rebase workspace is not a plain directory.');
     await this.#remove(path, scope);
+    if (resultState === 'refused') return;
     if (resultHead !== undefined) {
       const exists = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope, true);
       if (exists.status === 1) return;
@@ -169,14 +174,15 @@ export class GitRebaser {
         throw this.#failure('rev-parse', current);
       }
       if (current.stdout.trim() !== resultHead) {
-        if (prepared) return;
+        if (resultState !== 'ready') return;
         throw new Error('Another retained result owns this rebase ref.');
       }
+      if (resultState === 'prepared') throw new Error('The prepared rebase ref outcome is ambiguous; refusing recovery.');
       try { await this.#git(this.#options.repository.path, ['update-ref', '-d', ref, resultHead], scope, true); }
       catch (error) {
         const after = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope, true);
         if (after.status === 1) return;
-        if (prepared && after.status === 0) {
+        if (resultState !== 'ready' && after.status === 0) {
           const value = await this.#call(this.#options.repository.path, ['rev-parse', '--verify', ref], scope, true);
           if (value.status === 0 && value.stdout.trim() !== resultHead) return;
         }

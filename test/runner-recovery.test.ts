@@ -358,6 +358,19 @@ describe('startup recovery sequence', () => {
     expect(abortRebase).not.toHaveBeenCalled();
     expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
   });
+  it('rejects an empty-history result bound to a head other than its target before cleanup', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.base, onto: oid(5), oldHistory: [], startedAt: 123,
+      resultState: 'ready', resultHead: oid(6), resultMappings: [], processGroup: null };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
+  });
   it('records an export timeout as a diagnostic and still finalizes and removes the storage', async () => {
     const { d: root, store, admit, allocate } = fixture();
     const attempt = admit(id(1)); const h = allocate(id(1), attempt.id, 'h'); store.markRunning(id(1), attempt.id);
