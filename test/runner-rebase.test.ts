@@ -41,13 +41,13 @@ async function setup(conflict = false) {
     committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
     onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
     onResult: () => {} });
-  return { root, source, runnerRoot, repository, rebaser, base, owned, foreign, onto };
+  return { root, source, runnerRoot, repository, rebaser, base, owned, foreign, history: [owned, foreign], onto };
 }
 
 describe('trusted pre-merge rebase', () => {
   it('replays a complete linear history one-for-one and retains only its immutable result ref', async () => {
     const s = await setup(), attemptId = randomUUID();
-    const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
+    const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
     expect(result).toMatchObject({ oldHead: s.foreign, base: s.onto });
     expect(result.mappings.map(entry => entry.oldSha)).toEqual([s.owned, s.foreign]);
     expect(new Set(result.mappings.map(entry => entry.newSha)).size).toBe(2);
@@ -61,7 +61,7 @@ describe('trusted pre-merge rebase', () => {
 
   it('returns identity mappings without creating mutable state when the base is already current', async () => {
     const s = await setup(), attemptId = randomUUID();
-    const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base });
+    const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.base });
     expect(result).toEqual({ oldHead: s.foreign, base: s.base, head: s.foreign,
       mappings: [{ oldSha: s.owned, newSha: s.owned }, { oldSha: s.foreign, newSha: s.foreign }] });
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -74,20 +74,27 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
       onResult: () => vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER) });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.base }))
       .rejects.toThrow(/deadline expired while recording its result/);
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
   });
 
+  it('refuses when Git history no longer matches the durably captured ordered history', async () => {
+    const s = await setup(), attemptId = randomUUID();
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign,
+      oldHistory: [s.foreign], onto: s.onto })).rejects.toThrow(/no longer matches/);
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+  });
+
   it('never overwrites or deletes a retained result when an attempt ID is reused', async () => {
     const s = await setup(), attemptId = randomUUID();
-    const first = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
+    const first = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
     git(s.source, 'switch', '-q', 'main');
     const nextBase = commit(s.source, 'later.txt', 'later\n', 'move base again');
     await ensureCommit(s.repository, nextBase);
-    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: nextBase }))
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: nextBase }))
       .rejects.toThrow(/already has a retained result/);
-    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.base }))
       .rejects.toThrow(/already has a retained result/);
     await s.rebaser.abort(attemptId); // A reused live/startup marker has no ownership value for the earlier result.
     expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(first.head);
@@ -99,7 +106,8 @@ describe('trusted pre-merge rebase', () => {
     commit(s.source, 'kept.log', 'tracked\n', 'add tracked file');
     const head = commit(s.source, '.gitignore', '*.log\n', 'ignore later logs');
     await ensureCommit(s.repository, head);
-    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: head, onto: s.onto }))
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: head,
+      oldHistory: git(s.repository.path, 'rev-list', '--reverse', `${s.base}..${head}`).split('\n'), onto: s.onto }))
       .resolves.toMatchObject({ oldHead: head, base: s.onto });
   });
 
@@ -148,7 +156,7 @@ describe('trusted pre-merge rebase', () => {
         expect(ownedAttempt).toBe(attemptId);
         if (group !== 'spawning') { expect(active.get(group.pgid)).toBe(group.startedAt); active.delete(group.pgid); }
       }, onProcessUnsettled: () => {}, onResult: () => {} });
-    await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
+    await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
     expect(seen.length).toBeGreaterThan(1);
     expect(active.size).toBe(0);
   });
@@ -170,7 +178,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroup: () => { throw new Error('Git must not spawn after the deadline.'); },
       onProcessGroupSettled: (_attempt, group) => { if (group === 'spawning') settled++; }, onProcessUnsettled: () => {},
       onResult: () => {} });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })).rejects.toThrow(/deadline expired/);
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto })).rejects.toThrow(/deadline expired/);
     expect({ starts, settled }).toEqual({ starts: 1, settled: 1 });
   });
 
@@ -185,7 +193,7 @@ describe('trusted pre-merge rebase', () => {
         if (firstSettlement) { expect(groups).toBe(0); firstSettlement = false; }
         expect(owner).not.toBe('none'); owner = 'none';
       }, onProcessUnsettled: () => {}, onResult: () => {} });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto }))
       .rejects.toThrow('ownership commit outcome unknown');
     expect(owner).toBe('none');
     expect(groups).toBe(0);
@@ -199,7 +207,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroup: () => { throw new Error('Git must not spawn after the deadline.'); },
       onProcessGroupSettled: () => { throw new Error('settlement write failed'); }, onProcessUnsettled: () => {},
       onResult: () => {} });
-    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })
+    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
     if (!failure) throw new Error('Expected the deadline and settlement write to fail.');
@@ -218,7 +226,7 @@ describe('trusted pre-merge rebase', () => {
         if (++settled === 2 && !overran) { overran = true; vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER); }
       },
       onProcessUnsettled: () => {}, onResult: () => {} });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.base }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.base }))
       .rejects.toThrow(/deadline expired while recording process settlement/);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
   });
@@ -232,7 +240,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessGroupSettled: () => {
         if (processes === 7 && !overran) { overran = true; vi.spyOn(performance, 'now').mockReturnValue(Number.MAX_SAFE_INTEGER); }
       }, onProcessUnsettled: () => {}, onResult: () => {} });
-    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })
+    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
     if (!failure) throw new Error('Expected the child failure and deadline to be retained.');
@@ -244,7 +252,7 @@ describe('trusted pre-merge rebase', () => {
 
   it('reports a conflict, removes the mutable checkout, and retains no rewritten ref', async () => {
     const s = await setup(true), attemptId = randomUUID();
-    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })).rejects.toBeInstanceOf(RebaseConflict);
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto })).rejects.toBeInstanceOf(RebaseConflict);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
     expect(git(s.source, 'rev-parse', 'feature')).toBe(s.foreign);
@@ -263,7 +271,7 @@ describe('trusted pre-merge rebase', () => {
     const tree = git(s.source, 'write-tree');
     const collidingHead = git(s.source, 'commit-tree', tree, '-p', s.base, '-m', 'case-colliding feature');
     await ensureCommit(s.repository, collidingHead);
-    const operation = s.rebaser.run({ attemptId, oldBase: s.base, oldHead: collidingHead, onto: s.onto });
+    const operation = s.rebaser.run({ attemptId, oldBase: s.base, oldHead: collidingHead, oldHistory: [collidingHead], onto: s.onto });
     if (caseSensitive) await expect(operation).resolves.toMatchObject({ oldHead: collidingHead, base: s.onto });
     else await expect(operation).rejects.toThrow(/cannot faithfully check out/);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -284,7 +292,7 @@ describe('trusted pre-merge rebase', () => {
     const tree = git(s.source, 'write-tree');
     const collidingBase = git(s.source, 'commit-tree', tree, '-p', s.base, '-m', 'add lower-case path');
     await ensureCommit(s.repository, collidingHead); await ensureCommit(s.repository, collidingBase);
-    const operation = s.rebaser.run({ attemptId, oldBase: s.base, oldHead: collidingHead, onto: collidingBase });
+    const operation = s.rebaser.run({ attemptId, oldBase: s.base, oldHead: collidingHead, oldHistory: [collidingHead], onto: collidingBase });
     if (caseSensitive) await expect(operation).resolves.toMatchObject({ oldHead: collidingHead, base: collidingBase });
     else await expect(operation).rejects.toThrow(/cannot faithfully check out the rebased head/);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -294,7 +302,7 @@ describe('trusted pre-merge rebase', () => {
   it('honours an already-aborted signal before the first Git write', async () => {
     const s = await setup(), attemptId = randomUUID(), stop = new AbortController();
     stop.abort(new Error('cancelled before rebase'));
-    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled before rebase');
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
   });
@@ -307,7 +315,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessStarting: () => {},
       onProcessGroup: () => { if (++processes === 7) stop.abort(new Error('cancelled during rebase')); },
       onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled during rebase');
     expect(processes).toBeGreaterThanOrEqual(9); // stopped rebase, worktree removal, then pruning
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -321,7 +329,7 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, onProcessStarting: () => {},
       onProcessGroup: () => { if (++processes === 8) stop.abort(new Error('cancelled during conflict classification')); },
       onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled during conflict classification');
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
   });
@@ -334,7 +342,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessStarting: () => {}, onProcessGroup: () => stop.abort(new Error('cancelled by caller')),
       onProcessGroupSettled: () => { if (!failed) { failed = true; throw new Error('settlement write failed'); } },
       onProcessUnsettled: () => {}, onResult: () => {} });
-    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal })
+    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal: stop.signal })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
     if (!failure) throw new Error('Expected cancellation and settlement recording to fail.');
@@ -351,7 +359,7 @@ describe('trusted pre-merge rebase', () => {
       onProcessStarting: () => { if (++starts === 8) throw new Error('cleanup record failed'); },
       onProcessGroup: () => { if (++processes === 7) stop.abort(new Error('original cancellation')); },
       onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
-    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal })
+    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal: stop.signal })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
     if (!failure) throw new Error('Expected the rebase and cleanup to fail.');
@@ -368,7 +376,7 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' }, onProcessStarting: () => {},
       onProcessGroup: () => { if (++processes === 14) stop.abort(new Error('cancelled during cleanup')); },
       onProcessGroupSettled: () => {}, onProcessUnsettled: () => {}, onResult: () => {} });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto, signal: stop.signal }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto, signal: stop.signal }))
       .rejects.toThrow('cancelled during cleanup');
     expect(processes).toBeGreaterThanOrEqual(16); // result ref, worktree cleanup, prune, then result-ref deletion
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
@@ -389,7 +397,7 @@ describe('trusted pre-merge rebase', () => {
         }
       },
       onProcessUnsettled: () => {}, onResult: () => {} });
-    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto })
+    const failure = await rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto })
       .then(() => null, error => error as AggregateError);
     expect(failure).toBeInstanceOf(AggregateError);
     if (!failure) throw new Error('Expected the ref write and its cleanup to fail.');
@@ -401,7 +409,7 @@ describe('trusted pre-merge rebase', () => {
 
   it('aborts only a retained ref whose exact value is durably owned by the attempt', async () => {
     const s = await setup(), attemptId = randomUUID();
-    const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto });
+    const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
     expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(result.head);
     await s.rebaser.abort(attemptId);
     expect(git(s.repository.path, 'rev-parse', rebaseRef(attemptId))).toBe(result.head);
@@ -416,7 +424,7 @@ describe('trusted pre-merge rebase', () => {
       committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
       onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
       onResult: () => { throw new Error('result ownership write failed'); } });
-    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, onto: s.onto }))
+    await expect(rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto }))
       .rejects.toThrow('result ownership write failed');
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);

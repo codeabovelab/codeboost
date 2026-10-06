@@ -27,7 +27,7 @@ export interface GitRebaserOptions {
   onProcessGroup: (attemptId: string, group: ProcessGroup) => void;
   onProcessGroupSettled: (attemptId: string, group: ProcessGroup | 'spawning') => void;
   onProcessUnsettled: (attemptId: string, group: ProcessGroup) => void;
-  onResult: (attemptId: string, retainedHead: string | null, mappings: readonly { oldSha: string; newSha: string }[]) => void;
+  onResult: (attemptId: string, retainedHead: string | null, rewrittenHistory: readonly string[]) => void;
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
 
@@ -60,8 +60,8 @@ export class GitRebaser {
     this.#root = ownerOnlyDirectory(options.runnerRoot, options.runnerOwner, 'rebases');
   }
 
-  async run(input: { attemptId: string; oldBase: string; oldHead: string; onto: string; signal?: AbortSignal }): Promise<RebaseResult> {
-    const { attemptId, oldBase, oldHead, onto, signal } = input;
+  async run(input: { attemptId: string; oldBase: string; oldHead: string; oldHistory: readonly string[]; onto: string; signal?: AbortSignal }): Promise<RebaseResult> {
+    const { attemptId, oldBase, oldHead, oldHistory, onto, signal } = input;
     rebaseRef(attemptId);
     for (const value of [oldBase, oldHead, onto]) if (!COMMIT_ID.test(value)) throw new Error('A full commit ID is required for rebasing.');
     signal?.throwIfAborted();
@@ -72,10 +72,12 @@ export class GitRebaser {
     if (existing.status === 0) throw new Error('This rebase attempt already has a retained result.');
     if (existing.status !== 1) throw this.#failure('show-ref', existing);
     const old = await this.#history(this.#options.repository.path, oldBase, oldHead, scope);
+    if (old.length !== oldHistory.length || old.some((sha, index) => sha !== oldHistory[index]))
+      throw new Error('The repository history no longer matches the durably captured review history.');
     if (onto === oldBase) {
       const mappings = old.map(sha => ({ oldSha: sha, newSha: sha }));
       this.#assertResultCurrent(scope);
-      this.#options.onResult(attemptId, null, mappings);
+      this.#options.onResult(attemptId, null, old);
       this.#assertResultCurrent(scope);
       return { oldHead, base: onto, head: oldHead, mappings };
     }
@@ -119,7 +121,7 @@ export class GitRebaser {
       }
       const mappings = old.map((oldSha, index) => ({ oldSha, newSha: next[index]! }));
       this.#assertResultCurrent(scope);
-      this.#options.onResult(attemptId, head, mappings);
+      this.#options.onResult(attemptId, head, next);
       this.#assertResultCurrent(scope);
       result = { oldHead, base: onto, head, mappings };
     } catch (error) { primary = error; }

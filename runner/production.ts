@@ -210,7 +210,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     onProcessGroup: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, 'spawning', group),
     onProcessGroupSettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, null),
     onProcessUnsettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, 'unsettled'),
-    onResult: (attemptId, head, mappings) => service.store.setRebaseResult(rebasePlanKey, attemptId, head, mappings) }));
+    onResult: (attemptId, head, history) => service.store.setRebaseResult(rebasePlanKey, attemptId, head, history) }));
   const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
     diagnosticsCapBytes: config.diagnosticsCapBytes,
     deps: o.recovery ? o.recovery(image) : dRecoveryDeps(image,

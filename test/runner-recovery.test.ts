@@ -243,7 +243,7 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
-      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123 });
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123 });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', { pgid: 5151, startedAt: 456 });
     const owned = store.getTask(id(1)).rebaseInProgress;
@@ -262,9 +262,8 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
-      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123 });
-    store.setRebaseResult(store.getTask(id(1)).planKey, marker.attemptId, oid(4),
-      [{ oldSha: snapshot.head, newSha: oid(4) }]);
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123 });
+    store.setRebaseResult(store.getTask(id(1)).planKey, marker.attemptId, oid(4), [oid(4)]);
     const abortRebase = vi.fn(async () => undefined);
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
@@ -282,7 +281,7 @@ describe('startup recovery sequence', () => {
     const abortRebase = vi.fn(async () => undefined);
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
-    expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, resultHead: null, resultMappings: null });
+    expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultHead: null, resultMappings: null });
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
   it('retains a dead-group marker while another process still uses its rebase workspace', async () => {
@@ -290,7 +289,7 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
-      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3) });
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
     const group = { pgid: 5151, startedAt: 456 };
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', group);
@@ -307,7 +306,7 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
-      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3) });
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
     const group = { pgid: 5151, startedAt: 456 };
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', group);
@@ -325,7 +324,7 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
-      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3) });
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: deps().d }))
       .rejects.toThrow(/needs F3 to abort/);
     expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
@@ -335,7 +334,7 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
-      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3) });
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
     const abortRebase = vi.fn(async () => undefined);
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
