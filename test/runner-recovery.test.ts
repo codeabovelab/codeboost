@@ -551,8 +551,9 @@ describe('host process checks', () => {
     const wallClock = vi.spyOn(Date, 'now').mockImplementation(() => 1_000_000 - performance.now());
     try {
       const pending = hostProcesses.terminate(pgid, identity, 100);
+      const rejected = expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
       await vi.advanceTimersByTimeAsync(500);
-      await expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
+      await rejected;
     } finally {
       wallClock.mockRestore(); signal.mockRestore(); vi.useRealTimers();
       try { process.kill(-pgid, 'SIGKILL'); } catch {}
