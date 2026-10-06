@@ -1,4 +1,5 @@
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
@@ -45,6 +46,26 @@ async function setup(conflict = false) {
 }
 
 describe('trusted pre-merge rebase', () => {
+  it('uses the configured Git PATH inside the checkout verifier subprocess', async () => {
+    const s = await setup(), attemptId = randomUUID(), bin = join(s.root, 'git-bin'), marker = join(s.root, 'verified');
+    mkdirSync(bin);
+    const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    const quote = (value: string) => `'${value.replaceAll("'", "'\"'\"'")}'`;
+    writeFileSync(join(bin, 'git'), [
+      '#!/bin/sh',
+      `for arg do if [ "$arg" = ls-files ]; then : > ${quote(marker)}; fi; done`,
+      `exec ${quote(realGit)} "$@"`,
+    ].join('\n'), { mode: 0o755 });
+    const path = process.env.PATH;
+    process.env.PATH = `${bin}:${path ?? ''}`;
+    try {
+      await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });
+      expect(existsSync(marker)).toBe(true);
+    } finally {
+      if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+    }
+  });
+
   it('replays a complete linear history one-for-one and retains only its immutable result ref', async () => {
     const s = await setup(), attemptId = randomUUID();
     const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto });

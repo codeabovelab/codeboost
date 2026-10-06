@@ -209,7 +209,7 @@ export class GitRebaser {
 
   async #assertCheckout(repository: string, commit: string, label: string, scope: CallScope): Promise<void> {
     const verifier = fileURLToPath(new URL('./verify-checkout.ts', import.meta.url));
-    const verified = await this.#process(process.execPath, [verifier], repository, {}, scope, false, 64 * 1024);
+    const verified = await this.#process(process.execPath, [verifier], repository, gitEnvironment(), scope, false, 64 * 1024);
     this.#throwIfCancelled(verified, scope);
     if (verified.status !== 0) throw new Error(`The host filesystem cannot faithfully check out the ${label}.`,
       { cause: this.#failure('checkout verification', verified, 'node') });
