@@ -548,12 +548,13 @@ describe('host process checks', () => {
     const pgid = child.pid!, identity = processIdentity(pgid)!;
     vi.useFakeTimers();
     const signal = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    const wallClock = vi.spyOn(Date, 'now').mockImplementation(() => 1_000_000 - performance.now());
     try {
       const pending = hostProcesses.terminate(pgid, identity, 100);
       await vi.advanceTimersByTimeAsync(500);
       await expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
     } finally {
-      signal.mockRestore(); vi.useRealTimers();
+      wallClock.mockRestore(); signal.mockRestore(); vi.useRealTimers();
       try { process.kill(-pgid, 'SIGKILL'); } catch {}
       await once(child, 'exit'); children.splice(children.indexOf(child), 1);
     }

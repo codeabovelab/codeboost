@@ -121,14 +121,14 @@ export const hostProcesses: ProcessControl = {
     if (!ownsGroupAtSignal(pgid, identity)) return;
     try { process.kill(-pgid, 'SIGTERM'); }
     catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error; }
-    const until = Date.now() + graceMs;
-    while (groupAlive(pgid) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
+    const until = performance.now() + graceMs;
+    while (groupAlive(pgid) && performance.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
     if (ownsGroupAtSignal(pgid, identity)) {
       try { process.kill(-pgid, 'SIGKILL'); }
       catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
     }
-    const settlement = Date.now() + graceMs;
-    while (groupAlive(pgid) && Date.now() < settlement) await new Promise(resolve => setTimeout(resolve, 50));
+    const settlement = performance.now() + graceMs;
+    while (groupAlive(pgid) && performance.now() < settlement) await new Promise(resolve => setTimeout(resolve, 50));
     if (groupAlive(pgid)) throw new Error('The recorded process group did not exit after SIGKILL; retaining its ownership.');
   },
 };
