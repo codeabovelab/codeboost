@@ -50,7 +50,11 @@ export type RunnerSetup = (service: ReviewService, capability: ShutdownCapabilit
 export const RUNNER_NOT_CONFIGURED = 'The runner is not configured. Add a runner block to the review configuration and restart codeboost.';
 /** Demos never run the runner, whatever their configuration says. */
 export const RUNNER_NOT_IN_DEMO = 'Demos do not run the runner. Use a review configuration with a runner block.';
-export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planningInput?: PlanningDeps | PlanningSetup, runnerSetup?: RunnerSetup) {
+export interface ServerTestHooks {
+  /** Test-only gate for forcing a response lifecycle transition before the Issues wait is armed. */
+  beforeIssueRefreshWait?(): Promise<void> | void;
+}
+export async function startServer(config: ReviewConfig, port = 4318, questionAgent?: QuestionAgent, mergeGateway?: MergeGateway, shutdownDrainMs = MAX_SHUTDOWN_DRAIN_MS, issueGateway?: IssueGateway, runnerDeps?: RunnerDeps, planningInput?: PlanningDeps | PlanningSetup, runnerSetup?: RunnerSetup, testHooks: ServerTestHooks = {}) {
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
@@ -488,10 +492,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/issues') {
           if(input?.action!=='refresh')throw new Error('Unsupported issue action.');
+          await testHooks.beforeIssueRefreshWait?.();
           // A departing browser stops waiting; the board keeps the shared refresh for other callers.
           const departed=new AbortController();
           const depart=()=>{if(!res.writableEnded)departed.abort(new Error('Client disconnected.'));};
           res.once('close',depart);
+          // `close` may have fired while the request body was being read, before this listener existed.
+          if(res.closed||res.destroyed)depart();
           try { json(200,await issues.refresh(AbortSignal.any([requestAbort.signal,departed.signal]))); }
           finally { res.removeListener('close',depart); }
           return;
