@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, recoverStartup, releasePreparation, startTimeMatches, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
+import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup, releasePreparation, startTimeMatches, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -286,6 +286,23 @@ describe('startup recovery sequence', () => {
       resultHead: null, resultMappings: null });
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
+  it('rejects incomplete and cleanup-only markers that claim retained-result ownership', async () => {
+    for (const shape of ['missing-state', 'missing-history'] as const) {
+      const { d: root, store, raw } = fixture();
+      store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+      const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+      const result = { resultHead: oid(4), resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }] };
+      const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123,
+        ...(shape === 'missing-state' ? { oldHistory: [snapshot.head], ...result } : { resultState: 'ready', ...result }),
+        processGroup: null };
+      raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+      const abortRebase = vi.fn(async () => undefined);
+      await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+        deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+      expect(abortRebase).not.toHaveBeenCalled();
+      expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
+    }
+  });
   it('retains a dead-group marker while another process still uses its rebase workspace', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
@@ -317,7 +334,7 @@ describe('startup recovery sequence', () => {
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase, processes: { isAlive: () => true, terminate } }).d,
       openFiles: () => ['escaped-child'] })).rejects.toThrow(/still uses/);
-    expect(terminate).toHaveBeenCalledWith(group.pgid, 5_000);
+    expect(terminate).toHaveBeenCalledWith(group.pgid, group.startedAt, 5_000);
     expect(abortRebase).not.toHaveBeenCalled();
     expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: group });
   });
@@ -481,6 +498,28 @@ describe('startup recovery sequence', () => {
 });
 
 describe('host process checks', () => {
+  it('treats a permission-denied liveness probe as alive instead of releasing ownership', () => {
+    vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+    expect(hostProcesses.isAlive(4242, 0)).toBe(true);
+  });
+
+  it('revalidates the recorded start identity before signalling a process group', async () => {
+    const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
+    children.push(child);
+    const startedAt = Date.now();
+    await once(child, 'spawn');
+    const pgid = child.pid!;
+    try {
+      expect(hostProcesses.isAlive(pgid, startedAt)).toBe(true);
+      await expect(hostProcesses.terminate(pgid, startedAt + 60_000, 10)).rejects.toThrow(/identity|recorded process group/);
+      expect(() => process.kill(pgid, 0)).not.toThrow();
+    } finally {
+      try { process.kill(-pgid, 'SIGKILL'); } catch {}
+      await once(child, 'exit');
+      children.splice(children.indexOf(child), 1);
+    }
+  });
+
   it('treats a start time it cannot read as a match, so a live group is still stopped', () => {
     const at = Date.parse('Sat Sep 26 02:01:04 2026');
     expect(startTimeMatches('Sat Sep 26 02:01:04 2026\n', at)).toBe(true);

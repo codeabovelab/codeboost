@@ -100,22 +100,44 @@ export function acquireRunnerLock(databasePath: string, options: { lockRoot?: st
 export interface ProcessControl {
   /** The group leader is alive and started at the recorded time (guards against PID reuse). */
   isAlive(pgid: number, startedAt: number): boolean;
-  /** SIGTERM the group, SIGKILL after the grace period, and resolve only once it has exited. */
-  terminate(pgid: number, graceMs: number): Promise<void>;
+  /** Revalidate its recorded start, SIGTERM, SIGKILL after grace, and resolve only once the group has exited. */
+  terminate(pgid: number, startedAt: number, graceMs: number): Promise<void>;
 }
+const groupAlive = (pgid: number) => {
+  try { process.kill(-pgid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+};
+const ownsGroupAtSignal = (pgid: number, startedAt: number): boolean => {
+  if (!groupAlive(pgid)) return false;
+  try {
+    const output = execFileSync('ps', ['-o', 'lstart=', '-p', String(pgid)],
+      { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } });
+    const started = Date.parse(output.trim());
+    if (!Number.isFinite(started) || Math.abs(started - startedAt) >= 2_000)
+      throw new Error('The recorded process group identity changed before recovery could signal it.');
+  } catch (error) {
+    throw new Error('Could not prove the recorded process group still owns its ID; refusing to signal it.',
+      { cause: error instanceof Error ? error : undefined });
+  }
+  return true;
+};
 export const hostProcesses: ProcessControl = {
   isAlive(pgid, startedAt) {
-    try { process.kill(-pgid, 0); } catch { return false; }
+    if (!groupAlive(pgid)) return false;
     try { return startTimeMatches(execFileSync('ps', ['-o', 'lstart=', '-p', String(pgid)], { encoding: 'utf8', env: { ...process.env, LC_ALL: 'C' } }), startedAt); }
     catch { return true; } // Alive but unreadable: treat as ours and stop it (fail closed).
   },
-  async terminate(pgid, graceMs) {
-    const alive = () => { try { process.kill(-pgid, 0); return true; } catch { return false; } };
-    try { process.kill(-pgid, 'SIGTERM'); } catch { return; }
+  async terminate(pgid, startedAt, graceMs) {
+    if (!ownsGroupAtSignal(pgid, startedAt)) return;
+    try { process.kill(-pgid, 'SIGTERM'); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error; }
     const until = Date.now() + graceMs;
-    while (alive() && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
-    if (alive()) { try { process.kill(-pgid, 'SIGKILL'); } catch {} }
-    while (alive()) await new Promise(resolve => setTimeout(resolve, 50));
+    while (groupAlive(pgid) && Date.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
+    if (ownsGroupAtSignal(pgid, startedAt)) {
+      try { process.kill(-pgid, 'SIGKILL'); }
+      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
+    }
+    while (groupAlive(pgid)) await new Promise(resolve => setTimeout(resolve, 50));
   },
 };
 
@@ -191,7 +213,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   const unowned = interrupted.filter(a => a.preparationStartedAt !== null && a.preparationPgid === null).map(a => a.id);
   // 2b. Stop leftover preparation before D's recovery or any storage work.
   for (const a of interrupted) if (a.preparationPgid !== null && a.preparationStartedAt !== null && processes.isAlive(a.preparationPgid, a.preparationStartedAt))
-    await processes.terminate(a.preparationPgid, o.graceMs ?? 5_000);
+    await processes.terminate(a.preparationPgid, a.preparationStartedAt, o.graceMs ?? 5_000);
   // 2c/2d. D's recovery; a rejection propagates and stops startup.
   const recovered = await o.deps.recoverLeftovers(o.runnerOwner);
   if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned);
@@ -232,12 +254,13 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     const marker = rebase.marker as Partial<RebaseMarker> | null;
     const processGroup = marker?.processGroup, oldHistory = marker?.oldHistory ?? null,
       resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null,
-      resultState = marker?.resultState ?? (resultMappings === null ? 'none' : 'ready');
+      resultState = marker?.resultState ?? 'none';
     if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
         !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
         !validOldHistory(marker, oldHistory) ||
+        (oldHistory === null && (resultState !== 'none' || resultHead !== null || resultMappings !== null)) ||
         (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
         !['none', 'prepared', 'uncertain', 'refused', 'ready'].includes(resultState) ||
         (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
@@ -246,7 +269,8 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
           !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0)))
       throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', [rebase.planKey]);
     if (processGroup) {
-      if (processes.isAlive(processGroup.pgid, processGroup.startedAt)) await processes.terminate(processGroup.pgid, o.graceMs ?? 5_000);
+      if (processes.isAlive(processGroup.pgid, processGroup.startedAt))
+        await processes.terminate(processGroup.pgid, processGroup.startedAt, o.graceMs ?? 5_000);
       // A descendant can escape the recorded process group before it is terminated. Whether the group was initially
       // alive or dead, prove that no process still uses the workspace before releasing its durable owner.
       const workspace = join(o.runnerRoot, o.runnerOwner, 'rebases', marker.attemptId);
