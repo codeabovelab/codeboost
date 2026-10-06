@@ -171,6 +171,53 @@ describe('issue endpoints', { timeout: 30_000 }, () => {
     } finally { spy.mockRestore(); await app.close(); }
   });
 
+  it('stops waiting when the response closed before the Issues listener was attached', async () => {
+    root = mkdtempSync(join(tmpdir(), 'codeboost-issues-'));
+    const { gateway, calls } = heldGateway();
+    const waits: Promise<unknown>[] = [];
+    let closed = false;
+    let closedBeforeRefresh = false;
+    let disconnectNext = true;
+    const resumeHandler = deferred<void>();
+    const original = IssueBoard.prototype.refresh;
+    const spy = vi.spyOn(IssueBoard.prototype, 'refresh').mockImplementation(function (this: IssueBoard, signal) {
+      closedBeforeRefresh = closed;
+      const wait = original.call(this, signal);
+      waits.push(wait.then(() => 'settled', error => String(error)));
+      return wait;
+    });
+    const app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway,
+      undefined, undefined, undefined, { beforeIssueRefreshWait: () => resumeHandler.promise });
+    app.server.prependListener('request', (req, res) => {
+      if (req.url !== '/api/issues' || !disconnectNext) return;
+      disconnectNext = false;
+      req.once('end', () => {
+        res.once('close', () => { closed = true; resumeHandler.resolve(); });
+        res.destroy();
+      });
+    });
+    try {
+      const leaving = call(app.url, app.token, 'POST', { action: 'refresh' }).catch(() => undefined);
+      await expect.poll(() => waits.length).toBe(1);
+      expect(closedBeforeRefresh).toBe(true);
+      const staying = call(app.url, app.token, 'POST', { action: 'refresh' });
+      await expect.poll(() => waits.length).toBe(2);
+      let settled = false;
+      void waits[0]!.then(() => { settled = true; });
+      await expect.poll(() => settled, { timeout: 500 }).toBe(true);
+      expect(await waits[0]).toContain('Client disconnected');
+      expect(calls[0]!.signal!.aborted).toBe(false);
+      calls[0]!.result.resolve(snapshot());
+      await expect(staying).resolves.toMatchObject({ status: 200, body: { state: { state: 'fresh' } } });
+      expect(calls).toHaveLength(1);
+      await leaving;
+    } finally {
+      calls[0]?.result.resolve(snapshot());
+      spy.mockRestore();
+      await app.close();
+    }
+  });
+
   it('shutdown aborts an admitted refresh and waits for the retrieval to settle', async () => {
     root = mkdtempSync(join(tmpdir(), 'codeboost-issues-'));
     const { gateway, calls } = heldGateway();
