@@ -27,7 +27,8 @@ export interface GitRebaserOptions {
   onProcessGroup: (attemptId: string, group: ProcessGroup) => void;
   onProcessGroupSettled: (attemptId: string, group: ProcessGroup | 'spawning') => void;
   onProcessUnsettled: (attemptId: string, group: ProcessGroup) => void;
-  onResult: (attemptId: string, retainedHead: string | null, rewrittenHistory: readonly string[]) => void;
+  onResultPrepared: (attemptId: string, intendedHead: string | null, rewrittenHistory: readonly string[]) => void;
+  onResultReady: (attemptId: string) => void;
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
 
@@ -77,7 +78,9 @@ export class GitRebaser {
     if (onto === oldBase) {
       const mappings = old.map(sha => ({ oldSha: sha, newSha: sha }));
       this.#assertResultCurrent(scope);
-      this.#options.onResult(attemptId, null, old);
+      this.#options.onResultPrepared(attemptId, null, old);
+      this.#assertResultCurrent(scope);
+      this.#options.onResultReady(attemptId);
       this.#assertResultCurrent(scope);
       return { oldHead, base: onto, head: oldHead, mappings };
     }
@@ -109,7 +112,11 @@ export class GitRebaser {
       await this.#assertCheckout(path, head, 'rebased head', scope);
       const next = await this.#history(path, onto, head, scope);
       if (next.length !== old.length) throw new Error('The rebase did not preserve one commit for every task commit.');
+      const mappings = old.map((oldSha, index) => ({ oldSha, newSha: next[index]! }));
       attemptedRef = head;
+      this.#assertResultCurrent(scope);
+      this.#options.onResultPrepared(attemptId, head, next);
+      this.#assertResultCurrent(scope);
       const created = await this.#call(this.#options.repository.path, ['update-ref', ref, head, '0'.repeat(head.length)], scope);
       if (created.status === 0) retained = true;
       else if (created.status === null) uncertainRef = true;
@@ -119,9 +126,8 @@ export class GitRebaser {
         // attempted value. A normal nonzero exit proves atomic creation refused and must preserve the winning ref.
         throw this.#failure('update-ref', created);
       }
-      const mappings = old.map((oldSha, index) => ({ oldSha, newSha: next[index]! }));
       this.#assertResultCurrent(scope);
-      this.#options.onResult(attemptId, head, next);
+      this.#options.onResultReady(attemptId);
       this.#assertResultCurrent(scope);
       result = { oldHead, base: onto, head, mappings };
     } catch (error) { primary = error; }
@@ -146,14 +152,37 @@ export class GitRebaser {
   }
 
   /** Startup/live recovery for an attempt whose Store marker still exists. */
-  async abort(attemptId: string, resultHead?: string): Promise<void> {
+  async abort(attemptId: string, resultHead?: string, prepared = false): Promise<void> {
     const ref = rebaseRef(attemptId), path = this.#path(attemptId), stat = lstatSync(path, { throwIfNoEntry: false });
     if (resultHead !== undefined && !COMMIT_ID.test(resultHead)) throw new Error('A full retained result ID is required.');
     const scope = this.#scope(attemptId);
     if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) throw new Error('The rebase workspace is not a plain directory.');
     await this.#remove(path, scope);
-    if (resultHead !== undefined)
-      await this.#git(this.#options.repository.path, ['update-ref', '-d', ref, resultHead], scope, true);
+    if (resultHead !== undefined) {
+      const exists = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope, true);
+      if (exists.status === 1) return;
+      if (exists.status !== 0) throw this.#failure('show-ref', exists);
+      const current = await this.#call(this.#options.repository.path, ['rev-parse', '--verify', ref], scope, true);
+      if (current.status !== 0) {
+        const after = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope, true);
+        if (after.status === 1) return;
+        throw this.#failure('rev-parse', current);
+      }
+      if (current.stdout.trim() !== resultHead) {
+        if (prepared) return;
+        throw new Error('Another retained result owns this rebase ref.');
+      }
+      try { await this.#git(this.#options.repository.path, ['update-ref', '-d', ref, resultHead], scope, true); }
+      catch (error) {
+        const after = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope, true);
+        if (after.status === 1) return;
+        if (prepared && after.status === 0) {
+          const value = await this.#call(this.#options.repository.path, ['rev-parse', '--verify', ref], scope, true);
+          if (value.status === 0 && value.stdout.trim() !== resultHead) return;
+        }
+        throw error;
+      }
+    }
   }
 
   async #history(repository: string, base: string, head: string, scope: CallScope): Promise<string[]> {

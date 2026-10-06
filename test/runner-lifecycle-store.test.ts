@@ -545,7 +545,7 @@ describe('pre-merge rebase ownership', () => {
       { oldBase: oid(1), oldHead: oid(2), onto: oid(3), oldHistory: [oid(2)], startedAt: 123 });
     expect(store.getTask(identity).rebaseInProgress).toEqual({ attemptId: marker.attemptId, oldBase: oid(1), oldHead: oid(2), onto: oid(3),
       oldHistory: [oid(2)], startedAt: 123,
-      resultHead: null, resultMappings: null, processGroup: null });
+      resultState: 'none', resultHead: null, resultMappings: null, processGroup: null });
     const group = { pgid: 4242, startedAt: 456 };
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
       { pgid: 1, startedAt: 456 })).toThrow(/Invalid rebase process group/);
@@ -585,13 +585,14 @@ describe('pre-merge rebase ownership', () => {
       { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },
     ])).toThrow(/no longer owns/);
     const beforeResult = { snapshot: store.getSnapshot(identity), ledger: store.getLedger(identity), marker: store.getTask(identity).rebaseInProgress };
-    expect(() => store.setRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(7)]))
+    expect(() => store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(7)]))
       .toThrow(/complete captured history/);
     expect({ snapshot: store.getSnapshot(identity), ledger: store.getLedger(identity), marker: store.getTask(identity).rebaseInProgress })
       .toEqual(beforeResult);
     const resultMappings = [{ oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) }];
-    store.setRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(6), oid(7)]);
-    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ resultMappings });
+    store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(6), oid(7)]);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ resultState: 'prepared', resultMappings });
+    store.completeRebaseResult(store.getTask(identity).planKey, marker.attemptId);
     expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
       { oldSha: oid(4), newSha: oid(7) },
     ])).toThrow(/does not end/);
@@ -631,11 +632,11 @@ describe('pre-merge rebase ownership', () => {
     const marker = store.beginRebase(identity, expected, taskVersion,
       { oldBase: oid(1), oldHead: oid(5), onto: oid(6), oldHistory: [oid(3), oid(4), oid(5)] });
     const before = { snapshot: store.getSnapshot(identity), ledger: store.getLedger(identity), marker: store.getTask(identity).rebaseInProgress };
-    expect(() => store.setRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(9), [oid(9)]))
+    expect(() => store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(9), [oid(9)]))
       .toThrow(/complete captured history/);
     expect({ snapshot: store.getSnapshot(identity), ledger: store.getLedger(identity), marker: store.getTask(identity).rebaseInProgress })
       .toEqual(before);
-    store.setRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(9), [oid(7), oid(8), oid(9)]);
+    store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(9), [oid(7), oid(8), oid(9)]);
     expect(store.getTask(identity).rebaseInProgress).toMatchObject({ resultMappings: [
       { oldSha: oid(3), newSha: oid(7) }, { oldSha: oid(4), newSha: oid(8) }, { oldSha: oid(5), newSha: oid(9) },
     ] });
@@ -669,7 +670,8 @@ describe('pre-merge rebase ownership', () => {
       { oldBase: oid(1), oldHead: oid(1), onto: oid(5), oldHistory: [] });
     expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(6), []))
       .toThrow(/does not own/);
-    store.setRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(5), []);
+    store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(5), []);
+    store.completeRebaseResult(store.getTask(identity).planKey, marker.attemptId);
     expect(store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(5), []))
       .toMatchObject({ base: oid(5), head: oid(5) });
   });

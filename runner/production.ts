@@ -110,8 +110,9 @@ export function dRecoveryDeps(image: () => string, rebaser?: Pick<GitRebaser, 'a
         throw new Error('The interrupted rebase belongs to another configured plan; start that plan to recover it.');
       const attemptId = (marker as { attemptId?: unknown } | null)?.attemptId;
       const resultHead = (marker as { resultHead?: unknown } | null)?.resultHead;
+      const resultState = (marker as { resultState?: unknown } | null)?.resultState;
       if (typeof attemptId !== 'string') throw new Error('The interrupted rebase has no attempt ID.');
-      await rebaser.abort(attemptId, typeof resultHead === 'string' ? resultHead : undefined);
+      await rebaser.abort(attemptId, typeof resultHead === 'string' ? resultHead : undefined, resultState === 'prepared');
     } } : {}),
   };
 }
@@ -210,11 +211,12 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     onProcessGroup: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, 'spawning', group),
     onProcessGroupSettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, null),
     onProcessUnsettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, 'unsettled'),
-    onResult: (attemptId, head, history) => service.store.setRebaseResult(rebasePlanKey, attemptId, head, history) }));
+    onResultPrepared: (attemptId, head, history) => service.store.prepareRebaseResult(rebasePlanKey, attemptId, head, history),
+    onResultReady: attemptId => service.store.completeRebaseResult(rebasePlanKey, attemptId) }));
   const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
     diagnosticsCapBytes: config.diagnosticsCapBytes,
     deps: o.recovery ? o.recovery(image) : dRecoveryDeps(image,
-      { abort: async (attemptId, resultHead) => (await getRebaser()).abort(attemptId, resultHead) }, rebasePlanKey) });
+      { abort: async (attemptId, resultHead, prepared) => (await getRebaser()).abort(attemptId, resultHead, prepared) }, rebasePlanKey) });
   const repository = await getRepository();
   const imageId = image();
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,

@@ -263,12 +263,13 @@ describe('startup recovery sequence', () => {
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
       store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123 });
-    store.setRebaseResult(store.getTask(id(1)).planKey, marker.attemptId, oid(4), [oid(4)]);
+    store.prepareRebaseResult(store.getTask(id(1)).planKey, marker.attemptId, oid(4), [oid(4)]);
+    store.completeRebaseResult(store.getTask(id(1)).planKey, marker.attemptId);
     const abortRebase = vi.fn(async () => undefined);
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
     expect(abortRebase).toHaveBeenCalledWith(store.getTask(id(1)).planKey,
-      expect.objectContaining({ attemptId: marker.attemptId, resultHead: oid(4),
+      expect.objectContaining({ attemptId: marker.attemptId, resultState: 'ready', resultHead: oid(4),
         resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }], processGroup: null }));
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
@@ -281,7 +282,8 @@ describe('startup recovery sequence', () => {
     const abortRebase = vi.fn(async () => undefined);
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
-    expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultHead: null, resultMappings: null });
+    expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultState: 'none',
+      resultHead: null, resultMappings: null });
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
   it('retains a dead-group marker while another process still uses its rebase workspace', async () => {

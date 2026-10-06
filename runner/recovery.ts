@@ -230,13 +230,16 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     if (!o.deps.abortRebase) throw new RecoveryBlocked('An interrupted rebase needs F3 to abort it', [rebase.planKey]);
     const marker = rebase.marker as Partial<RebaseMarker> | null;
     const processGroup = marker?.processGroup, oldHistory = marker?.oldHistory ?? null,
-      resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null;
+      resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null,
+      resultState = marker?.resultState ?? (resultMappings === null ? 'none' : 'ready');
     if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
         !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
         !validOldHistory(marker, oldHistory) ||
         (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
+        !['none', 'prepared', 'ready'].includes(resultState) ||
+        (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
         !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
         (processGroup !== null && (!processGroup || typeof processGroup === 'string' || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
           !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0)))
@@ -253,7 +256,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
       if (users.length) throw new RecoveryBlocked('A process still uses an interrupted rebase workspace', users);
       o.store.setRebaseProcessGroup(rebase.planKey, marker.attemptId, processGroup, null);
     }
-    await o.deps.abortRebase(rebase.planKey, { ...marker, oldHistory, resultHead, resultMappings, processGroup: null });
+    await o.deps.abortRebase(rebase.planKey, { ...marker, oldHistory, resultState, resultHead, resultMappings, processGroup: null });
     if (!o.store.abortRebase(rebase.planKey, marker.attemptId))
       throw new RecoveryBlocked('An interrupted rebase changed while recovery aborted it', [rebase.planKey]);
   }
