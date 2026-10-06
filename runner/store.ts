@@ -93,7 +93,7 @@ export interface RebaseMarker {
   resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready';
   resultHead: string | null;
   resultMappings: { oldSha: string; newSha: string }[] | null;
-  processGroup: { pgid: number; startedAt: number } | 'spawning' | 'unsettled' | null;
+  processGroup: { pgid: number; startedAt: number; identity: string | null } | 'spawning' | 'unsettled' | null;
 }
 export interface AttemptRecord {
   id: string; kind: AttemptKind; phase: string; item: string | null; state: AttemptState; context: InvocationContext; deadline: number;
@@ -107,7 +107,8 @@ export interface AttemptRecord {
 }
 /** A non-terminal attempt at startup, with what recovery needs to stop its preparation and export its storage. */
 export interface InterruptedAttempt extends AttemptRecord {
-  planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; allocationId: string | null;
+  planKey: string; preparationPgid: number | null; preparationStartedAt: number | null; preparationIdentity: string | null;
+  allocationId: string | null;
   /** Saved after D's allocation returned (#91); null when it never did. */
   metadataBaseline: string | null; storageBase: string | null;
 }
@@ -162,8 +163,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 15) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 16) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -263,6 +264,12 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(requests)').all().some(column => column.name === 'continuation'))
             this.#db.exec('ALTER TABLE requests ADD COLUMN continuation TEXT');
           this.#db.exec('PRAGMA user_version=15');
+        }
+        // A process group can be signalled after a crash only when its exact kernel identity still matches.
+        if (version < 16) {
+          if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'preparation_identity'))
+            this.#db.exec('ALTER TABLE attempts ADD COLUMN preparation_identity TEXT');
+          this.#db.exec('PRAGMA user_version=16');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -754,7 +761,8 @@ export class Store {
     expected: RebaseMarker['processGroup'], group: RebaseMarker['processGroup']): void {
     assertUuidV4(attemptId, 'Rebase attempt ID');
     for (const value of [expected, group]) if (value && value !== 'spawning' && value !== 'unsettled' &&
-        (!Number.isSafeInteger(value.pgid) || value.pgid <= 1 || !Number.isSafeInteger(value.startedAt) || value.startedAt < 0))
+        (!Number.isSafeInteger(value.pgid) || value.pgid <= 1 || !Number.isSafeInteger(value.startedAt) || value.startedAt < 0 ||
+          (value.identity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(value.identity))))
       throw new Error('Invalid rebase process group.');
     this.#transaction(() => {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
@@ -2085,14 +2093,16 @@ export class Store {
   }
   /**
    * Saved in the same synchronous turn as the spawn. Preparation can run several subprocesses in turn: each one replaces
-   * the last, with its own start time when given, so startup recovery's start-time check (which guards against PID reuse)
-   * matches the group it finds.
+   * the last, with its own start time and kernel identity when given, so startup recovery can prove that the numeric ID
+   * still names the group it recorded.
    */
-  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number, startedAt?: number): void {
+  recordPreparationGroup(identity: PlanIdentity, id: string, pgid: number, startedAt?: number, processIdentity: string | null = null): void {
     if (!Number.isSafeInteger(pgid) || pgid < 2) throw new GuardRefusal('Invalid process group.');
     if (startedAt !== undefined && !Number.isSafeInteger(startedAt)) throw new GuardRefusal('Invalid process start time.');
-    if (this.#run(`UPDATE attempts SET preparation_pgid=?, preparation_started_at=COALESCE(?, preparation_started_at) WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`,
-      pgid, startedAt ?? null, identityKey(identity), id).changes !== 1)
+    if (processIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processIdentity))
+      throw new GuardRefusal('Invalid process identity.');
+    if (this.#run(`UPDATE attempts SET preparation_pgid=?, preparation_started_at=COALESCE(?, preparation_started_at), preparation_identity=? WHERE plan_key=? AND id=? AND preparation_started_at IS NOT NULL`,
+      pgid, startedAt ?? null, processIdentity, identityKey(identity), id).changes !== 1)
       throw new GuardRefusal('Preparation was not marked as starting.');
   }
   /** F chooses the allocation ID and saves it before the asynchronous allocation starts. */
@@ -2117,7 +2127,8 @@ export class Store {
   interruptedAttempts(): InterruptedAttempt[] {
     return this.#db.prepare("SELECT * FROM attempts WHERE state IN ('pending','running') ORDER BY rowid").all().map(row => ({
       ...this.#attemptRecord(row), planKey: row.plan_key as string, preparationPgid: row.preparation_pgid as number | null,
-      preparationStartedAt: row.preparation_started_at as number | null, allocationId: row.allocation_id as string | null,
+      preparationStartedAt: row.preparation_started_at as number | null, preparationIdentity: row.preparation_identity as string | null,
+      allocationId: row.allocation_id as string | null,
       metadataBaseline: row.metadata_baseline as string | null, storageBase: row.storage_base as string | null,
     }));
   }

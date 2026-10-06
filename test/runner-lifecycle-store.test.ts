@@ -105,7 +105,7 @@ describe('schema v12 review ordering', () => {
     migrated.saveReview(identity, { revision: 1, snapshotId: snapshot.id, reviewVersion: migratedVersion },
       [{ item: 'P1', fingerprint: 'approved-after-upgrade' }], []);
     expect(migrated.unapprovedExecutionItems(identity, 1)).toEqual([]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
   });
 });
 
@@ -546,17 +546,19 @@ describe('pre-merge rebase ownership', () => {
     expect(store.getTask(identity).rebaseInProgress).toEqual({ attemptId: marker.attemptId, oldBase: oid(1), oldHead: oid(2), onto: oid(3),
       oldHistory: [oid(2)], startedAt: 123,
       resultState: 'none', resultHead: null, resultMappings: null, processGroup: null });
-    const group = { pgid: 4242, startedAt: 456 };
+    const group = { pgid: 4242, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
-      { pgid: 1, startedAt: 456 })).toThrow(/Invalid rebase process group/);
+      { pgid: 1, startedAt: 456, identity: null })).toThrow(/Invalid rebase process group/);
+    expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
+      { pgid: 4242, startedAt: 456, identity: 'not-kernel-backed' })).toThrow(/Invalid rebase process group/);
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, 'spawning');
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, group)).toThrow(/Another Git process/);
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, 'spawning', group);
     expect(store.getTask(identity).rebaseInProgress).toMatchObject({ processGroup: { pgid: 4242, startedAt: 456 } });
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
-      { pgid: 5252, startedAt: 567 })).toThrow(/Another Git process/);
+      { pgid: 5252, startedAt: 567, identity: 'linux:00000000-0000-0000-0000-000000000000:2' })).toThrow(/Another Git process/);
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId,
-      { pgid: 3131, startedAt: 345 }, null)).toThrow(/Another Git process/);
+      { pgid: 3131, startedAt: 345, identity: null }, null)).toThrow(/Another Git process/);
     expect(store.getTask(identity).rebaseInProgress).toMatchObject({ processGroup: group });
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, randomUUID(), null, null)).toThrow(/no longer owns/);
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, group, null);
@@ -599,7 +601,7 @@ describe('pre-merge rebase ownership', () => {
     expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
       { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(8) },
     ])).toThrow(/does not end/);
-    const group = { pgid: 4242, startedAt: 456 };
+    const group = { pgid: 4242, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null, 'spawning');
     store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, 'spawning', group);
     expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
@@ -728,12 +730,26 @@ describe('runner commits and preparation groups (#87)', () => {
   it('keeps each recorded preparation group paired with its own start time', () => {
     const { store } = queued(); const attempt = admit(store);
     store.markPreparationStarting(identity, attempt.id, 1_000);
-    store.recordPreparationGroup(identity, attempt.id, 4242, 41_000);
-    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4242, preparationStartedAt: 41_000 });
+    const kernelIdentity = 'linux:00000000-0000-0000-0000-000000000000:41';
+    store.recordPreparationGroup(identity, attempt.id, 4242, 41_000, kernelIdentity);
+    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4242, preparationStartedAt: 41_000,
+      preparationIdentity: kernelIdentity });
     // Without a time, the marker's own stays.
     store.recordPreparationGroup(identity, attempt.id, 4343);
-    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4343, preparationStartedAt: 41_000 });
+    expect(store.interruptedAttempts()[0]).toMatchObject({ preparationPgid: 4343, preparationStartedAt: 41_000,
+      preparationIdentity: null });
     expect(() => store.recordPreparationGroup(identity, attempt.id, 4444, 1.5)).toThrow('start time');
+    expect(() => store.recordPreparationGroup(identity, attempt.id, 4444, 42_000, 'not-kernel-backed')).toThrow('process identity');
+  });
+
+  it('adds preparation identity to a version 15 database', () => {
+    const { path, store } = queued(); const attempt = admit(store);
+    store.close(); stores.splice(stores.indexOf(store), 1);
+    const db = new DatabaseSync(path);
+    db.exec('ALTER TABLE attempts DROP COLUMN preparation_identity; PRAGMA user_version=15;'); db.close();
+    const reopened = open(path);
+    expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, preparationIdentity: null })]);
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
   });
 });
 
@@ -867,7 +883,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_finding; PRAGMA user_version=7;'); db.close();
     const reopened = open(path);
     expect(reopened.getAttempt(identity, attempt.id).safetyFinding).toBeNull();
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
   });
 
   it('adds the durable owed marker to a version 12 database', () => {
@@ -877,7 +893,7 @@ describe('durable safety findings (#87 item 3)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN safety_owed; PRAGMA user_version=12;'); db.close();
     const reopened = open(path);
     expect(reopened.owedSafetyFindings()).toEqual([]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
   });
 
   it('restores and clears an escalation owed behind a human gate across real store reopens', () => {
@@ -917,7 +933,7 @@ describe('allocation baseline (#91)', () => {
     db.exec('ALTER TABLE attempts DROP COLUMN metadata_baseline; ALTER TABLE attempts DROP COLUMN storage_base; PRAGMA user_version=8;'); db.close();
     const reopened = open(path);
     expect(reopened.interruptedAttempts()).toEqual([expect.objectContaining({ id: attempt.id, metadataBaseline: null, storageBase: null })]);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
   });
 });
 describe('publish outcomes (#103)', () => {
@@ -933,7 +949,7 @@ describe('publish outcomes (#103)', () => {
     reopened.recordPublish(identity, { outcome: 'opened', draft: false, message: 'Pull request #1 is open.', number: 1, url: 'https://github.com/o/r/pull/1' });
     expect(reopened.lastPublish(identity)).toMatchObject({ outcome: 'opened', number: 1 });
     expect(reopened.getTask(identity)).toEqual(before);
-    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 15 });
+    expect(new DatabaseSync(path).prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
   });
   it('stamps an outcome with the version the publish saw, and refuses one it cannot have seen (#114)', () => {
     const { store } = queued(), version = store.getTask(identity).stateVersion;

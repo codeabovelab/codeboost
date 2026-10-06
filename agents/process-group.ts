@@ -1,12 +1,28 @@
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { NOT_STARTED, type DockerOutcome } from './docker.ts';
 
 /** A subprocess's process group, reported as soon as it exists so the caller can record it durably. */
 export interface ProcessGroup {
   /** The group ID, which is the leader's PID. */
   readonly pgid: number;
-  /** `Date.now()` right after the spawn; with the ID, it tells this group from a later one that reuses the ID. */
+  /** `Date.now()` right after the spawn, retained for lifecycle timing and diagnostics. */
   readonly startedAt: number;
+  /** Linux boot ID plus kernel start ticks. Null means crash recovery must not signal this group automatically. */
+  readonly identity: string | null;
+}
+
+/** A kernel-backed identity that changes across both PID reuse and host reboot. */
+export function processIdentity(pid: number): string | null {
+  if (process.platform !== 'linux') return null;
+  try {
+    const boot = readFileSync('/proc/sys/kernel/random/boot_id', 'ascii').trim();
+    const stat = readFileSync(`/proc/${pid}/stat`, 'ascii'), close = stat.lastIndexOf(')');
+    const fields = close < 0 ? [] : stat.slice(close + 2).trim().split(/ +/);
+    const ticks = fields[19]; // field 22 overall; fields starts with field 3 (`state`).
+    if (!/^[0-9a-f-]{36}$/.test(boot) || !ticks || !/^\d+$/.test(ticks)) return null;
+    return `linux:${boot}:${ticks}`;
+  } catch { return null; }
 }
 export interface ProcessGroupOptions {
   readonly env: NodeJS.ProcessEnv;
@@ -114,7 +130,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
     // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
     // the call still settles only after the group has exited, with the caller's error.
     let unrecorded: unknown;
-    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now() })); }
+    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now(), identity: processIdentity(pgid) })); }
     catch (error) { unrecorded = error; }
     // Normally output past the limit stops the group and settles as ENOBUFS. A caller that classifies from durable state
     // may explicitly keep a bounded prefix and let the process finish instead.

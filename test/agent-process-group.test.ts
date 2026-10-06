@@ -20,6 +20,8 @@ describe('runInProcessGroup', () => {
     // Synchronously, before anything else can run: the caller can record it before a crash could lose it.
     expect(reported?.pgid).toBeGreaterThan(1);
     expect(Math.abs(reported!.startedAt - Date.now())).toBeLessThan(5_000);
+    if (process.platform === 'linux') expect(reported!.identity).toMatch(/^linux:[0-9a-f-]{36}:\d+$/);
+    else expect(reported!.identity).toBeNull();
     expect(await pending).toMatchObject({ status: 3, stdout: 'out\n', stderr: 'err\n' });
     expect(groupAlive(reported!.pgid)).toBe(false);
   });

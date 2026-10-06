@@ -8,7 +8,8 @@ import { fileURLToPath } from 'node:url';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup, releasePreparation, startTimeMatches, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
+import { processIdentity } from '../agents/process-group.ts';
+import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup, releasePreparation, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -213,15 +214,19 @@ describe('startup recovery sequence', () => {
     const { d: root, store, admit, allocate } = fixture(2);
     const writable = admit(id(1)); const w = allocate(id(1), writable.id, 'w'); store.markRunning(id(1), writable.id);
     const readOnly = admit(id(2), { kind: 'review' });
-    store.markPreparationStarting(id(2), readOnly.id, Date.now()); store.recordPreparationGroup(id(2), readOnly.id, 4242);
+    const preparationIdentity = 'linux:00000000-0000-0000-0000-000000000000:42';
+    store.markPreparationStarting(id(2), readOnly.id, Date.now());
+    store.recordPreparationGroup(id(2), readOnly.id, 4242, Date.now(), preparationIdentity);
     const r = allocate(id(2), readOnly.id, 'r');
-    const inputs: unknown[] = [];
+    const inputs: unknown[] = [], terminate = vi.fn(async (pgid: number) => { calls.push(`terminate:${pgid}`); });
     const { d, calls } = deps({
       recoverLeftovers: async () => { calls.push('recover'); return { storage: [w, r], unowned: [] }; },
       exportTaskDiff: async (_h, input) => { inputs.push(input); calls.push(`export:${store.getAttempt(id(1), writable.id).state}`); return { diff: Buffer.from('partial'), truncated: false }; },
+      processes: { isAlive: () => true, terminate },
     });
     const report = await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'runner'), diagnosticsDir: join(root, 'diag'), deps: d });
     expect(calls).toEqual(['terminate:4242', 'recover', 'export:running', 'remove:w', 'remove:r']);
+    expect(terminate).toHaveBeenCalledWith(4242, preparationIdentity, 5_000);
     const finalized = store.getAttempt(id(1), writable.id);
     expect(finalized).toMatchObject({ state: 'failed', diagnosticRef: join(root, 'diag', `${writable.id}.diff`) });
     expect(readFileSync(finalized.diagnosticRef!, 'utf8')).toBe('partial');
@@ -245,7 +250,8 @@ describe('startup recovery sequence', () => {
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
       store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123 });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
-    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', { pgid: 5151, startedAt: 456 });
+    store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning',
+      { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' });
     const owned = store.getTask(id(1)).rebaseInProgress;
     const cleared = { ...(owned as object), processGroup: null };
     const seen: unknown[] = [];
@@ -310,7 +316,7 @@ describe('startup recovery sequence', () => {
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
       store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
-    const group = { pgid: 5151, startedAt: 456 };
+    const group = { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', group);
     mkdirSync(join(root, 'r', token, 'rebases', marker.attemptId), { recursive: true });
     const abortRebase = vi.fn(async () => undefined);
@@ -327,14 +333,14 @@ describe('startup recovery sequence', () => {
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
       store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
-    const group = { pgid: 5151, startedAt: 456 };
+    const group = { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, 'spawning', group);
     mkdirSync(join(root, 'r', token, 'rebases', marker.attemptId), { recursive: true });
     const terminate = vi.fn(async () => undefined), abortRebase = vi.fn(async () => undefined);
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase, processes: { isAlive: () => true, terminate } }).d,
       openFiles: () => ['escaped-child'] })).rejects.toThrow(/still uses/);
-    expect(terminate).toHaveBeenCalledWith(group.pgid, group.startedAt, 5_000);
+    expect(terminate).toHaveBeenCalledWith(group.pgid, group.identity, 5_000);
     expect(abortRebase).not.toHaveBeenCalled();
     expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: group });
   });
@@ -366,7 +372,7 @@ describe('startup recovery sequence', () => {
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
     const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), startedAt: 123,
-      processGroup: { pgid: 1, startedAt: 456 } };
+      processGroup: { pgid: 1, startedAt: 456, identity: null } };
     raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
     const terminate = vi.fn(async () => undefined), abortRebase = vi.fn(async () => undefined);
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
@@ -500,18 +506,34 @@ describe('startup recovery sequence', () => {
 describe('host process checks', () => {
   it('treats a permission-denied liveness probe as alive instead of releasing ownership', () => {
     vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
-    expect(hostProcesses.isAlive(4242, 0)).toBe(true);
+    expect(hostProcesses.isAlive(4242)).toBe(true);
   });
 
-  it('revalidates the recorded start identity before signalling a process group', async () => {
+  it('uses a kernel identity and never runs a PATH-selected ps with runner secrets', async () => {
+    const root = dir(), marker = join(root, 'ps-ran'), ps = join(root, 'ps'), path = process.env.PATH;
+    writeFileSync(ps, `#!/bin/sh\nprintf '%s' "$CODEBOOST_TEST_SECRET" > '${marker}'\n`, { mode: 0o755 });
+    process.env.PATH = `${root}:${path ?? ''}`; process.env.CODEBOOST_TEST_SECRET = 'must-not-leak';
+    try {
+      vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
+      expect(hostProcesses.isAlive(4242)).toBe(true);
+      await expect(hostProcesses.terminate(4242, null, 10)).rejects.toThrow(/prove the recorded process group/);
+      expect(existsSync(marker)).toBe(false);
+    } finally {
+      if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
+      delete process.env.CODEBOOST_TEST_SECRET;
+    }
+  });
+
+  it('revalidates the exact kernel identity before signalling a process group', async () => {
     const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
     children.push(child);
-    const startedAt = Date.now();
     await once(child, 'spawn');
     const pgid = child.pid!;
     try {
-      expect(hostProcesses.isAlive(pgid, startedAt)).toBe(true);
-      await expect(hostProcesses.terminate(pgid, startedAt + 60_000, 10)).rejects.toThrow(/identity|recorded process group/);
+      expect(hostProcesses.isAlive(pgid)).toBe(true);
+      const identity = processIdentity(pgid), wrong = identity === null ? 'linux:00000000-0000-0000-0000-000000000000:1'
+        : `${identity}0`;
+      await expect(hostProcesses.terminate(pgid, wrong, 10)).rejects.toThrow(/identity|recorded process group/);
       expect(() => process.kill(pgid, 0)).not.toThrow();
     } finally {
       try { process.kill(-pgid, 'SIGKILL'); } catch {}
@@ -520,12 +542,21 @@ describe('host process checks', () => {
     }
   });
 
-  it('treats a start time it cannot read as a match, so a live group is still stopped', () => {
-    const at = Date.parse('Sat Sep 26 02:01:04 2026');
-    expect(startTimeMatches('Sat Sep 26 02:01:04 2026\n', at)).toBe(true);
-    expect(startTimeMatches('Sat Sep 26 02:01:04 2026', at + 60_000)).toBe(false);
-    // procps under a Japanese locale; Date.parse cannot read it.
-    expect(startTimeMatches('土  9月 26 02:01:04 2026', at + 60_000)).toBe(true);
+  it.skipIf(process.platform !== 'linux')('bounds settlement after SIGKILL and retains ownership on failure', async () => {
+    const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
+    children.push(child); await once(child, 'spawn');
+    const pgid = child.pid!, identity = processIdentity(pgid)!;
+    vi.useFakeTimers();
+    const signal = vi.spyOn(process, 'kill').mockImplementation(() => true);
+    try {
+      const pending = hostProcesses.terminate(pgid, identity, 100);
+      await vi.advanceTimersByTimeAsync(500);
+      await expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
+    } finally {
+      signal.mockRestore(); vi.useRealTimers();
+      try { process.kill(-pgid, 'SIGKILL'); } catch {}
+      await once(child, 'exit'); children.splice(children.indexOf(child), 1);
+    }
   });
   it('finds a process working in the attempt directory when the path goes through a symlink', async () => {
     const root = dir(), real = join(root, 'real'), attempt = join(real, 'attempt');
