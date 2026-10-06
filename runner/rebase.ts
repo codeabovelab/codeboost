@@ -16,7 +16,19 @@ const CLEANUP_RESERVE_MS = 30_000;
 const MIN_REBASE_TIMEOUT_MS = CLEANUP_RESERVE_MS + PROCESS_SETTLEMENT_RESERVE_MS + 1;
 
 export interface RebaseMapping { oldSha: string; newSha: string }
-export interface RebaseResult { oldHead: string; base: string; head: string; mappings: RebaseMapping[] }
+export interface RebaseConflictInput {
+  readonly attemptId: string;
+  readonly commit: string;
+  readonly files: readonly string[];
+  /** The isolated runner-owned worktree. A production resolver must expose it only through lane D's bounded storage. */
+  readonly repository: string;
+  readonly signal?: AbortSignal;
+}
+export interface RebaseResult {
+  oldHead: string; base: string; head: string; mappings: RebaseMapping[];
+  /** Source commits whose foreign conflicts were resolved by the configured agent boundary. */
+  resolvedConflicts: string[];
+}
 export interface GitRebaserOptions {
   repository: RunnerRepository;
   runnerRoot: string;
@@ -27,8 +39,11 @@ export interface GitRebaserOptions {
   onProcessGroup: (attemptId: string, group: ProcessGroup) => void;
   onProcessGroupSettled: (attemptId: string, group: ProcessGroup | 'spawning') => void;
   onProcessUnsettled: (attemptId: string, group: ProcessGroup) => void;
-  onResultPrepared: (attemptId: string, intendedHead: string | null, rewrittenHistory: readonly string[]) => void;
+  onResultPrepared: (attemptId: string, intendedHead: string | null, rewrittenHistory: readonly string[],
+    resolvedConflicts: readonly string[]) => void;
   onResultState: (attemptId: string, state: 'uncertain' | 'refused' | 'ready') => void;
+  /** F4's sandboxed resolver. It must settle all owned resources before resolving or rejecting. */
+  resolveForeignConflict?: (input: RebaseConflictInput) => Promise<void>;
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
 
@@ -84,10 +99,18 @@ export class GitRebaser {
     this.#root = ownerOnlyDirectory(options.runnerRoot, options.runnerOwner, 'rebases');
   }
 
-  async run(input: { attemptId: string; oldBase: string; oldHead: string; oldHistory: readonly string[]; onto: string; signal?: AbortSignal }): Promise<RebaseResult> {
+  async run(input: { attemptId: string; oldBase: string; oldHead: string; oldHistory: readonly string[]; onto: string;
+    ledger?: readonly { sha: string; owner: string | null; origin: 'owned' | 'foreign' }[]; signal?: AbortSignal }): Promise<RebaseResult> {
     const { attemptId, oldBase, oldHead, oldHistory, onto, signal } = input;
     rebaseRef(attemptId);
     for (const value of [oldBase, oldHead, onto]) if (!COMMIT_ID.test(value)) throw new Error('A full commit ID is required for rebasing.');
+    const ledger = new Map<string, { owner: string | null; origin: 'owned' | 'foreign' }>();
+    for (const entry of input.ledger ?? []) {
+      if (!COMMIT_ID.test(entry.sha) || ledger.has(entry.sha) ||
+          (entry.origin === 'owned' ? typeof entry.owner !== 'string' || entry.owner.length === 0 : entry.owner !== null))
+        throw new Error('The trusted commit ledger is invalid.');
+      ledger.set(entry.sha, { owner: entry.owner, origin: entry.origin });
+    }
     signal?.throwIfAborted();
     const scope = this.#scope(attemptId, signal);
     const ref = rebaseRef(attemptId);
@@ -101,17 +124,18 @@ export class GitRebaser {
     if (onto === oldBase) {
       const mappings = old.map(sha => ({ oldSha: sha, newSha: sha }));
       this.#assertResultCurrent(scope);
-      this.#options.onResultPrepared(attemptId, null, old);
+      this.#options.onResultPrepared(attemptId, null, old, []);
       this.#assertResultCurrent(scope);
       this.#options.onResultState(attemptId, 'ready');
       this.#assertResultCurrent(scope);
-      return { oldHead, base: onto, head: oldHead, mappings };
+      return { oldHead, base: onto, head: oldHead, mappings, resolvedConflicts: [] };
     }
 
     const path = this.#path(attemptId);
     if (lstatSync(path, { throwIfNoEntry: false })) throw new Error('The rebase workspace already exists.');
     let added = false, retained = false, uncertainRef = false, attemptedRef: string | undefined;
     let result: RebaseResult | undefined, primary: unknown;
+    const resolvedConflicts: string[] = [];
     try {
       await this.#git(this.#options.repository.path, ['worktree', 'add', '--detach', '--', path, oldHead], scope);
       added = true;
@@ -119,16 +143,48 @@ export class GitRebaser {
       // case-colliding or normalization-colliding names on default macOS volumes). Hash the files into the index and
       // compare trees; status/stat-cache metadata is not proof that the contents are unchanged.
       await this.#assertCheckout(path, oldHead, 'reviewed head', scope);
-      const outcome = await this.#call(path, ['rebase', '--quiet', '--reapply-cherry-picks', '--keep-empty', '--empty=keep', '--onto', onto, oldBase, oldHead], scope, false, true);
-      this.#throwIfCancelled(outcome, scope);
-      if (outcome.status !== 0) {
+      let outcome = await this.#call(path, ['rebase', '--quiet', '--reapply-cherry-picks', '--keep-empty', '--empty=keep', '--onto', onto, oldBase, oldHead], scope, false, true);
+      for (;;) {
+        this.#throwIfCancelled(outcome, scope);
+        if (outcome.status === 0) break;
         if (outcome.status === null || outcome.error) throw this.#failure('rebase', outcome);
         // Rebase diagnostics can grow with valid commit messages and path counts. The index, not bounded text, proves a conflict.
         const conflicted = await this.#call(path, ['diff', '--quiet', '--ignore-submodules=all', '--diff-filter=U', '--'], scope);
         this.#throwIfCancelled(conflicted, scope);
-        if (conflicted.status === 1) throw new RebaseConflict('The rebase has conflicts and needs review.');
-        if (conflicted.status !== 0) throw this.#failure('diff', conflicted);
-        throw this.#failure('rebase', outcome);
+        if (conflicted.status !== 1) {
+          if (conflicted.status !== 0) throw this.#failure('diff', conflicted);
+          throw this.#failure('rebase', outcome);
+        }
+        const commit = await this.#git(path, ['rev-parse', '--verify', 'REBASE_HEAD^{commit}'], scope);
+        if (!old.includes(commit)) throw new RebaseConflict('The conflicted commit is outside the captured rebase history.');
+        const entry = ledger.get(commit);
+        // Missing ledger entries and explicit foreign entries share the foreign branch. A forged trailer is never read.
+        if (entry && (entry.origin !== 'foreign' || entry.owner !== null))
+          throw new RebaseConflict('An owned commit conflict needs its plan-item resolver.');
+        if (!this.#options.resolveForeignConflict)
+          throw new RebaseConflict('A foreign commit conflict needs review.');
+        const files = Object.freeze(await this.#paths(path, ['diff', '--name-only', '--diff-filter=U', '-z', '--'], scope));
+        if (!files.length) throw new RebaseConflict('Git reported a conflict without any conflicted files.');
+        const allowed = new Set(files);
+        this.#assertResultCurrent(scope);
+        await this.#resolveConflict({ attemptId, commit, files, repository: path }, scope);
+        this.#assertResultCurrent(scope);
+        if (await this.#git(path, ['rev-parse', '--verify', 'REBASE_HEAD^{commit}'], scope) !== commit)
+          throw new RebaseConflict('The conflict resolver changed the rebase operation.');
+        const changed = [...await this.#paths(path, ['diff', '--name-only', '-z', 'HEAD', '--'], scope),
+          ...await this.#paths(path, ['ls-files', '--others', '-z', '--'], scope)];
+        if (changed.some(file => !allowed.has(file)))
+          throw new RebaseConflict('The conflict resolver changed a file outside the conflicted set.');
+        const pathspec = Buffer.from(`${files.join('\0')}\0`);
+        await this.#git(path, ['--literal-pathspecs', 'add', '--all', '--pathspec-from-file=-', '--pathspec-file-nul'], scope, false, pathspec);
+        const unresolved = await this.#call(path, ['diff', '--quiet', '--ignore-submodules=all', '--diff-filter=U', '--'], scope);
+        this.#throwIfCancelled(unresolved, scope);
+        if (unresolved.status !== 0) {
+          if (unresolved.status === 1) throw new RebaseConflict('The conflict resolver left unresolved files.');
+          throw this.#failure('diff', unresolved);
+        }
+        resolvedConflicts.push(commit);
+        outcome = await this.#call(path, ['rebase', '--continue'], scope, false, true);
       }
       const head = await this.#git(path, ['rev-parse', '--verify', 'HEAD^{commit}'], scope);
       if (!COMMIT_ID.test(head)) throw new Error('Git returned an invalid rebased head.');
@@ -138,7 +194,7 @@ export class GitRebaser {
       const mappings = old.map((oldSha, index) => ({ oldSha, newSha: next[index]! }));
       attemptedRef = head;
       this.#assertResultCurrent(scope);
-      this.#options.onResultPrepared(attemptId, head, next);
+      this.#options.onResultPrepared(attemptId, head, next, resolvedConflicts);
       this.#assertResultCurrent(scope);
       const created = await this.#call(this.#options.repository.path, ['update-ref', ref, head, '0'.repeat(head.length)], scope);
       if (created.status === 0) retained = true;
@@ -155,7 +211,7 @@ export class GitRebaser {
       this.#assertResultCurrent(scope);
       this.#options.onResultState(attemptId, 'ready');
       this.#assertResultCurrent(scope);
-      result = { oldHead, base: onto, head, mappings };
+      result = { oldHead, base: onto, head, mappings, resolvedConflicts };
     } catch (error) { primary = error; }
     const cleanupFailures: unknown[] = [];
     if (added || lstatSync(path, { throwIfNoEntry: false })) {
@@ -269,8 +325,40 @@ export class GitRebaser {
     await this.#git(this.#options.repository.path, ['worktree', 'prune'], scope, true);
   }
 
-  async #git(repository: string, args: readonly string[], scope: CallScope, cleanup = false): Promise<string> {
-    const outcome = await this.#call(repository, args, scope, cleanup);
+  async #paths(repository: string, args: readonly string[], scope: CallScope): Promise<string[]> {
+    const outcome = await this.#call(repository, args, scope);
+    this.#throwIfCancelled(outcome, scope);
+    if (outcome.status !== 0) throw this.#failure(args[0] ?? 'git', outcome);
+    // Lane D's path APIs are strings. Refuse undecodable names rather than let UTF-8 replacement alias two paths.
+    if (outcome.stdout.includes('\ufffd') || (outcome.stdout && !outcome.stdout.endsWith('\0')))
+      throw new RebaseConflict('A conflicted path cannot be represented safely; resolve it manually.');
+    const paths = outcome.stdout ? outcome.stdout.slice(0, -1).split('\0') : [];
+    if (paths.some(path => !path || path.includes('\0'))) throw new RebaseConflict('Git returned an invalid conflicted path.');
+    return paths;
+  }
+
+  async #resolveConflict(input: Omit<RebaseConflictInput, 'signal'>, scope: CallScope): Promise<void> {
+    const resolveConflict = this.#options.resolveForeignConflict!;
+    const controller = new AbortController();
+    const abort = () => controller.abort(scope.signal?.reason ?? new Error('The rebase was cancelled.'));
+    if (scope.signal?.aborted) abort();
+    else scope.signal?.addEventListener('abort', abort, { once: true });
+    const timeoutMs = Math.max(0, Math.ceil(scope.workDeadline - performance.now()));
+    const timer = setTimeout(() => controller.abort(Object.assign(new Error('The rebase deadline expired during conflict resolution.'),
+      { code: 'ETIMEDOUT' })), timeoutMs);
+    try {
+      controller.signal.throwIfAborted();
+      // Await settlement after abort: the resolver owns its container/storage until its promise ends.
+      await resolveConflict(Object.freeze({ ...input, signal: controller.signal }));
+      controller.signal.throwIfAborted();
+    } finally {
+      clearTimeout(timer);
+      scope.signal?.removeEventListener('abort', abort);
+    }
+  }
+
+  async #git(repository: string, args: readonly string[], scope: CallScope, cleanup = false, input?: Buffer): Promise<string> {
+    const outcome = await this.#call(repository, args, scope, cleanup, false, input);
     if (!cleanup) this.#throwIfCancelled(outcome, scope);
     if (outcome.status !== 0) throw this.#failure(args[0] ?? 'git', outcome);
     return outcome.stdout.trim();

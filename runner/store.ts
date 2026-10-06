@@ -93,6 +93,8 @@ export interface RebaseMarker {
   resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready';
   resultHead: string | null;
   resultMappings: { oldSha: string; newSha: string }[] | null;
+  /** Source commits whose foreign conflicts were resolved by the sandboxed F4 agent. */
+  resolvedConflicts: string[];
   processGroup: { pgid: number; startedAt: number; identity: string | null } | 'spawning' | 'unsettled' | null;
 }
 export interface AttemptRecord {
@@ -118,7 +120,11 @@ export interface FeedbackEvent {
   id: string; planKey: string; actionId: string; planRevision: number; snapshotId: string | null; item: string | null;
   kind: FeedbackKind; text: string | null; sourceRef: string; supersedes: string | null; createdAt: string;
 }
-export interface LedgerEntry { sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null }
+export interface LedgerEntry {
+  sha: string; owner: string | null; origin: 'owned' | 'foreign'; sourceSha: string | null;
+  /** True only on a rewritten foreign commit whose conflict a sandboxed agent resolved. */
+  conflictResolved?: boolean;
+}
 export interface Checkpoint {
   id: string; revision: number; snapshotId: string; item: string;
   /** Runner-audited actual tree, retained separately from the declared plan. */
@@ -677,10 +683,13 @@ export class Store {
   #entry(key: string, entry: LedgerEntry): void {
     sha(entry.sha); if (entry.sourceSha !== null) sha(entry.sourceSha);
     if ((entry.origin === 'foreign' && entry.owner !== null) || (entry.origin === 'owned' && !entry.owner) || !['foreign', 'owned'].includes(entry.origin)) throw new Error('Invalid ledger ownership.');
+    if (entry.conflictResolved !== undefined && entry.conflictResolved !== true) throw new Error('Invalid conflict-resolution provenance.');
+    if (entry.conflictResolved && entry.origin !== 'foreign') throw new Error('Only a foreign ledger entry can carry conflict-resolution provenance.');
     const existing = this.#get('SELECT data FROM ledger WHERE key=? AND sha=?', key, entry.sha);
     if (existing) {
       const prior = decode<LedgerEntry>(existing.data);
-      if (prior.sha !== entry.sha || prior.owner !== entry.owner || prior.origin !== entry.origin || prior.sourceSha !== entry.sourceSha)
+      if (prior.sha !== entry.sha || prior.owner !== entry.owner || prior.origin !== entry.origin || prior.sourceSha !== entry.sourceSha ||
+          !!prior.conflictResolved !== !!entry.conflictResolved)
         throw new Error('Cannot overwrite immutable ledger ownership.');
       return;
     }
@@ -736,7 +745,7 @@ export class Store {
     assertUuidV4(attemptId, 'Rebase attempt ID');
     if (!Number.isSafeInteger(startedAt) || startedAt < 0) throw new Error('Invalid rebase start time.');
     const marker: RebaseMarker = { attemptId, oldBase: input.oldBase, oldHead: input.oldHead, onto: input.onto, oldHistory, startedAt,
-      resultState: 'none', resultHead: null, resultMappings: null, processGroup: null };
+      resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], processGroup: null };
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
@@ -774,17 +783,22 @@ export class Store {
     });
   }
   /** Persist the complete intended result before the rebaser's first ref write. */
-  prepareRebaseResult(planKey: string, attemptId: string, head: string | null, rewrittenHistory: readonly string[]): void {
+  prepareRebaseResult(planKey: string, attemptId: string, head: string | null, rewrittenHistory: readonly string[],
+    resolvedConflicts: readonly string[] = []): void {
     assertUuidV4(attemptId, 'Rebase attempt ID'); if (head !== null) sha(head);
     if (rewrittenHistory.length > 500) throw new Error('Rebase history exceeds 500 commits.');
     for (const value of rewrittenHistory) sha(value);
     if (new Set(rewrittenHistory).size !== rewrittenHistory.length) throw new Error('Rebase history must not repeat a commit.');
+    for (const value of resolvedConflicts) sha(value);
+    if (new Set(resolvedConflicts).size !== resolvedConflicts.length) throw new Error('Resolved conflicts must not repeat a commit.');
     this.#transaction(() => {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
       if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
       if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
       if (marker.oldHistory === null || rewrittenHistory.length !== marker.oldHistory.length)
         throw new GuardRefusal('The rebase result does not cover the complete captured history.');
+      if (resolvedConflicts.some(value => !marker.oldHistory!.includes(value)))
+        throw new GuardRefusal('A resolved conflict is outside the captured history.');
       if ((marker.onto === marker.oldBase) !== (head === null)) throw new GuardRefusal('The retained rebase result does not match its target.');
       const rewrittenHead = rewrittenHistory.at(-1);
       if (marker.oldHead === marker.oldBase ? rewrittenHistory.length !== 0 :
@@ -793,13 +807,23 @@ export class Store {
       if (marker.oldHead === marker.oldBase && head !== (marker.onto === marker.oldBase ? null : marker.onto))
         throw new GuardRefusal('An empty rebase history must resolve exactly to its target base.');
       const mappings = marker.oldHistory.map((oldSha, index) => ({ oldSha, newSha: rewrittenHistory[index]! }));
+      const ledger = new Map(this.#db.prepare('SELECT data FROM ledger WHERE key=?').all(planKey)
+        .map(row => decode<LedgerEntry>(row.data)).map(entry => [entry.sha, entry]));
+      for (const source of resolvedConflicts) {
+        const mapping = mappings.find(value => value.oldSha === source)!;
+        if (mapping.oldSha === mapping.newSha)
+          throw new GuardRefusal('A resolved conflict must rewrite its source commit.');
+        if (ledger.get(source)?.origin === 'owned')
+          throw new GuardRefusal('An owned commit cannot be prepared as a foreign conflict resolution.');
+      }
       if (marker.resultState !== 'none') {
-        if (marker.resultHead !== head || stable(marker.resultMappings) !== stable(mappings))
+        if (marker.resultHead !== head || stable(marker.resultMappings) !== stable(mappings) ||
+            stable(marker.resolvedConflicts ?? []) !== stable(resolvedConflicts))
           throw new GuardRefusal('Another result owns this rebase.');
         return;
       }
       if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
-        encode({ ...marker, resultState: 'prepared', resultHead: head, resultMappings: [...mappings] }),
+        encode({ ...marker, resultState: 'prepared', resultHead: head, resultMappings: [...mappings], resolvedConflicts: [...resolvedConflicts] }),
         planKey, task.rebase_in_progress as string).changes !== 1)
         throw new GuardRefusal('This rebase attempt no longer owns the task.');
     });
@@ -849,7 +873,7 @@ export class Store {
         : !endpoint || endpoint.oldSha !== marker.oldHead || endpoint.newSha !== head || stable(mappings) !== stable(marker.resultMappings))
         throw new GuardRefusal('The rebase mapping does not end at the captured and rewritten heads.');
       this.#assertContextWritable(key);
-      const snapshot = this.#applyRebase(identity, key, base, head, mappings);
+      const snapshot = this.#applyRebase(identity, key, base, head, mappings, marker.resolvedConflicts ?? []);
       this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=?', key);
       return snapshot;
     });
@@ -869,7 +893,7 @@ export class Store {
     });
   }
   #applyRebase(identity: PlanIdentity, key: string, base: string, head: string,
-    mappings: readonly { oldSha: string; newSha: string }[]): Snapshot {
+    mappings: readonly { oldSha: string; newSha: string }[], resolvedConflicts: readonly string[] = []): Snapshot {
     const ledger = new Map(this.getLedger(identity).map(entry => [entry.sha, entry]));
     const sources = new Set<string>(), destinations = new Set<string>();
     // Validate the complete response before the snapshot or ledger changes.
@@ -879,9 +903,12 @@ export class Store {
       sources.add(oldSha); destinations.add(newSha);
     }
     const snapshot = this.#snapshot(key, base, head);
+    const resolved = new Set(resolvedConflicts);
     for (const { oldSha, newSha } of mappings) {
       const source = ledger.get(oldSha);
-      if (oldSha !== newSha) this.#entry(key, { sha: newSha, owner: source?.owner ?? null, origin: source?.origin ?? 'foreign', sourceSha: oldSha });
+      if (resolved.has(oldSha) && source?.origin === 'owned') throw new Error('An owned commit cannot be published as a foreign conflict resolution.');
+      if (oldSha !== newSha) this.#entry(key, { sha: newSha, owner: source?.owner ?? null, origin: source?.origin ?? 'foreign', sourceSha: oldSha,
+        ...(resolved.has(oldSha) || source?.conflictResolved ? { conflictResolved: true } : {}) });
       else if (!source) this.#entry(key, { sha: newSha, owner: null, origin: 'foreign', sourceSha: null });
       this.#run('INSERT INTO rewrites VALUES (?,?,?,?)', key, snapshot.id, oldSha, newSha);
     }

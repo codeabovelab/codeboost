@@ -545,7 +545,7 @@ describe('pre-merge rebase ownership', () => {
       { oldBase: oid(1), oldHead: oid(2), onto: oid(3), oldHistory: [oid(2)], startedAt: 123 });
     expect(store.getTask(identity).rebaseInProgress).toEqual({ attemptId: marker.attemptId, oldBase: oid(1), oldHead: oid(2), onto: oid(3),
       oldHistory: [oid(2)], startedAt: 123,
-      resultState: 'none', resultHead: null, resultMappings: null, processGroup: null });
+      resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], processGroup: null });
     const group = { pgid: 4242, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
       { pgid: 1, startedAt: 456, identity: null })).toThrow(/Invalid rebase process group/);
@@ -592,8 +592,14 @@ describe('pre-merge rebase ownership', () => {
     expect({ snapshot: store.getSnapshot(identity), ledger: store.getLedger(identity), marker: store.getTask(identity).rebaseInProgress })
       .toEqual(beforeResult);
     const resultMappings = [{ oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) }];
-    store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(6), oid(7)]);
-    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ resultState: 'prepared', resultMappings });
+    expect(() => store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(6), oid(7)], [oid(3)]))
+      .toThrow(/owned commit/);
+    expect(() => store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(4), [oid(3), oid(4)], [oid(4)]))
+      .toThrow(/must rewrite/);
+    expect(() => store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(6), oid(7)], [oid(4), oid(4)]))
+      .toThrow(/must not repeat/);
+    store.prepareRebaseResult(store.getTask(identity).planKey, marker.attemptId, oid(7), [oid(6), oid(7)], [oid(4)]);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ resultState: 'prepared', resultMappings, resolvedConflicts: [oid(4)] });
     store.completeRebaseResult(store.getTask(identity).planKey, marker.attemptId);
     expect(() => store.finishRebase(identity, expected, taskVersion, marker.attemptId, oid(5), oid(7), [
       { oldSha: oid(4), newSha: oid(7) },
@@ -615,7 +621,7 @@ describe('pre-merge rebase ownership', () => {
     expect(store.getTask(identity).rebaseInProgress).toBeNull();
     expect(store.getLedger(identity)).toEqual(expect.arrayContaining([
       { sha: oid(6), owner: 'P1', origin: 'owned', sourceSha: oid(3) },
-      { sha: oid(7), owner: null, origin: 'foreign', sourceSha: oid(4) },
+      { sha: oid(7), owner: null, origin: 'foreign', sourceSha: oid(4), conflictResolved: true },
     ]));
     expect(store.getRewrites(identity, snapshot.id)).toEqual([
       { oldSha: oid(3), newSha: oid(6) }, { oldSha: oid(4), newSha: oid(7) },

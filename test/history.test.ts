@@ -41,6 +41,22 @@ it('splits a shared hunk by ledger owner; detects out-of-scope and forged traile
   expect(parts.filter(s => s.path === 'outside.txt').every(s => s.scope === 'out-of-scope')).toBe(true);
   expect(parts.filter(s => s.path === 'foreign.txt').every(s => s.row === 'Unplanned')).toBe(true);
 });
+it('keeps a resolved foreign conflict Unplanned and carries its visible provenance', () => {
+  const f = fixture(); f.write('a.txt', 'resolved by agent\ntwo\nthree\n'); const sha = f.commit();
+  const parts = linkHistory(f.plan, readHistory(f.dir, f.base), new Map([[sha, null]]), path => path, {}, new Set([sha]));
+  expect(parts.length).toBeGreaterThan(0);
+  expect(parts.every(segment => segment.row === 'Unplanned' && segment.conflictResolved === true)).toBe(true);
+});
+it('does not merge adjacent foreign lines with different conflict-resolution provenance', () => {
+  const f = fixture(); f.write('a.txt', 'ONE\ntwo\nthree\n'); const first = f.commit();
+  f.write('a.txt', 'ONE\nTWO\nthree\n'); const second = f.commit();
+  const history = readHistory(f.dir, f.base), ledger = new Map<string, string | null>([[first, null], [second, null]]);
+  for (const resolved of [first, second]) {
+    const added = linkHistory(f.plan, history, ledger, path => path, {}, new Set([resolved])).filter(segment => segment.operation === '+');
+    expect(added.find(segment => segment.content === 'ONE\n')?.conflictResolved).toBe(resolved === first ? true : undefined);
+    expect(added.find(segment => segment.content === 'TWO\n')?.conflictResolved).toBe(resolved === second ? true : undefined);
+  }
+});
 it('attributes pure deletions and marks repeated edits as ambiguous', () => {
   const f = fixture(); f.write('a.txt', 'one\nthree\n'); f.commit('P1');
   expect(f.segments().find(s => s.content === 'two\n')?.row).toBe('P1');

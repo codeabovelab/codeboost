@@ -8,9 +8,10 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it } from 'vitest';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
-import { approveItem, approvalStates, choiceKeys, applyChoices } from '../core/approvals.ts';
+import { approveItem, approvalStates, choiceKeys, applyChoices, stable } from '../core/approvals.ts';
 import { linkHistory, type Segment } from '../core/linking.ts';
 import { readHistory } from '../git/history.ts';
+import { identityKey } from '../core/identity.ts';
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
 const plan = (): Plan => ({ schema_version: 1, revision: 99, issue: 1, summary: 'Example', questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
@@ -160,14 +161,16 @@ it('rolls back the entire ledger batch and snapshot after a late ownership colli
   expect(() => store.recordRebase(identity, state(store), oid(5), oid(6), [{ oldSha: oid(2), newSha: oid(6) }, { oldSha: oid(3), newSha: oid(6) }])).toThrow(/one-to-one/);
   expect(store.getSnapshot(identity)).toEqual(before); expect(store.getLedger(identity)).toHaveLength(1);
 });
-it('preserves owned and missing/null foreign provenance through repeated rebase mappings and restart', () => {
+it('preserves owned, foreign, and conflict-resolution provenance through repeated rebase mappings and restart', () => {
   const { store, path } = fixture(); store.recordHistory(identity, state(store), oid(1), oid(3), [
-    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null }, { sha: oid(3), owner: null, origin: 'foreign', sourceSha: null },
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: null, origin: 'foreign', sourceSha: null, conflictResolved: true },
   ]);
   const snapshot = store.recordRebase(identity, state(store), oid(10), oid(14), [2,3,4].map(n => ({ oldSha: oid(n), newSha: oid(n + 10) })));
   store.recordRebase(identity, state(store), oid(20), oid(24), [12,13,14].map(n => ({ oldSha: oid(n), newSha: oid(n + 10) })));
   const recovered = open(path); expect(recovered.ownership(identity).get(oid(22))).toBe('P1');
   expect(recovered.ownership(identity).get(oid(23))).toBeNull(); expect(recovered.ownership(identity).get(oid(24))).toBeNull();
+  expect(recovered.getLedger(identity).find(e => e.sha === oid(23))).toEqual({ sha: oid(23), owner: null, origin: 'foreign', sourceSha: oid(13), conflictResolved: true });
   expect(recovered.getLedger(identity).find(e => e.sha === oid(24))).toEqual({ sha: oid(24), owner: null, origin: 'foreign', sourceSha: oid(14) });
   expect(recovered.getRewrites(identity, snapshot.id)).toHaveLength(3);
 });
@@ -190,10 +193,21 @@ it('retains typed file-card approvals/choices while fingerprints detect later me
   const segment: Segment = { path: 'a', oldPath: 'a', kind: 'file', operation: null, content: JSON.stringify({ kind: 'binary', oldObject: { type: 'blob', oid: oid(1) }, newObject: { type: 'blob', oid: oid(2) } }), context: '', owners: ['P1'], row: 'P1', scope: 'in-scope', oldLine: null, newLine: null, hunk: 0, sharesHunkWith: [] };
   const approval = approveItem(current, [segment], 'P1', identity);
   const choice = { key: choiceKeys([segment], identity)[0]!, action: 'accept' as const, item: null };
+  const legacyContent = stable({ path: segment.path, oldPath: segment.oldPath, kind: segment.kind,
+    operation: segment.operation, content: segment.content });
+  expect(choice.key).toBe(stable([identityKey(identity), legacyContent, 1, 1]));
+  expect(approval.fingerprint).toBe(stable({ identity: identityKey(identity), item: current.items[0], segments: [{
+    path: segment.path, oldPath: segment.oldPath, kind: segment.kind, operation: segment.operation,
+    content: segment.content, context: segment.context, owners: ['P1'],
+  }] }));
   store.saveReview(identity, state(store), [approval], [choice]);
   const recovered = open(path).getReview(identity);
   expect(recovered.approvals[0]!.fingerprint).toBe(approval.fingerprint); expect(recovered.choices[0]!.key).toBe(choice.key);
   expect(approvalStates(current, [segment], recovered.approvals, identity).P1).toBe('approved');
+  const resolved = { ...segment, conflictResolved: true as const };
+  expect(choiceKeys([resolved], identity)[0]).not.toBe(choice.key);
+  expect(applyChoices(current, [{ ...resolved, row: 'Unplanned', owners: [null], scope: 'unplanned' }], recovered.choices, identity)[0]!.row).toBe('Unplanned');
+  expect(approvalStates(current, [resolved], recovered.approvals, identity).P1).toBe('stale');
   expect(approvalStates(current, [{ ...segment, content: segment.content.replace(oid(2), oid(3)) }], recovered.approvals, identity).P1).toBe('stale');
   const old = state(store); store.importRevision(JSON.stringify({ ...plan(), items: [{ ...plan().items[0]!, title: 'Changed' }] }), 'json', context, 1);
   expect(() => store.saveReview(identity, old, [approval], [])).toThrow(/Stale/);

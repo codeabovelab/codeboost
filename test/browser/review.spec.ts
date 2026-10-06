@@ -98,6 +98,17 @@ test('reviews real changes, persists approval and conversation, and assigns fore
   await page.getByRole('button',{name:/P1 Bound exponential retries/}).click();await expect(page.getByText('! Stale:',{exact:false})).toBeVisible();await expect(page.getByRole('heading',{name:'At approval'})).toBeVisible();
   await page.screenshot({path:'test-results/review-desktop.png',fullPage:true});expect(errors).toEqual([]);
 });
+test('labels a resolved foreign conflict as Unplanned agent-resolved work',async({page})=>{
+ const service=app.service,identity=service.config.identity,initial=service.load(),repository=service.config.repository;
+ writeFileSync(join(repository,'resolved-conflict.txt'),'resolved by agent\n');fixtureGit(repository,'add','resolved-conflict.txt');
+ fixtureGit(repository,'commit','-m','Resolved foreign conflict');const head=fixtureGit(repository,'rev-parse','HEAD');
+ service.store.recordHistory(identity,initial.expected,initial.snapshot.base,head,[
+  {sha:head,owner:null,origin:'foreign',sourceSha:initial.snapshot.head,conflictResolved:true},
+ ]);
+ await page.goto(app.url);await page.getByRole('button',{name:/Unplanned changes/}).click();
+ await expect(page.getByText('Unplanned · conflict resolved by agent',{exact:true}).first()).toBeVisible();
+ await expect(page.getByRole('article',{name:/resolved-conflict\.txt, Unplanned · conflict resolved by agent/}).first()).toBeVisible();
+});
 test('opens an item selected while an assignment is in flight in the view its answered state calls for',async({page})=>{
  await page.goto(app.url);await page.getByRole('button',{name:'Approve P1',exact:true}).click();await expect(page.getByText('1 of 3 approved')).toBeVisible();
  let release!:()=>void,arrived!:()=>void;const held=new Promise<void>(resolve=>{release=resolve;}),assignArrived=new Promise<void>(resolve=>{arrived=resolve;});

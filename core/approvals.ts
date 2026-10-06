@@ -9,7 +9,8 @@ export function stable(value: unknown): string {
   if (value !== null && typeof value === 'object') return `{${Object.entries(value).sort(([a], [b]) => a.localeCompare(b)).map(([key, val]) => `${JSON.stringify(key)}:${stable(val)}`).join(',')}}`;
   return JSON.stringify(value);
 }
-const contentKey = (s: Segment) => stable({ path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation, content: s.content });
+const contentKey = (s: Segment) => stable({ path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
+  content: s.content, ...(s.conflictResolved ? { conflictResolved: true } : {}) });
 export interface SegmentChoice { key: string; action: 'assign' | 'accept'; item: string | null }
 /** Position among identical segments and total copies prevent approval transfer. */
 export function choiceKeys(segments: readonly Segment[], identity: PlanIdentity): string[] {
@@ -37,6 +38,7 @@ export interface Approval { item: string; fingerprint: string }
 export const reviewedSegment = (s: Segment) => ({
   path: s.path, oldPath: s.oldPath, kind: s.kind, operation: s.operation,
   content: s.content, context: s.context, owners: [...s.owners].sort(),
+  ...(s.conflictResolved ? { conflictResolved: true } : {}),
 });
 export function fingerprint(item: PlanItem, segments: readonly Segment[], identity: PlanIdentity): string {
   return stable({ identity: identityKey(identity), item, segments: segments.filter(s => s.row === item.id).map(reviewedSegment) });
