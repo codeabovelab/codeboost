@@ -1,5 +1,6 @@
-import { accessSync, constants, lstatSync, realpathSync, statSync } from 'node:fs';
-import { delimiter, join, resolve } from 'node:path';
+import { createHash } from 'node:crypto';
+import { accessSync, closeSync, constants, fstatSync, lstatSync, openSync, readlinkSync, readSync, realpathSync, statSync } from 'node:fs';
+import { delimiter, join, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import type { DockerOutcome } from '../agents/docker.ts';
@@ -166,14 +167,13 @@ export class GitRebaser {
         const files = Object.freeze(await this.#paths(path, ['diff', '--name-only', '--diff-filter=U', '-z', '--'], scope));
         if (!files.length) throw new RebaseConflict('Git reported a conflict without any conflicted files.');
         const allowed = new Set(files);
+        const outsideBefore = await this.#outsideConflictState(path, allowed, scope);
         this.#assertResultCurrent(scope);
         await this.#resolveConflict({ attemptId, commit, files, repository: path }, scope);
         this.#assertResultCurrent(scope);
         if (await this.#git(path, ['rev-parse', '--verify', 'REBASE_HEAD^{commit}'], scope) !== commit)
           throw new RebaseConflict('The conflict resolver changed the rebase operation.');
-        const changed = [...await this.#paths(path, ['diff', '--name-only', '-z', 'HEAD', '--'], scope),
-          ...await this.#paths(path, ['ls-files', '--others', '-z', '--'], scope)];
-        if (changed.some(file => !allowed.has(file)))
+        if (await this.#outsideConflictState(path, allowed, scope) !== outsideBefore)
           throw new RebaseConflict('The conflict resolver changed a file outside the conflicted set.');
         const pathspec = Buffer.from(`${files.join('\0')}\0`);
         await this.#git(path, ['--literal-pathspecs', 'add', '--all', '--pathspec-from-file=-', '--pathspec-file-nul'], scope, false, pathspec);
@@ -337,6 +337,40 @@ export class GitRebaser {
     return paths;
   }
 
+  async #outsideConflictState(repository: string, allowed: ReadonlySet<string>, scope: CallScope): Promise<string> {
+    const changed = new Set([
+      ...await this.#paths(repository, ['diff', '--name-only', '--ignore-submodules=all', '-z', 'HEAD', '--'], scope),
+      ...await this.#paths(repository, ['ls-files', '--others', '-z', '--'], scope),
+    ]);
+    const entries: string[][] = [];
+    for (const path of [...changed].filter(value => !allowed.has(value)).sort()) {
+      const index = await this.#git(repository, ['--literal-pathspecs', 'ls-files', '--stage', '-z', '--', path], scope);
+      entries.push([path, index, this.#worktreeFingerprint(repository, path)]);
+    }
+    return JSON.stringify(entries);
+  }
+
+  #worktreeFingerprint(repository: string, path: string): string {
+    const full = resolve(repository, path), root = `${resolve(repository)}${sep}`;
+    if (!full.startsWith(root)) throw new RebaseConflict('Git returned a path outside the rebase workspace.');
+    const before = lstatSync(full, { throwIfNoEntry: false });
+    if (!before) return 'missing';
+    if (before.isSymbolicLink()) return `link:${before.mode}:${readlinkSync(full, { encoding: 'buffer' }).toString('hex')}`;
+    if (!before.isFile()) throw new RebaseConflict('A changed path is not a regular file or symbolic link.');
+    const fd = openSync(full, constants.O_RDONLY | constants.O_NOFOLLOW);
+    try {
+      const stat = fstatSync(fd);
+      if (!stat.isFile()) throw new RebaseConflict('A changed path changed type while it was audited.');
+      const hash = createHash('sha256'), buffer = Buffer.allocUnsafe(64 * 1024);
+      for (;;) {
+        const length = readSync(fd, buffer, 0, buffer.length, null);
+        if (!length) break;
+        hash.update(buffer.subarray(0, length));
+      }
+      return `file:${stat.mode}:${hash.digest('hex')}`;
+    } finally { closeSync(fd); }
+  }
+
   async #resolveConflict(input: Omit<RebaseConflictInput, 'signal'>, scope: CallScope): Promise<void> {
     const resolveConflict = this.#options.resolveForeignConflict!;
     const controller = new AbortController();
@@ -349,7 +383,11 @@ export class GitRebaser {
     try {
       controller.signal.throwIfAborted();
       // Await settlement after abort: the resolver owns its container/storage until its promise ends.
-      await resolveConflict(Object.freeze({ ...input, signal: controller.signal }));
+      try { await resolveConflict(Object.freeze({ ...input, signal: controller.signal })); }
+      catch (error) {
+        controller.signal.throwIfAborted();
+        throw error;
+      }
       controller.signal.throwIfAborted();
     } finally {
       clearTimeout(timer);

@@ -339,6 +339,39 @@ describe('trusted pre-merge rebase', () => {
     expect(git(s.repository.path, 'show', `${result.head}:a.txt`)).toBe('resolved foreign change');
   });
 
+  it('allows clean files from the conflicted commit without attributing them to the resolver', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    writeFileSync(join(s.source, 'clean.txt'), 'clean foreign change\n');
+    git(s.source, 'add', '--', 'clean.txt');
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+    } });
+    const result = await runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] });
+    expect(git(s.repository.path, 'show', `${result.head}:a.txt`)).toBe('resolved foreign change');
+    expect(git(s.repository.path, 'show', `${result.head}:clean.txt`)).toBe('clean foreign change');
+  });
+
+  it('refuses a resolver edit to a cleanly applied file from the conflicted commit', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    writeFileSync(join(s.source, 'clean.txt'), 'clean foreign change\n');
+    git(s.source, 'add', '--', 'clean.txt');
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      writeFileSync(join(input.repository, 'clean.txt'), 'resolver changed clean file\n');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+  });
+
   it('refuses a resolver edit outside the exact conflicted files and drops the partial rewrite', async () => {
     const s = await setup('foreign'), attemptId = randomUUID();
     const runner = createRebaser(s, { resolveForeignConflict: async input => {
@@ -364,6 +397,20 @@ describe('trusted pre-merge rebase', () => {
     await expect(operation).rejects.toThrow(/stop conflict resolver/);
     expect(settled).toBe(true);
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+  });
+
+  it('preserves the cancellation reason when the resolver rejects with another error after abort', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID(), controller = new AbortController();
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const runner = createRebaser(s, { resolveForeignConflict: input => new Promise((_, reject) => {
+      entered(); input.signal!.addEventListener('abort', () => reject(new Error('resolver cleanup failed')), { once: true });
+    }) });
+    const operation = runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }], signal: controller.signal });
+    await started;
+    controller.abort(new Error('original cancellation'));
+    await expect(operation).rejects.toThrow(/original cancellation/);
   });
 
   it('never sends an owned conflict through the foreign resolver', async () => {
