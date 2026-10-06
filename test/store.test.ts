@@ -381,6 +381,12 @@ it.each([
       { path: 'outside', kind: 'add' as const, renamed_from: 'source', change: 'Declare the observed add' },
     ],
   },
+  {
+    name: 'an unsafe canonical path', outOfScopePaths: ['bad:name'],
+    files: [
+      { path: 'bad:name', kind: 'add' as const, renamed_from: null, change: 'Declare the observed path' },
+    ],
+  },
 ])('refuses checkpoint scope declarations with $name', ({ outOfScopePaths, files }) => {
   const { store } = fixture(true);
   store.recordCheckpoint(identity, state(store), {

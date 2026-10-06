@@ -2,7 +2,7 @@ import type { DatabaseSync, SQLInputValue, SQLOutputValue } from 'node:sqlite';
 import { createRequire } from 'node:module';
 import { randomUUID } from 'node:crypto';
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
-import { importPlan, applySuggestion, assertEditReply, assertPlan, validateContinuationPlan, type ContinuationBinding, type Plan, type PlanContext, type PlanItem, type EditReply } from '../core/plan.ts';
+import { importPlan, applySuggestion, assertEditReply, assertPlan, isRepoPath, validateContinuationPlan, type ContinuationBinding, type Plan, type PlanContext, type PlanItem, type EditReply } from '../core/plan.ts';
 import { stable } from '../core/approvals.ts';
 import type { PlanningMode } from '../core/planning-suggestions.ts';
 import type { Approval, SegmentChoice } from '../core/approvals.ts';
@@ -132,6 +132,8 @@ export class Store {
       if ((file.kind === 'rename') !== (file.renamed_from !== null))
         throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
       for (const path of file.kind === 'rename' ? [file.path, file.renamed_from!] : [file.path]) {
+        if (!isRepoPath(path))
+          throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
         const key = this.#pathKey(path);
         if (paths.some(other => other === key || other.startsWith(`${key}/`) || key.startsWith(`${other}/`)))
           throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
