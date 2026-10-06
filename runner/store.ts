@@ -126,6 +126,19 @@ function sha(value: string): void {
 export class Store {
   #db: DatabaseSync;
   #pathKey: (path: string) => string;
+  #assertValidItemPaths(item: PlanItem): void {
+    const paths: string[] = [];
+    for (const file of item.files) {
+      if ((file.kind === 'rename') !== (file.renamed_from !== null))
+        throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
+      for (const path of file.kind === 'rename' ? [file.path, file.renamed_from!] : [file.path]) {
+        const key = this.#pathKey(path);
+        if (paths.some(other => other === key || other.startsWith(`${key}/`) || key.startsWith(`${other}/`)))
+          throw new GuardRefusal(`Completed checkpoint item ${item.id} has invalid or overlapping file declarations.`);
+        paths.push(key);
+      }
+    }
+  }
   constructor(path: string, pathKey: (path: string) => string = value => value) {
     requireSupportedNode();
     this.#pathKey = pathKey;
@@ -934,6 +947,7 @@ export class Store {
       const observed = new Set(checkpoint.outOfScopePaths.map(this.#pathKey));
       const existingFiles = current.files.slice(0, before.files.length);
       const addedFiles = current.files.slice(before.files.length);
+      this.#assertValidItemPaths(current);
       if (stable({ ...current, files: existingFiles }) !== stable(before) ||
           addedFiles.some(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])].some(path => !observed.has(this.#pathKey(path)))))
         throw new GuardRefusal(`Completed checkpoint item ${checkpoint.completedItems[index]} changed beyond its scope declaration.`);

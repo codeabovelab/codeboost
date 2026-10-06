@@ -353,6 +353,44 @@ it('refuses a scope declaration whose rename source was not observed', () => {
   expect(() => store.importRevision(JSON.stringify(amended), 'json', contextWithSource, 1)).toThrow(/changed beyond its scope declaration/);
   expect(store.getPlan(identity).revision).toBe(1);
 });
+it.each([
+  {
+    name: 'duplicate operations', outOfScopePaths: ['outside'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: null, change: 'Declare the observed add' },
+      { path: 'outside', kind: 'delete' as const, renamed_from: null, change: 'Declare the observed delete' },
+    ],
+  },
+  {
+    name: 'parent and child paths', outOfScopePaths: ['outside', 'outside/child'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: null, change: 'Declare the observed parent' },
+      { path: 'outside/child', kind: 'add' as const, renamed_from: null, change: 'Declare the observed child' },
+    ],
+  },
+  {
+    name: 'a duplicated rename source', outOfScopePaths: ['outside', 'moved'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: null, change: 'Declare the observed add' },
+      { path: 'moved', kind: 'rename' as const, renamed_from: 'outside', change: 'Declare the observed rename' },
+    ],
+  },
+  {
+    name: 'a rename source on a non-rename operation', outOfScopePaths: ['outside', 'source'],
+    files: [
+      { path: 'outside', kind: 'add' as const, renamed_from: 'source', change: 'Declare the observed add' },
+    ],
+  },
+])('refuses checkpoint scope declarations with $name', ({ outOfScopePaths, files }) => {
+  const { store } = fixture(true);
+  store.recordCheckpoint(identity, state(store), {
+    item: 'P2', completedItems: ['P1', 'P2'], outOfScopePaths, baseEntries: context.baseEntries,
+  });
+  const amended = store.getPlan(identity);
+  amended.items[1]!.files.push(...files);
+  expect(() => store.importRevision(JSON.stringify(amended), 'json', context, 1)).toThrow(/file declarations/);
+  expect(store.getPlan(identity).revision).toBe(1);
+});
 it('uses configured path identity when matching checkpoint scope declarations', () => {
   const path = join(directory(), 'state.sqlite'), pathKey = (value: string) => value.toLowerCase();
   const store = open(path, pathKey), normalizedContext = { ...context, pathKey };
@@ -365,6 +403,11 @@ it('uses configured path identity when matching checkpoint scope declarations', 
   amended.items[1]!.files.push({ path: 'OUTSIDE', kind: 'add', renamed_from: null, change: 'Declare the observed path' });
   expect(store.importRevision(JSON.stringify(amended), 'json', normalizedContext, 1).revision).toBe(2);
   expect(store.continuationProgress(identity)?.next).toBeNull();
+  const identityCollision = store.getPlan(identity);
+  identityCollision.items[1]!.files.push({ path: 'outside', kind: 'delete', renamed_from: null, change: 'Duplicate the observed path' });
+  expect(() => store.importRevision(JSON.stringify(identityCollision), 'json', normalizedContext, 2))
+    .toThrow(/file declarations/);
+  expect(store.getPlan(identity).revision).toBe(2);
   const identityDrift = store.getPlan(identity);
   identityDrift.issue = 2;
   expect(() => store.importRevision(JSON.stringify(identityDrift), 'json', normalizedContext, 2)).toThrow(/Plan issue does not match/);

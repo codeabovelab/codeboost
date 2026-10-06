@@ -8,7 +8,7 @@ export const basePlan = (): Plan => ({ schema_version: 1, issue: 1, revision: 1,
   { id: 'P1', title: 'Change', intent: 'Improve behavior', files: [{ path: 'a.txt', kind: 'edit', renamed_from: null, change: 'Update behavior.' }], acceptance: [{ type: 'cmd', text: 'npm test' }], depends_on: [] },
 ] });
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
-const applySuggestion = (plan: Plan, reply: unknown, index: number, context: PlanContext) => applyBoundSuggestion(plan, reply, index, context, { identity: context.identity, schemaVersion: plan.schema_version, baseRevision: (reply as { base_revision: number }).base_revision, issue: plan.issue });
+const applySuggestion = (plan: Plan, reply: unknown, index: number, context: PlanContext, completedItems?: readonly string[]) => applyBoundSuggestion(plan, reply, index, context, { identity: context.identity, schemaVersion: plan.schema_version, baseRevision: (reply as { base_revision: number }).base_revision, issue: plan.issue }, completedItems);
 const context: PlanContext = { identity, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: p => p, allowedCommands: [['npm', 'test']], issue: 1 };
 const reply = (op: string, payload: object = {}) => ({ schema_version: 1, base_revision: 1, reply: '', edits: [{
   op, item: 'P1', summary: 'Improve plan', reason: 'Clarify it', field: null, value: null, file: null,
@@ -103,6 +103,18 @@ describe('suggestions', () => {
     const newItem = { ...structuredClone(plan.items[0]!), id: 'P2', depends_on: ['P1'] };
     plan = applySuggestion(plan, { ...reply('add_item', { item: 'P2', new_item: newItem }), base_revision: 4 }, 0, context);
     expect(plan.items).toHaveLength(2);
+  });
+  it('rejects an add-item continuation that exceeds the full-plan item limit', () => {
+    const plan = basePlan();
+    plan.items[0]!.files[0] = { path: 'done.txt', kind: 'add', renamed_from: null, change: 'Create completed output.' };
+    for (let index = 2; index <= 30; index++) plan.items.push({
+      ...structuredClone(plan.items[0]!), id: `P${index}`, depends_on: [`P${index - 1}`],
+      files: [{ path: `file-${index}.txt`, kind: 'add', renamed_from: null, change: `Create output ${index}.` }],
+    });
+    const newItem = { ...structuredClone(plan.items[29]!), id: 'P31', depends_on: ['P30'],
+      files: [{ path: 'file-31.txt', kind: 'add' as const, renamed_from: null, change: 'Create output 31.' }] };
+    expect(() => applySuggestion(plan, reply('add_item', { item: 'P31', new_item: newItem }), 0,
+      { ...context, baseEntries: [] }, ['P1'])).toThrow(/must NOT have more than 30 items/);
   });
 });
 it('rejects file/parent collisions declared within the same item', () => {

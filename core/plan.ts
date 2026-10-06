@@ -140,6 +140,10 @@ export function validatePlan(value: unknown, context: PlanContext): Validation {
 
 /** Validate only work still to run, starting with the runner-audited tree at its checkpoint. */
 export function validateContinuationPlan(plan: Plan, context: PlanContext, completedItems: readonly string[], allowEmptySuffix = false): Validation {
+  try { assertPlan(plan); } catch (error) {
+    if (error instanceof PlanError) return { errors: error.diagnostics, warnings: [] };
+    throw error;
+  }
   const prefix = plan.items.slice(0, completedItems.length).map(item => item.id);
   if (!completedItems.length || prefix.length !== completedItems.length || prefix.some((id, index) => id !== completedItems[index]) ||
       completedItems.length > plan.items.length || (!allowEmptySuffix && completedItems.length === plan.items.length))
