@@ -409,9 +409,12 @@ export class GitRebaser {
     const abort = () => controller.abort(scope.signal?.reason ?? new Error('The rebase was cancelled.'));
     if (scope.signal?.aborted) abort();
     else scope.signal?.addEventListener('abort', abort, { once: true });
-    const timeoutMs = Math.max(0, Math.ceil(scope.workDeadline - performance.now()));
-    const timer = setTimeout(() => controller.abort(Object.assign(new Error('The rebase deadline expired during conflict resolution.'),
-      { code: 'ETIMEDOUT' })), timeoutMs);
+    const deadlineError = () => Object.assign(new Error('The rebase deadline expired during conflict resolution.'),
+      { code: 'ETIMEDOUT' });
+    const remaining = scope.workDeadline - performance.now();
+    let timer: NodeJS.Timeout | undefined;
+    if (remaining <= 0) controller.abort(deadlineError());
+    else timer = setTimeout(() => controller.abort(deadlineError()), Math.ceil(remaining));
     try {
       controller.signal.throwIfAborted();
       // Await settlement after abort: the resolver owns its container/storage until its promise ends.
@@ -422,7 +425,7 @@ export class GitRebaser {
       }
       controller.signal.throwIfAborted();
     } finally {
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       scope.signal?.removeEventListener('abort', abort);
     }
   }

@@ -15,20 +15,38 @@ const gitPath = (root: string, executable: string): Buffer => {
   return output.subarray(0, output.length - 1);
 };
 
+export function readBoundedRebaseStateNames(read: () => Buffer | null,
+  budget: { entries: number; nameBytes: number },
+  limits = { entries: MAX_INDEX_ENTRIES, nameBytes: MAX_INDEX_BYTES }): Buffer[] {
+  const children: Buffer[] = [];
+  for (let name = read(); name; name = read()) {
+    if (++budget.entries > limits.entries) throw new Error('Git rebase state exceeds its entry bound.');
+    if ((budget.nameBytes += name.length) > limits.nameBytes)
+      throw new Error('Git rebase state exceeds its name-byte bound.');
+    children.push(name);
+  }
+  return children;
+}
+
 /** Hash the byte-exact rebase control directory without following any link. */
 export function rebaseStateDigest(root = process.cwd(), executable = 'git'): string {
   const directory = gitPath(root, executable), initial = lstatSync(directory);
   if (!initial.isDirectory() || initial.isSymbolicLink()) throw new Error('Git rebase state is not a plain directory.');
   const hash = createHash('sha256'), pending: { full: Buffer; relative: Buffer }[] = [{ full: directory, relative: Buffer.alloc(0) }];
-  let entries = 0, bytes = 0;
+  const enumeration = { entries: 0, nameBytes: 0 };
+  let bytes = 0;
   while (pending.length) {
     const current = pending.pop()!, opened = opendirSync(current.full, { encoding: 'buffer' as BufferEncoding });
-    const children: Buffer[] = [];
-    try { for (let entry = opened.readSync(); entry; entry = opened.readSync()) children.push(entry.name as unknown as Buffer); }
+    let children: Buffer[];
+    try {
+      children = readBoundedRebaseStateNames(() => {
+        const entry = opened.readSync();
+        return entry ? entry.name as unknown as Buffer : null;
+      }, enumeration);
+    }
     finally { opened.closeSync(); }
     children.sort(Buffer.compare);
     for (const name of children) {
-      if (++entries > MAX_INDEX_ENTRIES) throw new Error('Git rebase state exceeds its entry bound.');
       const full = Buffer.concat([current.full, Buffer.from('/'), name]);
       const relative = current.relative.length ? Buffer.concat([current.relative, Buffer.from('/'), name]) : name;
       const stat = lstatSync(full);
