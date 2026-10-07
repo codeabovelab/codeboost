@@ -606,11 +606,17 @@ export async function exportTaskPaths(storage: TaskFilesystems | RecoveredTaskSt
     throw new Error('Conflict paths are invalid or exceed the entry limit.');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024)
     throw new Error('Conflict path export needs a positive limit of at most 32 MiB.');
-  const stdout = await runStorageScript(storage, { kind: 'export', operation: 'Conflict path export',
-    consequence: 'resolved conflict files cannot be exported', entrypoint: 'node',
-    args: ['-e', EXPORT_PATHS_SCRIPT], input: Buffer.from(JSON.stringify({ paths, maxBytes })),
-    maxOutputBytes: Math.ceil(maxBytes / 3) * 4
-      + paths.reduce((n, path) => n + Buffer.byteLength(JSON.stringify(path)) + 96, 2) }, options);
+  let stdout: string;
+  try {
+    stdout = await runStorageScript(storage, { kind: 'export', operation: 'Conflict path export',
+      consequence: 'resolved conflict files cannot be exported', entrypoint: 'node',
+      args: ['-e', EXPORT_PATHS_SCRIPT], input: Buffer.from(JSON.stringify({ paths, maxBytes })),
+      maxOutputBytes: Math.ceil(maxBytes / 3) * 4
+        + paths.reduce((n, path) => n + Buffer.byteLength(JSON.stringify(path)) + 96, 2) }, options);
+  } catch (error) {
+    if (error instanceof AggregateError || (error as Error | undefined)?.name === 'AbortError') throw error;
+    throw new Error('Conflict path export failed.', { cause: error });
+  }
   const decoded = JSON.parse(stdout) as { path?: unknown; type?: unknown; executable?: unknown; content?: unknown }[];
   if (!Array.isArray(decoded) || decoded.length !== paths.length) throw new Error('Conflict path export returned a malformed list.');
   let used = 0;

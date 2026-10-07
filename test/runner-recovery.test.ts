@@ -614,14 +614,14 @@ describe('host process checks', () => {
     expect(hostProcesses.isAlive(4242)).toBe(true);
   });
 
-  it('uses a kernel identity and never runs a PATH-selected ps with runner secrets', async () => {
+  it('never runs a PATH-selected ps or signals a recovered numeric group', async () => {
     const root = dir(), marker = join(root, 'ps-ran'), ps = join(root, 'ps'), path = process.env.PATH;
     writeFileSync(ps, `#!/bin/sh\nprintf '%s' "$CODEBOOST_TEST_SECRET" > '${marker}'\n`, { mode: 0o755 });
     process.env.PATH = `${root}:${path ?? ''}`; process.env.CODEBOOST_TEST_SECRET = 'must-not-leak';
     try {
       vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
       expect(hostProcesses.isAlive(4242)).toBe(true);
-      await expect(hostProcesses.terminate(4242, null, 10)).rejects.toThrow(/prove the recorded process group/);
+      await expect(hostProcesses.terminate(4242, null, 10)).rejects.toThrow(/cannot signal its reusable numeric ID/);
       expect(existsSync(marker)).toBe(false);
     } finally {
       if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
@@ -629,16 +629,14 @@ describe('host process checks', () => {
     }
   });
 
-  it('revalidates the exact kernel identity before signalling a process group', async () => {
+  it('fails closed for a live recovered group even when its recorded identity is exact', async () => {
     const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
     children.push(child);
     await once(child, 'spawn');
     const pgid = child.pid!;
     try {
       expect(hostProcesses.isAlive(pgid)).toBe(true);
-      const identity = processIdentity(pgid), wrong = identity === null ? 'linux:00000000-0000-0000-0000-000000000000:1'
-        : `${identity}0`;
-      await expect(hostProcesses.terminate(pgid, wrong, 10)).rejects.toThrow(/identity|recorded process group/);
+      await expect(hostProcesses.terminate(pgid, processIdentity(pgid), 10)).rejects.toThrow(/cannot signal its reusable numeric ID/);
       expect(() => process.kill(pgid, 0)).not.toThrow();
     } finally {
       try { process.kill(-pgid, 'SIGKILL'); } catch {}
@@ -647,24 +645,6 @@ describe('host process checks', () => {
     }
   });
 
-  it.skipIf(process.platform !== 'linux')('bounds settlement after SIGKILL and retains ownership on failure', async () => {
-    const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
-    children.push(child); await once(child, 'spawn');
-    const pgid = child.pid!, identity = processIdentity(pgid)!;
-    vi.useFakeTimers();
-    const signal = vi.spyOn(process, 'kill').mockImplementation(() => true);
-    const wallClock = vi.spyOn(Date, 'now').mockImplementation(() => 1_000_000 - performance.now());
-    try {
-      const pending = hostProcesses.terminate(pgid, identity, 100);
-      const rejected = expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
-      await vi.advanceTimersByTimeAsync(500);
-      await rejected;
-    } finally {
-      wallClock.mockRestore(); signal.mockRestore(); vi.useRealTimers();
-      try { process.kill(-pgid, 'SIGKILL'); } catch {}
-      await once(child, 'exit'); children.splice(children.indexOf(child), 1);
-    }
-  });
   it('finds a process working in the attempt directory when the path goes through a symlink', async () => {
     const root = dir(), real = join(root, 'real'), attempt = join(real, 'attempt');
     mkdirSync(attempt, { recursive: true }); symlinkSync(real, join(root, 'link'));

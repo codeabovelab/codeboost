@@ -57,6 +57,13 @@ export function createAttachExitGuard() {
   return Object.freeze({ markExited: () => { exited = true; }, canSignal: () => !exited });
 }
 
+/** Signal an attached client only while this process still owns its live leader. */
+export function signalAttachedChild(guard: ReturnType<typeof createAttachExitGuard>, child: ChildProcess,
+  signal: NodeJS.Signals): void {
+  if (!guard.canSignal() || child.pid === undefined) return;
+  try { process.kill(-child.pid, signal); } catch { child.kill(signal); }
+}
+
 /** Start the streaming attach client without losing a synchronous cancellation raised by lifecycle hooks. */
 export function startOwnedAttachClient(options: {
   readonly lifecycle: ProcessGroupLifecycle;
@@ -553,8 +560,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     current.stdout?.resume(); current.stderr?.resume();
     if (options.processLifecycle) {
       if (current.pid !== undefined) {
-        try { process.kill(-current.pid, 'SIGTERM'); } catch { current.kill('SIGTERM'); }
-        later(() => { if (!closed) try { process.kill(-current.pid!, 'SIGKILL'); } catch { current.kill('SIGKILL'); } }, 1_000);
+        signalAttachedChild(attachExit, current, 'SIGTERM');
+        later(() => { if (!closed) signalAttachedChild(attachExit, current, 'SIGKILL'); }, 1_000);
       }
       return;
     }

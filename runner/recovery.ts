@@ -9,7 +9,7 @@ import type { RebaseMarker, Store } from './store.ts';
 import { WRITABLE_KINDS, isUuidV4 } from './lifecycle.ts';
 import { partialOutput, saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
-import { processIdentity, runInProcessGroup } from '../agents/process-group.ts';
+import { runInProcessGroup } from '../agents/process-group.ts';
 import type { DockerOutcome } from '../agents/docker.ts';
 
 /**
@@ -98,38 +98,20 @@ export function acquireRunnerLock(databasePath: string, options: { lockRoot?: st
 }
 
 export interface ProcessControl {
-  /** The numeric group still exists. Exact ownership is revalidated only at the signal boundary. */
+  /** The numeric group still exists. */
   isAlive(pgid: number): boolean;
-  /** Revalidate its kernel identity, SIGTERM, SIGKILL after grace, and resolve only once the group has exited. */
+  /** Stop the group only through an implementation with identity-bound signalling; otherwise fail closed. */
   terminate(pgid: number, identity: string | null, graceMs: number): Promise<void>;
 }
 const groupAlive = (pgid: number) => {
   try { process.kill(-pgid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
 };
-const ownsGroupAtSignal = (pgid: number, identity: string | null): boolean => {
-  if (!groupAlive(pgid)) return false;
-  const current = processIdentity(pgid);
-  if (identity === null || current === null)
-    throw new Error('Could not prove the recorded process group still owns its ID; refusing to signal it.');
-  if (current !== identity) throw new Error('The recorded process group identity changed before recovery could signal it.');
-  return true;
-};
 export const hostProcesses: ProcessControl = {
   isAlive(pgid) { return groupAlive(pgid); },
-  async terminate(pgid, identity, graceMs) {
-    if (!ownsGroupAtSignal(pgid, identity)) return;
-    try { process.kill(-pgid, 'SIGTERM'); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error; }
-    const until = performance.now() + graceMs;
-    while (groupAlive(pgid) && performance.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
-    if (ownsGroupAtSignal(pgid, identity)) {
-      try { process.kill(-pgid, 'SIGKILL'); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
-    }
-    const settlement = performance.now() + graceMs;
-    while (groupAlive(pgid) && performance.now() < settlement) await new Promise(resolve => setTimeout(resolve, 50));
-    if (groupAlive(pgid)) throw new Error('The recorded process group did not exit after SIGKILL; retaining its ownership.');
+  async terminate(pgid) {
+    if (!groupAlive(pgid)) return;
+    throw new Error('A recovered process group is still alive; the host cannot signal its reusable numeric ID safely, so ownership is retained.');
   },
 };
 

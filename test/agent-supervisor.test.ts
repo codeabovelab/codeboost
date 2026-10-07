@@ -112,7 +112,8 @@ describe('container invocation supervisor', () => {
       unsettled: () => { throw new Error('Docker client unexpectedly remained unsettled.'); },
     };
     const result = await startProfileInvocation(current, { processLifecycle: lifecycle }).settled;
-    expect(result).toMatchObject({ exitCode: 0, stopReason: undefined });
+    expect(result).toMatchObject({ exitCode: 0 });
+    expect(result.stopReason).toBeUndefined();
     expect(owner).toBeNull();
     const starts = events.filter(event => event === 'starting').length;
     expect(starts).toBeGreaterThan(10);

@@ -3,12 +3,12 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { EventEmitter } from 'node:events';
 import type { ChildProcess } from 'node:child_process';
-import { describe, expect, it } from 'vitest';
-import { canSignalDrainingGroup, runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
+import { describe, expect, it, vi } from 'vitest';
+import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import { NOT_STARTED } from '../agents/docker.ts';
 import { createOutcomeUnknown } from '../agents/client-outcome.ts';
 import { runTrackedProcess, type ProcessGroupOwner } from '../agents/tracked-docker.ts';
-import { createAttachExitGuard, startOwnedAttachClient, watchAttachedChild } from '../agents/adapters/supervisor.ts';
+import { createAttachExitGuard, signalAttachedChild, startOwnedAttachClient, watchAttachedChild } from '../agents/adapters/supervisor.ts';
 
 // Preparation subprocesses run in their own process group, and settle only once the whole group has exited (#51 item 5).
 const env = { PATH: process.env.PATH };
@@ -17,12 +17,17 @@ const groupAlive = (pgid: number) => {
 };
 
 describe('runInProcessGroup', () => {
-  it('signals a draining group only while its recorded kernel identity cannot belong to a reused leader', () => {
-    expect(canSignalDrainingGroup(false, null, null)).toBe(true);
-    expect(canSignalDrainingGroup(true, null, null)).toBe(false);
-    expect(canSignalDrainingGroup(true, 'linux:old:1', 'linux:new:2')).toBe(false);
-    expect(canSignalDrainingGroup(true, 'linux:old:1', 'linux:old:1')).toBe(true);
-    expect(canSignalDrainingGroup(true, 'linux:old:1', null)).toBe(false);
+  it('does not let a delayed attach kill signal a numeric PGID after leader exit', async () => {
+    vi.useFakeTimers();
+    const guard = createAttachExitGuard(), childKill = vi.fn(), groupKill = vi.spyOn(process, 'kill').mockReturnValue(true);
+    const child = Object.assign(new EventEmitter(), { pid: 999_999, kill: childKill }) as unknown as ChildProcess;
+    try {
+      setTimeout(() => signalAttachedChild(guard, child, 'SIGKILL'), 1_000);
+      guard.markExited();
+      await vi.advanceTimersByTimeAsync(1_000);
+      expect(groupKill).not.toHaveBeenCalled();
+      expect(childKill).not.toHaveBeenCalled();
+    } finally { groupKill.mockRestore(); vi.useRealTimers(); }
   });
 
   it('honours synchronous cancellation from attach lifecycle hooks before and after spawn', () => {
@@ -130,15 +135,22 @@ describe('runInProcessGroup', () => {
     expect(groupAlive(group!.pgid)).toBe(false);
   });
 
-  it('kills what the leader left in its group before settling, even after a normal exit', async () => {
-    let group: ProcessGroup | undefined;
+  it('retains ownership without signalling a numeric group after its leader exits', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'orphaned-group-')), pidFile = join(dir, 'pid');
     const began = performance.now();
-    const outcome = await runInProcessGroup('sh', ['-c', 'sleep 60 >/dev/null 2>&1 & echo started'],
-      { env, timeoutMs: 30_000, onProcessGroup: reported => { group = reported; } });
-    expect(outcome).toMatchObject({ status: 0, stdout: 'started\n' });
-    expect(groupAlive(group!.pgid)).toBe(false);
-    expect(performance.now() - began).toBeLessThan(10_000);
-  });
+    const script = `const {spawn}=require('node:child_process'),fs=require('node:fs');`
+      + `const c=spawn('sleep',['60'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidFile)},String(c.pid));c.unref();`;
+    try {
+      const outcome = await runInProcessGroup(process.execPath, ['-e', script], { env, timeoutMs: 30_000 });
+      expect(outcome.status).toBeNull();
+      expect((outcome.error as NodeJS.ErrnoException).code).toBe('EGROUPALIVE');
+      expect(performance.now() - began).toBeGreaterThanOrEqual(10_000);
+      expect(() => process.kill(Number(readFileSync(pidFile, 'utf8')), 0)).not.toThrow();
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch {}
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 20_000);
 
   it('bounds a group that ignores SIGTERM: SIGKILL after the grace period, then settles as a timeout', async () => {
     let group: ProcessGroup | undefined;

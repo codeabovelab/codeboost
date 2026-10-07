@@ -8,7 +8,7 @@ export interface ProcessGroup {
   readonly pgid: number;
   /** `Date.now()` right after the spawn, retained for lifecycle timing and diagnostics. */
   readonly startedAt: number;
-  /** Linux boot ID plus kernel start ticks. Null means crash recovery must not signal this group automatically. */
+  /** Linux boot ID plus kernel start ticks, retained for diagnostics and identity-bound process-control adapters. */
   readonly identity: string | null;
 }
 
@@ -65,33 +65,20 @@ const signalGroup = (pgid: number, signal: NodeJS.Signals | 0) => {
   try { process.kill(-pgid, signal); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
 };
-const processExists = (pid: number) => {
-  try { process.kill(pid, 0); return true; }
-  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
-};
-
-/** Whether a post-exit signal still targets the recorded group rather than a leader that reused its numeric ID. */
-export const canSignalDrainingGroup = (leaderExists: boolean, recorded: string | null,
-  current: string | null): boolean => !leaderExists || (recorded !== null && current === recorded);
-
-// The leader can exit while other members of its group still run (for example a child it forked). A group ID stays
-// taken while any member exists, so until the group is empty the ID cannot name someone else's group.
+// Once the leader exits, there is no portable identity-bound way in Node to signal its numeric process-group ID. Even
+// a liveness/identity check followed by kill has a reuse race between the two syscalls. Poll only: a group that remains
+// alive is returned to durable recovery instead of risking a signal to an unrelated process.
 const drainGroup = async (group: ProcessGroup) => {
-  const { pgid, identity } = group;
+  const { pgid } = group;
   const giveUpAt = performance.now() + DRAIN_LIMIT_MS;
   while (signalGroup(pgid, 0)) {
-    // A live group with no positive PID equal to its PGID is the original orphaned group: a new group needs that
-    // numeric leader. If such a leader exists, only the exact recorded kernel identity proves it was not reused.
-    const leaderExists = processExists(pgid), current = leaderExists ? processIdentity(pgid) : null;
-    if (!canSignalDrainingGroup(leaderExists, identity, current)) return false;
-    signalGroup(pgid, 'SIGKILL');
     if (performance.now() >= giveUpAt) return false;
     await pause(20);
   }
   return true;
 };
 
-/** Kill and await every member of a process group already recorded by the caller. */
+/** After its leader exits, observe whether every member of a recorded process group has gone without signalling it. */
 export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drainGroup(group);
 
 /**
@@ -139,7 +126,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
       if (stopped || exited) return;
       stopped = reason;
       signalGroup(pgid, 'SIGTERM');
-      graceTimer = setTimeout(() => signalGroup(pgid, 'SIGKILL'), graceMs);
+      graceTimer = setTimeout(() => { if (!exited) signalGroup(pgid, 'SIGKILL'); }, graceMs);
     };
     // Armed at the spawn, before the caller records the group: time spent recording counts against the deadline.
     const deadline = setTimeout(() => stop('timeout'), options.timeoutMs);
@@ -174,11 +161,10 @@ export function runInProcessGroup(file: string, args: readonly string[],
       if (finished) return;
       finished = true;
       exited = true;
+      clearTimeout(graceTimer);
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
       void drainGroup(group).then(async drained => {
-        // The group is empty (or given up on): a later SIGKILL could reach a new group that reuses the ID.
-        clearTimeout(graceTimer);
         let stdioTimer: ReturnType<typeof setTimeout> | undefined;
         await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
         // Cleared so a finished call never keeps the process alive.
@@ -192,7 +178,8 @@ export function runInProcessGroup(file: string, args: readonly string[],
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
         if (!drained) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
-            new Error(`${file} left processes in its group that did not exit after SIGKILL.`), { code: 'EGROUPALIVE' }) });
+            new Error(`${file} left processes in its group after its leader exited; ownership was retained without signalling a reusable group ID.`),
+            { code: 'EGROUPALIVE' }) });
           return;
         }
         if (!pipesClosed) {

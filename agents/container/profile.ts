@@ -288,7 +288,6 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     // Read through one no-follow descriptor so the path cannot be swapped between check and open.
     const sourceAuth = options.codexAuthFile ? readCapturedFile(options.codexAuthFile, 'Codex auth') : undefined;
     const inputDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-input-'));
-    cleanupDirectories.push(inputDirectory);
     writeFileSync(join(inputDirectory, 'schema.json'), sourceInput.content,
       { mode: 0o400, flag: 'wx' });
     chmodSync(join(inputDirectory, 'schema.json'), 0o444);
@@ -296,8 +295,9 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     // remove this directory as part of its durably known parent without first trusting an unrecorded leaf path.
     chmodSync(inputDirectory, 0o755);
     const inputIdentity = captureInput(inputDirectory);
+    cleanupDirectories.push(inputIdentity.inputDirectory);
     if (sourceAuth) {
-      const cleanupDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-auth-'));
+      const cleanupDirectory = realpathSync(mkdtempSync(join(cleanupRoot, 'codeboost-auth-')));
       cleanupDirectories.push(cleanupDirectory);
       const stagedAuth = join(cleanupDirectory, 'auth.json');
       writeFileSync(stagedAuth, sourceAuth.content, { mode: 0o400, flag: 'wx' });

@@ -1,7 +1,8 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
+  symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -120,8 +121,9 @@ afterAll(async () => {
 
 describe('real Docker agent isolation', () => {
   it('places temporary profile snapshots beneath an owner-only durable cleanup root', async () => {
-    const data = fixture(), cleanupRoot = join(data.root, 'profile-staging');
-    mkdirSync(cleanupRoot, { mode: 0o700 });
+    const data = fixture(), requestedCleanupRoot = join(data.root, 'profile-staging');
+    mkdirSync(requestedCleanupRoot, { mode: 0o700 });
+    const cleanupRoot = realpathSync(requestedCleanupRoot);
     const valid = await profile(data, 'planning', 'noop', { cleanupRoot });
     const directories = containerProfileResources(valid).filter(resource => resource.kind === 'directory');
     expect(directories).toHaveLength(2);
@@ -129,8 +131,9 @@ describe('real Docker agent isolation', () => {
     expect(valid.args).toContainEqual(expect.stringMatching(
       new RegExp(`^type=bind,source=${cleanupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/codeboost-input-`)));
 
-    const unsafeRoot = join(data.root, 'unsafe-profile-staging');
-    mkdirSync(unsafeRoot, { mode: 0o755 });
+    const requestedUnsafeRoot = join(data.root, 'unsafe-profile-staging');
+    mkdirSync(requestedUnsafeRoot, { mode: 0o755 });
+    const unsafeRoot = realpathSync(requestedUnsafeRoot);
     await expect(profile(data, 'planning', 'noop', { cleanupRoot: unsafeRoot })).rejects.toThrow('owner-only directory');
   }, 60_000);
 
