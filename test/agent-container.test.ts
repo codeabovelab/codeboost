@@ -9,14 +9,14 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
-  isContainerProfileAuthentic } from '../agents/container/profile.ts';
+  containerProfileResources, isContainerProfileAuthentic } from '../agents/container/profile.ts';
 import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
+import { exportTaskDiff, exportTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
   UnusableRepositoryError } from '../agents/container/storage.ts';
-import { checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
+import { checkConflictTree, checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
   TASK_COMMIT_REF, TaskCommitRefused, TaskTreeRefused, type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
 import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
@@ -82,7 +82,7 @@ const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop
 async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
   vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
-  treeCheck?: TaskTreeCheck;
+  treeCheck?: TaskTreeCheck; cleanupRoot?: string;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
@@ -94,6 +94,7 @@ async function profile(data: ReturnType<typeof fixture>, phase: Phase,
     ? options.treeCheck ?? await checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId }) : undefined;
   const base = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
     inputDirectory: data.input, command: trustedCommand, imageId, treeCheck,
+    cleanupRoot: options.cleanupRoot,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
   profiles.push(base);
@@ -118,6 +119,21 @@ afterAll(async () => {
 }, 120_000);
 
 describe('real Docker agent isolation', () => {
+  it('places temporary profile snapshots beneath an owner-only durable cleanup root', async () => {
+    const data = fixture(), cleanupRoot = join(data.root, 'profile-staging');
+    mkdirSync(cleanupRoot, { mode: 0o700 });
+    const valid = await profile(data, 'planning', 'noop', { cleanupRoot });
+    const directories = containerProfileResources(valid).filter(resource => resource.kind === 'directory');
+    expect(directories).toHaveLength(2);
+    expect(directories.every(resource => resource.name.startsWith(`${cleanupRoot}/codeboost-`))).toBe(true);
+    expect(valid.args).toContainEqual(expect.stringMatching(
+      new RegExp(`^type=bind,source=${cleanupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/codeboost-input-`)));
+
+    const unsafeRoot = join(data.root, 'unsafe-profile-staging');
+    mkdirSync(unsafeRoot, { mode: 0o755 });
+    await expect(profile(data, 'planning', 'noop', { cleanupRoot: unsafeRoot })).rejects.toThrow('owner-only directory');
+  }, 60_000);
+
   it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(
     '%s applies its enforced worktree access profile', async phase => {
       const data = fixture();
@@ -1701,6 +1717,25 @@ describe('real Docker agent isolation', () => {
       expect(error).toBeInstanceOf(TaskTreeRefused);
       return (error as TaskTreeRefused).differences;
     };
+
+    it('accepts only the exact dirty conflict set and exports exact no-follow leaf entries', async () => {
+      const data = fixture();
+      asAgent(data.filesystems, 'printf resolved > file.txt');
+      expect(await checkConflictTree(data.filesystems, { base: data.clone.head, paths: ['file.txt'], imageId }))
+        .toEqual({ base: data.clone.head, gitlinks: [] });
+      asAgent(data.filesystems, 'ln -s file.txt link; rm -f absent; mkdir -p nested; printf gone > nested/deleted; rm -rf nested');
+      const exported = await exportTaskPaths(data.filesystems, ['file.txt', 'link', 'absent', 'nested/deleted'], 1024, { imageId });
+      expect(exported.map(entry => ({ path: entry.path, type: entry.type, content: entry.content?.toString() }))).toEqual([
+        { path: 'file.txt', type: 'file', content: 'resolved' },
+        { path: 'link', type: 'symlink', content: 'file.txt' },
+        { path: 'absent', type: 'absent', content: undefined },
+        { path: 'nested/deleted', type: 'absent', content: undefined },
+      ]);
+      await expect(exportTaskPaths(data.filesystems, ['file.txt'], 2, { imageId })).rejects.toThrow(/Conflict path export/);
+      asAgent(data.filesystems, 'printf outside > outside.txt');
+      expect(await refusal(checkConflictTree(data.filesystems, { base: data.clone.head, paths: ['file.txt'], imageId })))
+        .toContain('"outside.txt" differs outside the conflict set');
+    }, 180_000);
 
     it('mounts every gitlink empty and read-only, so an agent\'s write beneath one is refused', async () => {
       const data = withGitlinks(['sm', 'deps/inner', 'x/y/z']);

@@ -260,8 +260,71 @@ describe('startup recovery sequence', () => {
     } });
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d });
     expect(seen).toEqual([{ planKey: store.getTask(id(1)).planKey, value: cleared, stillOwned: cleared }]);
-    expect(calls).toEqual(['recover', 'terminate:5151', 'abort-rebase']);
+    expect(calls).toEqual(['terminate:5151', 'recover', 'abort-rebase']);
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('recovers an unsettled pipe-holder marker without signalling a reusable process-group ID', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const child = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
+    store.beginRebaseConflict(planKey, marker.attemptId, { attemptId: child, allocationId, networkAllocationId, source: snapshot.head });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', 'unsettled');
+    mkdirSync(join(root, 'r', token, 'rebases', marker.attemptId), { recursive: true });
+    const calls: string[] = [], isAlive = vi.fn(() => true), terminate = vi.fn(async () => undefined);
+    const openFiles = vi.fn(() => [] as string[]), abortRebase = vi.fn(async () => { calls.push('abort-rebase');
+      expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: null, conflict: { attemptId: child } }); });
+    const removeTaskFilesystems = vi.fn(async () => { calls.push('remove-child'); });
+    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), openFiles,
+      deps: deps({ abortRebase, removeTaskFilesystems, processes: { isAlive, terminate }, recoverLeftovers: async () => {
+        calls.push('recover'); return { storage: [{ attemptId: child, allocationId, handle: 'child' }], unowned: [] };
+      } }).d });
+    expect(isAlive).not.toHaveBeenCalled(); expect(terminate).not.toHaveBeenCalled(); expect(openFiles).toHaveBeenCalledOnce();
+    expect(calls).toEqual(['recover', 'abort-rebase', 'remove-child']);
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('removes an interrupted conflict child before clearing its parent rebase', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const child = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
+    store.beginRebaseConflict(planKey, marker.attemptId, { attemptId: child, allocationId, networkAllocationId, source: snapshot.head });
+    const dockerIdentity = 'linux:00000000-0000-0000-0000-000000000000:3';
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', { pgid: 6161, startedAt: 789, identity: dockerIdentity });
+    const calls: string[] = [], abortRebase = vi.fn(async () => { calls.push('abort-rebase');
+      expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ conflict: { attemptId: child } }); });
+    const removeTaskFilesystems = vi.fn(async () => { calls.push('remove-child');
+      expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ conflict: { attemptId: child } }); });
+    const report = await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, removeTaskFilesystems, recoverLeftovers: async () => {
+        calls.push('recover'); return { storage: [{ attemptId: child, allocationId, handle: 'child' }], unowned: [] };
+      }, processes: { isAlive: () => true, terminate: async pgid => { calls.push(`terminate:${pgid}`); } } }).d });
+    expect(calls).toEqual(['terminate:6161', 'recover', 'abort-rebase', 'remove-child']);
+    expect(removeTaskFilesystems).toHaveBeenCalledWith('child');
+    expect(report.unmatchedStorage).toEqual([]);
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('retains a conflict marker when recovered storage only partially matches its identity', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const child = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
+    store.beginRebaseConflict(planKey, marker.attemptId, { attemptId: child, allocationId, networkAllocationId, source: snapshot.head });
+    const abortRebase = vi.fn(async () => undefined), removeTaskFilesystems = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, removeTaskFilesystems, recoverLeftovers: async () => ({
+        storage: [{ attemptId: child, allocationId: randomUUID(), handle: 'wrong' }], unowned: [],
+      }) }).d })).rejects.toThrow(/does not match/);
+    expect(abortRebase).not.toHaveBeenCalled(); expect(removeTaskFilesystems).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ conflict: { attemptId: child, allocationId } });
   });
   it('passes only the exact durably owned result ref to rebase recovery', async () => {
     const { d: root, store } = fixture();
@@ -289,7 +352,7 @@ describe('startup recovery sequence', () => {
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
     expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultState: 'none',
-      resultHead: null, resultMappings: null, resolvedConflicts: [] });
+      resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null });
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
   it('retains a recovery marker whose resolved-conflict provenance is outside its captured history', async () => {
@@ -394,6 +457,20 @@ describe('startup recovery sequence', () => {
       deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
     expect(abortRebase).not.toHaveBeenCalled();
     expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'spawning' });
+  });
+  it('rejects an unknown string process owner before recovery actions', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const malformed = { ...marker, processGroup: 'unknown-owner' };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(malformed)}' WHERE plan_key='${planKey}'`);
+    const recoverLeftovers = vi.fn(async () => ({ storage: [], unowned: [] }));
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ recoverLeftovers }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(recoverLeftovers).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(malformed);
   });
   it('rejects process-group ID 1 without sending any recovery signal', async () => {
     const { d: root, store, raw } = fixture();

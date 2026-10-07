@@ -55,5 +55,6 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
     network => ({ ...request, policy, network, command, claudeToken: oauthToken }),
     profile => start(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
+      processLifecycle: request.processLifecycle,
       invocationBudget: remaining, decode: (_profile, raw) => parseClaudeOutput(raw, structured) })));
 }

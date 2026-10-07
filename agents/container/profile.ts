@@ -2,7 +2,7 @@ import { createHash, randomUUID } from 'node:crypto';
 import { chmodSync, closeSync, constants, fstatSync, lstatSync, mkdtempSync, openSync, readSync,
   readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { assertCapturedInvocation, type InvocationInput, type Phase, type UnreleasedResource } from '../contract.ts';
 import { assertBuiltAgentImage } from './image.ts';
 import { assertTaskFilesystems, taskFilesystemOwner, type TaskFilesystems } from './storage.ts';
@@ -11,6 +11,7 @@ import { ownerLabelArgs, type ResourceOwner } from '../labels.ts';
 import { assertVendorNetwork, removeVendorNetwork, vendorNetworkResources,
   type VendorNetwork } from '../network/network.ts';
 import { assertAgentCommand, assertCommandSchema, assertPhasePolicy, type AgentCommand, type PhasePolicy } from '../policy.ts';
+import type { ProcessGroupLifecycle } from '../tracked-docker.ts';
 export interface ContainerProfile {
   readonly name: string;
   readonly args: readonly string[];
@@ -50,6 +51,10 @@ export interface ProfileOptions {
   readonly timeoutMs?: number;
   /** Cancels creation; whatever was staged is removed before the promise rejects. */
   readonly signal?: AbortSignal;
+  /** Optional owner-only plain directory beneath which temporary profile snapshots are created. */
+  readonly cleanupRoot?: string;
+  /** Durable ownership for Docker clients used during cleanup. */
+  readonly processLifecycle?: ProcessGroupLifecycle;
 }
 
 export class ProfileCreationCleanupError extends AggregateError {
@@ -168,13 +173,13 @@ export function isContainerProfileAuthentic(profile: ContainerProfile): boolean 
 
 /** Internal authenticity and host-file revalidation used at every launch boundary. */
 export async function assertContainerProfile(profile: ContainerProfile, timeoutMs = 30_000,
-  signal?: AbortSignal): Promise<void> {
+  signal?: AbortSignal, processLifecycle?: ProcessGroupLifecycle): Promise<void> {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
   assertTaskFilesystems(expected.filesystems, expected.clone);
   // Every caller, including those using the default budget, is bounded by the invocation deadline.
   await assertVendorNetwork(expected.network, expected.invocation, profile.name, profileTimeout(profile, timeoutMs),
-    signal);
+    signal, processLifecycle);
   assertPhasePolicy(expected.policy, expected.invocation);
   const actual = captureInput(expected.inputDirectory);
   if (actual.inputDirectory !== expected.inputDirectory || !sameFile(actual.schema, expected.schema))
@@ -210,12 +215,13 @@ export function containerProfileResources(profile: ContainerProfile): readonly U
 }
 
 /** Remove runner-owned credential staging after this one-shot profile settles. */
-export async function disposeContainerProfile(profile: ContainerProfile, networkTimeoutMs = 30_000): Promise<void> {
+export async function disposeContainerProfile(profile: ContainerProfile, networkTimeoutMs = 30_000,
+  processLifecycle?: ProcessGroupLifecycle): Promise<void> {
   const identity = identities.get(profile);
   if (!identity) return;
   const failures: unknown[] = [];
   try { removeOwnedDirectories(identity.cleanupDirectories); } catch (error) { failures.push(error); }
-  try { await removeVendorNetwork(identity.network, networkTimeoutMs); } catch (error) { failures.push(error); }
+  try { await removeVendorNetwork(identity.network, networkTimeoutMs, processLifecycle); } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
   identities.delete(profile);
 }
@@ -242,6 +248,15 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     throw new Error('Container profile requires the immutable built image ID.');
   assertBuiltAgentImage(options.imageId);
   assertTaskFilesystems(filesystems, invocation.clone);
+  let cleanupRoot = tmpdir();
+  if (options.cleanupRoot !== undefined) {
+    if (!isAbsolute(options.cleanupRoot) || realpathSync(options.cleanupRoot) !== options.cleanupRoot)
+      throw new Error('Profile cleanup root must be an absolute canonical directory.');
+    const stat = lstatSync(options.cleanupRoot);
+    if (!stat.isDirectory() || stat.isSymbolicLink() || (process.getuid && stat.uid !== process.getuid()) || (stat.mode & 0o077) !== 0)
+      throw new Error('Profile cleanup root must be a plain owner-only directory.');
+    cleanupRoot = options.cleanupRoot;
+  }
   // The storage must belong to this runner. The agent container is labelled with its own attempt and the allocation
   // it mounts, so recovery can find both from the container.
   const storageOwner = taskFilesystemOwner(filesystems);
@@ -250,7 +265,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
   const invocationLeft = Math.floor(invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   await assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft),
-    options.signal);
+    options.signal, options.processLifecycle);
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
   // Own the network from here on, so any later failure removes it rather than leaking it.
   claimedNetworks.add(options.network);
@@ -272,15 +287,17 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       || !/^codeboost-keeper-[0-9a-f-]+$/.test(filesystems.keeper)) throw new Error('Task filesystem identity is invalid.');
     // Read through one no-follow descriptor so the path cannot be swapped between check and open.
     const sourceAuth = options.codexAuthFile ? readCapturedFile(options.codexAuthFile, 'Codex auth') : undefined;
-    const inputDirectory = mkdtempSync(join(tmpdir(), 'codeboost-input-'));
+    const inputDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-input-'));
     cleanupDirectories.push(inputDirectory);
     writeFileSync(join(inputDirectory, 'schema.json'), sourceInput.content,
       { mode: 0o400, flag: 'wx' });
     chmodSync(join(inputDirectory, 'schema.json'), 0o444);
-    chmodSync(inputDirectory, 0o555);
+    // The agent runs as another uid and the bind mount is read-only; keep owner write permission so crash recovery can
+    // remove this directory as part of its durably known parent without first trusting an unrecorded leaf path.
+    chmodSync(inputDirectory, 0o755);
     const inputIdentity = captureInput(inputDirectory);
     if (sourceAuth) {
-      const cleanupDirectory = mkdtempSync(join(tmpdir(), 'codeboost-auth-'));
+      const cleanupDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-auth-'));
       cleanupDirectories.push(cleanupDirectory);
       const stagedAuth = join(cleanupDirectory, 'auth.json');
       writeFileSync(stagedAuth, sourceAuth.content, { mode: 0o400, flag: 'wx' });
@@ -348,7 +365,8 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     const cleanupProfileResources = async (budgetMs = 30_000) => {
       const failures: unknown[] = [];
       try { removeOwnedDirectories(cleanupDirectories); } catch (cleanupError) { failures.push(cleanupError); }
-      try { await removeVendorNetwork(options.network, budgetMs); } catch (cleanupError) { failures.push(cleanupError); }
+      try { await removeVendorNetwork(options.network, budgetMs, options.processLifecycle); }
+      catch (cleanupError) { failures.push(cleanupError); }
       if (failures.length) throw new AggregateError(failures, 'Profile resource cleanup did not settle.');
     };
     try { await cleanupProfileResources(); }

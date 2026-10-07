@@ -4,11 +4,16 @@ import type { TaskTreeCheck } from '../container/changes.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
 import { assertResourceOwner } from '../labels.ts';
 import type { CaptureLimits } from './supervisor.ts';
+import type { ProcessGroupLifecycle } from '../tracked-docker.ts';
 
 export interface AgentAdapterRequest {
   readonly invocation: InvocationInput;
   readonly filesystems: TaskFilesystems;
   readonly inputDirectory: string;
+  /** Optional owner-only root for profile snapshots whose lifecycle is durably owned by the caller. */
+  readonly cleanupRoot?: string;
+  /** Optional durable ownership hooks for Docker clients that can create or start resources. */
+  readonly processLifecycle?: ProcessGroupLifecycle;
   readonly imageId: string;
   readonly prompt: string;
   /**

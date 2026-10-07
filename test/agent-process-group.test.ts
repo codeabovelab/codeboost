@@ -1,10 +1,14 @@
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { EventEmitter } from 'node:events';
+import type { ChildProcess } from 'node:child_process';
 import { describe, expect, it } from 'vitest';
-import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
+import { canSignalDrainingGroup, runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import { NOT_STARTED } from '../agents/docker.ts';
 import { createOutcomeUnknown } from '../agents/client-outcome.ts';
+import { runTrackedProcess, type ProcessGroupOwner } from '../agents/tracked-docker.ts';
+import { createAttachExitGuard, startOwnedAttachClient, watchAttachedChild } from '../agents/adapters/supervisor.ts';
 
 // Preparation subprocesses run in their own process group, and settle only once the whole group has exited (#51 item 5).
 const env = { PATH: process.env.PATH };
@@ -13,6 +17,82 @@ const groupAlive = (pgid: number) => {
 };
 
 describe('runInProcessGroup', () => {
+  it('signals a draining group only while its recorded kernel identity cannot belong to a reused leader', () => {
+    expect(canSignalDrainingGroup(false, null, null)).toBe(true);
+    expect(canSignalDrainingGroup(true, null, null)).toBe(false);
+    expect(canSignalDrainingGroup(true, 'linux:old:1', 'linux:new:2')).toBe(false);
+    expect(canSignalDrainingGroup(true, 'linux:old:1', 'linux:old:1')).toBe(true);
+    expect(canSignalDrainingGroup(true, 'linux:old:1', null)).toBe(false);
+  });
+
+  it('honours synchronous cancellation from attach lifecycle hooks before and after spawn', () => {
+    let stopped = false, spawned = 0, attached = 0, terminated = 0;
+    const child = Object.assign(new EventEmitter(), { pid: 999_999, kill: () => true }) as unknown as ChildProcess;
+    const lifecycle = {
+      starting: () => {},
+      started: () => { stopped = true; },
+      settled: () => {},
+      unsettled: () => {},
+    };
+    startOwnedAttachClient({ lifecycle, stopped: () => stopped,
+      spawn: () => { spawned++; return child; }, attach: (_child, owner, group) => {
+        attached++; expect(owner).toEqual(group); expect(group?.pgid).toBe(999_999);
+      }, terminate: () => { terminated++; }, recordFailure: error => { throw error; } });
+    expect({ spawned, attached, terminated }).toEqual({ spawned: 1, attached: 1, terminated: 1 });
+
+    stopped = true;
+    expect(() => startOwnedAttachClient({ lifecycle: { ...lifecycle, starting: () => {} }, stopped: () => stopped,
+      spawn: () => { spawned++; return child; }, attach: () => {}, terminate: () => {},
+      recordFailure: error => { throw error; } })).toThrow(/before the Docker attach client started/);
+    expect(spawned).toBe(1);
+  });
+
+  it('finishes a spawned attach client on error even when no exit event follows', () => {
+    const child = new EventEmitter() as unknown as ChildProcess;
+    let finishes = 0, failures = 0;
+    const events: string[] = [];
+    watchAttachedChild(child, (code, signal) => { finishes++; events.push('finish'); expect(code).toBeNull(); expect(signal).toBeNull(); },
+      error => { failures++; events.push('failure'); expect(error.message).toBe('kill failed'); });
+    child.emit('error', new Error('kill failed'));
+    expect({ finishes, failures }).toEqual({ finishes: 1, failures: 1 });
+    expect(events).toEqual(['finish', 'failure']);
+  });
+
+  it('never signals an attach PGID after exit while inherited pipes remain open', async () => {
+    const child = new EventEmitter() as unknown as ChildProcess;
+    const guard = createAttachExitGuard(), pipeClosed = Promise.withResolvers<void>();
+    let signals = 0;
+    watchAttachedChild(child, () => {
+      guard.markExited();
+      void pipeClosed.promise.then(() => undefined);
+    }, error => { throw error; });
+    child.emit('exit', 0, null);
+    // The group is now empty but an escaped descendant still owns a pipe. A deadline firing here must not use the
+    // reusable numeric PGID; finish may continue waiting for bounded pipe closure without enabling termination.
+    if (guard.canSignal()) signals++;
+    expect(signals).toBe(0);
+    pipeClosed.resolve();
+    await pipeClosed.promise;
+    expect(guard.canSignal()).toBe(false);
+  });
+
+  it('composes durable lifecycle ownership with the caller process-group observer', async () => {
+    let owner: ProcessGroupOwner | null = null;
+    const events: string[] = [];
+    const outcome = await runTrackedProcess('sh', ['-c', 'exit 0'], { env, timeoutMs: 5_000,
+      lifecycle: {
+        starting: () => { expect(owner).toBeNull(); owner = 'spawning'; events.push('starting'); },
+        started: group => { expect(owner).toBe('spawning'); owner = group; events.push('started'); },
+        settled: expected => { expect(owner).toEqual(expected); owner = null; events.push('settled'); },
+        unsettled: () => { throw new Error('unexpected unsettled process'); },
+      },
+      onProcessGroup: group => { expect(owner).toEqual(group); events.push('observer'); },
+    });
+    expect(outcome.status).toBe(0);
+    expect(events).toEqual(['starting', 'started', 'observer', 'settled']);
+    expect(owner).toBeNull();
+  });
+
   it('reports the group in the same turn as the spawn, and returns a normal exit', async () => {
     let reported: ProcessGroup | undefined;
     const pending = runInProcessGroup('sh', ['-c', 'echo out; echo err >&2; exit 3'],

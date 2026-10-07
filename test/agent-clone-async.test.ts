@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 // Every Git call passes through; a test can act after one call settles and before the next is requested.
-const calls = vi.hoisted(() => ({ made: [] as string[][], afterCall: undefined as undefined | ((args: readonly string[]) => void) }));
+const calls = vi.hoisted(() => ({ made: [] as string[][], afterCall: undefined as undefined | ((args: readonly string[]) => void),
+  trackedFailure: undefined as undefined | 'EGROUPALIVE' | 'ESTDIOHELD' }));
 vi.mock('../agents/process-group.ts', async importOriginal => {
   const actual = await importOriginal<typeof import('../agents/process-group.ts')>();
   return { ...actual, runInProcessGroup: async (...call: Parameters<typeof actual.runInProcessGroup>) => {
@@ -16,7 +17,16 @@ vi.mock('../agents/process-group.ts', async importOriginal => {
     return outcome;
   } };
 });
-const { assertTaskClone, createTaskCloneAsync } = await import('../git/clone.ts');
+vi.mock('../agents/tracked-docker.ts', async importOriginal => {
+  const actual = await importOriginal<typeof import('../agents/tracked-docker.ts')>();
+  return { ...actual, runTrackedProcess: async (...call: Parameters<typeof actual.runTrackedProcess>) => {
+    const outcome = await actual.runTrackedProcess(...call);
+    if (calls.trackedFailure && call[0] === 'git' && call[1].includes('clone') && outcome.status === 0)
+      return { ...outcome, status: null, error: Object.assign(new Error('injected unsettled clone'), { code: calls.trackedFailure }) };
+    return outcome;
+  } };
+});
+const { assertTaskClone, cloneFailureRetainsDirectory, createTaskCloneAsync } = await import('../git/clone.ts');
 import type { ProcessGroup } from '../agents/process-group.ts';
 
 // The asynchronous clone (#51 item 5): every Git call runs in its own process group, and an abort settles only after
@@ -48,11 +58,28 @@ const withStubbornClone = async <T>(root: string, started: string, run: () => Pr
   try { return await run(); } finally { process.env.PATH = path; }
 };
 afterEach(() => {
-  calls.afterCall = undefined; calls.made = [];
+  calls.afterCall = undefined; calls.trackedFailure = undefined; calls.made = [];
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
 });
 
 describe('asynchronous task clone', () => {
+  it('retains a partial clone only for outcomes that prove process or pipe ownership is unsettled', () => {
+    expect(cloneFailureRetainsDirectory(Object.assign(new Error('alive'), { code: 'EGROUPALIVE' }))).toBe(true);
+    expect(cloneFailureRetainsDirectory(Object.assign(new Error('pipe'), { code: 'ESTDIOHELD' }))).toBe(true);
+    expect(cloneFailureRetainsDirectory(Object.assign(new Error('cancelled'), { code: 'ABORT_ERR' }))).toBe(false);
+  });
+
+  it.each(['EGROUPALIVE', 'ESTDIOHELD'] as const)(
+    'retains the actual partial clone after a tracked %s outcome', async code => {
+      const input = fixture(); calls.trackedFailure = code;
+      const lifecycle = { starting: () => {}, started: () => {}, settled: () => {}, unsettled: () => {} };
+      await expect(createTaskCloneAsync({ ...input, processLifecycle: lifecycle })).rejects.toMatchObject({ code });
+      const retained = readdirSync(input.parent);
+      expect(retained).toHaveLength(1);
+      expect(retained[0]).toMatch(/^codeboost-task-/);
+      expect(existsSync(join(input.parent, retained[0]!))).toBe(true);
+    });
+
   it('clones like the synchronous helper and reports each Git process group, all gone once it settles', async () => {
     const input = fixture(), groups: ProcessGroup[] = [];
     const clone = await createTaskCloneAsync({ ...input, onProcessGroup: group => { groups.push(group); } });

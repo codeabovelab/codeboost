@@ -8,7 +8,8 @@ import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { DockerError, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../process-group.ts';
-import { TREE_SCRIPT } from './tree-script.ts';
+import { runTrackedProcess, type ProcessGroupLifecycle } from '../tracked-docker.ts';
+import { MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, TREE_SCRIPT } from './tree-script.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
 
@@ -128,6 +129,10 @@ export interface PreparationOptions {
   readonly signal?: AbortSignal;
   /** Called in the same turn as each Docker spawn with its process group, so the caller can record it durably. */
   readonly onProcessGroup?: (group: ProcessGroup) => void;
+  /** Durable ownership around every individual Docker subprocess. */
+  readonly processLifecycle?: ProcessGroupLifecycle;
+  /** Overall budget for allocation or cleanup. Callers with a larger lifecycle deadline reserve group settlement. */
+  readonly timeoutMs?: number;
 }
 // The non-blocking driver: every Docker call runs in its own process group, and the promise settles only after it has
 // exited. An abort reaches the generator as an error at its next cancellable call or pause, so its own cleanup runs.
@@ -144,9 +149,12 @@ async function runStepsAsync<T>(steps: Steps<T>, options: PreparationOptions): P
       await pause(step.sleepMs);
       next = steps.next();
     } else {
-      next = steps.next(await runInProcessGroup('docker', step.args, { env: dockerEnvironment(),
-        timeoutMs: step.timeoutMs, signal: step.cancellable ? options.signal : undefined,
-        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer, input: step.input }));
+      const processOptions = { env: dockerEnvironment(), timeoutMs: step.timeoutMs,
+        signal: step.cancellable ? options.signal : undefined,
+        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer, input: step.input };
+      next = steps.next(options.processLifecycle
+        ? await runTrackedProcess('docker', step.args, { ...processOptions, lifecycle: options.processLifecycle })
+        : await runInProcessGroup('docker', step.args, processOptions));
     }
   }
   return next.value;
@@ -378,7 +386,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
  * every group has exited. A create cut short by the abort counts as possibly created, as for a killed client.
  */
 export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: TaskStorageLimits, imageId: string,
-  owner: ResourceOwner, options: PreparationOptions & { readonly timeoutMs?: number } = {}): Promise<TaskFilesystems> {
+  owner: ResourceOwner, options: PreparationOptions = {}): Promise<TaskFilesystems> {
   if (options.signal?.aborted)
     throw Object.assign(new Error('Task storage allocation was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
   try { return await runStepsAsync(allocation(clone, limits, imageId, owner, options.timeoutMs ?? 60_000), options); }
@@ -498,19 +506,22 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
  * `removeTaskFilesystems` without blocking the event loop: the same removal, each Docker call in its own process group.
  * It is never cancelled: it runs to its own deadline, so nothing is dropped, and settles only after every call exited.
  */
-export async function removeTaskFilesystemsAsync(filesystems: TaskFilesystems | RecoveredTaskStorage): Promise<void> {
+export async function removeTaskFilesystemsAsync(filesystems: TaskFilesystems | RecoveredTaskStorage,
+  options: PreparationOptions = {}): Promise<void> {
   const recovered = recoveredStorage.get(filesystems as RecoveredTaskStorage);
   if (recovered) {
     const handle = filesystems as RecoveredTaskStorage;
     await runStepsAsync(cleanup(recovered.keeperId ? [recovered.keeperId] : [],
-      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner), {});
+      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner,
+      new Set(), options.timeoutMs ?? 30_000), options);
     recoveredStorage.delete(handle);
     return;
   }
   const allocated = filesystems as TaskFilesystems;
   assertTaskFilesystems(allocated);
   const owner = taskFilesystemOwner(allocated);
-  await runStepsAsync(cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner), {});
+  await runStepsAsync(cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner,
+    new Set(), options.timeoutMs ?? 30_000), options);
   allocations.delete(allocated);
   liveAllocations.delete(owner.allocationId);
 }
@@ -522,6 +533,105 @@ export interface TaskDiff {
   readonly diff: Buffer;
   /** Whether the diff was longer than `maxBytes` and was cut. */
   readonly truncated: boolean;
+}
+
+export interface ExportedTaskPath {
+  readonly path: string;
+  readonly type: 'absent' | 'file' | 'symlink';
+  readonly executable?: boolean;
+  readonly content?: Buffer;
+}
+
+const EXPORT_PATHS_SCRIPT = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const request = JSON.parse(fs.readFileSync(0, 'utf8'));
+if (!request || !Array.isArray(request.paths) || !Number.isSafeInteger(request.maxBytes) || request.maxBytes < 1) process.exit(2);
+let used = 0;
+const entries = [];
+for (const name of request.paths) {
+  if (typeof name !== 'string' || !name || path.posix.isAbsolute(name) || Buffer.byteLength(name) > ${MAXIMUM_NAME_BYTES}
+      || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(name)
+      || name.split('/').some(p => !p || p === '.' || p === '..') || name.split('/')[0] === '.git') process.exit(2);
+  used += Buffer.byteLength(name);
+  if (used > request.maxBytes) process.exit(4);
+  const parts = name.split('/');
+  let cursor = '/work';
+  let missingAncestor = false;
+  for (const part of parts.slice(0, -1)) {
+    cursor = path.join(cursor, part);
+    let stat;
+    try { stat = fs.lstatSync(cursor); }
+    catch (error) {
+      if (error && error.code === 'ENOENT') { missingAncestor = true; break; }
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(3);
+  }
+  if (missingAncestor) { entries.push({ path: name, type: 'absent' }); continue; }
+  const target = path.join('/work', ...parts);
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) {
+    if (error && error.code === 'ENOENT') { entries.push({ path: name, type: 'absent' }); continue; }
+    throw error;
+  }
+  let content;
+  if (stat.isSymbolicLink()) content = Buffer.from(fs.readlinkSync(target, { encoding: 'buffer' }));
+  else if (stat.isFile()) {
+    if (stat.size > request.maxBytes - used) process.exit(4);
+    if (!fs.constants.O_NOFOLLOW) process.exit(3);
+    const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) process.exit(3);
+      if (opened.size > request.maxBytes - used) process.exit(4);
+      content = fs.readFileSync(fd);
+    } finally { fs.closeSync(fd); }
+  } else process.exit(3);
+  used += content.length;
+  if (used > request.maxBytes) process.exit(4);
+  entries.push({ path: name, type: stat.isSymbolicLink() ? 'symlink' : 'file',
+    ...(stat.isFile() ? { executable: (stat.mode & 0o111) !== 0 } : {}), content: content.toString('base64') });
+}
+process.stdout.write(JSON.stringify(entries));
+`;
+
+/** Export exact no-follow entries from task storage. The raw path plus content budget is enforced before output. */
+export async function exportTaskPaths(storage: TaskFilesystems | RecoveredTaskStorage, paths: readonly string[],
+  maxBytes: number, options: StorageScriptOptions): Promise<readonly ExportedTaskPath[]> {
+  if (!Array.isArray(paths) || paths.length > MAXIMUM_DECLARED_LINKS || paths.some(path => typeof path !== 'string' || !path
+      || path.startsWith('/') || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(path) || Buffer.byteLength(path) > MAXIMUM_NAME_BYTES
+      || path.split('/').some(part => !part || part === '.' || part === '..') || path.split('/')[0] === '.git'))
+    throw new Error('Conflict paths are invalid or exceed the entry limit.');
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024)
+    throw new Error('Conflict path export needs a positive limit of at most 32 MiB.');
+  const stdout = await runStorageScript(storage, { kind: 'export', operation: 'Conflict path export',
+    consequence: 'resolved conflict files cannot be exported', entrypoint: 'node',
+    args: ['-e', EXPORT_PATHS_SCRIPT], input: Buffer.from(JSON.stringify({ paths, maxBytes })),
+    maxOutputBytes: Math.ceil(maxBytes / 3) * 4
+      + paths.reduce((n, path) => n + Buffer.byteLength(JSON.stringify(path)) + 96, 2) }, options);
+  const decoded = JSON.parse(stdout) as { path?: unknown; type?: unknown; executable?: unknown; content?: unknown }[];
+  if (!Array.isArray(decoded) || decoded.length !== paths.length) throw new Error('Conflict path export returned a malformed list.');
+  let used = 0;
+  return Object.freeze(decoded.map((entry, index) => {
+    if (entry?.path !== paths[index] || !['absent', 'file', 'symlink'].includes(entry.type as string))
+      throw new Error('Conflict path export returned an unexpected entry.');
+    used += Buffer.byteLength(entry.path as string);
+    if (used > maxBytes) throw new Error('Conflict path export exceeded its byte limit.');
+    if (entry.type === 'absent') {
+      if (entry.content !== undefined || entry.executable !== undefined) throw new Error('Conflict path export returned malformed absence.');
+      return Object.freeze({ path: entry.path as string, type: 'absent' as const });
+    }
+    if (typeof entry.content !== 'string' || (entry.type === 'file' ? typeof entry.executable !== 'boolean' : entry.executable !== undefined))
+      throw new Error('Conflict path export returned malformed content.');
+    const content = Buffer.from(entry.content, 'base64');
+    if (content.toString('base64') !== entry.content) throw new Error('Conflict path export returned malformed base64.');
+    used += content.length;
+    if (used > maxBytes) throw new Error('Conflict path export exceeded its byte limit.');
+    return Object.freeze({ path: entry.path as string, type: entry.type as 'file' | 'symlink',
+      ...(entry.type === 'file' ? { executable: entry.executable as boolean } : {}), content });
+  }));
 }
 export interface ExportOptions extends PreparationOptions {
   /** The commit the storage was seeded from (the clone's head): a full commit ID. */

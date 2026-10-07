@@ -17,6 +17,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer } from '../agents/container/run.ts';
 import { createVendorNetwork } from '../agents/network/network.ts';
 import { createIsolationProbeCommand, createPhasePolicy, type IsolationProbe } from '../agents/policy.ts';
+import type { ProcessGroupLifecycle, ProcessGroupOwner } from '../agents/tracked-docker.ts';
 import { createTaskClone } from '../git/clone.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
@@ -98,6 +99,25 @@ describe('container invocation supervisor', () => {
     expect(isInvocationActive('finite')).toBe(false);
     expect(spawnSync('docker', ['container', 'inspect', current.name]).status).not.toBe(0);
     expect(spawnSync('docker', ['network', 'inspect', current.network.name]).status).not.toBe(0);
+  }, 60_000);
+
+  it('owns every validation, create, attach and cleanup Docker client without overlap', async () => {
+    const current = await profile(fixture(), 'finite-output', 'tracked-docker-clients');
+    let owner: ProcessGroupOwner | null = null;
+    const events: string[] = [];
+    const lifecycle: ProcessGroupLifecycle = {
+      starting: () => { expect(owner).toBeNull(); owner = 'spawning'; events.push('starting'); },
+      started: group => { expect(owner).toBe('spawning'); owner = group; events.push(`started:${group.pgid}`); },
+      settled: expected => { expect(owner).toEqual(expected); owner = null; events.push('settled'); },
+      unsettled: () => { throw new Error('Docker client unexpectedly remained unsettled.'); },
+    };
+    const result = await startProfileInvocation(current, { processLifecycle: lifecycle }).settled;
+    expect(result).toMatchObject({ exitCode: 0, stopReason: undefined });
+    expect(owner).toBeNull();
+    const starts = events.filter(event => event === 'starting').length;
+    expect(starts).toBeGreaterThan(10);
+    expect(events.filter(event => event.startsWith('started:'))).toHaveLength(starts);
+    expect(events.filter(event => event === 'settled')).toHaveLength(starts);
   }, 60_000);
 
   it.each([

@@ -65,18 +65,34 @@ const signalGroup = (pgid: number, signal: NodeJS.Signals | 0) => {
   try { process.kill(-pgid, signal); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
 };
+const processExists = (pid: number) => {
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
+};
+
+/** Whether a post-exit signal still targets the recorded group rather than a leader that reused its numeric ID. */
+export const canSignalDrainingGroup = (leaderExists: boolean, recorded: string | null,
+  current: string | null): boolean => !leaderExists || (recorded !== null && current === recorded);
 
 // The leader can exit while other members of its group still run (for example a child it forked). A group ID stays
 // taken while any member exists, so until the group is empty the ID cannot name someone else's group.
-const drainGroup = async (pgid: number) => {
+const drainGroup = async (group: ProcessGroup) => {
+  const { pgid, identity } = group;
   const giveUpAt = performance.now() + DRAIN_LIMIT_MS;
   while (signalGroup(pgid, 0)) {
+    // A live group with no positive PID equal to its PGID is the original orphaned group: a new group needs that
+    // numeric leader. If such a leader exists, only the exact recorded kernel identity proves it was not reused.
+    const leaderExists = processExists(pgid), current = leaderExists ? processIdentity(pgid) : null;
+    if (!canSignalDrainingGroup(leaderExists, identity, current)) return false;
     signalGroup(pgid, 'SIGKILL');
     if (performance.now() >= giveUpAt) return false;
     await pause(20);
   }
   return true;
 };
+
+/** Kill and await every member of a process group already recorded by the caller. */
+export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drainGroup(group);
 
 /**
  * Run one command as the leader of a new process group. The group is reported through `onProcessGroup` before this
@@ -129,8 +145,9 @@ export function runInProcessGroup(file: string, args: readonly string[],
     const deadline = setTimeout(() => stop('timeout'), options.timeoutMs);
     // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
     // the call still settles only after the group has exited, with the caller's error.
+    const group = Object.freeze({ pgid, startedAt: Date.now(), identity: processIdentity(pgid) });
     let unrecorded: unknown;
-    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now(), identity: processIdentity(pgid) })); }
+    try { options.onProcessGroup?.(group); }
     catch (error) { unrecorded = error; }
     // Normally output past the limit stops the group and settles as ENOBUFS. A caller that classifies from durable state
     // may explicitly keep a bounded prefix and let the process finish instead.
@@ -159,7 +176,7 @@ export function runInProcessGroup(file: string, args: readonly string[],
       exited = true;
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
-      void drainGroup(pgid).then(async drained => {
+      void drainGroup(group).then(async drained => {
         // The group is empty (or given up on): a later SIGKILL could reach a new group that reuses the ID.
         clearTimeout(graceTimer);
         let stdioTimer: ReturnType<typeof setTimeout> | undefined;

@@ -20,6 +20,7 @@ import { PullRequestPublisher } from './publish.ts';
 import type { ReviewService } from './review.ts';
 import { openRunnerRepository, ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
 import { GitRebaser } from './rebase.ts';
+import { createForeignConflictResolver } from './rebase-conflict.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
 
 /**
@@ -216,7 +217,10 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     onResultPrepared: (attemptId, head, history, conflicts) => service.store.prepareRebaseResult(rebasePlanKey, attemptId, head, history, conflicts),
     onResultState: (attemptId, state) => state === 'ready'
       ? service.store.completeRebaseResult(rebasePlanKey, attemptId)
-      : service.store.setRebaseResultState(rebasePlanKey, attemptId, state) }));
+      : service.store.setRebaseResultState(rebasePlanKey, attemptId, state),
+    resolveForeignConflict: createForeignConflictResolver({ store: service.store, identity, planKey: rebasePlanKey,
+      repository, runnerOwner, image, token,
+      limits: { ...EXECUTE_STORAGE, ...config.limits } }) }));
   const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
     diagnosticsCapBytes: config.diagnosticsCapBytes,
     deps: o.recovery ? o.recovery(image) : dRecoveryDeps(image,
