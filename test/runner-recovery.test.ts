@@ -9,7 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { processIdentity } from '../agents/process-group.ts';
-import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup, releasePreparation, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
+import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup,
+  releasePreparation, releaseRebaseProcess, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -263,7 +264,7 @@ describe('startup recovery sequence', () => {
     expect(calls).toEqual(['terminate:5151', 'recover', 'abort-rebase']);
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
-  it('recovers an unsettled pipe-holder marker without signalling a reusable process-group ID', async () => {
+  it('keeps an unsettled pipe-holder fail-closed until the operator explicitly releases the exact rebase', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
@@ -278,11 +279,21 @@ describe('startup recovery sequence', () => {
     const openFiles = vi.fn(() => [] as string[]), abortRebase = vi.fn(async () => { calls.push('abort-rebase');
       expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: null, conflict: { attemptId: child } }); });
     const removeTaskFilesystems = vi.fn(async () => { calls.push('remove-child'); });
-    await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), openFiles,
+    const options = { store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), openFiles,
       deps: deps({ abortRebase, removeTaskFilesystems, processes: { isAlive, terminate }, recoverLeftovers: async () => {
         calls.push('recover'); return { storage: [{ attemptId: child, allocationId, handle: 'child' }], unowned: [] };
-      } }).d });
-    expect(isAlive).not.toHaveBeenCalled(); expect(terminate).not.toHaveBeenCalled(); expect(openFiles).toHaveBeenCalledOnce();
+      } }).d };
+    await expect(recoverStartup(options)).rejects.toThrow(/--release-rebase-process/);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled', conflict: { attemptId: child } });
+    expect(calls).toEqual([]); expect(isAlive).not.toHaveBeenCalled(); expect(terminate).not.toHaveBeenCalled();
+    expect(openFiles).not.toHaveBeenCalled();
+    expect(() => releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token,
+      attemptId: marker.attemptId, openFiles: () => ['escaped-process'] })).toThrow(/still using/);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+    releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token, attemptId: marker.attemptId,
+      openFiles: () => [] });
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: null });
+    await recoverStartup(options);
     expect(calls).toEqual(['recover', 'abort-rebase', 'remove-child']);
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });

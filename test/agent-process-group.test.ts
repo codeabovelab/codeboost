@@ -114,6 +114,21 @@ describe('runInProcessGroup', () => {
     expect(settled).toBe('spawning');
   });
 
+  it('preserves a pre-spawn timeout when recording its settlement also fails', async () => {
+    const outcome = await runTrackedProcess('sh', ['-c', 'exit 0'], { env, timeoutMs: 10,
+      lifecycle: {
+        starting: () => { const until = performance.now() + 20; while (performance.now() < until); },
+        started: () => { throw new Error('must not start'); },
+        settled: () => { throw new Error('settlement write failed'); },
+        unsettled: () => { throw new Error('must not become unsettled'); },
+      },
+    });
+    expect(outcome).toMatchObject({ status: null, error: { code: 'ETIMEDOUT' } });
+    expect(((outcome.error as Error).cause as AggregateError).errors).toMatchObject([
+      { message: expect.stringContaining('ETIMEDOUT'), code: 'ETIMEDOUT' }, { message: 'settlement write failed' },
+    ]);
+  });
+
   it('reports the group in the same turn as the spawn, and returns a normal exit', async () => {
     let reported: ProcessGroup | undefined;
     const pending = runInProcessGroup('sh', ['-c', 'echo out; echo err >&2; exit 3'],

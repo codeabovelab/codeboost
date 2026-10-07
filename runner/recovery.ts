@@ -244,8 +244,12 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   // then prove no descendant still uses the workspace before releasing the process owner.
   for (const { planKey, marker } of activeRebases) if (marker.processGroup) {
     const processGroup = marker.processGroup;
-    // `spawning` is rejected before resource action. `unsettled` means the original group is gone but an escaped
-    // pipe holder was observed: never signal a numeric ID, prove the workspace unused, then release by exact CAS.
+    // `unsettled` proves an escaped process outside the original group still held a pipe. It need not have any file or
+    // cwd beneath the workspace, so no automatic observation can prove it has exited. Keep admission fail-closed until
+    // the operator stops the unknown process and explicitly releases this exact attempt under the runner lock.
+    if (processGroup === 'unsettled')
+      throw new RecoveryBlocked(`An interrupted rebase has an unidentified escaped process; stop it, then run --release-rebase-process ${marker.attemptId}`,
+        [marker.attemptId]);
     if (typeof processGroup !== 'string' && processes.isAlive(processGroup.pgid))
       await processes.terminate(processGroup.pgid, processGroup.identity, o.graceMs ?? 5_000);
     const workspace = join(o.runnerRoot, o.runnerOwner, 'rebases', marker.attemptId);
@@ -357,6 +361,26 @@ export function releasePreparation(o: { store: Store; runnerRoot: string; runner
     rmSync(dir, { recursive: true, force: true });
   }
   if (!o.store.clearPreparationMarker(o.attemptId)) throw new Error('The attempt is not waiting for release.');
+}
+
+/** --release-rebase-process: clear an unidentified escaped-process marker only after explicit operator confirmation. */
+export function releaseRebaseProcess(o: { store: Store; runnerRoot: string; runnerOwner: string; attemptId: string;
+  openFiles?: (dir: string) => string[] }): void {
+  if (!isUuidV4(o.attemptId)) throw new Error('Unknown rebase attempt.');
+  const matches = o.store.rebasesInProgress().filter(value => {
+    const marker = value.marker as { attemptId?: unknown; processGroup?: unknown } | null;
+    return marker?.attemptId === o.attemptId;
+  });
+  if (matches.length !== 1) throw new Error('Unknown rebase attempt.');
+  const marker = matches[0]!.marker as { processGroup?: unknown };
+  if (marker.processGroup !== 'unsettled') throw new Error('The rebase attempt is not waiting for escaped-process release.');
+  const dir = join(o.runnerRoot, o.runnerOwner, 'rebases', o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
+  if (st && (!st.isDirectory() || st.isSymbolicLink())) throw new Error('The rebase path is not a plain directory.');
+  if (st) {
+    const users = (o.openFiles ?? hostOpenFiles)(dir);
+    if (users.length) throw new RecoveryBlocked('A process is still using the rebase directory', users);
+  }
+  o.store.setRebaseProcessGroup(matches[0]!.planKey, o.attemptId, 'unsettled', null);
 }
 /** Processes with a file open or a working directory under dir. Throws if the check cannot run (fail closed). */
 export function hostOpenFiles(dir: string): string[] {

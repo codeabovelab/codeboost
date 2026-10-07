@@ -35,8 +35,9 @@ export async function runTrackedProcess(file: string, args: readonly string[],
     const timeout = Object.assign(new Error(`${file} ${args[0] ?? ''} ETIMEDOUT before spawn.`), { code: 'ETIMEDOUT' });
     try { options.lifecycle.settled('spawning'); }
     catch (error) {
-      return { status: null, stdout: '', stderr: '', error: new Error(
-        `${file} process ownership settlement could not be recorded.`, { cause: new AggregateError([timeout, error]) }) };
+      return { status: null, stdout: '', stderr: '', error: Object.assign(new Error(
+        `${file} process ownership settlement could not be recorded.`, { cause: new AggregateError([timeout, error]) }),
+      { code: 'ETIMEDOUT' }) };
     }
     return { status: null, stdout: '', stderr: '', error: timeout };
   }
@@ -52,8 +53,12 @@ export async function runTrackedProcess(file: string, args: readonly string[],
     else if (code === 'ESTDIOHELD') options.lifecycle.unsettled(owner, 'stdio-held');
     else options.lifecycle.settled(owner);
   } catch (error) {
-    const settlement = new Error(`${file} process ownership settlement could not be recorded.`, { cause: error });
-    if (code === 'EGROUPALIVE' || code === 'ESTDIOHELD') Object.assign(settlement, { code });
+    const original = outcome.error ?? (outcome.status !== null && outcome.status !== 0
+      ? Object.assign(new Error(`${file} ${args[0] ?? ''} exited with status ${outcome.status}.`), { status: outcome.status })
+      : undefined);
+    const settlement = new Error(`${file} process ownership settlement could not be recorded.`,
+      { cause: new AggregateError(original ? [original, error] : [error]) });
+    if (typeof code === 'string') Object.assign(settlement, { code });
     return { status: null, stdout: outcome.stdout, stderr: outcome.stderr,
       error: settlement };
   }

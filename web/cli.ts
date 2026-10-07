@@ -5,21 +5,25 @@ import { startServer, type RunnerSetup } from './server.ts';
 import { productionPlanning } from './planning.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { Store, requireSupportedNode } from '../runner/store.ts';
-import { acquireRunnerLock, releasePreparation } from '../runner/recovery.ts';
+import { acquireRunnerLock, releasePreparation, releaseRebaseProcess } from '../runner/recovery.ts';
 import { RUNNER_NEEDS_GITHUB, baseBranch, parseRunnerConfig, recoveryWarnings, setUpRunner } from '../runner/production.ts';
 requireSupportedNode();
 /** A refusal the person acts on (bad input, a held lock, a blocked recovery): its message and exit 1, not a stack. */
 function refuse(error: unknown): never { console.error(error instanceof Error ? error.message : String(error)); process.exit(1); }
 const checked = <T>(fn: () => T): T => { try { return fn(); } catch (error) { return refuse(error); } };
-const { values } = parseArgs({ options: { demo: { type:'boolean' }, directory:{type:'string'}, config:{type:'string'}, port:{type:'string'}, help:{type:'boolean'}, 'release-preparation':{type:'string'} } });
-if (values.help || (!values.demo && !values.config && values['release-preparation'] === undefined)) {
-  console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate and plan suggestions (Claude Code in a Docker container, like Ask); demos never merge or plan. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block with a baseBranch for its pull requests, and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).');
-} else if (values['release-preparation'] !== undefined) {
-  const attemptId = values['release-preparation'];
+const { values } = parseArgs({ options: { demo: { type:'boolean' }, directory:{type:'string'}, config:{type:'string'}, port:{type:'string'}, help:{type:'boolean'},
+  'release-preparation':{type:'string'}, 'release-rebase-process':{type:'string'} } });
+if (values['release-preparation'] !== undefined && values['release-rebase-process'] !== undefined)
+  refuse(new Error('Choose only one release operation.'));
+const release = values['release-preparation'] !== undefined ? 'preparation' : values['release-rebase-process'] !== undefined ? 'rebase' : undefined;
+if (values.help || (!values.demo && !values.config && release === undefined)) {
+  console.log('codeboost local review\n\nDemo: npm run demo\nExisting store: npm start -- --config /absolute/path/review.json\nOptions: --port 4318 --directory /path/to/demo\n\nThe configuration binds a trusted repository, database, plan identity, and known path identity. Configure the question agent in Settings; Ask runs it in a Docker container (Claude Code needs CLAUDE_CODE_OAUTH_TOKEN; Codex cannot answer questions yet). A github block enables the guarded merge gate and plan suggestions (Claude Code in a Docker container, like Ask); demos never merge or plan. A runner block (root, committer, optional diagnosticsDir and limits) turns on the runner: it needs Docker, the github block with a baseBranch for its pull requests, and CLAUDE_CODE_OAUTH_TOKEN, and runs startup recovery before the server opens.\n\n--release-preparation <attempt ID>: after startup recovery reports a preparation whose process was never recorded, and you have stopped that process, remove its attempt directory (refused while any process still uses it).\n--release-rebase-process <rebase attempt ID>: after startup recovery reports an unidentified escaped rebase process, stop that process and explicitly release its retained marker (refused while any process still uses its rebase directory).');
+} else if (release !== undefined) {
+  const attemptId = release === 'preparation' ? values['release-preparation']! : values['release-rebase-process']!;
   checked(() => {
-    if (!values.config) throw new Error('--release-preparation needs --config.');
+    if (!values.config) throw new Error(`--release-${release === 'preparation' ? 'preparation' : 'rebase-process'} needs --config.`);
     const config = JSON.parse(readFileSync(resolve(values.config), 'utf8'));
-    if (config.runner === undefined) throw new Error('This review has no runner block, so it has no preparations to release.');
+    if (config.runner === undefined) throw new Error(`This review has no runner block, so it has no ${release === 'preparation' ? 'preparations' : 'rebases'} to release.`);
     const runnerConfig = parseRunnerConfig(config.runner);
     // Under the runner lock, so no runner of this database is starting or running while the directory is checked.
     const lock = acquireRunnerLock(config.database);
@@ -27,7 +31,8 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
       const store = new Store(config.database);
       try {
         lock.verify();
-        releasePreparation({ store, runnerRoot: runnerConfig.root, runnerOwner: store.runnerOwnerToken(lock.file), attemptId });
+        const input = { store, runnerRoot: runnerConfig.root, runnerOwner: store.runnerOwnerToken(lock.file), attemptId };
+        if (release === 'preparation') releasePreparation(input); else releaseRebaseProcess(input);
         console.log('Released. Start codeboost again.');
       } finally { store.close(); }
     } finally { lock.release(); }
