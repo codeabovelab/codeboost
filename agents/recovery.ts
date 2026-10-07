@@ -190,9 +190,10 @@ export async function recoverLeftovers(runnerOwner: string, timeoutMs = 120_000,
   for (const resource of owned.container) {
     const kind = kindOf(resource);
     if (kind === 'storage:keeper') keep(resource, 'keeper');
-    // Seeders, export, inspection and commit containers are transient: a leftover one is removed, never kept with the
+    // Seeders, conflict imports, exports, inspections and commits are transient: a leftover one is removed, never kept with the
     // storage.
-    else if (kind === 'storage:seeder' || kind === 'storage:export' || kind === 'storage:inspect' || kind === 'storage:commit'
+    else if (kind === 'storage:seeder' || kind === 'storage:import' || kind === 'storage:export'
+      || kind === 'storage:inspect' || kind === 'storage:commit'
       || kind === 'agent' || kind === 'egress')
       remove.push(resource);
     else unknown(resource);

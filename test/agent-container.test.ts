@@ -15,7 +15,7 @@ import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesys
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { exportTaskDiff, exportTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
+import { exportTaskDiff, exportTaskPaths, importTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
   UnusableRepositoryError } from '../agents/container/storage.ts';
 import { checkConflictTree, checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
   TASK_COMMIT_REF, TaskCommitRefused, TaskTreeRefused, type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
@@ -1738,6 +1738,30 @@ describe('real Docker agent isolation', () => {
       asAgent(data.filesystems, 'printf outside > outside.txt');
       expect(await refusal(checkConflictTree(data.filesystems, { base: data.clone.head, paths: ['file.txt'], imageId })))
         .toContain('"outside.txt" differs outside the conflict set');
+    }, 180_000);
+
+    it('imports a bounded conflict snapshot only after clean storage allocation', async () => {
+      const data = fixture();
+      await importTaskPaths(data.filesystems, [
+        { path: 'file.txt', type: 'file', executable: false, content: Buffer.from('conflicted\n') },
+        { path: 'link', type: 'symlink', content: Buffer.from('file.txt') },
+        { path: 'nested/added.txt', type: 'file', executable: true, content: Buffer.from('added\n') },
+        { path: 'missing/path.txt', type: 'absent' },
+      ], 1024, { imageId });
+      expect(await checkConflictTree(data.filesystems,
+        { base: data.clone.head, paths: ['file.txt', 'link', 'nested/added.txt', 'missing/path.txt'], imageId }))
+        .toEqual({ base: data.clone.head, gitlinks: [] });
+      const exported = await exportTaskPaths(data.filesystems,
+        ['file.txt', 'link', 'nested/added.txt', 'missing/path.txt'], 1024, { imageId });
+      expect(exported).toEqual([
+        { path: 'file.txt', type: 'file', executable: false, content: Buffer.from('conflicted\n') },
+        { path: 'link', type: 'symlink', content: Buffer.from('file.txt') },
+        { path: 'nested/added.txt', type: 'file', executable: true, content: Buffer.from('added\n') },
+        { path: 'missing/path.txt', type: 'absent' },
+      ]);
+      await expect(importTaskPaths(data.filesystems,
+        [{ path: '.git/config', type: 'file', executable: false, content: Buffer.from('unsafe') }], 1024, { imageId }))
+        .rejects.toThrow(/invalid/);
     }, 180_000);
 
     it('mounts every gitlink empty and read-only, so an agent\'s write beneath one is refused', async () => {

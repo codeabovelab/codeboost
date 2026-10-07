@@ -864,10 +864,10 @@ export const EXPORT_SCRIPT = [
   'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ] || [ "${statuses[3]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');
 
-/** A container run over both volumes of task storage, read-only, as the storage user, with no network. */
+/** A container run over both volumes of task storage as the storage user with no network; only `import` may write work. */
 interface StorageScript {
   /** The `io.codeboost.task-storage` kind the container carries; recovery removes a leftover one. */
-  readonly kind: 'export' | 'inspect' | 'commit';
+  readonly kind: 'export' | 'inspect' | 'commit' | 'import';
   /** Names the operation in messages, for example "Task diff export". */
   readonly operation: string;
   /** Ends "Task work volume is missing; ..." when a volume is gone. */
@@ -882,6 +882,8 @@ interface StorageScript {
   readonly tmpBytes?: '64m' | '512m';
   /** Written to the script's stdin (`docker run -i`), which is then closed; without it stdin is not connected. */
   readonly input?: Buffer;
+  /** Only the conflict-snapshot importer may write the work volume; metadata always remains read-only. */
+  readonly writableWork?: boolean;
 }
 export interface StorageScriptOptions extends PreparationOptions {
   /** The immutable ID of the built agent image, whose tools run the script. */
@@ -909,7 +911,7 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', `--memory=${script.memory ?? '256m'}`, '--cpus=.5',
       '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${script.tmpBytes ?? '64m'}`,
-      '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
+      '--mount', `type=volume,source=${workVolume},target=/work${script.writableWork ? '' : ',readonly'}`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
       '--entrypoint', script.entrypoint, imageId, ...script.args];
     const outcome = yield* run(args, remaining(), true, script.maxOutputBytes, script.input);
@@ -932,14 +934,16 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
 }
 
 /**
- * Run a script over task storage (the value `prepareTaskFilesystems` returned, or a recovery handle) in a read-only
- * container with no network, and return its standard output. For D's own storage operations; not part of the contract.
+ * Run a script over task storage (the value `prepareTaskFilesystems` returned, or a recovery handle) in an isolated
+ * container with no network, and return its standard output. All callers mount both volumes read-only except the
+ * bounded conflict importer, which may write only the work volume. For D's own storage operations; not part of the contract.
  * On abort or at the deadline the client is stopped and the container, which outlives a killed client, is removed; the
  * promise settles only after both. An abort rejects with an `AbortError`, unless that container's cleanup did not
  * settle, which rejects with an `AggregateError`.
  */
 export async function runStorageScript(storage: TaskFilesystems | RecoveredTaskStorage, script: StorageScript,
   options: StorageScriptOptions): Promise<string> {
+  if (script.writableWork && script.kind !== 'import') throw new Error('Only a conflict import may write task storage.');
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId)) throw new Error(`${script.operation} requires the immutable built image ID.`);
   assertBuiltAgentImage(options.imageId);
   let owner: ResourceOwner, workVolume: string | undefined, metadataVolume: string | undefined;
@@ -963,6 +967,102 @@ export async function runStorageScript(storage: TaskFilesystems | RecoveredTaskS
     if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
       throw cancelled(error);
     throw error;
+  }
+}
+
+const IMPORT_PATHS_SCRIPT = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const request = JSON.parse(fs.readFileSync(0, 'utf8'));
+if (!request || !Array.isArray(request.entries) || !Number.isSafeInteger(request.maxBytes) || request.maxBytes < 1) process.exit(2);
+let used = 0;
+for (const entry of request.entries) {
+  const name = entry && entry.path;
+  if (typeof name !== 'string' || !name || path.posix.isAbsolute(name) || Buffer.byteLength(name) > ${MAXIMUM_NAME_BYTES}
+      || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(name)
+      || name.split('/').some(p => !p || p === '.' || p === '..') || name.split('/')[0] === '.git'
+      || !['absent', 'file', 'symlink'].includes(entry.type)) process.exit(2);
+  used += Buffer.byteLength(name);
+  let content;
+  if (entry.type === 'absent') {
+    if (entry.content !== undefined || entry.executable !== undefined) process.exit(2);
+  } else {
+    if (typeof entry.content !== 'string' || (entry.type === 'file' ? typeof entry.executable !== 'boolean' : entry.executable !== undefined)) process.exit(2);
+    content = Buffer.from(entry.content, 'base64');
+    if (content.toString('base64') !== entry.content) process.exit(2);
+    used += content.length;
+  }
+  if (used > request.maxBytes) process.exit(4);
+}
+for (const entry of request.entries) {
+  const parts = entry.path.split('/');
+  let cursor = '/work', missing = false;
+  for (const part of parts.slice(0, -1)) {
+    cursor = path.join(cursor, part);
+    let stat;
+    try { stat = fs.lstatSync(cursor); }
+    catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+      if (entry.type === 'absent') { missing = true; break; }
+      fs.mkdirSync(cursor, { mode: 0o755 });
+      stat = fs.lstatSync(cursor);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(3);
+  }
+  if (missing) continue;
+  const target = path.join('/work', ...parts);
+  let current;
+  try { current = fs.lstatSync(target); }
+  catch (error) { if (!error || error.code !== 'ENOENT') throw error; }
+  if (current) {
+    if (!current.isFile() && !current.isSymbolicLink()) process.exit(3);
+    fs.unlinkSync(target);
+  }
+  if (entry.type === 'absent') continue;
+  const content = Buffer.from(entry.content, 'base64');
+  if (entry.type === 'symlink') fs.symlinkSync(content, target);
+  else {
+    const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      entry.executable ? 0o755 : 0o644);
+    try { fs.writeFileSync(fd, content); } finally { fs.closeSync(fd); }
+    fs.chmodSync(target, entry.executable ? 0o755 : 0o644);
+  }
+}
+`;
+
+/** Import a bounded, exact conflict snapshot into a clean allocation without exposing any host path to Docker. */
+export async function importTaskPaths(storage: TaskFilesystems, entries: readonly ExportedTaskPath[], maxBytes: number,
+  options: StorageScriptOptions): Promise<void> {
+  if (!Array.isArray(entries) || entries.length === 0 || entries.length > MAXIMUM_DECLARED_LINKS)
+    throw new Error('Conflict path import needs a non-empty bounded entry list.');
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024)
+    throw new Error('Conflict path import needs a positive limit of at most 32 MiB.');
+  let used = 0;
+  const encoded = entries.map(entry => {
+    if (!entry || typeof entry.path !== 'string' || !entry.path || entry.path.startsWith('/')
+      || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(entry.path) || Buffer.byteLength(entry.path) > MAXIMUM_NAME_BYTES
+      || entry.path.split('/').some((part: string) => !part || part === '.' || part === '..') || entry.path.split('/')[0] === '.git'
+      || !['absent', 'file', 'symlink'].includes(entry.type)) throw new Error('Conflict path import entry is invalid.');
+    used += Buffer.byteLength(entry.path);
+    if (entry.type === 'absent') {
+      if (entry.content !== undefined || entry.executable !== undefined) throw new Error('Conflict path import absence is malformed.');
+      return { path: entry.path, type: entry.type };
+    }
+    if (!Buffer.isBuffer(entry.content) || (entry.type === 'file' ? typeof entry.executable !== 'boolean' : entry.executable !== undefined))
+      throw new Error('Conflict path import content is malformed.');
+    used += entry.content.length;
+    return { path: entry.path, type: entry.type, ...(entry.type === 'file' ? { executable: entry.executable } : {}),
+      content: entry.content.toString('base64') };
+  });
+  if (new Set(entries.map(entry => entry.path)).size !== entries.length) throw new Error('Conflict path import entries must not repeat.');
+  if (used > maxBytes) throw new Error('Conflict path import exceeded its byte limit.');
+  try {
+    await runStorageScript(storage, { kind: 'import', operation: 'Conflict path import',
+      consequence: 'the conflict snapshot cannot be imported', entrypoint: 'node', args: ['-e', IMPORT_PATHS_SCRIPT],
+      input: Buffer.from(JSON.stringify({ entries: encoded, maxBytes })), writableWork: true }, options);
+  } catch (error) {
+    if (error instanceof AggregateError || (error as Error | undefined)?.name === 'AbortError') throw error;
+    throw new Error('Conflict path import failed.', { cause: error });
   }
 }
 

@@ -1,13 +1,13 @@
 import { randomUUID } from 'node:crypto';
 import { chmodSync, constants, lstatSync, mkdirSync, openSync, closeSync, fstatSync, readFileSync, readlinkSync,
-  symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+  realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import { captureInvocation, type InvocationHandle, type TaskClone } from '../agents/contract.ts';
 import { checkConflictTree, inspectTaskChanges, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
   type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
-import { exportTaskPaths, prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync,
+import { exportTaskPaths, importTaskPaths, prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync,
   type ExportedTaskPath, type PreparationOptions, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
 import { DEFAULT_PROCESS_SETTLEMENT_MS, type ProcessGroup } from '../agents/process-group.ts';
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../agents/tracked-docker.ts';
@@ -32,6 +32,7 @@ interface ResolverDeps {
   start(request: AgentAdapterRequest, token: string): InvocationHandle;
   inspect: typeof inspectTaskChanges;
   exportPaths: typeof exportTaskPaths;
+  importPaths: typeof importTaskPaths;
   remove(filesystems: TaskFilesystems, options?: PreparationOptions): Promise<void>;
   removeStaging(path: string, timeoutMs: number, lifecycle: ProcessGroupLifecycle): Promise<void>;
 }
@@ -39,7 +40,7 @@ const REMOVE_STAGING_SCRIPT = "const fs=require('node:fs');fs.rmSync(fs.readFile
 const defaults: ResolverDeps = {
   clone: createTaskCloneAsync, allocate: prepareTaskFilesystemsAsync, snapshotLinks: snapshotDeclaredLinks,
   checkTree: checkConflictTree, start: startClaudeInvocation, inspect: inspectTaskChanges,
-  exportPaths: exportTaskPaths, remove: removeTaskFilesystemsAsync,
+  exportPaths: exportTaskPaths, importPaths: importTaskPaths, remove: removeTaskFilesystemsAsync,
   removeStaging: async (path, timeoutMs, lifecycle) => {
     const outcome = await runTrackedProcess(process.execPath, ['-e', REMOVE_STAGING_SCRIPT], {
       cwd: dirname(path), env: {}, input: Buffer.from(path), timeoutMs, lifecycle,
@@ -153,9 +154,8 @@ function writeEntry(root: string, entry: ExportedTaskPath): void {
   }
 }
 
-/** Copy only exact leaf entries; no ancestor symlink is followed and the complete snapshot is bounded before writes. */
-export function copyConflictPaths(source: string, destination: string, paths: readonly string[],
-  maxBytes = MAX_CONFLICT_SNAPSHOT_BYTES): void {
+/** Read only exact leaf entries; no ancestor symlink is followed and the complete snapshot is bounded. */
+function snapshotConflictPaths(source: string, paths: readonly string[], maxBytes = MAX_CONFLICT_SNAPSHOT_BYTES): readonly ExportedTaskPath[] {
   assertConflictPathSet(paths);
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > MAX_CONFLICT_SNAPSHOT_BYTES)
     throw new Error('Invalid conflict snapshot limit.');
@@ -167,7 +167,13 @@ export function copyConflictPaths(source: string, destination: string, paths: re
     const entry = readEntry(source, path, maxBytes - used - pathBytes);
     used += pathBytes + (entry.content?.length ?? 0); entries.push(entry);
   }
-  for (const entry of entries) writeEntry(destination, entry);
+  return entries;
+}
+
+/** Copy only exact leaf entries; no ancestor symlink is followed and the complete snapshot is bounded before writes. */
+export function copyConflictPaths(source: string, destination: string, paths: readonly string[],
+  maxBytes = MAX_CONFLICT_SNAPSHOT_BYTES): void {
+  for (const entry of snapshotConflictPaths(source, paths, maxBytes)) writeEntry(destination, entry);
 }
 
 function assertResolvedManifest(manifest: TaskChangeManifest, files: readonly string[]): void {
@@ -203,7 +209,7 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
     const childAttemptId = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
     options.store.beginRebaseConflict(options.planKey, input.attemptId,
       { attemptId: childAttemptId, allocationId, networkAllocationId, source: input.commit });
-    const staging = join(input.repository, `.codeboost-conflict-${childAttemptId}`);
+    let staging = join(input.repository, `.codeboost-conflict-${childAttemptId}`);
     let filesystems: TaskFilesystems | undefined, primary: unknown, handle: InvocationHandle | undefined, retainOwnership = false;
     let imageId = '';
     let processGroup: ProcessGroup | 'spawning' | 'unsettled' | null = null;
@@ -262,9 +268,12 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
       imageId = options.image();
       input.signal?.throwIfAborted();
       mkdirSync(staging, { mode: 0o700 });
+      // Profile creation accepts only a canonical cleanup root. Preserve the UUID leaf while resolving any configured
+      // root aliases (for example macOS /var -> /private/var) before handing the path across subsystem boundaries.
+      staging = realpathSync(staging);
       const clone = await bounded(deps.clone({ source: options.repository.path, parent: staging,
         taskId: options.planKey, head: input.baseHead, timeoutMs: operationBudget(), signal: input.signal, processLifecycle }));
-      copyConflictPaths(input.repository, clone.directory, input.files);
+      const conflictSnapshot = snapshotConflictPaths(input.repository, input.files);
       try {
         filesystems = await bounded(deps.allocate(clone, options.limits, imageId,
           { runnerOwner: options.runnerOwner, attemptId: childAttemptId, allocationId },
@@ -273,6 +282,8 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
         if (error instanceof AggregateError) retainOwnership = true;
         throw error;
       }
+      await bounded(deps.importPaths(filesystems, conflictSnapshot, MAX_CONFLICT_SNAPSHOT_BYTES,
+        { imageId, signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
       const links = await bounded(deps.snapshotLinks(filesystems!, input.files,
         { imageId, signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
       const treeCheck: TaskTreeCheck = await bounded(deps.checkTree(filesystems!,
@@ -329,7 +340,12 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
         writeEntry(input.repository, entry);
       }
       if (performance.now() >= deadline) throw deadlineError();
-    } catch (error) { primary = error; }
+    } catch (error) {
+      // An AggregateError from any Docker-backed stage means its own cleanup did not settle. Keep the durable child
+      // claim and all remaining resources for startup recovery instead of racing that still-owned work here.
+      if (error instanceof AggregateError) retainOwnership = true;
+      primary = error;
+    }
     const cleanup: unknown[] = [];
     if (handle && input.signal?.aborted) handle.cancel(stopReason(input.signal));
     if (filesystems && !retainOwnership) try {

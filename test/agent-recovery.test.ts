@@ -161,7 +161,7 @@ describe('recoverLeftovers', () => {
     expect(names()).toContain(agent!.name);
   });
 
-  it.each(['export', 'inspect', 'commit'])('removes a leftover %s container with the other transient containers, keeping the storage', async kind => {
+  it.each(['import', 'export', 'inspect', 'commit'])('removes a leftover %s container with the other transient containers, keeping the storage', async kind => {
     const mine = attempt(A, 'attempt-a'), storageLabels = mine.objects[0]!.labels;
     const transient: FakeObject = { kind: 'container', id: id(), name: `codeboost-${kind}-${randomUUID()}`,
       labels: { ...storageLabels, 'io.codeboost.task-storage': kind } };

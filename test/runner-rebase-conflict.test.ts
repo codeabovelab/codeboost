@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, readFileSync, readlinkSync, readdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
@@ -46,6 +46,7 @@ function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {})
   const events: string[] = [];
   let request: AgentAdapterRequest | undefined;
   let storageAllocationId: string | undefined;
+  let imported: readonly ExportedTaskPath[] | undefined;
   const storage = { keeper: 'keeper' } as TaskFilesystems;
   const d = {
     clone: async (options: AsyncCloneOptions) => {
@@ -68,6 +69,10 @@ function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {})
       options.processLifecycle?.starting(); options.processLifecycle?.started(group); options.processLifecycle?.settled(group);
       return storage;
     },
+    importPaths: async (_storage: TaskFilesystems, entries: readonly ExportedTaskPath[]) => {
+      imported = entries;
+      events.push(`import:${entries[0]?.content?.toString().trim() ?? entries[0]?.type}`);
+    },
     snapshotLinks: async () => ({ links: [], recorded: {}, linkArgs: [] }) as never,
     checkTree: async (_filesystems: TaskFilesystems, options: ProcessOptions) => {
       const group = { pgid: 6262, startedAt: 3, identity: null };
@@ -88,7 +93,8 @@ function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {})
     removeStaging: async (path: string) => { rmSync(path, { recursive: true }); },
     ...over,
   };
-  return { d, events, storage, get request() { return request; }, get storageAllocationId() { return storageAllocationId; } };
+  return { d, events, storage, get request() { return request; }, get storageAllocationId() { return storageAllocationId; },
+    get imported() { return imported; } };
 }
 
 const input = (f: ReturnType<typeof fixture>, signal?: AbortSignal): RebaseConflictInput => ({ attemptId: f.marker.attemptId,
@@ -196,18 +202,33 @@ describe('production foreign conflict resolver', () => {
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null });
   });
 
-  it('claims before preparation, exposes the conflict snapshot, copies back only the audited path, then clears ownership', async () => {
+  it('allocates from the clean clone before importing the conflict snapshot, then copies back only the audited path', async () => {
     const f = fixture(), x = deps(f);
     const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
       repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
       image: () => 'sha256:' + 'b'.repeat(64), token: 'secret', limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
     await resolve(input(f));
-    expect(x.events).toEqual(['clone', 'allocate:conflicted', 'start', 'remove']);
+    expect(x.events).toEqual(['clone', 'allocate:base', 'import:conflicted', 'start', 'remove']);
+    expect(x.imported).toEqual([{ path: 'conflict.txt', type: 'file', executable: false, content: Buffer.from('conflicted\n') }]);
     expect(x.request).toMatchObject({ invocation: { phase: 'fix', approvedArgv: [], runnerOwner: 'a'.repeat(32) },
       prompt: expect.stringContaining('["conflict.txt"]'), cleanupRoot: expect.stringContaining('.codeboost-conflict-') });
     expect(x.request!.networkAllocationId).not.toBe(x.storageAllocationId);
     expect(readFileSync(join(f.repository, 'conflict.txt'), 'utf8')).toBe('resolved\n');
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('canonicalizes a cleanup root whose configured spelling traverses a symlink', async () => {
+    const f = fixture(), aliasParent = join(f.root, 'root-alias'), alias = join(aliasParent, 'rebase');
+    symlinkSync(f.root, aliasParent);
+    const x = deps(f);
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret', limits: { workBytes: 1, workInodes: 1,
+        metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await resolve({ ...input(f), repository: alias });
+    const canonicalRepository = realpathSync(f.repository);
+    expect(x.request!.cleanupRoot).toMatch(new RegExp(`^${canonicalRepository.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/\\.codeboost-conflict-`));
+    expect(x.request!.cleanupRoot).not.toContain('root-alias');
   });
 
   it('reserves process settlement time and retains ownership when the adapter cannot settle by the work deadline', async () => {
@@ -287,6 +308,20 @@ describe('production foreign conflict resolver', () => {
       image: () => 'sha256:' + 'b'.repeat(64), token: 'secret', limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
     await expect(resolve(input(f))).rejects.toThrow(/startup recovery/);
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: { source: oid(2) }, processGroup: null });
+  });
+
+  it('retains storage when conflict import cleanup does not settle', async () => {
+    const f = fixture(), remove = vi.fn(async () => undefined), x = deps(f, {
+      remove,
+      importPaths: async () => { throw new AggregateError([new Error('import container remains')], 'import cleanup did not settle'); },
+    });
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret', limits: { workBytes: 1, workInodes: 1,
+        metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve(input(f))).rejects.toThrow(/startup recovery/);
+    expect(remove).not.toHaveBeenCalled();
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: { source: oid(2) } });
   });
 
   it('retains an exact process group and staging tree when a helper remains alive', async () => {
