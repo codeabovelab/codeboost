@@ -877,22 +877,37 @@ function renderIssuesWithPending(focusIssue) {
   }
   if (Number.isSafeInteger(focused)) document.querySelector(`.issue-trust[data-issue="${focused}"]`)?.focus();
 }
+function withIssueTrust(issue, trust) {
+  const { trust: _trust, trustedAt: _trustedAt, trustedBy: _trustedBy, trustChangedAt: _trustChangedAt, ...metadata } = issue;
+  return { ...metadata, trust: trust.trust,
+    ...(trust.trustedAt === undefined ? {} : { trustedAt: trust.trustedAt }),
+    ...(trust.trustedBy === undefined ? {} : { trustedBy: trust.trustedBy }),
+    ...(trust.trustChangedAt === undefined ? {} : { trustChangedAt: trust.trustChangedAt }) };
+}
+function trustCanReplace(replacement, current) {
+  return replacement.authorLogin === current.authorLogin
+    && (current.trustChangedAt === undefined
+      || (replacement.trustChangedAt !== undefined && replacement.trustChangedAt >= current.trustChangedAt));
+}
 function mergeIssueTrustView(updated, number) {
   const currentState = issuesView?.configured ? issuesView.state : null;
   const updatedState = updated?.configured ? updated.state : null;
   const replacement = updatedState?.issues.find((issue) => issue.number === number);
-  if (!issuesView?.configured || !currentState || !updated?.configured || !updatedState || !replacement) {
-    issuesView = updated;
-    return;
-  }
-  issuesView = { ...issuesView, repository: updated.repository, refreshing: updated.refreshing,
-    state: { ...currentState, issues: currentState.issues.map((issue) => issue.number === number ? replacement : issue) } };
+  const current = currentState?.issues.find((issue) => issue.number === number);
+  // A refresh may have completed while this trust request was in flight. Trust responses own only trust fields, and
+  // only for the same author; they must never restore an older title, rank, author, or a row the refresh removed.
+  if (!issuesView?.configured || !currentState || !updated?.configured || !updatedState || !replacement || !current
+      || !trustCanReplace(replacement, current)) return null;
+  const merged = currentState.issues.map((issue) => issue.number === number ? withIssueTrust(issue, replacement) : issue);
+  issuesView = { ...issuesView, state: { ...currentState, issues: merged } };
+  return merged.find((issue) => issue.number === number) ?? null;
 }
 function mergeTrustCommittedDuring(updated, generation) {
   if (!updated?.configured || !updated.state) return updated;
   return { ...updated, state: { ...updated.state, issues: updated.state.issues.map((issue) => {
     const committed = committedTrustRows.get(issue.number);
-    return committed && committed.generation > generation && committed.issue.authorLogin === issue.authorLogin ? committed.issue : issue;
+    return committed && committed.generation > generation && trustCanReplace(committed, issue)
+      ? withIssueTrust(issue, committed) : issue;
   }) } };
 }
 async function changeIssueTrust(button) {
@@ -914,9 +929,9 @@ async function changeIssueTrust(button) {
     if (trustRetries.get(number) === request) trustRetries.delete(number);
     if (trustGenerations.get(number) !== generation) return;
     trustPending.delete(number);
-    mergeIssueTrustView(updated, number);
-    const committed = updated?.configured && updated.state?.issues.find((entry) => entry.number === number);
-    if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, issue: committed });
+    const committed = mergeIssueTrustView(updated, number);
+    if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, authorLogin: committed.authorLogin,
+      trust: committed.trust, trustedAt: committed.trustedAt, trustedBy: committed.trustedBy, trustChangedAt: committed.trustChangedAt });
     renderIssuesWithPending();
   } catch (error) {
     // A transport failure or 503 proves nothing was returned. Keep the exact request and idempotency key for retry.

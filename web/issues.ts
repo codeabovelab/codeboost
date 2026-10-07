@@ -4,7 +4,7 @@ import type { IssueTrustRecord } from '../runner/store.ts';
 
 /** Issue bodies stay on the server: the screen never shows them, and each may be up to 64 KiB. */
 export type IssueSummary = Omit<RankedIssue, 'body' | 'trust'> & {
-  trust: RankedIssue['trust'] | 'approved'; trustedAt?: string; trustedBy?: string;
+  trust: RankedIssue['trust'] | 'approved'; trustedAt?: string; trustedBy?: string; trustChangedAt?: string;
 };
 type Summarized<State> = State extends unknown ? Omit<State, 'issues'> & { issues: IssueSummary[] } : never;
 export type IssueBoardState = Summarized<IssuePriorityState>;
@@ -47,7 +47,10 @@ export class IssueBoard {
     const state = this.#state && { ...this.#state, issues: this.#state.issues.map(issue => {
       const decision = this.#trust(issue.repository, issue.number);
       if (decision?.revokedAt === null && decision.authorLogin === issue.authorLogin)
-        return { ...issue, trust: 'approved' as const, trustedAt: decision.trustedAt, trustedBy: decision.trustedBy };
+        return { ...issue, trust: 'approved' as const, trustedAt: decision.trustedAt, trustedBy: decision.trustedBy,
+          trustChangedAt: decision.trustedAt };
+      if (decision?.revokedAt !== null && decision?.authorLogin === issue.authorLogin)
+        return { ...issue, trustChangedAt: decision.revokedAt };
       return issue;
     }) } as IssueBoardState;
     return { configured: true, repository: this.#prioritizer.gateway.repository, refreshing: this.#flight !== null, state };

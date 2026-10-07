@@ -1336,9 +1336,13 @@ export class Store {
     if (input.authorLogin !== null && (typeof input.authorLogin !== 'string' || !input.authorLogin || input.authorLogin.length > 100 || /[\s\u0000-\u001f\u007f]/u.test(input.authorLogin)))
       throw new GuardRefusal('Invalid issue author.');
     if (typeof input.trustedBy !== 'string' || !input.trustedBy || input.trustedBy.length > 100) throw new GuardRefusal('Invalid trust decision owner.');
-    const repository = input.repository.toLocaleLowerCase('en-US'), now = new Date().toISOString();
+    const repository = input.repository.toLocaleLowerCase('en-US');
     return this.#transaction(() => {
       const existing = this.issueTrust(repository, input.issue);
+      // Strictly order decisions even when two clients act in the same wall-clock millisecond. Browser responses use
+      // this timestamp as their CAS version, so an older response can never overwrite a newer same-author decision.
+      const previous = existing ? Date.parse(existing.revokedAt ?? existing.trustedAt) : -1;
+      const now = new Date(Math.max(Date.now(), previous + 1)).toISOString();
       if (input.trusted) {
         if (existing?.revokedAt === null && existing.authorLogin === input.authorLogin) return existing;
         this.#run(`INSERT INTO issue_trust(repository,issue,author_login,trusted_by,trusted_at,revoked_at) VALUES (?,?,?,?,?,NULL)

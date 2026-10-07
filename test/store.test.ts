@@ -5,7 +5,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
 import { approveItem, approvalStates, choiceKeys, applyChoices, stable } from '../core/approvals.ts';
@@ -60,6 +60,16 @@ it('scopes issue trust to repository and current author, supports revoke, and mi
     expect(db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'prompt_comments')).toBe(true);
     expect(migrated.issueTrust('owner/a', 5)).toBeNull();
   } finally { db.close(); }
+});
+it('strictly orders same-author trust decisions when the wall clock does not advance', () => {
+  const { store } = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+  try {
+    const trusted = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    const revoked = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+    const retrusted = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    expect(Date.parse(revoked.revokedAt!)).toBeGreaterThan(Date.parse(trusted.trustedAt));
+    expect(Date.parse(retrusted.trustedAt)).toBeGreaterThan(Date.parse(revoked.revokedAt!));
+  } finally { clock.mockRestore(); }
 });
 it('binds suggestion requests before the reply and rejects cross-plan, cancelled, delayed, replayed, and sibling applications', () => {
   const { store } = fixture(); const id = ready(store), sibling = ready(store);

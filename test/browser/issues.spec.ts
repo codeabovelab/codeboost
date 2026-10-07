@@ -170,6 +170,35 @@ test('reuses the trust action ID after a lost response without overwriting a new
   await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeVisible();
 });
 
+test('does not let an older same-author trust response overwrite a newer untrust', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  type TrustBody = { action: string; actionId: string; number: number; authorLogin: string | null };
+  let held: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse; body: TrustBody } | undefined;
+  const captured = deferred<void>(), refreshCompleted = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as TrustBody : undefined;
+    if (body?.action === 'refresh' && held) {
+      const response = await route.fetch(); await route.fulfill({ response }); refreshCompleted.resolve(); return;
+    }
+    if (body?.action !== 'trust' || body.number !== 21 || held) { await route.continue(); return; }
+    held = { route, response: await route.fetch(), body }; captured.resolve();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="21"]');
+  await row.getByRole('button', { name: 'Trust this issue' }).click();
+  await captured.promise;
+  const untrust = await page.request.post(new URL('/api/issues', app.url).href, {
+    headers: { 'x-codeboost-token': app.token }, data: { action: 'untrust', actionId: randomUUID(), number: 21,
+      authorLogin: held!.body.authorLogin },
+  });
+  expect(untrust.ok()).toBe(true);
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await refreshCompleted.promise;
+  await held!.route.fulfill({ response: held!.response });
+  await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeVisible();
+});
+
 test('reuses the trust action ID after a retryable 503', async ({ page }) => {
   app = await startServer(createDemo(join(root, 'demo')), 0);
   const actionIds: string[] = [];
@@ -244,14 +273,17 @@ test('merges successful overlapping trust responses for different issues', async
 test('does not let a refresh started during trust overwrite the committed decision', async ({ page }) => {
   app = await startServer(createDemo(join(root, 'demo')), 0);
   let trustRoute: import('@playwright/test').Route | undefined;
-  let refreshRoute: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  let refreshRoute: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse;
+    updated: { state: { issues: Record<string, unknown>[] } } } | undefined;
   const trustCaptured = deferred<void>(), refreshCaptured = deferred<void>();
   await page.route('**/api/issues', async route => {
     const request = route.request();
     const body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
     if (body.action === 'trust' && body.number === 21 && !trustRoute) { trustRoute = route; trustCaptured.resolve(); return; }
     if (body.action === 'refresh' && trustRoute && !refreshRoute) {
-      refreshRoute = { route, response: await route.fetch() }; refreshCaptured.resolve(); return;
+      const response = await route.fetch(), updated = await response.json() as { state: { issues: Record<string, unknown>[] } };
+      updated.state.issues = updated.state.issues.map(issue => issue.number === 21 ? { ...issue, title: 'Refreshed issue metadata' } : issue);
+      refreshRoute = { route, response, updated }; refreshCaptured.resolve(); return;
     }
     await route.continue();
   });
@@ -264,8 +296,41 @@ test('does not let a refresh started during trust overwrite the committed decisi
   const trusted = await trustRoute!.fetch();
   await trustRoute!.fulfill({ response: trusted });
   await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
-  await refreshRoute!.route.fulfill({ response: refreshRoute!.response });
+  await refreshRoute!.route.fulfill({ response: refreshRoute!.response, json: refreshRoute!.updated });
+  await expect(page.locator('tr[data-issue="21"]').getByRole('link', { name: 'Refreshed issue metadata' })).toBeVisible();
   await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+});
+
+test('does not let an older trust response overwrite a refresh or trust an obsolete author', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let trustRoute: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const trustCaptured = deferred<void>(), refreshCompleted = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request();
+    const body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action === 'trust' && body.number === 21 && !trustRoute) {
+      trustRoute = { route, response: await route.fetch() }; trustCaptured.resolve(); return;
+    }
+    if (body.action === 'refresh' && trustRoute) {
+      const response = await route.fetch(), updated = await response.json() as { state: { issues: Record<string, unknown>[] } };
+      updated.state.issues = updated.state.issues.map(issue => issue.number === 21
+        ? { ...issue, title: 'New issue metadata', authorLogin: 'replacement-author', trust: 'requires-approval' }
+        : issue);
+      await route.fulfill({ response, json: updated }); refreshCompleted.resolve(); return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="21"]');
+  await row.getByRole('button', { name: 'Trust this issue' }).click();
+  await trustCaptured.promise;
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await refreshCompleted.promise;
+  await expect(row.getByRole('link', { name: 'New issue metadata' })).toBeVisible();
+  await trustRoute!.route.fulfill({ response: trustRoute!.response });
+  await expect(row.getByRole('link', { name: 'New issue metadata' })).toBeVisible();
+  await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeVisible();
 });
 
 test('shows unavailable, then current, then stale issue data with the retrieval error', async ({ page }) => {
