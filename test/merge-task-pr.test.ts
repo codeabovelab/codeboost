@@ -133,6 +133,21 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(store.getMergeAttempt(identity)).toBeNull();
   });
 
+  it('reauthorizes issue trust immediately before irreversible admission', async () => {
+    const { store } = published(), gh = github(store);
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    const calls: string[] = [];
+    merges.setAuthorization(async () => {
+      calls.push('capture');
+      return () => { calls.push('revalidate'); throw new GuardRefusal('Issue trust was revoked.'); };
+    });
+    await expect(merges.merge('review-token')).rejects.toThrow('Issue trust was revoked.');
+    expect(calls).toEqual(['capture', 'revalidate']);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('inspects and merges the task\'s published PR and pins it on the attempt', async () => {
     const { store } = published();
     const gh = github(store);

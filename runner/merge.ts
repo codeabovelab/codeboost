@@ -63,6 +63,7 @@ export class MergeCoordinator {
   readonly gateway: MergeGateway;
   readonly operationTimeoutMs: number;
   readonly published: PublishedTarget | null;
+  #authorize: ((signal: AbortSignal) => Promise<() => void | Promise<void>>) | null = null;
   /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
   #settle: <T>(fn: () => T) => T;
   constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability, published?: PublishedTarget) {
@@ -70,6 +71,12 @@ export class MergeCoordinator {
     if (published && (published.configured !== undefined && (!Number.isSafeInteger(published.configured) || published.configured < 1))) throw new Error('Invalid configured pull request.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs; this.published = published ?? null;
     this.#settle = settleWith(capability);
+  }
+
+  /** Install the production issue-trust guard once the server's issue gateway is available. */
+  setAuthorization(authorize: (signal: AbortSignal) => Promise<() => void | Promise<void>>): void {
+    if (this.#authorize) throw new Error('Merge authorization is already configured.');
+    this.#authorize = authorize;
   }
 
   #attempt(): MergeAttempt | null {
@@ -359,6 +366,9 @@ export class MergeCoordinator {
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
+      // Capture the externally authorized issue identity before validation, then re-read it after every other await and
+      // immediately before the local admission transaction. A revoked trust record or changed author fails closed.
+      const validateAuthorization = this.#authorize ? await this.#authorize(signal) : null;
       const { status, resolved } = await this.#statusForMerge(view, signal);
       if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
       view = this.service.load();
@@ -383,6 +393,7 @@ export class MergeCoordinator {
           throw new Error('Merge-queue requirements changed after queue correlation. Refresh before merging.');
         if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
       }
+      if (validateAuthorization) await validateAuthorization();
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {

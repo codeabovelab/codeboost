@@ -85,6 +85,7 @@ export interface PreMergeActionResult {
 export interface PreMergeReadiness {
   stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string;
 }
+export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
 export function preMergeActionResponse(result: PreMergeActionResult) {
   return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
@@ -1008,7 +1009,7 @@ export class Store {
   isRewrittenHead(identity: PlanIdentity, ancestor: string, descendant: string): boolean {
     sha(ancestor); sha(descendant);
     const reverse = new Map<string, Set<string>>();
-    for (const row of this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=?').all(identityKey(identity))) {
+    for (const row of this.#rewriteLineage(identity)) {
       const prior = reverse.get(row.new_sha as string) ?? new Set<string>();
       prior.add(row.old_sha as string); reverse.set(row.new_sha as string, prior);
     }
@@ -1023,15 +1024,23 @@ export class Store {
   rewrittenAncestors(identity: PlanIdentity, descendant: string): string[] {
     sha(descendant);
     const reverse = new Map<string, Set<string>>();
-    for (const row of this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=?').all(identityKey(identity))) {
+    for (const row of this.#rewriteLineage(identity)) {
       const prior = reverse.get(row.new_sha as string) ?? new Set<string>();
       prior.add(row.old_sha as string); reverse.set(row.new_sha as string, prior);
     }
     const answer: string[] = [], pending = [descendant], seen = new Set(pending);
-    while (pending.length) for (const prior of reverse.get(pending.shift()!) ?? []) if (!seen.has(prior)) {
+    for (let index = 0; index < pending.length; index++) for (const prior of reverse.get(pending[index]!) ?? []) if (!seen.has(prior)) {
       seen.add(prior); answer.push(prior); pending.push(prior);
     }
     return answer;
+  }
+  /** A bounded safety scan: truncating rewrite evidence could misclassify a remote head as safe. */
+  #rewriteLineage(identity: PlanIdentity): { old_sha: string; new_sha: string }[] {
+    const rows = this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=? ORDER BY rowid DESC LIMIT ?')
+      .all(identityKey(identity), MAX_REWRITE_LINEAGE_ROWS + 1);
+    if (rows.length > MAX_REWRITE_LINEAGE_ROWS)
+      throw new GuardRefusal(`Rewrite lineage exceeds the ${MAX_REWRITE_LINEAGE_ROWS}-row safety limit; start a fresh review before preparing a merge.`);
+    return rows as { old_sha: string; new_sha: string }[];
   }
   /** Values must be computed by the runner from this exact revision/snapshot, never supplied by a browser. */
   saveReview(identity: PlanIdentity, expected: ReviewState, approvals: readonly Approval[], choices: readonly SegmentChoice[]): void {

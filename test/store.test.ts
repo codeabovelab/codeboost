@@ -7,7 +7,7 @@ import { fixtureGit } from './fixtures/git.ts';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it, vi } from 'vitest';
-import { Store, requireSupportedNode } from '../runner/store.ts';
+import { MAX_REWRITE_LINEAGE_ROWS, Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
 import { approveItem, approvalStates, choiceKeys, applyChoices, stable } from '../core/approvals.ts';
 import { linkHistory, type Segment } from '../core/linking.ts';
@@ -48,6 +48,17 @@ it('settles prepare-merge replays through shutdown and fails interrupted prepara
   expect(store.savedAction(identity, { actionId: active, kind: 'prepare-merge', request })?.response)
     .toEqual({ outcome: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null });
   expect(store.preMergeReady(identity, readiness)).toBe(true);
+});
+it('fails closed when durable rewrite lineage exceeds its safety bound', () => {
+  const { store } = fixture();
+  let head = oid(2);
+  for (let index = 0; index <= MAX_REWRITE_LINEAGE_ROWS; index++) {
+    const next = oid(index + 3);
+    store.recordRebase(identity, state(store), oid(1), next, [{ oldSha: head, newSha: next }]);
+    head = next;
+  }
+  expect(() => store.isRewrittenHead(identity, oid(2), head)).toThrow(/exceeds the 1000-row safety limit/);
+  expect(() => store.rewrittenAncestors(identity, head)).toThrow(/exceeds the 1000-row safety limit/);
 });
 it('recovers an interrupted review check without applying the expired code-writing budget', () => {
   const { store } = fixture();
