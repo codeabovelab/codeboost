@@ -23,6 +23,7 @@ import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
 import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
+import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -231,7 +232,7 @@ function world(): World {
  * earlier process would have left it.
  */
 async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource;
-  issueGateway?: IssueTrustGateway } = {}) {
+  issueGateway?: IssueTrustGateway; preMerge?: (service: ReviewService) => PreMergeCoordinator } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
@@ -280,7 +281,8 @@ async function serve(w: World, options: { before?: (service: ReviewService) => v
           // `hold`: the attempt keeps running until the test releases it.
           settled: (options.hold ?? Promise.resolve()).then(() => ({ attemptId: input.attemptId, context: input.context, exitCode: 0, signal: null, stdout: '', stderr: '' })) }),
         validate: () => ({ head: service.store.getSnapshot(service.config.identity).head, unchanged: true, inScope: [], outOfScope: [] }) };
-    return { deps, sources, findings, publisher, ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
+    return { deps, sources, findings, publisher, ...(options.preMerge ? { preMerge: () => options.preMerge!(service) } : {}),
+      ...(options.env ? { env: options.env } : {}), ...(options.shortRetryMs ? { shortRetryMs: options.shortRetryMs } : {}),
       recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   });
   cleanups.push(close);
@@ -294,7 +296,7 @@ async function act(app: App, action: string, actionId = randomUUID(), expectedSt
   const current = await view(app), stateVersion = expectedStateVersion ?? current.stateVersion, reviewVersion = expectedReviewVersion ?? current.reviewVersion;
   const response = await fetch(`${new URL(app.url).origin}/api/runner`, { method: 'POST', headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' },
     body: JSON.stringify({ action, expectedStateVersion: expectedStateVersion ?? stateVersion,
-      ...((action === 'start' || action === 'resume' || action === 'approve-continuation') ? { expectedReviewVersion: reviewVersion } : {}), actionId }) });
+      ...((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') ? { expectedReviewVersion: reviewVersion } : {}), actionId }) });
   return { status: response.status, body: await response.json() as Record<string, any> };
 }
 const publishSettled = (app: App, identity: PlanIdentity) => vi.waitFor(async () => {
@@ -1357,6 +1359,38 @@ describe('github.baseBranch', () => {
 
 describe('closing a cancelled task\'s pull requests (#111)', () => {
   const closedRecord = { outcome: 'closed', action: 'close' };
+  it('closes a ready PR after an asynchronously cancelled pre-merge preparation settles', async () => {
+    const w = world(), settle = Promise.withResolvers<void>();
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { return { number, authorLogin: 'member', collaborator: true }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    let active = false, cancelId: string | undefined;
+    const { app, identity, store } = await serve(w, { before: completeAll, issueGateway, preMerge: service => ({
+      get active() { return active; }, get last() { return null; }, assertStartable() {},
+      start: () => {
+        active = true;
+        return settle.promise.then(() => {
+          service.store.cancelTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, cancelId!);
+          active = false;
+          const snapshot = service.store.getSnapshot(service.config.identity);
+          return { state: 'failed' as const, base: snapshot.base, head: snapshot.head, checked: [], reason: 'Task cancelled.' };
+        });
+      },
+      cancelTask: (_version: number, actionId: string) => { cancelId = actionId; settle.resolve(); return 'stopping' as const; },
+      close: async () => undefined,
+    } as unknown as PreMergeCoordinator) });
+    await publishSettled(app, identity);
+    expect(w.github.prs).toEqual([expect.objectContaining({ open: true, draft: false })]);
+    expect(await act(app, 'prepare-merge')).toMatchObject({ status: 200, body: { result: { outcome: 'preparing' } } });
+    expect((await act(app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 20_000, interval: 20 });
+    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(w.github.prs[0]!.open).toBe(false);
+  });
+
   it('closes a ready PR when a task in review is cancelled, and keeps the branch', async () => {
     const w = world();
     const { app, identity, store, branch, head } = await serve(w, { before: completeAll });

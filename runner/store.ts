@@ -1788,9 +1788,15 @@ export class Store {
   commandChecksPassed(identity: PlanIdentity, item: string, head: string, commandsDigest: string): boolean {
     sha(head);
     if (!/^[a-f0-9]{64}$/.test(commandsDigest)) throw new Error('Invalid command-check digest.');
-    return !!this.#get(`SELECT 1 FROM attempts WHERE plan_key=? AND kind='check' AND item=? AND state='completed'
-      AND json_valid(result) AND json_extract(result,'$.passed')=1 AND json_extract(result,'$.head')=?
-      AND json_extract(result,'$.commandsDigest')=? ORDER BY rowid DESC LIMIT 1`, identityKey(identity), item, head, commandsDigest);
+    // The latest attempt for this item and materialized head is authoritative. A later failure, cancellation or
+    // interruption must invalidate an older pass even though terminal failures deliberately carry no result payload.
+    const row = this.#get(`SELECT a.state, a.result FROM attempts a JOIN snapshots s
+      ON s.key=a.plan_key AND s.id=json_extract(a.context,'$.snapshotId')
+      WHERE a.plan_key=? AND a.kind='check' AND a.item=? AND json_extract(s.data,'$.head')=?
+      ORDER BY a.rowid DESC LIMIT 1`, identityKey(identity), item, head);
+    if (!row || row.state !== 'completed' || typeof row.result !== 'string') return false;
+    const result = decode<Record<string, unknown>>(row.result);
+    return result.passed === true && result.head === head && result.commandsDigest === commandsDigest;
   }
   /** Cancel task: closes now, or, with an active attempt, stops it first and closes when it settles. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {

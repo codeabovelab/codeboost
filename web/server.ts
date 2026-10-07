@@ -284,6 +284,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (!publishing || stopping) return;
       publishing.actIfOwed(identity);
     });
+  /** A preparation can finish the delayed half of task cancellation; close its PRs only after that settlement. */
+  const afterPreMerge = (outcome: Promise<unknown>) => void outcome
+    .catch(error => console.error(`Pre-merge preparation failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`))
+    .finally(() => {
+      if (!publishing || stopping || service.store.getTask(identity).status !== 'cancelled') return;
+      publishing.taskCancelled(identity);
+    });
   const runnerAction = async (input: Record<string, unknown>, signal: AbortSignal) => {
     const { action, attemptId, expectedStateVersion, expectedReviewVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
@@ -341,7 +348,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }
     }
     // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
-    // stopping an attempt closes the task when the attempt settles; the run's end then closes them (afterRun).
+    // stopping an attempt closes the task when the attempt settles; the execution or pre-merge run's end then closes
+    // them (afterRun).
     // Only this action's own cancel: a replayed or refused one (the task already closed) starts nothing.
     if (action === 'cancel-task') {
       const before = service.store.getTask(identity).status;
@@ -380,8 +388,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           throw new GuardRefusal('The runner or publisher is busy; pre-merge preparation cannot start yet.');
         preMerge.assertStartable();
         const snapshotId = service.store.getSnapshot(identity).id;
-        service.store.afterCommit(() => { void preMerge!.start({ stateVersion: expectedStateVersion as number,
-          reviewVersion: expectedReviewVersion as number, snapshotId, actionId: actionId as string }); });
+        service.store.afterCommit(() => { afterPreMerge(preMerge!.start({ stateVersion: expectedStateVersion as number,
+          reviewVersion: expectedReviewVersion as number, snapshotId, actionId: actionId as string })); });
         return { outcome: 'preparing' };
       }
       if (action === 'approve-continuation') {

@@ -36,6 +36,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   commandWaitsForDeadline?: boolean;
+  releaseFails?: boolean;
   unsettledRebase?: boolean;
   operationTimeoutMs?: number;
   authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
@@ -88,7 +89,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       return { clone: { id: attempt.id, taskId: 'task', directory: repository, head: checkedHead }, storage: {} } as WorkspaceRef;
     },
     async snapshotDeclaredLinks() { throw new Error('not used'); }, async checkTree() { throw new Error('not used'); },
-    async inspectChanges() { throw new Error('not used'); }, async commit() { throw new Error('not used'); }, async release() {},
+    async inspectChanges() { throw new Error('not used'); }, async commit() { throw new Error('not used'); },
+    async release() { if (options.releaseFails) throw new Error('cleanup failed'); },
   };
   const cancelReasons: string[] = [];
   const runner = new RunnerCoordinator(service.store, commandCheckDeps(service.store, workspace, input => {
@@ -198,6 +200,14 @@ it('blocks when a command check fails on the rewritten head', async () => {
   expect(result.reason).toMatch(/command checks did not pass/);
   expect(checkedHeads).toEqual([rebased]);
   await coordinator.close(); await runner.close();
+});
+
+it('does not report readiness when command-check cleanup is unresolved', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { releaseFails: true });
+  expect(fixture.result).toMatchObject({ state: 'failed', checked: [] });
+  expect(fixture.result.reason).toMatch(/cleanup could not be confirmed/);
+  expect(fixture.runner.status(fixture.service.config.identity).unresolved).not.toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
 });
 
 it('revalidates task and review versions after the final remote read', async () => {

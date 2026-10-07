@@ -67,3 +67,18 @@ it('does not turn a nonzero or stopped command into passing evidence', async () 
     await f.runner.close();
   }
 });
+
+it('invalidates an older pass when the latest check on the same head fails', async () => {
+  let exitCode = 0;
+  const f = fixture(async input => ({ attemptId: input.attemptId, context: input.context, exitCode, signal: null,
+    stdout: '', stderr: exitCode ? 'failed' : '' }));
+  for (const expected of [true, false]) {
+    const attempt = f.runner.start(identity, { expectedStateVersion: f.store.getTask(identity).stateVersion, kind: 'check', item: 'P1',
+      deadline: Date.now() + 60_000, expectedContext: f.store.currentContext(identity) });
+    await f.runner.settled(identity);
+    expect(f.store.getAttempt(identity, attempt.id).state).toBe(expected ? 'completed' : 'failed');
+    expect(f.store.commandChecksPassed(identity, 'P1', oid(2), commandDigest(commands))).toBe(expected);
+    exitCode = 1;
+  }
+  await f.runner.close();
+});

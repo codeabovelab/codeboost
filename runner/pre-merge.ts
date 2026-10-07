@@ -239,6 +239,9 @@ export class PreMergeCoordinator {
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       signal.throwIfAborted();
       const settled = this.service.store.getAttempt(identity, attempt.id);
+      const runnerStatus = this.runner.status(identity);
+      if (runnerStatus.unresolved || this.runner.unreleased)
+        throw new GuardRefusal('Command-check cleanup could not be confirmed; restart and recover owned resources before preparing a merge.');
       if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
         ? settled.diagnostic : `${item.id} command checks did not pass.`);
       checked.push(item.id); view = this.service.load();
