@@ -1037,6 +1037,9 @@ export async function importTaskPaths(storage: TaskFilesystems, entries: readonl
     throw new Error('Conflict path import needs a non-empty bounded entry list.');
   if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024)
     throw new Error('Conflict path import needs a positive limit of at most 32 MiB.');
+  // Encoding follows user-controlled snapshot size and runs synchronously. Own one monotonic deadline before it, then
+  // admit Docker work only with the budget that remains after the payload is fully serialized.
+  const remaining = createDeadline(options.timeoutMs ?? 60_000);
   let used = 0;
   const encoded = entries.map(entry => {
     if (!entry || typeof entry.path !== 'string' || !entry.path || entry.path.startsWith('/')
@@ -1056,10 +1059,11 @@ export async function importTaskPaths(storage: TaskFilesystems, entries: readonl
   });
   if (new Set(entries.map(entry => entry.path)).size !== entries.length) throw new Error('Conflict path import entries must not repeat.');
   if (used > maxBytes) throw new Error('Conflict path import exceeded its byte limit.');
+  const input = Buffer.from(JSON.stringify({ entries: encoded, maxBytes })), timeoutMs = remaining();
   try {
     await runStorageScript(storage, { kind: 'import', operation: 'Conflict path import',
       consequence: 'the conflict snapshot cannot be imported', entrypoint: 'node', args: ['-e', IMPORT_PATHS_SCRIPT],
-      input: Buffer.from(JSON.stringify({ entries: encoded, maxBytes })), writableWork: true }, options);
+      input, writableWork: true }, { ...options, timeoutMs });
   } catch (error) {
     if (error instanceof AggregateError || (error as Error | undefined)?.name === 'AbortError') throw error;
     throw new Error('Conflict path import failed.', { cause: error });
