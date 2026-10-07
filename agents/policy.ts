@@ -98,6 +98,26 @@ export function createClaudeCommand(policy: PhasePolicy, prompt: string, schema?
 }
 
 /**
+ * The command-check adapter runs this fixed image-owned dispatcher. The approved argv travel in the captured schema
+ * file, not in a process argument, and the profile proves that the mounted bytes are the bytes approved here.
+ */
+export function createRunnerCommand(policy: PhasePolicy, commands: string): AgentCommand {
+  if (assertPhasePolicy(policy).vendor !== 'runner' || policy.phase !== 'review')
+    throw new Error('Runner commands require the read-only review policy.');
+  if (!commands || commands.includes('\0') || Buffer.byteLength(commands, 'utf8') > MAX_COMMAND_SCHEMA_BYTES)
+    throw new Error('Runner command input must be bounded JSON without NUL.');
+  let parsed: unknown;
+  try { parsed = JSON.parse(commands); } catch { throw new Error('Runner command input must be JSON.'); }
+  if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 100 || parsed.some(argv => !Array.isArray(argv)
+      || argv.length === 0 || argv.some(arg => typeof arg !== 'string' || arg.includes('\0'))))
+    throw new Error('Runner command input must contain complete literal argv arrays.');
+  const invocation = assertPhasePolicy(policy);
+  for (const argv of parsed as string[][]) if (!permitsCommand(invocation, argv))
+    throw new Error('Runner command was not approved exactly for this invocation.');
+  return command(policy, ['node', '/usr/local/bin/codeboost-command-check', '/run/codeboost-input/schema.json'], commands);
+}
+
+/**
  * A planning schema must describe a JSON object (Claude returns `structured_output` as an object) and fit one command
  * argument. Returns the schema unchanged.
  */

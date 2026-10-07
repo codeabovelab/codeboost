@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fixtureGit } from './fixtures/git.ts';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
@@ -28,6 +29,22 @@ function fixture(two = false) { const path = join(directory(), 'state.sqlite'); 
   store.createPlan(JSON.stringify(initial), 'json', context, oid(1), oid(2)); return { path, store }; }
 const state = (store: Store) => ({ revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id });
 function ready(store: Store) { const id = store.beginSuggestions(identity, state(store), 'suggest'); store.completeSuggestions(identity, id, reply()); return id; }
+it('settles prepare-merge replays through shutdown and fails interrupted preparations at startup recovery', () => {
+  const { store } = fixture(), request = { expectedStateVersion: 0, expectedReviewVersion: 0 };
+  const completed = randomUUID(), interrupted = randomUUID();
+  store.userAction(identity, { actionId: completed, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  store.userAction(identity, { actionId: interrupted, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  store.settleInterruptedPreMergeActions(identity);
+  expect(store.savedAction(identity, { actionId: completed, kind: 'prepare-merge', request })?.response)
+    .toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/restarted/) });
+  const active = randomUUID();
+  store.userAction(identity, { actionId: active, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const capability = store.shutdownCapability(); store.closeWrites();
+  capability.run(() => store.settlePreMergeAction(identity, active,
+    { state: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null }));
+  expect(store.savedAction(identity, { actionId: active, kind: 'prepare-merge', request })?.response)
+    .toEqual({ outcome: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null });
+});
 it('allocates revisions in SQLite, survives reopen, and keeps old revisions and snapshots immutable', () => {
   const { store, path } = fixture(); const first = store.getSnapshot(identity);
   expect(store.getPlan(identity).revision).toBe(1);

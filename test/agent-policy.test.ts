@@ -1,14 +1,14 @@
 import { describe, expect, it, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { assertAgentCommand, assertAgentTool, assertCommandSchema, codexBaseArguments, createClaudeCommand,
-  createCodexCommand, createPhasePolicy, dispatchApprovedCommand, MAX_COMMAND_SCHEMA_BYTES } from '../agents/policy.ts';
+  createCodexCommand, createPhasePolicy, createRunnerCommand, dispatchApprovedCommand, MAX_COMMAND_SCHEMA_BYTES } from '../agents/policy.ts';
 import planSchema from '../schema/versions/1/plan.schema.json' with { type: 'json' };
 import editSchema from '../schema/versions/1/plan-edit.schema.json' with { type: 'json' };
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const SCHEMA = '{"type":"object","properties":{"title":{"type":"string"}},"required":["title"]}\n';
 
 let attempt = 0;
-const request = (phase: Phase, vendor: 'claude' | 'codex' = 'claude'): InvocationInput => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
+const request = (phase: Phase, vendor: 'claude' | 'codex' | 'runner' = 'claude'): InvocationInput => captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
   clone: { id: 'clone-1', taskId: 'task-1', directory: '/tmp/task', head: 'a'.repeat(40) },
   vendor, phase, approvedArgv: ['planning', 'questions'].includes(phase) ? [] : [['npm', 'test']],
   deadline: 2000, attemptId: `attempt-${phase}-${++attempt}`,
@@ -115,6 +115,16 @@ describe('agent phase policy', () => {
     // A command without a schema reads nothing from the mount.
     const review = createClaudeCommand(createPhasePolicy(request('review')), 'Review.');
     expect(() => assertCommandSchema(review, Buffer.from('anything'))).not.toThrow();
+  });
+
+  it('runs only complete approved argv arrays in the credential-free review profile', () => {
+    const policy = createPhasePolicy(request('review', 'runner'));
+    const schema = JSON.stringify([['npm', 'test']]);
+    const command = createRunnerCommand(policy, schema);
+    expect(command.argv).toEqual(['node', '/usr/local/bin/codeboost-command-check', '/run/codeboost-input/schema.json']);
+    expect(() => assertCommandSchema(command, Buffer.from(schema))).not.toThrow();
+    expect(() => createRunnerCommand(policy, JSON.stringify([['npm', 'test', '--changed']]))).toThrow(/not approved exactly/);
+    expect(() => createRunnerCommand(createPhasePolicy(request('execute', 'runner')), schema)).toThrow(/review policy/);
   });
 
   it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(

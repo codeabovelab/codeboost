@@ -147,6 +147,21 @@ export class MergeCoordinator {
     return (await this.#status(view, fresh, signal)).status;
   }
 
+  /** Fresh exact base/head pair for pre-merge preparation, using the same task-PR resolution as merge admission. */
+  async remotePair(signal?: AbortSignal): Promise<{ base: string; head: string }> {
+    const resolved = this.#resolve(this.#attempt());
+    const remote = await this.gateway.inspect({ fresh: true, timeoutMs: 6_000, signal,
+      ...(resolved.target ? { target: resolved.target } : {}) });
+    signal?.throwIfAborted();
+    if (resolved.target && remote.pullRequest !== resolved.target.pullRequest)
+      throw new Error('GitHub returned a different pull request.');
+    if (resolved.headBranch !== undefined) {
+      const blockers = this.#publishedBlockers(remote, resolved);
+      if (blockers.length) throw new GuardRefusal(blockers[0]!.message);
+    }
+    return { base: remote.base, head: remote.head };
+  }
+
   async #status(view: ReviewView, fresh: boolean, signal?: AbortSignal): Promise<{ status: MergeStatus; resolved: ResolvedTarget }> {
     const blockers: MergeBlocker[] = [];
     for (const item of view.items) {

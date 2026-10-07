@@ -5,12 +5,13 @@ import { buildAgentImage } from '../agents/container/image.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync, type TaskStorageLimits } from '../agents/container/storage.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
+import { startRunnerCommandInvocation } from '../agents/adapters/runner.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
 import { GhIssueGateway, withIssueReadDeadline, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { baseBranch } from '../github/validate.ts';
 import { identityKey } from '../core/identity.ts';
-import type { RunnerDeps } from './coordinator.ts';
+import { combineRunnerDeps, type RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
 import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources, type GuardedIssueText } from './execution.ts';
 import { GuardRefusal, isUuidV4, quoteForTerminal, type ShutdownCapability } from './lifecycle.ts';
@@ -22,6 +23,9 @@ import { openRunnerRepository, ownerOnlyDirectory, type RunnerRepository } from 
 import { GitRebaser } from './rebase.ts';
 import { createForeignConflictResolver } from './rebase-conflict.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
+import { commandCheckDeps } from './checks.ts';
+import { PreMergeCoordinator } from './pre-merge.ts';
+import type { RunnerCoordinator } from './coordinator.ts';
 
 /**
  * The production runner (#91): D's real workspace, launcher, recovery, export and removal, under the database's runner
@@ -142,6 +146,23 @@ export function claudeLauncher(o: { imageId: string; runnerRoot: string; runnerO
   };
 }
 
+/** D's credential-free read-only container for one item's exact `cmd:` argv arrays. */
+export function runnerCommandLauncher(o: { imageId: string; runnerRoot: string; runnerOwner: string;
+  start?: typeof startRunnerCommandInvocation }) {
+  return (input: Parameters<typeof startRunnerCommandInvocation>[0]['invocation'], commands: string,
+    workspace: Parameters<typeof workspaceFilesystems>[0]) => {
+    if (!isUuidV4(input.attemptId)) throw new Error('Attempt ID must be a UUID v4.');
+    const directory = join(o.runnerRoot, o.runnerOwner, 'attempts', input.attemptId, 'input');
+    mkdirSync(directory, { mode: 0o755 });
+    chmodSync(directory, 0o755);
+    const schema = join(directory, 'schema.json');
+    writeFileSync(schema, commands, { mode: 0o444, flag: 'wx' });
+    chmodSync(schema, 0o444);
+    return (o.start ?? startRunnerCommandInvocation)({ invocation: input, filesystems: workspaceFilesystems(workspace),
+      inputDirectory: directory, imageId: o.imageId, prompt: '', networkAllocationId: randomUUID() });
+  };
+}
+
 /**
  * What startup recovery left for a person (runner-lifecycle.md: never removed automatically), one line each. Docker
  * labels and file names are not codeboost's, so each is quoted: a newline or control character in one cannot forge a line.
@@ -165,6 +186,8 @@ export interface RunnerAssembly {
   readonly env?: NodeJS.ProcessEnv;
   /** Tests only: the delay of the publisher's short retry (SHORT_RETRY_MS, 30 s). */
   readonly shortRetryMs?: number;
+  /** F5 production refresh/rebase/check coordinator, built against the configured task PR. */
+  readonly preMerge?: (runner: RunnerCoordinator, inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>) => PreMergeCoordinator;
   readonly sources: ExecutionSources;
   readonly findings: SafetyFindings;
   readonly recovery: RecoveryReport;
@@ -213,14 +236,14 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   // Exposing the raw rebaser before that coordinator exists would let a caller bypass those required guards.
   const getRebaser = () => rebaserPromise ??= getRepository().then(repository => new GitRebaser({ repository,
     runnerRoot: config.root, runnerOwner, committer: config.committer,
-    onProcessStarting: attemptId => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, null, 'spawning'),
-    onProcessGroup: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, 'spawning', group),
-    onProcessGroupSettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, null),
-    onProcessUnsettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, 'unsettled'),
-    onResultPrepared: (attemptId, head, history, conflicts) => service.store.prepareRebaseResult(rebasePlanKey, attemptId, head, history, conflicts),
+    onProcessStarting: attemptId => o.capability.run(() => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, null, 'spawning')),
+    onProcessGroup: (attemptId, group) => o.capability.run(() => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, 'spawning', group)),
+    onProcessGroupSettled: (attemptId, group) => o.capability.run(() => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, null)),
+    onProcessUnsettled: (attemptId, group) => o.capability.run(() => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, 'unsettled')),
+    onResultPrepared: (attemptId, head, history, conflicts) => o.capability.run(() => service.store.prepareRebaseResult(rebasePlanKey, attemptId, head, history, conflicts)),
     onResultState: (attemptId, state) => state === 'ready'
-      ? service.store.completeRebaseResult(rebasePlanKey, attemptId)
-      : service.store.setRebaseResultState(rebasePlanKey, attemptId, state),
+      ? o.capability.run(() => service.store.completeRebaseResult(rebasePlanKey, attemptId))
+      : o.capability.run(() => service.store.setRebaseResultState(rebasePlanKey, attemptId, state)),
     resolveForeignConflict: createForeignConflictResolver({ store: service.store, identity, planKey: rebasePlanKey,
       repository, runnerOwner, image, token,
       limits: { ...EXECUTE_STORAGE, ...config.limits } }) }));
@@ -228,6 +251,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     diagnosticsCapBytes: config.diagnosticsCapBytes,
     deps: o.recovery ? o.recovery(image) : dRecoveryDeps(image,
       { abort: async (attemptId, resultHead, state) => (await getRebaser()).abort(attemptId, resultHead, state) }, rebasePlanKey) });
+  service.store.settleInterruptedPreMergeActions(identity);
   const repository = await getRepository();
   const imageId = image();
   const workspace = createTaskWorkspace({ store: service.store, runnerRoot: config.root, runnerOwner, repository, imageId,
@@ -274,8 +298,11 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     vendor: () => 'claude',
   };
   const findings = new SafetyFindings(service.store, o.capability);
-  const deps = executionDeps(service.store, workspace, claudeLauncher({ imageId, runnerRoot: config.root, runnerOwner, token }), sources, runnerOwner, findings,
-    { diagnostics: { directory: diagnosticsDir, capBytes: config.diagnosticsCapBytes ?? DEFAULT_DIAGNOSTICS_CAP_BYTES } });
+  const deps = combineRunnerDeps(
+    executionDeps(service.store, workspace, claudeLauncher({ imageId, runnerRoot: config.root, runnerOwner, token }), sources, runnerOwner, findings,
+      { diagnostics: { directory: diagnosticsDir, capBytes: config.diagnosticsCapBytes ?? DEFAULT_DIAGNOSTICS_CAP_BYTES } }),
+    commandCheckDeps(service.store, workspace,
+      runnerCommandLauncher({ imageId, runnerRoot: config.root, runnerOwner }), requested => sources.planContext(requested), runnerOwner));
   const github = review.github;
   // Never a `url` here (#101 review, finding 6): the push goes to the configured repository on GH_HOST, from the runner's
   // own repository. Only commits the ledger records as codeboost's may be overwritten. The F3 rebase foundation can
@@ -286,5 +313,12 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const env = o.env as NodeJS.ProcessEnv;
   const publisher = (closing: () => boolean) => new PullRequestPublisher(service.store, { checks: new GhAlreadyFixedGateway({ repository: github.repository, env }),
     pulls: new GhPullRequestGateway({ repository: github.repository, env }), pusher, closing }, { repository: github.repository, baseBranch: base });
-  return { deps, sources, findings, recovery, publisher, env };
+  const rebaser = await getRebaser();
+  const preMerge = (runner: RunnerCoordinator,
+    inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>) =>
+    new PreMergeCoordinator(service, runner, rebaser, {
+      inspect,
+      fetch: (pair, signal) => pusher.fetchCommits([pair.base, pair.head], signal),
+    }, undefined, o.capability);
+  return { deps, sources, findings, recovery, publisher, env, preMerge };
 }

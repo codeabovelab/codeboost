@@ -6,7 +6,7 @@ import { ATTEMPT_PHASES, GuardRefusal, ShuttingDownError, WRITABLE_KINDS, bounde
 /** What F's host-side preparation hands to D's start call. */
 export interface PreparedAttempt {
   readonly clone: TaskClone;
-  readonly vendor: 'claude' | 'codex';
+  readonly vendor: InvocationInput['vendor'];
   readonly approvedArgv: readonly (readonly string[])[];
   /** Opaque data the deps keep for their own finish/release steps (for example the task workspace). */
   readonly private?: unknown;
@@ -76,6 +76,47 @@ export interface RunnerDeps {
   /** Optional: remove task storage after the terminal write and before the slot is freed. A failure keeps the slot under a marker. */
   release?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void>;
   now?(): number;
+}
+
+/** Compose kind-specific runner dependencies while preserving each implementation's private prepared value. */
+export function combineRunnerDeps(...delegates: readonly RunnerDeps[]): RunnerDeps {
+  if (!delegates.length) throw new Error('At least one runner dependency set is required.');
+  const runnerOwner = delegates[0]!.runnerOwner;
+  if (delegates.some(delegate => delegate.runnerOwner !== runnerOwner || !delegate.kinds?.length))
+    throw new Error('Combined runner dependencies need one owner and explicit kinds.');
+  const byKind = new Map<AttemptKind, RunnerDeps>();
+  for (const delegate of delegates) for (const kind of delegate.kinds!) {
+    if (byKind.has(kind)) throw new Error(`Runner kind ${kind} has more than one implementation.`);
+    byKind.set(kind, delegate);
+  }
+  type Combined = { delegate: RunnerDeps; prepared: PreparedAttempt };
+  const unpack = (prepared: PreparedAttempt): Combined => prepared.private as Combined;
+  const wrap = (delegate: RunnerDeps, prepared: PreparedAttempt): PreparedAttempt => ({
+    clone: prepared.clone, vendor: prepared.vendor, approvedArgv: prepared.approvedArgv,
+    private: { delegate, prepared } satisfies Combined,
+  });
+  const select = (attempt: AttemptRecord) => {
+    const delegate = byKind.get(attempt.kind);
+    if (!delegate) throw new Error(`No runner dependency can run ${attempt.kind}.`);
+    return delegate;
+  };
+  return {
+    runnerOwner, kinds: [...byKind.keys()],
+    async prepare(attempt, signal) { const delegate = select(attempt); return wrap(delegate, await delegate.prepare(attempt, signal)); },
+    async cleanupPreparation(attempt) { await select(attempt).cleanupPreparation(attempt); },
+    beforeStart(attempt, prepared) { const value = unpack(prepared); value.delegate.beforeStart?.(attempt, value.prepared); },
+    start(input, prepared) { const value = unpack(prepared); return value.delegate.start(input, value.prepared); },
+    onStarted(attempt, prepared) { const value = unpack(prepared); value.delegate.onStarted?.(attempt, value.prepared); },
+    validate(attempt, result) { return select(attempt).validate(attempt, result); },
+    async finish(attempt, result, prepared, signal) {
+      const value = unpack(prepared);
+      if (!value.delegate.finish) return { value: value.delegate.validate(attempt, result) };
+      return value.delegate.finish(attempt, result, value.prepared, signal);
+    },
+    async auditFailed(attempt, prepared, signal) { const value = unpack(prepared); await value.delegate.auditFailed?.(attempt, value.prepared, signal); },
+    async exportPartial(attempt, prepared) { const value = unpack(prepared); return await value.delegate.exportPartial?.(attempt, value.prepared) ?? {}; },
+    async release(attempt, prepared) { const value = unpack(prepared); await value.delegate.release?.(attempt, value.prepared); },
+  };
 }
 export interface SlotLimits { readonly writable: number; readonly readOnly: number }
 export interface StartRequest {

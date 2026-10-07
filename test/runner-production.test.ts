@@ -103,7 +103,8 @@ describe('runner startup', () => {
       buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); } });
     // D's recovery stops every leftover agent before the (possibly long) image build.
     expect(calls).toEqual(['verify', 'deps', 'recover', 'image']);
-    expect(assembly.deps.kinds).toEqual(['execute']);
+    expect(assembly.deps.kinds).toEqual(['execute', 'check']);
+    expect(assembly.preMerge).toBeTypeOf('function');
     // The token is the database's own, kept for this file identity.
     expect(assembly.deps.runnerOwner).toBe(service.store.runnerOwnerToken({ dev: 1n, ino: 2n }));
     // The review now reads runner commits from the repository the runner writes.

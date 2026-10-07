@@ -12,6 +12,7 @@ RUN npm install --global --allow-scripts=@anthropic-ai/claude-code \
     && install --directory --owner=10001 --group=10001 --mode=0755 /work /work/.git
 
 COPY --chmod=0555 container/probe.sh /usr/local/bin/codeboost-container-probe
+COPY --chmod=0555 container/command-check.mjs /usr/local/bin/codeboost-command-check
 COPY --chmod=0444 network/proxy.mjs /usr/local/lib/codeboost-egress-proxy.mjs
 
 LABEL org.opencontainers.image.base.name="docker.io/library/node:26.7.0-bookworm@sha256:e929171d35b9df7773a3ec5b068e387fa109441dc90f91e6560af5d39b7e9bf1" \

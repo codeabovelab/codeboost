@@ -27,7 +27,8 @@ require_option / ro
 
 [ "${HOME:-}" = '/home/codeboost' ] || fail 'HOME must be the isolated home directory'
 [ "${CODEBOOST_PHASE:-}" != '' ] || fail 'phase is required'
-[ "${CODEBOOST_VENDOR:-}" = 'codex' ] || [ "${CODEBOOST_VENDOR:-}" = 'claude' ] || fail 'vendor is required'
+[ "${CODEBOOST_VENDOR:-}" = 'codex' ] || [ "${CODEBOOST_VENDOR:-}" = 'claude' ] \
+  || [ "${CODEBOOST_VENDOR:-}" = 'runner' ] || fail 'vendor is required'
 
 [ "$(findmnt --noheadings --output FSTYPE --target /work)" = 'tmpfs' ] || fail '/work must use a bounded tmpfs task filesystem'
 [ "$(findmnt --noheadings --output FSTYPE --target /work/.git)" = 'tmpfs' ] || fail 'Git metadata must use a separate tmpfs filesystem'
@@ -81,6 +82,10 @@ case "$CODEBOOST_VENDOR" in
   claude)
     [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || fail 'Claude credential is missing'
     [ -z "${CODEX_HOME:-}" ] || fail 'Codex credential must not accompany Claude'
+    ;;
+  runner)
+    [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] || fail 'Claude credential must not accompany runner commands'
+    [ -z "${CODEX_HOME:-}" ] || fail 'Codex credential must not accompany runner commands'
     ;;
 esac
 

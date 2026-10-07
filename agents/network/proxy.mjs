@@ -1,7 +1,8 @@
 import { createServer, connect } from 'node:net';
 
-const allowed = new Set((process.env.CODEBOOST_ALLOWED_HOSTS ?? '').split(',').filter(Boolean));
-if (!allowed.size) throw new Error('CODEBOOST_ALLOWED_HOSTS is required.');
+if (!Object.hasOwn(process.env, 'CODEBOOST_ALLOWED_HOSTS')) throw new Error('CODEBOOST_ALLOWED_HOSTS is required.');
+// An explicitly empty allowlist is the credential-free runner profile: keep the proxy boundary up and refuse every CONNECT.
+const allowed = new Set(process.env.CODEBOOST_ALLOWED_HOSTS.split(',').filter(Boolean));
 // Ports are fixed in production; the overrides exist so tests can run the proxy against a local upstream.
 const listenPort = Number(process.env.CODEBOOST_PROXY_PORT ?? 3128);
 const upstreamPort = Number(process.env.CODEBOOST_UPSTREAM_PORT ?? 443);

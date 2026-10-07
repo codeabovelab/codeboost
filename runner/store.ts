@@ -78,6 +78,14 @@ export function publishActionResponse(record: PublishRecord) {
   return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.action ? { action: record.action } : {}), ...(record.reconcile ? { reconcile: true } : {}), ...(record.number === undefined ? {} : { number: record.number }),
     ...(record.url === undefined ? {} : { url: record.url }) };
 }
+export interface PreMergeActionResult {
+  state: 'ready' | 'review-required' | 'failed';
+  base: string; head: string; checked: readonly string[]; reason: string | null;
+}
+/** What a completed `prepare-merge` action replays after its background coordinator settles. */
+export function preMergeActionResponse(result: PreMergeActionResult) {
+  return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
+}
 export interface TaskRecord {
   planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
   currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
@@ -1656,7 +1664,8 @@ export class Store {
     try {
       return this.#transaction((): AttemptRecord => {
         const task = this.#task(key);
-        if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
+        const reviewCheck = input.kind === 'check' && MERGEABLE_STATUSES.includes(task.status as TaskStatus);
+        if (!reviewCheck && task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
         if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
         // Requeue claim: exactly one path (I3's requeue, or the user's Resume) clears it, by CAS in this admitting transaction.
         if (task.requeue_pending === 1 && !input.claimRequeue) throw new GuardRefusal('Recovery is requeueing this task.');
@@ -1680,7 +1689,8 @@ export class Store {
         const id = randomUUID(), created = new Date(now).toISOString();
         this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
           id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
-        this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', requeue_pending=0, budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+        if (reviewCheck) this.#run('UPDATE tasks SET current_attempt_id=? WHERE plan_key=?', id, key);
+        else this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', requeue_pending=0, budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
         this.#touch(key);
         return this.getAttempt(identity, id);
       });
@@ -1729,7 +1739,8 @@ export class Store {
       let outcome = classifySettlement({ ...settlement, firstReason, contextCurrent });
       if (outcome.state === 'completed' && row.state !== 'running') throw new GuardRefusal('Only a running attempt can complete.');
       // The task must still be running; a task never leaves running while an attempt is active, so this is a second safeguard.
-      if (outcome.state === 'completed' && (task.status !== 'running' || task.cancel_requested !== null))
+      const reviewCheck = row.kind === 'check' && MERGEABLE_STATUSES.includes(task.status as TaskStatus);
+      if (outcome.state === 'completed' && ((!reviewCheck && task.status !== 'running') || task.cancel_requested !== null))
         outcome = { state: 'cancelled', reason: this.#closed(task.status) || task.cancel_requested !== null
           ? 'The task was closed before the result was saved.' : 'The task left the running state before the result was saved.', timeLimit: false };
       let result: string | null = null;
@@ -1756,6 +1767,14 @@ export class Store {
       }
       return outcome;
     });
+  }
+  /** Passing evidence for exactly this item, head and command list. Interrupted, failed, stale and older-head rows do not count. */
+  commandChecksPassed(identity: PlanIdentity, item: string, head: string, commandsDigest: string): boolean {
+    sha(head);
+    if (!/^[a-f0-9]{64}$/.test(commandsDigest)) throw new Error('Invalid command-check digest.');
+    return !!this.#get(`SELECT 1 FROM attempts WHERE plan_key=? AND kind='check' AND item=? AND state='completed'
+      AND json_valid(result) AND json_extract(result,'$.passed')=1 AND json_extract(result,'$.head')=?
+      AND json_extract(result,'$.commandsDigest')=? ORDER BY rowid DESC LIMIT 1`, identityKey(identity), item, head, commandsDigest);
   }
   /** Cancel task: closes now, or, with an active attempt, stops it first and closes when it settles. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
@@ -1833,6 +1852,25 @@ export class Store {
     const outcome = decode<{ ok: boolean; value?: T; error?: string; kind?: string }>(row.response);
     if (!outcome.ok) throw outcome.kind === 'upstream' ? new UpstreamFailure(outcome.error!) : new GuardRefusal(outcome.error!);
     return { response: outcome.value as T, replayed: true };
+  }
+  /** Settle the exact admitted pre-merge action so retry/restart replay never remains at `preparing`. */
+  settlePreMergeAction(identity: PlanIdentity, actionId: string, result: PreMergeActionResult): void {
+    assertUuidV4(actionId, 'Action ID');
+    const response = encode({ ok: true, value: preMergeActionResponse(result) });
+    if (response.length > 65536) throw new Error('Action response is too large to record.');
+    const changed = this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+      response, identityKey(identity), actionId).changes;
+    if (changed !== 1) throw new Error('The pre-merge action no longer owns settlement.');
+  }
+  /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
+  settleInterruptedPreMergeActions(identity: PlanIdentity): void {
+    const snapshot = this.getSnapshot(identity);
+    const result: PreMergeActionResult = { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [],
+      reason: 'The server restarted before pre-merge preparation completed. Start a new preparation.' };
+    this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+      encode({ ok: true, value: preMergeActionResponse(result) }), identityKey(identity));
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
   recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null; supersedeLatest?: boolean }): FeedbackEvent {
