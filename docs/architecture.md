@@ -44,7 +44,7 @@ Writing standard: plain language, ISO 24495-1:2023
   - **In use for a non-demo review with a `github` block:** planning. `/api/plan/suggestions` and `/api/plan/drafts` ask Claude, through lane D, for suggestion cards or a whole next plan revision (#117, #124). Nothing becomes a revision until you apply it.
   - **In use with an opt-in `runner` block in `review.json`:** the whole loop after planning. `start` and `resume` on `/api/runner` run a task's plan item by item with a Claude agent (#91). They require current plan-item approvals, bind both the task state and review version, recheck approvals before each later item, and refuse when a completed prefix no longer ends at the task's current head (#107). After an out-of-scope pause, an approved amended plan can reconcile the completed prefix and resume only the unfinished suffix (#88, PR #134). When a run ends, codeboost publishes the task's pull request, a draft if the task needs a person (#103). Approve & merge merges that pull request (#121). Cancelling a task closes its pull requests (#111). These are API actions; the screen has no buttons for them yet.
   - **Partly built for pre-merge automation:** a trusted local rebase engine records one-to-one commit mappings, verifies the resulting checkout byte for byte, owns its subprocesses durably, and recovers interrupted work (#22, PR #136). It is not wired into the merge path yet.
-  - **Not built:** the "trust this issue" action and its runner guard (#108), screens for planning and the runner actions, the remaining pre-merge rebase/conflict/check orchestration, running `cmd:` checks, review rounds, and the Planning, Queue and Learning screens.
+  - **Not built:** screens for planning and the runner actions, the remaining pre-merge rebase/conflict/check orchestration, running `cmd:` checks, review rounds, and the Planning, Queue and Learning screens.
 
 ## Terms used
 
@@ -414,7 +414,7 @@ These are the decisions that shape the structure. The full list, with the reason
 | Hardening | Allowlisted subprocess environments | Done: every Git command (#82, #83) and every `gh` runner (#84, #86). |
 | Tests | Test suite reliability | Done. The full suite runs ordinary tests first and Docker-backed files serially; CI and the real-Docker gate passed on PR #132 (#129). |
 | G | Planning screen | Not started. Unblocked: E4 is done and the planning API runs Claude in production. |
-| H | Issue ranking and Issues screen | Done except H4b (#108): the "trust this issue" action, plus a runner guard that refuses issues from non-collaborators that nobody trusted. It is unblocked now that #130 has merged. |
+| H | Issue ranking and Issues screen | Done. H4b (#108, PR #139) records author-bound trust, guards runner and publishing boundaries, controls which comments reach prompts, records prompt comment evidence, and provides trust/untrust controls on the Issues screen. |
 | I, J | Queue and run windows; learning from feedback | Not started (after F) |
 
 ## Known limits
@@ -425,7 +425,6 @@ These are the decisions that shape the structure. The full list, with the reason
 - `cmd:` acceptance checks do not run yet, so any plan item with a `cmd:` check blocks merging.
 - One user, one machine, one runner per database. The lock refuses a second runner, and it refuses network filesystems, where OS locks are unreliable.
 - The runner is opt-in: it needs a `runner` block and a `github` block in `review.json`, and it is always off in the demo. It runs through the API only; the screen has no start, resume, publish or planning controls yet. Publishing also needs `github.baseBranch`.
-- The runner does not check who wrote an issue yet. `start` and `resume` run a plan whose issue came from a non-collaborator (#130 adds an approval check on the plan, not on the issue author), and no attempt records which comments its prompt carried. Only collaborators' comments reach the prompt. #108 adds the guard and the record. Until then, start runs only for issues you have checked yourself.
 - codeboost is Claude-only. Codex is refused in every phase (#93, PR #106), because it can read files only through its shell, which every phase turns off. `agent-isolation.md` says when to revisit this.
 
 ## Test this document with a reader
