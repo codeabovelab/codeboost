@@ -223,15 +223,12 @@ const EXPORT_LIMIT = 1024 * 1024;
 export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport> {
   const now = o.now ?? Date.now, processes = o.deps.processes ?? hostProcesses;
   if (!/^[0-9a-f]{32}$/.test(o.runnerOwner)) throw new Error('Invalid runner owner token.');
-  const interrupted = o.store.interruptedAttempts();
-  // Step 7's input is taken before finalization: an interrupted attempt that started preparation but never saved its group.
-  const unowned = interrupted.filter(a => a.preparationStartedAt !== null && a.preparationPgid === null).map(a => a.id);
-  // 2b. Stop leftover preparation before D's recovery or any storage work.
-  for (const a of interrupted) if (a.preparationPgid !== null && a.preparationStartedAt !== null && processes.isAlive(a.preparationPgid))
-    await processes.terminate(a.preparationPgid, a.preparationIdentity, o.graceMs ?? 5_000);
-  const rebases = o.store.rebasesInProgress().map(value => recoveryRebase(value.planKey, value.marker));
+  // Preflight every rebase marker before recovery terminates a process or changes durable ownership. In particular,
+  // one unidentified escaped process blocks the whole pass: settling earlier work would make a refused startup partial.
+  const rawRebases = o.store.rebasesInProgress();
+  const rebases = rawRebases.map(value => recoveryRebase(value.planKey, value.marker));
   if (rebases.some(value => value === null))
-    throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', o.store.rebasesInProgress().map(value => value.planKey));
+    throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', rawRebases.map(value => value.planKey));
   const activeRebases = rebases as RecoveryRebase[], childIdentities = new Set<string>(), childAllocations = new Set<string>();
   for (const { planKey, marker } of activeRebases) if (marker.conflict) {
     if (childIdentities.has(marker.conflict.attemptId) || childAllocations.has(marker.conflict.allocationId)
@@ -240,16 +237,20 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     childIdentities.add(marker.conflict.attemptId); childAllocations.add(marker.conflict.allocationId);
     childAllocations.add(marker.conflict.networkAllocationId);
   }
+  const unsettled = activeRebases.find(({ marker }) => marker.processGroup === 'unsettled');
+  if (unsettled)
+    throw new RecoveryBlocked(`An interrupted rebase has an unidentified escaped process; stop it, then run --release-rebase-process ${unsettled.marker.attemptId}`,
+      [unsettled.marker.attemptId]);
+  const interrupted = o.store.interruptedAttempts();
+  // Step 7's input is taken before finalization: an interrupted attempt that started preparation but never saved its group.
+  const unowned = interrupted.filter(a => a.preparationStartedAt !== null && a.preparationPgid === null).map(a => a.id);
+  // 2b. Stop leftover preparation before D's recovery or any storage work.
+  for (const a of interrupted) if (a.preparationPgid !== null && a.preparationStartedAt !== null && processes.isAlive(a.preparationPgid))
+    await processes.terminate(a.preparationPgid, a.preparationIdentity, o.graceMs ?? 5_000);
   // A rebase helper can be a Git/clone process or a Docker client. Stop it before D scans and removes daemon objects,
   // then prove no descendant still uses the workspace before releasing the process owner.
   for (const { planKey, marker } of activeRebases) if (marker.processGroup) {
     const processGroup = marker.processGroup;
-    // `unsettled` proves an escaped process outside the original group still held a pipe. It need not have any file or
-    // cwd beneath the workspace, so no automatic observation can prove it has exited. Keep admission fail-closed until
-    // the operator stops the unknown process and explicitly releases this exact attempt under the runner lock.
-    if (processGroup === 'unsettled')
-      throw new RecoveryBlocked(`An interrupted rebase has an unidentified escaped process; stop it, then run --release-rebase-process ${marker.attemptId}`,
-        [marker.attemptId]);
     if (typeof processGroup !== 'string' && processes.isAlive(processGroup.pgid))
       await processes.terminate(processGroup.pgid, processGroup.identity, o.graceMs ?? 5_000);
     const workspace = join(o.runnerRoot, o.runnerOwner, 'rebases', marker.attemptId);

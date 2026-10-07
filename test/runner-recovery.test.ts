@@ -265,7 +265,11 @@ describe('startup recovery sequence', () => {
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
   it('keeps an unsettled pipe-holder fail-closed until the operator explicitly releases the exact rebase', async () => {
-    const { d: root, store } = fixture();
+    const { d: root, store, admit } = fixture(2);
+    const interrupted = admit(id(2), { kind: 'review' });
+    const preparationIdentity = 'linux:00000000-0000-0000-0000-000000000000:42';
+    store.markPreparationStarting(id(2), interrupted.id, Date.now());
+    store.recordPreparationGroup(id(2), interrupted.id, 4242, Date.now(), preparationIdentity);
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
@@ -285,6 +289,8 @@ describe('startup recovery sequence', () => {
       } }).d };
     await expect(recoverStartup(options)).rejects.toThrow(/--release-rebase-process/);
     expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled', conflict: { attemptId: child } });
+    expect(store.interruptedAttempts().find(attempt => attempt.id === interrupted.id))
+      .toMatchObject({ preparationPgid: 4242, preparationIdentity });
     expect(calls).toEqual([]); expect(isAlive).not.toHaveBeenCalled(); expect(terminate).not.toHaveBeenCalled();
     expect(openFiles).not.toHaveBeenCalled();
     expect(() => releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token,
