@@ -83,7 +83,7 @@ if (values.help || (!values.demo && !values.config && values['release-preparatio
   for (const signal of ['SIGINT', 'SIGTERM'] as const) process.removeListener(signal, duringStartup);
   // A publish an earlier process owed (#103) starts only under a lock verified to name the database: publishOwed runs the
   // check itself, first, so no order of these lines can start one before it.
-  try { if (stopping) lock.verify(); else app.publishOwed(() => lock.verify()); }
+  try { if (stopping) lock.verify(); else await app.publishOwed(() => lock.verify()); }
   catch (error) {
     await app.close(); lock.release();
     // The database path changed: a refusal the person acts on, so its message, not a stack.

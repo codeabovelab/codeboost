@@ -1,11 +1,11 @@
-import type { IssueGateway, IssueSnapshot, RepositoryIssue } from '../github/issues.ts';
+import type { IssueSnapshot, IssueTrustGateway, RepositoryIssue } from '../github/issues.ts';
 
 const repository = 'codeboost-demo/retry-service';
 const DAY = 86_400_000;
 
 /** Disposable fixture only. Demo issues never come from, or go to, GitHub. */
-export function demoIssueGateway(now: () => Date = () => new Date()): IssueGateway {
-  return {
+export function demoIssueGateway(now: () => Date = () => new Date()): IssueTrustGateway {
+  const gateway: IssueTrustGateway = {
     repository,
     async fetch(options = {}): Promise<IssueSnapshot> {
       options.signal?.throwIfAborted();
@@ -31,5 +31,18 @@ export function demoIssueGateway(now: () => Date = () => new Date()): IssueGatew
         ],
       };
     },
+    async issueAccess(number, options = {}) {
+      options.signal?.throwIfAborted();
+      const found = (await gateway.fetch(options)).issues.find(issue => issue.number === number);
+      if (!found) throw new Error(`Demo issue #${number} does not exist.`);
+      return { number, authorLogin: found.authorLogin, collaborator: found.trust === 'trusted' };
+    },
+    async issueText(number, options = {}) {
+      options.signal?.throwIfAborted();
+      const found = (await gateway.fetch(options)).issues.find(issue => issue.number === number);
+      if (!found) throw new Error(`Demo issue #${number} does not exist.`);
+      return { number, title: found.title, body: found.body, comments: [] };
+    },
   };
+  return gateway;
 }

@@ -12,7 +12,7 @@ import type { Store, TaskPullRequest } from './store.ts';
  */
 export interface BranchPusher {
   /** Makes `refs/heads/<branch>` on GitHub point at `head`. Settles only when the push finished or failed. */
-  push(identity: PlanIdentity, input: { head: string; branch: string }, signal?: AbortSignal): Promise<void>;
+  push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: () => void }, signal?: AbortSignal): Promise<void>;
 }
 export interface PublishConfig {
   repository: string; baseBranch: string;
@@ -103,7 +103,7 @@ export class PullRequestPublisher {
    * Opens the task's PR, or a draft PR with the open problems when `problems` is given (the task is in needs human).
    * Order: recover a lost opening; check; push; record the opening; open. A match or an unreadable check opens nothing.
    */
-  async publish(identity: PlanIdentity, input: { problems?: readonly string[] } = {}, signal?: AbortSignal): Promise<PublishOutcome> {
+  async publish(identity: PlanIdentity, input: { problems?: readonly string[]; beforeMutation?: () => void } = {}, signal?: AbortSignal): Promise<PublishOutcome> {
     signal?.throwIfAborted();
     this.#assertOpen();
     const key = identityKey(identity);
@@ -202,7 +202,7 @@ export class PullRequestPublisher {
     return Math.max(0, Date.parse(lost.createdAt) + (this.#config.settleMs ?? DEFAULT_SETTLE_MS) - (this.#config.now ?? Date.now)());
   }
 
-  async #publish(identity: PlanIdentity, input: { problems?: readonly string[] }, signal?: AbortSignal): Promise<PublishOutcome> {
+  async #publish(identity: PlanIdentity, input: { problems?: readonly string[]; beforeMutation?: () => void }, signal?: AbortSignal): Promise<PublishOutcome> {
     const draft = input.problems !== undefined;
     const recovered = await this.#recover(identity, draft, signal);
     if (recovered) return recovered;
@@ -350,19 +350,21 @@ export class PullRequestPublisher {
       // The push is a refresh's first content write (it moves the open PR's head), so the refresh is recorded before it;
       // beginRefresh re-reads the task after the draft change's await. A task change during the push cannot strand it.
       this.#assertOpen();
+      input.beforeMutation?.();
       const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
-      await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+      await this.#pusher.push(identity, { head: snapshot.head, branch, ...(input.beforeMutation ? { beforePush: input.beforeMutation } : {}) }, signal);
       signal?.throwIfAborted();
       // Re-read after the push's await, before anything else about the PR changes (description, ready or draft): a
       // cancel, reassignment or review during the push leaves the update in flight and the PR as it was.
       this.#assertOpen();
+      input.beforeMutation?.();
       this.#store.assertRefreshCurrent(identity, earlier.openingId, draft);
       // Any failure here, including a draft refusal after the PR was made ready again meanwhile, leaves the update
       // recorded as in flight; the next publish settles it and starts again from the draft step above.
       const pr = await this.#pulls.refresh(live.number, {
         // The PR's base on GitHub: the lookup only returns a PR into the configured base.
         base: this.#config.baseBranch, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
-        beforeReady: () => { this.#assertOpen(); this.#store.assertRefreshCurrent(identity, earlier.openingId, draft); },
+        beforeReady: () => { this.#assertOpen(); input.beforeMutation?.(); this.#store.assertRefreshCurrent(identity, earlier.openingId, draft); },
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
       const status = this.#store.recordRefreshConfirmed(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
@@ -370,15 +372,18 @@ export class PullRequestPublisher {
     }
     // No PR exists yet, so moving the branch changes nothing a reviewer sees.
     this.#assertOpen();
-    await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+    input.beforeMutation?.();
+    await this.#pusher.push(identity, { head: snapshot.head, branch, ...(input.beforeMutation ? { beforePush: input.beforeMutation } : {}) }, signal);
     signal?.throwIfAborted();
     // The last await before the irreversible call is behind us: beginPullRequest re-reads the task state in its transaction.
     this.#assertOpen();
+    input.beforeMutation?.();
     const opening = this.#store.beginPullRequest(identity, {
       checkId: check.id, repository: this.#config.repository, base: this.#config.baseBranch, headBranch: branch, headSha: snapshot.head, draft,
     });
     let pr;
     try {
+      input.beforeMutation?.();
       pr = await this.#pulls.open({
         base: opening.base, headBranch: branch, draft, marker: marker(opening.openingId),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(opening.openingId), problems: input.problems }),

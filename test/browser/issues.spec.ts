@@ -79,6 +79,73 @@ test('ranks demo issues with visible reasons and trust, and keeps review input a
   expect(errors).toEqual([]);
 });
 
+test('trusts and untrusts a demo issue without GitHub and keeps keyboard focus on the action', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="21"]');
+  const trust = row.getByRole('button', { name: 'Trust this issue' });
+  await expect(trust).toBeVisible();
+  await trust.focus();
+  await page.keyboard.press('Enter');
+  const remove = row.getByRole('button', { name: 'Remove trust' });
+  await expect(remove).toBeFocused();
+  await expect(row.getByLabel(/trusted by you on/i)).toContainText('✓ Trusted by you on');
+  await page.reload();
+  await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await row.getByRole('button', { name: 'Remove trust' }).focus();
+  await page.keyboard.press('Enter');
+  await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeFocused();
+  await expect(row.getByLabel(/needs your trust before queueing/)).toBeVisible();
+});
+
+test('ignores an older trust response that returns after a newer action', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let first: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const captured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request();
+    const body = request.method() === 'POST' ? request.postDataJSON() as { action?: string } : {};
+    if (body.action !== 'trust' || first) { await route.continue(); return; }
+    first = { route, response: await route.fetch() };
+    captured.resolve();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="21"]'), button = row.locator('button.issue-trust');
+  await button.click();
+  await captured.promise;
+  // Simulate a second explicit activation while the first browser response is delayed. The generation guard owns it.
+  await button.evaluate(element => element.removeAttribute('aria-disabled'));
+  await button.click();
+  await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await first!.route.fulfill({ response: first!.response });
+  await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await expect(page.locator('#issues-status')).toContainText('✓ Current');
+});
+
+test('merges concurrent trust responses for different issues without losing either decision', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let held: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const captured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request();
+    const body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action !== 'trust' || body.number !== 21 || held) { await route.continue(); return; }
+    held = { route, response: await route.fetch() };
+    captured.resolve();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await captured.promise;
+  await page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await expect(page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await held!.route.fulfill({ response: held!.response });
+  await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await expect(page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+});
+
 test('shows unavailable, then current, then stale issue data with the retrieval error', async ({ page }) => {
   const { gateway, pending } = scriptedGateway();
   app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);

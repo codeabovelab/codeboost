@@ -44,10 +44,17 @@ export interface IssueSnapshot {
 
 /** The issue text an execute prompt carries, as untrusted data. */
 export interface IssueText { readonly number: number; readonly title: string; readonly body: string; readonly comments: readonly string[] }
+export interface IssueAccess { readonly number: number; readonly authorLogin: string | null; readonly collaborator: boolean }
 
 export interface IssueGateway {
   readonly repository: string;
   fetch(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<IssueSnapshot>;
+}
+
+/** The extra current-issue reads used by trust actions and runner admission. */
+export interface IssueTrustGateway extends IssueGateway {
+  issueAccess(number: number, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<IssueAccess>;
+  issueText(number: number, options?: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null }): Promise<IssueText>;
 }
 
 type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
@@ -233,12 +240,28 @@ export class GhIssueGateway implements IssueGateway {
     }));
   }
 
+  async issueAccess(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueAccess> {
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
+    return this.#bounded(options, async signal => {
+      let decoded: unknown;
+      const output = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/issues/${number}`], { signal });
+      try { decoded = JSON.parse(output); }
+      catch { throw new Error('GitHub returned invalid issue JSON.'); }
+      const issue = object(decoded, 'GitHub returned a malformed issue.');
+      if (issue.number !== number) throw new Error('GitHub returned a different issue.');
+      if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
+      const authorLogin = issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
+      const collaborators = await this.#loadCollaborators(signal);
+      return { number, authorLogin, collaborator: authorLogin !== null && collaborators.has(authorLogin.toLocaleLowerCase('en-US')) };
+    });
+  }
+
   /**
    * One issue's text for an execute prompt (#91): its title, body and the comments of repository collaborators only
    * (design, "Which comments reach the agent"), oldest first. Everything stays untrusted data inside the prompt.
    * Fails closed on anything malformed, on a pull request, and past the comment page limit.
    */
-  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueText> {
+  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null } = {}): Promise<IssueText> {
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
     return this.#bounded(options, async signal => {
       let decoded: unknown;
@@ -249,6 +272,8 @@ export class GhIssueGateway implements IssueGateway {
       if (issue.number !== number) throw new Error('GitHub returned a different issue.');
       if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
       const title = boundedString(issue.title, 'title', 4096), body = boundedString(issue.body, 'body', MAX_BODY_LENGTH, true);
+      const authorLogin = issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
+      const includeEveryComment = options.trustedAuthor !== undefined && options.trustedAuthor === authorLogin;
       // The execute prompt carries the issue as one JSON data block of at most MAX_PROMPT_BYTES (dataJSON). A running byte
       // count stops reading early (a title and body already over it read no collaborator or comment page); the exact check
       // below uses the prompt's own serializer, so an issue accepted here is one the prompt can carry.
@@ -260,7 +285,7 @@ export class GhIssueGateway implements IssueGateway {
       // The title and body alone, as the prompt serializes them (escaping included): an issue that cannot fit reads nothing more.
       carried({ number, title, body, comments: [] });
       let total = Buffer.byteLength(title) + Buffer.byteLength(body);
-      const collaborators = await this.#loadCollaborators(signal);
+      const collaborators = includeEveryComment ? null : await this.#loadCollaborators(signal);
       const comments: string[] = [];
       for (let page = 1; ; page++) {
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
@@ -275,9 +300,11 @@ export class GhIssueGateway implements IssueGateway {
           const comment = object(value, 'GitHub returned a malformed comment.');
           // A deleted ("ghost") author is nobody's collaborator. Other people's comments are dropped before their body is
           // checked, so none of theirs can make the issue unreadable.
-          if (comment.user === null) continue;
-          const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
-          if (!collaborators.has(author.toLocaleLowerCase('en-US'))) continue;
+          if (!includeEveryComment) {
+            if (comment.user === null) continue;
+            const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
+            if (!collaborators!.has(author.toLocaleLowerCase('en-US'))) continue;
+          }
           const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
           total += Buffer.byteLength(text);
           if (total > MAX_PROMPT_BYTES) throw tooLong();

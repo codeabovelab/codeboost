@@ -833,9 +833,11 @@ function issueStatus() {
   return ["bad", `✕ Unavailable · ${esc(state.error)}`];
 }
 function trustMark(issue) {
-  return issue.trust === "trusted"
-    ? '<span class="good" aria-label="Trust: author is a repository collaborator">✓ Collaborator</span>'
-    : '<span class="warn" aria-label="Trust: needs your trust before queueing, author is not a repository collaborator">! Needs trust</span>';
+  if (issue.trust === "trusted") return '<span class="good" aria-label="Trust: author is a repository collaborator">✓ Collaborator</span>';
+  if (issue.trust === "approved") return `<span class="good" aria-label="Trust: trusted by you on ${esc(issue.trustedAt)}">✓ Trusted by you on ${esc(new Date(issue.trustedAt).toLocaleDateString())}</span>
+    <button class="issue-trust" data-action="untrust" data-issue="${issue.number}">Remove trust</button>`;
+  return `<span class="warn" aria-label="Trust: needs your trust before queueing, author is not a repository collaborator">! Needs trust</span>
+    <button class="issue-trust" data-action="trust" data-issue="${issue.number}">Trust this issue</button>`;
 }
 function renderIssues() {
   const [tone, text] = issueStatus();
@@ -860,6 +862,48 @@ function renderIssues() {
         `<tr data-issue="${issue.number}"><td class="mono">${index + 1}</td><td><div class="issue-title"><span class="mono muted">#${issue.number}</span> ${/^https:\/\/github\.com\//.test(issue.url) ? `<a href="${esc(issue.url)}" target="_blank" rel="noopener noreferrer">${esc(issue.title)}</a>` : esc(issue.title)}${issue.labels.length ? ` <span class="issue-labels mono">${issue.labels.map(esc).join(" · ")}</span>` : ""}</div><ul class="issue-reasons" aria-label="Why #${issue.number} ranks here">${issue.reasons.map((reason) => `<li>${esc(reason)}</li>`).join("")}</ul></td><td class="mono numeric">${issue.score}</td><td>${trustMark(issue)}</td><td class="mono">${esc(issue.createdAt.slice(0, 10))}</td></tr>`,
     )
     .join("")}</tbody></table>`;
+}
+const trustGenerations = new Map();
+function mergeIssueTrustView(updated, number) {
+  const currentState = issuesView?.configured ? issuesView.state : null;
+  const updatedState = updated?.configured ? updated.state : null;
+  const replacement = updatedState?.issues.find((issue) => issue.number === number);
+  if (!issuesView?.configured || !currentState || !updated?.configured || !updatedState || !replacement) {
+    issuesView = updated;
+    return;
+  }
+  issuesView = { ...issuesView, repository: updated.repository, refreshing: updated.refreshing,
+    state: { ...currentState, issues: currentState.issues.map((issue) => issue.number === number ? replacement : issue) } };
+}
+async function changeIssueTrust(button) {
+  if (button.getAttribute("aria-disabled") === "true") return;
+  const number = Number(button.dataset.issue), action = button.dataset.action;
+  const issue = issuesView?.configured && issuesView.state?.issues.find((entry) => entry.number === number);
+  if (!issue || !["trust", "untrust"].includes(action)) return;
+  const generation = (trustGenerations.get(number) ?? 0) + 1;
+  trustGenerations.set(number, generation);
+  const viewGeneration = ++issuesGeneration;
+  if (issuesLoading) {
+    issuesLoading = false;
+    $("issues-refresh").removeAttribute("aria-disabled");
+    $("issues-refresh").textContent = "Refresh issues";
+  }
+  const restoreFocus = document.activeElement === button;
+  button.setAttribute("aria-disabled", "true");
+  button.textContent = action === "trust" ? "Trusting…" : "Removing…";
+  try {
+    const updated = await api("/api/issues", { action, actionId: crypto.randomUUID(), number, authorLogin: issue.authorLogin });
+    if (trustGenerations.get(number) !== generation) return;
+    mergeIssueTrustView(updated, number);
+    renderIssues();
+    if (restoreFocus) document.querySelector(`.issue-trust[data-issue="${number}"]`)?.focus();
+  } catch (error) {
+    if (trustGenerations.get(number) !== generation || issuesGeneration !== viewGeneration) return;
+    button.removeAttribute("aria-disabled");
+    button.textContent = action === "trust" ? "Trust this issue" : "Remove trust";
+    $("issues-status").className = "bad";
+    $("issues-status").textContent = `✕ Could not ${action === "trust" ? "trust" : "remove trust from"} issue #${number}. ${error.message}`;
+  }
 }
 async function loadIssues() {
   if (issuesLoading) return;
@@ -895,6 +939,10 @@ $("issues-link").onclick = (event) => {
   showView("issues");
 };
 $("issues-refresh").onclick = () => loadIssues();
+$("issues-list").onclick = (event) => {
+  const button = event.target.closest("button.issue-trust");
+  if (button) changeIssueTrust(button);
+};
 showView(new URLSearchParams(location.search).get("view") === "issues" ? "issues" : "review");
 
 await refresh();

@@ -1,4 +1,5 @@
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
+import { createHash } from 'node:crypto';
 import type { PlanContext } from '../core/plan.ts';
 import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
@@ -174,6 +175,10 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       signal.throwIfAborted();
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
         issue, approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
+      store.recordAttemptComments(identity, attempt.id, {
+        count: issue.comments.length,
+        digest: createHash('sha256').update(JSON.stringify(issue.comments)).digest('hex'),
+      });
       const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
       // From here task storage exists: a failure hands it to the coordinator, which removes it after the terminal write.

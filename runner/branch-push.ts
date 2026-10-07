@@ -106,7 +106,7 @@ export class GitBranchPusher implements BranchPusher {
     this.#config = config; this.#url = url;
   }
 
-  async push(identity: PlanIdentity, input: { head: string; branch: string }, signal?: AbortSignal): Promise<void> {
+  async push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: () => void }, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     if (identity.repositoryId !== this.#config.repositoryId) throw new Error('The task belongs to another repository.');
     if (!COMMIT_ID.test(input.head)) throw new Error('A full commit ID is required.');
@@ -123,6 +123,7 @@ export class GitBranchPusher implements BranchPusher {
     if (remote !== null && !owned.has(remote))
       throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
     signal?.throwIfAborted();
+    input.beforePush?.();
     // Leased to the value read above (pushArguments).
     try {
       await this.#git(pushArguments({ url: this.#url, ref, read: remote, head: input.head }), signal, true);

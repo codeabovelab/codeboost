@@ -253,6 +253,22 @@ describe('issue text for an execute prompt (#91)', () => {
     expect(text.comments).toEqual([...full.filter((_, n) => n % 2).map(c => c.body), 'last']);
     expect(calls.filter(args => args[5]!.endsWith('/comments')).map(args => args.at(-1))).toEqual(['page=1', 'page=2']);
   });
+  it('includes every comment only when trust matches the issue current author', async () => {
+    const comments = [comment('member', 'collaborator'), comment('outsider', 'outside'), comment(null, 'ghost')];
+    const fixture = gateway([comments], rawIssue({ user: { login: 'outside-author' } })), g = fixture.gateway;
+    expect((await g.issueText(7)).comments).toEqual(['collaborator']);
+    expect((await g.issueText(7, { trustedAuthor: 'old-author' })).comments).toEqual(['collaborator']);
+    expect((await g.issueText(7, { trustedAuthor: 'outside-author' })).comments).toEqual(['collaborator', 'outside', 'ghost']);
+    expect(fixture.calls.filter(isCollaboratorRequest)).toHaveLength(2);
+  });
+  it('reads the current author and collaborator list as one bounded admission decision', async () => {
+    await expect(gateway([], rawIssue({ user: { login: 'Member' } })).gateway.issueAccess(7)).resolves.toEqual({
+      number: 7, authorLogin: 'Member', collaborator: true,
+    });
+    await expect(gateway([], rawIssue({ user: null })).gateway.issueAccess(7)).resolves.toEqual({
+      number: 7, authorLogin: null, collaborator: false,
+    });
+  });
   it('refuses a pull request, a different issue, and text too long for a prompt', async () => {
     await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
     await expect(gateway([], rawIssue({ number: 8 })).gateway.issueText(7)).rejects.toThrow(/different issue/);

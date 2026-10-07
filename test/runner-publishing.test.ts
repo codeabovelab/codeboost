@@ -22,6 +22,7 @@ import { PullRequestMisplaced, openingMarker, type OpenPullRequestInput, type Pu
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
+import type { IssueTrustGateway } from '../github/issues.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -227,13 +228,14 @@ function world(): World {
  * of the three coordinator paths that can raise a finding. `before` shapes the Store before the runner exists, as an
  * earlier process would have left it.
  */
-async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource } = {}) {
+async function serve(w: World, options: { before?: (service: ReviewService) => void; onPushSpawn?: (n: number, app: () => App, close: () => Promise<void>) => void; demo?: boolean; startup?: boolean; settleMs?: number; env?: NodeJS.ProcessEnv; hold?: Promise<void>; shortRetryMs?: number; findingSource?: FindingSource;
+  issueGateway?: IssueTrustGateway } = {}) {
   let app: App | undefined, spawns = 0, closing: Promise<void> | undefined;
   const close = () => closing ??= app!.close();
   let branchOf: (identity: PlanIdentity) => string = () => '';
   let findings: SafetyFindings | undefined;
-  const config = { ...w.demo, demo: options.demo ?? false };
-  app = await startServer(config, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+  const config = { ...w.demo, demo: options.demo ?? false, ...(options.issueGateway ? { github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1, baseBranch: 'main' } } : {}) };
+  app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
     const identity = service.config.identity, task = service.store.getTask(identity), plan = service.store.getPlan(identity);
     if (task.status !== 'merged' && task.status !== 'cancelled' && service.store.unapprovedExecutionItems(identity, plan.revision).length) {
       const review = service.load();
@@ -448,6 +450,93 @@ describe('publishing a finished task (#103)', () => {
     const { app } = await serve(w);
     const refused = await act(app, 'publish');
     expect(refused).toMatchObject({ status: 409, body: { error: expect.stringMatching(/The task is in review/) } });
+    expect(w.github.calls).toEqual([]);
+  });
+
+  it('rechecks issue trust before a publish action crosses its external boundary', async () => {
+    const w = world();
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { return { number, authorLogin: 'outside', collaborator: false }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, store, identity } = await serve(w, { before: completeAll, startup: false, issueGateway });
+    expect(await act(app, 'publish')).toMatchObject({ status: 409, body: { error: expect.stringMatching(/not trusted for its current author/) } });
+    expect(w.github.calls).toEqual([]);
+    store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    expect(await act(app, 'publish')).toMatchObject({ status: 200, body: { result: { outcome: 'publishing' } } });
+    await app.publishing!.settled(identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
+  });
+
+  it('rechecks issue trust before an automatic publish retry and stops after revocation', async () => {
+    const w = world();
+    let accessReads = 0;
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { accessReads++; return { number, authorLogin: 'outside', collaborator: false }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    w.github.staleHeadOnce = 'a'.repeat(40);
+    const { app, store, identity } = await serve(w, { startup: false, shortRetryMs: 100, issueGateway, before: service => {
+      completeAll(service);
+      service.store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    } });
+    app.publishOwed(() => undefined);
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', reconcile: true }), { timeout: 10_000 });
+    const calls = [...w.github.calls];
+    store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/not trusted/) }),
+      { timeout: 10_000, interval: 50 });
+    expect(accessReads).toBe(2);
+    expect(w.github.calls).toEqual(calls);
+  });
+
+  it('rechecks the bound trust decision after awaited safety reads and before pushing', async () => {
+    const w = world(), checking = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { return { number, authorLogin: 'outside', collaborator: false }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    w.github.checks.check = async () => { w.github.calls.push('check'); checking.resolve(); await release.promise;
+      return { outcome: 'clear', baseHead: 'b'.repeat(40) }; };
+    const { app, store, identity, branch } = await serve(w, { startup: false, issueGateway, before: service => {
+      completeAll(service);
+      service.store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    } });
+    app.publishOwed(() => undefined);
+    await checking.promise;
+    store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+    release.resolve();
+    await publishSettled(app, identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/not trusted/) });
+    expect(w.github.head(branch)).toBeNull();
+    expect(w.github.prs).toEqual([]);
+  });
+
+  it('aborts and settles a publish whose issue authorization is still pending during shutdown', async () => {
+    const w = world(), reading = Promise.withResolvers<void>();
+    let accessSignal: AbortSignal | undefined;
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      issueAccess(_number, options = {}) {
+        accessSignal = options.signal; reading.resolve();
+        return new Promise((_resolve, reject) => options.signal?.addEventListener('abort', () => reject(options.signal!.reason), { once: true }));
+      },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, store, close } = await serve(w, { startup: false, issueGateway, before: completeAll });
+    const records = vi.spyOn(store, 'recordPublish');
+    app.publishOwed(() => undefined);
+    await reading.promise;
+    await close();
+    expect(accessSignal?.aborted).toBe(true);
+    expect(records.mock.calls.some(call => call[1].outcome === 'stopped')).toBe(true);
     expect(w.github.calls).toEqual([]);
   });
 

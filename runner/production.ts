@@ -231,11 +231,13 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
    * read the issue, every collaborator page and every comment page again. Only a completed read is kept. The window is
    * measured on the monotonic clock, so a wall-clock step back cannot stretch it.
    */
-  let lastRead: { number: number; at: number; text: IssueText } | null = null;
+  let lastRead: { number: number; trustedAuthor: string | null | undefined; at: number; text: IssueText } | null = null;
   const issueText = async (number: number, signal: AbortSignal): Promise<IssueText> => {
-    if (lastRead && lastRead.number === number && performance.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
-    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000 });
-    lastRead = { number, at, text };
+    const trust = service.store.issueTrust(review.github!.repository, number);
+    const trustedAuthor = trust?.revokedAt === null ? trust.authorLogin : undefined;
+    if (lastRead && lastRead.number === number && lastRead.trustedAuthor === trustedAuthor && performance.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
+    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000, trustedAuthor });
+    lastRead = { number, trustedAuthor, at, text };
     return text;
   };
   const only = (requested: typeof identity) => {

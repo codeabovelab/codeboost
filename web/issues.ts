@@ -1,8 +1,11 @@
 import { IssuePrioritizer, type IssuePriorityState, type RankedIssue } from '../core/issue-ranking.ts';
 import type { IssueGateway } from '../github/issues.ts';
+import type { IssueTrustRecord } from '../runner/store.ts';
 
 /** Issue bodies stay on the server: the screen never shows them, and each may be up to 64 KiB. */
-export type IssueSummary = Omit<RankedIssue, 'body'>;
+export type IssueSummary = Omit<RankedIssue, 'body' | 'trust'> & {
+  trust: RankedIssue['trust'] | 'approved'; trustedAt?: string; trustedBy?: string;
+};
 type Summarized<State> = State extends unknown ? Omit<State, 'issues'> & { issues: IssueSummary[] } : never;
 export type IssueBoardState = Summarized<IssuePriorityState>;
 
@@ -26,19 +29,38 @@ export const REFRESH_TIMEOUT_MS = 12_000;
 export class IssueBoard {
   readonly #prioritizer: IssuePrioritizer | null;
   readonly #reason: string;
+  readonly #trust: (repository: string, issue: number) => IssueTrustRecord | null;
   #state: IssueBoardState | null = null;
   #flight: Promise<void> | null = null;
   #controller: AbortController | null = null;
   #closing = false;
 
-  constructor(gateway: IssueGateway | null, unavailableReason = 'Issue ranking is not configured.', now?: () => Date) {
+  constructor(gateway: IssueGateway | null, unavailableReason = 'Issue ranking is not configured.', now?: () => Date,
+    trust: (repository: string, issue: number) => IssueTrustRecord | null = () => null) {
     this.#prioritizer = gateway ? new IssuePrioritizer(gateway, now) : null;
     this.#reason = unavailableReason;
+    this.#trust = trust;
   }
 
   view(): IssueBoardView {
     if (!this.#prioritizer) return { configured: false, reason: this.#reason };
-    return { configured: true, repository: this.#prioritizer.gateway.repository, refreshing: this.#flight !== null, state: this.#state };
+    const state = this.#state && { ...this.#state, issues: this.#state.issues.map(issue => {
+      if (issue.trust === 'trusted') return issue;
+      const decision = this.#trust(issue.repository, issue.number);
+      return decision?.revokedAt === null && decision.authorLogin === issue.authorLogin
+        ? { ...issue, trust: 'approved' as const, trustedAt: decision.trustedAt, trustedBy: decision.trustedBy }
+        : issue;
+    }) } as IssueBoardState;
+    return { configured: true, repository: this.#prioritizer.gateway.repository, refreshing: this.#flight !== null, state };
+  }
+
+  /** Latest complete board knowledge for one issue. Unknown is deliberately not treated as trusted. */
+  trustStatus(number: number): 'allowed' | 'blocked' | 'unknown' {
+    const view = this.view();
+    if (!view.configured || !view.state || view.state.state !== 'fresh') return 'unknown';
+    const issue = view.state.issues.find(candidate => candidate.number === number);
+    if (!issue) return 'unknown';
+    return issue.trust === 'trusted' || issue.trust === 'approved' ? 'allowed' : 'blocked';
   }
 
   async refresh(signal?: AbortSignal): Promise<IssueBoardView> {

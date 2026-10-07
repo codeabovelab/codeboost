@@ -160,9 +160,16 @@ it('starts a publish the database owes once startup has verified the lock (#103)
     store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
     store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
   } finally { store.close(); }
-  // A gh that records each call and fails, so nothing reaches GitHub.
+  // A gh that admits the collaborator-authored issue, then records and fails the publish so nothing reaches GitHub.
   const bin = docker.path.split(':')[0]!, calls = join(bin, 'gh-calls');
-  writeFileSync(join(bin, 'gh'), `#!/bin/sh\necho "$@" >> '${calls}'\nexit 1\n`); chmodSync(join(bin, 'gh'), 0o755);
+  writeFileSync(join(bin, 'gh'), `#!/bin/sh
+echo "$@" >> '${calls}'
+case "$*" in
+  *repos/owner/repo/issues/3*) printf '%s' '{"number":3,"user":{"login":"member"}}'; exit 0 ;;
+  *repos/owner/repo/collaborators*) printf '%s' '[{"login":"member"}]'; exit 0 ;;
+esac
+exit 1
+`); chmodSync(join(bin, 'gh'), 0o755);
   docker.release();
   const cli = start(docker);
   try {

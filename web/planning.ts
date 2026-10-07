@@ -14,7 +14,7 @@ export const ISSUE_READ_TIMEOUT_MS = 30_000;
 export function productionPlanning(config: ReviewConfig, options: {
   /** The single-runner lock's check that the database path still names the locked file (runner/recovery.ts). */
   verifyLock: () => void;
-  issues?: { issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number }): Promise<IssueText> };
+  issues?: { issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null }): Promise<IssueText> };
   agent?: (service: ReviewService) => PlanningAgent;
 }): PlanningSetup | undefined {
   const github = config.github;
@@ -30,7 +30,9 @@ export function productionPlanning(config: ReviewConfig, options: {
     return {
       provider,
       async describe(signal) {
-        const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
+        const trust = service.store.issueTrust(github.repository, github.issue);
+        const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS,
+          trustedAuthor: trust?.revokedAt === null ? trust.authorLogin : undefined });
         // The configured base branch (#103), or the base commit when none (or an empty one) is configured.
         const baseRef = github.baseBranch || service.store.getSnapshot(config.identity).base;
         return { issue: { number: text.number, title: text.title, body: text.body, comments: [...text.comments] },

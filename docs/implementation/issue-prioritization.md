@@ -108,8 +108,7 @@ The status line says one of:
 - "✕ Unavailable": no list has been retrieved yet, with the error;
 - "– Not configured": the review configuration has no `github.repository`.
 
-A note says that trusting issues and queueing are not available yet. Demo mode
-shows fixture issues and never contacts GitHub.
+Demo mode shows fixture issues and never contacts GitHub.
 
 **State holders.**
 
@@ -118,6 +117,33 @@ shows fixture issues and never contacts GitHub.
 | Retrieval (`gh` subprocesses) | `IssueBoard` in `web/issues.ts` | One refresh at a time, under an abort controller owned by the server. Concurrent requests join it. The gateway timeout is 12 seconds, below the 15-second request timeout. |
 | Last good list | `IssuePrioritizer` (H3) | Kept in memory only. After a restart, the first failure is "unavailable", not "stale". |
 | HTTP requests | `web/server.ts` | `GET /api/issues` reads the current view without fetching. `POST /api/issues` with `{"action":"refresh"}` starts or joins a refresh. A request that is aborted stops waiting but does not cancel the shared refresh. |
+
+## H4b: Trust this issue
+
+**Decision and scope.** A trust decision is bound to the lower-cased repository identity, issue number and the issue's
+current author login. It applies to planning and execute prompts. Revoking trust does not interrupt an invocation that
+already started; the next start, resume, planning read or publish evaluates the new decision. Publishing is guarded too,
+so a revoked decision cannot cross the next irreversible boundary.
+
+**Durable state.** Schema v17 adds one `issue_trust` row per repository and issue, retaining who decided, when, the
+author that was observed, and a revocation time. Changing or deleting the GitHub author makes the row inapplicable.
+Trust and untrust requests carry UUID v4 action IDs and use the ordinary durable action replay before GitHub is read.
+Each execute attempt also stores the SHA-256 digest and count of the exact comment strings put in its prompt.
+
+**Admission.** Start, resume and publish fetch the issue author and the complete current collaborator list under one
+bounded GitHub read. A collaborator-authored issue passes without a local decision. Every other issue needs a live,
+unrevoked row for that exact repository, number and author. Malformed, partial, failed and over-limit reads fail closed,
+and the refusal is saved under the action ID. The task and review versions are still checked in the same transaction
+that admits the attempt, after the external read.
+
+**Comments.** Without matching trust, only current collaborators' comments enter planning and execute prompts. With
+matching trust, every bounded comment enters the same untrusted-data block, including comments from deleted accounts.
+The issue author is re-read with the comments, so a decision for an earlier author cannot widen the prompt.
+
+**Screen and demo.** The Issues table offers `Trust this issue` and `Remove trust`. While either request is in flight,
+the focused control remains enabled for focus purposes, uses `aria-disabled`, and ignores repeat activation. A response
+updates only that issue state and restores focus to its replacement control. Demo fixtures use the same Store and API,
+but resolve author and collaborator state locally and never contact GitHub.
 | Rendered screen | `web/public/app.js` | A generation number discards a response that a newer refresh has replaced. Switching screens hides and shows views without re-rendering, so review drafts, selections and focus stay. |
 
 **Shutdown.** The server rejects new requests, drains admitted requests within

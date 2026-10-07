@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
@@ -119,6 +119,14 @@ describe('item execution', () => {
     expect(argv[0]).toEqual([['npm', 'test']]);
     expect(owners[0]).toBe(RUNNER_OWNER);
     expect(argv[1]).toEqual([]);
+  });
+  it('records a digest and count of the exact comments carried by every execute attempt', async () => {
+    const comments = ['collaborator note', 'trusted outside note'];
+    const { store, executor } = setup({ issue: () => ({ number: 1, title: 'Issue', body: '', comments }) });
+    await executor.runTask(identity);
+    const evidence = { count: 2, digest: createHash('sha256').update(JSON.stringify(comments)).digest('hex') };
+    expect(store.getAttempts(identity).map(attempt => attempt.promptComments)).toEqual([evidence, evidence]);
+    expect(store.recentAttempts(identity, 20).map(attempt => attempt.promptComments)).toEqual([evidence, evidence]);
   });
   it('reports a planned-but-unchanged item without committing', async () => {
     const { executor, commits } = setup({ manifests: { P1: manifest([]) } });
