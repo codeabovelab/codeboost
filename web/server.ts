@@ -389,9 +389,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         if (runner.isActive(identity) || executor?.busy(identity) || publishing?.busy(identity))
           throw new GuardRefusal('The runner or publisher is busy; pre-merge preparation cannot start yet.');
         preMerge.assertStartable();
-        const snapshotId = service.store.getSnapshot(identity).id;
+        const snapshot = service.store.getSnapshot(identity);
         service.store.afterCommit(() => { afterPreMerge(preMerge!.start({ stateVersion: expectedStateVersion as number,
-          reviewVersion: expectedReviewVersion as number, snapshotId, actionId: actionId as string })); });
+          reviewVersion: expectedReviewVersion as number, snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head,
+          actionId: actionId as string })); });
         return { outcome: 'preparing' };
       }
       if (action === 'approve-continuation') {

@@ -73,7 +73,7 @@ export class PreMergeCoordinator {
     if (this.#closing) throw new GuardRefusal('The server is shutting down.');
     if (this.#active) throw new GuardRefusal('Pre-merge preparation is already running.');
   }
-  start(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }): Promise<PreMergeResult> {
+  start(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; actionId?: string }): Promise<PreMergeResult> {
     this.assertStartable();
     const controller = new AbortController(); this.#abort = controller;
     const deadline = performance.now() + this.operationTimeoutMs;
@@ -82,6 +82,7 @@ export class PreMergeCoordinator {
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
     let readiness: PreMergeReadiness | null = null;
+    let failurePair = { base: expected.base, head: expected.head };
     const remember = (input: PreparedResult) => {
       const { readiness: readyBinding, ...plain } = input;
       readiness = readyBinding ?? null;
@@ -93,10 +94,10 @@ export class PreMergeCoordinator {
       this.#last = result;
       return result;
     };
-    const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline)).then(remember, error => {
+    const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline,
+      pair => { failurePair = pair; })).then(remember, error => {
       // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
-      const snapshot = this.service.store.getSnapshot(this.service.config.identity);
-      const result: PreMergeResult = { state: 'failed', base: snapshot.base, head: snapshot.head,
+      const result: PreMergeResult = { state: 'failed', ...failurePair,
         checked: [], reason: error instanceof Error ? error.message : String(error) };
       return remember(result);
     }).then(result => {
@@ -109,7 +110,7 @@ export class PreMergeCoordinator {
       catch (error) {
         // No terminal response or readiness was committed. Remove only this action's pending placeholder, so the same
         // key can start the preparation again instead of replaying work that no longer exists.
-        try { this.settle(() => this.service.store.abandonPreMergeAction(this.service.config.identity, expected.actionId!)); }
+        try { this.settle(() => this.service.store.makePreMergeActionResendable(this.service.config.identity, expected.actionId!)); }
         catch { /* The original storage failure remains the result; startup recovery handles a placeholder we could not remove. */ }
         const failed: PreMergeResult = { ...result, state: 'failed',
           reason: error instanceof Error ? error.message : String(error) };
@@ -133,11 +134,12 @@ export class PreMergeCoordinator {
     return outcome;
   }
 
-  #refresh(pair: RemotePair, priorHead?: string) {
-    const view = this.service.load();
+  #refresh(pair: RemotePair, remaining: () => number, priorHead?: string) {
+    const historyOptions = () => ({ maxDurationMs: Math.min(30_000, remaining()) });
+    const view = this.service.load(historyOptions());
     const repository = this.service.reviewRepository().path;
     let history: ReturnType<typeof readHistory>;
-    try { history = readHistory(repository, pair.base, pair.head); }
+    try { history = readHistory(repository, pair.base, pair.head, historyOptions()); }
     catch (error) {
       // A collaborator may push on the old remote head while the base moves (or while F5 retains an unpushed local
       // rebase). Review that head against the latest stored base it actually descended from; the next preparation can
@@ -149,7 +151,8 @@ export class PreMergeCoordinator {
       for (const candidate of [priorHead, ...this.service.store.rewrittenAncestors(this.service.config.identity, priorHead)]) {
         const priorId = this.service.store.snapshotWithHead(this.service.config.identity, candidate);
         if (!priorId) continue;
-        try { recovered = readHistory(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base, pair.head); break; }
+        try { recovered = readHistory(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base,
+          pair.head, historyOptions()); break; }
         catch (fallback) {
           if (!(fallback instanceof Error)
             || !/linear history descended from the base|base must be an ancestor of the head/i.test(fallback.message)) throw fallback;
@@ -159,7 +162,7 @@ export class PreMergeCoordinator {
       history = recovered;
     }
     this.service.store.recordHistory(this.service.config.identity, view.expected, history.base, history.head, []);
-    return this.service.load();
+    return this.service.load(historyOptions());
   }
   #reviewBlocker(view: ReturnType<ReviewService['load']>, requireChecks = false): string | null {
     const item = view.items.find(value => value.state !== 'approved' || value.outside.length);
@@ -183,7 +186,7 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
-    deadline: number): Promise<PreparedResult> {
+    deadline: number, onPair: (pair: RemotePair) => void): Promise<PreparedResult> {
     const identity = this.service.config.identity;
     const remaining = () => {
       const value = Math.ceil(deadline - performance.now());
@@ -201,7 +204,11 @@ export class PreMergeCoordinator {
       const validate = await this.authorize(signal);
       await validate(); signal.throwIfAborted(); remaining();
     };
-    let view = this.service.load(), task = this.service.store.getTask(identity);
+    const track = <T extends ReturnType<ReviewService['load']>>(current: T): T => {
+      onPair({ base: current.snapshot.base, head: current.snapshot.head }); return current;
+    };
+    const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, remaining()) }));
+    let view = load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
     if (!MERGEABLE_STATUSES.includes(task.status)) throw new GuardRefusal(`The task is ${task.status}; prepare it from review.`);
@@ -226,13 +233,14 @@ export class PreMergeCoordinator {
     const retainedRemoteHead = initial.head !== view.snapshot.head
       && this.service.store.isRewrittenHead(identity, initial.head, view.snapshot.head);
     if (initial.head !== view.snapshot.head && !retainedRemoteHead) {
-      view = this.#refresh(initial, view.snapshot.head);
+      view = track(this.#refresh(initial, remaining, view.snapshot.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
         reason: 'The pull request head moved; attribution and approvals were refreshed.' };
     }
     if (initial.base !== view.snapshot.base) {
       const repository = this.service.reviewRepository().path;
-      const old = readHistory(repository, view.snapshot.base, view.snapshot.head).commits.map(commit => commit.sha);
+      const old = readHistory(repository, view.snapshot.base, view.snapshot.head,
+        { maxDurationMs: Math.min(30_000, remaining()) }).commits.map(commit => commit.sha);
       task = this.service.store.getTask(identity);
       const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
         reviewVersion: view.expected.reviewVersion! };
@@ -253,7 +261,7 @@ export class PreMergeCoordinator {
         catch (cleanup) { throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error }); }
         throw error;
       }
-      view = this.service.load();
+      view = load();
     }
     const blocker = this.#reviewBlocker(view);
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
@@ -281,7 +289,7 @@ export class PreMergeCoordinator {
         throw new GuardRefusal('Command-check cleanup could not be confirmed; restart and recover owned resources before preparing a merge.');
       if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
         ? settled.diagnostic : `${item.id} command checks did not pass.`);
-      checked.push(item.id); view = this.service.load();
+      checked.push(item.id); view = load();
       const changed = this.#reviewBlocker(view);
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
     }
@@ -293,11 +301,11 @@ export class PreMergeCoordinator {
     assertCurrent(guarded);
     if (final.base !== initial.base || final.head !== initial.head) {
       await this.remote.fetch(final, signal); signal.throwIfAborted(); assertCurrent(guarded);
-      view = this.#refresh(final, initial.head);
+      view = track(this.#refresh(final, remaining, initial.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during preparation; attribution and approvals were refreshed.' };
     }
-    view = this.service.load();
+    view = load();
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed during preparation; reload it.' };
@@ -308,7 +316,7 @@ export class PreMergeCoordinator {
     // Authorization is asynchronous. A review edit during that read invalidates its result just as one during the
     // final remote inspection does; nothing may persist readiness from the pre-authorization view.
     assertCurrent(guarded);
-    view = this.service.load();
+    view = load();
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed during final authorization; reload it.' };
@@ -321,11 +329,11 @@ export class PreMergeCoordinator {
     assertCurrent(guarded);
     if (authorizedRemote.base !== initial.base || authorizedRemote.head !== initial.head) {
       await this.remote.fetch(authorizedRemote, signal); signal.throwIfAborted(); assertCurrent(guarded);
-      view = this.#refresh(authorizedRemote, initial.head);
+      view = track(this.#refresh(authorizedRemote, remaining, initial.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during final authorization; attribution and approvals were refreshed.' };
     }
-    view = this.service.load();
+    view = load();
     if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The local review changed after final authorization; reload it.' };

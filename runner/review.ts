@@ -57,7 +57,7 @@ export class ReviewService {
     if (!this.config.runnerRepository) throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
     return { path: this.config.runnerRepository, runnerOwned: true };
   }
-  load() {
+  load(options: { maxDurationMs?: number } = {}) {
     const { identity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
@@ -66,7 +66,8 @@ export class ReviewService {
     // HEAD changes in the user's repository are observed; no Git mutation is performed by the review service. Runner
     // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
     // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
-    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
+    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD',
+      options.maxDurationMs === undefined ? {} : { maxDurationMs: options.maxDurationMs });
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = this.#pathKey;
     const ledger = this.store.getLedger(identity);

@@ -140,7 +140,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize, options.reserves);
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons,
     rebaseRuns: () => rebaseRuns, rebaseAborts: () => rebaseAborts };
 }
@@ -187,7 +187,7 @@ it('does not report readiness while a current change request remains open', asyn
   fixture.service.store.addReviewNote(fixture.service.config.identity, current.expected, 'P1', 'change', 'Please revise this.');
   const changed = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
   const result = await fixture.coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: changed.expected.reviewVersion!, snapshotId: changed.snapshot.id });
+    reviewVersion: changed.expected.reviewVersion!, snapshotId: changed.snapshot.id, base: changed.snapshot.base, head: changed.snapshot.head });
   expect(result).toMatchObject({ state: 'review-required', checked: [] });
   expect(result.reason).toMatch(/1 change request remains open/);
   await fixture.coordinator.close(); await fixture.runner.close();
@@ -199,7 +199,7 @@ it('preserves an unpushed rebased head across review and preparation retries', a
   view = first.service.act({ action: 'approve', item: 'P1', token: view.token });
   const task = first.service.store.getTask(first.service.config.identity);
   const result = await first.coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result).toMatchObject({ state: 'ready', head: first.rebased, reason: null });
   expect(first.rebaseRuns()).toBe(1);
   await first.coordinator.close(); await first.runner.close();
@@ -343,7 +343,7 @@ it('refreshes the moved head against its prior base when the PR base and head ad
     { inspect: async () => moved, fetch: async () => undefined });
   const task = service.store.getTask(config.identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result.reason).toMatch(/head moved/);
   expect(result).toMatchObject({ state: 'review-required', base: initial.base, head: moved.head, checked: [] });
   const refreshed = service.load();
@@ -398,7 +398,7 @@ it('traces an unpushed rewrite back to the base of a collaborator head', async (
       fetch: async () => undefined });
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result).toMatchObject({ state: 'review-required', base: oldBase, head: collaboratorHead });
   expect(result.reason).toMatch(/moved during preparation/);
   expect(service.load().snapshot).toMatchObject({ base: oldBase, head: collaboratorHead });
@@ -420,7 +420,7 @@ it('settles an admitted action after shutdown aborts its remote refresh', async 
     { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
       fetch: async () => undefined }, 60_000, capability);
   const active = coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
-    snapshotId: view.snapshot.id, actionId });
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head, actionId });
   await Promise.resolve();
   service.store.closeWrites(); await coordinator.close();
   await expect(active).resolves.toMatchObject({ state: 'failed', reason: 'Server shutdown.' });
@@ -440,7 +440,7 @@ it('applies one operation-wide deadline to remote work and later checks', async 
     { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
       fetch: async () => undefined }, 20);
   await expect(coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
-    snapshotId: view.snapshot.id })).resolves.toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head })).resolves.toMatchObject({ state: 'failed' });
   await coordinator.close();
 });
 
@@ -462,7 +462,7 @@ it('aborts remote work early enough to reserve bounded subprocess settlement', a
     { processMs: processReserve });
   const startedAt = performance.now();
   const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
-    snapshotId: view.snapshot.id });
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
   expect(abortedAt - startedAt).toBeLessThanOrEqual(operationTimeout - processReserve + 500);
   expect(performance.now() - startedAt).toBeLessThanOrEqual(operationTimeout + 500);
@@ -475,6 +475,13 @@ it('makes a preparation action resendable when its terminal storage write fails'
   markRunnerOwned(service);
   const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
   const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
+  const readiness = { stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head };
+  const priorActionId = randomUUID();
+  service.store.userAction(config.identity, { actionId: priorActionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  service.store.settlePreMergeAction(config.identity, priorActionId,
+    { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked: [], reason: null }, readiness);
+  expect(service.store.preMergeReady(config.identity, readiness)).toBe(true);
   service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   const original = service.store.settlePreMergeAction.bind(service.store);
   vi.spyOn(service.store, 'settlePreMergeAction').mockImplementationOnce(() => {
@@ -486,12 +493,53 @@ it('makes a preparation action resendable when its terminal storage write fails'
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => ({ base: view.snapshot.base, head: view.snapshot.head }), fetch: async () => undefined });
   const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
-    snapshotId: view.snapshot.id, actionId });
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head, actionId });
   expect(result).toMatchObject({ state: 'failed', reason: 'transient storage failure' });
+  expect(service.store.preMergeReady(config.identity, readiness)).toBe(false);
   expect(service.store.savedAction(config.identity, { actionId, kind: 'prepare-merge', request })).toBeUndefined();
   const replay = service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   expect(replay).toMatchObject({ replayed: false, response: { outcome: 'preparing' } });
   await coordinator.close();
+});
+
+it('settles a failed preparation even when the fallback snapshot read would fail', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-fallback-read-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
+  const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
+  service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const original = service.store.getSnapshot.bind(service.store); let reads = 0;
+  vi.spyOn(service.store, 'getSnapshot').mockImplementation((...args) => {
+    if (++reads >= 2) throw Object.assign(new Error('transient snapshot read failure'), { code: 'ERR_SQLITE_ERROR' });
+    return original(...args);
+  });
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => { throw new Error('remote inspection failed'); }, fetch: async () => undefined });
+  await expect(coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head, actionId }))
+    .resolves.toMatchObject({ state: 'failed', reason: 'transient snapshot read failure' });
+  expect(service.store.savedAction(config.identity, { actionId, kind: 'prepare-merge', request })?.response)
+    .toMatchObject({ outcome: 'failed', reason: 'transient snapshot read failure' });
+  await coordinator.close();
+});
+
+it('threads the remaining operation budget through every synchronous review reload', async () => {
+  const fixture = await rebaseFixture('feature\n');
+  const view = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
+  const original = fixture.service.load.bind(fixture.service); const budgets: number[] = [];
+  vi.spyOn(fixture.service, 'load').mockImplementation(options => {
+    budgets.push(options?.maxDurationMs ?? -1); return original(options);
+  });
+  const result = await fixture.coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+  expect(result.state).toBe('ready');
+  expect(budgets.length).toBeGreaterThan(1);
+  expect(budgets.every(value => value > 0 && value <= 30_000)).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
 });
 
 it('rechecks the remote after local preparation and refreshes a head that moved in flight', async () => {
@@ -527,7 +575,7 @@ it('rechecks the remote after local preparation and refreshes a head that moved 
     { inspect: async () => ++reads === 1 ? { base, head } : moved, fetch: async () => undefined });
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
-    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result).toMatchObject({ state: 'review-required', base, head: moved.head, checked: [] });
   expect(result.reason).toMatch(/moved during preparation/);
   expect(service.load().segments.some(segment => segment.row === 'Unplanned')).toBe(true);

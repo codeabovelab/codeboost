@@ -1869,9 +1869,15 @@ export class Store {
       this.#run('INSERT INTO user_actions VALUES (?,?,?,?,?,?)', key, action.actionId, action.kind, hash, response, new Date().toISOString());
     };
     let replaying = false;
+    let restarting = false;
     try {
       return this.#transaction(() => {
         const prior = saved(); if (prior) { replaying = true; return prior; }
+        // A background storage failure leaves a tombstone: it blocks older preparation readiness while validation is
+        // retried, and is replaced atomically by this same request rather than exposed as a replay.
+        restarting = this.#run(`DELETE FROM user_actions WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+          AND request_hash=? AND json_extract(response,'$.ok')=1
+          AND json_extract(response,'$.value.outcome')='resendable'`, key, action.actionId, hash).changes === 1;
         const outer = this.#action;
         this.#action = { key, actionId: action.actionId };
         let value: T;
@@ -1884,6 +1890,9 @@ export class Store {
       if (!replaying && !storage && !(error instanceof ActionIdReused) && !(error instanceof BadRequest) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
         this.#transaction(() => {
+          if (restarting) this.#run(`DELETE FROM user_actions WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+            AND request_hash=? AND json_extract(response,'$.ok')=1
+            AND json_extract(response,'$.value.outcome')='resendable'`, key, action.actionId, hash);
           if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId))
             record({ ok: false, error: message, ...(error instanceof UpstreamFailure ? { kind: 'upstream' } : {}) });
           if (error instanceof RefusalWithEffect) error.effect();
@@ -1901,7 +1910,8 @@ export class Store {
     const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', identityKey(identity), action.actionId);
     if (!row) return undefined;
     if (row.request_hash !== requestHash(action.kind, action.request)) throw new ActionIdReused('Action ID already used for a different request.');
-    const outcome = decode<{ ok: boolean; value?: T; error?: string; kind?: string }>(row.response);
+    const outcome = decode<{ ok: boolean; value?: T & { outcome?: unknown }; error?: string; kind?: string }>(row.response);
+    if (row.kind === 'prepare-merge' && outcome.ok && outcome.value?.outcome === 'resendable') return undefined;
     if (!outcome.ok) throw outcome.kind === 'upstream' ? new UpstreamFailure(outcome.error!) : new GuardRefusal(outcome.error!);
     return { response: outcome.value as T, replayed: true };
   }
@@ -1931,14 +1941,14 @@ export class Store {
     });
   }
   /**
-   * A background preparation whose terminal write failed applied no durable readiness. Remove only its still-pending
-   * placeholder so the same idempotency key can safely be resent; a terminal outcome is never made resendable.
+   * A background preparation whose terminal write failed applied no durable readiness. Replace only its still-pending
+   * placeholder with a tombstone so the same key can be resent without revealing an older ready preparation.
    */
-  abandonPreMergeAction(identity: PlanIdentity, actionId: string): boolean {
+  makePreMergeActionResendable(identity: PlanIdentity, actionId: string): boolean {
     assertUuidV4(actionId, 'Action ID');
-    return this.#run(`DELETE FROM user_actions WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+    return this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
       AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
-      identityKey(identity), actionId).changes === 1;
+      encode({ ok: true, value: { outcome: 'resendable' } }), identityKey(identity), actionId).changes === 1;
   }
   /** The latest preparation action is authoritative and must match every current local generation and the exact pair. */
   preMergeReady(identity: PlanIdentity, readiness: PreMergeReadiness): boolean {
