@@ -29,6 +29,7 @@ export class PreMergeCoordinator {
   #abort: AbortController | null = null;
   #closing = false;
   #last: PreMergeResult | null = null;
+  #lastBinding: { stateVersion: number; reviewVersion: number; snapshotId: string } | null = null;
 
   constructor(service: ReviewService, runner: RunnerCoordinator, rebaser: GitRebaser, remote: PreMergeRemote,
     operationTimeoutMs = 10 * 60_000, capability?: ShutdownCapability,
@@ -41,7 +42,17 @@ export class PreMergeCoordinator {
   }
 
   get active(): boolean { return this.#active !== null; }
-  get last(): PreMergeResult | null { return this.#last; }
+  get last(): (PreMergeResult & { stale: boolean }) | null {
+    if (!this.#last) return null;
+    let stale = false;
+    if (this.#last.state === 'ready' && this.#lastBinding) try {
+      const task = this.service.store.getTask(this.service.config.identity);
+      stale = task.stateVersion !== this.#lastBinding.stateVersion
+        || this.service.store.reviewVersion(this.service.config.identity) !== this.#lastBinding.reviewVersion
+        || this.service.store.getSnapshot(this.service.config.identity).id !== this.#lastBinding.snapshotId;
+    } catch { stale = true; }
+    return { ...this.#last, stale };
+  }
   assertStartable(): void {
     if (this.#closing) throw new GuardRefusal('The server is shutting down.');
     if (this.#active) throw new GuardRefusal('Pre-merge preparation is already running.');
@@ -54,20 +65,34 @@ export class PreMergeCoordinator {
       { code: 'ETIMEDOUT' })), this.operationTimeoutMs);
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
-    const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline)).then(result => (this.#last = result), error => {
+    const remember = (input: PreMergeResult) => {
+      let result = input;
+      this.#lastBinding = null;
+      if (result.state === 'ready') try {
+        this.#lastBinding = {
+          stateVersion: this.service.store.getTask(this.service.config.identity).stateVersion,
+          reviewVersion: this.service.store.reviewVersion(this.service.config.identity),
+          snapshotId: this.service.store.getSnapshot(this.service.config.identity).id,
+        };
+      } catch (error) {
+        result = { ...result, state: 'failed', reason: `Could not bind preparation readiness: ${error instanceof Error ? error.message : String(error)}` };
+      }
+      this.#last = result;
+      return result;
+    };
+    const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline)).then(remember, error => {
       // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
       const snapshot = this.service.store.getSnapshot(this.service.config.identity);
       const result: PreMergeResult = { state: 'failed', base: snapshot.base, head: snapshot.head,
         checked: [], reason: error instanceof Error ? error.message : String(error) };
-      this.#last = result; return result;
+      return remember(result);
     }).then(result => {
       if (!expected.actionId) return result;
       try { this.settle(() => this.service.store.settlePreMergeAction(this.service.config.identity, expected.actionId!, result)); }
       catch (error) {
         const failed: PreMergeResult = { ...result, state: 'failed',
           reason: error instanceof Error ? error.message : String(error) };
-        this.#last = failed;
-        return failed;
+        return remember(failed);
       }
       return result;
     }).finally(() => { clearTimeout(timer); if (this.#active === active) { this.#active = null; this.#abort = null; } });
@@ -87,9 +112,22 @@ export class PreMergeCoordinator {
     return outcome;
   }
 
-  #refresh(pair: RemotePair) {
+  #refresh(pair: RemotePair, priorHead?: string) {
     const view = this.service.load();
-    const history = readHistory(this.service.reviewRepository().path, pair.base, pair.head);
+    const repository = this.service.reviewRepository().path;
+    let history: ReturnType<typeof readHistory>;
+    try { history = readHistory(repository, pair.base, pair.head); }
+    catch (error) {
+      // A collaborator may push on the old remote head while the base moves (or while F5 retains an unpushed local
+      // rebase). Review that head against the latest stored base it actually descended from; the next preparation can
+      // then rebase the newly attributed head. Only ancestry mismatch permits this fallback: every other read failure
+      // remains fail-closed.
+      if (!priorHead || !(error instanceof Error)
+        || !/linear history descended from the base|base must be an ancestor of the head/i.test(error.message)) throw error;
+      const priorId = this.service.store.snapshotWithHead(this.service.config.identity, priorHead);
+      if (!priorId) throw error;
+      history = readHistory(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base, pair.head);
+    }
     this.service.store.recordHistory(this.service.config.identity, view.expected, history.base, history.head, []);
     return this.service.load();
   }
@@ -152,7 +190,7 @@ export class PreMergeCoordinator {
     const retainedRemoteHead = initial.head !== view.snapshot.head
       && this.service.store.isRewrittenHead(identity, initial.head, view.snapshot.head);
     if (initial.head !== view.snapshot.head && !retainedRemoteHead) {
-      view = this.#refresh(initial);
+      view = this.#refresh(initial, view.snapshot.head);
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
         reason: 'The pull request head moved; attribution and approvals were refreshed.' };
     }
@@ -214,7 +252,8 @@ export class PreMergeCoordinator {
     const final = await this.remote.inspect(signal); signal.throwIfAborted();
     assertCurrent(guarded);
     if (final.base !== initial.base || final.head !== initial.head) {
-      await this.remote.fetch(final, signal); view = this.#refresh(final);
+      await this.remote.fetch(final, signal); signal.throwIfAborted(); assertCurrent(guarded);
+      view = this.#refresh(final, initial.head);
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during preparation; attribution and approvals were refreshed.' };
     }
@@ -236,6 +275,23 @@ export class PreMergeCoordinator {
     const authorizedBlocker = this.#reviewBlocker(view, true);
     if (authorizedBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
       reason: authorizedBlocker };
+    // The authorization read above is asynchronous, so the PR may have moved after the earlier inspection. Reinspect
+    // it, then immediately recheck every local generation before recording readiness.
+    const authorizedRemote = await this.remote.inspect(signal); signal.throwIfAborted();
+    assertCurrent(guarded);
+    if (authorizedRemote.base !== initial.base || authorizedRemote.head !== initial.head) {
+      await this.remote.fetch(authorizedRemote, signal); signal.throwIfAborted(); assertCurrent(guarded);
+      view = this.#refresh(authorizedRemote, initial.head);
+      return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
+        reason: 'The pull request moved during final authorization; attribution and approvals were refreshed.' };
+    }
+    view = this.service.load();
+    if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
+      return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
+        reason: 'The local review changed after final authorization; reload it.' };
+    const postAuthorizationBlocker = this.#reviewBlocker(view, true);
+    if (postAuthorizationBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
+      checked, reason: postAuthorizationBlocker };
     return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null };
   }
 }

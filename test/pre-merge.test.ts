@@ -33,7 +33,7 @@ const markRunnerOwned = (service: ReviewService) => {
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
-  duringAuthorize?: (service: ReviewService, call: number) => void;
+  duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   commandWaitsForDeadline?: boolean;
   unsettledRebase?: boolean;
@@ -113,17 +113,17 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: commandExit ?? 0,
         signal: null, stdout: '', stderr: commandExit ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
   }, () => context, 'a'.repeat(32)));
-  let remoteReads = 0;
+  let remoteReads = 0, remotePair = { base: onto, head };
   let authorizationChecks = 0;
   const authorize = options.authorize ?? (options.duringAuthorize ? async () => () => {
-    options.duringAuthorize!(service, ++authorizationChecks);
+    remotePair = options.duringAuthorize!(service, ++authorizationChecks) ?? remotePair;
   } : undefined);
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
       remoteReads++;
       if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator);
-      return { base: onto, head };
+      return remotePair;
     }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize);
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
@@ -223,6 +223,28 @@ it('revalidates task and review versions after final authorization', async () =>
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('refreshes a pull request head that moves during final authorization', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    if (call !== 2) return;
+    writeFileSync(join(service.config.repository, 'late.txt'), 'late collaborator push\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'late push');
+    return { base: service.load().snapshot.base, head: fixtureGit(service.config.repository, 'rev-parse', 'HEAD') };
+  } });
+  expect(fixture.result).toMatchObject({ state: 'review-required' });
+  expect(fixture.result.reason).toMatch(/moved during final authorization/);
+  expect(fixture.service.load().snapshot.head).toBe(fixture.result.head);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('marks historical readiness stale after the review changes', async () => {
+  const fixture = await rebaseFixture('feature\n');
+  expect(fixture.coordinator.last).toMatchObject({ state: 'ready', stale: false });
+  const view = fixture.service.load();
+  fixture.service.store.addReviewNote(fixture.service.config.identity, view.expected, 'P1', 'change', 'Review changed later.');
+  expect(fixture.coordinator.last).toMatchObject({ state: 'ready', stale: true });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('keeps a command-check deadline separate from the code-writing task budget', async () => {
   const fixture = await rebaseFixture('feature\n', 0, { commandWaitsForDeadline: true, operationTimeoutMs: 5_000 });
   expect(fixture.result).toMatchObject({ state: 'failed' });
@@ -255,7 +277,7 @@ it('preserves shutdown as the reason that stops an active command check', async 
   await fixture.runner.close();
 });
 
-it('refreshes attribution and approvals against the exact head after a collaborator push', async () => {
+it('refreshes the moved head against its prior base when the PR base and head advance together', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
   markRunnerOwned(service);
@@ -266,7 +288,12 @@ it('refreshes attribution and approvals against the exact head after a collabora
   fixtureGit(config.repository, 'worktree', 'add', '-q', work, branch);
   writeFileSync(join(work, 'README.md'), 'A collaborator changed this after checks started.\n');
   fixtureGit(work, 'add', 'README.md'); fixtureGit(work, 'commit', '-qm', 'collaborator push');
-  const moved = { base: initial.base, head: fixtureGit(work, 'rev-parse', 'HEAD') };
+  const baseWork = join(root, 'advanced-base');
+  fixtureGit(config.repository, 'branch', 'advanced-base', initial.base);
+  fixtureGit(config.repository, 'worktree', 'add', '-q', baseWork, 'advanced-base');
+  writeFileSync(join(baseWork, 'base-moved.txt'), 'new base\n'); fixtureGit(baseWork, 'add', '.');
+  fixtureGit(baseWork, 'commit', '-qm', 'advance base');
+  const moved = { base: fixtureGit(baseWork, 'rev-parse', 'HEAD'), head: fixtureGit(work, 'rev-parse', 'HEAD') };
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
       stop: () => false, isActive: () => false } as never,
@@ -276,9 +303,9 @@ it('refreshes attribution and approvals against the exact head after a collabora
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
   expect(result.reason).toMatch(/head moved/);
-  expect(result).toMatchObject({ state: 'review-required', base: moved.base, head: moved.head, checked: [] });
+  expect(result).toMatchObject({ state: 'review-required', base: initial.base, head: moved.head, checked: [] });
   const refreshed = service.load();
-  expect(refreshed.snapshot).toMatchObject(moved);
+  expect(refreshed.snapshot).toMatchObject({ base: initial.base, head: moved.head });
   expect(refreshed.segments.some(segment => segment.row === 'Unplanned')).toBe(true);
   expect(refreshed.items.some(item => item.state !== 'approved')).toBe(true);
   await coordinator.close();
