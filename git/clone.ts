@@ -1,7 +1,7 @@
 import { execFileSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { lstatSync, mkdtempSync, opendirSync, realpathSync, rmSync } from 'node:fs';
-import { isAbsolute, join, relative, resolve } from 'node:path';
+import { isAbsolute, join, relative, resolve, sep } from 'node:path';
 import type { TaskClone } from '../agents/contract.ts';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../agents/tracked-docker.ts';
@@ -46,6 +46,19 @@ export interface CloneOptions {
   readonly timeoutMs?: number;
 }
 
+interface PathSemantics {
+  readonly sep: string;
+  isAbsolute(path: string): boolean;
+  relative(from: string, to: string): string;
+}
+
+/** Whether `candidate` is `base` itself or one of its descendants under the supplied platform's path rules. */
+export function pathIsWithin(base: string, candidate: string,
+  paths: PathSemantics = { sep, isAbsolute, relative }): boolean {
+  const rel = paths.relative(base, candidate);
+  return rel === '' || (!paths.isAbsolute(rel) && rel !== '..' && !rel.startsWith(`..${paths.sep}`));
+}
+
 /**
  * The clone, as a sequence of Git calls. Both variants run these same steps; only how each call runs differs. Every
  * failure after the clone directory exists, an abort included, removes it before the error leaves.
@@ -62,11 +75,7 @@ function* cloneSteps(options: CloneOptions): Generator<CloneStep, TaskClone, Git
     return value;
   };
   const source = realpathSync(options.source), parent = realpathSync(options.parent);
-  const within = (base: string, path: string) => {
-    const rel = relative(base, path);
-    return rel === '' || (!isAbsolute(rel) && rel !== '..' && !rel.startsWith('../'));
-  };
-  if (within(source, parent)) throw new Error('Task storage must be outside the source repository.');
+  if (pathIsWithin(source, parent)) throw new Error('Task storage must be outside the source repository.');
   function* run(cwd: string, ...args: string[]): Generator<CloneStep, string, GitOutcome | undefined> {
     const outcome = yield { cwd, args, timeoutMs: remaining() };
     if (!outcome || outcome.status !== 0) throw outcome?.error ?? new Error(`git ${args[0] ?? ''} failed.`);
@@ -74,7 +83,7 @@ function* cloneSteps(options: CloneOptions): Generator<CloneStep, TaskClone, Git
     return outcome.stdout.trim();
   }
   const common = realpathSync(resolve(source, yield* run(source, 'rev-parse', '--git-common-dir')));
-  if (within(common, parent)) throw new Error('Task storage must be outside source metadata.');
+  if (pathIsWithin(common, parent)) throw new Error('Task storage must be outside source metadata.');
   function* audit(metadata: string, independent: boolean): Generator<CloneStep, void, GitOutcome | undefined> {
     for (const name of ['shallow', 'info/grafts', 'objects/info/alternates', 'objects/info/http-alternates']) {
       if (lstatSync(join(metadata, name), { throwIfNoEntry: false })) throw new Error(`Unsupported Git storage: ${name}`);
