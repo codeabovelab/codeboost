@@ -27,6 +27,16 @@ const safePath = (root: Buffer, path: Buffer): Buffer => {
   const parts = split0(Buffer.concat([Buffer.from(path).map(byte => byte === 0x2f ? 0 : byte), Buffer.from([0])]));
   if (!parts.length || parts.some(part => !part.length || part.equals(Buffer.from('.')) || part.equals(Buffer.from('..'))))
     throw new Error('Git returned an unsafe path.');
+  const rootStat = lstatSync(root, { throwIfNoEntry: false });
+  if (!rootStat?.isDirectory() || rootStat.isSymbolicLink()) throw new Error('The conflict workspace is not a plain directory.');
+  let ancestor = root;
+  for (const part of parts.slice(0, -1)) {
+    ancestor = Buffer.concat([ancestor, Buffer.from('/'), part]);
+    const stat = lstatSync(ancestor, { throwIfNoEntry: false });
+    if (!stat) break;
+    if (stat.isSymbolicLink()) throw new Error('A changed path has a symlink ancestor.');
+    if (!stat.isDirectory()) throw new Error('A changed path has a non-directory ancestor.');
+  }
   return Buffer.concat([root, Buffer.from('/'), path]);
 };
 

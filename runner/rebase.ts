@@ -107,7 +107,7 @@ export class GitRebaser {
     for (const value of [oldBase, oldHead, onto]) if (!COMMIT_ID.test(value)) throw new Error('A full commit ID is required for rebasing.');
     const ledger = new Map<string, { owner: string | null; origin: 'owned' | 'foreign' }>();
     for (const entry of input.ledger ?? []) {
-      if (!COMMIT_ID.test(entry.sha) || ledger.has(entry.sha) ||
+      if (!COMMIT_ID.test(entry.sha) || ledger.has(entry.sha) || (entry.origin !== 'owned' && entry.origin !== 'foreign') ||
           (entry.origin === 'owned' ? typeof entry.owner !== 'string' || entry.owner.length === 0 : entry.owner !== null))
         throw new Error('The trusted commit ledger is invalid.');
       ledger.set(entry.sha, { owner: entry.owner, origin: entry.origin });
@@ -411,6 +411,9 @@ export class GitRebaser {
     else scope.signal?.addEventListener('abort', abort, { once: true });
     const deadlineError = () => Object.assign(new Error('The rebase deadline expired during conflict resolution.'),
       { code: 'ETIMEDOUT' });
+    const abortExpired = () => {
+      if (!controller.signal.aborted && performance.now() >= scope.workDeadline) controller.abort(deadlineError());
+    };
     const remaining = scope.workDeadline - performance.now();
     let timer: NodeJS.Timeout | undefined;
     if (remaining <= 0) controller.abort(deadlineError());
@@ -420,9 +423,11 @@ export class GitRebaser {
       // Await settlement after abort: the resolver owns its container/storage until its promise ends.
       try { await resolveConflict(Object.freeze({ ...input, signal: controller.signal })); }
       catch (error) {
+        abortExpired();
         controller.signal.throwIfAborted();
         throw error;
       }
+      abortExpired();
       controller.signal.throwIfAborted();
     } finally {
       if (timer) clearTimeout(timer);
