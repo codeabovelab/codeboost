@@ -39,11 +39,15 @@ it('settles prepare-merge replays through shutdown and fails interrupted prepara
     .toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/restarted/) });
   const active = randomUUID();
   store.userAction(identity, { actionId: active, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const snapshot = store.getSnapshot(identity);
+  const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head };
   const capability = store.shutdownCapability(); store.closeWrites();
   capability.run(() => store.settlePreMergeAction(identity, active,
-    { state: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null }));
+    { state: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null }, readiness));
   expect(store.savedAction(identity, { actionId: active, kind: 'prepare-merge', request })?.response)
     .toEqual({ outcome: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null });
+  expect(store.preMergeReady(identity, readiness)).toBe(true);
 });
 it('recovers an interrupted review check without applying the expired code-writing budget', () => {
   const { store } = fixture();

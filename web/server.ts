@@ -82,7 +82,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       (repository, issue) => service.store.issueTrust(repository, issue));
     // With a runner block the merge targets the task's published PR (#121); without one, github.pullRequest is required.
     const published = !config.demo && config.runner !== undefined && config.github
-      ? { repository: config.github.repository, baseBranch: baseBranch(config.github), ...(config.github.pullRequest !== undefined ? { configured: config.github.pullRequest } : {}) } : undefined;
+      ? { repository: config.github.repository, baseBranch: baseBranch(config.github), requiresPreparation: true,
+        ...(config.github.pullRequest !== undefined ? { configured: config.github.pullRequest } : {}) } : undefined;
     if (!config.demo && config.github && !published && !mergeGateway && config.github.pullRequest === undefined)
       throw new Error('Add github.pullRequest, the pull request to merge, to the review configuration, or add a runner block so codeboost publishes its own.');
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), MERGE_OPERATION_TIMEOUT_MS, capability, published) : null;

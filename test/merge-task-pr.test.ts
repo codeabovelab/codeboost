@@ -22,6 +22,7 @@ const plan: Plan = { schema_version: 1, issue: 12, revision: 1, summary: 'Stop t
 const context: PlanContext = { identity, issue: 12, baseEntries: [{ path: 'a.ts', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
 const BRANCH = 'codeboost/issue-12-task-42-0123456789abcdef';
 const PUBLISHED: PublishedTarget = { repository: 'owner/repo', baseBranch: 'main' };
+const PREPARED_PUBLISHED: PublishedTarget = { ...PUBLISHED, requiresPreparation: true };
 const url = (n: number) => `https://github.com/owner/repo/pull/${n}`;
 
 const stores: Store[] = [], roots: string[] = [];
@@ -50,6 +51,17 @@ function published() {
   const opening = begin(store);
   expect(opened(store, opening.openingId, 7)).toBe('in review');
   return { store, opening };
+}
+function prepare(store: Store) {
+  const actionId = randomUUID(), request = { expectedStateVersion: store.getTask(identity).stateVersion,
+    expectedReviewVersion: store.reviewVersion(identity) };
+  store.userAction(identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const snapshot = store.getSnapshot(identity);
+  const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head };
+  store.settlePreMergeAction(identity, actionId,
+    { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
+  return readiness;
 }
 /**
  * PR 7 is opened and running; a later opening was abandoned, so a test can adopt it as PR 8 (newer than 7) at any point.
@@ -100,6 +112,27 @@ function github(store: Store, change: (number: number) => Partial<RemoteMergeSta
 }
 
 describe('the merge gate with a runner block (#121)', () => {
+  it('requires durable current preparation through the irreversible admission transaction', async () => {
+    const { store } = published(), gh = github(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    expect((await merges.status()).blockers).toContainEqual({ code: 'preparation',
+      message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
+    prepare(store);
+    expect((await merges.status()).ready).toBe(true);
+
+    let reads = 0;
+    gh.client.before = () => {
+      if (++reads !== 2) return;
+      const task = store.getTask(identity);
+      store.userAction(identity, { actionId: randomUUID(), kind: 'prepare-merge',
+        request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: store.reviewVersion(identity) } },
+      () => ({ outcome: 'preparing' }));
+    };
+    await expect(merges.merge('review-token')).rejects.toThrow(/pre-merge preparation has not completed/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('inspects and merges the task\'s published PR and pins it on the attempt', async () => {
     const { store } = published();
     const gh = github(store);

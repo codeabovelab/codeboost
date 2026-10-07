@@ -332,6 +332,58 @@ it('refreshes the moved head against its prior base when the PR base and head ad
   await coordinator.close();
 });
 
+it('traces an unpushed rewrite back to the base of a collaborator head', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-lineage-')); roots.push(root);
+  const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
+  fixtureGit(repository, 'config', 'user.name', 'Test'); fixtureGit(repository, 'config', 'user.email', 'test@example.com');
+  writeFileSync(join(repository, 'a.txt'), 'base\n'); fixtureGit(repository, 'add', '.'); fixtureGit(repository, 'commit', '-qm', 'base');
+  const oldBase = fixtureGit(repository, 'rev-parse', 'HEAD');
+  fixtureGit(repository, 'switch', '-qc', 'feature');
+  writeFileSync(join(repository, 'a.txt'), 'feature\n'); fixtureGit(repository, 'commit', '-am', 'feature', '-q');
+  const oldHead = fixtureGit(repository, 'rev-parse', 'HEAD');
+  fixtureGit(repository, 'switch', '-q', 'main');
+  writeFileSync(join(repository, 'base.txt'), 'advanced\n'); fixtureGit(repository, 'add', '.'); fixtureGit(repository, 'commit', '-qm', 'advance base');
+  const newBase = fixtureGit(repository, 'rev-parse', 'HEAD');
+  fixtureGit(repository, 'switch', '-qc', 'local-rewrite');
+  writeFileSync(join(repository, 'a.txt'), 'feature\n'); fixtureGit(repository, 'commit', '-am', 'rebased feature', '-q');
+  const rewrittenHead = fixtureGit(repository, 'rev-parse', 'HEAD');
+  const collaborator = join(root, 'collaborator'); fixtureGit(repository, 'branch', 'collaborator-lineage', oldHead);
+  fixtureGit(repository, 'worktree', 'add', '-q', collaborator, 'collaborator-lineage');
+  writeFileSync(join(collaborator, 'late.txt'), 'late\n'); fixtureGit(collaborator, 'add', '.'); fixtureGit(collaborator, 'commit', '-qm', 'late push');
+  const collaboratorHead = fixtureGit(collaborator, 'rev-parse', 'HEAD');
+
+  const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
+  const config = { database: join(root, 'review.sqlite'), repository, runnerRepository: repository, identity,
+    pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' as const } };
+  const service = new ReviewService(config); services.push(service);
+  const plan: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'One change', questions: [], items: [{ id: 'P1',
+    title: 'Change a', intent: 'Change a', files: [{ path: 'a.txt', kind: 'edit', renamed_from: null, change: 'Change it' }],
+    acceptance: [{ type: 'check', text: 'a changed' }], depends_on: [] }] };
+  const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a.txt', kind: 'file' }], pathKey: path => path, allowedCommands: [] };
+  service.store.createPlan(JSON.stringify(plan), 'json', context, oldBase, oldHead);
+  let view = service.load();
+  service.store.recordHistory(identity, view.expected, oldBase, oldHead,
+    [{ sha: oldHead, owner: 'P1', origin: 'owned', sourceSha: null }]);
+  markRunnerOwned(service); view = service.load();
+  service.store.recordRebase(identity, view.expected, newBase, rewrittenHead,
+    [{ oldSha: oldHead, newSha: rewrittenHead }]);
+  view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
+  let reads = 0;
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => ++reads === 1 ? { base: newBase, head: rewrittenHead } : { base: newBase, head: collaboratorHead },
+      fetch: async () => undefined });
+  const task = service.store.getTask(identity);
+  const result = await coordinator.start({ stateVersion: task.stateVersion,
+    reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
+  expect(result).toMatchObject({ state: 'review-required', base: oldBase, head: collaboratorHead });
+  expect(result.reason).toMatch(/moved during preparation/);
+  expect(service.load().snapshot).toMatchObject({ base: oldBase, head: collaboratorHead });
+  await coordinator.close();
+});
+
 it('settles an admitted action after shutdown aborts its remote refresh', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-shutdown-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);

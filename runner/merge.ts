@@ -36,6 +36,8 @@ export interface MergeUnavailableStatus { available: true; ready: false; action:
 export interface PublishedTarget {
   repository: string;
   baseBranch: string;
+  /** Runner-owned production PRs require a durable, exact-review preparation before irreversible admission. */
+  requiresPreparation?: boolean;
   /** `github.pullRequest`, if the configuration still names one. It must be the task's PR. */
   configured?: number;
 }
@@ -183,6 +185,11 @@ export class MergeCoordinator {
     if (this.service.store && this.service.config) {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
+      if (this.published?.requiresPreparation && view.expected.reviewVersion !== undefined
+        && !this.service.store.preMergeReady(this.service.config.identity, {
+          stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion,
+          snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
+        })) blockers.push({ code: 'preparation', message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
     }
     let resolved: ResolvedTarget;
     try { resolved = this.#resolve(this.#attempt()); }
@@ -381,7 +388,8 @@ export class MergeCoordinator {
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
         const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
         const begin = () => store.beginMergeAttempt(config.identity, { ...view.expected, reviewVersion }, commandStatus.remote.head, queueWatermark,
-          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion, { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId });
+          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion,
+          { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId }, this.published?.requiresPreparation === true);
         let begun: MergeAttempt | null = null;
         // The attempt and the click's saved response commit in one transaction, or neither does.
         if (action) store.userAction(config.identity, action, () => mergeActionResponse(begun = begin()));

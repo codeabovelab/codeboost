@@ -82,6 +82,9 @@ export interface PreMergeActionResult {
   state: 'ready' | 'review-required' | 'failed';
   base: string; head: string; checked: readonly string[]; reason: string | null;
 }
+export interface PreMergeReadiness {
+  stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string;
+}
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
 export function preMergeActionResponse(result: PreMergeActionResult) {
   return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
@@ -511,7 +514,7 @@ export class Store {
    * task's PRs may be in flight.
    */
   beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null,
-    target: { pullRequest: number; openingId: string | null } | null = null): MergeAttempt {
+    target: { pullRequest: number; openingId: string | null } | null = null, requirePreparation = false): MergeAttempt {
     sha(reviewedHead);
     if (target !== null && (!Number.isSafeInteger(target.pullRequest) || target.pullRequest < 1 || (target.openingId !== null && typeof target.openingId !== 'string')))
       throw new Error('Invalid merge target.');
@@ -532,6 +535,10 @@ export class Store {
       if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
       if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (requirePreparation && !this.preMergeReady(identity, {
+        stateVersion: task.state_version as number, reviewVersion: expected.reviewVersion,
+        snapshotId: expected.snapshotId, base: this.getSnapshot(identity).base, head: reviewedHead,
+      })) throw new GuardRefusal('Pre-merge preparation has not completed for the current review. Prepare the merge again.');
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
       if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');
@@ -1011,6 +1018,20 @@ export class Store {
       if (!seen.has(prior)) { seen.add(prior); pending.push(prior); }
     }
     return false;
+  }
+  /** Durable predecessors of a rewritten commit, nearest first, across every retained rebase mapping. */
+  rewrittenAncestors(identity: PlanIdentity, descendant: string): string[] {
+    sha(descendant);
+    const reverse = new Map<string, Set<string>>();
+    for (const row of this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=?').all(identityKey(identity))) {
+      const prior = reverse.get(row.new_sha as string) ?? new Set<string>();
+      prior.add(row.old_sha as string); reverse.set(row.new_sha as string, prior);
+    }
+    const answer: string[] = [], pending = [descendant], seen = new Set(pending);
+    while (pending.length) for (const prior of reverse.get(pending.shift()!) ?? []) if (!seen.has(prior)) {
+      seen.add(prior); answer.push(prior); pending.push(prior);
+    }
+    return answer;
   }
   /** Values must be computed by the runner from this exact revision/snapshot, never supplied by a browser. */
   saveReview(identity: PlanIdentity, expected: ReviewState, approvals: readonly Approval[], choices: readonly SegmentChoice[]): void {
@@ -1876,14 +1897,37 @@ export class Store {
     return { response: outcome.value as T, replayed: true };
   }
   /** Settle the exact admitted pre-merge action so retry/restart replay never remains at `preparing`. */
-  settlePreMergeAction(identity: PlanIdentity, actionId: string, result: PreMergeActionResult): void {
+  settlePreMergeAction(identity: PlanIdentity, actionId: string, result: PreMergeActionResult,
+    readiness: PreMergeReadiness | null = null): PreMergeActionResult {
     assertUuidV4(actionId, 'Action ID');
-    const response = encode({ ok: true, value: preMergeActionResponse(result) });
-    if (response.length > 65536) throw new Error('Action response is too large to record.');
-    const changed = this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
-      AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
-      response, identityKey(identity), actionId).changes;
-    if (changed !== 1) throw new Error('The pre-merge action no longer owns settlement.');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      let effective = result;
+      if (result.state === 'ready') {
+        const task = this.#task(key), current = this.#current(key), snapshot = this.getSnapshot(identity);
+        if (!readiness || task.state_version !== readiness.stateVersion || current.review_version !== readiness.reviewVersion
+          || current.snapshot_id !== readiness.snapshotId || snapshot.base !== readiness.base || snapshot.head !== readiness.head
+          || result.base !== readiness.base || result.head !== readiness.head) {
+          effective = { ...result, state: 'review-required', reason: 'The task or review changed before preparation readiness was recorded. Prepare the merge again.' };
+          readiness = null;
+        }
+      }
+      const response = encode({ ok: true, value: preMergeActionResponse(effective), ...(readiness ? { preMergeReadiness: readiness } : {}) });
+      if (response.length > 65536) throw new Error('Action response is too large to record.');
+      const changed = this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+        AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+        response, key, actionId).changes;
+      if (changed !== 1) throw new Error('The pre-merge action no longer owns settlement.');
+      return effective;
+    });
+  }
+  /** The latest preparation action is authoritative and must match every current local generation and the exact pair. */
+  preMergeReady(identity: PlanIdentity, readiness: PreMergeReadiness): boolean {
+    const row = this.#get("SELECT response FROM user_actions WHERE plan_key=? AND kind='prepare-merge' ORDER BY rowid DESC LIMIT 1",
+      identityKey(identity));
+    if (!row) return false;
+    const saved = decode<{ ok?: unknown; value?: { outcome?: unknown }; preMergeReadiness?: PreMergeReadiness }>(row.response);
+    return saved.ok === true && saved.value?.outcome === 'ready' && stable(saved.preMergeReadiness) === stable(readiness);
   }
   /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
   settleInterruptedPreMergeActions(identity: PlanIdentity): void {

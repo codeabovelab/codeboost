@@ -4,7 +4,7 @@ import type { RunnerCoordinator } from './coordinator.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
 import { RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
 import type { ReviewService } from './review.ts';
-import type { RebaseMarker } from './store.ts';
+import type { PreMergeReadiness, RebaseMarker } from './store.ts';
 
 export interface RemotePair { base: string; head: string }
 export interface PreMergeRemote {
@@ -15,6 +15,7 @@ export interface PreMergeResult {
   state: 'ready' | 'review-required' | 'failed';
   base: string; head: string; checked: readonly string[]; reason: string | null;
 }
+type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
 
 // D may spend 30 s on its first cleanup and 60 s retrying it; F may then spend 30 s releasing task storage. Keep all
 // of that ownership settlement inside the preparation's one overall deadline.
@@ -69,18 +70,15 @@ export class PreMergeCoordinator {
       { code: 'ETIMEDOUT' })), this.operationTimeoutMs);
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
-    const remember = (input: PreMergeResult) => {
-      let result = input;
+    let readiness: PreMergeReadiness | null = null;
+    const remember = (input: PreparedResult) => {
+      const { readiness: readyBinding, ...plain } = input;
+      readiness = readyBinding ?? null;
+      let result: PreMergeResult = plain;
       this.#lastBinding = null;
-      if (result.state === 'ready') try {
-        this.#lastBinding = {
-          stateVersion: this.service.store.getTask(this.service.config.identity).stateVersion,
-          reviewVersion: this.service.store.reviewVersion(this.service.config.identity),
-          snapshotId: this.service.store.getSnapshot(this.service.config.identity).id,
-        };
-      } catch (error) {
-        result = { ...result, state: 'failed', reason: `Could not bind preparation readiness: ${error instanceof Error ? error.message : String(error)}` };
-      }
+      if (result.state === 'ready' && readiness) this.#lastBinding = readiness;
+      else if (result.state === 'ready') result = { ...result, state: 'failed',
+        reason: 'Could not bind preparation readiness: preparation readiness was not bound to the final review.' };
       this.#last = result;
       return result;
     };
@@ -92,7 +90,11 @@ export class PreMergeCoordinator {
       return remember(result);
     }).then(result => {
       if (!expected.actionId) return result;
-      try { this.settle(() => this.service.store.settlePreMergeAction(this.service.config.identity, expected.actionId!, result)); }
+      try {
+        const effective = this.settle(() => this.service.store.settlePreMergeAction(
+          this.service.config.identity, expected.actionId!, result, readiness));
+        if (effective !== result) result = remember(effective);
+      }
       catch (error) {
         const failed: PreMergeResult = { ...result, state: 'failed',
           reason: error instanceof Error ? error.message : String(error) };
@@ -128,9 +130,18 @@ export class PreMergeCoordinator {
       // remains fail-closed.
       if (!priorHead || !(error instanceof Error)
         || !/linear history descended from the base|base must be an ancestor of the head/i.test(error.message)) throw error;
-      const priorId = this.service.store.snapshotWithHead(this.service.config.identity, priorHead);
-      if (!priorId) throw error;
-      history = readHistory(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base, pair.head);
+      let recovered: ReturnType<typeof readHistory> | null = null;
+      for (const candidate of [priorHead, ...this.service.store.rewrittenAncestors(this.service.config.identity, priorHead)]) {
+        const priorId = this.service.store.snapshotWithHead(this.service.config.identity, candidate);
+        if (!priorId) continue;
+        try { recovered = readHistory(repository, this.service.store.getSnapshot(this.service.config.identity, priorId).base, pair.head); break; }
+        catch (fallback) {
+          if (!(fallback instanceof Error)
+            || !/linear history descended from the base|base must be an ancestor of the head/i.test(fallback.message)) throw fallback;
+        }
+      }
+      if (!recovered) throw error;
+      history = recovered;
     }
     this.service.store.recordHistory(this.service.config.identity, view.expected, history.base, history.head, []);
     return this.service.load();
@@ -157,7 +168,7 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
-    deadline: number): Promise<PreMergeResult> {
+    deadline: number): Promise<PreparedResult> {
     const identity = this.service.config.identity;
     const remaining = () => {
       const value = Math.ceil(deadline - performance.now());
@@ -305,6 +316,9 @@ export class PreMergeCoordinator {
     const postAuthorizationBlocker = this.#reviewBlocker(view, true);
     if (postAuthorizationBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
       checked, reason: postAuthorizationBlocker };
-    return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null };
+    return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null,
+      readiness: { stateVersion: this.service.store.getTask(identity).stateVersion,
+        reviewVersion: this.service.store.reviewVersion(identity), snapshotId: view.snapshot.id,
+        base: view.snapshot.base, head: view.snapshot.head } };
   }
 }
