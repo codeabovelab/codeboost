@@ -500,18 +500,19 @@ describe('startup recovery sequence', () => {
       .rejects.toThrow(/needs F3 to abort/);
     expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
   });
-  it('fails closed without cleanup when a crash left the spawned process identity unknown', async () => {
+  it('moves a crash-before-spawn owner into the explicit-release path without cleanup', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
       store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
-    const abortRebase = vi.fn(async () => undefined);
+    const abortRebase = vi.fn(async () => undefined), recoverLeftovers = vi.fn(async () => ({ storage: [], unowned: [] }));
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
-      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+      deps: deps({ abortRebase, recoverLeftovers }).d })).rejects.toThrow(/--release-rebase-process/);
     expect(abortRebase).not.toHaveBeenCalled();
-    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'spawning' });
+    expect(recoverLeftovers).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
   });
   it('rejects an unknown string process owner before recovery actions', async () => {
     const { d: root, store, raw } = fixture();

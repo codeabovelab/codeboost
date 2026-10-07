@@ -200,7 +200,7 @@ function recoveryRebase(planKey: string, value: unknown): RecoveryRebase | null 
       !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
       !validResolvedConflicts(oldHistory, resultMappings ?? [], rawResolvedConflicts) ||
       (resultState === 'none' && Array.isArray(rawResolvedConflicts) && rawResolvedConflicts.length !== 0) ||
-      (processGroup !== null && (typeof processGroup === 'string' ? processGroup !== 'unsettled' :
+      (processGroup !== null && (typeof processGroup === 'string' ? !['spawning', 'unsettled'].includes(processGroup) :
         (!processGroup || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
           !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0 ||
           (processGroupIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processGroupIdentity))))) ||
@@ -241,10 +241,11 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   if (unsettled)
     throw new RecoveryBlocked(`An interrupted rebase has an unidentified escaped process; stop it, then run --release-rebase-process ${unsettled.marker.attemptId}`,
       [unsettled.marker.attemptId]);
-  // A persisted exact group proves only that the leader was recorded, not that every descendant settled. The runner may
-  // have crashed after the leader/group disappeared but before the lifecycle callback durably recorded `unsettled`.
-  // Stop a still-live exact group while its identity is trustworthy, then require the same explicit release in either
-  // case. Workspace open-file scans cannot prove that an escaped pipe holder no longer exists.
+  // `spawning` means a crash may have happened before the synchronous spawn callback identified the child. A persisted
+  // exact group proves only that the leader was recorded, not that every descendant settled: the runner may have crashed
+  // after the leader/group disappeared but before the lifecycle callback durably recorded `unsettled`. Stop a still-live
+  // exact group while its identity is trustworthy, then require the same explicit release in every ambiguous case.
+  // Workspace open-file scans cannot prove that an escaped pipe holder no longer exists.
   const recoveredProcess = activeRebases.find(({ marker }) => marker.processGroup !== null);
   if (recoveredProcess) {
     const { planKey, marker } = recoveredProcess;
