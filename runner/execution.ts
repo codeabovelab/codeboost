@@ -123,7 +123,7 @@ export class SafetyFindings {
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined;
-  treeCheck: TaskTreeCheck | undefined }
+  treeCheck: TaskTreeCheck | undefined; promptComments: { count: number; digest: string } }
 
 /**
  * RunnerDeps for execute attempts: fresh workspace, prompt, agent, then audit and the runner's own commit.
@@ -179,14 +179,14 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const issue = guardedIssue.text;
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
         issue, approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
-      store.recordAttemptComments(identity, attempt.id, {
+      const promptComments = {
         count: issue.comments.length,
         digest: createHash('sha256').update(JSON.stringify(issue.comments)).digest('hex'),
-      });
+      };
       const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
       // From here task storage exists: a failure hands it to the coordinator, which removes it after the terminal write.
-      const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined, treeCheck: undefined };
+      const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined, treeCheck: undefined, promptComments };
       const prepared = { clone: ws.clone, vendor, approvedArgv: request.approvedArgv, private: data };
       try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredPaths, signal); }
       catch (error) { throw new PreparationFailure(error, prepared); }
@@ -216,6 +216,10 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
     // Host-side files only (the staging clone); task storage waits for release.
     async cleanupPreparation(attempt) { await workspace.cleanupPreparation?.(attempt); },
     start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace, data.treeCheck!); },
+    onStarted(attempt, prepared) {
+      const data = prepared.private as Private;
+      store.recordAttemptComments(identityOf(attempt), attempt.id, data.promptComments);
+    },
     validate() { throw new Error('Execute attempts publish through finish().'); },
     async finish(attempt, _result, prepared, signal) {
       const data = prepared.private as Private, identity = identityOf(attempt);

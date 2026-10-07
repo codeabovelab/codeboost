@@ -254,6 +254,21 @@ describe('storage failures', () => {
     expect(store.getAttempt(A, attempt.id).state).toBe('pending');
     expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
   });
+  it('owns, cancels and settles the handle when the synchronous started hook throws', async () => {
+    const { store, runner, launches, preparations, deps } = setup();
+    const markRunning = vi.spyOn(store, 'markRunning');
+    deps.onStarted = () => { throw Object.assign(new Error('evidence write failed'), { code: 'ERR_SQLITE_ERROR' }); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    expect(launches[0]!.cancels).toEqual(['capture-failure']);
+    expect(runner.isActive(A)).toBe(true);
+    expect(markRunning).not.toHaveBeenCalled();
+    launches[0]!.settle({ exitCode: null, stopReason: 'capture-failure' });
+    await until(() => !runner.isActive(A), 'settlement');
+    expect(runner.status(A).unresolved).toEqual({ attemptId: attempt.id, reason: 'start-not-saved' });
+    expect(store.getAttempt(A, attempt.id).state).toBe('pending');
+  });
   it('still cancels and awaits the handle when reading the refused attempt fails', async () => {
     const { store, runner, launches, preparations } = setup();
     vi.spyOn(store, 'markRunning').mockImplementation(() => {

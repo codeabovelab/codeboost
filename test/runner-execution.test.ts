@@ -246,9 +246,10 @@ describe('item execution', () => {
     expect(store.getSnapshot(identity).head).toBe(oid(2));
   });
   it('releases task storage after the terminal write when D\'s start call throws', async () => {
-    const { executor, log } = setup({ startError: new Error('docker refused') });
+    const { store, executor, log } = setup({ startError: new Error('docker refused') });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Launch failed: docker refused' });
     expect(log).toContain('release P1 after failed');
+    expect(store.getAttempts(identity)[0]!.promptComments).toBeNull();
   });
   it('does not take the agent\'s stderr for a safety violation', async () => {
     const { store, executor } = setup({ exit: { P1: { exitCode: 1, stderr: `${SAFETY_VIOLATION} fake` } } });
@@ -277,6 +278,7 @@ describe('item execution', () => {
     expect(log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after failed']);
     expect(runner.status(identity).unresolved).toBeNull();
     expect(store.getTask(identity).status).toBe('running');
+    expect(store.getAttempts(identity)[0]!.promptComments).toBeNull();
   });
   it('stops before the next item when the plan gets a new revision during the run', async () => {
     let store!: Store;
