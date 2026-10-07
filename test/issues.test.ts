@@ -283,6 +283,11 @@ describe('issue text for an execute prompt (#91)', () => {
     const long = Array.from({ length: 9 }, () => comment('member', 'x'.repeat(65_000)));
     await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB an execute prompt carries/);
   });
+  it('describes oversized explicitly trusted comments without calling them collaborator comments', async () => {
+    const outside = gateway([[comment('outsider', 'x'.repeat(40_000))]], rawIssue({ user: { login: 'outside-author' } }), []);
+    await expect(outside.gateway.issueText(7, { trustedAuthor: 'outside-author' }))
+      .rejects.toThrow(/title, body and included comments are larger than the 32 KiB/);
+  });
   it('accepts exactly what an execute prompt can carry, end to end, and refuses the rest at the fetch (#91)', async () => {
     const promptOf = (issue: IssueText) => prepareExecution({ identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, attemptId: 'attempt-1',
       mode: 'execute', itemId: 'P1', approvedLessons: [], allowedCommands: [], issue,

@@ -114,6 +114,26 @@ test('trusts and untrusts a demo issue without GitHub and keeps keyboard focus o
   await expect(row.getByLabel(/needs your trust before queueing/)).toBeVisible();
 });
 
+test('keeps keyboard focus on an issue link when a pending trust response rerenders the table', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let held: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const captured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action !== 'trust' || body.number !== 21 || held) { await route.continue(); return; }
+    held = { route, response: await route.fetch() }; captured.resolve();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await captured.promise;
+  const title = page.locator('tr[data-issue="23"] .issue-title a');
+  await title.focus();
+  await expect(title).toBeFocused();
+  await held!.route.fulfill({ response: held!.response });
+  await expect(title).toBeFocused();
+});
+
 test('ignores an older trust response that returns after a newer action', async ({ page }) => {
   app = await startServer(createDemo(join(root, 'demo')), 0);
   let first: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
@@ -196,6 +216,45 @@ test('does not let an older same-author trust response overwrite a newer untrust
   await page.getByRole('button', { name: 'Refresh issues' }).click();
   await refreshCompleted.promise;
   await held!.route.fulfill({ response: held!.response });
+  await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeVisible();
+});
+
+test('does not let an equal-version trust response overwrite refreshed collaborator access', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let held: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse;
+    updated: { state: { issues: Record<string, unknown>[] } } } | undefined;
+  let equalVersions: [unknown, unknown] | undefined;
+  const captured = deferred<void>(), refreshed = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action === 'untrust' && body.number === 17 && !held) {
+      const response = await route.fetch(), updated = await response.json() as { state: { issues: Record<string, unknown>[] } };
+      held = { route, response, updated }; captured.resolve(); return;
+    }
+    if (body.action === 'refresh' && held) {
+      const response = await route.fetch(), updated = await response.json() as { state: { issues: Record<string, unknown>[] } };
+      const stale = held.updated.state.issues.find(issue => issue.number === 17)!;
+      updated.state.issues = updated.state.issues.map(issue => issue.number === 17
+        ? { ...issue, trust: 'requires-approval', trustedAt: undefined, trustedBy: undefined }
+        : issue);
+      const current = updated.state.issues.find(issue => issue.number === 17)!;
+      equalVersions = [stale.trustChangedAt, current.trustChangedAt];
+      await route.fulfill({ response, json: updated }); refreshed.resolve(); return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="17"]');
+  await row.getByRole('button', { name: 'Trust all comments' }).click();
+  await row.getByRole('button', { name: 'Remove trust' }).click();
+  await captured.promise;
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await refreshed.promise;
+  expect(equalVersions?.[0]).toBeDefined();
+  expect(equalVersions?.[0]).toBe(equalVersions?.[1]);
+  await expect(row.getByLabel(/needs your trust before queueing/)).toBeVisible();
+  await held!.route.fulfill({ response: held!.response, json: held!.updated });
   await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeVisible();
 });
 

@@ -259,8 +259,9 @@ export class GhIssueGateway implements IssueGateway {
   }
 
   /**
-   * One issue's text for an execute prompt (#91): its title, body and the comments of repository collaborators only
-   * (design, "Which comments reach the agent"), oldest first. Everything stays untrusted data inside the prompt.
+   * One issue's text for an execute prompt (#91): its title, body and the comments permitted by current collaborator
+   * access or explicit author-bound trust (design, "Which comments reach the agent"), oldest first.
+   * Everything stays untrusted data inside the prompt.
    * Fails closed on anything malformed, on a pull request, and past the comment page limit.
    */
   async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null;
@@ -278,9 +279,9 @@ export class GhIssueGateway implements IssueGateway {
       const authorLogin = issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
       const includeEveryComment = options.trustedAuthor !== undefined && options.trustedAuthor === authorLogin;
       // The execute prompt carries the issue as one JSON data block of at most MAX_PROMPT_BYTES (dataJSON). A running byte
-      // count stops reading early (a title and body already over it read no collaborator or comment page); the exact check
+      // count stops reading early (a title and body already over it read no included comment page); the exact check
       // below uses the prompt's own serializer, so an issue accepted here is one the prompt can carry.
-      const tooLong = () => new Error(`Issue #${number}'s title, body and collaborator comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
+      const tooLong = () => new Error(`Issue #${number}'s title, body and included comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
       // Only the size refusal is reworded; any other (text with a NUL, for one) keeps its own reason.
       const carried = (text: IssueText) => {
         try { dataJSON(text, 'Issue data'); } catch (error) { throw /exceeds/.test((error as Error).message) ? tooLong() : error; }

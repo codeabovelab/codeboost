@@ -867,7 +867,12 @@ function renderIssues() {
 const trustGenerations = new Map(), trustPending = new Map(), trustRetries = new Map(), committedTrustRows = new Map();
 let trustCommitGeneration = 0;
 function renderIssuesWithPending(focusIssue) {
-  const focused = focusIssue ?? Number(document.activeElement?.closest?.("button.issue-trust")?.dataset.issue);
+  const active = document.activeElement;
+  const activeRow = active?.closest?.("tr[data-issue]");
+  const activeSelector = active?.matches?.("button.issue-trust") ? "button.issue-trust"
+    : active?.matches?.(".issue-title a") ? ".issue-title a" : null;
+  const focused = Number.isSafeInteger(focusIssue) ? { number: focusIssue, selector: "button.issue-trust" }
+    : activeSelector && activeRow ? { number: Number(activeRow.dataset.issue), selector: activeSelector } : null;
   renderIssues();
   for (const [number, pending] of trustPending) {
     const control = document.querySelector(`.issue-trust[data-issue="${number}"]`);
@@ -875,7 +880,8 @@ function renderIssuesWithPending(focusIssue) {
     control.setAttribute("aria-disabled", "true");
     control.textContent = pending.action === "trust" ? "Trusting…" : "Removing…";
   }
-  if (Number.isSafeInteger(focused)) document.querySelector(`.issue-trust[data-issue="${focused}"]`)?.focus();
+  if (focused && Number.isSafeInteger(focused.number))
+    document.querySelector(`tr[data-issue="${focused.number}"] ${focused.selector}`)?.focus();
 }
 function withIssueTrust(issue, trust) {
   const { trust: _trust, trustedAt: _trustedAt, trustedBy: _trustedBy, trustChangedAt: _trustChangedAt, ...metadata } = issue;
@@ -887,7 +893,7 @@ function withIssueTrust(issue, trust) {
 function trustCanReplace(replacement, current) {
   return replacement.authorLogin === current.authorLogin
     && (current.trustChangedAt === undefined
-      || (replacement.trustChangedAt !== undefined && replacement.trustChangedAt >= current.trustChangedAt));
+      || (replacement.trustChangedAt !== undefined && replacement.trustChangedAt > current.trustChangedAt));
 }
 function mergeIssueTrustView(updated, number) {
   const currentState = issuesView?.configured ? issuesView.state : null;
