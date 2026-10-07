@@ -132,7 +132,7 @@ describe('item execution', () => {
     const comments = ['collaborator note', 'trusted outside note'];
     const { store, executor } = setup({ issue: () => ({ number: 1, title: 'Issue', body: '', comments }) });
     await executor.runTask(identity);
-    const evidence = { count: 2, digest: createHash('sha256').update(JSON.stringify(comments)).digest('hex') };
+    const evidence = { count: 2, digest: createHash('sha256').update(JSON.stringify(comments)).digest('hex'), state: 'delivered' };
     expect(store.getAttempts(identity).map(attempt => attempt.promptComments)).toEqual([evidence, evidence]);
     expect(store.recentAttempts(identity, 20).map(attempt => attempt.promptComments)).toEqual([evidence, evidence]);
   });
@@ -249,7 +249,7 @@ describe('item execution', () => {
     const { store, executor, log } = setup({ startError: new Error('docker refused') });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Launch failed: docker refused' });
     expect(log).toContain('release P1 after failed');
-    expect(store.getAttempts(identity)[0]!.promptComments).toBeNull();
+    expect(store.getAttempts(identity)[0]!.promptComments).toMatchObject({ count: 0, state: 'prepared' });
   });
   it('does not take the agent\'s stderr for a safety violation', async () => {
     const { store, executor } = setup({ exit: { P1: { exitCode: 1, stderr: `${SAFETY_VIOLATION} fake` } } });

@@ -215,11 +215,12 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
     },
     // Host-side files only (the staging clone); task storage waits for release.
     async cleanupPreparation(attempt) { await workspace.cleanupPreparation?.(attempt); },
-    start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace, data.treeCheck!); },
-    onStarted(attempt, prepared) {
+    beforeStart(attempt, prepared) {
       const data = prepared.private as Private;
       store.recordAttemptComments(identityOf(attempt), attempt.id, data.promptComments);
     },
+    start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace, data.treeCheck!); },
+    onStarted(attempt) { store.markAttemptCommentsDelivered(identityOf(attempt), attempt.id); },
     validate() { throw new Error('Execute attempts publish through finish().'); },
     async finish(attempt, _result, prepared, signal) {
       const data = prepared.private as Private, identity = identityOf(attempt);

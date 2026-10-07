@@ -107,7 +107,7 @@ export interface AttemptRecord {
    */
   safetyFinding: string | null;
   /** Digest and count of the exact issue comments carried by this attempt's prompt. */
-  promptComments: { count: number; digest: string } | null;
+  promptComments: { count: number; digest: string; state: 'prepared' | 'delivered' } | null;
 }
 export interface IssueTrustRecord {
   repository: string; issue: number; authorLogin: string | null; trustedBy: string; trustedAt: string; revokedAt: string | null;
@@ -1360,9 +1360,25 @@ export class Store {
     this.#transaction(() => {
       const row = this.#get('SELECT state,prompt_comments FROM attempts WHERE plan_key=? AND id=?', key, id);
       if (!row || (row.state !== 'pending' && row.state !== 'running')) throw new GuardRefusal('The attempt is no longer active.');
-      const value = encode(evidence);
+      const value = encode({ ...evidence, state: 'prepared' });
       if (row.prompt_comments !== null && row.prompt_comments !== value) throw new GuardRefusal('The attempt already records different prompt comments.');
       if (row.prompt_comments === null) { this.#run('UPDATE attempts SET prompt_comments=? WHERE plan_key=? AND id=?', value, key, id); this.#touch(key); }
+    });
+  }
+  markAttemptCommentsDelivered(identity: PlanIdentity, id: string): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const row = this.#get('SELECT state,prompt_comments FROM attempts WHERE plan_key=? AND id=?', key, id);
+      if (!row || (row.state !== 'pending' && row.state !== 'running')) throw new GuardRefusal('The attempt is no longer active.');
+      if (row.prompt_comments === null) throw new GuardRefusal('The attempt has no prepared prompt comment evidence.');
+      const evidence = decode(row.prompt_comments) as { count?: unknown; digest?: unknown; state?: unknown };
+      if (evidence.state === 'delivered') return;
+      if (evidence.state !== 'prepared' || !Number.isSafeInteger(evidence.count) || (evidence.count as number) < 0
+        || typeof evidence.digest !== 'string' || !/^[a-f0-9]{64}$/.test(evidence.digest))
+        throw new GuardRefusal('The attempt has invalid prompt comment evidence.');
+      this.#run('UPDATE attempts SET prompt_comments=? WHERE plan_key=? AND id=?',
+        encode({ count: evidence.count, digest: evidence.digest, state: 'delivered' }), key, id);
+      this.#touch(key);
     });
   }
   /**

@@ -142,7 +142,9 @@ author that was observed, and a revocation time. Changing or deleting the GitHub
 Trust and untrust requests carry UUID v4 action IDs and use the ordinary durable action replay before GitHub is read.
 Definite GitHub read failures are saved too and replay with their upstream-failure classification; shutdown remains
 resendable. Concurrent callers with one action ID all observe the first durable outcome.
-Each execute attempt also stores the SHA-256 digest and count of the exact comment strings put in its prompt.
+Each execute attempt also stores the SHA-256 digest and count of the exact comment strings put in its prompt. The
+evidence is durably `prepared` after every pre-launch check and before the launcher receives the prompt, then becomes
+`delivered` only after the launcher returns an owned handle; recovery can therefore distinguish either crash window.
 
 **Admission.** Start, resume, continuation approval and every plan item fetch the issue author and the complete current
 collaborator list under a bounded GitHub read. A collaborator-authored issue passes without a local decision. Every

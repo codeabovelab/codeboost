@@ -254,6 +254,17 @@ describe('storage failures', () => {
     expect(store.getAttempt(A, attempt.id).state).toBe('pending');
     expect(() => runner.start(B, request(store, B))).toThrow(/No free runner slot/);
   });
+  it('fails closed before launch when the synchronous pre-start hook throws', async () => {
+    const { store, runner, launches, preparations, deps, cleaned } = setup();
+    deps.beforeStart = () => { throw new Error('evidence write failed'); };
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(launches).toEqual([]);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Launch failed: evidence write failed' });
+    expect(cleaned()).toBe(1);
+    expect(runner.status(A).unresolved).toBeNull();
+  });
   it('owns, cancels and settles the handle when the synchronous started hook throws', async () => {
     const { store, runner, launches, preparations, deps } = setup();
     const markRunning = vi.spyOn(store, 'markRunning');
