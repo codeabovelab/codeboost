@@ -155,6 +155,10 @@ export class MergeCoordinator {
     signal?.throwIfAborted();
     if (resolved.target && remote.pullRequest !== resolved.target.pullRequest)
       throw new Error('GitHub returned a different pull request.');
+    if (remote.pullRequestState !== 'OPEN')
+      throw new GuardRefusal(`Pull request #${remote.pullRequest} is ${remote.pullRequestState.toLowerCase()}; pre-merge preparation requires an open pull request.`);
+    if (remote.draft)
+      throw new GuardRefusal(`Pull request #${remote.pullRequest} is a draft; mark it ready before pre-merge preparation.`);
     if (resolved.headBranch !== undefined) {
       const blockers = this.#publishedBlockers(remote, resolved);
       if (blockers.length) throw new GuardRefusal(blockers[0]!.message);

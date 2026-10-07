@@ -162,8 +162,16 @@ describe('the merge gate with a runner block (#121)', () => {
     const status = await merges.status();
     expect(status.ready).toBe(false);
     expect(status.blockers.map(blocker => blocker.message)).toEqual([expect.stringMatching(message)]);
+    await expect(merges.remotePair()).rejects.toThrow(message);
     await expect(merges.merge('review-token')).rejects.toThrow(message);
     expect(gh.merged).toEqual([]);
+  });
+
+  it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
+    const { store } = published();
+    const gh = github(store, () => ({ pullRequestState: 'CLOSED' }));
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+    await expect(merges.remotePair()).rejects.toThrow(/is closed; pre-merge preparation requires an open pull request/);
   });
 
   it('does not ask a merged PR to still be open on its branch', async () => {

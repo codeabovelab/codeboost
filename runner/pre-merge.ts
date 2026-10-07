@@ -50,8 +50,9 @@ export class PreMergeCoordinator {
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
     const active = Promise.resolve().then(() => this.#run(expected, controller.signal)).then(result => (this.#last = result), error => {
-      const view = this.service.load();
-      const result: PreMergeResult = { state: 'failed', base: view.snapshot.base, head: view.snapshot.head,
+      // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
+      const snapshot = this.service.store.getSnapshot(this.service.config.identity);
+      const result: PreMergeResult = { state: 'failed', base: snapshot.base, head: snapshot.head,
         checked: [], reason: error instanceof Error ? error.message : String(error) };
       this.#last = result; return result;
     }).then(result => {
@@ -70,6 +71,15 @@ export class PreMergeCoordinator {
   }
   async close(): Promise<void> {
     this.#closing = true; this.#abort?.abort(new Error('Server shutdown.')); await this.#active;
+  }
+  /** Cancel the task and promptly stop whichever rebase, remote read or command check this preparation owns. */
+  cancelTask(expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
+    const identity = this.service.config.identity;
+    const outcome = this.runner.isActive(identity)
+      ? this.runner.cancelTask(identity, expectedStateVersion, actionId)
+      : this.service.store.cancelTask(identity, expectedStateVersion, actionId);
+    this.service.store.afterCommit(() => this.#abort?.abort(new Error('Task cancelled.')));
+    return outcome;
   }
 
   #refresh(pair: RemotePair) {
@@ -109,8 +119,20 @@ export class PreMergeCoordinator {
     const merge = this.service.store.getMergeAttempt(identity);
     if (merge && (merge.state === 'submitting' || merge.state === 'queued'))
       throw new GuardRefusal('A merge is in progress; wait for its outcome.');
+    const assertCurrent = (guard: { stateVersion: number; reviewVersion: number; snapshotId: string }) => {
+      const currentTask = this.service.store.getTask(identity);
+      if (currentTask.stateVersion !== guard.stateVersion || !MERGEABLE_STATUSES.includes(currentTask.status)
+        || currentTask.cancelRequested !== null || this.service.store.reviewVersion(identity) !== guard.reviewVersion
+        || this.service.store.getSnapshot(identity).id !== guard.snapshotId)
+        throw new GuardRefusal('The task or review changed during preparation. Reload first.');
+    };
     const initial = await this.remote.inspect(signal); await this.remote.fetch(initial, signal); signal.throwIfAborted();
-    if (initial.head !== view.snapshot.head) {
+    assertCurrent(expected);
+    // F6 will push the rewritten head. Until then, a retry must recognize the durable rewrite lineage instead of
+    // mistaking codeboost's still-remote predecessor for a collaborator push.
+    const retainedRemoteHead = initial.head !== view.snapshot.head
+      && this.service.store.isRewrittenHead(identity, initial.head, view.snapshot.head);
+    if (initial.head !== view.snapshot.head && !retainedRemoteHead) {
       view = this.#refresh(initial);
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
         reason: 'The pull request head moved; attribution and approvals were refreshed.' };
@@ -147,9 +169,10 @@ export class PreMergeCoordinator {
       task = this.service.store.getTask(identity);
       const attempt = this.runner.start(identity, { expectedStateVersion: task.stateVersion, kind: 'check', item: item.id,
         deadline: Date.now() + this.checkTimeoutMs, expectedContext: this.service.store.currentContext(identity) });
-      const stop = () => this.runner.stop(identity, attempt.id, 'cancelled');
+      const stop = () => this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown' : 'cancelled');
       signal.addEventListener('abort', stop, { once: true });
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
+      signal.throwIfAborted();
       const settled = this.service.store.getAttempt(identity, attempt.id);
       if (settled.state !== 'completed') throw new GuardRefusal(`${item.id} command checks did not pass.`);
       checked.push(item.id); view = this.service.load();
@@ -157,7 +180,11 @@ export class PreMergeCoordinator {
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
     }
     const prepared = { base: view.snapshot.base, head: view.snapshot.head };
+    const guarded = { stateVersion: this.service.store.getTask(identity).stateVersion,
+      // Rebase and command attempts advance task/snapshot state, but this preparation never owns a review edit.
+      reviewVersion: expected.reviewVersion, snapshotId: view.snapshot.id };
     const final = await this.remote.inspect(signal); signal.throwIfAborted();
+    assertCurrent(guarded);
     if (final.base !== initial.base || final.head !== initial.head) {
       await this.remote.fetch(final, signal); view = this.#refresh(final);
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,

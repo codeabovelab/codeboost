@@ -45,6 +45,24 @@ it('settles prepare-merge replays through shutdown and fails interrupted prepara
   expect(store.savedAction(identity, { actionId: active, kind: 'prepare-merge', request })?.response)
     .toEqual({ outcome: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null });
 });
+it('recovers an interrupted review check without applying the expired code-writing budget', () => {
+  const { store } = fixture();
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const now = Date.now();
+  const execute = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: now + 60_000, budgetMs: 10,
+    expectedContext: store.currentContext(identity), now });
+  store.markRunning(identity, execute.id);
+  store.settleAttempt(identity, execute.id, { firstReason: null, exitCode: 0, valid: true });
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+  const check = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'check', item: 'P1', deadline: now + 60_000,
+    expectedContext: store.currentContext(identity), now: now + 1_000 });
+  const [recovered] = store.recoverInterrupted(now + 2_000);
+  expect(recovered).toMatchObject({ attemptId: check.id, state: 'failed', requeued: false });
+  expect(store.getAttempt(identity, check.id)).toMatchObject({ state: 'failed', firstReason: null });
+  expect(store.getTask(identity).status).toBe('in review');
+});
 it('allocates revisions in SQLite, survives reopen, and keeps old revisions and snapshots immutable', () => {
   const { store, path } = fixture(); const first = store.getSnapshot(identity);
   expect(store.getPlan(identity).revision).toBe(1);

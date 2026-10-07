@@ -365,7 +365,10 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if ((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
-      if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
+      if (action === 'cancel-task') return { outcome: preMerge?.active
+        ? preMerge.cancelTask(expectedStateVersion as number, actionId as string)
+        : runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string)
+          : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
       if (action === 'prepare-merge') {
         if (access) requireTrustedIssue(access);

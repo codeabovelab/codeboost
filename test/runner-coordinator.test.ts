@@ -366,6 +366,23 @@ describe('review regressions', () => {
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
     expect(store.getTask(A).status).not.toBe('needs human');
   });
+  it('runs a review command check after the code-writing task budget has expired', async () => {
+    let clock = Date.now();
+    const { store, runner, launches, preparations, deps } = setup();
+    deps.now = () => clock;
+    runner.start(A, request(store, A, { budgetMs: 100, deadline: clock + 60_000 }));
+    await until(() => preparations.length === 1, 'execution preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'execution launch'); launches[0]!.settle();
+    await runner.settled(A);
+    store.transitionTask(A, store.getTask(A).stateVersion, 'in review');
+    clock += 1_000;
+    const check = runner.start(A, request(store, A, { kind: 'check', deadline: clock + 60_000 }));
+    await until(() => preparations.length === 2, 'check preparation'); preparations[1]!.resolve();
+    await until(() => launches.length === 2, 'check launch'); launches[1]!.settle();
+    await runner.settled(A);
+    expect(store.getAttempt(A, check.id)).toMatchObject({ state: 'completed', firstReason: null });
+    expect(store.getTask(A).status).toBe('in review');
+  });
   it('shows the cancel task stop after a preparation timeout, and closes the task', async () => {
     const { store, runner, preparations } = setup({ prepareIgnoresAbort: true });
     const attempt = runner.start(A, request(store, A, { deadline: Date.now() + 30 }));

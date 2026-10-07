@@ -231,7 +231,7 @@ export class RunnerCoordinator {
    * User stop or detected staleness. The first reason wins; nothing is freed until settlement.
    * `cause` says what made the attempt stale (for example "plan revision 4 replaced 3") and is kept only if `stale` wins.
    */
-  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale', cause?: string): boolean {
+  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale' | 'shutdown', cause?: string): boolean {
     const job = this.#jobs.get(identityKey(identity));
     if (!job || job.attemptId !== attemptId) return false;
     return this.#requestStop(job, reason, reason === 'stale' && cause !== undefined ? bounded(cause) : undefined);
@@ -327,7 +327,7 @@ export class RunnerCoordinator {
       wait();
     };
     const budget = this.#store.getTask(job.identity).budgetDeadline;
-    if (budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
+    if (attempt.kind !== 'check' && budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
     at(attempt.deadline, () => { if (!job.handle && !job.firstReason) { job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT)); } });
   }
   async #run(job: Job, attempt: AttemptRecord): Promise<void> {
@@ -358,7 +358,7 @@ export class RunnerCoordinator {
         this.#requestStop(job, 'stale');
         return await this.#endBeforeLaunch(job, attempt, {}, prepared);
       }
-      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}, prepared); }
+      if (attempt.kind !== 'check' && task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}, prepared); }
       if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }, prepared); }
       // Fail closed: once D reported resources it could not remove, no new invocation starts, even one already admitted.
       if (this.#unreleased) return await this.#endBeforeLaunch(job, attempt, { detail: NOT_STARTED_UNRELEASED }, prepared);

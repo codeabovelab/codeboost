@@ -997,6 +997,21 @@ export class Store {
     this.getSnapshot(identity, snapshotId);
     return this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=? AND snapshot_id=? ORDER BY old_sha').all(identityKey(identity), snapshotId).map(row => ({ oldSha: row.old_sha as string, newSha: row.new_sha as string }));
   }
+  /** Whether `descendant` was produced by one or more durable rebase mappings from `ancestor`. */
+  isRewrittenHead(identity: PlanIdentity, ancestor: string, descendant: string): boolean {
+    sha(ancestor); sha(descendant);
+    const reverse = new Map<string, Set<string>>();
+    for (const row of this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=?').all(identityKey(identity))) {
+      const prior = reverse.get(row.new_sha as string) ?? new Set<string>();
+      prior.add(row.old_sha as string); reverse.set(row.new_sha as string, prior);
+    }
+    const pending = [descendant], seen = new Set(pending);
+    while (pending.length) for (const prior of reverse.get(pending.pop()!) ?? []) {
+      if (prior === ancestor) return true;
+      if (!seen.has(prior)) { seen.add(prior); pending.push(prior); }
+    }
+    return false;
+  }
   /** Values must be computed by the runner from this exact revision/snapshot, never supplied by a browser. */
   saveReview(identity: PlanIdentity, expected: ReviewState, approvals: readonly Approval[], choices: readonly SegmentChoice[]): void {
     const key = identityKey(identity);
@@ -1674,8 +1689,9 @@ export class Store {
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
         if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
         if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
-        // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
-        if (task.budget_deadline !== null && (task.budget_deadline as number) <= now)
+        // The code-writing task budget (null until execution starts) ends execution admission. Review checks have their
+        // own exact-head deadline and must remain runnable after implementation ends.
+        if (!reviewCheck && task.budget_deadline !== null && (task.budget_deadline as number) <= now)
           throw new RefusalWithEffect('The task time budget has run out; it needs a person.', expire);
         const current = this.#contextOf(key);
         if (!sameContext(input.expectedContext, current)) throw new GuardRefusal('The plan, snapshot, assignment or referenced code changed. Reload before starting.');
@@ -2341,7 +2357,7 @@ export class Store {
       const key = row.plan_key as string, task = this.#task(key);
       const contextCurrent = sameContext(decode<InvocationContext>(row.context), this.#contextOf(key));
       let firstReason = row.first_reason as FirstReason | null;
-      if (firstReason === null && contextCurrent && task.budget_deadline !== null && now >= (task.budget_deadline as number)) firstReason = 'time-limit';
+      if (row.kind !== 'check' && firstReason === null && contextCurrent && task.budget_deadline !== null && now >= (task.budget_deadline as number)) firstReason = 'time-limit';
       const deadlinePassed = firstReason === null && now >= (row.deadline as number);
       const outcome = classifySettlement({
         firstReason, contextCurrent, exitCode: null, valid: false,
@@ -2362,7 +2378,7 @@ export class Store {
         const status = this.#task(key).status as string;
         const interrupted = outcome.state === 'failed' && (outcome.reason ?? '').startsWith('Interrupted');
         const shutdown = outcome.state === 'cancelled' && firstReason === 'shutdown';
-        if (!this.#closed(status) && !gated.includes(status) && (interrupted || shutdown)) {
+        if (row.kind !== 'check' && !this.#closed(status) && !gated.includes(status) && (interrupted || shutdown)) {
           this.#run('UPDATE tasks SET requeue_pending=1 WHERE plan_key=?', key); requeued = true;
         }
         this.#touch(key);
