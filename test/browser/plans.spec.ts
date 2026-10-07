@@ -276,6 +276,75 @@ test('does not let an older Review refresh overwrite a committed import', async 
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });
 
+test('clears stale Plans data when a Review refresh fails after navigation', async ({ page }) => {
+  await page.goto(app.url);
+  let release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  await page.route('**/api/review', async route => {
+    arrived();
+    await held;
+    await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Review read failed.' }) });
+  });
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await captured;
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await expect(page.getByRole('heading', { name: 'Make retries predictable and document the behavior' })).toBeVisible();
+  release();
+  await expect(page.locator('#reload')).toHaveText('Refresh');
+  await expect(page.locator('#plans-summary')).toHaveText('Plan unavailable');
+  await expect(page.locator('#plans-status')).toContainText('Could not read this branch’s history. Review read failed. Use Refresh to retry.');
+});
+
+test('does not let a question poll started during Plans refresh replace its completed answer', async ({ page }) => {
+  const config = app.service.config;
+  await app.close();
+  app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
+  await page.goto(app.url);
+  await page.getByLabel('Question about this item').fill('Will this answer finish?');
+  await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
+  await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
+  const note = app.service.store.getReviewNotes(config.identity).find(value => value.text === 'Will this answer finish?')!;
+
+  let releaseRefresh!: () => void, refreshArrived!: () => void;
+  const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+  const capturedRefresh = new Promise<void>(resolve => { refreshArrived = resolve; });
+  await page.route('**/api/review', async route => {
+    const response = await route.fetch();
+    const refreshed = await response.json();
+    const completed = refreshed.notes.find((value: { id: string }) => value.id === note.id);
+    completed.answer = { ...completed.answer, status: 'complete', text: 'The fresh completed answer.' };
+    completed.answerActive = false;
+    refreshArrived();
+    await heldRefresh;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(refreshed) });
+  });
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.locator('#plans-refresh').click();
+  await capturedRefresh;
+
+  let releasePoll!: () => void, pollArrived!: () => void;
+  const heldPoll = new Promise<void>(resolve => { releasePoll = resolve; });
+  const capturedPoll = new Promise<void>(resolve => { pollArrived = resolve; });
+  await page.route('**/api/questions', async route => {
+    const response = await route.fetch();
+    pollArrived();
+    await heldPoll;
+    await route.fulfill({ response });
+  });
+  await capturedPoll;
+  releaseRefresh();
+  await expect(page.locator('#plans-status')).toContainText('Revision r1 is current.');
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await expect(page.getByText('The fresh completed answer.', { exact: true })).toBeVisible();
+  const stalePollResponse = page.waitForResponse(response => response.url().endsWith('/api/questions'));
+  releasePoll();
+  await stalePollResponse;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.getByText('The fresh completed answer.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Agent · Answering…', { exact: true })).toHaveCount(0);
+});
+
 test('does not let an older Plans refresh re-enable merge after it commits', async ({ page }) => {
   test.slow();
   const config = { ...app.service.config, demo: false };

@@ -78,6 +78,8 @@ function showFailure(message) {
   mergePollDelay = 2000;
   data = null;
   snippetSelection = null;
+  renderPlans();
+  claimPlanStatus(view === "plans" ? "bad" : "neutral", view === "plans" ? `✕ ${message}` : "");
   $("selection-actions").hidden = true;
   $("attachment").hidden = true;
   $("banner").textContent = message;
@@ -1172,7 +1174,7 @@ $("plans-refresh").onclick = async () => {
   if (planRefreshPending || planImportPending) return;
   if (busy) return;
   const generation = ++planOperationGeneration;
-  const sharedGeneration = ++reviewGeneration;
+  let sharedGeneration = ++reviewGeneration;
   mergeGeneration++;
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
@@ -1186,6 +1188,7 @@ $("plans-refresh").onclick = async () => {
     rememberDraft();
     const updated = await api("/api/review");
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
+    sharedGeneration = ++reviewGeneration;
     mergeGeneration++;
     if (mergePollTimer) clearTimeout(mergePollTimer);
     mergePollTimer = null;
