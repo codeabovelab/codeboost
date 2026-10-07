@@ -40,7 +40,7 @@ export async function runTrackedProcess(file: string, args: readonly string[],
     }
     return { status: null, stdout: '', stderr: '', error: timeout };
   }
-  const outcome = await runInProcessGroup(file, args, { ...options, timeoutMs: remaining,
+  const outcome = await runInProcessGroup(file, args, { ...options, timeoutMs: remaining, allowUnsettledReturn: true,
     onProcessGroup: group => {
       options.lifecycle.started(group);
       owner = group;

@@ -43,6 +43,12 @@ export interface ProcessGroupOptions {
    * reading it all is not an error: what it did is in its status and output.
    */
   readonly input?: Buffer;
+  /**
+   * Return a retained-owner error when descendants or inherited pipe holders outlive the bounded drain. This is safe
+   * only when the caller durably owns the reported group/resource and recovery will keep that ownership until release.
+   * Callers without durable ownership wait fail-closed instead of returning while unknown work is still live.
+   */
+  readonly allowUnsettledReturn?: boolean;
 }
 
 const DEFAULT_GRACE_MS = 5_000;
@@ -68,18 +74,18 @@ const signalGroup = (pgid: number, signal: NodeJS.Signals | 0) => {
 // Once the leader exits, there is no portable identity-bound way in Node to signal its numeric process-group ID. Even
 // a liveness/identity check followed by kill has a reuse race between the two syscalls. Poll only: a group that remains
 // alive is returned to durable recovery instead of risking a signal to an unrelated process.
-const drainGroup = async (group: ProcessGroup) => {
+const drainGroup = async (group: ProcessGroup, bounded: boolean) => {
   const { pgid } = group;
   const giveUpAt = performance.now() + DRAIN_LIMIT_MS;
   while (signalGroup(pgid, 0)) {
-    if (performance.now() >= giveUpAt) return false;
+    if (bounded && performance.now() >= giveUpAt) return false;
     await pause(20);
   }
   return true;
 };
 
 /** After its leader exits, observe whether every member of a recorded process group has gone without signalling it. */
-export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drainGroup(group);
+export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drainGroup(group, true);
 
 /**
  * Run one command as the leader of a new process group. The group is reported through `onProcessGroup` before this
@@ -164,9 +170,11 @@ export function runInProcessGroup(file: string, args: readonly string[],
       clearTimeout(graceTimer);
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
-      void drainGroup(group).then(async drained => {
+      void drainGroup(group, options.allowUnsettledReturn === true).then(async drained => {
         let stdioTimer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
+        if (options.allowUnsettledReturn) {
+          await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
+        } else await closed;
         // Cleared so a finished call never keeps the process alive.
         clearTimeout(stdioTimer);
         // Timers run before I/O in each event-loop turn: after a long block the timer can win while the rest of the

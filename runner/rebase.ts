@@ -507,6 +507,7 @@ export class GitRebaser {
     const outcome = await runInProcessGroup(file, args, {
       cwd, env, timeoutMs, graceMs: 1_000, signal: cleanup ? undefined : scope.signal, input,
       onProcessGroup: value => { this.#options.onProcessGroup(scope.attemptId, value); group = value; }, maxBuffer, discardExcessOutput,
+      allowUnsettledReturn: true,
     });
     const code = (outcome.error as NodeJS.ErrnoException | undefined)?.code;
     let callbackFailure: unknown;

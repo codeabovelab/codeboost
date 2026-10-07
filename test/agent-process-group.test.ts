@@ -157,7 +157,9 @@ describe('runInProcessGroup', () => {
     const script = `const {spawn}=require('node:child_process'),fs=require('node:fs');`
       + `const c=spawn('sleep',['60'],{stdio:'ignore'});fs.writeFileSync(${JSON.stringify(pidFile)},String(c.pid));c.unref();`;
     try {
-      const outcome = await runInProcessGroup(process.execPath, ['-e', script], { env, timeoutMs: 30_000 });
+      const outcome = await runInProcessGroup(process.execPath, ['-e', script], {
+        env, timeoutMs: 30_000, allowUnsettledReturn: true,
+      });
       expect(outcome.status).toBeNull();
       expect((outcome.error as NodeJS.ErrnoException).code).toBe('EGROUPALIVE');
       expect(performance.now() - began).toBeGreaterThanOrEqual(10_000);
@@ -167,6 +169,15 @@ describe('runInProcessGroup', () => {
       rmSync(dir, { recursive: true, force: true });
     }
   }, 20_000);
+
+  it('does not release an untracked caller while a descendant remains in the group', async () => {
+    const script = `const {spawn}=require('node:child_process');spawn('sleep',['0.2'],{stdio:'ignore'}).unref();`;
+    const began = performance.now();
+    const outcome = await runInProcessGroup(process.execPath, ['-e', script], { env, timeoutMs: 5_000 });
+    expect(outcome).toMatchObject({ status: 0 });
+    expect(outcome.error).toBeUndefined();
+    expect(performance.now() - began).toBeGreaterThanOrEqual(150);
+  });
 
   it('bounds a group that ignores SIGTERM: SIGKILL after the grace period, then settles as a timeout', async () => {
     let group: ProcessGroup | undefined;
@@ -221,7 +232,9 @@ describe('runInProcessGroup', () => {
       + `String(c.pid)); c.unref(); console.log('leader done');`;
     try {
       const began = performance.now();
-      const outcome = await runInProcessGroup(process.execPath, ['-e', escape], { env, timeoutMs: 30_000 });
+      const outcome = await runInProcessGroup(process.execPath, ['-e', escape], {
+        env, timeoutMs: 30_000, allowUnsettledReturn: true,
+      });
       // The output may be incomplete, so it is not reported as a success; what was read is kept.
       expect(outcome).toMatchObject({ status: null, stdout: 'leader done\n' });
       expect((outcome.error as NodeJS.ErrnoException).code).toBe('ESTDIOHELD');
