@@ -287,7 +287,12 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       || !/^codeboost-keeper-[0-9a-f-]+$/.test(filesystems.keeper)) throw new Error('Task filesystem identity is invalid.');
     // Read through one no-follow descriptor so the path cannot be swapped between check and open.
     const sourceAuth = options.codexAuthFile ? readCapturedFile(options.codexAuthFile, 'Codex auth') : undefined;
-    const inputDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-input-'));
+    const createdInputDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-input-'));
+    // Own each directory immediately after creation. Every following write, chmod, canonicalization, or recapture can
+    // fail, and construction cleanup must still remove or durably report the newly created staging path.
+    cleanupDirectories.push(createdInputDirectory);
+    const inputDirectory = realpathSync(createdInputDirectory);
+    cleanupDirectories[cleanupDirectories.length - 1] = inputDirectory;
     writeFileSync(join(inputDirectory, 'schema.json'), sourceInput.content,
       { mode: 0o400, flag: 'wx' });
     chmodSync(join(inputDirectory, 'schema.json'), 0o444);
@@ -295,10 +300,11 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     // remove this directory as part of its durably known parent without first trusting an unrecorded leaf path.
     chmodSync(inputDirectory, 0o755);
     const inputIdentity = captureInput(inputDirectory);
-    cleanupDirectories.push(inputIdentity.inputDirectory);
     if (sourceAuth) {
-      const cleanupDirectory = realpathSync(mkdtempSync(join(cleanupRoot, 'codeboost-auth-')));
-      cleanupDirectories.push(cleanupDirectory);
+      const createdAuthDirectory = mkdtempSync(join(cleanupRoot, 'codeboost-auth-'));
+      cleanupDirectories.push(createdAuthDirectory);
+      const cleanupDirectory = realpathSync(createdAuthDirectory);
+      cleanupDirectories[cleanupDirectories.length - 1] = cleanupDirectory;
       const stagedAuth = join(cleanupDirectory, 'auth.json');
       writeFileSync(stagedAuth, sourceAuth.content, { mode: 0o400, flag: 'wx' });
       chmodSync(stagedAuth, 0o444);

@@ -1,12 +1,12 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
   symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
@@ -25,6 +25,20 @@ import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupE
   type VendorNetwork } from '../agents/network/network.ts';
 import { createClaudeCommand, createIsolationProbeCommand, createPhasePolicy,
   assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
+const stagingFault = vi.hoisted(() => ({ chmodPathPrefix: '', realpathPathPrefix: '' }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, chmodSync: (path: Parameters<typeof actual.chmodSync>[0], mode: number) => {
+    if (typeof path === 'string' && stagingFault.chmodPathPrefix && path.startsWith(stagingFault.chmodPathPrefix)
+      && path.endsWith('/schema.json'))
+      throw Object.assign(new Error('staging filesystem is full'), { code: 'ENOSPC' });
+    return actual.chmodSync(path, mode);
+  }, realpathSync: ((path: Parameters<typeof actual.realpathSync>[0]) => {
+    if (typeof path === 'string' && stagingFault.realpathPathPrefix && path.startsWith(stagingFault.realpathPathPrefix))
+      throw Object.assign(new Error('staging canonicalization failed'), { code: 'EIO' });
+    return actual.realpathSync(path);
+  }) as typeof actual.realpathSync };
+});
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
 
@@ -120,6 +134,20 @@ afterAll(async () => {
 }, 120_000);
 
 describe('real Docker agent isolation', () => {
+  it.each([
+    ['input setup', 'codeboost-input-', 'chmodPathPrefix', 'staging filesystem is full'],
+    ['auth canonicalization', 'codeboost-auth-', 'realpathPathPrefix', 'staging canonicalization failed'],
+  ] as const)('removes a newly created profile directory when %s fails', async (_case, prefix, fault, message) => {
+    const data = fixture(), requestedCleanupRoot = join(data.root, 'profile-construction-failure');
+    mkdirSync(requestedCleanupRoot, { mode: 0o700 });
+    const cleanupRoot = realpathSync(requestedCleanupRoot);
+    stagingFault[fault] = `${cleanupRoot}/${prefix}`;
+    try {
+      await expect(profile(data, 'planning', 'noop', { cleanupRoot })).rejects.toThrow(message);
+      expect(readdirSync(cleanupRoot)).toEqual([]);
+    } finally { stagingFault[fault] = ''; }
+  }, 60_000);
+
   it('places temporary profile snapshots beneath an owner-only durable cleanup root', async () => {
     const data = fixture(), requestedCleanupRoot = join(data.root, 'profile-staging');
     mkdirSync(requestedCleanupRoot, { mode: 0o700 });
