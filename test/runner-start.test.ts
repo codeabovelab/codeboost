@@ -124,6 +124,28 @@ describe('start (#91 part 2)', () => {
       body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
     expect(store.getAttempts(identity)).toEqual([]);
   });
+  it('returns the first durable success when an identical concurrent access read fails later', async () => {
+    const secondStarted = Promise.withResolvers<void>(), releaseFailure = Promise.withResolvers<void>();
+    let reads = 0;
+    const gateway: IssueTrustGateway = {
+      repository: 'owner/repo',
+      async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) {
+        if (++reads === 1) { await secondStarted.promise; return { number, authorLogin: 'member', collaborator: true }; }
+        secondStarted.resolve(); await releaseFailure.promise; throw new Error('later GitHub failure');
+      },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, identity, store } = await serve({ issueGateway: gateway });
+    const actionId = randomUUID(), first = act(app, 'start', { actionId });
+    await vi.waitFor(() => expect(reads).toBe(1));
+    const second = act(app, 'start', { actionId });
+    const accepted = await first;
+    expect(accepted).toMatchObject({ status: 200, body: { result: { outcome: 'started', item: 'P1' } } });
+    releaseFailure.resolve();
+    expect(await second).toMatchObject({ status: 200, body: { result: accepted.body.result } });
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
   it('requires every item of the current plan revision to be approved before start', async () => {
     const { app, identity, store } = await serve({ approve: false });
     expect(await view(app)).toMatchObject({ startable: false });

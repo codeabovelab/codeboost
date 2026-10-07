@@ -140,13 +140,17 @@ guarded too, so a revoked decision cannot cross the next irreversible boundary.
 **Durable state.** Schema v17 adds one `issue_trust` row per repository and issue, retaining who decided, when, the
 author that was observed, and a revocation time. Changing or deleting the GitHub author makes the row inapplicable.
 Trust and untrust requests carry UUID v4 action IDs and use the ordinary durable action replay before GitHub is read.
+Definite GitHub read failures are saved too and replay with their upstream-failure classification; shutdown remains
+resendable. Concurrent callers with one action ID all observe the first durable outcome.
 Each execute attempt also stores the SHA-256 digest and count of the exact comment strings put in its prompt.
 
 **Admission.** Start, resume, continuation approval and every plan item fetch the issue author and the complete current
 collaborator list under a bounded GitHub read. A collaborator-authored issue passes without a local decision. Every
 other issue needs a live, unrevoked row for that exact repository, number and author. A prompt text read revalidates the
 admitted author and collaborator result against the issue and collaborator snapshot used for that text, closing the gap
-between authorization and prompt construction. Malformed, partial, failed and over-limit reads fail closed. Action-time
+between authorization and prompt construction. When explicit trust widened the comments, its author-bound Store row is
+re-read immediately after the awaited text fetch so revocation cannot admit the stale all-comments result. Malformed,
+partial, failed and over-limit reads fail closed. Action-time
 failures are saved under the action ID; per-item failures settle that attempt without admitting the next item. The task
 and review versions are still checked in the same transaction that admits an attempt, after the external read.
 

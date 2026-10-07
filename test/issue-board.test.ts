@@ -197,6 +197,29 @@ describe('issue endpoints', { timeout: 30_000 }, () => {
     } finally { await app.close(); }
   });
 
+  it('records an issue-access failure under the trust action ID and replays the same 502 without another read', async () => {
+    root = mkdtempSync(join(tmpdir(), 'codeboost-issues-trust-failure-'));
+    let accessReads = 0, fail = true;
+    const gateway = {
+      repository: 'owner/repo',
+      async fetch() { return snapshot(); },
+      async issueAccess(number: number) { accessReads++; if (fail) throw new Error('GitHub unavailable');
+        return { number, authorLogin: 'outside', collaborator: false }; },
+      async issueText(number: number) { return { number, title: 'One', body: '', comments: [] }; },
+    };
+    const app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
+    try {
+      await call(app.url, app.token, 'POST', { action: 'refresh' });
+      const requestBody = { action: 'trust', actionId: randomUUID(), number: 1, authorLogin: 'outside' };
+      expect(await call(app.url, app.token, 'POST', requestBody)).toMatchObject({ status: 502,
+        body: { error: expect.stringMatching(/GitHub unavailable/) } });
+      fail = false;
+      expect(await call(app.url, app.token, 'POST', requestBody)).toMatchObject({ status: 502,
+        body: { error: expect.stringMatching(/GitHub unavailable/) } });
+      expect(accessReads).toBe(1);
+    } finally { await app.close(); }
+  });
+
   it('a disconnected browser stops waiting while the shared refresh continues for another caller', async () => {
     root = mkdtempSync(join(tmpdir(), 'codeboost-issues-'));
     const { gateway, calls } = heldGateway();

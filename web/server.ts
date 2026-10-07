@@ -300,8 +300,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       try { access = await readIssueAccess(signal); }
       catch (error) {
         if (stopping || runner?.closing || signal.aborted) throw new ShuttingDownError();
-        service.store.userAction(identity, { actionId: actionId as string, kind: action as string, request }, () => { throw error; });
-        throw error;
+        return service.store.userAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request }, () => { throw error; }).response;
       }
     }
     // A refused start or resume can still move the task to needs human (an expired budget is committed with the refusal),
@@ -460,6 +459,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         try { described = await planning.describe(signal); }
         catch (error) {
           if (stopping) throw new ShuttingDownError();
+          if (error instanceof GuardRefusal)
+            return service.store.userAction<unknown>(identity, { actionId, kind, request }, () => { throw error; }).response;
           throw new UpstreamFailure(`The issue could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
         }
       }
@@ -558,7 +559,12 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             if (saved) { json(200, issues.view()); return; }
             let access: IssueAccess;
             try { access = await trustGateway.issueAccess(input.number as number, { signal: requestAbort.signal, timeoutMs: 12_000 }); }
-            catch (error) { throw new UpstreamFailure(`The issue author could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`); }
+            catch (error) {
+              if (stopping || requestAbort.signal.aborted) throw new ShuttingDownError();
+              const failure = new UpstreamFailure(`The issue author could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+              service.store.userAction(identity, { actionId: input.actionId, kind, request }, () => { throw failure; });
+              json(200, issues.view()); return;
+            }
             service.store.userAction(identity, { actionId: input.actionId, kind, request }, () => {
               if (access.authorLogin !== input.authorLogin) throw new GuardRefusal('The issue author changed. Refresh before changing trust.');
               service.store.setIssueTrust({ repository: trustGateway.repository, issue: access.number, authorLogin: access.authorLogin,

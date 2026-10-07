@@ -12,6 +12,7 @@ import { ISSUE_READ_TIMEOUT_MS, productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -73,6 +74,19 @@ it('refuses when the issue author or collaborator access changes between admissi
   });
   const deps = productionPlanning(config, { ...verified, issues: issues(issueText), agent: () => closable() })!(service);
   await expect(deps.describe(new AbortController().signal)).rejects.toThrow(/access changed during admission/);
+});
+
+it('refuses all-comments text when explicit trust is revoked during the awaited planning read', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const issueText = async (number: number) => { started.resolve(); await release.promise; return text(number); };
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText, false), agent: () => closable() })!(service);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  const description = deps.describe(new AbortController().signal);
+  await started.promise;
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  release.resolve();
+  await expect(description).rejects.toThrow(/not trusted/);
 });
 
 it.each([['release', 'release'], ['', null]] as const)('names the configured base branch %j, or else the base commit, in the prompt', async (baseBranch, expected) => {
@@ -176,6 +190,22 @@ it('starts no suggestion when the issue cannot be read, and reports GitHub\'s fa
   const response = await start();
   expect(response).toMatchObject({ status: 502, body: { error: 'The issue could not be read from GitHub: GitHub is unreachable.' } });
   expect(invoke).not.toHaveBeenCalled();
+  expect(recorded()).toBe(0);
+});
+
+it('preserves a planning trust refusal as 409 instead of labelling it a GitHub read failure', async () => {
+  let trusted = false;
+  const invoke = vi.fn(), describe = vi.fn(async () => {
+    if (!trusted) throw new GuardRefusal('Issue is not trusted.');
+    return issueOf(1);
+  });
+  const { start, recorded } = await serve({ provider: { invoke }, describe });
+  const actionId = randomUUID();
+  expect(await start(actionId)).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
+  trusted = true;
+  expect(await start(actionId)).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
+  expect(invoke).not.toHaveBeenCalled();
+  expect(describe).toHaveBeenCalledTimes(1);
   expect(recorded()).toBe(0);
 });
 

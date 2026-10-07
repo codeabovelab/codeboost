@@ -242,6 +242,11 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       && lastRead.access.collaborator === access.collaborator && lastRead.trustedAuthor === trustedAuthor
       && performance.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
     const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000, trustedAuthor, expectedAccess: access });
+    if (trustedAuthor !== undefined) {
+      const current = service.store.issueTrust(review.github!.repository, number);
+      if (!current || current.revokedAt !== null || current.authorLogin !== trustedAuthor)
+        throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
+    }
     lastRead = { access, trustedAuthor, at, text };
     return text;
   };
