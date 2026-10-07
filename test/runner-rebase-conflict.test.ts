@@ -40,7 +40,7 @@ function fixture() {
 const manifest = (changes: TaskChangeManifest['changes'] = [{ path: 'conflict.txt', kind: 'modify', oldType: 'file', newType: 'file', underGit: false, ignored: false }]) => ({
   base: oid(2), changes, agentCommits: [], metadataChanged: false, linkTargetChanges: [], nestedGitlinkContent: [], digest: 'd'.repeat(64),
 }) satisfies TaskChangeManifest;
-type ProcessOptions = { processLifecycle?: ProcessGroupLifecycle };
+type ProcessOptions = { processLifecycle?: ProcessGroupLifecycle; timeoutMs?: number };
 
 function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {}) {
   const events: string[] = [];
@@ -98,6 +98,32 @@ describe('production foreign conflict resolver', () => {
   it('reserves the complete default tracked-process settlement budget plus its durable-write margin', () => {
     expect(CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS).toBe(DEFAULT_PROCESS_SETTLEMENT_MS + 1_000);
     expect(DEFAULT_PROCESS_SETTLEMENT_MS).toBe(16_000);
+  });
+
+  it('keeps every stage and child invocation on one monotonic deadline when wall time moves backward', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture(), x = deps(f), budgets: number[] = [];
+      const clone = x.d.clone, allocate = x.d.allocate;
+      x.d.clone = async (options: AsyncCloneOptions) => {
+        budgets.push(options.timeoutMs!);
+        const result = await clone(options);
+        vi.setSystemTime(Date.now() - 60_000);
+        return result;
+      };
+      x.d.allocate = async (...args: Parameters<typeof allocate>) => {
+        budgets.push(args[4].timeoutMs!);
+        return allocate(...args);
+      };
+      const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+        repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+        image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+        limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+      await resolve({ ...input(f), deadline: Date.now() + CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS + 5_000 });
+      expect(budgets).toHaveLength(2);
+      expect(budgets[1]).toBeLessThanOrEqual(budgets[0]!);
+      expect(x.request!.invocation.deadline - Date.now()).toBeLessThanOrEqual(budgets[0]!);
+    } finally { vi.useRealTimers(); }
   });
 
   it('does not claim a conflict child for an already-aborted request', async () => {

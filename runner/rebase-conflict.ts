@@ -192,7 +192,12 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
   return async input => {
     assertConflictPathSet(input.files);
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.baseHead)) throw new Error('Conflict base must be a full commit ID.');
-    if (!Number.isSafeInteger(input.deadline) || input.deadline <= Date.now()) throw new Error('Conflict deadline has passed.');
+    const wallRemaining = input.deadline - Date.now();
+    if (!Number.isSafeInteger(input.deadline) || !Number.isSafeInteger(wallRemaining) || wallRemaining < 1)
+      throw new Error('Conflict deadline has passed.');
+    // Convert the caller's wall-clock transport value once. Every later stage shares this monotonic boundary even if
+    // the system clock moves; wall time is reconstructed only for the child invocation contract.
+    const deadline = performance.now() + wallRemaining;
     // A pre-cancelled request owns nothing: check immediately before the first durable child claim.
     input.signal?.throwIfAborted();
     const childAttemptId = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
@@ -228,12 +233,12 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
     const deadlineError = () => Object.assign(new Error('Conflict child settlement exceeded the rebase work deadline.'),
       { code: 'ETIMEDOUT' });
     const operationBudget = () => {
-      const remaining = Math.floor(input.deadline - Date.now() - CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS);
+      const remaining = Math.floor(deadline - performance.now() - CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS);
       if (remaining < 1) throw deadlineError();
       return remaining;
     };
     const bounded = async <T>(operation: Promise<T>): Promise<T> => {
-      const remaining = Math.floor(input.deadline - Date.now());
+      const remaining = Math.floor(deadline - performance.now());
       if (remaining < 1) {
         retainOwnership = true;
         void operation.catch(() => { /* durable recovery owns any late result */ });
@@ -279,7 +284,7 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
       chmodSync(join(inputDirectory, 'schema.json'), 0o444);
       const context = options.store.currentContext(options.identity);
       const invocation = captureInvocation({ clone, phase: 'fix', vendor: 'claude', approvedArgv: [],
-        deadline: input.deadline - CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS,
+        deadline: Date.now() + operationBudget(),
         attemptId: childAttemptId, runnerOwner: options.runnerOwner, context });
       const prompt = `Resolve the in-progress rebase conflict in exactly these paths: ${JSON.stringify(input.files)}. `
         + 'Edit only those paths. Do not create commits or change repository metadata. Preserve the intent of both sides and leave each path in its final resolved form.';
@@ -320,10 +325,10 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
         if (exportedBytes > MAX_CONFLICT_SNAPSHOT_BYTES) throw new Error('The conflict export exceeded its byte limit.');
       }
       for (const entry of entries) {
-        if (Date.now() >= input.deadline) throw deadlineError();
+        if (performance.now() >= deadline) throw deadlineError();
         writeEntry(input.repository, entry);
       }
-      if (Date.now() >= input.deadline) throw deadlineError();
+      if (performance.now() >= deadline) throw deadlineError();
     } catch (error) { primary = error; }
     const cleanup: unknown[] = [];
     if (handle && input.signal?.aborted) handle.cancel(stopReason(input.signal));
