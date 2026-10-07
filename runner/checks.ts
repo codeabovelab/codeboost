@@ -11,6 +11,8 @@ interface Private { workspace: WorkspaceRef; head: string; commands: readonly (r
 export type RunnerCommandLauncher = (input: InvocationInput, commands: string, workspace: WorkspaceRef) => InvocationHandle;
 
 export function commandDigest(commands: readonly (readonly string[])[]): string {
+  if (commands.some(argv => argv.some(argument => !argument.isWellFormed())))
+    throw new Error('Command arguments must be well-formed Unicode.');
   return createHash('sha256').update(JSON.stringify(commands)).digest('hex');
 }
 

@@ -109,7 +109,7 @@ export function createRunnerCommand(policy: PhasePolicy, commands: string): Agen
   let parsed: unknown;
   try { parsed = JSON.parse(commands); } catch { throw new Error('Runner command input must be JSON.'); }
   if (!Array.isArray(parsed) || parsed.length === 0 || parsed.length > 100 || parsed.some(argv => !Array.isArray(argv)
-      || argv.length === 0 || argv.some(arg => typeof arg !== 'string' || arg.includes('\0'))))
+      || argv.length === 0 || argv.some(arg => typeof arg !== 'string' || !arg.isWellFormed() || arg.includes('\0'))))
     throw new Error('Runner command input must contain complete literal argv arrays.');
   const invocation = assertPhasePolicy(policy);
   for (const argv of parsed as string[][]) if (!permitsCommand(invocation, argv))

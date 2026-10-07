@@ -124,6 +124,7 @@ describe('agent phase policy', () => {
     expect(command.argv).toEqual(['node', '/usr/local/bin/codeboost-command-check', '/run/codeboost-input/schema.json']);
     expect(() => assertCommandSchema(command, Buffer.from(schema))).not.toThrow();
     expect(() => createRunnerCommand(policy, JSON.stringify([['npm', 'test', '--changed']]))).toThrow(/not approved exactly/);
+    expect(() => createRunnerCommand(policy, '[["npm","\\ud800"]]')).toThrow(/literal argv/);
     expect(() => createRunnerCommand(createPhasePolicy(request('execute', 'runner')), schema)).toThrow(/review policy/);
   });
 

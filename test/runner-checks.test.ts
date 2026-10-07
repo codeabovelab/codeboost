@@ -20,6 +20,10 @@ const plan: Plan = { schema_version: 1, revision: 1, issue: 1, summary: 'Check',
 const roots: string[] = [], stores: Store[] = [];
 afterEach(() => { for (const store of stores.splice(0)) store.close(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
+it('refuses to hash command arguments that a process spawn would normalize', () => {
+  expect(() => commandDigest([['node', '\ud800']])).toThrow(/well-formed Unicode/);
+});
+
 function fixture(result: (input: InvocationInput) => Promise<InvocationResult>) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-checks-')); roots.push(root);
   const store = new Store(join(root, 'state.sqlite')); stores.push(store);

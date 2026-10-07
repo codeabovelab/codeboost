@@ -10,6 +10,7 @@ describe('frozen v1 input contract', () => {
   expect(commandAllowed(['go', 'test'], [['go', 'test']])).toBe(true);
  });
  it.each(['test (x)', 'test #x', 'test !x', "test 'a\\b'"])('rejects forbidden tokenizer spelling %s', text => expect(() => commandArgv(text)).toThrow());
+ it('rejects a command argument that the process boundary would normalize', () => expect(() => commandArgv('test "\\ud800"')).toThrow());
  it('preserves empty args, adjacent quotes, and quoted punctuation', () => expect(commandArgv(`test '' ab" cd" '#!()'`)).toEqual(['test', '', 'ab cd', '#!()']));
  it('requires selected issue and known path identity', () => {
   expect(validatePlan(plan(), { ...context, issue: undefined } as any).errors.length).toBeGreaterThan(0);

@@ -11,7 +11,8 @@ try {
   const commands = JSON.parse(readFileSync(fd, 'utf8'));
   if (!Array.isArray(commands) || commands.length === 0 || commands.length > 100) process.exit(78);
   for (const argv of commands) {
-    if (!Array.isArray(argv) || argv.length === 0 || argv.some(arg => typeof arg !== 'string' || arg.includes('\0'))) process.exit(78);
+    if (!Array.isArray(argv) || argv.length === 0
+      || argv.some(arg => typeof arg !== 'string' || !arg.isWellFormed() || arg.includes('\0'))) process.exit(78);
     const result = spawnSync(argv[0], argv.slice(1), { cwd: '/work', stdio: ['ignore', 'inherit', 'inherit'], shell: false });
     if (result.error) {
       process.stderr.write(`codeboost command check could not start ${JSON.stringify(argv[0])}: ${JSON.stringify(result.error.message)}\n`);
