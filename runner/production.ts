@@ -244,7 +244,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       if (!current || current.revokedAt !== null || current.authorLogin !== trustedAuthor)
         throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
     };
-    if (lastRead && lastRead.access.number === number && lastRead.access.authorLogin === access.authorLogin
+    // Explicit trust deliberately admits every comment and is fully represented by `trustedAuthor`. Collaborator-only
+    // reads depend on the complete current collaborator set, which IssueAccess does not carry, so never cache them.
+    if (trustedAuthor !== undefined && lastRead && lastRead.access.number === number && lastRead.access.authorLogin === access.authorLogin
       && lastRead.access.collaborator === access.collaborator && lastRead.trustedAuthor === trustedAuthor
       && performance.now() - lastRead.at < ISSUE_REUSE_MS) return { text: lastRead.text, validate };
     const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000, trustedAuthor, expectedAccess: access });

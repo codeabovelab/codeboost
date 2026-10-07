@@ -21,6 +21,7 @@ import type { GitRebaser } from '../runner/rebase.ts';
 vi.mock('../agents/recovery.ts', async original => ({ ...await original<typeof import('../agents/recovery.ts')>(), recoverLeftovers: vi.fn() }));
 const issueReads: number[] = [];
 let issueAuthor = 'member', issueCollaborator = true;
+let collaboratorComments: string[] = [];
 let afterIssueAccess: (() => void) | undefined;
 let beforeIssueTextReturn: (() => Promise<void> | void) | undefined;
 vi.mock('../github/issues.ts', async original => {
@@ -35,7 +36,7 @@ vi.mock('../github/issues.ts', async original => {
       await beforeIssueTextReturn?.();
       if (options.expectedAccess && (options.expectedAccess.authorLogin !== issueAuthor || options.expectedAccess.collaborator !== issueCollaborator))
         throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
-      issueReads.push(number); return { number, title: 'T', body: 'B', comments: options.trustedAuthor === issueAuthor ? ['Outside note.'] : [] };
+      issueReads.push(number); return { number, title: 'T', body: 'B', comments: options.trustedAuthor === issueAuthor ? ['Outside note.'] : [...collaboratorComments] };
     }
   } };
 });
@@ -48,6 +49,7 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
   issueAuthor = 'member'; issueCollaborator = true;
+  collaboratorComments = [];
   afterIssueAccess = undefined;
   beforeIssueTextReturn = undefined;
   vi.restoreAllMocks();
@@ -110,6 +112,8 @@ describe('runner startup', () => {
   });
   it('reads the issue once for a run of items, and again once the reuse window has passed', async () => {
     const { root, service } = fixture();
+    service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
+      authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
     const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     issueReads.length = 0;
@@ -124,6 +128,21 @@ describe('runner startup', () => {
     vi.spyOn(performance, 'now').mockReturnValue(now + ISSUE_REUSE_MS + 1);
     await sources.issue(identity, signal);
     expect(issueReads).toHaveLength(2);
+  });
+  it('does not reuse collaborator-filtered comments without a complete collaborator snapshot', async () => {
+    const { root, service } = fixture();
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    issueReads.length = 0;
+    collaboratorComments = ['Former collaborator note.'];
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({
+      text: { comments: ['Former collaborator note.'] },
+    });
+    // The gateway's next filtered view represents that commenter losing collaborator access while the issue author's
+    // own access remains unchanged. Reusing the old text would keep untrusted instructions in the next prompt.
+    collaboratorComments = [];
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: [] } });
+    expect(issueReads).toEqual([service.store.getPlan(service.config.identity).issue, service.store.getPlan(service.config.identity).issue]);
   });
   it('passes explicit trust into execute comments and refuses the next item read after revocation', async () => {
     const { root, service } = fixture();

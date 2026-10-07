@@ -73,6 +73,7 @@ class FakeGitHub {
   pulls: PullRequestGateway = {
     repository: REPO,
     open: async (input: OpenPullRequestInput, signal?: AbortSignal) => {
+      const finalize = await input.beforeOpen?.(); finalize?.();
       this.calls.push(`open ${input.draft ? 'draft' : 'ready'}`);
       if (this.head(input.headBranch) === null) throw new Error('No such branch on GitHub.');
       const pr: Pr = { number: 100 + this.prs.length, url: `https://github.com/${REPO}/pull/${100 + this.prs.length}`, draft: input.draft, open: true,
@@ -102,11 +103,12 @@ class FakeGitHub {
       pr.open = false;
       return { number, url: pr.url };
     },
-    markDraft: async number => { this.onDraft?.(); const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
+    markDraft: async (number, input) => { const finalize = await input.beforeDraft?.(); finalize?.(); this.onDraft?.(); const pr = this.prs.find(candidate => candidate.number === number)!; pr.draft = true; return this.#view(pr); },
     refresh: async (number, input) => {
+      const finalizePatch = await input.beforePatch?.(); finalizePatch?.();
       this.calls.push(`refresh ${input.draft ? 'draft' : 'ready'}`);
       const pr = this.prs.find(candidate => candidate.number === number)!;
-      input.beforeReady?.();
+      const finalizeReady = await input.beforeReady?.(); finalizeReady?.();
       pr.body = input.body; pr.draft = input.draft;
       return this.#view(pr);
     },
@@ -501,11 +503,11 @@ describe('publishing a finished task (#103)', () => {
     } });
     app.publishOwed(() => undefined);
     await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened', reconcile: true }), { timeout: 10_000 });
-    const calls = [...w.github.calls];
+    const calls = [...w.github.calls], readsBeforeRetry = accessReads;
     store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
     await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/not trusted/) }),
       { timeout: 10_000, interval: 50 });
-    expect(accessReads).toBe(2);
+    expect(accessReads).toBe(readsBeforeRetry + 1);
     expect(w.github.calls).toEqual(calls);
   });
 
@@ -529,6 +531,29 @@ describe('publishing a finished task (#103)', () => {
     release.resolve();
     await publishSettled(app, identity);
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/not trusted/) });
+    expect(w.github.head(branch)).toBeNull();
+    expect(w.github.prs).toEqual([]);
+  });
+
+  it('re-reads current issue access after awaited safety reads and before pushing', async () => {
+    const w = world(), checking = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let access = { authorLogin: 'member', collaborator: true }, accessReads = 0;
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { accessReads++; return { number, ...access }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    w.github.checks.check = async () => { w.github.calls.push('check'); checking.resolve(); await release.promise;
+      return { outcome: 'clear', baseHead: 'b'.repeat(40) }; };
+    const { app, store, identity, branch } = await serve(w, { startup: false, issueGateway, before: completeAll });
+    app.publishOwed(() => undefined);
+    await checking.promise;
+    access = { authorLogin: 'outside', collaborator: false };
+    release.resolve();
+    await publishSettled(app, identity);
+    expect(accessReads).toBe(2);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/not trusted.*current author/) });
     expect(w.github.head(branch)).toBeNull();
     expect(w.github.prs).toEqual([]);
   });

@@ -67,7 +67,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   /** Publishes the task's pull request (#103); only a production runner whose setup built a publisher has one. */
   let publishing: TaskPublishing | null = null;
   /** Installed after the issue gateway and trust helpers exist; every publish attempt, including retries, calls it. */
-  let authorizePublish: ((identity: PlanIdentity, signal: AbortSignal) => Promise<() => void>) | undefined;
+  let authorizePublish: ((identity: PlanIdentity, signal: AbortSignal) => Promise<() => Promise<void>>) | undefined;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
   const capability = service.store.shutdownCapability();
   try {
@@ -141,7 +141,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   authorizePublish = async (_publishIdentity, signal) => {
     const access = await readIssueAccess(signal);
     requireTrustedIssue(access);
-    return () => requireTrustedIssue(access);
+    return async () => requireTrustedIssue(await readIssueAccess(signal));
   };
   /**
    * What `start` or `resume` would run (#91 part 2), or the local refusal. It writes nothing, so the view asks it too.

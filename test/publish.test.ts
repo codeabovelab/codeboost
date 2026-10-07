@@ -64,6 +64,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
   } };
   const pulls: PullRequestGateway = {
     async open(input) {
+      const finalize = await input.beforeOpen?.(); finalize?.();
       log.push(`open ${input.draft ? 'draft' : 'ready'}`); opened.push(input);
       if (options.open) return options.open(input);
       if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
@@ -111,6 +112,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
         .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch })));
     },
     async markDraft(number, input) {
+      const finalize = await input.beforeDraft?.(); finalize?.();
       log.push(`draft ${number}`);
       // Like the adapter's read-back: the PR must be from the branch and into the base asked for.
       if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
@@ -135,10 +137,11 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       return { number, url: 'https://github.com/owner/repo/pull/1' };
     },
     async refresh(number, input) {
+      const finalizePatch = await input.beforePatch?.(); finalizePatch?.();
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
       if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
       options.onRefresh?.();
-      input.beforeReady?.();
+      const finalizeReady = await input.beforeReady?.(); finalizeReady?.();
       if (options.refreshFails) throw new Error('timeout reading the PR back');
       if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
       if (closed.has(number)) throw new Error(`Pull request #${number} is not open.`);
@@ -151,7 +154,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
     },
   };
   const pusher: BranchPusher = { async push(id, input, signal) {
-    input.beforePush?.();
+    const finalize = await input.beforePush?.(); finalize?.();
     log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal);
   } };
   const publisher = new PullRequestPublisher(store, { checks: gate, pulls, pusher, closing: options.closing }, publishConfig);
@@ -244,6 +247,21 @@ describe('opening the task PR', () => {
     await expect(publisher.publish(identity)).rejects.toThrow(/Stale task state/);
     expect(log).not.toContain('open ready');
     expect(store.getTask(identity).status).toBe('running');
+  });
+  it('rechecks local task currentness after awaited external authorization and immediately before pushing', async () => {
+    const store = runningTask(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let checks = 0;
+    const run = harness(store);
+    const publishing = run.publisher.publish(identity, { beforeMutation: async () => {
+      checks++;
+      if (checks === 2) { entered.resolve(); await release.promise; }
+    } });
+    await entered.promise;
+    store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
+    release.resolve();
+    await expect(publishing).rejects.toThrow(/Stale task state/);
+    expect(run.log.some(line => line.startsWith('push'))).toBe(false);
+    expect(run.log.some(line => line.startsWith('open'))).toBe(false);
   });
   it('refuses to open the PR when a review note is added during the push', async () => {
     const store = runningTask();

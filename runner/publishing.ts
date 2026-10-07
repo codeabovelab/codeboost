@@ -51,11 +51,11 @@ export class TaskPublishing {
   #retried = new Map<string, { deadline: number; short: number }>();
   #shortRetryMs: number;
   /** Fresh admission check at every publish attempt, including automatic retries. Close jobs do not need issue trust. */
-  #authorizePublish?: (identity: PlanIdentity, signal: AbortSignal) => Promise<() => void>;
+  #authorizePublish?: (identity: PlanIdentity, signal: AbortSignal) => Promise<() => Promise<void>>;
   /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
   #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
-    env: NodeJS.ProcessEnv = process.env, options: { shortRetryMs?: number; authorizePublish?: (identity: PlanIdentity, signal: AbortSignal) => Promise<() => void> } = {}) {
+    env: NodeJS.ProcessEnv = process.env, options: { shortRetryMs?: number; authorizePublish?: (identity: PlanIdentity, signal: AbortSignal) => Promise<() => Promise<void>> } = {}) {
     this.#store = store; this.#publisher = publisher; this.#runner = runner; this.#executor = executor; this.#write = settleWith(capability);
     this.#shortRetryMs = options.shortRetryMs ?? SHORT_RETRY_MS;
     this.#authorizePublish = options.authorizePublish;
@@ -278,7 +278,7 @@ export class TaskPublishing {
       // Durable in-flight ownership before the first external write (AGENTS.md): if this process stops before the outcome
       // is recorded, startup finds the marker and publishes again or settles it as interrupted. No marker, no publish.
       const draft = job.kind === 'publish' && job.draft;
-      let assertAuthorized: (() => void) | undefined;
+      let assertAuthorized: (() => Promise<void>) | undefined;
       if (job.kind === 'publish' && this.#authorizePublish) {
         try { assertAuthorized = await this.#authorizePublish(identity, abort.signal); }
         catch (error) {
