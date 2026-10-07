@@ -31,7 +31,7 @@ vi.mock('node:child_process', async importOriginal => {
 vi.mock('../agents/container/image.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../agents/container/image.ts')>(), assertBuiltAgentImage: () => {},
 }));
-const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, prepareTaskFilesystemsAsync,
+const { adoptRecoveredTaskStorage, exportTaskDiff, hasLiveTaskStorage, importTaskPaths, prepareTaskFilesystemsAsync,
   removeTaskFilesystems, removeTaskFilesystemsAsync } = await import('../agents/container/storage.ts');
 const { createTaskClone } = await import('../git/clone.ts');
 const { commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_BUNDLE_BYTES, MAXIMUM_DECLARED_LINKS,
@@ -260,6 +260,32 @@ describe('asynchronous task storage allocation', () => {
       { signal: AbortSignal.abort(), onProcessGroup: group => { groups.push(group); } })).rejects.toThrow('cancelled');
     expect(groups).toEqual([]);
     expect(stored()).toEqual([]);
+  });
+});
+
+describe('conflict path import', () => {
+  it('starts no Docker work when snapshot encoding consumes the remaining monotonic budget', async () => {
+    const filesystems = await prepareTaskFilesystemsAsync(clone(), LIMITS, IMAGE, owner());
+    calls.made = [];
+    let now = 0;
+    const clock = vi.spyOn(performance, 'now').mockImplementation(() => now);
+    const content = Buffer.from('conflicted\n');
+    Object.defineProperty(content, 'toString', { value: function(this: Buffer, encoding?: BufferEncoding) {
+      now = 2;
+      return Buffer.prototype.toString.call(this, encoding);
+    } });
+    const starting = vi.fn();
+    try {
+      await expect(importTaskPaths(filesystems,
+        [{ path: 'file.txt', type: 'file', executable: false, content }], 1024, { imageId: IMAGE, timeoutMs: 1,
+          processLifecycle: { starting, started: vi.fn(), settled: vi.fn(), unsettled: vi.fn() } }))
+        .rejects.toThrow(/overall deadline/);
+      expect(starting).not.toHaveBeenCalled();
+      expect(calls.made).toEqual([]);
+    } finally {
+      clock.mockRestore();
+      removeTaskFilesystems(filesystems);
+    }
   });
 });
 

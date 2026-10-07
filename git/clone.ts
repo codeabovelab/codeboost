@@ -4,6 +4,7 @@ import { lstatSync, mkdtempSync, opendirSync, realpathSync, rmSync } from 'node:
 import { isAbsolute, join, relative, resolve } from 'node:path';
 import type { TaskClone } from '../agents/contract.ts';
 import { runInProcessGroup, type ProcessGroup } from '../agents/process-group.ts';
+import { runTrackedProcess, type ProcessGroupLifecycle } from '../agents/tracked-docker.ts';
 
 interface DirectoryIdentity { readonly dev: number; readonly ino: number }
 interface CloneIdentity { readonly directory: string; readonly root: DirectoryIdentity; readonly metadata: DirectoryIdentity }
@@ -122,10 +123,16 @@ function* cloneSteps(options: CloneOptions): Generator<CloneStep, TaskClone, Git
     trustedClones.set(clone, Object.freeze({ directory: realpathSync(directory), root, metadata: cloneMetadata }));
     return clone;
   } catch (error) {
-    rmSync(directory, { recursive: true, force: true });
+    // An unsettled group or escaped pipe holder may still use the clone. Its durable parent owns the directory until
+    // recovery proves that process gone; unlinking it here would erase that recovery boundary underneath live work.
+    if (!cloneFailureRetainsDirectory(error)) rmSync(directory, { recursive: true, force: true });
     throw error;
   }
 }
+
+/** Process outcomes that make deleting a partial clone unsafe until durable recovery proves the owner settled. */
+export const cloneFailureRetainsDirectory = (error: unknown): boolean =>
+  ['EGROUPALIVE', 'ESTDIOHELD'].includes(String((error as NodeJS.ErrnoException | undefined)?.code));
 
 /**
  * Prepare an independent committed snapshot. This is trusted staging, not the
@@ -160,6 +167,8 @@ export interface AsyncCloneOptions extends CloneOptions {
   readonly signal?: AbortSignal;
   /** Called in the same turn as each Git spawn with its process group, so the caller can record it durably. */
   readonly onProcessGroup?: (group: ProcessGroup) => void;
+  /** Durable ownership around every individual Git subprocess. */
+  readonly processLifecycle?: ProcessGroupLifecycle;
 }
 
 /**
@@ -189,8 +198,11 @@ async function runCloneSteps(options: AsyncCloneOptions): Promise<TaskClone> {
       next = signal?.aborted ? steps.throw(aborted()) : steps.next();
       continue;
     }
-    const outcome = await runInProcessGroup('git', [...GIT_OPTIONS, ...step.args], { cwd: step.cwd, env,
-      timeoutMs: step.timeoutMs, signal, onProcessGroup: options.onProcessGroup, maxBuffer: 1024 * 1024 });
+    const processOptions = { cwd: step.cwd, env, timeoutMs: step.timeoutMs, signal,
+      onProcessGroup: options.onProcessGroup, maxBuffer: 1024 * 1024 };
+    const outcome = options.processLifecycle
+      ? await runTrackedProcess('git', [...GIT_OPTIONS, ...step.args], { ...processOptions, lifecycle: options.processLifecycle })
+      : await runInProcessGroup('git', [...GIT_OPTIONS, ...step.args], processOptions);
     const cancelled = (outcome.error as NodeJS.ErrnoException | undefined)?.code === 'ABORT_ERR';
     next = steps.next(outcome.status === 0 ? outcome : { ...outcome, error: cancelled ? aborted() : outcome.error
       ?? new Error(`git ${step.args[0] ?? ''} failed (exit ${outcome.status}): ${outcome.stderr.trim().slice(0, 512)}`) });

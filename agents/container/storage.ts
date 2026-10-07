@@ -8,7 +8,8 @@ import { assertBuiltAgentImage } from './image.ts';
 import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { DockerError, pause, runDocker, type DockerOutcome } from '../docker.ts';
 import { MAXIMUM_TIMER_MS, runInProcessGroup, type ProcessGroup } from '../process-group.ts';
-import { TREE_SCRIPT } from './tree-script.ts';
+import { runTrackedProcess, type ProcessGroupLifecycle } from '../tracked-docker.ts';
+import { MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, TREE_SCRIPT } from './tree-script.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, releaseAllocationId, type ResourceOwner, UUID_V4 } from '../labels.ts';
 
@@ -128,6 +129,10 @@ export interface PreparationOptions {
   readonly signal?: AbortSignal;
   /** Called in the same turn as each Docker spawn with its process group, so the caller can record it durably. */
   readonly onProcessGroup?: (group: ProcessGroup) => void;
+  /** Durable ownership around every individual Docker subprocess. */
+  readonly processLifecycle?: ProcessGroupLifecycle;
+  /** Overall budget for allocation or cleanup. Callers with a larger lifecycle deadline reserve group settlement. */
+  readonly timeoutMs?: number;
 }
 // The non-blocking driver: every Docker call runs in its own process group, and the promise settles only after it has
 // exited. An abort reaches the generator as an error at its next cancellable call or pause, so its own cleanup runs.
@@ -144,9 +149,12 @@ async function runStepsAsync<T>(steps: Steps<T>, options: PreparationOptions): P
       await pause(step.sleepMs);
       next = steps.next();
     } else {
-      next = steps.next(await runInProcessGroup('docker', step.args, { env: dockerEnvironment(),
-        timeoutMs: step.timeoutMs, signal: step.cancellable ? options.signal : undefined,
-        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer, input: step.input }));
+      const processOptions = { env: dockerEnvironment(), timeoutMs: step.timeoutMs,
+        signal: step.cancellable ? options.signal : undefined,
+        onProcessGroup: options.onProcessGroup, maxBuffer: step.maxBuffer, input: step.input };
+      next = steps.next(options.processLifecycle
+        ? await runTrackedProcess('docker', step.args, { ...processOptions, lifecycle: options.processLifecycle })
+        : await runInProcessGroup('docker', step.args, processOptions));
     }
   }
   return next.value;
@@ -378,7 +386,7 @@ export function prepareTaskFilesystems(clone: TaskClone, limits: TaskStorageLimi
  * every group has exited. A create cut short by the abort counts as possibly created, as for a killed client.
  */
 export async function prepareTaskFilesystemsAsync(clone: TaskClone, limits: TaskStorageLimits, imageId: string,
-  owner: ResourceOwner, options: PreparationOptions & { readonly timeoutMs?: number } = {}): Promise<TaskFilesystems> {
+  owner: ResourceOwner, options: PreparationOptions = {}): Promise<TaskFilesystems> {
   if (options.signal?.aborted)
     throw Object.assign(new Error('Task storage allocation was cancelled.'), { name: 'AbortError', code: 'ABORT_ERR' });
   try { return await runStepsAsync(allocation(clone, limits, imageId, owner, options.timeoutMs ?? 60_000), options); }
@@ -498,19 +506,22 @@ export function removeTaskFilesystems(filesystems: TaskFilesystems | RecoveredTa
  * `removeTaskFilesystems` without blocking the event loop: the same removal, each Docker call in its own process group.
  * It is never cancelled: it runs to its own deadline, so nothing is dropped, and settles only after every call exited.
  */
-export async function removeTaskFilesystemsAsync(filesystems: TaskFilesystems | RecoveredTaskStorage): Promise<void> {
+export async function removeTaskFilesystemsAsync(filesystems: TaskFilesystems | RecoveredTaskStorage,
+  options: PreparationOptions = {}): Promise<void> {
   const recovered = recoveredStorage.get(filesystems as RecoveredTaskStorage);
   if (recovered) {
     const handle = filesystems as RecoveredTaskStorage;
     await runStepsAsync(cleanup(recovered.keeperId ? [recovered.keeperId] : [],
-      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner), {});
+      [handle.metadataVolume, handle.workVolume].filter((name): name is string => name !== undefined), recovered.owner,
+      new Set(), options.timeoutMs ?? 30_000), options);
     recoveredStorage.delete(handle);
     return;
   }
   const allocated = filesystems as TaskFilesystems;
   assertTaskFilesystems(allocated);
   const owner = taskFilesystemOwner(allocated);
-  await runStepsAsync(cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner), {});
+  await runStepsAsync(cleanup([allocated.keeper], [allocated.metadataVolume, allocated.workVolume], owner,
+    new Set(), options.timeoutMs ?? 30_000), options);
   allocations.delete(allocated);
   liveAllocations.delete(owner.allocationId);
 }
@@ -522,6 +533,111 @@ export interface TaskDiff {
   readonly diff: Buffer;
   /** Whether the diff was longer than `maxBytes` and was cut. */
   readonly truncated: boolean;
+}
+
+export interface ExportedTaskPath {
+  readonly path: string;
+  readonly type: 'absent' | 'file' | 'symlink';
+  readonly executable?: boolean;
+  readonly content?: Buffer;
+}
+
+const EXPORT_PATHS_SCRIPT = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const request = JSON.parse(fs.readFileSync(0, 'utf8'));
+if (!request || !Array.isArray(request.paths) || !Number.isSafeInteger(request.maxBytes) || request.maxBytes < 1) process.exit(2);
+let used = 0;
+const entries = [];
+for (const name of request.paths) {
+  if (typeof name !== 'string' || !name || path.posix.isAbsolute(name) || Buffer.byteLength(name) > ${MAXIMUM_NAME_BYTES}
+      || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(name)
+      || name.split('/').some(p => !p || p === '.' || p === '..') || name.split('/')[0] === '.git') process.exit(2);
+  used += Buffer.byteLength(name);
+  if (used > request.maxBytes) process.exit(4);
+  const parts = name.split('/');
+  let cursor = '/work';
+  let missingAncestor = false;
+  for (const part of parts.slice(0, -1)) {
+    cursor = path.join(cursor, part);
+    let stat;
+    try { stat = fs.lstatSync(cursor); }
+    catch (error) {
+      if (error && error.code === 'ENOENT') { missingAncestor = true; break; }
+      throw error;
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(3);
+  }
+  if (missingAncestor) { entries.push({ path: name, type: 'absent' }); continue; }
+  const target = path.join('/work', ...parts);
+  let stat;
+  try { stat = fs.lstatSync(target); }
+  catch (error) {
+    if (error && error.code === 'ENOENT') { entries.push({ path: name, type: 'absent' }); continue; }
+    throw error;
+  }
+  let content;
+  if (stat.isSymbolicLink()) content = Buffer.from(fs.readlinkSync(target, { encoding: 'buffer' }));
+  else if (stat.isFile()) {
+    if (stat.size > request.maxBytes - used) process.exit(4);
+    if (!fs.constants.O_NOFOLLOW) process.exit(3);
+    const fd = fs.openSync(target, fs.constants.O_RDONLY | fs.constants.O_NOFOLLOW);
+    try {
+      const opened = fs.fstatSync(fd);
+      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) process.exit(3);
+      if (opened.size > request.maxBytes - used) process.exit(4);
+      content = fs.readFileSync(fd);
+    } finally { fs.closeSync(fd); }
+  } else process.exit(3);
+  used += content.length;
+  if (used > request.maxBytes) process.exit(4);
+  entries.push({ path: name, type: stat.isSymbolicLink() ? 'symlink' : 'file',
+    ...(stat.isFile() ? { executable: (stat.mode & 0o111) !== 0 } : {}), content: content.toString('base64') });
+}
+process.stdout.write(JSON.stringify(entries));
+`;
+
+/** Export exact no-follow entries from task storage. The raw path plus content budget is enforced before output. */
+export async function exportTaskPaths(storage: TaskFilesystems | RecoveredTaskStorage, paths: readonly string[],
+  maxBytes: number, options: StorageScriptOptions): Promise<readonly ExportedTaskPath[]> {
+  if (!Array.isArray(paths) || paths.length > MAXIMUM_DECLARED_LINKS || paths.some(path => typeof path !== 'string' || !path
+      || path.startsWith('/') || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(path) || Buffer.byteLength(path) > MAXIMUM_NAME_BYTES
+      || path.split('/').some(part => !part || part === '.' || part === '..') || path.split('/')[0] === '.git'))
+    throw new Error('Conflict paths are invalid or exceed the entry limit.');
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024)
+    throw new Error('Conflict path export needs a positive limit of at most 32 MiB.');
+  let stdout: string;
+  try {
+    stdout = await runStorageScript(storage, { kind: 'export', operation: 'Conflict path export',
+      consequence: 'resolved conflict files cannot be exported', entrypoint: 'node',
+      args: ['-e', EXPORT_PATHS_SCRIPT], input: Buffer.from(JSON.stringify({ paths, maxBytes })),
+      maxOutputBytes: Math.ceil(maxBytes / 3) * 4
+        + paths.reduce((n, path) => n + Buffer.byteLength(JSON.stringify(path)) + 96, 2) }, options);
+  } catch (error) {
+    if (error instanceof AggregateError || (error as Error | undefined)?.name === 'AbortError') throw error;
+    throw new Error('Conflict path export failed.', { cause: error });
+  }
+  const decoded = JSON.parse(stdout) as { path?: unknown; type?: unknown; executable?: unknown; content?: unknown }[];
+  if (!Array.isArray(decoded) || decoded.length !== paths.length) throw new Error('Conflict path export returned a malformed list.');
+  let used = 0;
+  return Object.freeze(decoded.map((entry, index) => {
+    if (entry?.path !== paths[index] || !['absent', 'file', 'symlink'].includes(entry.type as string))
+      throw new Error('Conflict path export returned an unexpected entry.');
+    used += Buffer.byteLength(entry.path as string);
+    if (used > maxBytes) throw new Error('Conflict path export exceeded its byte limit.');
+    if (entry.type === 'absent') {
+      if (entry.content !== undefined || entry.executable !== undefined) throw new Error('Conflict path export returned malformed absence.');
+      return Object.freeze({ path: entry.path as string, type: 'absent' as const });
+    }
+    if (typeof entry.content !== 'string' || (entry.type === 'file' ? typeof entry.executable !== 'boolean' : entry.executable !== undefined))
+      throw new Error('Conflict path export returned malformed content.');
+    const content = Buffer.from(entry.content, 'base64');
+    if (content.toString('base64') !== entry.content) throw new Error('Conflict path export returned malformed base64.');
+    used += content.length;
+    if (used > maxBytes) throw new Error('Conflict path export exceeded its byte limit.');
+    return Object.freeze({ path: entry.path as string, type: entry.type as 'file' | 'symlink',
+      ...(entry.type === 'file' ? { executable: entry.executable as boolean } : {}), content });
+  }));
 }
 export interface ExportOptions extends PreparationOptions {
   /** The commit the storage was seeded from (the clone's head): a full commit ID. */
@@ -748,10 +864,10 @@ export const EXPORT_SCRIPT = [
   'if [ "${statuses[1]}" -ne 0 ] || [ "${statuses[2]}" -ne 0 ] || [ "${statuses[3]}" -ne 0 ]; then echo "the export pipeline failed" >&2; exit 5; fi',
 ].join('\n');
 
-/** A container run over both volumes of task storage, read-only, as the storage user, with no network. */
+/** A container run over both volumes of task storage as the storage user with no network; only `import` may write work. */
 interface StorageScript {
   /** The `io.codeboost.task-storage` kind the container carries; recovery removes a leftover one. */
-  readonly kind: 'export' | 'inspect' | 'commit';
+  readonly kind: 'export' | 'inspect' | 'commit' | 'import';
   /** Names the operation in messages, for example "Task diff export". */
   readonly operation: string;
   /** Ends "Task work volume is missing; ..." when a volume is gone. */
@@ -766,6 +882,8 @@ interface StorageScript {
   readonly tmpBytes?: '64m' | '512m';
   /** Written to the script's stdin (`docker run -i`), which is then closed; without it stdin is not connected. */
   readonly input?: Buffer;
+  /** Only the conflict-snapshot importer may write the work volume; metadata always remains read-only. */
+  readonly writableWork?: boolean;
 }
 export interface StorageScriptOptions extends PreparationOptions {
   /** The immutable ID of the built agent image, whose tools run the script. */
@@ -793,7 +911,7 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
       '--read-only', '--user', '10001:10001', '--network=none', '--cap-drop=ALL', '--security-opt=no-new-privileges',
       '--security-opt=seccomp=builtin', '--runtime=runc', '--pids-limit=64', `--memory=${script.memory ?? '256m'}`, '--cpus=.5',
       '--tmpfs', `/tmp:rw,nosuid,nodev,noexec,size=${script.tmpBytes ?? '64m'}`,
-      '--mount', `type=volume,source=${workVolume},target=/work,readonly`,
+      '--mount', `type=volume,source=${workVolume},target=/work${script.writableWork ? '' : ',readonly'}`,
       '--mount', `type=volume,source=${metadataVolume},target=/work/.git,readonly`,
       '--entrypoint', script.entrypoint, imageId, ...script.args];
     const outcome = yield* run(args, remaining(), true, script.maxOutputBytes, script.input);
@@ -816,14 +934,16 @@ function* storageScriptSteps(workVolume: string, metadataVolume: string, owner: 
 }
 
 /**
- * Run a script over task storage (the value `prepareTaskFilesystems` returned, or a recovery handle) in a read-only
- * container with no network, and return its standard output. For D's own storage operations; not part of the contract.
+ * Run a script over task storage (the value `prepareTaskFilesystems` returned, or a recovery handle) in an isolated
+ * container with no network, and return its standard output. All callers mount both volumes read-only except the
+ * bounded conflict importer, which may write only the work volume. For D's own storage operations; not part of the contract.
  * On abort or at the deadline the client is stopped and the container, which outlives a killed client, is removed; the
  * promise settles only after both. An abort rejects with an `AbortError`, unless that container's cleanup did not
  * settle, which rejects with an `AggregateError`.
  */
 export async function runStorageScript(storage: TaskFilesystems | RecoveredTaskStorage, script: StorageScript,
   options: StorageScriptOptions): Promise<string> {
+  if (script.writableWork && script.kind !== 'import') throw new Error('Only a conflict import may write task storage.');
   if (!/^sha256:[0-9a-f]{64}$/.test(options.imageId)) throw new Error(`${script.operation} requires the immutable built image ID.`);
   assertBuiltAgentImage(options.imageId);
   let owner: ResourceOwner, workVolume: string | undefined, metadataVolume: string | undefined;
@@ -847,6 +967,106 @@ export async function runStorageScript(storage: TaskFilesystems | RecoveredTaskS
     if (options.signal?.aborted && !(error instanceof AggregateError) && (error as Error | undefined)?.name !== 'AbortError')
       throw cancelled(error);
     throw error;
+  }
+}
+
+const IMPORT_PATHS_SCRIPT = String.raw`
+const fs = require('node:fs');
+const path = require('node:path');
+const request = JSON.parse(fs.readFileSync(0, 'utf8'));
+if (!request || !Array.isArray(request.entries) || !Number.isSafeInteger(request.maxBytes) || request.maxBytes < 1) process.exit(2);
+let used = 0;
+for (const entry of request.entries) {
+  const name = entry && entry.path;
+  if (typeof name !== 'string' || !name || path.posix.isAbsolute(name) || Buffer.byteLength(name) > ${MAXIMUM_NAME_BYTES}
+      || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(name)
+      || name.split('/').some(p => !p || p === '.' || p === '..') || name.split('/')[0] === '.git'
+      || !['absent', 'file', 'symlink'].includes(entry.type)) process.exit(2);
+  used += Buffer.byteLength(name);
+  let content;
+  if (entry.type === 'absent') {
+    if (entry.content !== undefined || entry.executable !== undefined) process.exit(2);
+  } else {
+    if (typeof entry.content !== 'string' || (entry.type === 'file' ? typeof entry.executable !== 'boolean' : entry.executable !== undefined)) process.exit(2);
+    content = Buffer.from(entry.content, 'base64');
+    if (content.toString('base64') !== entry.content) process.exit(2);
+    used += content.length;
+  }
+  if (used > request.maxBytes) process.exit(4);
+}
+for (const entry of request.entries) {
+  const parts = entry.path.split('/');
+  let cursor = '/work', missing = false;
+  for (const part of parts.slice(0, -1)) {
+    cursor = path.join(cursor, part);
+    let stat;
+    try { stat = fs.lstatSync(cursor); }
+    catch (error) {
+      if (!error || error.code !== 'ENOENT') throw error;
+      if (entry.type === 'absent') { missing = true; break; }
+      fs.mkdirSync(cursor, { mode: 0o755 });
+      stat = fs.lstatSync(cursor);
+    }
+    if (!stat.isDirectory() || stat.isSymbolicLink()) process.exit(3);
+  }
+  if (missing) continue;
+  const target = path.join('/work', ...parts);
+  let current;
+  try { current = fs.lstatSync(target); }
+  catch (error) { if (!error || error.code !== 'ENOENT') throw error; }
+  if (current) {
+    if (!current.isFile() && !current.isSymbolicLink()) process.exit(3);
+    fs.unlinkSync(target);
+  }
+  if (entry.type === 'absent') continue;
+  const content = Buffer.from(entry.content, 'base64');
+  if (entry.type === 'symlink') fs.symlinkSync(content, target);
+  else {
+    const fd = fs.openSync(target, fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL | fs.constants.O_NOFOLLOW,
+      entry.executable ? 0o755 : 0o644);
+    try { fs.writeFileSync(fd, content); } finally { fs.closeSync(fd); }
+    fs.chmodSync(target, entry.executable ? 0o755 : 0o644);
+  }
+}
+`;
+
+/** Import a bounded, exact conflict snapshot into a clean allocation without exposing any host path to Docker. */
+export async function importTaskPaths(storage: TaskFilesystems, entries: readonly ExportedTaskPath[], maxBytes: number,
+  options: StorageScriptOptions): Promise<void> {
+  if (!Array.isArray(entries) || entries.length === 0 || entries.length > MAXIMUM_DECLARED_LINKS)
+    throw new Error('Conflict path import needs a non-empty bounded entry list.');
+  if (!Number.isSafeInteger(maxBytes) || maxBytes < 1 || maxBytes > 32 * 1024 * 1024)
+    throw new Error('Conflict path import needs a positive limit of at most 32 MiB.');
+  // Encoding follows user-controlled snapshot size and runs synchronously. Own one monotonic deadline before it, then
+  // admit Docker work only with the budget that remains after the payload is fully serialized.
+  const remaining = createDeadline(options.timeoutMs ?? 60_000);
+  let used = 0;
+  const encoded = entries.map(entry => {
+    if (!entry || typeof entry.path !== 'string' || !entry.path || entry.path.startsWith('/')
+      || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(entry.path) || Buffer.byteLength(entry.path) > MAXIMUM_NAME_BYTES
+      || entry.path.split('/').some((part: string) => !part || part === '.' || part === '..') || entry.path.split('/')[0] === '.git'
+      || !['absent', 'file', 'symlink'].includes(entry.type)) throw new Error('Conflict path import entry is invalid.');
+    used += Buffer.byteLength(entry.path);
+    if (entry.type === 'absent') {
+      if (entry.content !== undefined || entry.executable !== undefined) throw new Error('Conflict path import absence is malformed.');
+      return { path: entry.path, type: entry.type };
+    }
+    if (!Buffer.isBuffer(entry.content) || (entry.type === 'file' ? typeof entry.executable !== 'boolean' : entry.executable !== undefined))
+      throw new Error('Conflict path import content is malformed.');
+    used += entry.content.length;
+    return { path: entry.path, type: entry.type, ...(entry.type === 'file' ? { executable: entry.executable } : {}),
+      content: entry.content.toString('base64') };
+  });
+  if (new Set(entries.map(entry => entry.path)).size !== entries.length) throw new Error('Conflict path import entries must not repeat.');
+  if (used > maxBytes) throw new Error('Conflict path import exceeded its byte limit.');
+  const input = Buffer.from(JSON.stringify({ entries: encoded, maxBytes })), timeoutMs = remaining();
+  try {
+    await runStorageScript(storage, { kind: 'import', operation: 'Conflict path import',
+      consequence: 'the conflict snapshot cannot be imported', entrypoint: 'node', args: ['-e', IMPORT_PATHS_SCRIPT],
+      input, writableWork: true }, { ...options, timeoutMs });
+  } catch (error) {
+    if (error instanceof AggregateError || (error as Error | undefined)?.name === 'AbortError') throw error;
+    throw new Error('Conflict path import failed.', { cause: error });
   }
 }
 

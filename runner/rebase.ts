@@ -20,9 +20,13 @@ export interface RebaseMapping { oldSha: string; newSha: string }
 export interface RebaseConflictInput {
   readonly attemptId: string;
   readonly commit: string;
+  /** The pinned HEAD whose tree the resolver snapshot is based on. */
+  readonly baseHead: string;
   readonly files: readonly string[];
   /** The isolated runner-owned worktree. A production resolver must expose it only through lane D's bounded storage. */
   readonly repository: string;
+  /** Wall-clock form of this rebase operation's already-bounded monotonic work deadline. */
+  readonly deadline: number;
   readonly signal?: AbortSignal;
 }
 export interface RebaseResult {
@@ -68,6 +72,8 @@ const configuredGit = (): { executable: string; environment: NodeJS.ProcessEnv }
 
 /** A conflict is a review outcome, not an infrastructure failure. No rewritten ref is retained. */
 export class RebaseConflict extends Error {}
+/** The resolver retained child resources for startup recovery, so live cleanup must not remove their parent workspace. */
+export class RebaseResourcesUnsettled extends Error {}
 
 /** The durable ref that keeps a completed rewrite reachable in the runner-owned bare repository. */
 export function rebaseRef(attemptId: string): string {
@@ -174,7 +180,8 @@ export class GitRebaser {
         const outsideBefore = await this.#outsideConflictState(path, allowed, priorHead, scope);
         const operationBefore = await this.#rebaseState(path, scope);
         this.#assertResultCurrent(scope);
-        await this.#resolveConflict({ attemptId, commit, files, repository: path }, scope);
+        await this.#resolveConflict({ attemptId, commit, baseHead: priorHead, files, repository: path,
+          deadline: Date.now() + Math.max(0, Math.floor(scope.workDeadline - performance.now())) }, scope);
         this.#assertResultCurrent(scope);
         if (await this.#git(path, ['rev-parse', '--verify', 'REBASE_HEAD^{commit}'], scope) !== commit)
           throw new RebaseConflict('The conflict resolver changed the rebase operation.');
@@ -227,7 +234,7 @@ export class GitRebaser {
       result = { oldHead, base: onto, head, mappings, resolvedConflicts };
     } catch (error) { primary = error; }
     const cleanupFailures: unknown[] = [];
-    if (added || lstatSync(path, { throwIfNoEntry: false })) {
+    if (!(primary instanceof RebaseResourcesUnsettled) && (added || lstatSync(path, { throwIfNoEntry: false }))) {
       try { await this.#remove(path, scope); } catch (error) { cleanupFailures.push(error); }
     }
     // Cleanup is deliberately uninterruptible, but an abort that arrived while it ran still cancels the operation.
@@ -423,6 +430,8 @@ export class GitRebaser {
       // Await settlement after abort: the resolver owns its container/storage until its promise ends.
       try { await resolveConflict(Object.freeze({ ...input, signal: controller.signal })); }
       catch (error) {
+        // Retained ownership outranks cancellation/deadline reporting: live cleanup must preserve its parent workspace.
+        if (error instanceof RebaseResourcesUnsettled) throw error;
         abortExpired();
         controller.signal.throwIfAborted();
         throw error;
@@ -498,6 +507,7 @@ export class GitRebaser {
     const outcome = await runInProcessGroup(file, args, {
       cwd, env, timeoutMs, graceMs: 1_000, signal: cleanup ? undefined : scope.signal, input,
       onProcessGroup: value => { this.#options.onProcessGroup(scope.attemptId, value); group = value; }, maxBuffer, discardExcessOutput,
+      allowUnsettledReturn: true,
     });
     const code = (outcome.error as NodeJS.ErrnoException | undefined)?.code;
     let callbackFailure: unknown;

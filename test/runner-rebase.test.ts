@@ -5,7 +5,7 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
-import { GitRebaser, RebaseConflict, rebaseRef, type GitRebaserOptions } from '../runner/rebase.ts';
+import { GitRebaser, RebaseConflict, RebaseResourcesUnsettled, rebaseRef, type GitRebaserOptions } from '../runner/rebase.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
 import { splitBoundedIndexRecords, verifyCheckout } from '../runner/verify-checkout.ts';
 import { readBoundedRebaseStateNames } from '../runner/hash-rebase-state.ts';
@@ -648,6 +648,16 @@ describe('trusted pre-merge rebase', () => {
       ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] }))
       .rejects.toThrow(/deadline expired during conflict resolution/);
     expect(expireNextRead).toBe(false);
+  });
+
+  it('retains the parent workspace when conflict child resources need startup recovery', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async () => {
+      throw new RebaseResourcesUnsettled('child resources remain');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/child resources remain/);
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(true);
   });
 
   it('never sends an owned conflict through the foreign resolver', async () => {

@@ -9,7 +9,8 @@ import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { processIdentity } from '../agents/process-group.ts';
-import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup, releasePreparation, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
+import { LockHeld, RecoveryBlocked, acquireRunnerLock, hostOpenFiles, hostOpenFilesBounded, hostProcesses, recoverStartup,
+  releasePreparation, releaseRebaseProcess, type RecoveryDeps, type RunnerLock } from '../runner/recovery.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 
@@ -243,7 +244,7 @@ describe('startup recovery sequence', () => {
       expect(store.getAttempt(id(1), attempt.id).state).toBe('running');
     }
   });
-  it('aborts each exact interrupted rebase before clearing its durable ownership marker', async () => {
+  it('requires explicit release before aborting an exact interrupted rebase', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
@@ -258,10 +259,102 @@ describe('startup recovery sequence', () => {
     const { d, calls } = deps({ abortRebase: async (planKey, value) => {
       calls.push('abort-rebase'); seen.push({ planKey, value, stillOwned: store.getTask(id(1)).rebaseInProgress });
     } });
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d }))
+      .rejects.toThrow(/--release-rebase-process/);
+    expect(seen).toEqual([]);
+    expect(calls).toEqual(['terminate:5151']);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+    releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token, attemptId: marker.attemptId,
+      openFiles: () => [] });
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), deps: d });
     expect(seen).toEqual([{ planKey: store.getTask(id(1)).planKey, value: cleared, stillOwned: cleared }]);
-    expect(calls).toEqual(['recover', 'terminate:5151', 'abort-rebase']);
+    expect(calls).toEqual(['terminate:5151', 'recover', 'abort-rebase']);
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('keeps an unsettled pipe-holder fail-closed until the operator explicitly releases the exact rebase', async () => {
+    const { d: root, store, admit } = fixture(2);
+    const interrupted = admit(id(2), { kind: 'review' });
+    const preparationIdentity = 'linux:00000000-0000-0000-0000-000000000000:42';
+    store.markPreparationStarting(id(2), interrupted.id, Date.now());
+    store.recordPreparationGroup(id(2), interrupted.id, 4242, Date.now(), preparationIdentity);
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const child = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
+    store.beginRebaseConflict(planKey, marker.attemptId, { attemptId: child, allocationId, networkAllocationId, source: snapshot.head });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', 'unsettled');
+    mkdirSync(join(root, 'r', token, 'rebases', marker.attemptId), { recursive: true });
+    const calls: string[] = [], isAlive = vi.fn(() => true), terminate = vi.fn(async () => undefined);
+    const openFiles = vi.fn(() => [] as string[]), abortRebase = vi.fn(async () => { calls.push('abort-rebase');
+      expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: null, conflict: { attemptId: child } }); });
+    const removeTaskFilesystems = vi.fn(async () => { calls.push('remove-child'); });
+    const options = { store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'), openFiles,
+      deps: deps({ abortRebase, removeTaskFilesystems, processes: { isAlive, terminate }, recoverLeftovers: async () => {
+        calls.push('recover'); return { storage: [{ attemptId: child, allocationId, handle: 'child' }], unowned: [] };
+      } }).d };
+    await expect(recoverStartup(options)).rejects.toThrow(/--release-rebase-process/);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled', conflict: { attemptId: child } });
+    expect(store.interruptedAttempts().find(attempt => attempt.id === interrupted.id))
+      .toMatchObject({ preparationPgid: 4242, preparationIdentity });
+    expect(calls).toEqual([]); expect(isAlive).not.toHaveBeenCalled(); expect(terminate).not.toHaveBeenCalled();
+    expect(openFiles).not.toHaveBeenCalled();
+    expect(() => releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token,
+      attemptId: marker.attemptId, openFiles: () => ['escaped-process'] })).toThrow(/still using/);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+    releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token, attemptId: marker.attemptId,
+      openFiles: () => [] });
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: null });
+    await recoverStartup(options);
+    expect(calls).toEqual(['recover', 'abort-rebase', 'remove-child']);
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('removes an interrupted conflict child before clearing its parent rebase', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const child = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
+    store.beginRebaseConflict(planKey, marker.attemptId, { attemptId: child, allocationId, networkAllocationId, source: snapshot.head });
+    const dockerIdentity = 'linux:00000000-0000-0000-0000-000000000000:3';
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', { pgid: 6161, startedAt: 789, identity: dockerIdentity });
+    const calls: string[] = [], abortRebase = vi.fn(async () => { calls.push('abort-rebase');
+      expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ conflict: { attemptId: child } }); });
+    const removeTaskFilesystems = vi.fn(async () => { calls.push('remove-child');
+      expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ conflict: { attemptId: child } }); });
+    const options = { store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, removeTaskFilesystems, recoverLeftovers: async () => {
+        calls.push('recover'); return { storage: [{ attemptId: child, allocationId, handle: 'child' }], unowned: [] };
+      }, processes: { isAlive: () => true, terminate: async pgid => { calls.push(`terminate:${pgid}`); } } }).d };
+    await expect(recoverStartup(options)).rejects.toThrow(/--release-rebase-process/);
+    expect(calls).toEqual(['terminate:6161']);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled', conflict: { attemptId: child } });
+    releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token, attemptId: marker.attemptId,
+      openFiles: () => [] });
+    const report = await recoverStartup(options);
+    expect(calls).toEqual(['terminate:6161', 'recover', 'abort-rebase', 'remove-child']);
+    expect(removeTaskFilesystems).toHaveBeenCalledWith('child');
+    expect(report.unmatchedStorage).toEqual([]);
+    expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('retains a conflict marker when recovered storage only partially matches its identity', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const child = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
+    store.beginRebaseConflict(planKey, marker.attemptId, { attemptId: child, allocationId, networkAllocationId, source: snapshot.head });
+    const abortRebase = vi.fn(async () => undefined), removeTaskFilesystems = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, removeTaskFilesystems, recoverLeftovers: async () => ({
+        storage: [{ attemptId: child, allocationId: randomUUID(), handle: 'wrong' }], unowned: [],
+      }) }).d })).rejects.toThrow(/does not match/);
+    expect(abortRebase).not.toHaveBeenCalled(); expect(removeTaskFilesystems).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ conflict: { attemptId: child, allocationId } });
   });
   it('passes only the exact durably owned result ref to rebase recovery', async () => {
     const { d: root, store } = fixture();
@@ -289,7 +382,7 @@ describe('startup recovery sequence', () => {
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
     expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultState: 'none',
-      resultHead: null, resultMappings: null, resolvedConflicts: [] });
+      resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null });
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
   });
   it('retains a recovery marker whose resolved-conflict provenance is outside its captured history', async () => {
@@ -337,7 +430,7 @@ describe('startup recovery sequence', () => {
       expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
     }
   });
-  it('retains a dead-group marker while another process still uses its rebase workspace', async () => {
+  it('retains a dead recovered group when explicit release finds a workspace user', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
@@ -350,11 +443,51 @@ describe('startup recovery sequence', () => {
     const abortRebase = vi.fn(async () => undefined);
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase, processes: { isAlive: () => false, terminate: async () => undefined } }).d,
-      openFiles: () => ['escaped-child'] })).rejects.toThrow(/still uses/);
+      openFiles: () => { throw new Error('startup must not use workspace scans to prove process settlement'); } })).rejects.toThrow(/--release-rebase-process/);
     expect(abortRebase).not.toHaveBeenCalled();
-    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: group });
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+    expect(() => releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token,
+      attemptId: marker.attemptId, openFiles: () => ['escaped-child'] })).toThrow(/still using/);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
   });
-  it('retains a terminated-group marker while an escaped descendant still uses its rebase workspace', async () => {
+  it('requires explicit release when a recovered exact group disappeared before settlement was recorded', async () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    const group = { pgid: 5151, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', group);
+    const abortRebase = vi.fn(async () => undefined), recoverLeftovers = vi.fn(async () => ({ storage: [], unowned: [] }));
+
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase, recoverLeftovers, processes: { isAlive: () => false, terminate: async () => undefined } }).d,
+      openFiles: () => [] })).rejects.toThrow(/--release-rebase-process/);
+
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ attemptId: marker.attemptId, processGroup: 'unsettled' });
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(recoverLeftovers).not.toHaveBeenCalled();
+  });
+  it('refuses explicit release through a replaced rebase-directory ancestor', () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', 'unsettled');
+    const runnerRoot = join(root, 'r'), owner = join(runnerRoot, token), redirected = join(root, 'redirected-rebases');
+    mkdirSync(owner, { recursive: true }); mkdirSync(join(redirected, marker.attemptId), { recursive: true });
+    symlinkSync(redirected, join(owner, 'rebases'));
+    const openFiles = vi.fn(() => [] as string[]);
+
+    expect(() => releaseRebaseProcess({ store, runnerRoot, runnerOwner: token,
+      attemptId: marker.attemptId, openFiles })).toThrow(/directory owned by you|plain directory/);
+    expect(openFiles).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+  });
+  it('retains a terminated recovered group when explicit release finds an escaped workspace user', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
@@ -367,10 +500,13 @@ describe('startup recovery sequence', () => {
     const terminate = vi.fn(async () => undefined), abortRebase = vi.fn(async () => undefined);
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase, processes: { isAlive: () => true, terminate } }).d,
-      openFiles: () => ['escaped-child'] })).rejects.toThrow(/still uses/);
+      openFiles: () => { throw new Error('startup must not use workspace scans to prove process settlement'); } })).rejects.toThrow(/--release-rebase-process/);
     expect(terminate).toHaveBeenCalledWith(group.pgid, group.identity, 5_000);
     expect(abortRebase).not.toHaveBeenCalled();
-    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: group });
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+    expect(() => releaseRebaseProcess({ store, runnerRoot: join(root, 'r'), runnerOwner: token,
+      attemptId: marker.attemptId, openFiles: () => ['escaped-child'] })).toThrow(/still using/);
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
   });
   it('fails closed and retains an interrupted rebase when no recovery implementation is present', async () => {
     const { d: root, store } = fixture();
@@ -382,18 +518,33 @@ describe('startup recovery sequence', () => {
       .rejects.toThrow(/needs F3 to abort/);
     expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
   });
-  it('fails closed without cleanup when a crash left the spawned process identity unknown', async () => {
+  it('moves a crash-before-spawn owner into the explicit-release path without cleanup', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
     const snapshot = store.getSnapshot(id(1));
     const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
       store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
     store.setRebaseProcessGroup(store.getTask(id(1)).planKey, marker.attemptId, null, 'spawning');
-    const abortRebase = vi.fn(async () => undefined);
+    const abortRebase = vi.fn(async () => undefined), recoverLeftovers = vi.fn(async () => ({ storage: [], unowned: [] }));
     await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
-      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+      deps: deps({ abortRebase, recoverLeftovers }).d })).rejects.toThrow(/--release-rebase-process/);
     expect(abortRebase).not.toHaveBeenCalled();
-    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'spawning' });
+    expect(recoverLeftovers).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+  });
+  it('rejects an unknown string process owner before recovery actions', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    const malformed = { ...marker, processGroup: 'unknown-owner' };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(malformed)}' WHERE plan_key='${planKey}'`);
+    const recoverLeftovers = vi.fn(async () => ({ storage: [], unowned: [] }));
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ recoverLeftovers }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(recoverLeftovers).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(malformed);
   });
   it('rejects process-group ID 1 without sending any recovery signal', async () => {
     const { d: root, store, raw } = fixture();
@@ -529,6 +680,19 @@ describe('startup recovery sequence', () => {
     expect(existsSync(dirPath)).toBe(false);
     await expect(run()).resolves.toMatchObject({ finalized: [] });
   });
+  it('refuses preparation release through a replaced attempts-directory ancestor', () => {
+    const { d: root, store, admit } = fixture();
+    const attempt = admit(id(1)); store.markPreparationStarting(id(1), attempt.id, Date.now());
+    const runnerRoot = join(root, 'r'), owner = join(runnerRoot, token), redirected = join(root, 'redirected-attempts');
+    mkdirSync(owner, { recursive: true }); mkdirSync(join(redirected, attempt.id), { recursive: true });
+    symlinkSync(redirected, join(owner, 'attempts'));
+    const openFiles = vi.fn(() => [] as string[]);
+
+    expect(() => releasePreparation({ store, runnerRoot, runnerOwner: token,
+      attemptId: attempt.id, openFiles })).toThrow(/directory owned by you|plain directory/);
+    expect(openFiles).not.toHaveBeenCalled();
+    expect(store.interruptedAttempts().find(value => value.id === attempt.id)?.preparationStartedAt).not.toBeNull();
+  });
 });
 
 describe('host process checks', () => {
@@ -537,14 +701,14 @@ describe('host process checks', () => {
     expect(hostProcesses.isAlive(4242)).toBe(true);
   });
 
-  it('uses a kernel identity and never runs a PATH-selected ps with runner secrets', async () => {
+  it('never runs a PATH-selected ps or signals a recovered numeric group', async () => {
     const root = dir(), marker = join(root, 'ps-ran'), ps = join(root, 'ps'), path = process.env.PATH;
     writeFileSync(ps, `#!/bin/sh\nprintf '%s' "$CODEBOOST_TEST_SECRET" > '${marker}'\n`, { mode: 0o755 });
     process.env.PATH = `${root}:${path ?? ''}`; process.env.CODEBOOST_TEST_SECRET = 'must-not-leak';
     try {
       vi.spyOn(process, 'kill').mockImplementation(() => { throw Object.assign(new Error('denied'), { code: 'EPERM' }); });
       expect(hostProcesses.isAlive(4242)).toBe(true);
-      await expect(hostProcesses.terminate(4242, null, 10)).rejects.toThrow(/prove the recorded process group/);
+      await expect(hostProcesses.terminate(4242, null, 10)).rejects.toThrow(/cannot signal its reusable numeric ID/);
       expect(existsSync(marker)).toBe(false);
     } finally {
       if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
@@ -552,16 +716,14 @@ describe('host process checks', () => {
     }
   });
 
-  it('revalidates the exact kernel identity before signalling a process group', async () => {
+  it('fails closed for a live recovered group even when its recorded identity is exact', async () => {
     const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
     children.push(child);
     await once(child, 'spawn');
     const pgid = child.pid!;
     try {
       expect(hostProcesses.isAlive(pgid)).toBe(true);
-      const identity = processIdentity(pgid), wrong = identity === null ? 'linux:00000000-0000-0000-0000-000000000000:1'
-        : `${identity}0`;
-      await expect(hostProcesses.terminate(pgid, wrong, 10)).rejects.toThrow(/identity|recorded process group/);
+      await expect(hostProcesses.terminate(pgid, processIdentity(pgid), 10)).rejects.toThrow(/cannot signal its reusable numeric ID/);
       expect(() => process.kill(pgid, 0)).not.toThrow();
     } finally {
       try { process.kill(-pgid, 'SIGKILL'); } catch {}
@@ -570,24 +732,6 @@ describe('host process checks', () => {
     }
   });
 
-  it.skipIf(process.platform !== 'linux')('bounds settlement after SIGKILL and retains ownership on failure', async () => {
-    const child = spawn('/bin/sh', ['-c', 'exec sleep 30'], { detached: true, stdio: 'ignore' });
-    children.push(child); await once(child, 'spawn');
-    const pgid = child.pid!, identity = processIdentity(pgid)!;
-    vi.useFakeTimers();
-    const signal = vi.spyOn(process, 'kill').mockImplementation(() => true);
-    const wallClock = vi.spyOn(Date, 'now').mockImplementation(() => 1_000_000 - performance.now());
-    try {
-      const pending = hostProcesses.terminate(pgid, identity, 100);
-      const rejected = expect(pending).rejects.toThrow(/did not exit after SIGKILL/);
-      await vi.advanceTimersByTimeAsync(500);
-      await rejected;
-    } finally {
-      wallClock.mockRestore(); signal.mockRestore(); vi.useRealTimers();
-      try { process.kill(-pgid, 'SIGKILL'); } catch {}
-      await once(child, 'exit'); children.splice(children.indexOf(child), 1);
-    }
-  });
   it('finds a process working in the attempt directory when the path goes through a symlink', async () => {
     const root = dir(), real = join(root, 'real'), attempt = join(real, 'attempt');
     mkdirSync(attempt, { recursive: true }); symlinkSync(real, join(root, 'link'));

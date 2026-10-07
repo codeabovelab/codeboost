@@ -437,6 +437,83 @@ function treeDifferences(manifest: TaskChangeManifest): string[] {
   return found;
 }
 
+function gitlinkMountDifferences(gitlinks: readonly string[]): string[] {
+  const found: string[] = [], q = JSON.stringify;
+  if (gitlinks.length > MAXIMUM_GITLINK_MOUNTS)
+    found.push(`the head has ${gitlinks.length} gitlinks, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be mounted`);
+  const parents = gitlinkParents(gitlinks).length;
+  if (parents > MAXIMUM_GITLINK_MOUNTS)
+    found.push(`the head's gitlinks are below ${parents} directories, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be pinned`);
+  const mountBytes = gitlinks.reduce((total, path) => total + Buffer.byteLength(path), 0)
+    + gitlinkParents(gitlinks).reduce((total, path) => total + 2 * Buffer.byteLength(path), 0);
+  if (mountBytes > MAXIMUM_GITLINK_MOUNT_BYTES)
+    found.push(`the gitlink mounts would name ${mountBytes} bytes of paths, more than the ${MAXIMUM_GITLINK_MOUNT_BYTES} a launch passes`);
+  for (const path of gitlinks) if (unmountable(path)) found.push(`gitlink ${q(path)} has a name Docker cannot mount`);
+  return found;
+}
+
+export interface ConflictTreeOptions extends StorageScriptOptions {
+  readonly base: string;
+  /** The exact non-gitlink conflict paths whose dirty pre-agent state is allowed. */
+  readonly paths: readonly string[];
+  readonly metadataBaseline?: string;
+}
+
+/**
+ * Pre-launch capability for a rebase-fix child. Unlike an ordinary item, the input is intentionally dirty, but every
+ * difference must be one of the exact conflict paths and no path may traverse a link or gitlink.
+ */
+export async function checkConflictTree(storage: TaskFilesystems, options: ConflictTreeOptions): Promise<TaskTreeCheck> {
+  if (typeof options.base !== 'string' || !COMMIT_ID.test(options.base)) throw new Error('base must be a full commit ID.');
+  if (!Array.isArray(options.paths) || options.paths.length === 0 || options.paths.length > MAXIMUM_DECLARED_LINKS)
+    throw new Error(`Conflict paths must contain between 1 and ${MAXIMUM_DECLARED_LINKS} entries.`);
+  const paths = [...new Set(options.paths)];
+  if (paths.length !== options.paths.length) throw new Error('Conflict paths must not repeat.');
+  for (const path of paths) assertDeclaredPath(path);
+  assertArguments(paths);
+  const baseline = resolveMetadataBaseline(storage, options.metadataBaseline);
+  let stdout: string;
+  try {
+    stdout = await runStorageScript(storage, { kind: 'inspect', operation: 'Conflict tree check',
+      consequence: 'the conflict tree cannot be checked', entrypoint: 'perl', maxOutputBytes: MAXIMUM_TREE_OUTPUT + OUTPUT_SLACK,
+      memory: INSPECTION_MEMORY, tmpBytes: INSPECTION_TMP,
+      args: ['-e', TREE_SCRIPT, 'prelaunch', baseline, options.base, ...paths] },
+    { ...options, timeoutMs: options.timeoutMs ?? 120_000 });
+  } catch (error) {
+    if (error instanceof DockerError && [6, 8, 9].includes(error.status ?? -1)) {
+      const reason = error.stderr.trim().split('\n').at(-1)!.slice(0, 512);
+      throw new TaskTreeRefused([`the conflict tree cannot be checked whole (${JSON.stringify(reason)})`]);
+    }
+    throw error;
+  }
+  const output = JSON.parse(stdout) as InspectOutput & { metadataOnly?: boolean; gitlinks?: unknown; declared?: unknown };
+  const manifest = manifestOf(options.base, { baseline, links: [], recorded: {}, linkArgs: [] }, output);
+  const allowed = new Set(paths), differences: string[] = [], q = JSON.stringify;
+  if (manifest.metadataChanged) differences.push('the Git metadata differs from what the seeder recorded');
+  if (manifest.agentCommits.length) differences.push('HEAD is not the recorded head');
+  for (const change of manifest.changes) {
+    if (!allowed.has(change.path) || (change.oldPath !== undefined && !allowed.has(change.oldPath)))
+      differences.push(`${q(change.path)} differs outside the conflict set`);
+    if (change.underGit || [change.oldType, change.newType].some(type => type === 'gitlink' || type === 'directory' || type === 'other'))
+      differences.push(`${q(change.path)} has a type the conflict resolver cannot edit`);
+  }
+  for (const path of manifest.nestedGitlinkContent) differences.push(`gitlink ${q(path)} has content or cannot be read`);
+  if (manifest.linkTargetChanges.length) differences.push('a conflict path reaches through a symbolic link');
+  const gitlinks = output.gitlinks, declared = output.declared as DeclaredFact[] | undefined;
+  if (!Array.isArray(gitlinks) || gitlinks.some(path => { try { assertDeclaredPath(path); return false; } catch { return true; } })
+    || !Array.isArray(declared) || declared.length !== paths.length || declared.some((fact, index) => fact?.path !== paths[index]))
+    throw new Error('The conflict tree check returned an unexpected result.');
+  for (const fact of declared) {
+    if (fact.blockedBy !== undefined) differences.push(`${q(fact.path)} lies beneath the ${fact.blockedByType} ${q(fact.blockedBy)}`);
+    if (!['absent', 'file', 'symlink'].includes(fact.type)) differences.push(`${q(fact.path)} is a ${fact.type}, not an editable conflict file`);
+  }
+  differences.push(...gitlinkMountDifferences(gitlinks as string[]));
+  if (differences.length) throw new TaskTreeRefused([...new Set(differences)]);
+  const check = Object.freeze({ base: options.base, gitlinks: Object.freeze([...gitlinks as string[]]) });
+  treeChecks.set(check, { filesystems: storage, used: false });
+  return check;
+}
+
 /**
  * Check task storage immediately before an execute or fix invocation (plan-format.md, "Clean invocation state" and
  * "Submodules in version 1"): read without following links, the work tree must be exactly the tree of `base` (no
@@ -507,16 +584,7 @@ export async function checkTaskTree(storage: TaskFilesystems, options: TreeCheck
       if (type !== 'absent') differences.push(`${operation.kind} destination ${q(path)} is occupied by a ${type}`);
     }
   }
-  if (gitlinks.length > MAXIMUM_GITLINK_MOUNTS)
-    differences.push(`the head has ${gitlinks.length} gitlinks, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be mounted`);
-  const parents = gitlinkParents(gitlinks as string[]).length;
-  if (parents > MAXIMUM_GITLINK_MOUNTS)
-    differences.push(`the head's gitlinks are below ${parents} directories, more than the ${MAXIMUM_GITLINK_MOUNTS} that can be pinned`);
-  const mountBytes = (gitlinks as string[]).reduce((total, path) => total + Buffer.byteLength(path), 0)
-    + gitlinkParents(gitlinks as string[]).reduce((total, path) => total + 2 * Buffer.byteLength(path), 0);
-  if (mountBytes > MAXIMUM_GITLINK_MOUNT_BYTES)
-    differences.push(`the gitlink mounts would name ${mountBytes} bytes of paths, more than the ${MAXIMUM_GITLINK_MOUNT_BYTES} a launch passes`);
-  for (const path of gitlinks as string[]) if (unmountable(path)) differences.push(`gitlink ${q(path)} has a name Docker cannot mount`);
+  differences.push(...gitlinkMountDifferences(gitlinks as string[]));
   if (differences.length) throw new TaskTreeRefused([...new Set(differences)]);
   const check = Object.freeze({ base: options.base, gitlinks: Object.freeze([...gitlinks as string[]]) });
   treeChecks.set(check, { filesystems: storage, used: false });

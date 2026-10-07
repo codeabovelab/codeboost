@@ -1,22 +1,23 @@
 import { execFileSync, spawnSync } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { chmodSync, existsSync, mkdtempSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdtempSync, mkdirSync, readdirSync, readFileSync, realpathSync, renameSync, rmSync, statSync,
+  symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
-import { afterAll, afterEach, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
 import { captureInvocation, type InvocationInput, type Phase } from '../agents/contract.ts';
 import { AGENT_IMAGE, assertBuiltAgentImage, buildAgentImage } from '../agents/container/image.ts';
 import { assertContainerProfile, createContainerProfile, disposeContainerProfile,
-  isContainerProfileAuthentic } from '../agents/container/profile.ts';
+  containerProfileResources, isContainerProfileAuthentic } from '../agents/container/profile.ts';
 import { createValidatedContainer, disposeValidatedContainer, prepareTaskFilesystems, removeTaskFilesystems, runContainer,
   startValidatedContainer, hasExactOptions, validateContainer } from '../agents/container/run.ts';
 import { createTaskClone } from '../git/clone.ts';
 import { hasOwnerLabels } from '../agents/labels.ts';
-import { exportTaskDiff, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
+import { exportTaskDiff, exportTaskPaths, importTaskPaths, isRecoveredTaskStorage, prepareTaskFilesystemsAsync, taskFilesystemOwner, EXPORT_SCRIPT,
   UnusableRepositoryError } from '../agents/container/storage.ts';
-import { checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
+import { checkConflictTree, checkTaskTree, commitTaskChanges, inspectTaskChanges, manifestDigest, MAXIMUM_CHANGES, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
   TASK_COMMIT_REF, TaskCommitRefused, TaskTreeRefused, type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
 import { TREE_SCRIPT } from '../agents/container/tree-script.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
@@ -24,6 +25,20 @@ import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupE
   type VendorNetwork } from '../agents/network/network.ts';
 import { createClaudeCommand, createIsolationProbeCommand, createPhasePolicy,
   assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
+const stagingFault = vi.hoisted(() => ({ chmodPathPrefix: '', realpathPathPrefix: '' }));
+vi.mock('node:fs', async importOriginal => {
+  const actual = await importOriginal<typeof import('node:fs')>();
+  return { ...actual, chmodSync: (path: Parameters<typeof actual.chmodSync>[0], mode: number) => {
+    if (typeof path === 'string' && stagingFault.chmodPathPrefix && path.startsWith(stagingFault.chmodPathPrefix)
+      && path.endsWith('/schema.json'))
+      throw Object.assign(new Error('staging filesystem is full'), { code: 'ENOSPC' });
+    return actual.chmodSync(path, mode);
+  }, realpathSync: ((path: Parameters<typeof actual.realpathSync>[0]) => {
+    if (typeof path === 'string' && stagingFault.realpathPathPrefix && path.startsWith(stagingFault.realpathPathPrefix))
+      throw Object.assign(new Error('staging canonicalization failed'), { code: 'EIO' });
+    return actual.realpathSync(path);
+  }) as typeof actual.realpathSync };
+});
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 const testOwner = (attemptId = 'fixture') => ({ runnerOwner: TEST_RUNNER_OWNER, attemptId, allocationId: randomUUID() });
 
@@ -82,7 +97,7 @@ const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop
 async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
   vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
-  treeCheck?: TaskTreeCheck;
+  treeCheck?: TaskTreeCheck; cleanupRoot?: string; invocationBudget?: () => number;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
@@ -94,6 +109,8 @@ async function profile(data: ReturnType<typeof fixture>, phase: Phase,
     ? options.treeCheck ?? await checkTaskTree(data.filesystems, { base: data.clone.head, operations: [], imageId }) : undefined;
   const base = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
     inputDirectory: data.input, command: trustedCommand, imageId, treeCheck,
+    cleanupRoot: options.cleanupRoot,
+    invocationBudget: options.invocationBudget,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
   profiles.push(base);
@@ -118,6 +135,37 @@ afterAll(async () => {
 }, 120_000);
 
 describe('real Docker agent isolation', () => {
+  it.each([
+    ['input setup', 'codeboost-input-', 'chmodPathPrefix', 'staging filesystem is full'],
+    ['auth canonicalization', 'codeboost-auth-', 'realpathPathPrefix', 'staging canonicalization failed'],
+  ] as const)('removes a newly created profile directory when %s fails', async (_case, prefix, fault, message) => {
+    const data = fixture(), requestedCleanupRoot = join(data.root, 'profile-construction-failure');
+    mkdirSync(requestedCleanupRoot, { mode: 0o700 });
+    const cleanupRoot = realpathSync(requestedCleanupRoot);
+    stagingFault[fault] = `${cleanupRoot}/${prefix}`;
+    try {
+      await expect(profile(data, 'planning', 'noop', { cleanupRoot })).rejects.toThrow(message);
+      expect(readdirSync(cleanupRoot)).toEqual([]);
+    } finally { stagingFault[fault] = ''; }
+  }, 60_000);
+
+  it('places temporary profile snapshots beneath an owner-only durable cleanup root', async () => {
+    const data = fixture(), requestedCleanupRoot = join(data.root, 'profile-staging');
+    mkdirSync(requestedCleanupRoot, { mode: 0o700 });
+    const cleanupRoot = realpathSync(requestedCleanupRoot);
+    const valid = await profile(data, 'planning', 'noop', { cleanupRoot });
+    const directories = containerProfileResources(valid).filter(resource => resource.kind === 'directory');
+    expect(directories).toHaveLength(2);
+    expect(directories.every(resource => resource.name.startsWith(`${cleanupRoot}/codeboost-`))).toBe(true);
+    expect(valid.args).toContainEqual(expect.stringMatching(
+      new RegExp(`^type=bind,source=${cleanupRoot.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}/codeboost-input-`)));
+
+    const requestedUnsafeRoot = join(data.root, 'unsafe-profile-staging');
+    mkdirSync(requestedUnsafeRoot, { mode: 0o755 });
+    const unsafeRoot = realpathSync(requestedUnsafeRoot);
+    await expect(profile(data, 'planning', 'noop', { cleanupRoot: unsafeRoot })).rejects.toThrow('owner-only directory');
+  }, 60_000);
+
   it.each(['planning', 'questions', 'review', 'execute', 'fix'] as const)(
     '%s applies its enforced worktree access profile', async phase => {
       const data = fixture();
@@ -1702,6 +1750,49 @@ describe('real Docker agent isolation', () => {
       return (error as TaskTreeRefused).differences;
     };
 
+    it('accepts only the exact dirty conflict set and exports exact no-follow leaf entries', async () => {
+      const data = fixture();
+      asAgent(data.filesystems, 'printf resolved > file.txt');
+      expect(await checkConflictTree(data.filesystems, { base: data.clone.head, paths: ['file.txt'], imageId }))
+        .toEqual({ base: data.clone.head, gitlinks: [] });
+      asAgent(data.filesystems, 'ln -s file.txt link; rm -f absent; mkdir -p nested; printf gone > nested/deleted; rm -rf nested');
+      const exported = await exportTaskPaths(data.filesystems, ['file.txt', 'link', 'absent', 'nested/deleted'], 1024, { imageId });
+      expect(exported.map(entry => ({ path: entry.path, type: entry.type, content: entry.content?.toString() }))).toEqual([
+        { path: 'file.txt', type: 'file', content: 'resolved' },
+        { path: 'link', type: 'symlink', content: 'file.txt' },
+        { path: 'absent', type: 'absent', content: undefined },
+        { path: 'nested/deleted', type: 'absent', content: undefined },
+      ]);
+      await expect(exportTaskPaths(data.filesystems, ['file.txt'], 2, { imageId })).rejects.toThrow(/Conflict path export/);
+      asAgent(data.filesystems, 'printf outside > outside.txt');
+      expect(await refusal(checkConflictTree(data.filesystems, { base: data.clone.head, paths: ['file.txt'], imageId })))
+        .toContain('"outside.txt" differs outside the conflict set');
+    }, 180_000);
+
+    it('imports a bounded conflict snapshot only after clean storage allocation', async () => {
+      const data = fixture();
+      await importTaskPaths(data.filesystems, [
+        { path: 'file.txt', type: 'file', executable: false, content: Buffer.from('conflicted\n') },
+        { path: 'link', type: 'symlink', content: Buffer.from('file.txt') },
+        { path: 'nested/added.txt', type: 'file', executable: true, content: Buffer.from('added\n') },
+        { path: 'missing/path.txt', type: 'absent' },
+      ], 1024, { imageId });
+      expect(await checkConflictTree(data.filesystems,
+        { base: data.clone.head, paths: ['file.txt', 'link', 'nested/added.txt', 'missing/path.txt'], imageId }))
+        .toEqual({ base: data.clone.head, gitlinks: [] });
+      const exported = await exportTaskPaths(data.filesystems,
+        ['file.txt', 'link', 'nested/added.txt', 'missing/path.txt'], 1024, { imageId });
+      expect(exported).toEqual([
+        { path: 'file.txt', type: 'file', executable: false, content: Buffer.from('conflicted\n') },
+        { path: 'link', type: 'symlink', content: Buffer.from('file.txt') },
+        { path: 'nested/added.txt', type: 'file', executable: true, content: Buffer.from('added\n') },
+        { path: 'missing/path.txt', type: 'absent' },
+      ]);
+      await expect(importTaskPaths(data.filesystems,
+        [{ path: '.git/config', type: 'file', executable: false, content: Buffer.from('unsafe') }], 1024, { imageId }))
+        .rejects.toThrow(/invalid/);
+    }, 180_000);
+
     it('mounts every gitlink empty and read-only, so an agent\'s write beneath one is refused', async () => {
       const data = withGitlinks(['sm', 'deps/inner', 'x/y/z']);
       const check = await checkTaskTree(data.filesystems, { base: data.clone.head, imageId,
@@ -2315,6 +2406,16 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), captured = Date.now(), late = await profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
     execFileSync('sleep', [String(Math.max(0, captured + 6_500 - Date.now()) / 1000)]);
     await expect(runContainer(late, 60_000)).rejects.toThrow('deadline has passed');
+  }, 60_000);
+
+  it('carries a monotonic invocation budget through real container launch after wall time moves forward', async () => {
+    const data = fixture(), end = performance.now() + 60_000;
+    const valid = await profile(data, 'planning', 'noop', {
+      deadlineMs: 5 * 60_000, invocationBudget: () => Math.ceil(end - performance.now()),
+    });
+    const wall = Date.now(), clock = vi.spyOn(Date, 'now').mockReturnValue(wall + 10 * 60_000);
+    try { expect(await runContainer(valid, 60_000)).toBe(''); }
+    finally { clock.mockRestore(); }
   }, 60_000);
 
   it('refuses to build a profile once the invocation deadline has passed', async () => {

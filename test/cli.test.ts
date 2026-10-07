@@ -86,13 +86,15 @@ it('refuses a runner without github.baseBranch before the lock and before the to
     expect([missing.status, missing.stderr.trim()]).toEqual([1, RUNNER_NEEDS_GITHUB]);
   } finally { held.release(); }
 });
-it('refuses a bad port and an unknown preparation with a message, never a stack', () => {
+it('refuses a bad port and unknown manual-release targets with a message, never a stack', () => {
   const { run } = review();
   const port = run('--port', 'x');
   expect([port.status, port.stderr.trim()]).toEqual([1, 'Invalid port.']);
   for (let n = 0; n < 2; n++) {
     const release = run('--release-preparation', randomUUID());
     expect([release.status, release.stderr.trim()]).toEqual([1, 'Unknown attempt.']);
+    const rebase = run('--release-rebase-process', randomUUID());
+    expect([rebase.status, rebase.stderr.trim()]).toEqual([1, 'Unknown rebase attempt.']);
   }
 });
 
@@ -127,6 +129,10 @@ it('stops at once with exit 130 on a second Ctrl+C during startup', async () => 
 it('reports that --release-preparation needs --config, instead of printing help and exiting 0', () => {
   const result = spawnSync(process.execPath, [cli, '--release-preparation', randomUUID()], { encoding: 'utf8', timeout: 20_000 });
   expect([result.status, result.stderr.trim()]).toEqual([1, '--release-preparation needs --config.']);
+});
+it('reports that --release-rebase-process needs --config, instead of printing help and exiting 0', () => {
+  const result = spawnSync(process.execPath, [cli, '--release-rebase-process', randomUUID()], { encoding: 'utf8', timeout: 20_000 });
+  expect([result.status, result.stderr.trim()]).toEqual([1, '--release-rebase-process needs --config.']);
 });
 it('ignores a runner block in a demo configuration opened with --config, and serves the demo', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-cli-')); roots.push(root);

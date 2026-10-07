@@ -7,7 +7,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { parseClaudeOutput, readPlanningSchema, startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { startCodexInvocation } from '../agents/adapters/codex.ts';
 import { isInvocationActive, OUTPUT_LIMITS, retainSetupCleanup } from '../agents/adapters/supervisor.ts';
-import { createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
+import { capAdapterInvocationBudget, createAdapterInvocationBudget, createInvocationBudget } from '../agents/adapters/types.ts';
 import { captureInvocation } from '../agents/contract.ts';
 const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 
@@ -180,5 +180,13 @@ describe('production agent adapters', () => {
     expect(remaining()).toBeGreaterThan(0);
     expect(remaining()).toBeLessThanOrEqual(250);
     expect(() => createAdapterInvocationBudget(invocation, 10 * 60_000 + 1)).toThrow('ten-minute ceiling');
+  });
+
+  it('caps a carried monotonic budget without extending either deadline', () => {
+    const carriedEnd = performance.now() + 60_000;
+    const remaining = capAdapterInvocationBudget(() => Math.ceil(carriedEnd - performance.now()), 250);
+    expect(remaining()).toBeGreaterThan(0);
+    expect(remaining()).toBeLessThanOrEqual(250);
+    expect(() => capAdapterInvocationBudget(() => 60_000, 10 * 60_000 + 1)).toThrow('ten-minute ceiling');
   });
 });

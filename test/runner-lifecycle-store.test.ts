@@ -545,7 +545,7 @@ describe('pre-merge rebase ownership', () => {
       { oldBase: oid(1), oldHead: oid(2), onto: oid(3), oldHistory: [oid(2)], startedAt: 123 });
     expect(store.getTask(identity).rebaseInProgress).toEqual({ attemptId: marker.attemptId, oldBase: oid(1), oldHead: oid(2), onto: oid(3),
       oldHistory: [oid(2)], startedAt: 123,
-      resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], processGroup: null });
+      resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null, processGroup: null });
     const group = { pgid: 4242, startedAt: 456, identity: 'linux:00000000-0000-0000-0000-000000000000:1' };
     expect(() => store.setRebaseProcessGroup(store.getTask(identity).planKey, marker.attemptId, null,
       { pgid: 1, startedAt: 456, identity: null })).toThrow(/Invalid rebase process group/);
@@ -567,6 +567,34 @@ describe('pre-merge rebase ownership', () => {
     expect(() => store.beginMergeAttempt(identity, expected, oid(2), null, 'direct')).toThrow(/rebase is in progress/);
     expect(() => store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued')).toThrow(/rebase is in progress/);
     expect(() => store.setAssignment(identity, store.getTask(identity).stateVersion, 'other', 'other-head')).toThrow(/rebase is in progress/);
+  });
+
+  it('keeps a unique conflict child durable until its resources settle', () => {
+    const { store } = fixture();
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'approved but merge blocked');
+    const marker = store.beginRebase(identity, reviewed(store), store.getTask(identity).stateVersion,
+      { oldBase: oid(1), oldHead: oid(2), onto: oid(3), oldHistory: [oid(2)] });
+    const planKey = store.getTask(identity).planKey, child = randomUUID(), allocation = randomUUID(), networkAllocation = randomUUID();
+    expect(() => store.beginRebaseConflict(planKey, marker.attemptId,
+      { attemptId: marker.attemptId, allocationId: allocation, networkAllocationId: networkAllocation, source: oid(2) })).toThrow(/own attempt identity/);
+    expect(() => store.beginRebaseConflict(planKey, marker.attemptId,
+      { attemptId: child, allocationId: allocation, networkAllocationId: allocation, source: oid(2) })).toThrow(/distinct allocation/);
+    store.beginRebaseConflict(planKey, marker.attemptId,
+      { attemptId: child, allocationId: allocation, networkAllocationId: networkAllocation, source: oid(2) });
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: {
+      attemptId: child, allocationId: allocation, networkAllocationId: networkAllocation, source: oid(2) } });
+    expect(() => store.beginRebaseConflict(planKey, marker.attemptId,
+      { attemptId: randomUUID(), allocationId: randomUUID(), networkAllocationId: randomUUID(), source: oid(2) })).toThrow(/already active/);
+    expect(() => store.prepareRebaseResult(planKey, marker.attemptId, oid(4), [oid(4)], [oid(2)])).toThrow(/child has not settled/);
+    expect(store.abortRebase(planKey, marker.attemptId)).toBe(false);
+    expect(() => store.clearRebaseConflict(planKey, marker.attemptId, randomUUID())).toThrow(/no longer owns/);
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    expect(() => store.clearRebaseConflict(planKey, marker.attemptId, child)).toThrow(/process has not settled/);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: { attemptId: child }, processGroup: 'spawning' });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', null);
+    store.clearRebaseConflict(planKey, marker.attemptId, child);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null });
+    expect(store.abortRebase(planKey, marker.attemptId)).toBe(true);
   });
 
   it('publishes only a current attempt and preserves owned and foreign ledger provenance', () => {

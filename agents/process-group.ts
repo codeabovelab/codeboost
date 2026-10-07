@@ -8,7 +8,7 @@ export interface ProcessGroup {
   readonly pgid: number;
   /** `Date.now()` right after the spawn, retained for lifecycle timing and diagnostics. */
   readonly startedAt: number;
-  /** Linux boot ID plus kernel start ticks. Null means crash recovery must not signal this group automatically. */
+  /** Linux boot ID plus kernel start ticks, retained for diagnostics and identity-bound process-control adapters. */
   readonly identity: string | null;
 }
 
@@ -43,6 +43,12 @@ export interface ProcessGroupOptions {
    * reading it all is not an error: what it did is in its status and output.
    */
   readonly input?: Buffer;
+  /**
+   * Return a retained-owner error when descendants or inherited pipe holders outlive the bounded drain. This is safe
+   * only when the caller durably owns the reported group/resource and recovery will keep that ownership until release.
+   * Callers without durable ownership wait fail-closed instead of returning while unknown work is still live.
+   */
+  readonly allowUnsettledReturn?: boolean;
 }
 
 const DEFAULT_GRACE_MS = 5_000;
@@ -54,6 +60,8 @@ const DRAIN_LIMIT_MS = 10_000;
 // Once the group is gone, how long to wait for stdout and stderr to reach end of file. Only a process outside the group
 // (one that called setsid but kept the inherited pipe) can hold them open after that, and it must not hold this call.
 const STDIO_CLOSE_MS = 1_000;
+/** Worst-case default SIGTERM grace plus post-exit group and pipe settlement. */
+export const DEFAULT_PROCESS_SETTLEMENT_MS = DEFAULT_GRACE_MS + DRAIN_LIMIT_MS + STDIO_CLOSE_MS;
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const notStarted = (message: string): DockerOutcome =>
   ({ status: null, stdout: '', stderr: '', error: Object.assign(new Error(message), { code: NOT_STARTED }) });
@@ -65,25 +73,29 @@ const signalGroup = (pgid: number, signal: NodeJS.Signals | 0) => {
   try { process.kill(-pgid, signal); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
 };
-
-// The leader can exit while other members of its group still run (for example a child it forked). A group ID stays
-// taken while any member exists, so until the group is empty the ID cannot name someone else's group.
-const drainGroup = async (pgid: number) => {
+// Once the leader exits, there is no portable identity-bound way in Node to signal its numeric process-group ID. Even
+// a liveness/identity check followed by kill has a reuse race between the two syscalls. Poll only: a group that remains
+// alive is returned to durable recovery instead of risking a signal to an unrelated process.
+const drainGroup = async (group: ProcessGroup, bounded: boolean) => {
+  const { pgid } = group;
   const giveUpAt = performance.now() + DRAIN_LIMIT_MS;
   while (signalGroup(pgid, 0)) {
-    signalGroup(pgid, 'SIGKILL');
-    if (performance.now() >= giveUpAt) return false;
+    if (bounded && performance.now() >= giveUpAt) return false;
     await pause(20);
   }
   return true;
 };
 
+/** After its leader exits, observe whether every member of a recorded process group has gone without signalling it. */
+export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drainGroup(group, true);
+
 /**
  * Run one command as the leader of a new process group. The group is reported through `onProcessGroup` before this
  * returns control to the event loop. On abort or at the deadline the whole group gets SIGTERM, then SIGKILL after the
  * grace period, so a child that ignores SIGTERM is still bounded. The promise settles only after the leader has
- * exited and every other member of its group is gone. Never rejects: failures are in the outcome, shaped like
- * `runDocker`'s, so `status` is a number only when the command ran to completion.
+ * exited and every other member of its group is gone, unless a caller with durable recovery ownership explicitly
+ * allows an unsettled return. Never rejects: failures are in the outcome, shaped like `runDocker`'s, so `status` is a
+ * number only when the command ran to completion.
  */
 export function runInProcessGroup(file: string, args: readonly string[],
   options: ProcessGroupOptions): Promise<DockerOutcome> {
@@ -123,14 +135,15 @@ export function runInProcessGroup(file: string, args: readonly string[],
       if (stopped || exited) return;
       stopped = reason;
       signalGroup(pgid, 'SIGTERM');
-      graceTimer = setTimeout(() => signalGroup(pgid, 'SIGKILL'), graceMs);
+      graceTimer = setTimeout(() => { if (!exited) signalGroup(pgid, 'SIGKILL'); }, graceMs);
     };
     // Armed at the spawn, before the caller records the group: time spent recording counts against the deadline.
     const deadline = setTimeout(() => stop('timeout'), options.timeoutMs);
     // If the caller cannot record the group, the child must not outlive this call: it is killed at once below, and
     // the call still settles only after the group has exited, with the caller's error.
+    const group = Object.freeze({ pgid, startedAt: Date.now(), identity: processIdentity(pgid) });
     let unrecorded: unknown;
-    try { options.onProcessGroup?.(Object.freeze({ pgid, startedAt: Date.now(), identity: processIdentity(pgid) })); }
+    try { options.onProcessGroup?.(group); }
     catch (error) { unrecorded = error; }
     // Normally output past the limit stops the group and settles as ENOBUFS. A caller that classifies from durable state
     // may explicitly keep a bounded prefix and let the process finish instead.
@@ -157,13 +170,14 @@ export function runInProcessGroup(file: string, args: readonly string[],
       if (finished) return;
       finished = true;
       exited = true;
+      clearTimeout(graceTimer);
       clearTimeout(deadline);
       options.signal?.removeEventListener('abort', onAbort);
-      void drainGroup(pgid).then(async drained => {
-        // The group is empty (or given up on): a later SIGKILL could reach a new group that reuses the ID.
-        clearTimeout(graceTimer);
+      void drainGroup(group, options.allowUnsettledReturn === true).then(async drained => {
         let stdioTimer: ReturnType<typeof setTimeout> | undefined;
-        await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
+        if (options.allowUnsettledReturn) {
+          await Promise.race([closed, new Promise<void>(done => { stdioTimer = setTimeout(done, STDIO_CLOSE_MS); })]);
+        } else await closed;
         // Cleared so a finished call never keeps the process alive.
         clearTimeout(stdioTimer);
         // Timers run before I/O in each event-loop turn: after a long block the timer can win while the rest of the
@@ -175,7 +189,8 @@ export function runInProcessGroup(file: string, args: readonly string[],
         const stdout = Buffer.concat(out).toString('utf8'), stderr = Buffer.concat(err).toString('utf8');
         if (!drained) {
           resolve({ status: null, stdout, stderr, error: Object.assign(
-            new Error(`${file} left processes in its group that did not exit after SIGKILL.`), { code: 'EGROUPALIVE' }) });
+            new Error(`${file} left processes in its group after its leader exited; ownership was retained without signalling a reusable group ID.`),
+            { code: 'EGROUPALIVE' }) });
           return;
         }
         if (!pipesClosed) {

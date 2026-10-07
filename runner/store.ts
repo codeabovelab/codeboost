@@ -95,6 +95,8 @@ export interface RebaseMarker {
   resultMappings: { oldSha: string; newSha: string }[] | null;
   /** Source commits whose foreign conflicts were resolved by the sandboxed F4 agent. */
   resolvedConflicts: string[];
+  /** The one sandboxed child whose Docker/storage resources the parent rebase currently owns. */
+  conflict: { attemptId: string; allocationId: string; networkAllocationId: string; source: string } | null;
   processGroup: { pgid: number; startedAt: number; identity: string | null } | 'spawning' | 'unsettled' | null;
 }
 export interface AttemptRecord {
@@ -759,7 +761,7 @@ export class Store {
     assertUuidV4(attemptId, 'Rebase attempt ID');
     if (!Number.isSafeInteger(startedAt) || startedAt < 0) throw new Error('Invalid rebase start time.');
     const marker: RebaseMarker = { attemptId, oldBase: input.oldBase, oldHead: input.oldHead, onto: input.onto, oldHistory, startedAt,
-      resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], processGroup: null };
+      resultState: 'none', resultHead: null, resultMappings: null, resolvedConflicts: [], conflict: null, processGroup: null };
     const key = identityKey(identity);
     return this.#transaction(() => {
       this.#expect(key, expected);
@@ -777,6 +779,57 @@ export class Store {
       this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=?', encode(marker), key);
       this.#touch(key);
       return marker;
+    });
+  }
+  /** Claim the exact child identity before its first clone, storage, network or container write. */
+  beginRebaseConflict(planKey: string, attemptId: string,
+    input: { attemptId: string; allocationId: string; networkAllocationId: string; source: string }): void {
+    assertUuidV4(attemptId, 'Rebase attempt ID');
+    assertUuidV4(input.attemptId, 'Conflict attempt ID');
+    assertUuidV4(input.allocationId, 'Conflict allocation ID');
+    assertUuidV4(input.networkAllocationId, 'Conflict network allocation ID');
+    sha(input.source);
+    if (input.attemptId === attemptId) throw new Error('A conflict child needs its own attempt identity.');
+    if (input.allocationId === input.networkAllocationId)
+      throw new Error('Conflict storage and network need distinct allocation identities.');
+    this.#transaction(() => {
+      if (this.#get('SELECT 1 FROM attempts WHERE id=?', input.attemptId))
+        throw new GuardRefusal('An existing runner attempt owns this conflict child identity.');
+      if (this.#get('SELECT 1 FROM attempts WHERE allocation_id IN (?,?)', input.allocationId, input.networkAllocationId))
+        throw new GuardRefusal('An existing runner attempt owns this conflict child allocation.');
+      // A child identity or allocation is never allowed to name resources of another active rebase.
+      for (const row of this.#db.prepare('SELECT plan_key, rebase_in_progress FROM tasks WHERE rebase_in_progress IS NOT NULL').all()) {
+        const active = decode<Partial<RebaseMarker>>(row.rebase_in_progress);
+        if (row.plan_key !== planKey && active.conflict &&
+            (active.conflict.attemptId === input.attemptId ||
+             [active.conflict.allocationId, active.conflict.networkAllocationId].includes(input.allocationId) ||
+             [active.conflict.allocationId, active.conflict.networkAllocationId].includes(input.networkAllocationId)))
+          throw new GuardRefusal('Another rebase already owns this conflict child identity.');
+      }
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
+      if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.conflict) throw new GuardRefusal('A conflict child is already active for this rebase.');
+      if (marker.resultState !== 'none' || marker.oldHistory === null || !marker.oldHistory.includes(input.source)
+          || marker.resolvedConflicts.includes(input.source))
+        throw new GuardRefusal('This conflict does not belong to the active rebase.');
+      if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
+        encode({ ...marker, conflict: { ...input } }), planKey, task.rebase_in_progress as string).changes !== 1)
+        throw new GuardRefusal('This rebase attempt no longer owns the task.');
+    });
+  }
+  /** Release a child only after its invocation, storage and staging files have all settled. */
+  clearRebaseConflict(planKey: string, attemptId: string, conflictAttemptId: string): void {
+    assertUuidV4(attemptId, 'Rebase attempt ID'); assertUuidV4(conflictAttemptId, 'Conflict attempt ID');
+    this.#transaction(() => {
+      const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
+      if (marker?.attemptId !== attemptId || marker.conflict?.attemptId !== conflictAttemptId)
+        throw new GuardRefusal('This conflict child no longer owns the rebase.');
+      if (marker.processGroup !== null)
+        throw new GuardRefusal('The conflict child process has not settled.');
+      if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
+        encode({ ...marker, conflict: null }), planKey, task.rebase_in_progress as string).changes !== 1)
+        throw new GuardRefusal('This conflict child no longer owns the rebase.');
     });
   }
   /** Record or clear the exact Git process group currently owned by a rebase. This does not advance task context. */
@@ -809,6 +862,7 @@ export class Store {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
       if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
       if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.conflict) throw new GuardRefusal('The conflict child has not settled.');
       if (marker.oldHistory === null || rewrittenHistory.length !== marker.oldHistory.length)
         throw new GuardRefusal('The rebase result does not cover the complete captured history.');
       if (resolvedConflicts.some(value => !marker.oldHistory!.includes(value)))
@@ -849,6 +903,7 @@ export class Store {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
       if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
       if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.conflict) throw new GuardRefusal('The conflict child has not settled.');
       if (marker.resultState === state) return;
       if (marker.resultState !== 'prepared' || marker.resultMappings === null)
         throw new GuardRefusal('The rebase result was not prepared before its ref write.');
@@ -875,6 +930,7 @@ export class Store {
       if (task.state_version !== expectedTaskStateVersion + 1) throw new GuardRefusal('The task changed during the rebase. Discard its result.');
       if (marker?.attemptId !== attemptId) throw new GuardRefusal('This rebase attempt no longer owns the task.');
       if (marker.processGroup !== null) throw new GuardRefusal('The rebase Git process has not settled.');
+      if (marker.conflict) throw new GuardRefusal('The conflict child has not settled.');
       if (marker.resultState !== 'ready' || marker.resultMappings === null ||
           (marker.onto === marker.oldBase ? marker.resultHead !== null : marker.resultHead !== head))
         throw new GuardRefusal('The rebase result does not own its retained ref.');
@@ -899,6 +955,7 @@ export class Store {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
       if (marker?.attemptId !== attemptId) return false;
       if (marker.processGroup !== null) return false;
+      if (marker.conflict) return false;
       const encoded = task.rebase_in_progress as string;
       if (this.#run('UPDATE tasks SET rebase_in_progress=NULL WHERE plan_key=? AND rebase_in_progress=?', planKey, encoded).changes !== 1) return false;
       if (task.cancel_requested !== null && !this.#closed(task.status as TaskStatus)) this.#closeTask(planKey, 'cancelled', task.cancel_requested as string);

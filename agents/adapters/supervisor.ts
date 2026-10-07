@@ -6,6 +6,8 @@ import { agentContainerId, agentContainerResources, createValidatedContainer, di
   isContainerProfileRetired, retireContainerProfile, validateContainer } from '../container/run.ts';
 import { assertContainerProfileAuthenticity, containerProfileResources, disposeContainerProfile,
   isContainerProfileAuthentic, type ContainerProfile } from '../container/profile.ts';
+import { drainProcessGroup, processIdentity, type ProcessGroup } from '../process-group.ts';
+import type { ProcessGroupLifecycle, ProcessGroupOwner } from '../tracked-docker.ts';
 
 export const OUTPUT_LIMITS = Object.freeze({
   stdoutBytes: 16 * 1024 * 1024,
@@ -16,6 +18,7 @@ const DEFAULT_TIMEOUT_MS = 10 * 60_000;
 const CAPTURE_ABORT_GRACE_MS = 1_000;
 const ACKNOWLEDGEMENT_RETRY_MS = 250;
 const DIAGNOSTIC_BYTES = 1024;
+const ATTACH_PIPE_CLOSE_MS = 1_000;
 const active = new Map<string, InvocationHandle>();
 const activeProfiles = new WeakSet<ContainerProfile>();
 const cleanupRecoveries = new Set<InvocationHandle>();
@@ -42,9 +45,66 @@ export interface SupervisorOptions {
   readonly invocationBudget?: () => number;
   readonly decode?: (profile: ContainerProfile, rawStdout: Buffer, maximumBytes: number,
     timeoutMs: number, signal: AbortSignal) => DecodedOutput | Promise<DecodedOutput>;
+  /** Durable ownership for Docker clients that can create or start resources. */
+  readonly processLifecycle?: ProcessGroupLifecycle;
 }
 export class OutputLimitError extends Error {}
 export class CaptureDeadlineError extends Error {}
+
+/** Once the attach leader exits its numeric process-group ID may be reused, even while old pipes remain open. */
+export function createAttachExitGuard() {
+  let exited = false;
+  return Object.freeze({ markExited: () => { exited = true; }, canSignal: () => !exited });
+}
+
+/** Signal an attached client only while this process still owns its live leader. */
+export function signalAttachedChild(guard: ReturnType<typeof createAttachExitGuard>, child: ChildProcess,
+  signal: NodeJS.Signals): void {
+  if (!guard.canSignal() || child.pid === undefined) return;
+  try { process.kill(-child.pid, signal); } catch { child.kill(signal); }
+}
+
+/** Start the streaming attach client without losing a synchronous cancellation raised by lifecycle hooks. */
+export function startOwnedAttachClient(options: {
+  readonly lifecycle: ProcessGroupLifecycle;
+  readonly stopped: () => boolean;
+  readonly spawn: () => ChildProcess;
+  readonly attach: (child: ChildProcess, owner: ProcessGroupOwner, group?: ProcessGroup) => void;
+  readonly terminate: () => void;
+  readonly recordFailure: (error: unknown) => void;
+}): void {
+  let owner: ProcessGroupOwner = 'spawning';
+  options.lifecycle.starting();
+  if (options.stopped()) {
+    options.lifecycle.settled('spawning');
+    throw new Error('Invocation stopped before the Docker attach client started.');
+  }
+  let child: ChildProcess;
+  try { child = options.spawn(); }
+  catch (error) { options.lifecycle.settled('spawning'); throw error; }
+  let spawnedGroup: ProcessGroup | undefined;
+  if (child.pid !== undefined) {
+    const group = Object.freeze({ pgid: child.pid, startedAt: Date.now(), identity: processIdentity(child.pid) });
+    spawnedGroup = group;
+    try { options.lifecycle.started(group); owner = group; }
+    catch (error) {
+      options.recordFailure(error);
+      try { process.kill(-child.pid, 'SIGKILL'); } catch { child.kill('SIGKILL'); }
+    }
+  }
+  options.attach(child, owner, spawnedGroup);
+  if (options.stopped()) options.terminate();
+}
+
+/** Observe both normal exit and an error that Node does not promise will be followed by exit. */
+export function watchAttachedChild(child: ChildProcess,
+  finish: (code: number | null, signal: NodeJS.Signals | null) => void,
+  failed: (error: Error) => void): void {
+  child.once('exit', (code, signal) => { finish(code, signal); });
+  // Finish first: it disables later PGID signalling and hands the recorded group to the drain path. The failure
+  // callback can synchronously cancel the invocation, and must not signal a numeric ID that drain may just release.
+  child.once('error', error => { finish(null, null); failed(error); });
+}
 
 const dockerEnvironment = () => ({ PATH: process.env.PATH, DOCKER_HOST: process.env.DOCKER_HOST });
 const positiveInteger = (value: number, name: string) => {
@@ -194,11 +254,13 @@ const profileResources = (profile: ContainerProfile) =>
  * before this profile created any container.
  */
 const rejectProfile = (profile: ContainerProfile, error: unknown, register = true,
-  cleanup: (profile: ContainerProfile, budgetMs: number) => Promise<void> = disposeValidatedContainer,
-  reason?: StopReason): InvocationHandle => {
+  cleanup: (profile: ContainerProfile, budgetMs: number, processLifecycle?: ProcessGroupLifecycle) => Promise<void>
+    = disposeValidatedContainer,
+  reason?: StopReason, processLifecycle?: ProcessGroupLifecycle): InvocationHandle => {
   const invocation = assertPhasePolicy(profile.policy);
   activeProfiles.add(profile);
-  return retainCleanup(invocation, budget => isContainerProfileAuthentic(profile) ? cleanup(profile, budget) : undefined,
+  return retainCleanup(invocation, budget => isContainerProfileAuthentic(profile)
+    ? cleanup(profile, budget, processLifecycle) : undefined,
     `Invocation was rejected: ${String(error)}`, () => profileResources(profile), register, unreleased => {
       activeProfiles.delete(profile);
       if (unreleased) retireContainerProfile(profile);
@@ -401,7 +463,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     // This profile never created a container; the name belongs to the active invocation, so only
     // release this profile's own staging and network.
     return rejectProfile(profile, new Error('An invocation with this attempt ID is still active.'), false,
-      disposeContainerProfile);
+      disposeContainerProfile, undefined, options.processLifecycle);
   }
   // Rejections before container creation own no container, so they release (and retry) only the profile's own
   // staging and network; a name held by another invocation or a failing inspect cannot block that.
@@ -416,14 +478,16 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     positiveInteger(carriedBudget, 'invocationBudget');
     if (carriedBudget > DEFAULT_TIMEOUT_MS)
       throw new Error('invocationBudget cannot exceed the production ten-minute ceiling.');
+    if (options.processLifecycle && profile.deferredOutput)
+      throw new Error('Durably tracked invocations cannot use concurrent deferred-output controls.');
   } catch (error) {
     return rejectProfile(profile, error, true, disposeContainerProfile,
-      isDeadlineError(error) ? 'timeout' : undefined);
+      isDeadlineError(error) ? 'timeout' : undefined, options.processLifecycle);
   }
-  const wallRemaining = invocation.deadline - Date.now();
+  const wallRemaining = options.invocationBudget ? carriedBudget : invocation.deadline - Date.now();
   if (!Number.isSafeInteger(wallRemaining) || wallRemaining < 1) {
     return rejectProfile(profile, new Error('Invocation deadline has already expired.'), true, disposeContainerProfile,
-      'timeout');
+      'timeout', options.processLifecycle);
   }
   const duration = Math.min(wallRemaining, configuredTimeout, carriedBudget), deadline = performance.now() + duration;
   const remaining = () => {
@@ -438,6 +502,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
   let closed = false, terminating = false, settlementComplete = false;
   let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
   let decodeAbort: AbortController | undefined;
+  const attachExit = createAttachExitGuard();
   let protocolToken: string | undefined, protocolStarted = false, protocolReady = false;
   let readyStatus: number | undefined, acknowledgementFailures = 0;
   let protocolBuffer = Buffer.alloc(0);
@@ -489,10 +554,17 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     });
   };
   const terminate = () => {
-    if (terminating || closed || !child) return;
+    if (terminating || closed || !child || !attachExit.canSignal()) return;
     terminating = true;
     const current = child;
     current.stdout?.resume(); current.stderr?.resume();
+    if (options.processLifecycle) {
+      if (current.pid !== undefined) {
+        signalAttachedChild(attachExit, current, 'SIGTERM');
+        later(() => { if (!closed) signalAttachedChild(attachExit, current, 'SIGKILL'); }, 1_000);
+      }
+      return;
+    }
     void runControl(['stop', '--signal=TERM', '--time=1', container]);
     later(() => { if (!closed) void runControl(['kill', '--signal=KILL', container]); }, 1_500);
     later(() => {
@@ -683,7 +755,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         break;
       }
       try {
-        await disposeValidatedContainer(profile, budget);
+        await disposeValidatedContainer(profile, budget, options.processLifecycle);
         wakeCleanup = undefined;
         break;
       } catch (error) {
@@ -729,15 +801,40 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     resolveSettled(result);
   };
 
-  const attach = (started: ChildProcess) => {
+  const attach = (started: ChildProcess, processOwner?: ProcessGroupOwner, spawnedGroup?: ProcessGroup) => {
     child = started;
+    let finished = false, pipeClosed = false, resolvePipeClosed!: () => void;
+    const pipesClosed = new Promise<void>(resolve => { resolvePipeClosed = resolve; });
     started.stdout?.on('data', value => capture('stdout', value));
     started.stderr?.on('data', captureStderr);
     started.stdout?.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
     started.stderr?.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
-    started.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
-    started.once('close', async (code, signal) => {
+    const finish = async (code: number | null, signal: NodeJS.Signals | null) => {
+      if (finished) return;
+      finished = true;
+      // Disable every later deadline/cancellation signal before awaiting group drain or pipe closure. Once exit fires,
+      // the numeric PGID can be reused; drain owns the old group until it reports empty and must be the last signaller.
+      attachExit.markExited();
+      let unsettled: 'group-alive' | 'stdio-held' | undefined;
+    if (spawnedGroup && options.processLifecycle
+        && !await drainProcessGroup(spawnedGroup)) unsettled = 'group-alive';
+      let pipeTimer: ReturnType<typeof setTimeout> | undefined;
+      if (!pipeClosed) await Promise.race([pipesClosed, new Promise<void>(resolve => {
+        pipeTimer = setTimeout(resolve, ATTACH_PIPE_CLOSE_MS);
+      })]);
+      clearTimeout(pipeTimer);
+      if (!pipeClosed) {
+        unsettled ??= 'stdio-held';
+        started.stdout?.destroy(); started.stderr?.destroy();
+      }
       closed = true;
+      if (processOwner && options.processLifecycle) try {
+        if (unsettled) options.processLifecycle.unsettled(processOwner, unsettled);
+        else options.processLifecycle.settled(processOwner);
+      } catch (error) {
+        stopReason ??= 'capture-failure'; failureDetail ??=
+          `Could not settle Docker client ownership: ${error instanceof Error ? error.message : String(error)}`;
+      }
       for (const timer of timers) clearTimeout(timer);
       timers.clear();
       if (!stopReason && performance.now() >= deadline) stop('timeout');
@@ -764,15 +861,24 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         if (decodedOutput.providerFailed) exitCode = exitCode === 0 ? 1 : exitCode;
       }
       await settleWith(exitCode, signal, finalStdout, finalStderr);
+    };
+    started.once('close', (code, signal) => {
+      pipeClosed = true; resolvePipeClosed();
+      if (!processOwner) void finish(code, signal);
     });
+    if (processOwner) watchAttachedChild(started, (code, signal) => { void finish(code, signal); }, error => {
+      failureDetail ??= error.message; stop('capture-failure');
+    });
+    else started.once('error', error => { failureDetail ??= error.message; stop('capture-failure'); });
   };
 
   void (async () => {
     try {
-      await createValidatedContainer(profile, remaining(), options.secrets ?? {}, setupAbort.signal);
+      await createValidatedContainer(profile, remaining(), options.secrets ?? {}, setupAbort.signal,
+        options.processLifecycle);
       container = agentContainerId(profile) ?? '';
       if (!container) throw new Error('Docker did not return the created agent container ID.');
-      await validateContainer(container, profile, remaining(), setupAbort.signal);
+      await validateContainer(container, profile, remaining(), setupAbort.signal, options.processLifecycle);
       if (stopReason) throw new Error('Invocation was stopped during setup.');
     } catch (error) {
       closed = true;
@@ -784,9 +890,28 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       await settleWith(null, null, Buffer.alloc(0), Buffer.alloc(0));
       return;
     }
-    attach(spawn('docker', ['start', '--attach', container], {
-      env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'],
-    }));
+    try {
+      const spawnAttach = () => spawn('docker', ['start', '--attach', container], {
+        env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], detached: options.processLifecycle !== undefined,
+      });
+      if (options.processLifecycle) startOwnedAttachClient({ lifecycle: options.processLifecycle,
+        stopped: () => {
+          // Lifecycle hooks are synchronous and can keep the deadline timer from running. Recheck the monotonic
+          // deadline at the spawn boundary so an overdue invocation cannot create an attach client afterward.
+          if (!stopReason && performance.now() >= deadline) stop('timeout');
+          return stopReason !== undefined;
+        }, spawn: spawnAttach,
+        attach: (started, owner, group) => attach(started, owner, group), terminate,
+        recordFailure: error => {
+          failureDetail ??= `Could not record Docker client ownership: ${error instanceof Error ? error.message : String(error)}`;
+          stopReason ??= 'capture-failure';
+        } });
+      else attach(spawnAttach());
+    } catch (error) {
+      closed = true; stopReason ??= 'capture-failure';
+      failureDetail ??= `Container start failed: ${error instanceof Error ? error.message : String(error)}`;
+      await settleWith(null, null, Buffer.alloc(0), Buffer.alloc(0));
+    }
   })();
   return handle;
 }

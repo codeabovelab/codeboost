@@ -4,7 +4,8 @@ import { readCapturedFile } from '../container/profile.ts';
 import { createClaudeCommand, createPhasePolicy, MAX_COMMAND_SCHEMA_BYTES } from '../policy.ts';
 import { launchInvocation } from './supervisor.ts';
 import { setUpProfile } from './setup.ts';
-import { assertAdapterRequest, createAdapterInvocationBudget, type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
+import { assertAdapterRequest, capAdapterInvocationBudget, createAdapterInvocationBudget,
+  type AgentAdapterOptions, type AgentAdapterRequest } from './types.ts';
 
 /**
  * Read Claude's `--output-format json` envelope. A result whose `subtype` is not `success`, or whose `is_error` is
@@ -46,7 +47,9 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   oauthToken: string, options: AgentAdapterOptions = {}): InvocationHandle {
   if (!oauthToken || oauthToken.includes('\0')) throw new Error('Claude OAuth token is malformed.');
   const policy = createPhasePolicy(request.invocation);
-  const remaining = createAdapterInvocationBudget(request.invocation, options.timeoutMs);
+  const remaining = options.invocationBudget
+    ? capAdapterInvocationBudget(options.invocationBudget, options.timeoutMs)
+    : createAdapterInvocationBudget(request.invocation, options.timeoutMs);
   const structured = policy.phase === 'planning';
   // Invalid input throws here, before anything is allocated; only Docker setup runs inside the handle.
   const command = createClaudeCommand(policy, request.prompt,
@@ -55,5 +58,6 @@ export function startClaudeInvocation(request: AgentAdapterRequest,
   return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
     network => ({ ...request, policy, network, command, claudeToken: oauthToken }),
     profile => start(profile, { ...options, secrets: { CLAUDE_CODE_OAUTH_TOKEN: oauthToken },
+      processLifecycle: request.processLifecycle,
       invocationBudget: remaining, decode: (_profile, raw) => parseClaudeOutput(raw, structured) })));
 }

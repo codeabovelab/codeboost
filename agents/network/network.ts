@@ -4,7 +4,8 @@ import { createOutcomeUnknown, DOCKER_ID } from '../client-outcome.ts';
 import { ALLOCATION_IN_USE, allocationListCommands, assertResourceOwner, claimAllocationId, hasOwnerLabels,
   ownerLabelArgs, ownerLabels, releaseAllocationId, type ResourceOwner } from '../labels.ts';
 import { assertBuiltAgentImage } from '../container/image.ts';
-import { docker as runDockerCommand, pause, runDocker, type DockerOutcome } from '../docker.ts';
+import { docker as runDockerCommand, dockerEnvironment, pause, runDocker, type DockerOutcome } from '../docker.ts';
+import { runTrackedDocker, runTrackedProcess, type ProcessGroupLifecycle } from '../tracked-docker.ts';
 
 export const VENDOR_HOSTS = Object.freeze({
   claude: Object.freeze(['api.anthropic.com']),
@@ -47,12 +48,19 @@ const networkResources = (name: string, proxyContainer: string, owner: ResourceO
   ]);
 };
 // Fails closed: an unanswered list cannot prove the ID is unused. Throws when more than `expected` objects carry it.
-// The three lists are independent, so they run in parallel.
+// The three lists are independent, so ordinary callers run them in parallel. A durable owner permits only one
+// subprocess at a time, so lifecycle callers serialize them and refresh the shared deadline before each command.
 const assertAllocationObjects = async (allocationId: string, expected: number, remaining: () => number,
-  signal?: AbortSignal) => {
-  const timeoutMs = remaining();
-  const results = await Promise.all(allocationListCommands(allocationId)
-    .map(command => runDocker(command, { timeoutMs, signal })));
+  signal?: AbortSignal, lifecycle?: ProcessGroupLifecycle) => {
+  const commands = allocationListCommands(allocationId);
+  const results: DockerOutcome[] = [];
+  if (lifecycle) {
+    for (const command of commands) results.push(await runTrackedProcess('docker', command,
+      { env: dockerEnvironment(), timeoutMs: remaining(), signal, lifecycle }));
+  } else {
+    results.push(...await Promise.all(commands.map(command =>
+      runDocker(command, { timeoutMs: remaining(), signal }))));
+  }
   if (results.some(result => result.status !== 0)) throw new Error('Could not confirm that allocationId is unused.');
   const found = results.reduce((count, result) => count + result.stdout.split('\n').filter(line => line.trim()).length, 0);
   if (found > expected) throw new Error(ALLOCATION_IN_USE);
@@ -78,8 +86,12 @@ const deadline = (timeoutMs: number) => {
     return value;
   };
 };
-const docker = (args: readonly string[], timeout: number, signal?: AbortSignal) =>
-  runDockerCommand(args, { timeoutMs: timeout, signal });
+const docker = (args: readonly string[], timeout: number, signal?: AbortSignal, lifecycle?: ProcessGroupLifecycle) =>
+  lifecycle ? runTrackedDocker(args, { timeoutMs: timeout, signal, lifecycle })
+    : runDockerCommand(args, { timeoutMs: timeout, signal });
+const dockerOutcome = (args: readonly string[], timeout: number, lifecycle?: ProcessGroupLifecycle) => lifecycle
+  ? runTrackedProcess('docker', args, { env: dockerEnvironment(), timeoutMs: timeout, lifecycle })
+  : runDocker(args, { timeoutMs: timeout });
 const absent = (result: DockerOutcome) => result.status !== 0 && result.status !== null && !result.error
   && /(?:No such (?:object|container|network)|network .* not found)/i.test(`${result.stdout}\n${result.stderr}`);
 /** How long a network or proxy whose create client was killed may still materialize in the daemon. */
@@ -91,8 +103,8 @@ const CREATE_SETTLE_MS = 10_000;
 // even if its labels are wrong, as when validation refused it for that. A name proves nothing: an object found by
 // name is removed only if it carries the egress label and all three owner labels.
 const remove = async (object: 'container' | 'network', target: string, remaining: () => number, kind: string,
-  owner: ResourceOwner, settleBy = 0) => {
-  const inspect = (ref: string) => runDocker([object, 'inspect', ref], { timeoutMs: remaining() });
+  owner: ResourceOwner, settleBy = 0, lifecycle?: ProcessGroupLifecycle) => {
+  const inspect = (ref: string) => dockerOutcome([object, 'inspect', ref], remaining(), lifecycle);
   let before: DockerOutcome;
   for (;;) {
     before = await inspect(target);
@@ -110,14 +122,15 @@ const remove = async (object: 'container' | 'network', target: string, remaining
   const id = inspected?.Id;
   if (!id || !DOCKER_ID.test(id) || (DOCKER_ID.test(target) && id !== target))
     throw new Error(`Failed to establish the identity of ${kind}.`);
-  const result = await runDocker(object === 'container' ? ['rm', '--force', id] : ['network', 'rm', id],
-    { timeoutMs: remaining() });
+  const result = await dockerOutcome(object === 'container' ? ['rm', '--force', id] : ['network', 'rm', id],
+    remaining(), lifecycle);
   if (result.status === 0) return;
   if (!absent(await inspect(id))) throw new Error(`Failed to confirm removal of ${kind}.`);
 };
 
 const validateVendorNetwork = async (network: VendorNetwork, invocation: InvocationInput | undefined,
-  agentName: string | undefined, remaining: () => number, signal?: AbortSignal): Promise<void> => {
+  agentName: string | undefined, remaining: () => number, signal?: AbortSignal,
+  lifecycle?: ProcessGroupLifecycle): Promise<void> => {
   const identity = identities.get(network);
   if (!identity) throw new Error('Vendor network was not created by the trusted network builder.');
   if (invocation && (identity.invocation !== invocation || network.vendor !== invocation.vendor))
@@ -125,7 +138,7 @@ const validateVendorNetwork = async (network: VendorNetwork, invocation: Invocat
   assertBuiltAgentImage(identity.imageId);
   // Inspect by the captured IDs, so a removed-and-recreated network or proxy cannot stand in for the original.
   const inspectAllocated = async (args: readonly string[]) => {
-    try { return await docker(args, remaining(), signal); }
+    try { return await docker(args, remaining(), signal, lifecycle); }
     catch (cause) { throw new Error('Vendor network or proxy changed after allocation.', { cause }); }
   };
   const inspect = JSON.parse(await inspectAllocated(['container', 'inspect', identity.proxyId]))[0] as
@@ -140,7 +153,7 @@ const validateVendorNetwork = async (network: VendorNetwork, invocation: Invocat
         RestartPolicy?: { Name?: string; MaximumRetryCount?: number } | null };
       NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }>; Ports?: Record<string, unknown> };
       Mounts?: unknown[] } | undefined;
-  const image = JSON.parse(await docker(['image', 'inspect', identity.imageId], remaining(), signal))[0] as
+  const image = JSON.parse(await docker(['image', 'inspect', identity.imageId], remaining(), signal, lifecycle))[0] as
     { Config?: { Env?: string[] } } | undefined;
   const inspectedNetwork = JSON.parse(await inspectAllocated(['network', 'inspect', identity.networkId]))[0] as
     { Id?: string; Name?: string; Internal?: boolean; Driver?: string; Labels?: Record<string, string>; IPAM?: { Config?: Array<{ Subnet?: string }> };
@@ -188,8 +201,8 @@ const validateVendorNetwork = async (network: VendorNetwork, invocation: Invocat
 
 // Async, so an invalid deadline rejects like every other failure instead of throwing synchronously.
 export async function assertVendorNetwork(network: VendorNetwork, invocation?: InvocationInput, agentName?: string,
-  timeoutMs = 30_000, signal?: AbortSignal): Promise<void> {
-  return validateVendorNetwork(network, invocation, agentName, deadline(timeoutMs), signal);
+  timeoutMs = 30_000, signal?: AbortSignal, lifecycle?: ProcessGroupLifecycle): Promise<void> {
+  return validateVendorNetwork(network, invocation, agentName, deadline(timeoutMs), signal, lifecycle);
 }
 
 /**
@@ -197,7 +210,8 @@ export async function assertVendorNetwork(network: VendorNetwork, invocation?: I
  * and everything created so far is removed (cleanup itself is not cancelled) before the promise rejects.
  */
 export async function createVendorNetwork(invocation: InvocationInput, imageId: string, allocationId: string,
-  timeoutMs = 60_000, signal?: AbortSignal): Promise<VendorNetwork> {
+  timeoutMs = 60_000, signal?: AbortSignal, processLifecycle?: ProcessGroupLifecycle,
+  invocationBudget?: () => number): Promise<VendorNetwork> {
   assertCapturedInvocation(invocation);
   assertBuiltAgentImage(imageId);
   // The network and proxy carry the invocation's runner and attempt and this caller-chosen allocation ID.
@@ -207,7 +221,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
   // No allocation may outlive the invocation it serves.
-  const invocationLeft = Math.floor(invocation.deadline - Date.now());
+  const invocationLeft = Math.floor(invocationBudget?.() ?? invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   timeoutMs = Math.min(timeoutMs, invocationLeft);
   const overall = deadline(timeoutMs), cleanupReserve = Math.min(10_000, Math.floor(timeoutMs / 3));
@@ -229,7 +243,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   const create = async (object: string, args: readonly string[]) => {
     const timeout = remaining();
     try {
-      const output = await docker(args, timeout, signal);
+      const output = await docker(args, timeout, signal, processLifecycle);
       created.add(object);
       return output;
     } catch (error) {
@@ -259,19 +273,19 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     if (!mayExist('network')) networkGone = true;
     if (proxyPlanned && !proxyGone) try {
       await remove('container', proxyTarget,
-        budget, 'vendor proxy', owner, proxyId ? 0 : settleBy(proxyContainer));
+        budget, 'vendor proxy', owner, proxyId ? 0 : settleBy(proxyContainer), processLifecycle);
       proxyGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
     if (networkPlanned && !networkGone) try {
       await remove('network', networkTarget,
-        budget, 'vendor network', owner, networkId ? 0 : settleBy(name));
+        budget, 'vendor network', owner, networkId ? 0 : settleBy(name), processLifecycle);
       networkGone = true;
     } catch (cleanupError) { failures.push(cleanupError); }
     if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');
   };
   claimAllocationId(allocationId);
   // Nothing created yet: a reused ID (still labelling objects from any earlier process) is refused here.
-  try { await assertAllocationObjects(allocationId, 0, remaining, signal); }
+  try { await assertAllocationObjects(allocationId, 0, remaining, signal, processLifecycle); }
   catch (error) { releaseAllocationId(allocationId); throw error; }
   try {
     networkPlanned = true;
@@ -280,7 +294,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
       '--label', `io.codeboost.egress=${allocationId}`, ...labels, name]), 'network');
     // The check above and this create are not atomic across processes. Once our network exists, it must be the only
     // object carrying the ID: of two racing allocations, the later check sees both and backs out.
-    await assertAllocationObjects(allocationId, 1, remaining, signal);
+    await assertAllocationObjects(allocationId, 1, remaining, signal, processLifecycle);
     proxyPlanned = true;
     // Create and start separately: a refused create made nothing, while a failed start leaves a container we own by ID.
     proxyId = createdId(await create(proxyContainer, ['create', '--name', proxyContainer, '--read-only', '--user', '10001:10001',
@@ -289,15 +303,15 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
       '--label', `io.codeboost.egress=${allocationId}`, ...labels,
       '--env', `CODEBOOST_ALLOWED_HOSTS=${VENDOR_HOSTS[vendor].join(',')}`,
       '--entrypoint', 'node', imageId, '/usr/local/lib/codeboost-egress-proxy.mjs']), 'proxy');
-    await docker(['start', proxyId], remaining(), signal);
-    await docker(['network', 'connect', 'bridge', proxyId], remaining(), signal);
+    await docker(['start', proxyId], remaining(), signal, processLifecycle);
+    await docker(['network', 'connect', 'bridge', proxyId], remaining(), signal, processLifecycle);
     await docker(['exec', proxyId, 'node', '-e', [
       "const net=require('node:net');let attempts=0;",
       "const check=()=>{const socket=net.connect(3128,'127.0.0.1');",
       "socket.once('connect',()=>{socket.destroy();process.exit(0)});",
       "socket.once('error',()=>{socket.destroy();if(++attempts===50)process.exit(1);setTimeout(check,20)})};check();",
-    ].join('')], remaining(), signal);
-    const proxyInspect = JSON.parse(await docker(['container', 'inspect', proxyId], remaining(), signal))[0] as
+    ].join('')], remaining(), signal, processLifecycle);
+    const proxyInspect = JSON.parse(await docker(['container', 'inspect', proxyId], remaining(), signal, processLifecycle))[0] as
       { NetworkSettings?: { Networks?: Record<string, { IPAddress?: string }> } } | undefined;
     const proxyIp = proxyInspect?.NetworkSettings?.Networks?.[name]?.IPAddress;
     if (!proxyIp || !/^10\.254\.\d{1,3}\.\d{1,3}$/.test(proxyIp))
@@ -306,7 +320,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
     identities.set(network, Object.freeze({ allocationId, owner, imageId, invocation, subnet, proxyIp, networkId,
       proxyId }));
     registered = network;
-    await validateVendorNetwork(network, invocation, undefined, remaining, signal);
+    await validateVendorNetwork(network, invocation, undefined, remaining, signal, processLifecycle);
     remaining();
     signal?.throwIfAborted();
     releaseAllocationId(allocationId);
@@ -331,7 +345,8 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   }
 }
 
-export async function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30_000): Promise<void> {
+export async function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30_000,
+  processLifecycle?: ProcessGroupLifecycle): Promise<void> {
   const identity = identities.get(network);
   if (!identity) {
     if (removedNetworks.has(network)) return;
@@ -344,12 +359,12 @@ export async function removeVendorNetwork(network: VendorNetwork, timeoutMs = 30
   removedParts.set(network, removed);
   if (!removed.has('container')) try {
     await remove('container', identity.proxyId,
-      remaining, 'vendor proxy', identity.owner);
+      remaining, 'vendor proxy', identity.owner, 0, processLifecycle);
     removed.add('container');
   } catch (error) { failures.push(error); }
   if (!removed.has('network')) try {
     await remove('network', identity.networkId,
-      remaining, 'vendor network', identity.owner);
+      remaining, 'vendor network', identity.owner, 0, processLifecycle);
     removed.add('network');
   } catch (error) { failures.push(error); }
   if (failures.length) throw new AggregateError(failures, 'Vendor network cleanup did not settle.');

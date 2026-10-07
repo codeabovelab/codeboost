@@ -9,7 +9,7 @@ import type { RebaseMarker, Store } from './store.ts';
 import { WRITABLE_KINDS, isUuidV4 } from './lifecycle.ts';
 import { partialOutput, saveDiagnostic } from './diagnostics.ts';
 import { ownerOnlyDirectory } from './runner-repository.ts';
-import { processIdentity, runInProcessGroup } from '../agents/process-group.ts';
+import { runInProcessGroup } from '../agents/process-group.ts';
 import type { DockerOutcome } from '../agents/docker.ts';
 
 /**
@@ -98,38 +98,20 @@ export function acquireRunnerLock(databasePath: string, options: { lockRoot?: st
 }
 
 export interface ProcessControl {
-  /** The numeric group still exists. Exact ownership is revalidated only at the signal boundary. */
+  /** The numeric group still exists. */
   isAlive(pgid: number): boolean;
-  /** Revalidate its kernel identity, SIGTERM, SIGKILL after grace, and resolve only once the group has exited. */
+  /** Stop the group only through an implementation with identity-bound signalling; otherwise fail closed. */
   terminate(pgid: number, identity: string | null, graceMs: number): Promise<void>;
 }
 const groupAlive = (pgid: number) => {
   try { process.kill(-pgid, 0); return true; }
   catch (error) { return (error as NodeJS.ErrnoException).code !== 'ESRCH'; }
 };
-const ownsGroupAtSignal = (pgid: number, identity: string | null): boolean => {
-  if (!groupAlive(pgid)) return false;
-  const current = processIdentity(pgid);
-  if (identity === null || current === null)
-    throw new Error('Could not prove the recorded process group still owns its ID; refusing to signal it.');
-  if (current !== identity) throw new Error('The recorded process group identity changed before recovery could signal it.');
-  return true;
-};
 export const hostProcesses: ProcessControl = {
   isAlive(pgid) { return groupAlive(pgid); },
-  async terminate(pgid, identity, graceMs) {
-    if (!ownsGroupAtSignal(pgid, identity)) return;
-    try { process.kill(-pgid, 'SIGTERM'); }
-    catch (error) { if ((error as NodeJS.ErrnoException).code === 'ESRCH') return; throw error; }
-    const until = performance.now() + graceMs;
-    while (groupAlive(pgid) && performance.now() < until) await new Promise(resolve => setTimeout(resolve, 50));
-    if (ownsGroupAtSignal(pgid, identity)) {
-      try { process.kill(-pgid, 'SIGKILL'); }
-      catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ESRCH') throw error; }
-    }
-    const settlement = performance.now() + graceMs;
-    while (groupAlive(pgid) && performance.now() < settlement) await new Promise(resolve => setTimeout(resolve, 50));
-    if (groupAlive(pgid)) throw new Error('The recorded process group did not exit after SIGKILL; retaining its ownership.');
+  async terminate(pgid) {
+    if (!groupAlive(pgid)) return;
+    throw new Error('A recovered process group is still alive; the host cannot signal its reusable numeric ID safely, so ownership is retained.');
   },
 };
 
@@ -193,6 +175,45 @@ function validResolvedConflicts(history: unknown, mappings: unknown, conflicts: 
   return new Set(conflicts).size === conflicts.length && conflicts.every(value => typeof value === 'string' &&
     /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value) && history.includes(value) && sources.get(value) !== value);
 }
+interface RecoveryRebase {
+  planKey: string;
+  marker: RebaseMarker;
+}
+function recoveryRebase(planKey: string, value: unknown): RecoveryRebase | null {
+  const marker = value as Partial<RebaseMarker> | null;
+  const processGroup = marker?.processGroup, processGroupIdentity = processGroup && typeof processGroup === 'object'
+    ? processGroup.identity ?? null : null, oldHistory = marker?.oldHistory ?? null,
+    resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null,
+    resultState = marker?.resultState ?? 'none', rawResolvedConflicts = marker && Object.hasOwn(marker, 'resolvedConflicts')
+      ? marker.resolvedConflicts : [], rawConflict = marker && Object.hasOwn(marker, 'conflict') ? marker.conflict : null;
+  const conflict = rawConflict === null ? null : rawConflict as {
+    attemptId?: unknown; allocationId?: unknown; networkAllocationId?: unknown; source?: unknown };
+  if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
+      !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
+      !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
+      !validOldHistory(marker, oldHistory) ||
+      (oldHistory === null && (resultState !== 'none' || resultHead !== null || resultMappings !== null)) ||
+      (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
+      !['none', 'prepared', 'uncertain', 'refused', 'ready'].includes(resultState) ||
+      (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
+      !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
+      !validResolvedConflicts(oldHistory, resultMappings ?? [], rawResolvedConflicts) ||
+      (resultState === 'none' && Array.isArray(rawResolvedConflicts) && rawResolvedConflicts.length !== 0) ||
+      (processGroup !== null && (typeof processGroup === 'string' ? !['spawning', 'unsettled'].includes(processGroup) :
+        (!processGroup || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
+          !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0 ||
+          (processGroupIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processGroupIdentity))))) ||
+      (conflict !== null && (!isUuidV4(conflict.attemptId) || !isUuidV4(conflict.allocationId) ||
+        !isUuidV4(conflict.networkAllocationId) || conflict.allocationId === conflict.networkAllocationId || conflict.attemptId === marker.attemptId ||
+        typeof conflict.source !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(conflict.source) ||
+        !Array.isArray(oldHistory) || !oldHistory.includes(conflict.source) || (rawResolvedConflicts as unknown[]).includes(conflict.source) || resultState !== 'none')))
+    return null;
+  return { planKey, marker: { ...marker as RebaseMarker, oldHistory: oldHistory as string[] | null,
+    resultState, resultHead: resultHead as string | null,
+    resultMappings: resultMappings as RebaseMarker['resultMappings'], resolvedConflicts: rawResolvedConflicts as string[],
+    conflict: conflict === null ? null : conflict as RebaseMarker['conflict'] } };
+}
 const EXPORT_LIMIT = 1024 * 1024;
 
 /**
@@ -202,6 +223,40 @@ const EXPORT_LIMIT = 1024 * 1024;
 export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport> {
   const now = o.now ?? Date.now, processes = o.deps.processes ?? hostProcesses;
   if (!/^[0-9a-f]{32}$/.test(o.runnerOwner)) throw new Error('Invalid runner owner token.');
+  // Preflight every rebase marker before recovery terminates a process or changes durable ownership. In particular,
+  // one unidentified escaped process blocks the whole pass: settling earlier work would make a refused startup partial.
+  const rawRebases = o.store.rebasesInProgress();
+  const rebases = rawRebases.map(value => recoveryRebase(value.planKey, value.marker));
+  if (rebases.some(value => value === null))
+    throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', rawRebases.map(value => value.planKey));
+  const activeRebases = rebases as RecoveryRebase[], childIdentities = new Set<string>(), childAllocations = new Set<string>();
+  for (const { planKey, marker } of activeRebases) if (marker.conflict) {
+    if (childIdentities.has(marker.conflict.attemptId) || childAllocations.has(marker.conflict.allocationId)
+      || childAllocations.has(marker.conflict.networkAllocationId))
+      throw new RecoveryBlocked('Interrupted rebases claim the same conflict child resources', [planKey]);
+    childIdentities.add(marker.conflict.attemptId); childAllocations.add(marker.conflict.allocationId);
+    childAllocations.add(marker.conflict.networkAllocationId);
+  }
+  const unsettled = activeRebases.find(({ marker }) => marker.processGroup === 'unsettled');
+  if (unsettled)
+    throw new RecoveryBlocked(`An interrupted rebase has an unidentified escaped process; stop it, then run --release-rebase-process ${unsettled.marker.attemptId}`,
+      [unsettled.marker.attemptId]);
+  // `spawning` means a crash may have happened before the synchronous spawn callback identified the child. A persisted
+  // exact group proves only that the leader was recorded, not that every descendant settled: the runner may have crashed
+  // after the leader/group disappeared but before the lifecycle callback durably recorded `unsettled`. Stop a still-live
+  // exact group while its identity is trustworthy, then require the same explicit release in every ambiguous case.
+  // Workspace open-file scans cannot prove that an escaped pipe holder no longer exists.
+  const recoveredProcess = activeRebases.find(({ marker }) => marker.processGroup !== null);
+  if (recoveredProcess) {
+    const { planKey, marker } = recoveredProcess;
+    if (marker.processGroup === null) throw new Error('Recovered process ownership disappeared during startup recovery.');
+    const processGroup = marker.processGroup;
+    if (typeof processGroup !== 'string' && processes.isAlive(processGroup.pgid))
+      await processes.terminate(processGroup.pgid, processGroup.identity, o.graceMs ?? 5_000);
+    o.store.setRebaseProcessGroup(planKey, marker.attemptId, processGroup, 'unsettled');
+    throw new RecoveryBlocked(`An interrupted rebase may have an unidentified escaped process; stop it, then run --release-rebase-process ${marker.attemptId}`,
+      [marker.attemptId]);
+  }
   const interrupted = o.store.interruptedAttempts();
   // Step 7's input is taken before finalization: an interrupted attempt that started preparation but never saved its group.
   const unowned = interrupted.filter(a => a.preparationStartedAt !== null && a.preparationPgid === null).map(a => a.id);
@@ -212,9 +267,23 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   const recovered = await o.deps.recoverLeftovers(o.runnerOwner);
   if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned);
   // A handle is used only if both its attempt ID and its allocation ID match one attempt row of this database
-  // (runner-lifecycle.md, "Recovered storage handles"); any other is reported and left for a person.
+  // or the exact active conflict child of one validated rebase marker; any other is reported and left for a person.
   const matched = recovered.storage.filter(s => isUuidV4(s.attemptId) && isUuidV4(s.allocationId) && o.store.attemptAllocation(s.attemptId) === s.allocationId);
-  const unmatchedStorage = recovered.storage.filter(s => !matched.includes(s)).map(s => s.attemptId);
+  const rebaseStorage = new Map<string, RecoveredStorage>();
+  for (const storage of recovered.storage) {
+    const owner = activeRebases.find(value => value.marker.conflict?.attemptId === storage.attemptId
+      && value.marker.conflict.allocationId === storage.allocationId);
+    if (!owner) {
+      const partial = activeRebases.find(value => value.marker.conflict?.attemptId === storage.attemptId
+        || value.marker.conflict?.allocationId === storage.allocationId);
+      if (partial) throw new RecoveryBlocked('Recovered storage does not match its conflict child ownership marker', [partial.planKey]);
+      continue;
+    }
+    if (rebaseStorage.has(owner.planKey))
+      throw new RecoveryBlocked('An interrupted rebase has more than one recovered handle for its conflict child', [owner.planKey]);
+    rebaseStorage.set(owner.planKey, storage);
+  }
+  const unmatchedStorage = recovered.storage.filter(s => !matched.includes(s) && ![...rebaseStorage.values()].includes(s)).map(s => s.attemptId);
   // 3. Export phase: stopped writable attempts only, outside any transaction, fixed names, bounded deadline.
   const exports: Record<string, { diagnosticRef?: string; failure?: string }> = {};
   ownerOnlyDirectory(o.diagnosticsDir);
@@ -243,45 +312,15 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   // 3. Finalization phase: one transaction; a failure stops startup.
   const finalized = o.store.recoverInterrupted(now(), exports);
   // 4. Rebases, storage removal (every matched handle), then attempt directories.
-  for (const rebase of o.store.rebasesInProgress()) {
+  for (const rebase of activeRebases) {
     if (!o.deps.abortRebase) throw new RecoveryBlocked('An interrupted rebase needs F3 to abort it', [rebase.planKey]);
-    const marker = rebase.marker as Partial<RebaseMarker> | null;
-    const processGroup = marker?.processGroup, processGroupIdentity = processGroup && typeof processGroup === 'object'
-      ? processGroup.identity ?? null : null, oldHistory = marker?.oldHistory ?? null,
-      resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null,
-      resultState = marker?.resultState ?? 'none', rawResolvedConflicts = marker && Object.hasOwn(marker, 'resolvedConflicts')
-        ? marker.resolvedConflicts : [];
-    if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
-        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
-        !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
-        !Number.isSafeInteger(marker.startedAt) || marker.startedAt! < 0 ||
-        !validOldHistory(marker, oldHistory) ||
-        (oldHistory === null && (resultState !== 'none' || resultHead !== null || resultMappings !== null)) ||
-        (resultHead !== null && (typeof resultHead !== 'string' || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(resultHead))) ||
-        !['none', 'prepared', 'uncertain', 'refused', 'ready'].includes(resultState) ||
-        (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
-        !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
-        !validResolvedConflicts(oldHistory, resultMappings ?? [], rawResolvedConflicts) ||
-        (resultState === 'none' && Array.isArray(rawResolvedConflicts) && rawResolvedConflicts.length !== 0) ||
-        (processGroup !== null && (!processGroup || typeof processGroup === 'string' || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
-          !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0 ||
-          (processGroupIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processGroupIdentity)))))
-      throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', [rebase.planKey]);
-    const resolvedConflicts = rawResolvedConflicts as string[];
-    if (processGroup) {
-      if (processes.isAlive(processGroup.pgid))
-        await processes.terminate(processGroup.pgid, processGroupIdentity, o.graceMs ?? 5_000);
-      // A descendant can escape the recorded process group before it is terminated. Whether the group was initially
-      // alive or dead, prove that no process still uses the workspace before releasing its durable owner.
-      const workspace = join(o.runnerRoot, o.runnerOwner, 'rebases', marker.attemptId);
-      const stat = lstatSync(workspace, { throwIfNoEntry: false });
-      if (stat && (!stat.isDirectory() || stat.isSymbolicLink()))
-        throw new RecoveryBlocked('An interrupted rebase workspace is not a plain directory', [workspace]);
-      const users = stat ? await (o.openFiles ? o.openFiles(workspace) : hostOpenFilesBounded(workspace)) : [];
-      if (users.length) throw new RecoveryBlocked('A process still uses an interrupted rebase workspace', users);
-      o.store.setRebaseProcessGroup(rebase.planKey, marker.attemptId, processGroup, null);
+    const marker = rebase.marker;
+    await o.deps.abortRebase(rebase.planKey, marker);
+    if (marker.conflict) {
+      const storage = rebaseStorage.get(rebase.planKey);
+      if (storage) await o.deps.removeTaskFilesystems(storage.handle);
+      o.store.clearRebaseConflict(rebase.planKey, marker.attemptId, marker.conflict.attemptId);
     }
-    await o.deps.abortRebase(rebase.planKey, { ...marker, oldHistory, resultState, resultHead, resultMappings, resolvedConflicts, processGroup: null });
     if (!o.store.abortRebase(rebase.planKey, marker.attemptId))
       throw new RecoveryBlocked('An interrupted rebase changed while recovery aborted it', [rebase.planKey]);
   }
@@ -316,7 +355,8 @@ async function stopped(exporting: Promise<unknown>, graceMs: number, attemptId: 
 /** --release-preparation: remove an attempt directory only when no process has a file open or a working directory in it. */
 export function releasePreparation(o: { store: Store; runnerRoot: string; runnerOwner: string; attemptId: string; openFiles?: (dir: string) => string[] }): void {
   if (!isUuidV4(o.attemptId) || o.store.attemptOwner(o.attemptId) === null) throw new Error('Unknown attempt.');
-  const dir = join(o.runnerRoot, o.runnerOwner, 'attempts', o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
+  const attempts = ownerOnlyDirectory(o.runnerRoot, o.runnerOwner, 'attempts');
+  const dir = join(attempts, o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
   if (st && (!st.isDirectory() || st.isSymbolicLink())) throw new Error('The attempt path is not a plain directory.');
   if (st) {
     const users = (o.openFiles ?? hostOpenFiles)(dir);
@@ -324,6 +364,27 @@ export function releasePreparation(o: { store: Store; runnerRoot: string; runner
     rmSync(dir, { recursive: true, force: true });
   }
   if (!o.store.clearPreparationMarker(o.attemptId)) throw new Error('The attempt is not waiting for release.');
+}
+
+/** --release-rebase-process: clear an unidentified escaped-process marker only after explicit operator confirmation. */
+export function releaseRebaseProcess(o: { store: Store; runnerRoot: string; runnerOwner: string; attemptId: string;
+  openFiles?: (dir: string) => string[] }): void {
+  if (!isUuidV4(o.attemptId)) throw new Error('Unknown rebase attempt.');
+  const matches = o.store.rebasesInProgress().filter(value => {
+    const marker = value.marker as { attemptId?: unknown; processGroup?: unknown } | null;
+    return marker?.attemptId === o.attemptId;
+  });
+  if (matches.length !== 1) throw new Error('Unknown rebase attempt.');
+  const marker = matches[0]!.marker as { processGroup?: unknown };
+  if (marker.processGroup !== 'unsettled') throw new Error('The rebase attempt is not waiting for escaped-process release.');
+  const rebases = ownerOnlyDirectory(o.runnerRoot, o.runnerOwner, 'rebases');
+  const dir = join(rebases, o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
+  if (st && (!st.isDirectory() || st.isSymbolicLink())) throw new Error('The rebase path is not a plain directory.');
+  if (st) {
+    const users = (o.openFiles ?? hostOpenFiles)(dir);
+    if (users.length) throw new RecoveryBlocked('A process is still using the rebase directory', users);
+  }
+  o.store.setRebaseProcessGroup(matches[0]!.planKey, o.attemptId, 'unsettled', null);
 }
 /** Processes with a file open or a working directory under dir. Throws if the check cannot run (fail closed). */
 export function hostOpenFiles(dir: string): string[] {
