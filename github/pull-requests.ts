@@ -4,6 +4,7 @@ import { BRANCH, REPOSITORY, SHA } from './validate.ts';
 
 /** A `gh` runner that can also write a request body to stdin (`gh api --input -`). */
 export type RunGhWithInput = (args: readonly string[], options?: { signal?: AbortSignal; input?: string }) => Promise<string>;
+type MutationBoundary = () => void | Promise<void | (() => void)>;
 
 export interface OpenPullRequestInput {
   base: string;
@@ -13,6 +14,8 @@ export interface OpenPullRequestInput {
   body: string;
   draft: boolean;
   marker: string;
+  /** Runs after validation and immediately before the irreversible open request. */
+  beforeOpen?: MutationBoundary;
 }
 export interface OpenedPullRequest { number: number; url: string; headSha: string; draft: boolean }
 export interface PullRequestGateway {
@@ -40,8 +43,8 @@ export interface PullRequestGateway {
    */
   readPull(number: number, signal?: AbortSignal): Promise<{ open: boolean; headBranch: string; base: string; marker: string }>;
   /** Replaces the title and description of an open PR codeboost opened; marks it ready when `ready`, or a draft when `draft`. */
-  /** `beforeReady` runs after the description update's await and before any ready or draft change; if it throws, no such change is made. */
-  refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest>;
+  /** Boundary callbacks are awaited immediately before their named mutation; if one throws, that mutation is not made. */
+  refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforePatch?: MutationBoundary; beforeReady?: MutationBoundary }, signal?: AbortSignal): Promise<OpenedPullRequest>;
   /**
    * Closes a PR codeboost opened (#111), read by its number (GitHub's list may lag behind it). An open PR must still be from
    * `headBranch` in this repository with `marker` on its first line, or it is refused (`PullRequestMisplaced`) and left
@@ -50,7 +53,7 @@ export interface PullRequestGateway {
    */
   close(number: number, input: { headBranch: string; marker: string; beforeClose?: () => void }, signal?: AbortSignal): Promise<{ number: number; url: string }>;
   /** Turns an open PR codeboost opened back into a draft; a no-op for a draft. */
-  markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest>;
+  markDraft(number: number, input: { base: string; headBranch: string; marker: string; beforeDraft?: MutationBoundary }, signal?: AbortSignal): Promise<OpenedPullRequest>;
 }
 /**
  * GitHub refused a draft because the repository does not support draft PRs (for example a private repository on the
@@ -164,6 +167,8 @@ export class GhPullRequestGateway implements PullRequestGateway {
     signal = this.#bounded(signal);
     this.#validate(input);
     if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
+    const finalize = await input.beforeOpen?.();
+    finalize?.();
     const post = () => this.#json(['api', '-X', 'POST', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls`], signal,
       { title: input.title, body: input.body, head: input.headBranch, base: input.base, draft: input.draft });
     let response;
@@ -248,16 +253,19 @@ export class GhPullRequestGateway implements PullRequestGateway {
     return { ...pr, marker: found[0]! };
   }
 
-  async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforeReady?: () => void }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+  async refresh(number: number, input: OpenPullRequestInput & { ready: boolean; headSha?: string; beforePatch?: MutationBoundary; beforeReady?: MutationBoundary }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     signal = this.#bounded(signal);
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
     if (markerOf(input.body) !== input.marker) throw new Error('The pull request description must start with its marker.');
+    const finalizePatch = await input.beforePatch?.();
+    finalizePatch?.();
     const patched = this.#pull(await this.#json(['api', '-X', 'PATCH', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/pulls/${number}`], signal,
       { title: input.title, body: input.body }), input);
     if (patched.number !== number || markerOf(patched.body) !== input.marker) throw new Error('GitHub returned a different pull request.');
     // The caller's re-check after the PATCH's await: a task change during it must not lead to a ready change.
-    input.beforeReady?.();
+    const finalizeReady = await input.beforeReady?.();
+    finalizeReady?.();
     // A ready PR whose task went back to needs human becomes a draft again; a draft whose task is ready leaves draft.
     if (input.ready && patched.draft) await this.run(['pr', 'ready', String(number), '--repo', this.repository], { signal });
     else if (input.draft && !patched.draft) await draftCall(() => this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal }));
@@ -296,10 +304,12 @@ export class GhPullRequestGateway implements PullRequestGateway {
   }
 
   /** The caller has just read the PR as ready, so this changes it straight away and reads the result back once. */
-  async markDraft(number: number, input: { base: string; headBranch: string; marker: string }, signal?: AbortSignal): Promise<OpenedPullRequest> {
+  async markDraft(number: number, input: { base: string; headBranch: string; marker: string; beforeDraft?: MutationBoundary }, signal?: AbortSignal): Promise<OpenedPullRequest> {
     signal = this.#bounded(signal);
     this.#validate(input);
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid pull request number.');
+    const finalize = await input.beforeDraft?.();
+    finalize?.();
     let refused: unknown = null;
     try { await draftCall(() => this.run(['pr', 'ready', String(number), '--undo', '--repo', this.repository], { signal })); }
     catch (error) { if (error instanceof DraftsUnsupported || signal?.aborted) throw error; refused = error; }

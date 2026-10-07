@@ -5,7 +5,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
-import { afterEach, expect, it } from 'vitest';
+import { afterEach, expect, it, vi } from 'vitest';
 import { Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
 import { approveItem, approvalStates, choiceKeys, applyChoices, stable } from '../core/approvals.ts';
@@ -38,6 +38,38 @@ it('allocates revisions in SQLite, survives reopen, and keeps old revisions and 
   const recovered = open(path);
   expect(recovered.getPlan(identity)).toEqual(next); expect(recovered.getSnapshot(identity, first.id)).toEqual(first);
   expect(recovered.getSnapshot(identity).head).toBe(oid(4));
+});
+it('scopes issue trust to repository and current author, supports revoke, and migrates schema v16', () => {
+  const { store, path } = fixture();
+  expect(store.issueTrust('owner/a', 5)).toBeNull();
+  const trusted = store.setIssueTrust({ repository: 'Owner/A', issue: 5, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  expect(trusted).toMatchObject({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trustedBy: 'local user', revokedAt: null });
+  expect(store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: true, trustedBy: 'local user' })).toEqual(trusted);
+  expect(store.issueTrust('owner/b', 5)).toBeNull();
+  const revoked = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  expect(revoked.revokedAt).toBeTypeOf('string');
+  expect(store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: false, trustedBy: 'local user' })).toEqual(revoked);
+  expect(() => store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'changed', trusted: false, trustedBy: 'local user' })).toThrow(/not trusted for its current author/);
+  close(store);
+  const legacy = new DatabaseSync(path);
+  legacy.exec('DROP TABLE issue_trust; ALTER TABLE attempts DROP COLUMN prompt_comments; PRAGMA user_version=16;'); legacy.close();
+  const migrated = open(path), db = new DatabaseSync(path);
+  try {
+    expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
+    expect(db.prepare("SELECT name FROM sqlite_master WHERE type='table' AND name='issue_trust'").get()).toEqual({ name: 'issue_trust' });
+    expect(db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'prompt_comments')).toBe(true);
+    expect(migrated.issueTrust('owner/a', 5)).toBeNull();
+  } finally { db.close(); }
+});
+it('strictly orders same-author trust decisions when the wall clock does not advance', () => {
+  const { store } = fixture(), clock = vi.spyOn(Date, 'now').mockReturnValue(1_000);
+  try {
+    const trusted = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    const revoked = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+    const retrusted = store.setIssueTrust({ repository: 'owner/a', issue: 5, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    expect(Date.parse(revoked.revokedAt!)).toBeGreaterThan(Date.parse(trusted.trustedAt));
+    expect(Date.parse(retrusted.trustedAt)).toBeGreaterThan(Date.parse(revoked.revokedAt!));
+  } finally { clock.mockRestore(); }
 });
 it('binds suggestion requests before the reply and rejects cross-plan, cancelled, delayed, replayed, and sibling applications', () => {
   const { store } = fixture(); const id = ready(store), sibling = ready(store);

@@ -108,8 +108,7 @@ The status line says one of:
 - "✕ Unavailable": no list has been retrieved yet, with the error;
 - "– Not configured": the review configuration has no `github.repository`.
 
-A note says that trusting issues and queueing are not available yet. Demo mode
-shows fixture issues and never contacts GitHub.
+Demo mode shows fixture issues and never contacts GitHub.
 
 **State holders.**
 
@@ -130,3 +129,42 @@ unconfigured state. `test/browser/issues.spec.ts` covers ranked order, reasons,
 trust marks, `aria-current` navigation, review input kept across navigation,
 review shortcuts ignored on the Issues screen, the unavailable → current → stale
 sequence, a late refresh after leaving the screen, and the 1280px layout.
+
+## H4b: Trust this issue
+
+**Decision and scope.** A trust decision is bound to the lower-cased repository identity, issue number and the issue's
+current author login. It applies to planning and execute prompts. Revoking trust does not interrupt an invocation that
+already started; every later plan-item admission, planning read and publish evaluates the new decision. Publishing is
+guarded too, so a revoked decision cannot cross the next irreversible boundary.
+
+**Durable state.** Schema v17 adds one `issue_trust` row per repository and issue, retaining who decided, when, the
+author that was observed, and a revocation time. Changing or deleting the GitHub author makes the row inapplicable.
+Trust and untrust requests carry UUID v4 action IDs and use the ordinary durable action replay before GitHub is read.
+Definite GitHub read failures are saved too and replay with their upstream-failure classification; shutdown remains
+resendable. Concurrent callers with one action ID all observe the first durable outcome.
+Each execute attempt also stores the SHA-256 digest and count of the exact comment strings put in its prompt. The
+evidence is durably `prepared` after every pre-launch check and before the launcher receives the prompt, then becomes
+`delivered` only after the launcher returns an owned handle; recovery can therefore distinguish either crash window.
+
+**Admission.** Start, resume, continuation approval and every plan item fetch the issue author and the complete current
+collaborator list under a bounded GitHub read. A collaborator-authored issue passes without a local decision. Every
+other issue needs a live, unrevoked row for that exact repository, number and author. A prompt text read revalidates the
+admitted author and collaborator result against the issue and collaborator snapshot used for that text, closing the gap
+between authorization and prompt construction. When explicit trust widened the comments, its author-bound Store row is
+re-read immediately after the awaited text fetch so revocation cannot admit the stale all-comments result. The returned
+execute source carries the same synchronous guard into `prepareExecution`, and the planning description carries it
+into the recorded user action; each runs in the same turn immediately before its prompt is constructed. Malformed,
+partial, failed and over-limit reads fail closed. Action-time
+failures are saved under the action ID; per-item failures settle that attempt without admitting the next item. The task
+and review versions are still checked in the same transaction that admits an attempt, after the external read.
+
+**Comments.** Without matching explicit trust, only current collaborators' comments enter planning and execute prompts.
+With matching trust, every bounded comment enters the same untrusted-data block, including comments from deleted
+accounts. The issue author is re-read with the comments, so a decision for an earlier author cannot widen the prompt.
+
+**Screen and demo.** The Issues table offers `Trust this issue` for outside authors, `Trust all comments` for current
+collaborators, and `Remove trust` for either explicit decision. The collaborator's author-bound decision widens comment
+access without changing its already-eligible status. While a request is in flight, the focused control remains
+enabled for focus purposes, uses `aria-disabled`, and ignores repeat activation. Responses merge only their own row;
+overlapping refreshes and trust requests cannot overwrite a committed decision or reset another control. Demo fixtures
+use the same Store and API, but resolve author and collaborator state locally and never contact GitHub.

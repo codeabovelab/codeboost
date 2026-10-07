@@ -4,14 +4,15 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
-import type { IssueText } from '../github/issues.ts';
+import { ISSUE_READ_ACTIVE_MS, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { createDemo } from '../scripts/demo.ts';
 import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
-import { ISSUE_READ_TIMEOUT_MS, productionPlanning } from '../web/planning.ts';
+import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 
 // Production planning wiring (#117): when it is on, what each request is told, and how the server awaits the issue.
 vi.setConfig({ testTimeout: 20_000 });
@@ -30,6 +31,9 @@ function production(config = demo()): ReviewConfig {
   return { ...config, demo: false, github: { repository: 'acme/retry-service', pullRequest: 7, issue } };
 }
 const text = (number: number): IssueText => ({ number, title: 'Retries ignore the cap', body: 'Body with <tags>.', comments: ['Collaborator note.'] });
+const issues = (issueText: (number: number, options?: { trustedAuthor?: string | null; expectedAccess?: IssueAccess }) => Promise<IssueText>, collaborator = true) => ({
+  issueAccess: async (number: number) => ({ number, authorLogin: 'outside', collaborator }), issueText,
+});
 const closable = (close = vi.fn(async () => undefined)) => ({ close, invoke: vi.fn() }) as unknown as PlanningAgent;
 const verified = { verifyLock: () => undefined };
 
@@ -42,11 +46,64 @@ it('is off in a demo and without a github block, so neither plans', () => {
 
 it('tells each request the GitHub issue, the repository and the base commit, read with a bound', async () => {
   const config = production(), service = new ReviewService(config); closers.push(() => service.close());
-  const issueText = vi.fn(async (number: number) => text(number)), signal = new AbortController().signal;
-  const deps = productionPlanning(config, { ...verified, issues: { issueText }, agent: () => closable() })!(service);
-  expect(await deps.describe(signal)).toEqual({ issue: text(config.github!.issue), approvedLessons: [],
-    repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base } });
-  expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
+  const issueText = vi.fn(async (number: number, options?: { signal?: AbortSignal; timeoutMs?: number;
+    trustedAuthor?: string | null; expectedAccess?: IssueAccess }) => text(number));
+  const issueAccess = vi.fn(async (number: number, _options?: { signal?: AbortSignal; timeoutMs?: number }) =>
+    ({ number, authorLogin: 'outside', collaborator: true }));
+  const signal = new AbortController().signal;
+  const deps = productionPlanning(config, { ...verified, issues: { issueAccess, issueText }, agent: () => closable() })!(service);
+  expect(await deps.describe(signal)).toMatchObject({ issue: text(config.github!.issue), approvedLessons: [],
+    repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base }, validate: expect.any(Function) });
+  expect(issueAccess.mock.calls[0]![1]!.signal).toBe(issueText.mock.calls[0]![1]!.signal);
+  expect(issueAccess.mock.calls[0]![1]!.signal).not.toBe(signal);
+  expect(issueAccess.mock.calls[0]![1]!.timeoutMs).toBe(ISSUE_READ_ACTIVE_MS);
+  expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal: issueAccess.mock.calls[0]![1]!.signal,
+    timeoutMs: ISSUE_READ_ACTIVE_MS, trustedAuthor: undefined,
+    expectedAccess: { number: config.github!.issue, authorLogin: 'outside', collaborator: true } });
+});
+
+it('passes explicit trust into planning comments and refuses the next read after revocation', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const issueText = vi.fn(async (number: number, options?: { trustedAuthor?: string | null }) =>
+    ({ ...text(number), comments: options?.trustedAuthor === 'outside' ? ['Outside note.'] : [] }));
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText, false), agent: () => closable() })!(service);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  await expect(deps.describe(new AbortController().signal)).resolves.toMatchObject({ issue: { comments: ['Outside note.'] } });
+  expect(issueText).toHaveBeenLastCalledWith(config.github!.issue, expect.objectContaining({ trustedAuthor: 'outside' }));
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  await expect(deps.describe(new AbortController().signal)).rejects.toThrow(/not trusted/);
+});
+
+it('refuses when the issue author or collaborator access changes between admission and the text read', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const issueText = vi.fn(async (_number: number, options?: { expectedAccess?: IssueAccess }) => {
+    expect(options?.expectedAccess).toEqual({ number: config.github!.issue, authorLogin: 'outside', collaborator: true });
+    throw new Error(`Issue #${config.github!.issue}'s author or collaborator access changed during admission.`);
+  });
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText), agent: () => closable() })!(service);
+  await expect(deps.describe(new AbortController().signal)).rejects.toThrow(/access changed during admission/);
+});
+
+it('refuses all-comments text when explicit trust is revoked during the awaited planning read', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const started = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const issueText = async (number: number) => { started.resolve(); await release.promise; return text(number); };
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText, false), agent: () => closable() })!(service);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  const description = deps.describe(new AbortController().signal);
+  await started.promise;
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  release.resolve();
+  await expect(description).rejects.toThrow(/not trusted/);
+});
+
+it('carries explicit trust to the planning prompt boundary', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const deps = productionPlanning(config, { ...verified, issues: issues(async number => text(number), false), agent: () => closable() })!(service);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  const described = await deps.describe(new AbortController().signal);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  expect(() => described.validate()).toThrow(/not trusted/);
 });
 
 it.each([['release', 'release'], ['', null]] as const)('names the configured base branch %j, or else the base commit, in the prompt', async (baseBranch, expected) => {
@@ -55,7 +112,7 @@ it.each([['release', 'release'], ['', null]] as const)('names the configured bas
   const agent = () => ({ close: async () => undefined, invoke: async (request: AuthorRequest, signal: AbortSignal) => {
     requests.push(request); return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } }) as unknown as PlanningAgent;
   const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined,
-    productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent })!);
+    productionPlanning(config, { ...verified, issues: issues(async number => text(number)), agent })!);
   closers.push(() => app.close());
   const call = async (method: string, path: string, body?: unknown) => (await fetch(`${new URL(app.url).origin}${path}`, { method,
     headers: { 'x-codeboost-token': app.token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined })).json() as Promise<Record<string, any>>;
@@ -89,7 +146,7 @@ it('closes the Store and starts nothing when the planning setup refuses', async 
 
 it('closes the planning agent when the server closes', async () => {
   const config = production(), close = vi.fn(async () => undefined);
-  const setup = productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent: () => closable(close) })!;
+  const setup = productionPlanning(config, { ...verified, issues: issues(async number => text(number)), agent: () => closable(close) })!;
   const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, setup);
   await app.close();
   expect(close).toHaveBeenCalledTimes(1);
@@ -123,7 +180,8 @@ function holding() {
     return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } };
   return { provider, requests };
 }
-const issueOf = (number: number) => ({ issue: text(number), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' } });
+const issueOf = (number: number) => ({ issue: text(number), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' },
+  validate: () => undefined });
 
 it('awaits the issue before starting a suggestion, and sends it to the provider', async () => {
   const requests: AuthorRequest[] = [];
@@ -136,7 +194,7 @@ it('awaits the issue before starting a suggestion, and sends it to the provider'
   const started = start();
   await new Promise(done => setTimeout(done, 50));
   expect(requests).toHaveLength(0);
-  resolve({ issue: text(view.plan.issue), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' } });
+  resolve({ issue: text(view.plan.issue), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' }, validate: () => undefined });
   const response = await started;
   expect(response).toMatchObject({ status: 200, body: { result: { requestId: expect.any(String) } } });
   await vi.waitFor(() => expect(requests).toHaveLength(1));
@@ -144,11 +202,47 @@ it('awaits the issue before starting a suggestion, and sends it to the provider'
   expect(requests[0]!.prompt).toContain('acme/retry-service');
 });
 
-it('starts no suggestion when the issue cannot be read, and reports GitHub\'s failure as 502', async () => {
-  const invoke = vi.fn();
-  const { start, recorded } = await serve({ provider: { invoke }, describe: async () => { throw new Error('GitHub is unreachable.'); } });
-  const response = await start();
+it('starts no suggestion when the issue cannot be read, and durably replays GitHub\'s 502', async () => {
+  let available = false;
+  const invoke = vi.fn(), describe = vi.fn(async () => {
+    if (!available) throw new Error('GitHub is unreachable.');
+    return issueOf(1);
+  });
+  const { start, recorded } = await serve({ provider: { invoke }, describe });
+  const actionId = randomUUID(), response = await start(actionId);
   expect(response).toMatchObject({ status: 502, body: { error: 'The issue could not be read from GitHub: GitHub is unreachable.' } });
+  available = true;
+  expect(await start(actionId)).toEqual(response);
+  expect(invoke).not.toHaveBeenCalled();
+  expect(describe).toHaveBeenCalledTimes(1);
+  expect(recorded()).toBe(0);
+});
+
+it('preserves a planning trust refusal as 409 instead of labelling it a GitHub read failure', async () => {
+  let trusted = false;
+  const invoke = vi.fn(), describe = vi.fn(async () => {
+    if (!trusted) throw new GuardRefusal('Issue is not trusted.');
+    return issueOf(1);
+  });
+  const { start, recorded } = await serve({ provider: { invoke }, describe });
+  const actionId = randomUUID();
+  expect(await start(actionId)).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
+  trusted = true;
+  expect(await start(actionId)).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
+  expect(invoke).not.toHaveBeenCalled();
+  expect(describe).toHaveBeenCalledTimes(1);
+  expect(recorded()).toBe(0);
+});
+
+it('revalidates planning trust after describe resolves and before constructing the prompt', async () => {
+  let trusted = true;
+  const invoke = vi.fn(), description = issueOf(1);
+  const describe = () => new Promise<ReturnType<typeof issueOf> & { validate(): void }>(resolve => {
+    resolve({ ...description, validate: () => { if (!trusted) throw new GuardRefusal('Issue is not trusted.'); } });
+    queueMicrotask(() => { trusted = false; });
+  });
+  const { start, recorded } = await serve({ provider: { invoke }, describe });
+  expect(await start()).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
   expect(invoke).not.toHaveBeenCalled();
   expect(recorded()).toBe(0);
 });

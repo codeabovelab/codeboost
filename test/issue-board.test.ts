@@ -2,6 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { request } from 'node:http';
+import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { IssueBoard } from '../web/issues.ts';
 import { startServer } from '../web/server.ts';
@@ -84,6 +85,44 @@ describe('issue board', () => {
     });
   });
 
+  it('exposes only fresh board trust as a control-admission hint', async () => {
+    const { gateway, calls } = heldGateway();
+    const board = new IssueBoard(gateway);
+    expect(board.trustStatus(1)).toBe('unknown');
+    const first = board.refresh();
+    calls[0]!.result.resolve({ ...snapshot(), issues: [{ ...snapshot().issues[0]!, trust: 'requires-approval' }] });
+    await first;
+    expect(board.trustStatus(1)).toBe('blocked');
+    const second = board.refresh();
+    calls[1]!.result.reject(new Error('gh: HTTP 502'));
+    await second;
+    expect(board.trustStatus(1)).toBe('unknown');
+  });
+
+  it('checks trust only for the requested non-collaborator issue', async () => {
+    const { gateway, calls } = heldGateway(), trust = vi.fn(() => null);
+    const board = new IssueBoard(gateway, undefined, undefined, trust);
+    const issues = Array.from({ length: 1_000 }, (_, index) => ({ ...snapshot().issues[0]!, number: index + 1,
+      title: `Issue ${index + 1}`, trust: 'requires-approval' as const }));
+    const refresh = board.refresh();
+    calls[0]!.result.resolve({ ...snapshot(), issues });
+    await refresh;
+    trust.mockClear();
+    expect(board.trustStatus(1_000)).toBe('blocked');
+    expect(trust).toHaveBeenCalledTimes(1);
+    expect(trust).toHaveBeenCalledWith('owner/repo', 1_000);
+  });
+
+  it('shows a matching explicit decision before collaborator trust so its broader permission can be removed', async () => {
+    const { gateway, calls } = heldGateway();
+    const board = new IssueBoard(gateway, undefined, undefined, () => ({ repository: 'owner/repo', issue: 1,
+      authorLogin: 'owner', trustedBy: 'local user', trustedAt: '2026-09-25T00:00:00.000Z', revokedAt: null }));
+    const refresh = board.refresh();
+    calls[0]!.result.resolve(snapshot());
+    await refresh;
+    expect(board.view()).toMatchObject({ state: { issues: [{ trust: 'approved', trustedBy: 'local user' }] } });
+  });
+
   it('close aborts the refresh, awaits its settlement, and refuses new refreshes', async () => {
     const { gateway, calls } = heldGateway();
     const board = new IssueBoard(gateway);
@@ -137,6 +176,61 @@ describe('issue endpoints', { timeout: 30_000 }, () => {
       const response = await refreshing;
       expect(response.status).toBe(200);
       expect(response.body.state).toMatchObject({ state: 'fresh', issues: [{ number: 1, reasons: ['20 points: bug label'] }] });
+    } finally { await app.close(); }
+  });
+
+  it('records repository-and-author-bound trust, replays it, and refuses a stale author precondition', async () => {
+    root = mkdtempSync(join(tmpdir(), 'codeboost-issues-trust-'));
+    let author: string | null = 'outside', accessReads = 0;
+    const base = snapshot(), external = { ...base, issues: [{ ...base.issues[0]!, authorLogin: author, trust: 'requires-approval' as const }] };
+    const gateway = {
+      repository: 'owner/repo',
+      async fetch() { return { ...external, issues: [{ ...external.issues[0]!, authorLogin: author }] }; },
+      async issueAccess(number: number) { accessReads++; return { number, authorLogin: author, collaborator: false }; },
+      async issueText(number: number) { return { number, title: 'One', body: '', comments: [] }; },
+    };
+    const app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
+    try {
+      await call(app.url, app.token, 'POST', { action: 'refresh' });
+      const actionId = randomUUID(), requestBody = { action: 'trust', actionId, number: 1, authorLogin: 'outside' };
+      const trusted = await call(app.url, app.token, 'POST', requestBody);
+      expect(trusted).toMatchObject({ status: 200, body: { state: { issues: [{ trust: 'approved', trustedBy: 'local user' }] } } });
+      expect((await call(app.url, app.token, 'POST', requestBody)).body).toEqual(trusted.body);
+      expect(accessReads).toBe(1);
+      const untrustId = randomUUID();
+      expect(await call(app.url, app.token, 'POST', { ...requestBody, actionId: untrustId, action: 'untrust' }))
+        .toMatchObject({ status: 200, body: { state: { issues: [{ trust: 'requires-approval' }] } } });
+      expect(await call(app.url, app.token, 'POST', { ...requestBody, actionId: randomUUID() }))
+        .toMatchObject({ status: 200, body: { state: { issues: [{ trust: 'approved' }] } } });
+      const replayedUntrust = await call(app.url, app.token, 'POST', { ...requestBody, actionId: untrustId, action: 'untrust' });
+      expect(replayedUntrust).toMatchObject({ status: 200, body: { state: { issues: [{ trust: 'approved' }] } } });
+      expect(accessReads).toBe(3);
+      author = 'renamed';
+      const stale = await call(app.url, app.token, 'POST', { ...requestBody, actionId: randomUUID(), action: 'untrust' });
+      expect(stale).toMatchObject({ status: 409, body: { error: expect.stringMatching(/author changed/i) } });
+    } finally { await app.close(); }
+  });
+
+  it('records an issue-access failure under the trust action ID and replays the same 502 without another read', async () => {
+    root = mkdtempSync(join(tmpdir(), 'codeboost-issues-trust-failure-'));
+    let accessReads = 0, fail = true;
+    const gateway = {
+      repository: 'owner/repo',
+      async fetch() { return snapshot(); },
+      async issueAccess(number: number) { accessReads++; if (fail) throw new Error('GitHub unavailable');
+        return { number, authorLogin: 'outside', collaborator: false }; },
+      async issueText(number: number) { return { number, title: 'One', body: '', comments: [] }; },
+    };
+    const app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, gateway);
+    try {
+      await call(app.url, app.token, 'POST', { action: 'refresh' });
+      const requestBody = { action: 'trust', actionId: randomUUID(), number: 1, authorLogin: 'outside' };
+      expect(await call(app.url, app.token, 'POST', requestBody)).toMatchObject({ status: 502,
+        body: { error: expect.stringMatching(/GitHub unavailable/) } });
+      fail = false;
+      expect(await call(app.url, app.token, 'POST', requestBody)).toMatchObject({ status: 502,
+        body: { error: expect.stringMatching(/GitHub unavailable/) } });
+      expect(accessReads).toBe(1);
     } finally { await app.close(); }
   });
 

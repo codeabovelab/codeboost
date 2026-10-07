@@ -1,4 +1,5 @@
 import { identityKey, type PlanIdentity } from '../core/identity.ts';
+import { createHash } from 'node:crypto';
 import type { PlanContext } from '../core/plan.ts';
 import type { InvocationContext, InvocationHandle, InvocationInput, TaskClone } from '../agents/contract.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
@@ -54,13 +55,15 @@ export interface TaskWorkspace {
 }
 /** D's start call for an execute/fix phase with this prompt and the tree check made for it; returns at once (see #51). */
 export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: WorkspaceRef, treeCheck: TaskTreeCheck) => InvocationHandle;
+/** Issue text plus the synchronous authorization check that must run in the same turn as prompt construction. */
+export interface GuardedIssueText { readonly text: IssueText; validate(): void }
 /** Trusted runner-side sources for a task. Issue text and lessons are untrusted data inside the prompt. */
 export interface ExecutionSources {
   planContext(identity: PlanIdentity): PlanContext;
   /** Entries of the audited runner commit, read from its immutable tree after export. */
   checkpointContext(identity: PlanIdentity, head: string): PlanContext;
-  /** The issue text the prompt carries; fetched per attempt, so it may await (and must stop on abort). */
-  issue(identity: PlanIdentity, signal: AbortSignal): IssueText | Promise<IssueText>;
+  /** Fetched per attempt; its guard is re-run synchronously at prompt construction after the await. */
+  issue(identity: PlanIdentity, signal: AbortSignal): GuardedIssueText | Promise<GuardedIssueText>;
   lessons(identity: PlanIdentity): readonly string[];
   vendor(identity: PlanIdentity): 'claude' | 'codex';
 }
@@ -120,7 +123,7 @@ export class SafetyFindings {
 }
 export interface ExecutionResult { head: string; unchanged: boolean; inScope: string[]; outOfScope: string[] }
 interface Private { workspace: WorkspaceRef; prompt: string; baseHead: string; linkSnapshot: DeclaredLinkSnapshot | undefined;
-  treeCheck: TaskTreeCheck | undefined }
+  treeCheck: TaskTreeCheck | undefined; promptComments: { count: number; digest: string } }
 
 /**
  * RunnerDeps for execute attempts: fresh workspace, prompt, agent, then audit and the runner's own commit.
@@ -170,14 +173,20 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const vendor = sources.vendor(identity);
       // D refuses Codex in phases it cannot work in (#93); refuse here too, before any GitHub call or task storage.
       if (vendor === 'codex') assertCodexPhase('execute');
-      const issue = await sources.issue(identity, signal);
+      const guardedIssue = await sources.issue(identity, signal);
       signal.throwIfAborted();
+      guardedIssue.validate();
+      const issue = guardedIssue.text;
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
         issue, approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
+      const promptComments = {
+        count: issue.comments.length,
+        digest: createHash('sha256').update(JSON.stringify(issue.comments)).digest('hex'),
+      };
       const declaredPaths = [...new Set(item.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]))];
       const ws = await workspace.materialize(attempt, baseHead, signal);
       // From here task storage exists: a failure hands it to the coordinator, which removes it after the terminal write.
-      const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined, treeCheck: undefined };
+      const data: Private = { workspace: ws, prompt: request.prompt, baseHead, linkSnapshot: undefined, treeCheck: undefined, promptComments };
       const prepared = { clone: ws.clone, vendor, approvedArgv: request.approvedArgv, private: data };
       try { data.linkSnapshot = await workspace.snapshotDeclaredLinks(ws, declaredPaths, signal); }
       catch (error) { throw new PreparationFailure(error, prepared); }
@@ -206,7 +215,12 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
     },
     // Host-side files only (the staging clone); task storage waits for release.
     async cleanupPreparation(attempt) { await workspace.cleanupPreparation?.(attempt); },
+    beforeStart(attempt, prepared) {
+      const data = prepared.private as Private;
+      store.recordAttemptComments(identityOf(attempt), attempt.id, data.promptComments);
+    },
     start(input, prepared) { const data = prepared.private as Private; return launch(input, data.prompt, data.workspace, data.treeCheck!); },
+    onStarted(attempt) { store.markAttemptCommentsDelivered(identityOf(attempt), attempt.id); },
     validate() { throw new Error('Execute attempts publish through finish().'); },
     async finish(attempt, _result, prepared, signal) {
       const data = prepared.private as Private, identity = identityOf(attempt);

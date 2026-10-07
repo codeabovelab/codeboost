@@ -775,3 +775,8 @@ body.resizing-conversation { cursor: col-resize; user-select: none; }
   font-size: 12px;
   color: var(--muted);
 }
+.issue-trust {
+  display: block;
+  margin-top: 8px;
+  white-space: nowrap;
+}
