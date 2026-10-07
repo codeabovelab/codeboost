@@ -63,6 +63,8 @@ export interface ConflictResolverOptions {
   readonly image: () => string;
   readonly token: string;
   readonly limits: TaskStorageLimits;
+  /** Fresh authorization re-read immediately before the credentialed conflict agent launches. */
+  readonly authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
   readonly deps?: Partial<ResolverDeps>;
 }
 export type ForeignConflictResolverOptions = ConflictResolverOptions;
@@ -319,6 +321,12 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
       const prompt = `Resolve source commit ${JSON.stringify(input.commit)} while it is replayed onto base commit ${JSON.stringify(input.baseHead)}. `
         + ownership + `Resolve the in-progress conflict in exactly these paths: ${JSON.stringify(input.files)}. `
         + 'Edit only those paths. Do not create commits or change repository metadata. Preserve the intent of both sides and leave each path in its final resolved form.';
+      if (options.authorize) {
+        const authorizationSignal = input.signal ?? new AbortController().signal;
+        const validate = await bounded(options.authorize(authorizationSignal));
+        await bounded(Promise.resolve(validate()));
+        input.signal?.throwIfAborted();
+      }
       assertCurrentContext();
       handle = deps.start({ invocation, filesystems, inputDirectory, imageId, prompt,
         networkAllocationId, treeCheck, cleanupRoot: staging, processLifecycle }, options.token,

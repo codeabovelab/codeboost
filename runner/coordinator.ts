@@ -124,6 +124,8 @@ export interface StartRequest {
   expectedContext: AttemptRecord['context'];
   /** Clears the task's requeue claim in the admitting transaction: the user's Resume of an interrupted task. */
   claimRequeue?: boolean;
+  /** Fresh authorization plus its final launch guard. This is trusted coordinator state, never persisted input. */
+  authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
 }
 export interface RunnerStatus {
   active: boolean;
@@ -151,6 +153,7 @@ interface Job {
    * later stop, but the job's reason, its abort signal and D's handle change only on commit; a rollback drops it (#79).
    */
   pendingReason?: FirstReason;
+  authorize?: StartRequest['authorize'];
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: UnresolvedReason }
@@ -214,7 +217,8 @@ export class RunnerCoordinator {
     if (this.#deps.kinds && !this.#deps.kinds.includes(request.kind)) throw new GuardRefusal(`The runner cannot run ${request.kind} attempts yet.`);
     const group: Group = WRITABLE_KINDS.includes(request.kind) ? 'writable' : 'readOnly';
     if (this.#used(group) >= this.#limits[group]) throw new GuardRefusal('No free runner slot. Try again when the current attempt finishes.');
-    const job: Job = { identity: { ...identity }, key, group, attemptId: '', firstReason: null, reasonSaved: true, preparationTimedOut: false, controller: new AbortController(), timers: [] };
+    const job: Job = { identity: { ...identity }, key, group, attemptId: '', firstReason: null, reasonSaved: true,
+      preparationTimedOut: false, authorize: request.authorize, controller: new AbortController(), timers: [] };
     this.#jobs.set(key, job);
     let attempt: AttemptRecord;
     try { attempt = this.#store.admitAttempt(identity, { ...request, now: this.#now() }); }
@@ -231,7 +235,7 @@ export class RunnerCoordinator {
    * User stop or detected staleness. The first reason wins; nothing is freed until settlement.
    * `cause` says what made the attempt stale (for example "plan revision 4 replaced 3") and is kept only if `stale` wins.
    */
-  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale' | 'shutdown', cause?: string): boolean {
+  stop(identity: PlanIdentity, attemptId: string, reason: FirstReason, cause?: string): boolean {
     const job = this.#jobs.get(identityKey(identity));
     if (!job || job.attemptId !== attemptId) return false;
     return this.#requestStop(job, reason, reason === 'stale' && cause !== undefined ? bounded(cause) : undefined);
@@ -348,6 +352,14 @@ export class RunnerCoordinator {
         return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error), error instanceof PreparationFailure ? error.allocated : undefined);
       }
       if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
+      if (job.authorize) try {
+        const validate = await job.authorize(job.controller.signal);
+        await validate();
+        job.controller.signal.throwIfAborted();
+      } catch (error) {
+        return await this.#endBeforeLaunch(job, attempt,
+          { detail: `Authorization changed before launch: ${message(error)}` }, prepared);
+      }
       // Launch check: one synchronous turn, no await between the checks and D's start call.
       const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;

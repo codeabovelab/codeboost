@@ -187,7 +187,8 @@ export interface RunnerAssembly {
   /** Tests only: the delay of the publisher's short retry (SHORT_RETRY_MS, 30 s). */
   readonly shortRetryMs?: number;
   /** F5 production refresh/rebase/check coordinator, built against the configured task PR. */
-  readonly preMerge?: (runner: RunnerCoordinator, inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>) => PreMergeCoordinator;
+  readonly preMerge?: (runner: RunnerCoordinator, inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>,
+    authorize: (signal: AbortSignal) => Promise<() => void | Promise<void>>) => PreMergeCoordinator;
   readonly sources: ExecutionSources;
   readonly findings: SafetyFindings;
   readonly recovery: RecoveryReport;
@@ -223,6 +224,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const identity = review.identity;
   const rebasePlanKey = identityKey(identity);
   let repositoryPromise: Promise<RunnerRepository> | undefined, rebaserPromise: Promise<GitRebaser> | undefined;
+  let authorizePreMerge: ((signal: AbortSignal) => Promise<() => void | Promise<void>>) | undefined;
   const getRepository = () => repositoryPromise ??= openRunnerRepository({ runnerRoot: config.root, runnerOwner,
     repositoryId: identity.repositoryId, source: review.repository }).then(repository => {
       // The review and rebase recovery read the same runner-owned repository that execution writes.
@@ -231,9 +233,8 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       review.runnerRepository = repository.path;
       return repository;
     });
-  // F3-F4 assemble the trusted local rewrite/conflict engine here so startup can recover its durable markers. No
-  // production action starts it yet: F5-F6 must first own base/head refresh, admission, checks, push and merge handoff.
-  // Exposing the raw rebaser before that coordinator exists would let a caller bypass those required guards.
+  // Assemble the trusted local rewrite/conflict engine here so startup can recover its durable markers. The F5
+  // coordinator below is its only live entry point; exposing the raw rebaser would bypass refresh, admission and checks.
   const getRebaser = () => rebaserPromise ??= getRepository().then(repository => new GitRebaser({ repository,
     runnerRoot: config.root, runnerOwner, committer: config.committer,
     onProcessStarting: attemptId => o.capability.run(() => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, null, 'spawning')),
@@ -246,6 +247,10 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       : o.capability.run(() => service.store.setRebaseResultState(rebasePlanKey, attemptId, state)),
     resolveForeignConflict: createForeignConflictResolver({ store: service.store, identity, planKey: rebasePlanKey,
       repository, runnerOwner, image, token,
+      authorize: signal => {
+        if (!authorizePreMerge) throw new GuardRefusal('Issue trust admission is not configured.');
+        return authorizePreMerge(signal);
+      },
       limits: { ...EXECUTE_STORAGE, ...config.limits } }) }));
   const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
     diagnosticsCapBytes: config.diagnosticsCapBytes,
@@ -315,10 +320,13 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     pulls: new GhPullRequestGateway({ repository: github.repository, env }), pusher, closing }, { repository: github.repository, baseBranch: base });
   const rebaser = await getRebaser();
   const preMerge = (runner: RunnerCoordinator,
-    inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>) =>
-    new PreMergeCoordinator(service, runner, rebaser, {
+    inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>,
+    authorize: (signal: AbortSignal) => Promise<() => void | Promise<void>>) => {
+    authorizePreMerge = authorize;
+    return new PreMergeCoordinator(service, runner, rebaser, {
       inspect,
       fetch: (pair, signal) => pusher.fetchCommits([pair.base, pair.head], signal),
-    }, undefined, o.capability);
+    }, undefined, o.capability, authorize);
+  };
   return { deps, sources, findings, recovery, publisher, env, preMerge };
 }

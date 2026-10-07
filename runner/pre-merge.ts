@@ -2,7 +2,7 @@ import { readHistory } from '../git/history.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
-import type { GitRebaser } from './rebase.ts';
+import { RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
 import type { ReviewService } from './review.ts';
 import type { RebaseMarker } from './store.ts';
 
@@ -22,7 +22,8 @@ export class PreMergeCoordinator {
   readonly runner: RunnerCoordinator;
   readonly rebaser: GitRebaser;
   readonly remote: PreMergeRemote;
-  readonly checkTimeoutMs: number;
+  readonly operationTimeoutMs: number;
+  readonly authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
   readonly settle: <T>(fn: () => T) => T;
   #active: Promise<PreMergeResult> | null = null;
   #abort: AbortController | null = null;
@@ -30,11 +31,12 @@ export class PreMergeCoordinator {
   #last: PreMergeResult | null = null;
 
   constructor(service: ReviewService, runner: RunnerCoordinator, rebaser: GitRebaser, remote: PreMergeRemote,
-    checkTimeoutMs = 10 * 60_000, capability?: ShutdownCapability) {
-    if (!Number.isSafeInteger(checkTimeoutMs) || checkTimeoutMs < 1 || checkTimeoutMs > 60 * 60_000)
-      throw new Error('Invalid command-check deadline.');
+    operationTimeoutMs = 10 * 60_000, capability?: ShutdownCapability,
+    authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>) {
+    if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 60 * 60_000)
+      throw new Error('Invalid pre-merge operation deadline.');
     this.service = service; this.runner = runner; this.rebaser = rebaser; this.remote = remote;
-    this.checkTimeoutMs = checkTimeoutMs;
+    this.operationTimeoutMs = operationTimeoutMs; this.authorize = authorize;
     this.settle = settleWith(capability);
   }
 
@@ -47,9 +49,12 @@ export class PreMergeCoordinator {
   start(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }): Promise<PreMergeResult> {
     this.assertStartable();
     const controller = new AbortController(); this.#abort = controller;
+    const deadline = performance.now() + this.operationTimeoutMs;
+    const timer = setTimeout(() => controller.abort(Object.assign(new Error('Pre-merge preparation deadline exceeded.'),
+      { code: 'ETIMEDOUT' })), this.operationTimeoutMs);
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
-    const active = Promise.resolve().then(() => this.#run(expected, controller.signal)).then(result => (this.#last = result), error => {
+    const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline)).then(result => (this.#last = result), error => {
       // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
       const snapshot = this.service.store.getSnapshot(this.service.config.identity);
       const result: PreMergeResult = { state: 'failed', base: snapshot.base, head: snapshot.head,
@@ -65,7 +70,7 @@ export class PreMergeCoordinator {
         return failed;
       }
       return result;
-    }).finally(() => { if (this.#active === active) { this.#active = null; this.#abort = null; } });
+    }).finally(() => { clearTimeout(timer); if (this.#active === active) { this.#active = null; this.#abort = null; } });
     this.#active = active;
     return active;
   }
@@ -93,6 +98,9 @@ export class PreMergeCoordinator {
     if (item) return `${item.id} requires refreshed attribution or approval.`;
     if (view.segments.some(segment => segment.row === 'Ambiguous')) return 'Ambiguous changes require attribution.';
     if (view.segments.some(segment => segment.row === 'Unplanned')) return 'Unplanned changes require a plan amendment.';
+    const changes = view.notes.filter(note => note.kind === 'change' && note.revision === view.plan.revision
+      && note.snapshotId === view.snapshot.id).length;
+    if (changes) return `${changes} change request${changes === 1 ? ' remains' : 's remain'} open.`;
     if (requireChecks) {
       const unchecked = view.items.find(item => item.acceptance.some(check => check.type === 'cmd') && item.checks.tests !== '✓ Passed');
       if (unchecked) return `${unchecked.id} command checks have not passed on this head.`;
@@ -106,8 +114,19 @@ export class PreMergeCoordinator {
     if (!this.settle(() => this.service.store.abortRebase(this.service.store.getTask(identity).planKey, marker.attemptId)))
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
-  async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal): Promise<PreMergeResult> {
+  async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
+    deadline: number): Promise<PreMergeResult> {
     const identity = this.service.config.identity;
+    const remaining = () => {
+      const value = Math.ceil(deadline - performance.now());
+      if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded.'), { code: 'ETIMEDOUT' });
+      return value;
+    };
+    const authorize = async () => {
+      if (!this.authorize) return;
+      const validate = await this.authorize(signal);
+      await validate(); signal.throwIfAborted(); remaining();
+    };
     let view = this.service.load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
@@ -147,6 +166,7 @@ export class PreMergeCoordinator {
       const marker = this.service.store.beginRebase(identity, reviewed, task.stateVersion,
         { oldBase: view.snapshot.base, oldHead: view.snapshot.head, oldHistory: old, onto: initial.base });
       try {
+        await authorize();
         const result = await this.rebaser.run({ attemptId: marker.attemptId, oldBase,
           oldHead, oldHistory: old, onto: initial.base,
           ledger: this.service.store.getLedger(identity), signal });
@@ -154,6 +174,7 @@ export class PreMergeCoordinator {
         this.service.store.finishRebase(identity, reviewed, task.stateVersion, marker.attemptId,
           result.base, result.head, result.mappings);
       } catch (error) {
+        if (error instanceof RebaseResourcesUnsettled) throw error;
         try { await this.#cleanupRebase(identity, marker); }
         catch (cleanup) { throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error }); }
         throw error;
@@ -168,13 +189,16 @@ export class PreMergeCoordinator {
       signal.throwIfAborted();
       task = this.service.store.getTask(identity);
       const attempt = this.runner.start(identity, { expectedStateVersion: task.stateVersion, kind: 'check', item: item.id,
-        deadline: Date.now() + this.checkTimeoutMs, expectedContext: this.service.store.currentContext(identity) });
-      const stop = () => this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown' : 'cancelled');
+        deadline: Date.now() + remaining(), expectedContext: this.service.store.currentContext(identity),
+        ...(this.authorize ? { authorize: this.authorize } : {}) });
+      const stop = () => this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown'
+        : (signal.reason as { code?: unknown } | undefined)?.code === 'ETIMEDOUT' ? 'time-limit' : 'cancelled');
       signal.addEventListener('abort', stop, { once: true });
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       signal.throwIfAborted();
       const settled = this.service.store.getAttempt(identity, attempt.id);
-      if (settled.state !== 'completed') throw new GuardRefusal(`${item.id} command checks did not pass.`);
+      if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
+        ? settled.diagnostic : `${item.id} command checks did not pass.`);
       checked.push(item.id); view = this.service.load();
       const changed = this.#reviewBlocker(view);
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
@@ -197,6 +221,7 @@ export class PreMergeCoordinator {
     const finalBlocker = this.#reviewBlocker(view, true);
     if (finalBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
       reason: finalBlocker };
+    await authorize();
     return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null };
   }
 }

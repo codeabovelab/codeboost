@@ -383,6 +383,20 @@ describe('review regressions', () => {
     expect(store.getAttempt(A, check.id)).toMatchObject({ state: 'completed', firstReason: null });
     expect(store.getTask(A).status).toBe('in review');
   });
+  it('revalidates authorization after preparation and refuses a revoked launch', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const calls: string[] = [];
+    const attempt = runner.start(A, request(store, A, { authorize: async () => {
+      calls.push('read');
+      return () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); };
+    } }));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(calls).toEqual(['read', 'validate']);
+    expect(launches).toEqual([]);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null,
+      diagnostic: expect.stringMatching(/Authorization changed before launch.*trust was revoked/) });
+  });
   it('shows the cancel task stop after a preparation timeout, and closes the task', async () => {
     const { store, runner, preparations } = setup({ prepareIgnoresAbort: true });
     const attempt = runner.start(A, request(store, A, { deadline: Date.now() + 30 }));

@@ -165,6 +165,19 @@ describe('production rebase conflict resolver', () => {
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
   });
 
+  it('revalidates authorization immediately before the credentialed conflict agent launch', async () => {
+    const f = fixture(), x = deps(f), calls: string[] = [];
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      authorize: async () => { calls.push('read'); return () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); }; },
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve(input(f))).rejects.toThrow(/Issue trust was revoked/);
+    expect(calls).toEqual(['read', 'validate']);
+    expect(x.events).not.toContain('start');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
   it('bounds the complete host snapshot before changing the destination', () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-conflict-copy-')); roots.push(root);
     const source = join(root, 'source'), destination = join(root, 'destination');

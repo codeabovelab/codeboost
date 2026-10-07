@@ -12,6 +12,7 @@ import { commandCheckDeps } from '../runner/checks.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import type { InvocationHandle, InvocationResult } from '../agents/contract.ts';
 import type { TaskWorkspace, WorkspaceRef } from '../runner/execution.ts';
+import { RebaseResourcesUnsettled } from '../runner/rebase.ts';
 
 const roots: string[] = [], services: ReviewService[] = [];
 vi.setConfig({ testTimeout: 15_000 });
@@ -33,6 +34,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
   closeDuringCommand?: boolean;
+  unsettledRebase?: boolean;
+  authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -63,16 +66,18 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
   markRunnerOwned(service); view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
   let coordinator!: PreMergeCoordinator, rebaseRuns = 0;
+  let rebaseAborts = 0;
   const rebaser = { run: async (input: { attemptId: string; signal: AbortSignal }) => {
     rebaseRuns++;
     options.duringRebase?.(service, coordinator);
     input.signal.throwIfAborted();
+    if (options.unsettledRebase) throw new RebaseResourcesUnsettled('Conflict resources remain owned.');
     const planKey = service.store.getTask(identity).planKey;
     service.store.prepareRebaseResult(planKey, input.attemptId, rebased, [rebased]);
     service.store.completeRebaseResult(planKey, input.attemptId);
     return { oldHead: head, base: onto, head: rebased,
       mappings: [{ oldSha: head, newSha: rebased }], resolvedConflicts: [] };
-  }, abort: async () => undefined } as never;
+  }, abort: async () => { rebaseAborts++; } } as never;
   const checkedHeads: string[] = [];
   const workspace: TaskWorkspace = {
     async materialize(attempt, checkedHead) {
@@ -105,12 +110,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       remoteReads++;
       if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator);
       return { base: onto, head };
-    }, fetch: async () => undefined });
+    }, fetch: async () => undefined }, undefined, undefined, options.authorize);
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons,
-    rebaseRuns: () => rebaseRuns };
+    rebaseRuns: () => rebaseRuns, rebaseAborts: () => rebaseAborts };
 }
 
 it('preserves an approval when a moved base leaves its attributed fingerprint unchanged', async () => {
@@ -126,6 +131,39 @@ it('returns to review when a moved-base rewrite changes an approved fingerprint'
   expect(result.reason).toMatch(/requires refreshed attribution or approval/);
   expect(service.load().items.find(item => item.id === 'P1')?.state).toBe('stale');
   await coordinator.close(); await runner.close();
+});
+
+it('leaves an unsettled conflict and its rebase marker for startup recovery', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { unsettledRebase: true });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Conflict resources remain owned.' });
+  expect(fixture.rebaseAborts()).toBe(0);
+  expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).not.toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('revalidates authorization before starting the delayed local rebase', async () => {
+  const calls: string[] = [];
+  const fixture = await rebaseFixture('feature\n', undefined, { authorize: async () => {
+    calls.push('read'); return () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); };
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Issue trust was revoked.' });
+  expect(calls).toEqual(['read', 'validate']);
+  expect(fixture.rebaseRuns()).toBe(0);
+  expect(fixture.rebaseAborts()).toBe(1);
+  expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('does not report readiness while a current change request remains open', async () => {
+  const fixture = await rebaseFixture('feature\n');
+  const current = fixture.service.load();
+  fixture.service.store.addReviewNote(fixture.service.config.identity, current.expected, 'P1', 'change', 'Please revise this.');
+  const changed = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
+  const result = await fixture.coordinator.start({ stateVersion: task.stateVersion,
+    reviewVersion: changed.expected.reviewVersion!, snapshotId: changed.snapshot.id });
+  expect(result).toMatchObject({ state: 'review-required', checked: [] });
+  expect(result.reason).toMatch(/1 change request remains open/);
+  await fixture.coordinator.close(); await fixture.runner.close();
 });
 
 it('preserves an unpushed rebased head across review and preparation retries', async () => {
@@ -232,6 +270,22 @@ it('settles an admitted action after shutdown aborts its remote refresh', async 
   await expect(active).resolves.toMatchObject({ state: 'failed', reason: 'Server shutdown.' });
   expect(service.store.savedAction(config.identity, { actionId, kind: 'prepare-merge', request })?.response)
     .toMatchObject({ outcome: 'failed', reason: 'Server shutdown.' });
+});
+
+it('applies one operation-wide deadline to remote work and later checks', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-deadline-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load(), task = service.store.getTask(config.identity);
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
+      fetch: async () => undefined }, 20);
+  await expect(coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id })).resolves.toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
+  await coordinator.close();
 });
 
 it('rechecks the remote after local preparation and refreshes a head that moved in flight', async () => {
