@@ -242,20 +242,29 @@ export class GhIssueGateway implements IssueGateway {
     }));
   }
 
+  async #loadIssueAuthor(number: number, signal: AbortSignal): Promise<string | null> {
+    let decoded: unknown;
+    const output = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/issues/${number}`], { signal });
+    try { decoded = JSON.parse(output); }
+    catch { throw new Error('GitHub returned invalid issue JSON.'); }
+    const issue = object(decoded, 'GitHub returned a malformed issue.');
+    if (issue.number !== number) throw new Error('GitHub returned a different issue.');
+    if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
+    return issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
+  }
+
+  async #loadIssueAccess(number: number, signal: AbortSignal): Promise<{ access: IssueAccess; collaborators: ReadonlySet<string> }> {
+    const authorLogin = await this.#loadIssueAuthor(number, signal);
+    const collaborators = await this.#loadCollaborators(signal);
+    const currentAuthor = await this.#loadIssueAuthor(number, signal);
+    if (currentAuthor !== authorLogin) throw new Error(`Issue #${number}'s author changed during access verification.`);
+    return { access: { number, authorLogin: currentAuthor,
+      collaborator: currentAuthor !== null && collaborators.has(currentAuthor.toLocaleLowerCase('en-US')) }, collaborators };
+  }
+
   async issueAccess(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueAccess> {
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
-    return this.#bounded(options, async signal => {
-      let decoded: unknown;
-      const output = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/issues/${number}`], { signal });
-      try { decoded = JSON.parse(output); }
-      catch { throw new Error('GitHub returned invalid issue JSON.'); }
-      const issue = object(decoded, 'GitHub returned a malformed issue.');
-      if (issue.number !== number) throw new Error('GitHub returned a different issue.');
-      if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
-      const authorLogin = issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
-      const collaborators = await this.#loadCollaborators(signal);
-      return { number, authorLogin, collaborator: authorLogin !== null && collaborators.has(authorLogin.toLocaleLowerCase('en-US')) };
-    });
+    return this.#bounded(options, async signal => (await this.#loadIssueAccess(number, signal)).access);
   }
 
   /**
@@ -292,11 +301,12 @@ export class GhIssueGateway implements IssueGateway {
       const collaborators = includeEveryComment && !options.expectedAccess ? null : await this.#loadCollaborators(signal);
       if (options.expectedAccess) {
         const collaborator = authorLogin !== null && collaborators!.has(authorLogin.toLocaleLowerCase('en-US'));
-        if (options.expectedAccess.number !== number || options.expectedAccess.authorLogin !== authorLogin
+        const currentAuthor = await this.#loadIssueAuthor(number, signal);
+        if (currentAuthor !== authorLogin || options.expectedAccess.number !== number || options.expectedAccess.authorLogin !== currentAuthor
           || options.expectedAccess.collaborator !== collaborator)
           throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
       }
-      const comments: string[] = [];
+      const comments: string[] = [], includedCommentAuthors = new Set<string>();
       for (let page = 1; ; page++) {
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
           `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });
@@ -313,7 +323,9 @@ export class GhIssueGateway implements IssueGateway {
           if (!includeEveryComment) {
             if (comment.user === null) continue;
             const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
-            if (!collaborators!.has(author.toLocaleLowerCase('en-US'))) continue;
+            const authorKey = author.toLocaleLowerCase('en-US');
+            if (!collaborators!.has(authorKey)) continue;
+            includedCommentAuthors.add(authorKey);
           }
           const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
           total += Buffer.byteLength(text);
@@ -324,6 +336,13 @@ export class GhIssueGateway implements IssueGateway {
       }
       const text = { number, title, body, comments };
       carried(text);
+      if (options.expectedAccess) {
+        const current = await this.#loadIssueAccess(number, signal);
+        if (current.access.number !== options.expectedAccess.number || current.access.authorLogin !== options.expectedAccess.authorLogin
+          || current.access.collaborator !== options.expectedAccess.collaborator
+          || [...includedCommentAuthors].some(author => !current.collaborators.has(author)))
+          throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
+      }
       return text;
     });
   }

@@ -22,7 +22,7 @@ import { PullRequestMisplaced, openingMarker, type OpenPullRequestInput, type Pu
 import type { AlreadyFixedGateway } from '../github/already-fixed.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { approveItem } from '../core/approvals.ts';
-import type { IssueTrustGateway } from '../github/issues.ts';
+import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
 
 vi.setConfig({ testTimeout: 30_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -554,6 +554,33 @@ describe('publishing a finished task (#103)', () => {
     await publishSettled(app, identity);
     expect(accessReads).toBe(2);
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'refused', message: expect.stringMatching(/not trusted.*current author/) });
+    expect(w.github.head(branch)).toBeNull();
+    expect(w.github.prs).toEqual([]);
+  });
+
+  it('does not publish when the issue author changes during the final collaborator read', async () => {
+    const w = world(), checking = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let author = 'outside', issueReads = 0, holdCollaborators = false;
+    const issueGateway = new GhIssueGateway(REPO, async args => {
+      if (args.some(argument => argument.endsWith('/collaborators'))) {
+        if (holdCollaborators) { holdCollaborators = false; checking.resolve(); await release.promise; }
+        return '[]';
+      }
+      if (args[5] === `repos/${REPO}/issues`) return '[]';
+      issueReads++;
+      if (issueReads === 3) holdCollaborators = true;
+      return JSON.stringify({ number: 3, user: { login: author } });
+    });
+    const { app, store, identity, branch } = await serve(w, { startup: false, issueGateway, before: service => {
+      completeAll(service);
+      service.store.setIssueTrust({ repository: REPO, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    } });
+    app.publishOwed(() => undefined);
+    await checking.promise;
+    author = 'replacement';
+    release.resolve();
+    await publishSettled(app, identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: expect.stringMatching(/author changed during access verification/) });
     expect(w.github.head(branch)).toBeNull();
     expect(w.github.prs).toEqual([]);
   });

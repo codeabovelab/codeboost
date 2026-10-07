@@ -269,6 +269,38 @@ describe('issue text for an execute prompt (#91)', () => {
       number: 7, authorLogin: null, collaborator: false,
     });
   });
+  it.each([
+    ['old-author', 'new-author'],
+    ['old-author', null],
+    [null, 'new-author'],
+  ] as const)('refuses issue access when the author changes from %s to %s during collaborator retrieval', async (before, after) => {
+    const collaboratorsStarted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    let current: string | null = before;
+    const g = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) {
+        calls.push('collaborators'); collaboratorsStarted.resolve(); await release.promise;
+        return JSON.stringify(before === null ? [] : [{ login: before }]);
+      }
+      calls.push('issue');
+      return JSON.stringify(rawIssue({ user: current === null ? null : { login: current } }));
+    });
+    const checking = g.issueAccess(7);
+    await collaboratorsStarted.promise;
+    current = after;
+    release.resolve();
+    await expect(checking).rejects.toThrow(/author changed during access verification/);
+    expect(calls).toEqual(['issue', 'collaborators', 'issue']);
+  });
+  it('accepts a stable ghost author only after rereading it after collaborator retrieval', async () => {
+    const calls: string[] = [];
+    const g = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) { calls.push('collaborators'); return '[]'; }
+      calls.push('issue'); return JSON.stringify(rawIssue({ user: null }));
+    });
+    await expect(g.issueAccess(7)).resolves.toEqual({ number: 7, authorLogin: null, collaborator: false });
+    expect(calls).toEqual(['issue', 'collaborators', 'issue']);
+  });
   it('refuses text when its current author or collaborator access differs from admission', async () => {
     const changedAuthor = gateway([], rawIssue({ user: { login: 'other' } }), ['other']).gateway;
     await expect(changedAuthor.issueText(7, { expectedAccess: { number: 7, authorLogin: 'member', collaborator: true } }))
@@ -276,6 +308,62 @@ describe('issue text for an execute prompt (#91)', () => {
     const changedAccess = gateway([], rawIssue({ user: { login: 'member' } }), []).gateway;
     await expect(changedAccess.issueText(7, { expectedAccess: { number: 7, authorLogin: 'member', collaborator: true } }))
       .rejects.toThrow(/author or collaborator access changed during admission/);
+  });
+  it.each([
+    ['old-author', 'new-author'],
+    [null, 'new-author'],
+  ] as const)('refuses issue text when the author changes from %s to %s while comments load', async (before, after) => {
+    const commentsStarted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    let current: string | null = before;
+    const g = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) { calls.push('collaborators'); return '[]'; }
+      if (args[5]!.endsWith('/comments')) {
+        calls.push('comments'); commentsStarted.resolve(); await release.promise; return '[]';
+      }
+      calls.push('issue');
+      return JSON.stringify(rawIssue({ user: current === null ? null : { login: current } }));
+    });
+    const checking = g.issueText(7, { trustedAuthor: before,
+      expectedAccess: { number: 7, authorLogin: before, collaborator: false } });
+    await commentsStarted.promise;
+    current = after;
+    release.resolve();
+    await expect(checking).rejects.toThrow(/author or collaborator access changed during admission/);
+    expect(calls).toEqual(['issue', 'collaborators', 'issue', 'comments', 'issue', 'collaborators', 'issue']);
+  });
+  it('revalidates every included collaborator comment author after comment pagination', async () => {
+    const read = async (removeCommentAuthor: boolean, explicitlyTrusted: boolean) => {
+      const commentsStarted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+      const calls: string[] = [];
+      let collaborators = ['issue-author', 'comment-author'];
+      const g = new GhIssueGateway('owner/repo', async args => {
+        if (isCollaboratorRequest(args)) {
+          calls.push('collaborators'); return JSON.stringify(collaborators.map(login => ({ login })));
+        }
+        if (args[5]!.endsWith('/comments')) {
+          calls.push('comments'); commentsStarted.resolve(); await release.promise;
+          return JSON.stringify([comment('comment-author', 'prompt injection')]);
+        }
+        calls.push('issue'); return JSON.stringify(rawIssue({ user: { login: 'issue-author' } }));
+      });
+      const result = g.issueText(7, { ...(explicitlyTrusted ? { trustedAuthor: 'issue-author' } : {}),
+        expectedAccess: { number: 7, authorLogin: 'issue-author', collaborator: true } });
+      await commentsStarted.promise;
+      if (removeCommentAuthor) collaborators = ['issue-author'];
+      release.resolve();
+      return { result, calls };
+    };
+
+    const removed = await read(true, false);
+    await expect(removed.result).rejects.toThrow(/author or collaborator access changed during admission/);
+    expect(removed.calls).toEqual(['issue', 'collaborators', 'issue', 'comments', 'issue', 'collaborators', 'issue']);
+
+    const stable = await read(false, false);
+    await expect(stable.result).resolves.toMatchObject({ comments: ['prompt injection'] });
+
+    const explicitlyTrusted = await read(true, true);
+    await expect(explicitlyTrusted.result).resolves.toMatchObject({ comments: ['prompt injection'] });
   });
   it('refuses a pull request, a different issue, and text too long for a prompt', async () => {
     await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
