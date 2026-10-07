@@ -241,27 +241,27 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
   if (unsettled)
     throw new RecoveryBlocked(`An interrupted rebase has an unidentified escaped process; stop it, then run --release-rebase-process ${unsettled.marker.attemptId}`,
       [unsettled.marker.attemptId]);
+  // A persisted exact group proves only that the leader was recorded, not that every descendant settled. The runner may
+  // have crashed after the leader/group disappeared but before the lifecycle callback durably recorded `unsettled`.
+  // Stop a still-live exact group while its identity is trustworthy, then require the same explicit release in either
+  // case. Workspace open-file scans cannot prove that an escaped pipe holder no longer exists.
+  const recoveredProcess = activeRebases.find(({ marker }) => marker.processGroup !== null);
+  if (recoveredProcess) {
+    const { planKey, marker } = recoveredProcess;
+    if (marker.processGroup === null) throw new Error('Recovered process ownership disappeared during startup recovery.');
+    const processGroup = marker.processGroup;
+    if (typeof processGroup !== 'string' && processes.isAlive(processGroup.pgid))
+      await processes.terminate(processGroup.pgid, processGroup.identity, o.graceMs ?? 5_000);
+    o.store.setRebaseProcessGroup(planKey, marker.attemptId, processGroup, 'unsettled');
+    throw new RecoveryBlocked(`An interrupted rebase may have an unidentified escaped process; stop it, then run --release-rebase-process ${marker.attemptId}`,
+      [marker.attemptId]);
+  }
   const interrupted = o.store.interruptedAttempts();
   // Step 7's input is taken before finalization: an interrupted attempt that started preparation but never saved its group.
   const unowned = interrupted.filter(a => a.preparationStartedAt !== null && a.preparationPgid === null).map(a => a.id);
   // 2b. Stop leftover preparation before D's recovery or any storage work.
   for (const a of interrupted) if (a.preparationPgid !== null && a.preparationStartedAt !== null && processes.isAlive(a.preparationPgid))
     await processes.terminate(a.preparationPgid, a.preparationIdentity, o.graceMs ?? 5_000);
-  // A rebase helper can be a Git/clone process or a Docker client. Stop it before D scans and removes daemon objects,
-  // then prove no descendant still uses the workspace before releasing the process owner.
-  for (const { planKey, marker } of activeRebases) if (marker.processGroup) {
-    const processGroup = marker.processGroup;
-    if (typeof processGroup !== 'string' && processes.isAlive(processGroup.pgid))
-      await processes.terminate(processGroup.pgid, processGroup.identity, o.graceMs ?? 5_000);
-    const workspace = join(o.runnerRoot, o.runnerOwner, 'rebases', marker.attemptId);
-    const stat = lstatSync(workspace, { throwIfNoEntry: false });
-    if (stat && (!stat.isDirectory() || stat.isSymbolicLink()))
-      throw new RecoveryBlocked('An interrupted rebase workspace is not a plain directory', [workspace]);
-    const users = stat ? await (o.openFiles ? o.openFiles(workspace) : hostOpenFilesBounded(workspace)) : [];
-    if (users.length) throw new RecoveryBlocked('A process still uses an interrupted rebase workspace', users);
-    o.store.setRebaseProcessGroup(planKey, marker.attemptId, processGroup, null);
-    marker.processGroup = null;
-  }
   // 2c/2d. D's recovery; a rejection propagates and stops startup.
   const recovered = await o.deps.recoverLeftovers(o.runnerOwner);
   if (recovered.unowned.length) throw new RecoveryBlocked('Docker holds codeboost objects this runner will not remove itself: objects without a runner label may belong to an older build that is still running, and objects of this runner it cannot identify are not ones it made. Stop every older codeboost process, check and run these commands, then start again', recovered.unowned);
