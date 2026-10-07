@@ -202,7 +202,13 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
   return async input => {
     assertConflictPathSet(input.files);
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.baseHead)) throw new Error('Conflict base must be a full commit ID.');
-    const item = input.owner === null ? null : options.store.getPlan(options.identity).items.find(value => value.id === input.owner);
+    const context = options.store.currentContext(options.identity);
+    const assertCurrentContext = () => {
+      if (!sameContext(options.store.currentContext(options.identity), context))
+        throw new Error('The conflict resolution context changed. Reload before launching or applying it.');
+    };
+    const item = input.owner === null ? null
+      : options.store.getPlan(options.identity, context.planRevision).items.find(value => value.id === input.owner);
     if (input.owner !== null && !item) throw new Error('The owned conflict does not name a current plan item.');
     const wallRemaining = input.deadline - Date.now();
     if (!Number.isSafeInteger(input.deadline) || !Number.isSafeInteger(wallRemaining) || wallRemaining < 1)
@@ -214,6 +220,7 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
     // serialization overrun must not create a child whose remaining lifecycle cannot fit the caller's budget.
     const schemaInput = item ? ownedInput(item) : SCHEMA;
     if (performance.now() >= deadline) throw new Error('Conflict deadline has passed.');
+    assertCurrentContext();
     // A pre-cancelled request owns nothing: check immediately before the first durable child claim.
     input.signal?.throwIfAborted();
     const childAttemptId = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
@@ -303,7 +310,6 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
       mkdirSync(inputDirectory, { mode: 0o755 });
       writeFileSync(join(inputDirectory, 'schema.json'), schemaInput, { mode: 0o444, flag: 'wx' });
       chmodSync(join(inputDirectory, 'schema.json'), 0o444);
-      const context = options.store.currentContext(options.identity);
       const invocation = captureInvocation({ clone, phase: 'fix', vendor: 'claude', approvedArgv: [],
         deadline: Date.now() + operationBudget(),
         attemptId: childAttemptId, runnerOwner: options.runnerOwner, context });
@@ -313,6 +319,7 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
       const prompt = `Resolve source commit ${JSON.stringify(input.commit)} while it is replayed onto base commit ${JSON.stringify(input.baseHead)}. `
         + ownership + `Resolve the in-progress conflict in exactly these paths: ${JSON.stringify(input.files)}. `
         + 'Edit only those paths. Do not create commits or change repository metadata. Preserve the intent of both sides and leave each path in its final resolved form.';
+      assertCurrentContext();
       handle = deps.start({ invocation, filesystems, inputDirectory, imageId, prompt,
         networkAllocationId, treeCheck, cleanupRoot: staging, processLifecycle }, options.token,
         { invocationBudget: operationBudget });
@@ -350,6 +357,7 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
         exportedBytes += Buffer.byteLength(entry.path) + (entry.content?.length ?? 0);
         if (exportedBytes > MAX_CONFLICT_SNAPSHOT_BYTES) throw new Error('The conflict export exceeded its byte limit.');
       }
+      assertCurrentContext();
       for (const entry of entries) {
         if (performance.now() >= deadline) throw deadlineError();
         writeEntry(input.repository, entry);

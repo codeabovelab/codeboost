@@ -275,6 +275,49 @@ describe('production rebase conflict resolver', () => {
     expect(x.request?.prompt).toContain(oid(9));
   });
 
+  it('does not launch an owned conflict child after its captured plan revision changes', async () => {
+    const f = fixture(), x = deps(f), cloneEntered = Promise.withResolvers<void>(), releaseClone = Promise.withResolvers<void>();
+    const clone = x.d.clone;
+    x.d.clone = async (...args: Parameters<typeof clone>) => {
+      const result = await clone(...args);
+      cloneEntered.resolve();
+      await releaseClone.promise;
+      return result;
+    };
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    const running = resolve({ ...input(f), owner: 'P1' });
+    await cloneEntered.promise;
+    f.store.importRevision(JSON.stringify({ ...plan, items: [{ ...plan.items[0]!, title: 'Changed' }] }), 'json', context, 1);
+    releaseClone.resolve();
+    await expect(running).rejects.toThrow(/context changed/);
+    expect(x.events).not.toContain('start');
+    expect(readFileSync(join(f.repository, 'conflict.txt'), 'utf8')).toBe('conflicted\n');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('does not apply owned conflict output after its captured plan revision changes', async () => {
+    const f = fixture(), inspectEntered = Promise.withResolvers<void>(), releaseInspect = Promise.withResolvers<void>();
+    const x = deps(f, { inspect: async () => {
+      inspectEntered.resolve();
+      await releaseInspect.promise;
+      return manifest();
+    } });
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    const running = resolve({ ...input(f), owner: 'P1' });
+    await inspectEntered.promise;
+    f.store.importRevision(JSON.stringify({ ...plan, items: [{ ...plan.items[0]!, title: 'Changed' }] }), 'json', context, 1);
+    releaseInspect.resolve();
+    await expect(running).rejects.toThrow(/context changed/);
+    expect(readFileSync(join(f.repository, 'conflict.txt'), 'utf8')).toBe('conflicted\n');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
   it('canonicalizes a cleanup root whose configured spelling traverses a symlink', async () => {
     const f = fixture(), aliasParent = join(f.root, 'root-alias'), alias = join(aliasParent, 'rebase');
     symlinkSync(f.root, aliasParent);
