@@ -11,6 +11,7 @@ import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import { readCapturedFile } from '../agents/container/profile.ts';
 import type { InvocationInput } from '../agents/contract.ts';
+import { ISSUE_READ_ACTIVE_MS, type IssueAccess } from '../github/issues.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/storage.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
@@ -19,10 +20,28 @@ import type { GitRebaser } from '../runner/rebase.ts';
 
 vi.mock('../agents/recovery.ts', async original => ({ ...await original<typeof import('../agents/recovery.ts')>(), recoverLeftovers: vi.fn() }));
 const issueReads: number[] = [];
+let issueAuthor = 'member', issueCollaborator = true;
+let collaboratorComments: string[] = [];
+let afterIssueAccess: (() => void) | undefined;
+let beforeIssueTextReturn: (() => Promise<void> | void) | undefined;
+const issueStageOptions: { signal?: AbortSignal; timeoutMs?: number }[] = [];
 vi.mock('../github/issues.ts', async original => {
   const actual = await original<typeof import('../github/issues.ts')>();
   return { ...actual, GhIssueGateway: class extends actual.GhIssueGateway {
-    override async issueText(number: number) { issueReads.push(number); return { number, title: 'T', body: 'B', comments: [] }; }
+    override async issueAccess(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
+      issueStageOptions.push(options);
+      const result = { number, authorLogin: issueAuthor, collaborator: issueCollaborator };
+      afterIssueAccess?.();
+      return result;
+    }
+    override async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number;
+      trustedAuthor?: string | null; expectedAccess?: IssueAccess } = {}) {
+      issueStageOptions.push(options);
+      await beforeIssueTextReturn?.();
+      if (options.expectedAccess && (options.expectedAccess.authorLogin !== issueAuthor || options.expectedAccess.collaborator !== issueCollaborator))
+        throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
+      issueReads.push(number); return { number, title: 'T', body: 'B', comments: options.trustedAuthor === issueAuthor ? ['Outside note.'] : [...collaboratorComments] };
+    }
   } };
 });
 vi.mock('../agents/container/storage.ts', async original => ({ ...await original<typeof import('../agents/container/storage.ts')>(),
@@ -33,6 +52,11 @@ const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
 afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
   for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true });
+  issueAuthor = 'member'; issueCollaborator = true;
+  collaboratorComments = [];
+  afterIssueAccess = undefined;
+  beforeIssueTextReturn = undefined;
+  issueStageOptions.length = 0;
   vi.restoreAllMocks();
 });
 const OWNER = 'c'.repeat(32), committer = { name: 'codeboost', email: 'runner@codeboost.invalid' };
@@ -93,12 +117,16 @@ describe('runner startup', () => {
   });
   it('reads the issue once for a run of items, and again once the reuse window has passed', async () => {
     const { root, service } = fixture();
+    service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
+      authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
     const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
     issueReads.length = 0;
     const signal = new AbortController().signal, identity = service.config.identity;
     await sources.issue(identity, signal); await sources.issue(identity, signal);
     expect(issueReads).toHaveLength(1);
+    expect(issueStageOptions[0]!.signal).toBe(issueStageOptions[1]!.signal);
+    expect(issueStageOptions.slice(0, 2).map(options => options.timeoutMs)).toEqual([ISSUE_READ_ACTIVE_MS, ISSUE_READ_ACTIVE_MS]);
     // A wall-clock step back does not keep the old text.
     vi.spyOn(Date, 'now').mockReturnValue(0);
     await sources.issue(identity, signal);
@@ -107,6 +135,69 @@ describe('runner startup', () => {
     vi.spyOn(performance, 'now').mockReturnValue(now + ISSUE_REUSE_MS + 1);
     await sources.issue(identity, signal);
     expect(issueReads).toHaveLength(2);
+  });
+  it('does not reuse collaborator-filtered comments without a complete collaborator snapshot', async () => {
+    const { root, service } = fixture();
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    issueReads.length = 0;
+    collaboratorComments = ['Former collaborator note.'];
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({
+      text: { comments: ['Former collaborator note.'] },
+    });
+    // The gateway's next filtered view represents that commenter losing collaborator access while the issue author's
+    // own access remains unchanged. Reusing the old text would keep untrusted instructions in the next prompt.
+    collaboratorComments = [];
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: [] } });
+    expect(issueReads).toEqual([service.store.getPlan(service.config.identity).issue, service.store.getPlan(service.config.identity).issue]);
+  });
+  it('passes explicit trust into execute comments and refuses the next item read after revocation', async () => {
+    const { root, service } = fixture();
+    issueAuthor = 'outside'; issueCollaborator = false;
+    service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
+      authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: ['Outside note.'] } });
+    service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
+      authorLogin: issueAuthor, trusted: false, trustedBy: 'local user' });
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).rejects.toThrow(/not trusted/);
+  });
+  it('refuses when access changes between the execute admission and text read', async () => {
+    const { root, service } = fixture();
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    // The gateway's first read admits the collaborator; its text read observes the changed current access and refuses.
+    afterIssueAccess = () => { issueCollaborator = false; };
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).rejects.toThrow(/access changed during admission/);
+  });
+  it('refuses all-comments text when explicit trust is revoked during the awaited read', async () => {
+    const { root, service } = fixture();
+    issueAuthor = 'outside'; issueCollaborator = false;
+    const issue = service.store.getPlan(service.config.identity).issue;
+    service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    issueReads.length = 0;
+    beforeIssueTextReturn = () => { service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor,
+      trusted: false, trustedBy: 'local user' }); };
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).rejects.toThrow(/not trusted/);
+    beforeIssueTextReturn = undefined;
+    service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: ['Outside note.'] } });
+    expect(issueReads).toEqual([issue, issue]);
+  });
+  it('returns a prompt-boundary guard that catches revocation after issue text resolves', async () => {
+    const { root, service } = fixture();
+    issueAuthor = 'outside'; issueCollaborator = false;
+    const issue = service.store.getPlan(service.config.identity).issue;
+    service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    const guarded = await sources.issue(service.config.identity, new AbortController().signal);
+    expect(guarded.text.comments).toEqual(['Outside note.']);
+    service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: false, trustedBy: 'local user' });
+    expect(() => guarded.validate()).toThrow(/not trusted/);
   });
   it('refuses before touching anything without a github block, a token, or with a demo', async () => {
     for (const [patch, env, message] of [[{ github: undefined }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /github block/], [{}, {}, RUNNER_CREDENTIAL_MISSING], [{ demo: true }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /Demos never/]] as const) {
@@ -152,7 +243,7 @@ describe('server with a runner setup', () => {
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
     const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: (_identity, head) => service.planContextAt(head),
-      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+      issue: () => ({ text: { number: 1, title: '', body: '', comments: [] }, validate: () => undefined }), lessons: () => [], vendor: () => 'claude' };
     return { deps, sources, findings: new SafetyFindings(service.store), recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   };
   it('closes the Store only after the plan runs in progress, and after a failing step', async () => {

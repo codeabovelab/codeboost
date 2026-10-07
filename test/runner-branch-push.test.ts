@@ -8,6 +8,7 @@ import { fixtureGit as git } from './fixtures/git.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { GH_ENV_ALLOWLIST } from '../github/gh-env.ts';
 import { BranchPushRefused, CREDENTIAL_HELPER, GitBranchPusher, gitFailure, pushArguments, pushEnvironment, pushUrl, redact } from '../runner/branch-push.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 import { ensureCommit, fetchTaskCommit, openRunnerRepository, type RunnerRepository } from '../runner/runner-repository.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
@@ -66,6 +67,17 @@ describe('GitBranchPusher', () => {
     // No tags, no attempt refs, nothing else.
     expect(remoteRefs(s)).toBe(`${head} ${REF}`);
     expect(git(s.source, 'for-each-ref')).toBe(sourceRefs);
+  });
+
+  it('runs the final caller guard after the remote read and immediately before the push', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'guarded'), seen: number[] = [];
+    const guarded = pusher(s, { onProcessGroup: () => seen.push(seen.length + 1) });
+    await expect(guarded.instance.push(IDENTITY, { head, branch: BRANCH, beforePush: () => {
+      expect(seen).toHaveLength(2);
+      throw new GuardRefusal('Issue trust was revoked.');
+    } })).rejects.toThrow('Issue trust was revoked');
+    expect(seen).toHaveLength(2);
+    expect(remoteRefs(s)).toBe('');
   });
 
   it('does nothing when the branch is already at the head, as after a push whose outcome was lost', async () => {

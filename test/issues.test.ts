@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES, type IssueText } from '../github/issues.ts';
+import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES, ISSUE_PIPE_GRACE_MS, ISSUE_KILL_GRACE_MS, ISSUE_READ_ACTIVE_MS,
+  ISSUE_READ_TIMEOUT_MS, withIssueReadDeadline, type IssueText } from '../github/issues.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
 
 const rawIssue = (overrides: Record<string, unknown> = {}) => ({
@@ -24,6 +25,71 @@ const responses = (issues: readonly unknown[], collaborators: readonly string[] 
   async (args: readonly string[]) => JSON.stringify(isCollaboratorRequest(args)
     ? collaborators.map(login => ({ login }))
     : issues);
+
+it('shares one issue-read deadline across sequential stages and awaits subprocess settlement inside the wall budget', async () => {
+  vi.useFakeTimers();
+  try {
+    const caller = new AbortController(), access = Promise.withResolvers<void>();
+    let shared: AbortSignal | undefined, settled = false;
+    const operation = withIssueReadDeadline(caller.signal, async (signal, timeoutMs) => {
+      shared = signal;
+      expect(timeoutMs).toBe(ISSUE_READ_ACTIVE_MS);
+      await access.promise;
+      return new Promise<never>((_resolve, reject) => signal.addEventListener('abort', () => {
+        setTimeout(() => { settled = true; reject(signal.reason); }, ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS);
+      }, { once: true }));
+    });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(20_000);
+    access.resolve();
+    await vi.advanceTimersByTimeAsync(ISSUE_READ_ACTIVE_MS - 20_001);
+    expect(shared?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(shared?.aborted).toBe(true);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toBe(shared?.reason);
+    expect(settled).toBe(true);
+    expect(ISSUE_READ_ACTIVE_MS + ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS).toBe(ISSUE_READ_TIMEOUT_MS);
+  } finally { vi.useRealTimers(); }
+});
+
+it('preserves the caller abort reason and waits for the active issue stage to settle', async () => {
+  const caller = new AbortController(), aborted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const reason = new Error('caller stopped');
+  const operation = withIssueReadDeadline(caller.signal, async signal => {
+    signal.addEventListener('abort', () => aborted.resolve(), { once: true });
+    await release.promise;
+    signal.throwIfAborted();
+  });
+  let settled = false;
+  void operation.finally(() => { settled = true; }).catch(() => undefined);
+  caller.abort(reason);
+  await aborted.promise;
+  expect(settled).toBe(false);
+  release.resolve();
+  await expect(operation).rejects.toBe(reason);
+});
+
+it('refuses a successful issue stage that settles after the shared deadline', async () => {
+  vi.useFakeTimers();
+  try {
+    let shared: AbortSignal | undefined;
+    const operation = withIssueReadDeadline(new AbortController().signal, signal => {
+      shared = signal;
+      return new Promise<string>(resolve => signal.addEventListener('abort', () => {
+        setTimeout(() => resolve('late success'), ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS);
+      }, { once: true }));
+    });
+    const outcome = operation.then(value => value, error => error);
+    await vi.advanceTimersByTimeAsync(ISSUE_READ_ACTIVE_MS);
+    expect(shared?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS);
+    expect(await outcome).toBe(shared?.reason);
+  } finally { vi.useRealTimers(); }
+});
 
 describe('GitHub issue retrieval', () => {
   it.each([
@@ -253,11 +319,128 @@ describe('issue text for an execute prompt (#91)', () => {
     expect(text.comments).toEqual([...full.filter((_, n) => n % 2).map(c => c.body), 'last']);
     expect(calls.filter(args => args[5]!.endsWith('/comments')).map(args => args.at(-1))).toEqual(['page=1', 'page=2']);
   });
+  it('includes every comment only when trust matches the issue current author', async () => {
+    const comments = [comment('member', 'collaborator'), comment('outsider', 'outside'), comment(null, 'ghost')];
+    const fixture = gateway([comments], rawIssue({ user: { login: 'outside-author' } })), g = fixture.gateway;
+    expect((await g.issueText(7)).comments).toEqual(['collaborator']);
+    expect((await g.issueText(7, { trustedAuthor: 'old-author' })).comments).toEqual(['collaborator']);
+    expect((await g.issueText(7, { trustedAuthor: 'outside-author' })).comments).toEqual(['collaborator', 'outside', 'ghost']);
+    expect(fixture.calls.filter(isCollaboratorRequest)).toHaveLength(2);
+  });
+  it('reads the current author and collaborator list as one bounded admission decision', async () => {
+    await expect(gateway([], rawIssue({ user: { login: 'Member' } })).gateway.issueAccess(7)).resolves.toEqual({
+      number: 7, authorLogin: 'Member', collaborator: true,
+    });
+    await expect(gateway([], rawIssue({ user: null })).gateway.issueAccess(7)).resolves.toEqual({
+      number: 7, authorLogin: null, collaborator: false,
+    });
+  });
+  it.each([
+    ['old-author', 'new-author'],
+    ['old-author', null],
+    [null, 'new-author'],
+  ] as const)('refuses issue access when the author changes from %s to %s during collaborator retrieval', async (before, after) => {
+    const collaboratorsStarted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    let current: string | null = before;
+    const g = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) {
+        calls.push('collaborators'); collaboratorsStarted.resolve(); await release.promise;
+        return JSON.stringify(before === null ? [] : [{ login: before }]);
+      }
+      calls.push('issue');
+      return JSON.stringify(rawIssue({ user: current === null ? null : { login: current } }));
+    });
+    const checking = g.issueAccess(7);
+    await collaboratorsStarted.promise;
+    current = after;
+    release.resolve();
+    await expect(checking).rejects.toThrow(/author changed during access verification/);
+    expect(calls).toEqual(['issue', 'collaborators', 'issue']);
+  });
+  it('accepts a stable ghost author only after rereading it after collaborator retrieval', async () => {
+    const calls: string[] = [];
+    const g = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) { calls.push('collaborators'); return '[]'; }
+      calls.push('issue'); return JSON.stringify(rawIssue({ user: null }));
+    });
+    await expect(g.issueAccess(7)).resolves.toEqual({ number: 7, authorLogin: null, collaborator: false });
+    expect(calls).toEqual(['issue', 'collaborators', 'issue']);
+  });
+  it('refuses text when its current author or collaborator access differs from admission', async () => {
+    const changedAuthor = gateway([], rawIssue({ user: { login: 'other' } }), ['other']).gateway;
+    await expect(changedAuthor.issueText(7, { expectedAccess: { number: 7, authorLogin: 'member', collaborator: true } }))
+      .rejects.toThrow(/author or collaborator access changed during admission/);
+    const changedAccess = gateway([], rawIssue({ user: { login: 'member' } }), []).gateway;
+    await expect(changedAccess.issueText(7, { expectedAccess: { number: 7, authorLogin: 'member', collaborator: true } }))
+      .rejects.toThrow(/author or collaborator access changed during admission/);
+  });
+  it.each([
+    ['old-author', 'new-author'],
+    [null, 'new-author'],
+  ] as const)('refuses issue text when the author changes from %s to %s while comments load', async (before, after) => {
+    const commentsStarted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    const calls: string[] = [];
+    let current: string | null = before;
+    const g = new GhIssueGateway('owner/repo', async args => {
+      if (isCollaboratorRequest(args)) { calls.push('collaborators'); return '[]'; }
+      if (args[5]!.endsWith('/comments')) {
+        calls.push('comments'); commentsStarted.resolve(); await release.promise; return '[]';
+      }
+      calls.push('issue');
+      return JSON.stringify(rawIssue({ user: current === null ? null : { login: current } }));
+    });
+    const checking = g.issueText(7, { trustedAuthor: before,
+      expectedAccess: { number: 7, authorLogin: before, collaborator: false } });
+    await commentsStarted.promise;
+    current = after;
+    release.resolve();
+    await expect(checking).rejects.toThrow(/author or collaborator access changed during admission/);
+    expect(calls).toEqual(['issue', 'collaborators', 'issue', 'comments', 'issue', 'collaborators', 'issue']);
+  });
+  it('revalidates every included collaborator comment author after comment pagination', async () => {
+    const read = async (removeCommentAuthor: boolean, explicitlyTrusted: boolean) => {
+      const commentsStarted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+      const calls: string[] = [];
+      let collaborators = ['issue-author', 'comment-author'];
+      const g = new GhIssueGateway('owner/repo', async args => {
+        if (isCollaboratorRequest(args)) {
+          calls.push('collaborators'); return JSON.stringify(collaborators.map(login => ({ login })));
+        }
+        if (args[5]!.endsWith('/comments')) {
+          calls.push('comments'); commentsStarted.resolve(); await release.promise;
+          return JSON.stringify([comment('comment-author', 'prompt injection')]);
+        }
+        calls.push('issue'); return JSON.stringify(rawIssue({ user: { login: 'issue-author' } }));
+      });
+      const result = g.issueText(7, { ...(explicitlyTrusted ? { trustedAuthor: 'issue-author' } : {}),
+        expectedAccess: { number: 7, authorLogin: 'issue-author', collaborator: true } });
+      await commentsStarted.promise;
+      if (removeCommentAuthor) collaborators = ['issue-author'];
+      release.resolve();
+      return { result, calls };
+    };
+
+    const removed = await read(true, false);
+    await expect(removed.result).rejects.toThrow(/author or collaborator access changed during admission/);
+    expect(removed.calls).toEqual(['issue', 'collaborators', 'issue', 'comments', 'issue', 'collaborators', 'issue']);
+
+    const stable = await read(false, false);
+    await expect(stable.result).resolves.toMatchObject({ comments: ['prompt injection'] });
+
+    const explicitlyTrusted = await read(true, true);
+    await expect(explicitlyTrusted.result).resolves.toMatchObject({ comments: ['prompt injection'] });
+  });
   it('refuses a pull request, a different issue, and text too long for a prompt', async () => {
     await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
     await expect(gateway([], rawIssue({ number: 8 })).gateway.issueText(7)).rejects.toThrow(/different issue/);
     const long = Array.from({ length: 9 }, () => comment('member', 'x'.repeat(65_000)));
     await expect(gateway([long]).gateway.issueText(7)).rejects.toThrow(/larger than the 32 KiB an execute prompt carries/);
+  });
+  it('describes oversized explicitly trusted comments without calling them collaborator comments', async () => {
+    const outside = gateway([[comment('outsider', 'x'.repeat(40_000))]], rawIssue({ user: { login: 'outside-author' } }), []);
+    await expect(outside.gateway.issueText(7, { trustedAuthor: 'outside-author' }))
+      .rejects.toThrow(/title, body and included comments are larger than the 32 KiB/);
   });
   it('accepts exactly what an execute prompt can carry, end to end, and refuses the rest at the fetch (#91)', async () => {
     const promptOf = (issue: IssueText) => prepareExecution({ identity: { repositoryId: 'repo', taskId: 'task', planId: 'plan' }, attemptId: 'attempt-1',

@@ -2,6 +2,7 @@ import { createServer, type IncomingMessage } from 'node:http';
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import type { PlanIdentity } from '../core/identity.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
 import { Questions, type QuestionAgent } from '../runner/questions.ts';
 import { GhMergeGateway, type MergeGateway } from '../github/merge.ts';
@@ -12,14 +13,18 @@ import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
 import { baseBranch } from '../github/validate.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
-import { ActionIdReused, BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
-import { GhIssueGateway, type IssueGateway } from '../github/issues.ts';
+import { ActionIdReused, BadRequest, GuardRefusal, ShuttingDownError, UpstreamFailure, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
+import { GhIssueGateway, type IssueGateway, type IssueAccess, type IssueTrustGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
 import { SuggestionCoordinator, type PlanningMode, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
-export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
+export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & {
+  repo: { name: string; baseRef: string };
+  /** Revalidates any mutable authority carried by this description at the synchronous prompt-construction boundary. */
+  validate(): void;
+};
 /** Live planning runs only through D (G4 after #51, #117). Until a provider is injected, starting a suggestion is refused. */
 export interface PlanningDeps {
   provider: AuthorProvider;
@@ -33,8 +38,6 @@ export interface PlanningDeps {
 }
 /** Start, cancel or apply a suggestion or a draft (#124): `/api/plan/<kind>` or `/api/plan/<kind>/<id>/<action>`. */
 const PLANNING_REQUEST = /^\/api\/plan\/(suggestions|drafts)(?:\/([0-9a-f-]{36})\/(cancel|apply))?$/;
-/** A dependency the server reads from (GitHub) failed: 502, not recorded. */
-class UpstreamFailure extends Error {}
 /** How long a planning request may take to settle after shutdown aborts it, before its worker is abandoned (Ask's grace). */
 export const PLANNING_SHUTDOWN_GRACE_MS = 20_000;
 /** Production planning is built after the Store opens, from the review it serves (see web/cli.ts). */
@@ -58,19 +61,23 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
-  let planning: PlanningDeps | undefined;
+  let planning: PlanningDeps | undefined, issueSource: IssueGateway | null;
   /** Runs a task's plan items; one per Store, like the coordinator. Only the production runner has one. */
   let executor: ItemExecutor | null = null;
   /** Publishes the task's pull request (#103); only a production runner whose setup built a publisher has one. */
   let publishing: TaskPublishing | null = null;
+  /** Installed after the issue gateway and trust helpers exist; every publish attempt, including retries, calls it. */
+  let authorizePublish: ((identity: PlanIdentity, signal: AbortSignal) => Promise<() => Promise<void>>) | undefined;
   // Only coordinators' settlement and close code receive this; HTTP handlers never do.
   const capability = service.store.shutdownCapability();
   try {
     if (!config.demo && config.github && config.github.issue !== service.store.getPlan(config.identity).issue) throw new Error('The GitHub merge issue must match the stored plan issue.');
     questions=new Questions(service,questionAgent,capability);
     // Issue retrieval is read-only, so demos may show it; they use a local fixture and never contact GitHub.
-    issues = new IssueBoard(issueGateway ?? (config.demo ? demoIssueGateway() : config.github ? new GhIssueGateway(config.github.repository) : null),
-      'Issue ranking needs a GitHub repository. Add a github block with a repository to the review configuration.');
+    issueSource = issueGateway ?? (config.demo ? demoIssueGateway() : config.github ? new GhIssueGateway(config.github.repository) : null);
+    issues = new IssueBoard(issueSource,
+      'Issue ranking needs a GitHub repository. Add a github block with a repository to the review configuration.', undefined,
+      (repository, issue) => service.store.issueTrust(repository, issue));
     // With a runner block the merge targets the task's published PR (#121); without one, github.pullRequest is required.
     const published = !config.demo && config.runner !== undefined && config.github
       ? { repository: config.github.repository, baseBranch: baseBranch(config.github), ...(config.github.pullRequest !== undefined ? { configured: config.github.pullRequest } : {}) } : undefined;
@@ -100,7 +107,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       runner = new RunnerCoordinator(service.store, assembly.deps, undefined, capability);
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
-      if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, { ...(assembly.shortRetryMs !== undefined ? { shortRetryMs: assembly.shortRetryMs } : {}) }); }
+      if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, {
+        ...(assembly.shortRetryMs !== undefined ? { shortRetryMs: assembly.shortRetryMs } : {}),
+        ...(config.github ? { authorizePublish: (publishIdentity: PlanIdentity, signal: AbortSignal) => {
+          if (!authorizePublish) throw new GuardRefusal('Issue trust admission is not configured.');
+          return authorizePublish(publishIdentity, signal);
+        } } : {}),
+      }); }
     } catch (error) { service.close(); throw error; }
   }
   const loadReview=()=>{const view=service.load();return {...view,notes:view.notes.map(note=>({...note,answerActive:questions.isRunning(note.id)}))};};
@@ -109,9 +122,32 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     .filter(note=>note.kind==='question')
     .map(note=>({id:note.id,answer:note.answer,answerActive:questions.isRunning(note.id)}));
   const identity = config.identity;
+  const trustGateway = issueSource && 'issueAccess' in issueSource ? issueSource as IssueTrustGateway : null;
+  const requireTrustedIssue = (access: IssueAccess): void => {
+    if (access.collaborator) return;
+    const repository = trustGateway!.repository;
+    const trust = service.store.issueTrust(repository, access.number);
+    if (!trust || trust.revokedAt !== null || trust.authorLogin !== access.authorLogin)
+      throw new GuardRefusal(`Issue #${access.number} is not trusted for its current author.`);
+  };
+  const readIssueAccess = async (signal: AbortSignal): Promise<IssueAccess> => {
+    if (!trustGateway || !config.github) throw new GuardRefusal('Issue trust admission is not configured.');
+    try { return await trustGateway.issueAccess(config.github.issue, { signal, timeoutMs: 12_000 }); }
+    catch (error) {
+      if (signal.aborted) throw signal.reason;
+      throw new UpstreamFailure(`Issue trust could not be verified: ${error instanceof Error ? error.message : String(error)}`);
+    }
+  };
+  authorizePublish = async (_publishIdentity, signal) => {
+    const access = await readIssueAccess(signal);
+    requireTrustedIssue(access);
+    return async () => requireTrustedIssue(await readIssueAccess(signal));
+  };
   /**
-   * What `start` or `resume` would run (#91 part 2), or the refusal. It writes nothing, so the view asks it too and never
-   * offers what the action would refuse. `start` runs a task that is in review or queued and has attempted no item of its
+   * What `start` or `resume` would run (#91 part 2), or the local refusal. It writes nothing, so the view asks it too.
+   * The view also suppresses controls when the latest complete issue board says trust is blocked; every action still
+   * performs a fresh external admission check because collaborator status and authorship can change afterward. `start`
+   * runs a task that is in review or queued and has attempted no item of its
    * current plan revision; `resume` continues a running or queued task that attempted an item at any revision (or that
    * recovery left to requeue), from the first item the current revision has not completed, whether its last item
    * completed, failed or was stopped. A queued task with only earlier-revision attempts may take either; both run the
@@ -219,25 +255,29 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           reason: error instanceof Error ? error.message : String(error) };
       }
     }
-    return { available: !!runner, task, attempts, startable: !!progress && offered('start', progress), resumable: !!progress && offered('resume', progress),
+    const trustBlocked = !!config.github && issues.trustStatus(config.github.issue) === 'blocked';
+    return { available: !!runner, task, attempts, startable: !trustBlocked && !!progress && offered('start', progress), resumable: !trustBlocked && !!progress && offered('resume', progress),
       stateVersion: task.stateVersion, reviewVersion: service.store.reviewVersion(identity), retryable, stopRequested: status.stopRequested,
-      unresolved: status.unresolved, continuation, publish: publishView(progress) };
+      unresolved: status.unresolved, continuation, publish: publishView(progress, trustBlocked) };
   };
   /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
-  const publishView = (progress?: ReturnType<ItemExecutor['progress']>) => {
+  const publishView = (progress: ReturnType<ItemExecutor['progress']> | undefined, trustBlocked: boolean) => {
     if (!publishing) return { available: false, active: false, publishable: false, closable: false, draft: false, last: null };
     let job: ReturnType<TaskPublishing['mode']> | null = null;
     try { job = publishing.mode(identity, progress); } catch (error) { if (!(error instanceof GuardRefusal) && !(error instanceof ShuttingDownError)) throw error; }
     // `closable`: the task is cancelled and a close of its PRs is owed (#111): not after one that closed them.
     const last = publishing.lastOutcome(identity);
-    return { available: true, active: publishing.busy(identity), publishable: job?.kind === 'publish', closable: job?.kind === 'close' && last?.outcome !== 'closed',
+    return { available: true, active: publishing.busy(identity), publishable: !trustBlocked && job?.kind === 'publish', closable: job?.kind === 'close' && last?.outcome !== 'closed',
       draft: job?.kind === 'publish' && job.draft, last };
   };
   /** A run's outcome is in the task and attempt rows; once it ends, the task's status decides whether a publish is owed. */
   const afterRun = (outcome: Promise<unknown>) => void outcome
     .catch(error => console.error(`Runner run failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`))
-    .finally(() => publishing?.actIfOwed(identity));
-  const runnerAction = (input: Record<string, unknown>) => {
+    .finally(() => {
+      if (!publishing || stopping) return;
+      publishing.actIfOwed(identity);
+    });
+  const runnerAction = async (input: Record<string, unknown>, signal: AbortSignal) => {
     const { action, attemptId, expectedStateVersion, expectedReviewVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
     if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'approve-continuation', 'publish', 'close-pull-requests'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
@@ -252,6 +292,20 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     }
     if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
     const request = { attemptId, expectedStateVersion, ...((action === 'start' || action === 'resume' || action === 'approve-continuation') ? { expectedReviewVersion } : {}) };
+    let access: IssueAccess | undefined;
+    const trustGated = !!config.github &&
+      (((action === 'start' || action === 'resume') && !!executor) ||
+        (action === 'approve-continuation' && !!executor) || (action === 'publish' && !!publishing));
+    if (trustGated) {
+      const replay = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request });
+      if (replay) return replay.response;
+      if (stopping || runner?.closing) throw new ShuttingDownError();
+      try { access = await readIssueAccess(signal); }
+      catch (error) {
+        if (stopping || runner?.closing || signal.aborted) throw new ShuttingDownError();
+        return service.store.userAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request }, () => { throw error; }).response;
+      }
+    }
     // A refused start or resume can still move the task to needs human (an expired budget is committed with the refusal),
     // and a task that moves there is owed a draft PR (#103). Only that move publishes: a person who pressed resume on a
     // task already in needs human asked for no publish.
@@ -310,6 +364,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
       if (action === 'approve-continuation') {
+        if (access) requireTrustedIssue(access);
         if (!executor || runner.isActive(identity) || executor.busy(identity) || publishing?.busy(identity))
           throw new GuardRefusal('The runner is busy or closing; continuation cannot be approved yet.');
         const progress = service.store.continuationProgress(identity);
@@ -327,6 +382,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         return { outcome: 'approved', checkpointId: progress.checkpoint.id, next: progress.next };
       }
       if (action === 'start' || action === 'resume') {
+        if (access) requireTrustedIssue(access);
         const choice = runChoice(action);
         // In this transaction with the admission: a refused admission rolls the move to queued back with it.
         if (choice.queue) service.store.transitionTask(identity, expectedStateVersion as number, 'queued');
@@ -339,6 +395,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         return begun.attemptId ? { outcome: 'started', attemptId: begun.attemptId, item: choice.fromItem } : { outcome: 'settled' };
       }
       if (action === 'publish') {
+        if (access) requireTrustedIssue(access);
         // Retries a publish that failed or was refused (#103); it runs after this action commits, in the background.
         if (!publishing) throw new GuardRefusal(config.demo ? 'Demos never publish pull requests.' : 'This runner does not publish pull requests.');
         // Replaced by the publish's outcome once it settles (recordPublish), so a replay reports that.
@@ -405,7 +462,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         try { described = await planning.describe(signal); }
         catch (error) {
           if (stopping) throw new ShuttingDownError();
-          throw new UpstreamFailure(`The issue could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+          const outcome = error instanceof GuardRefusal ? error
+            : new UpstreamFailure(`The issue could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+          return service.store.userAction<unknown>(identity, { actionId, kind, request }, () => { throw outcome; }).response;
         }
       }
     }
@@ -424,6 +483,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         // Read above whenever the checks before this line pass; they cannot change across the synchronous action.
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
         const amendment = service.planningContextForAmendment(), context = amendment.context;
+        described.validate();
         const handle = suggestions.start({ context, completedItems: amendment.completedItems, continuationBinding: amendment.continuation,
           continuationContext: amendment.continuationContext,
           revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,
@@ -491,6 +551,32 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         // Admitted requests drain normally (AGENTS.md); only the irreversible merge boundary rechecks the flag.
         if (stopping && input.action === 'merge') { json(503, { error: 'The review server is shutting down.' }); return; }
         if(path==='/api/issues') {
+          if (input?.action === 'trust' || input?.action === 'untrust') {
+            if (!trustGateway) throw new GuardRefusal('Issue trust actions are not configured.');
+            if (!isUuidV4(input.actionId)) throw new BadRequest('An issue trust action needs a UUID v4 actionId.');
+            if (!Number.isSafeInteger(input.number) || (input.number as number) < 1) throw new BadRequest('An issue trust action needs a positive issue number.');
+            if (input.authorLogin !== null && (typeof input.authorLogin !== 'string' || !(input.authorLogin as string)))
+              throw new BadRequest('An issue trust action needs the current author login or null.');
+            const kind = `issue-${input.action}`, request = { repository: trustGateway.repository, number: input.number,
+              authorLogin: input.authorLogin, action: input.action };
+            const saved = service.store.savedAction<unknown>(identity, { actionId: input.actionId, kind, request });
+            if (saved) { json(200, issues.view()); return; }
+            let access: IssueAccess;
+            try { access = await trustGateway.issueAccess(input.number as number, { signal: requestAbort.signal, timeoutMs: 12_000 }); }
+            catch (error) {
+              if (stopping || requestAbort.signal.aborted) throw new ShuttingDownError();
+              const failure = new UpstreamFailure(`The issue author could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+              service.store.userAction(identity, { actionId: input.actionId, kind, request }, () => { throw failure; });
+              json(200, issues.view()); return;
+            }
+            service.store.userAction(identity, { actionId: input.actionId, kind, request }, () => {
+              if (access.authorLogin !== input.authorLogin) throw new GuardRefusal('The issue author changed. Refresh before changing trust.');
+              service.store.setIssueTrust({ repository: trustGateway.repository, issue: access.number, authorLogin: access.authorLogin,
+                trusted: input.action === 'trust', trustedBy: 'local user' });
+              return { outcome: input.action === 'trust' ? 'trusted' : 'untrusted', number: access.number };
+            });
+            json(200, issues.view()); return;
+          }
           if(input?.action!=='refresh')throw new Error('Unsupported issue action.');
           await testHooks.beforeIssueRefreshWait?.();
           // A departing browser stops waiting; the board keeps the shared refresh for other callers.
@@ -503,7 +589,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           finally { res.removeListener('close',depart); }
           return;
         }
-        if(path==='/api/runner') { json(200, { result: runnerAction(input), runner: runnerView() }); return; }
+        if(path==='/api/runner') { json(200, { result: await runnerAction(input, requestAbort.signal), runner: runnerView() }); return; }
         if(planningPath) { json(200, { result: await planningAction(path, input, requestAbort.signal) }); return; }
         if(path==='/api/settings') {service.store.setQuestionProvider(input.questionProvider);json(200,{questionProvider:service.store.questionProvider()});return;}
         if(input.action==='retry-question') {
@@ -579,7 +665,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
      * runs once, in the background; recovery finds a lost opening by its marker. A publish pushes, so `verifyLock`
      * (the runner lock still names the database) runs first, here: if it throws, nothing starts and its error is thrown.
      */
-    publishOwed: (verifyLock: () => void) => { verifyLock(); publishing?.startup(identity); },
+    publishOwed: (verifyLock: () => void): void | Promise<void> => {
+      verifyLock();
+      if (!publishing) return;
+      publishing.startup(identity);
+    },
     url: `http://127.0.0.1:${address.port}/#${token}`, close: async () => {
     // Step 1, one synchronous turn: reject new API requests and new runner work. Admitted requests drain (step 2).
     stopping = true;

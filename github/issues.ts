@@ -15,6 +15,24 @@ export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
  * to 0.75 s later: 12.75 s, below the 15-second serving request budget.
  */
 export const ISSUE_KILL_GRACE_MS = 500, ISSUE_PIPE_GRACE_MS = 250;
+/** One sequential access-and-text operation, including the subprocess settlement tail after its active-work abort. */
+export const ISSUE_READ_TIMEOUT_MS = 30_000;
+export const ISSUE_READ_ACTIVE_MS = ISSUE_READ_TIMEOUT_MS - ISSUE_KILL_GRACE_MS - ISSUE_PIPE_GRACE_MS;
+
+/** Shares one active-work deadline across every sequential stage and awaits the caller's work through settlement. */
+export async function withIssueReadDeadline<T>(signal: AbortSignal,
+  read: (sharedSignal: AbortSignal, activeTimeoutMs: number) => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  const deadline = new AbortController();
+  const shared = AbortSignal.any([signal, deadline.signal]);
+  const timer = setTimeout(() => deadline.abort(new Error('Issue retrieval timed out.')), ISSUE_READ_ACTIVE_MS);
+  try {
+    const value = await read(shared, ISSUE_READ_ACTIVE_MS);
+    shared.throwIfAborted();
+    return value;
+  }
+  finally { clearTimeout(timer); }
+}
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
@@ -44,10 +62,19 @@ export interface IssueSnapshot {
 
 /** The issue text an execute prompt carries, as untrusted data. */
 export interface IssueText { readonly number: number; readonly title: string; readonly body: string; readonly comments: readonly string[] }
+export interface IssueAccess { readonly number: number; readonly authorLogin: string | null; readonly collaborator: boolean }
 
 export interface IssueGateway {
   readonly repository: string;
   fetch(options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<IssueSnapshot>;
+}
+
+/** The extra current-issue reads used by trust actions and runner admission. */
+export interface IssueTrustGateway extends IssueGateway {
+  issueAccess(number: number, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<IssueAccess>;
+  issueText(number: number, options?: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null;
+    /** Revalidate the admission read against the issue and collaborator snapshot used for this text read. */
+    expectedAccess?: IssueAccess }): Promise<IssueText>;
 }
 
 type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
@@ -233,12 +260,39 @@ export class GhIssueGateway implements IssueGateway {
     }));
   }
 
+  async #loadIssueAuthor(number: number, signal: AbortSignal): Promise<string | null> {
+    let decoded: unknown;
+    const output = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json', `repos/${this.repository}/issues/${number}`], { signal });
+    try { decoded = JSON.parse(output); }
+    catch { throw new Error('GitHub returned invalid issue JSON.'); }
+    const issue = object(decoded, 'GitHub returned a malformed issue.');
+    if (issue.number !== number) throw new Error('GitHub returned a different issue.');
+    if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
+    return issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
+  }
+
+  async #loadIssueAccess(number: number, signal: AbortSignal): Promise<{ access: IssueAccess; collaborators: ReadonlySet<string> }> {
+    const authorLogin = await this.#loadIssueAuthor(number, signal);
+    const collaborators = await this.#loadCollaborators(signal);
+    const currentAuthor = await this.#loadIssueAuthor(number, signal);
+    if (currentAuthor !== authorLogin) throw new Error(`Issue #${number}'s author changed during access verification.`);
+    return { access: { number, authorLogin: currentAuthor,
+      collaborator: currentAuthor !== null && collaborators.has(currentAuthor.toLocaleLowerCase('en-US')) }, collaborators };
+  }
+
+  async issueAccess(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueAccess> {
+    if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
+    return this.#bounded(options, async signal => (await this.#loadIssueAccess(number, signal)).access);
+  }
+
   /**
-   * One issue's text for an execute prompt (#91): its title, body and the comments of repository collaborators only
-   * (design, "Which comments reach the agent"), oldest first. Everything stays untrusted data inside the prompt.
+   * One issue's text for an execute prompt (#91): its title, body and the comments permitted by current collaborator
+   * access or explicit author-bound trust (design, "Which comments reach the agent"), oldest first.
+   * Everything stays untrusted data inside the prompt.
    * Fails closed on anything malformed, on a pull request, and past the comment page limit.
    */
-  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}): Promise<IssueText> {
+  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null;
+    expectedAccess?: IssueAccess } = {}): Promise<IssueText> {
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
     return this.#bounded(options, async signal => {
       let decoded: unknown;
@@ -249,10 +303,12 @@ export class GhIssueGateway implements IssueGateway {
       if (issue.number !== number) throw new Error('GitHub returned a different issue.');
       if (Object.hasOwn(issue, 'pull_request')) throw new Error(`#${number} is a pull request, not an issue.`);
       const title = boundedString(issue.title, 'title', 4096), body = boundedString(issue.body, 'body', MAX_BODY_LENGTH, true);
+      const authorLogin = issue.user === null ? null : login(object(issue.user, 'GitHub returned an invalid issue author.').login, 'issue author');
+      const includeEveryComment = options.trustedAuthor !== undefined && options.trustedAuthor === authorLogin;
       // The execute prompt carries the issue as one JSON data block of at most MAX_PROMPT_BYTES (dataJSON). A running byte
-      // count stops reading early (a title and body already over it read no collaborator or comment page); the exact check
+      // count stops reading early (a title and body already over it read no included comment page); the exact check
       // below uses the prompt's own serializer, so an issue accepted here is one the prompt can carry.
-      const tooLong = () => new Error(`Issue #${number}'s title, body and collaborator comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
+      const tooLong = () => new Error(`Issue #${number}'s title, body and included comments are larger than the ${MAX_PROMPT_BYTES / 1024} KiB an execute prompt carries; codeboost does not cut an issue to fit.`);
       // Only the size refusal is reworded; any other (text with a NUL, for one) keeps its own reason.
       const carried = (text: IssueText) => {
         try { dataJSON(text, 'Issue data'); } catch (error) { throw /exceeds/.test((error as Error).message) ? tooLong() : error; }
@@ -260,8 +316,15 @@ export class GhIssueGateway implements IssueGateway {
       // The title and body alone, as the prompt serializes them (escaping included): an issue that cannot fit reads nothing more.
       carried({ number, title, body, comments: [] });
       let total = Buffer.byteLength(title) + Buffer.byteLength(body);
-      const collaborators = await this.#loadCollaborators(signal);
-      const comments: string[] = [];
+      const collaborators = includeEveryComment && !options.expectedAccess ? null : await this.#loadCollaborators(signal);
+      if (options.expectedAccess) {
+        const collaborator = authorLogin !== null && collaborators!.has(authorLogin.toLocaleLowerCase('en-US'));
+        const currentAuthor = await this.#loadIssueAuthor(number, signal);
+        if (currentAuthor !== authorLogin || options.expectedAccess.number !== number || options.expectedAccess.authorLogin !== currentAuthor
+          || options.expectedAccess.collaborator !== collaborator)
+          throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
+      }
+      const comments: string[] = [], includedCommentAuthors = new Set<string>();
       for (let page = 1; ; page++) {
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',
           `repos/${this.repository}/issues/${number}/comments`, '-f', `per_page=${PAGE_SIZE}`, '-f', `page=${page}`], { signal });
@@ -275,9 +338,13 @@ export class GhIssueGateway implements IssueGateway {
           const comment = object(value, 'GitHub returned a malformed comment.');
           // A deleted ("ghost") author is nobody's collaborator. Other people's comments are dropped before their body is
           // checked, so none of theirs can make the issue unreadable.
-          if (comment.user === null) continue;
-          const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
-          if (!collaborators.has(author.toLocaleLowerCase('en-US'))) continue;
+          if (!includeEveryComment) {
+            if (comment.user === null) continue;
+            const author = login(object(comment.user, 'GitHub returned an invalid comment author.').login, 'issue author');
+            const authorKey = author.toLocaleLowerCase('en-US');
+            if (!collaborators!.has(authorKey)) continue;
+            includedCommentAuthors.add(authorKey);
+          }
           const text = boundedString(comment.body, 'comment', MAX_BODY_LENGTH, true);
           total += Buffer.byteLength(text);
           if (total > MAX_PROMPT_BYTES) throw tooLong();
@@ -287,6 +354,13 @@ export class GhIssueGateway implements IssueGateway {
       }
       const text = { number, title, body, comments };
       carried(text);
+      if (options.expectedAccess) {
+        const current = await this.#loadIssueAccess(number, signal);
+        if (current.access.number !== options.expectedAccess.number || current.access.authorLogin !== options.expectedAccess.authorLogin
+          || current.access.collaborator !== options.expectedAccess.collaborator
+          || [...includedCommentAuthors].some(author => !current.collaborators.has(author)))
+          throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
+      }
       return text;
     });
   }

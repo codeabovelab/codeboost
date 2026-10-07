@@ -29,7 +29,7 @@ async function serve(answer: (view: View) => Answer, options: { describe?: Plann
   const provider: AuthorProvider = { invoke: (request, signal) => { requests.push(request); return answering(request, signal); } };
   let issue = 0;
   const planning: PlanningDeps = { provider, describe: options.describe ?? (() => ({ issue: { number: issue, title: 'Retries', body: '', comments: [] },
-    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' } })) };
+    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' }, validate: () => undefined })) };
   const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, planning);
   let closed = false;
   const close = async () => { if (!closed) { closed = true; await app.close(); } };
@@ -195,7 +195,7 @@ it('reports a GitHub failure before a draft as 502, recording nothing', async ()
 
 it('refuses a draft with 503 when shutdown begins while the issue is read', async () => {
   let resolve!: () => void;
-  const served = await serve(redraft, { describe: () => new Promise(done => { resolve = () => done({ issue: { number: 0, title: '', body: '', comments: [] }, approvedLessons: [], repo: { name: 'r', baseRef: 'main' } }); }) });
+  const served = await serve(redraft, { describe: () => new Promise(done => { resolve = () => done({ issue: { number: 0, title: '', body: '', comments: [] }, approvedLessons: [], repo: { name: 'r', baseRef: 'main' }, validate: () => undefined }); }) });
   const started = served.start('drafts');
   await vi.waitFor(() => expect(resolve).toBeTypeOf('function'));
   const closing = served.close();
@@ -317,7 +317,7 @@ it('refuses a draft against a stale revision or snapshot, starting nothing', asy
 it('replays a draft start without reading GitHub again', async () => {
   let reads = 0, issue = 0;
   const served = await serve(redraft, { describe: () => { reads++; return { issue: { number: issue, title: 'Retries', body: '', comments: [] },
-    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' } }; } });
+    approvedLessons: [], repo: { name: 'retry-service', baseRef: 'main' }, validate: () => undefined }; } });
   issue = served.view.plan.issue;
   const body = { expectedRevision: served.view.plan.revision, snapshotId: served.view.snapshot.id, feedback: '', actionId: randomUUID() };
   const first = await served.api('POST', '/api/plan/drafts', body);

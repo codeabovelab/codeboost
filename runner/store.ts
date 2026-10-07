@@ -9,7 +9,7 @@ import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import type { AlreadyFixedResult } from '../github/already-fixed.ts';
 import {
-  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, HUMAN_GATES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, HUMAN_GATES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, UpstreamFailure, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   WRITABLE_KINDS, assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
@@ -106,6 +106,11 @@ export interface AttemptRecord {
    * with. The terminal write (or startup recovery) acted on it: the task went to needs human, unless it was closed.
    */
   safetyFinding: string | null;
+  /** Digest and count of the exact issue comments carried by this attempt's prompt. */
+  promptComments: { count: number; digest: string; state: 'prepared' | 'delivered' } | null;
+}
+export interface IssueTrustRecord {
+  repository: string; issue: number; authorLogin: string | null; trustedBy: string; trustedAt: string; revokedAt: string | null;
 }
 /** A non-terminal attempt at startup, with what recovery needs to stop its preparation and export its storage. */
 export interface InterruptedAttempt extends AttemptRecord {
@@ -169,8 +174,8 @@ export class Store {
       this.#db.exec('PRAGMA foreign_keys=ON; PRAGMA journal_mode=WAL; PRAGMA synchronous=FULL;');
       this.#transaction(() => {
         const version = this.#get('PRAGMA user_version')!.user_version as number;
-        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16].includes(version)) throw new Error('Unsupported store schema version.');
-        if (version === 16) return;
+        if (![0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17].includes(version)) throw new Error('Unsupported store schema version.');
+        if (version === 17) return;
         if (version === 0) this.#db.exec(`
           CREATE TABLE plans (key TEXT PRIMARY KEY, issue INTEGER NOT NULL, revision INTEGER NOT NULL, snapshot_id TEXT);
           CREATE TABLE revisions (key TEXT NOT NULL REFERENCES plans(key), revision INTEGER NOT NULL, data TEXT NOT NULL, PRIMARY KEY(key,revision));
@@ -276,6 +281,15 @@ export class Store {
           if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'preparation_identity'))
             this.#db.exec('ALTER TABLE attempts ADD COLUMN preparation_identity TEXT');
           this.#db.exec('PRAGMA user_version=16');
+        }
+        // Repository-scoped issue trust and the exact comment-set evidence carried by execute prompts (#108).
+        if (version < 17) {
+          this.#db.exec(`CREATE TABLE IF NOT EXISTS issue_trust (
+            repository TEXT NOT NULL, issue INTEGER NOT NULL, author_login TEXT, trusted_by TEXT NOT NULL,
+            trusted_at TEXT NOT NULL, revoked_at TEXT, PRIMARY KEY(repository,issue));`);
+          if (!this.#db.prepare('PRAGMA table_info(attempts)').all().some(column => column.name === 'prompt_comments'))
+            this.#db.exec('ALTER TABLE attempts ADD COLUMN prompt_comments TEXT');
+          this.#db.exec('PRAGMA user_version=17');
         }
       });
     } catch (error) { this.#db.close(); throw error; }
@@ -1307,7 +1321,69 @@ export class Store {
       diagnosticRef: row.diagnostic_ref as string | null, createdAt: row.created_at as string,
       startedAt: row.started_at as string | null, settledAt: row.settled_at as string | null,
       safetyFinding: row.safety_finding as string | null,
+      promptComments: row.prompt_comments === null || row.prompt_comments === undefined ? null : decode(row.prompt_comments),
     };
+  }
+  issueTrust(repository: string, issue: number): IssueTrustRecord | null {
+    const row = this.#get('SELECT * FROM issue_trust WHERE repository=? AND issue=?', repository.toLocaleLowerCase('en-US'), issue);
+    if (!row) return null;
+    return { repository: row.repository as string, issue: row.issue as number, authorLogin: row.author_login as string | null,
+      trustedBy: row.trusted_by as string, trustedAt: row.trusted_at as string, revokedAt: row.revoked_at as string | null };
+  }
+  setIssueTrust(input: { repository: string; issue: number; authorLogin: string | null; trusted: boolean; trustedBy: string }): IssueTrustRecord {
+    if (!/^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/.test(input.repository) || !Number.isSafeInteger(input.issue) || input.issue < 1)
+      throw new GuardRefusal('Invalid issue trust target.');
+    if (input.authorLogin !== null && (typeof input.authorLogin !== 'string' || !input.authorLogin || input.authorLogin.length > 100 || /[\s\u0000-\u001f\u007f]/u.test(input.authorLogin)))
+      throw new GuardRefusal('Invalid issue author.');
+    if (typeof input.trustedBy !== 'string' || !input.trustedBy || input.trustedBy.length > 100) throw new GuardRefusal('Invalid trust decision owner.');
+    const repository = input.repository.toLocaleLowerCase('en-US');
+    return this.#transaction(() => {
+      const existing = this.issueTrust(repository, input.issue);
+      // Strictly order decisions even when two clients act in the same wall-clock millisecond. Browser responses use
+      // this timestamp as their CAS version, so an older response can never overwrite a newer same-author decision.
+      const previous = existing ? Date.parse(existing.revokedAt ?? existing.trustedAt) : -1;
+      const now = new Date(Math.max(Date.now(), previous + 1)).toISOString();
+      if (input.trusted) {
+        if (existing?.revokedAt === null && existing.authorLogin === input.authorLogin) return existing;
+        this.#run(`INSERT INTO issue_trust(repository,issue,author_login,trusted_by,trusted_at,revoked_at) VALUES (?,?,?,?,?,NULL)
+          ON CONFLICT(repository,issue) DO UPDATE SET author_login=excluded.author_login,trusted_by=excluded.trusted_by,trusted_at=excluded.trusted_at,revoked_at=NULL`,
+        repository, input.issue, input.authorLogin, input.trustedBy, now);
+      } else {
+        if (existing && existing.revokedAt !== null && existing.authorLogin === input.authorLogin) return existing;
+        if (!existing || existing.authorLogin !== input.authorLogin)
+          throw new GuardRefusal('This issue is not trusted for its current author.');
+        this.#run('UPDATE issue_trust SET revoked_at=? WHERE repository=? AND issue=?', now, repository, input.issue);
+      }
+      return this.issueTrust(repository, input.issue)!;
+    });
+  }
+  recordAttemptComments(identity: PlanIdentity, id: string, evidence: { count: number; digest: string }): void {
+    if (!Number.isSafeInteger(evidence.count) || evidence.count < 0 || !/^[a-f0-9]{64}$/.test(evidence.digest))
+      throw new GuardRefusal('Invalid prompt comment evidence.');
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const row = this.#get('SELECT state,prompt_comments FROM attempts WHERE plan_key=? AND id=?', key, id);
+      if (!row || (row.state !== 'pending' && row.state !== 'running')) throw new GuardRefusal('The attempt is no longer active.');
+      const value = encode({ ...evidence, state: 'prepared' });
+      if (row.prompt_comments !== null && row.prompt_comments !== value) throw new GuardRefusal('The attempt already records different prompt comments.');
+      if (row.prompt_comments === null) { this.#run('UPDATE attempts SET prompt_comments=? WHERE plan_key=? AND id=?', value, key, id); this.#touch(key); }
+    });
+  }
+  markAttemptCommentsDelivered(identity: PlanIdentity, id: string): void {
+    const key = identityKey(identity);
+    this.#transaction(() => {
+      const row = this.#get('SELECT state,prompt_comments FROM attempts WHERE plan_key=? AND id=?', key, id);
+      if (!row || (row.state !== 'pending' && row.state !== 'running')) throw new GuardRefusal('The attempt is no longer active.');
+      if (row.prompt_comments === null) throw new GuardRefusal('The attempt has no prepared prompt comment evidence.');
+      const evidence = decode(row.prompt_comments) as { count?: unknown; digest?: unknown; state?: unknown };
+      if (evidence.state === 'delivered') return;
+      if (evidence.state !== 'prepared' || !Number.isSafeInteger(evidence.count) || (evidence.count as number) < 0
+        || typeof evidence.digest !== 'string' || !/^[a-f0-9]{64}$/.test(evidence.digest))
+        throw new GuardRefusal('The attempt has invalid prompt comment evidence.');
+      this.#run('UPDATE attempts SET prompt_comments=? WHERE plan_key=? AND id=?',
+        encode({ count: evidence.count, digest: evidence.digest, state: 'delivered' }), key, id);
+      this.#touch(key);
+    });
   }
   /**
    * A safety finding sends the task to needs human (plan-format.md, "After each run"), in the transaction that settles
@@ -1419,7 +1495,7 @@ export class Store {
   /** The latest attempts, oldest first, for status views: results are flagged, not read. */
   recentAttempts(identity: PlanIdentity, limit: number): (Omit<AttemptRecord, 'result'> & { hasResult: boolean })[] {
     return this.#db.prepare(`SELECT * FROM (SELECT id, kind, phase, item, state, context, deadline, first_reason, stop_reason, exit_code, signal,
-      NULL AS result, result IS NOT NULL AS has_result, diagnostic, diagnostic_ref, created_at, started_at, settled_at, rowid AS row_order
+      NULL AS result, result IS NOT NULL AS has_result, diagnostic, diagnostic_ref, prompt_comments, created_at, started_at, settled_at, rowid AS row_order
       FROM attempts WHERE plan_key=? ORDER BY rowid DESC LIMIT ?) ORDER BY row_order`).all(identityKey(identity), limit)
       .map(row => { const { result: _result, ...attempt } = this.#attemptRecord(row); return { ...attempt, hasResult: row.has_result === 1 }; });
   }
@@ -1680,7 +1756,8 @@ export class Store {
       if (!replaying && !storage && !(error instanceof ActionIdReused) && !(error instanceof BadRequest) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
         this.#transaction(() => {
-          if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message });
+          if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId))
+            record({ ok: false, error: message, ...(error instanceof UpstreamFailure ? { kind: 'upstream' } : {}) });
           if (error instanceof RefusalWithEffect) error.effect();
         });
       }
@@ -1696,8 +1773,8 @@ export class Store {
     const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', identityKey(identity), action.actionId);
     if (!row) return undefined;
     if (row.request_hash !== requestHash(action.kind, action.request)) throw new ActionIdReused('Action ID already used for a different request.');
-    const outcome = decode<{ ok: boolean; value?: T; error?: string }>(row.response);
-    if (!outcome.ok) throw new GuardRefusal(outcome.error!);
+    const outcome = decode<{ ok: boolean; value?: T; error?: string; kind?: string }>(row.response);
+    if (!outcome.ok) throw outcome.kind === 'upstream' ? new UpstreamFailure(outcome.error!) : new GuardRefusal(outcome.error!);
     return { response: outcome.value as T, replayed: true };
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */

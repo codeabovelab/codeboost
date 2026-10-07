@@ -50,12 +50,15 @@ export class TaskPublishing {
    */
   #retried = new Map<string, { deadline: number; short: number }>();
   #shortRetryMs: number;
+  /** Fresh admission check at every publish attempt, including automatic retries. Close jobs do not need issue trust. */
+  #authorizePublish?: (identity: PlanIdentity, signal: AbortSignal) => Promise<() => Promise<void>>;
   /** Jobs in progress, by task, from scheduling until the outcome is recorded; `abort` stops a publish on cancel. */
   #running = new Map<string, { job: PullRequestJob; done: Promise<void>; abort: AbortController }>();
   constructor(store: Store, publisher: PullRequestPublisher, runner: RunnerCoordinator, executor: ItemExecutor, capability?: ShutdownCapability,
-    env: NodeJS.ProcessEnv = process.env, options: { shortRetryMs?: number } = {}) {
+    env: NodeJS.ProcessEnv = process.env, options: { shortRetryMs?: number; authorizePublish?: (identity: PlanIdentity, signal: AbortSignal) => Promise<() => Promise<void>> } = {}) {
     this.#store = store; this.#publisher = publisher; this.#runner = runner; this.#executor = executor; this.#write = settleWith(capability);
     this.#shortRetryMs = options.shortRetryMs ?? SHORT_RETRY_MS;
+    this.#authorizePublish = options.authorizePublish;
     this.#secrets = TOKEN_VARIABLES.flatMap(name => env[name] ?? []);
   }
 
@@ -207,6 +210,7 @@ export class TaskPublishing {
     this.#closing = true;
     for (const timer of this.#retries.values()) clearTimeout(timer);
     this.#retries.clear();
+    for (const running of this.#running.values()) running.abort.abort(new ShuttingDownError());
     await this.#publisher.close();
     while (this.#running.size) await Promise.all([...this.#running.values()].map(running => running.done));
   }
@@ -274,6 +278,18 @@ export class TaskPublishing {
       // Durable in-flight ownership before the first external write (AGENTS.md): if this process stops before the outcome
       // is recorded, startup finds the marker and publishes again or settles it as interrupted. No marker, no publish.
       const draft = job.kind === 'publish' && job.draft;
+      let assertAuthorized: (() => Promise<void>) | undefined;
+      if (job.kind === 'publish' && this.#authorizePublish) {
+        try { assertAuthorized = await this.#authorizePublish(identity, abort.signal); }
+        catch (error) {
+          const stopped = error instanceof ShuttingDownError || error instanceof PublishCancelled || (this.#closing && (error as Error)?.name === 'AbortError');
+          const record = { outcome: stopped ? 'stopped' as const : REFUSALS.some(type => error instanceof type) ? 'refused' as const : 'failed' as const,
+            draft, message: message(error, this.#secrets) };
+          try { this.#write(() => this.#store.recordPublish(identity, record, actionId)); }
+          catch (writeError) { console.error(`Could not record the publish admission outcome: ${JSON.stringify(message(writeError, this.#secrets))}`); }
+          return;
+        }
+      }
       try {
         this.#write(() => this.#store.recordPublish(identity, job.kind === 'close' ? { outcome: 'closing', draft: false, action: 'close', message: 'The task\'s pull requests are being closed.' }
           : { outcome: 'publishing', draft, message: 'A pull request is being published.' }));
@@ -288,7 +304,9 @@ export class TaskPublishing {
             : 'No open pull request of the task was left to close.' };
         } else {
           // The problems are read when the publish starts: the task is in needs human, and its last attempt says why.
-          const outcome = await this.#publisher.publish(identity, draft ? { problems: this.#problems(identity) } : {}, abort.signal);
+          const outcome = await this.#publisher.publish(identity, {
+            ...(draft ? { problems: this.#problems(identity) } : {}), ...(assertAuthorized ? { beforeMutation: assertAuthorized } : {}),
+          }, abort.signal);
           record = describe(outcome, draft);
           seenVersion = outcome.seenVersion;
         }

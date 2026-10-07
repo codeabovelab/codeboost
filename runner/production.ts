@@ -6,14 +6,14 @@ import { exportTaskDiff, removeTaskFilesystemsAsync, type TaskStorageLimits } fr
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
-import { GhIssueGateway, type IssueText } from '../github/issues.ts';
+import { GhIssueGateway, withIssueReadDeadline, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { baseBranch } from '../github/validate.ts';
 import { identityKey } from '../core/identity.ts';
 import type { RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
-import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources } from './execution.ts';
-import { isUuidV4, quoteForTerminal, type ShutdownCapability } from './lifecycle.ts';
+import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources, type GuardedIssueText } from './execution.ts';
+import { GuardRefusal, isUuidV4, quoteForTerminal, type ShutdownCapability } from './lifecycle.ts';
 import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport, type RunnerLock } from './recovery.ts';
 import { GitBranchPusher, pushUrl } from './branch-push.ts';
 import { PullRequestPublisher } from './publish.ts';
@@ -231,13 +231,29 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
    * read the issue, every collaborator page and every comment page again. Only a completed read is kept. The window is
    * measured on the monotonic clock, so a wall-clock step back cannot stretch it.
    */
-  let lastRead: { number: number; at: number; text: IssueText } | null = null;
-  const issueText = async (number: number, signal: AbortSignal): Promise<IssueText> => {
-    if (lastRead && lastRead.number === number && performance.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
-    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000 });
-    lastRead = { number, at, text };
-    return text;
-  };
+  let lastRead: { access: IssueAccess; trustedAuthor: string | null | undefined; at: number; text: IssueText } | null = null;
+  const issueText = (number: number, signal: AbortSignal): Promise<GuardedIssueText> => withIssueReadDeadline(signal, async (readSignal, timeoutMs) => {
+    const access = await issues.issueAccess(number, { signal: readSignal, timeoutMs });
+    const trust = service.store.issueTrust(review.github!.repository, number);
+    const explicitlyTrusted = trust?.revokedAt === null && trust.authorLogin === access.authorLogin;
+    if (!access.collaborator && !explicitlyTrusted) throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
+    const trustedAuthor = explicitlyTrusted ? access.authorLogin : undefined;
+    const validate = () => {
+      if (trustedAuthor === undefined) return;
+      const current = service.store.issueTrust(review.github!.repository, number);
+      if (!current || current.revokedAt !== null || current.authorLogin !== trustedAuthor)
+        throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
+    };
+    // Explicit trust deliberately admits every comment and is fully represented by `trustedAuthor`. Collaborator-only
+    // reads depend on the complete current collaborator set, which IssueAccess does not carry, so never cache them.
+    if (trustedAuthor !== undefined && lastRead && lastRead.access.number === number && lastRead.access.authorLogin === access.authorLogin
+      && lastRead.access.collaborator === access.collaborator && lastRead.trustedAuthor === trustedAuthor
+      && performance.now() - lastRead.at < ISSUE_REUSE_MS) return { text: lastRead.text, validate };
+    const at = performance.now(), text = await issues.issueText(number, { signal: readSignal, timeoutMs, trustedAuthor, expectedAccess: access });
+    validate();
+    lastRead = { access, trustedAuthor, at, text };
+    return { text, validate };
+  });
   const only = (requested: typeof identity) => {
     if (identityKey(requested) !== identityKey(identity)) throw new Error('This server runs only its configured plan.');
   };

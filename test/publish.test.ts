@@ -64,6 +64,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
   } };
   const pulls: PullRequestGateway = {
     async open(input) {
+      const finalize = await input.beforeOpen?.(); finalize?.();
       log.push(`open ${input.draft ? 'draft' : 'ready'}`); opened.push(input);
       if (options.open) return options.open(input);
       if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
@@ -111,6 +112,7 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
         .map(([m, pr]) => ({ ...pr, marker: m, base: bases.get(m) ?? publishConfig.baseBranch })));
     },
     async markDraft(number, input) {
+      const finalize = await input.beforeDraft?.(); finalize?.();
       log.push(`draft ${number}`);
       // Like the adapter's read-back: the PR must be from the branch and into the base asked for.
       if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
@@ -135,10 +137,11 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       return { number, url: 'https://github.com/owner/repo/pull/1' };
     },
     async refresh(number, input) {
+      const finalizePatch = await input.beforePatch?.(); finalizePatch?.();
       log.push(`refresh ${number} ${input.ready ? 'ready' : 'draft'}`); opened.push(input);
       if ((bases.get(input.marker) ?? input.base) !== input.base) throw new Error('GitHub returned a pull request for a different branch.');
       options.onRefresh?.();
-      input.beforeReady?.();
+      const finalizeReady = await input.beforeReady?.(); finalizeReady?.();
       if (options.refreshFails) throw new Error('timeout reading the PR back');
       if (options.draftsUnsupported && input.draft) throw new DraftsUnsupported('no drafts');
       if (closed.has(number)) throw new Error(`Pull request #${number} is not open.`);
@@ -150,7 +153,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       return pr;
     },
   };
-  const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
+  const pusher: BranchPusher = { async push(id, input, signal) {
+    const finalize = await input.beforePush?.(); finalize?.();
+    log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal);
+  } };
   const publisher = new PullRequestPublisher(store, { checks: gate, pulls, pusher, closing: options.closing }, publishConfig);
   publishBranch = publisher.branch(identity);
   return { log, checks, opened, pulls, publisher };
@@ -241,6 +247,21 @@ describe('opening the task PR', () => {
     await expect(publisher.publish(identity)).rejects.toThrow(/Stale task state/);
     expect(log).not.toContain('open ready');
     expect(store.getTask(identity).status).toBe('running');
+  });
+  it('rechecks local task currentness after awaited external authorization and immediately before pushing', async () => {
+    const store = runningTask(), entered = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+    let checks = 0;
+    const run = harness(store);
+    const publishing = run.publisher.publish(identity, { beforeMutation: async () => {
+      checks++;
+      if (checks === 2) { entered.resolve(); await release.promise; }
+    } });
+    await entered.promise;
+    store.setAssignment(identity, store.getTask(identity).stateVersion, 'someone-else', 'code');
+    release.resolve();
+    await expect(publishing).rejects.toThrow(/Stale task state/);
+    expect(run.log.some(line => line.startsWith('push'))).toBe(false);
+    expect(run.log.some(line => line.startsWith('open'))).toBe(false);
   });
   it('refuses to open the PR when a review note is added during the push', async () => {
     const store = runningTask();
@@ -337,7 +358,7 @@ describe('schema v7', () => {
       expect(upgraded.taskPullRequests(identity)).toEqual([]);
       expect(upgraded.latestAlreadyFixed(identity)).toBeNull();
       const db = new DatabaseSync(path, { readOnly: true });
-      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 16 });
+      expect(db.prepare('PRAGMA user_version').get()).toEqual({ user_version: 17 });
       const names = db.prepare("SELECT name FROM sqlite_master WHERE type IN ('table','index') AND (name LIKE '%pull_requests%' OR name LIKE 'already_fixed_checks%') AND name NOT LIKE 'sqlite_autoindex%' ORDER BY name").all().map(row => row.name);
       expect(names).toEqual(['already_fixed_checks', 'already_fixed_checks_task', 'task_pull_requests', 'task_pull_requests_number', 'task_pull_requests_opening', 'task_pull_requests_task']);
       db.close();
@@ -968,6 +989,21 @@ describe('recovering a lost opening', () => {
     // The draft is not marked ready and its description is not replaced; the update stays in flight for the next publish.
     expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: { head: oid(3) } }]);
+  });
+  it('rechecks authorization after an existing PR push and before refreshing it', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    let checks = 0;
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity, { beforeMutation: () => {
+      checks++;
+      if (checks === 3) throw new GuardRefusal('Issue trust was revoked.');
+    } })).rejects.toThrow('Issue trust was revoked');
+    expect(checks).toBe(3);
+    expect(again.log.some(line => line.startsWith('push'))).toBe(true);
+    expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
   });
   it('runs one publish per task at a time, across publishers over the same Store', async () => {
     const store = runningTask();

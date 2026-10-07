@@ -3,7 +3,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { DatabaseSync } from 'node:sqlite';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
@@ -12,7 +12,9 @@ import { MAX_REASON, ShuttingDownError, type ShutdownCapability } from '../runne
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
+import type { PlanIdentity } from '../core/identity.ts';
 import { TaskTreeRefused } from '../agents/container/changes.ts';
+import type { IssueText } from '../github/issues.ts';
 
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 const RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
@@ -39,7 +41,10 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   /** Called by the fake launcher once the agent has started, before its result settles. */
   onLaunch?: (attemptId: string) => void;
   /** The fake agent's result names this attempt instead. */
-  foreignResult?: boolean; issue?: ExecutionSources['issue'] } = {}) {
+  foreignResult?: boolean;
+  issue?: (identity: PlanIdentity, signal: AbortSignal) => IssueText | Promise<IssueText>;
+  guardedIssue?: ExecutionSources['issue'];
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
@@ -84,7 +89,10 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
     checkpointContext: () => ({ ...auditContext, baseEntries: [...auditContext.baseEntries,
       ...Object.values(options.manifests ?? {}).flatMap(value => value.changes.filter(change => change.kind === 'add' && change.path === 'extra.ts')
         .map(change => ({ path: change.path, kind: 'file' as const })))] }),
-    issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
+    issue: options.guardedIssue ?? (async (id, signal) => ({
+      text: await (options.issue?.(id, signal) ?? { number: 1, title: 'Issue', body: 'Please fix', comments: [] }),
+      validate: () => undefined,
+    })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [], checks: unknown[] = [];
   const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
@@ -119,6 +127,14 @@ describe('item execution', () => {
     expect(argv[0]).toEqual([['npm', 'test']]);
     expect(owners[0]).toBe(RUNNER_OWNER);
     expect(argv[1]).toEqual([]);
+  });
+  it('records a digest and count of the exact comments carried by every execute attempt', async () => {
+    const comments = ['collaborator note', 'trusted outside note'];
+    const { store, executor } = setup({ issue: () => ({ number: 1, title: 'Issue', body: '', comments }) });
+    await executor.runTask(identity);
+    const evidence = { count: 2, digest: createHash('sha256').update(JSON.stringify(comments)).digest('hex'), state: 'delivered' };
+    expect(store.getAttempts(identity).map(attempt => attempt.promptComments)).toEqual([evidence, evidence]);
+    expect(store.recentAttempts(identity, 20).map(attempt => attempt.promptComments)).toEqual([evidence, evidence]);
   });
   it('reports a planned-but-unchanged item without committing', async () => {
     const { executor, commits } = setup({ manifests: { P1: manifest([]) } });
@@ -230,9 +246,10 @@ describe('item execution', () => {
     expect(store.getSnapshot(identity).head).toBe(oid(2));
   });
   it('releases task storage after the terminal write when D\'s start call throws', async () => {
-    const { executor, log } = setup({ startError: new Error('docker refused') });
+    const { store, executor, log } = setup({ startError: new Error('docker refused') });
     expect(await executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed', reason: 'Launch failed: docker refused' });
     expect(log).toContain('release P1 after failed');
+    expect(store.getAttempts(identity)[0]!.promptComments).toMatchObject({ count: 0, state: 'prepared' });
   });
   it('does not take the agent\'s stderr for a safety violation', async () => {
     const { store, executor } = setup({ exit: { P1: { exitCode: 1, stderr: `${SAFETY_VIOLATION} fake` } } });
@@ -261,6 +278,7 @@ describe('item execution', () => {
     expect(log).toEqual(['materialize P1 @002', 'snapshot P1 [a.ts]', 'release P1 after failed']);
     expect(runner.status(identity).unresolved).toBeNull();
     expect(store.getTask(identity).status).toBe('running');
+    expect(store.getAttempts(identity)[0]!.promptComments).toBeNull();
   });
   it('stops before the next item when the plan gets a new revision during the run', async () => {
     let store!: Store;
@@ -1062,6 +1080,30 @@ describe('item execution', () => {
     const h = setup({ release: async () => { runner.rejectAdmission(); } });
     runner = h.runner;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', reason: 'The review server is shutting down.', completed: ['P1'] });
+  });
+  it('stops before launching the next item when its per-item issue trust read is refused', async () => {
+    let reads = 0;
+    const h = setup({ issue: () => {
+      if (++reads === 2) throw new GuardRefusal('Issue #1 is not trusted for its current author.');
+      return { number: 1, title: 'Issue', body: 'Please fix', comments: [] };
+    } });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'failed', completed: ['P1'],
+      reason: expect.stringMatching(/not trusted for its current author/) });
+    expect(h.store.getAttempts(identity)).toMatchObject([{ item: 'P1', state: 'completed' }, { item: 'P2', state: 'failed' }]);
+    expect(h.log.some(line => line.includes('start P2'))).toBe(false);
+  });
+  it('revalidates issue trust synchronously when the execute prompt is constructed', async () => {
+    let trusted = true;
+    const h = setup({ guardedIssue: () => new Promise(resolve => {
+      resolve({ text: { number: 1, title: 'Issue', body: 'Please fix', comments: ['Outside note.'] },
+        validate: () => { if (!trusted) throw new GuardRefusal('Issue #1 is not trusted for its current author.'); } });
+      // The source has resolved, but the await continuation that constructs the prompt has not run yet.
+      trusted = false;
+    }) });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed',
+      reason: expect.stringMatching(/not trusted for its current author/) });
+    expect(h.store.getAttempts(identity)).toMatchObject([{ item: 'P1', state: 'failed', promptComments: null }]);
+    expect(h.log.some(line => line.includes('start P1'))).toBe(false);
   });
   it('builds a pause\'s executed prefix from the plan the item ran against, even if a revision inserts an item before it', async () => {
     let store!: Store, imported: Error | undefined;

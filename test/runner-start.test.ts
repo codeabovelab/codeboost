@@ -12,6 +12,7 @@ import type { RunnerDeps } from '../runner/coordinator.ts';
 import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 import type { AttemptKind } from '../runner/lifecycle.ts';
 import { approveItem } from '../core/approvals.ts';
+import type { IssueTrustGateway } from '../github/issues.ts';
 
 vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -25,16 +26,18 @@ type App = Awaited<ReturnType<typeof startServer>>;
  * A server with a runner whose preparation always fails: an admitted item ends `failed` without an agent, which is
  * enough to see what start and resume admit. `before` shapes the Store before the runner exists, as recovery would.
  */
-async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void; findings?: (findings: SafetyFindings, service: ReviewService) => void } = {}) {
+async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before?: (service: ReviewService) => void; findings?: (findings: SafetyFindings, service: ReviewService) => void;
+  issueGateway?: IssueTrustGateway } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-start-')); roots.push(root);
   const demo = createDemo(join(root, 'demo'));
-  const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+  const config = options.issueGateway ? { ...demo, demo: false, github: { repository: options.issueGateway.repository, issue: 3, pullRequest: 1 } } : demo;
+  const app = await startServer(config, 0, undefined, undefined, 2_000, options.issueGateway, undefined, undefined, async service => {
     if (options.approve !== false) approvePlan(service);
     options.before?.(service);
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
     const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
-      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+      issue: () => ({ text: { number: 1, title: '', body: '', comments: [] }, validate: () => undefined }), lessons: () => [], vendor: () => 'claude' };
     const findings = new SafetyFindings(service.store);
     options.findings?.(findings, service);
     return { deps, sources, findings, recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
@@ -57,6 +60,14 @@ function approvePlan(service: ReviewService) {
   const view = service.load();
   service.store.saveReview(service.config.identity, view.expected,
     view.items.map(item => approveItem(view.plan, view.segments, item.id, service.config.identity, item.count === 0)), []);
+}
+function trustGateway(read: () => { authorLogin: string | null; collaborator: boolean } | Error): IssueTrustGateway {
+  return {
+    repository: 'owner/repo',
+    async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
+    async issueAccess(number) { const value = read(); if (value instanceof Error) throw value; return { number, ...value }; },
+    async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+  };
 }
 
 /** Before the runner exists: queue the task and leave one execute attempt of its first item, failed. */
@@ -94,6 +105,47 @@ function revise(service: ReviewService) {
 }
 
 describe('start (#91 part 2)', () => {
+  it('refuses an outside-authored issue until matching repository-scoped trust is recorded', async () => {
+    const gateway = trustGateway(() => ({ authorLogin: 'outside', collaborator: false }));
+    const { app, identity, store } = await serve({ issueGateway: gateway });
+    expect((await act(app, 'start')).body.error).toMatch(/not trusted for its current author/i);
+    expect(store.getAttempts(identity)).toEqual([]);
+    store.setIssueTrust({ repository: 'owner/repo', issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+    expect((await act(app, 'start')).body.result).toMatchObject({ outcome: 'started', item: 'P1' });
+  });
+  it('records and replays a failed or incomplete collaborator read as a definite upstream failure', async () => {
+    let result: ReturnType<Parameters<typeof trustGateway>[0]> = new Error('incomplete collaborator page');
+    const { app, identity, store } = await serve({ issueGateway: trustGateway(() => result) });
+    const actionId = randomUUID();
+    expect(await act(app, 'start', { actionId })).toMatchObject({ status: 502,
+      body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
+    result = { authorLogin: 'member', collaborator: true };
+    expect(await act(app, 'start', { actionId })).toMatchObject({ status: 502,
+      body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
+    expect(store.getAttempts(identity)).toEqual([]);
+  });
+  it('returns the first durable success when an identical concurrent access read fails later', async () => {
+    const secondStarted = Promise.withResolvers<void>(), releaseFailure = Promise.withResolvers<void>();
+    let reads = 0;
+    const gateway: IssueTrustGateway = {
+      repository: 'owner/repo',
+      async fetch() { return { repository: 'owner/repo', retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) {
+        if (++reads === 1) { await secondStarted.promise; return { number, authorLogin: 'member', collaborator: true }; }
+        secondStarted.resolve(); await releaseFailure.promise; throw new Error('later GitHub failure');
+      },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, identity, store } = await serve({ issueGateway: gateway });
+    const actionId = randomUUID(), first = act(app, 'start', { actionId });
+    await vi.waitFor(() => expect(reads).toBe(1));
+    const second = act(app, 'start', { actionId });
+    const accepted = await first;
+    expect(accepted).toMatchObject({ status: 200, body: { result: { outcome: 'started', item: 'P1' } } });
+    releaseFailure.resolve();
+    expect(await second).toMatchObject({ status: 200, body: { result: accepted.body.result } });
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
   it('requires every item of the current plan revision to be approved before start', async () => {
     const { app, identity, store } = await serve({ approve: false });
     expect(await view(app)).toMatchObject({ startable: false });
@@ -172,6 +224,12 @@ describe('status polling (#91 part 2)', () => {
 });
 
 describe('resume (#91 part 2)', () => {
+  it('refuses an untrusted current author before resuming', async () => {
+    const { app, identity, store } = await serve({ issueGateway: trustGateway(() => ({ authorLogin: 'outside', collaborator: false })),
+      before: service => { failedFirstItem(service); } });
+    expect((await act(app, 'resume')).body.error).toMatch(/not trusted for its current author/i);
+    expect(store.getAttempts(identity)).toHaveLength(1);
+  });
   it('claims the requeue recovery left and continues from the first unfinished item', async () => {
     let interrupted = '';
     const { app, identity, store, items } = await serve({ before: service => {
@@ -279,7 +337,8 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1', 'P2'], next: 'P3' });
   });
   it('requires explicit continuation approval and resumes at the audited suffix through the API', async () => {
-    const { app, identity, store, items } = await serve({ before: service => {
+    const gateway = trustGateway(() => ({ authorLogin: 'outside', collaborator: false }));
+    const { app, identity, store, items } = await serve({ issueGateway: gateway, before: service => {
       committedFirstItem(service, false, ['other.ts']);
       const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
       const entries = [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' as const }];
@@ -294,9 +353,13 @@ describe('start and resume refusals and races (#91 part 2)', () => {
         next.items.map(item => approveItem(next, [], item.id, id, true)), []);
       const baseContext = service.planContext();
       service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+      s.setIssueTrust({ repository: gateway.repository, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
     } });
     expect(await view(app)).toMatchObject({ resumable: false, startable: false });
     expect((await act(app, 'resume')).body.error).toMatch(/Approve the amended plan continuation/);
+    store.setIssueTrust({ repository: gateway.repository, issue: 3, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+    expect((await act(app, 'approve-continuation')).body.error).toMatch(/not trusted/);
+    store.setIssueTrust({ repository: gateway.repository, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
     const approved = await act(app, 'approve-continuation');
     expect(approved).toMatchObject({ status: 200, body: { result: { outcome: 'approved', next: items[1] } } });
     expect(store.getTask(identity).status).toBe('queued');
@@ -681,6 +744,47 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume', { expectedStateVersion: stateVersion, actionId })).body.result).toEqual(first.body.result);
     expect((await act(app, 'resume', { expectedStateVersion: stateVersion })).body.error).toMatch(/Stale task state/);
     expect(store.getAttempts(identity)).toHaveLength(2);
+  });
+  it('replays a saved action after shutdown stops new runner admission', async () => {
+    const { app, identity, store } = await serve({ issueGateway: trustGateway(() => ({ authorLogin: 'owner', collaborator: true })) });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    const request = { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId };
+    const first = await act(app, 'start', request);
+    expect(first.status).toBe(200);
+    expect(store.savedAction(identity, { actionId, kind: 'start', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeDefined();
+
+    app.runner!.rejectAdmission();
+    expect(await act(app, 'start', request)).toMatchObject({ status: 200, body: { result: first.body.result } });
+    expect((await act(app, 'start', { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion })).status).toBe(503);
+  });
+  it('replays a saved action whose body finishes arriving after server shutdown begins', async () => {
+    const { app, close, database, identity, store } = await serve({ issueGateway: trustGateway(() => ({ authorLogin: 'owner', collaborator: true })) });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    const first = await act(app, 'start', { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId });
+    const attemptCount = store.getAttempts(identity).length, url = new URL(app.url);
+    const text = JSON.stringify({ action: 'start', expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId });
+    let finish!: () => void;
+    const replay = new Promise<{ status: number; body: Record<string, any> }>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(Buffer.concat(chunks).toString()) }));
+      });
+      req.on('error', reject);
+      req.write(text.slice(0, 5));
+      finish = () => req.end(text.slice(5));
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    finish();
+    expect(await replay).toMatchObject({ status: 200, body: { result: first.body.result } });
+    await closing;
+    const reopened = new Store(database); cleanups.push(() => reopened.close());
+    expect(reopened.getAttempts(identity)).toHaveLength(attemptCount);
   });
   it('replays a pre-review-version action, but never creates a new action without the review version', async () => {
     const actionId = randomUUID(); let stateVersion = 0;

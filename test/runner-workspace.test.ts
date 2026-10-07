@@ -52,7 +52,7 @@ async function setup(agent: Record<string, string>) {
     const review = new ReviewService({ database: join(root, 'state.sqlite'), repository: source, runnerRepository: repository.path,
       identity, pathIdentity: { caseSensitive: true, unicodeNormalization: 'none' } });
     try { return review.planContextAt(commit); } finally { review.close(); }
-  }, issue: () => ({ number: 1, title: 'Issue', body: 'Fix', comments: [] }),
+  }, issue: () => ({ text: { number: 1, title: 'Issue', body: 'Fix', comments: [] }, validate: () => undefined }),
     lessons: () => [], vendor: () => 'claude' };
   const findings = new SafetyFindings(store);
   // The agent: a container that edits the work volume, mounted as an agent container mounts it (metadata read-only).

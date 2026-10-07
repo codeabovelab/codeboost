@@ -11,8 +11,8 @@ import type { Store, TaskPullRequest } from './store.ts';
  * "Needs human"). The push of the task head to its branch is injected; `GitBranchPusher` (`branch-push.ts`) is the real one.
  */
 export interface BranchPusher {
-  /** Makes `refs/heads/<branch>` on GitHub point at `head`. Settles only when the push finished or failed. */
-  push(identity: PlanIdentity, input: { head: string; branch: string }, signal?: AbortSignal): Promise<void>;
+  /** Makes the branch point at `head`. Implementations call `beforePush` after their final await, immediately before the write. */
+  push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: MutationBoundary }, signal?: AbortSignal): Promise<void>;
 }
 export interface PublishConfig {
   repository: string; baseBranch: string;
@@ -54,6 +54,8 @@ const pullRequestList = (prs: readonly { number: number }[]) => `Pull requests $
  * time, so an update is never cleared or overtaken while its GitHub calls run. The runner lock rules out a second process.
  */
 const publishing = new WeakMap<Store, Set<string>>();
+type MutationGuard = () => void | Promise<void>;
+export type MutationBoundary = () => void | Promise<void | (() => void)>;
 
 export class PullRequestPublisher {
   #store: Store; #checks: AlreadyFixedGateway; #pulls: PullRequestGateway; #pusher: BranchPusher; #config: PublishConfig;
@@ -88,6 +90,15 @@ export class PullRequestPublisher {
     if (this.#closing || this.#coordinatorClosing()) throw new ShuttingDownError();
   }
 
+  /** Fresh external authorization first, then every local precondition again with no await before the mutation. */
+  #boundary(beforeMutation: MutationGuard | undefined, signal: AbortSignal | undefined, current: () => void): MutationBoundary {
+    return async () => {
+      if (beforeMutation) await beforeMutation();
+      // The adapter invokes this returned finalizer after the await and immediately before its external write.
+      return () => { this.#assertOpen(); signal?.throwIfAborted(); current(); };
+    };
+  }
+
   /**
    * The task's branch. The readable slug may collide (`Task_42` and `task-42`); the suffix, a hash of the exact task
    * identity, keeps branches of different tasks apart.
@@ -103,7 +114,7 @@ export class PullRequestPublisher {
    * Opens the task's PR, or a draft PR with the open problems when `problems` is given (the task is in needs human).
    * Order: recover a lost opening; check; push; record the opening; open. A match or an unreadable check opens nothing.
    */
-  async publish(identity: PlanIdentity, input: { problems?: readonly string[] } = {}, signal?: AbortSignal): Promise<PublishOutcome> {
+  async publish(identity: PlanIdentity, input: { problems?: readonly string[]; beforeMutation?: MutationGuard } = {}, signal?: AbortSignal): Promise<PublishOutcome> {
     signal?.throwIfAborted();
     this.#assertOpen();
     const key = identityKey(identity);
@@ -146,7 +157,7 @@ export class PullRequestPublisher {
     const keep = (error: unknown) => { if (signal.aborted || error instanceof ShuttingDownError) throw error; problems.push(error); };
     // Settles a lost opening (OpeningUnsettled while GitHub may still show it) and a lost update first. The task was
     // cancelled after they began, so neither moves its status.
-    try { await this.#recover(identity, false, signal); } catch (error) { keep(error); }
+    try { await this.#recover(identity, false, undefined, signal); } catch (error) { keep(error); }
     const close = async (number: number, headBranch: string, mark: string) => {
       try {
         // The shutdown flags right before the close, after the gateway's read: no await between them.
@@ -202,11 +213,11 @@ export class PullRequestPublisher {
     return Math.max(0, Date.parse(lost.createdAt) + (this.#config.settleMs ?? DEFAULT_SETTLE_MS) - (this.#config.now ?? Date.now)());
   }
 
-  async #publish(identity: PlanIdentity, input: { problems?: readonly string[] }, signal?: AbortSignal): Promise<PublishOutcome> {
+  async #publish(identity: PlanIdentity, input: { problems?: readonly string[]; beforeMutation?: MutationGuard }, signal?: AbortSignal): Promise<PublishOutcome> {
     const draft = input.problems !== undefined;
-    const recovered = await this.#recover(identity, draft, signal);
+    const recovered = await this.#recover(identity, draft, input.beforeMutation, signal);
     if (recovered) return recovered;
-    const notes = await this.#draftStranded(identity, signal);
+    const notes = await this.#draftStranded(identity, input.beforeMutation, signal);
     const task = this.#store.getTask(identity), snapshot = this.#store.getSnapshot(identity), plan = this.#store.getPlan(identity);
     const reviewVersion = this.#store.reviewVersion(identity);
     // The full publish guard (status, no attempt, merge, requeue or rebase) before any GitHub call.
@@ -233,7 +244,7 @@ export class PullRequestPublisher {
       // The task's PRs are not where it can publish, and a person has to decide: none of them stays ready meanwhile,
       // although the task itself could otherwise be published as ready.
       // Only this run's notes: it looks every PR up again, so an earlier run's failure it has since fixed is not reported.
-      const latest = await this.#draftStranded(identity, signal, true);
+      const latest = await this.#draftStranded(identity, input.beforeMutation, signal, true);
       throw new PullRequestMisplaced(latest.length ? `${error.message} ${latest.join(' ')}` : error.message);
     }
     signal?.throwIfAborted();
@@ -256,7 +267,9 @@ export class PullRequestPublisher {
         if (this.#mayKeepReady(identity)) state = 'It is left as it is: the task is now in review, approved or merged.';
         else if (pr.marker === marker(row.openingId)) {
           let drafted;
-          try { drafted = await this.#pulls.markDraft(row.number, { base: pr.base, headBranch: pr.headBranch, marker: pr.marker }, signal); }
+          try { drafted = await this.#pulls.markDraft(row.number, { base: pr.base, headBranch: pr.headBranch, marker: pr.marker,
+            beforeDraft: this.#boundary(input.beforeMutation, signal, () => this.#store.assertUnchangedSince(identity,
+              { stateVersion: task.stateVersion, reviewVersion, snapshotId: snapshot.id, draft })) }, signal); }
           catch (error) {
             if (signal?.aborted) throw error;
             state = error instanceof DraftsUnsupported ? 'It stays ready for review: this repository does not support draft pull requests.'
@@ -294,7 +307,9 @@ export class PullRequestPublisher {
       let leftReady: number | undefined;
       if (earlier && live && !live.draft) {
         try {
-          const drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal);
+          const drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId),
+            beforeDraft: this.#boundary(input.beforeMutation, signal, () => this.#store.assertUnchangedSince(identity,
+              { stateVersion, reviewVersion, snapshotId: snapshot.id, draft })) }, signal);
           stateVersion = this.#store.recordPullRequestDraft(identity, earlier.openingId, drafted.number, drafted.draft, { stateVersion, reviewVersion });
         } catch (error) {
           if (!(error instanceof DraftsUnsupported)) throw error;
@@ -325,7 +340,9 @@ export class PullRequestPublisher {
     if (needsDraft) this.#store.assertUnchangedSince(identity, { stateVersion, reviewVersion, snapshotId: snapshot.id, draft });
     let drafted = null, leftReady: number | undefined;
     if (needsDraft && earlier && live) {
-      try { drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal); }
+      try { drafted = await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId),
+        beforeDraft: this.#boundary(input.beforeMutation, signal, () => this.#store.assertUnchangedSince(identity,
+          { stateVersion, reviewVersion, snapshotId: snapshot.id, draft })) }, signal); }
       catch (error) { if (!(error instanceof DraftsUnsupported)) throw error; leftReady = live.number; }
     }
     signal?.throwIfAborted();
@@ -343,44 +360,59 @@ export class PullRequestPublisher {
       if (draft && !live.draft) {
         // Read before the call: nothing is written after it on the refusal path (#114).
         const seenVersion = this.#store.getTask(identity).stateVersion;
-        try { await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId) }, signal); }
+        try { await this.#pulls.markDraft(live.number, { base: this.#config.baseBranch, headBranch: branch, marker: marker(earlier.openingId),
+          beforeDraft: this.#boundary(input.beforeMutation, signal, () => this.#store.assertUnchangedSince(identity,
+            { stateVersion: check.stateVersion, reviewVersion: check.reviewVersion, snapshotId: snapshot.id, draft })) }, signal); }
         catch (error) { if (error instanceof DraftsUnsupported) return { kind: 'draft unsupported', number: live.number, seenVersion }; throw error; }
         signal?.throwIfAborted();
       }
       // The push is a refresh's first content write (it moves the open PR's head), so the refresh is recorded before it;
       // beginRefresh re-reads the task after the draft change's await. A task change during the push cannot strand it.
       this.#assertOpen();
+      await input.beforeMutation?.();
       const stateVersion = this.#store.beginRefresh(identity, { checkId: check.id, openingId: earlier.openingId, headSha: snapshot.head, draft });
-      await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+      const refreshCurrent = () => this.#store.assertRefreshCurrent(identity, earlier.openingId, draft);
+      await this.#pusher.push(identity, { head: snapshot.head, branch,
+        beforePush: this.#boundary(input.beforeMutation, signal, refreshCurrent) }, signal);
       signal?.throwIfAborted();
       // Re-read after the push's await, before anything else about the PR changes (description, ready or draft): a
       // cancel, reassignment or review during the push leaves the update in flight and the PR as it was.
       this.#assertOpen();
+      await input.beforeMutation?.();
       this.#store.assertRefreshCurrent(identity, earlier.openingId, draft);
       // Any failure here, including a draft refusal after the PR was made ready again meanwhile, leaves the update
       // recorded as in flight; the next publish settles it and starts again from the draft step above.
       const pr = await this.#pulls.refresh(live.number, {
         // The PR's base on GitHub: the lookup only returns a PR into the configured base.
         base: this.#config.baseBranch, headBranch: branch, draft, ready: !draft, headSha: snapshot.head, marker: marker(earlier.openingId),
-        beforeReady: () => { this.#assertOpen(); this.#store.assertRefreshCurrent(identity, earlier.openingId, draft); },
+        beforePatch: this.#boundary(input.beforeMutation, signal, refreshCurrent),
+        beforeReady: this.#boundary(input.beforeMutation, signal, refreshCurrent),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(earlier.openingId), problems: input.problems }),
       }, signal);
       const status = this.#store.recordRefreshConfirmed(identity, earlier.openingId, pr, { head: snapshot.head, stateVersion });
-      return this.#settleHead(identity, earlier.openingId, pr, snapshot.head, draft, status, branch, signal);
+      return this.#settleHead(identity, earlier.openingId, pr, snapshot.head, draft, status, branch, input.beforeMutation, signal);
     }
     // No PR exists yet, so moving the branch changes nothing a reviewer sees.
     this.#assertOpen();
-    await this.#pusher.push(identity, { head: snapshot.head, branch }, signal);
+    await input.beforeMutation?.();
+    const checkCurrent = () => this.#store.assertUnchangedSince(identity,
+      { stateVersion: check.stateVersion, reviewVersion: check.reviewVersion, snapshotId: snapshot.id, draft });
+    await this.#pusher.push(identity, { head: snapshot.head, branch,
+      beforePush: this.#boundary(input.beforeMutation, signal, checkCurrent) }, signal);
     signal?.throwIfAborted();
     // The last await before the irreversible call is behind us: beginPullRequest re-reads the task state in its transaction.
     this.#assertOpen();
+    await input.beforeMutation?.();
     const opening = this.#store.beginPullRequest(identity, {
       checkId: check.id, repository: this.#config.repository, base: this.#config.baseBranch, headBranch: branch, headSha: snapshot.head, draft,
     });
     let pr;
     try {
+      await input.beforeMutation?.();
       pr = await this.#pulls.open({
         base: opening.base, headBranch: branch, draft, marker: marker(opening.openingId),
+        beforeOpen: this.#boundary(input.beforeMutation, signal, () => this.#store.assertUnchangedSince(identity,
+          { stateVersion: opening.ownerVersion, reviewVersion: opening.ownerReviewVersion, snapshotId: snapshot.id, draft })),
         title: pullRequestTitle(plan), body: pullRequestBody({ plan, marker: marker(opening.openingId), problems: input.problems }),
       }, signal);
     } catch (error) {
@@ -391,7 +423,7 @@ export class PullRequestPublisher {
       return { kind: 'draft unsupported', number: null, seenVersion: this.#store.getTask(identity).stateVersion };
     }
     const status = this.#store.recordPullRequestOpened(identity, opening.openingId, pr);
-    return this.#settleHead(identity, opening.openingId, pr, snapshot.head, draft, status, branch, signal);
+    return this.#settleHead(identity, opening.openingId, pr, snapshot.head, draft, status, branch, input.beforeMutation, signal);
   }
 
   /**
@@ -401,7 +433,7 @@ export class PullRequestPublisher {
    * of the whole publish (AGENTS.md: a later step's failure must not turn a succeeded irreversible action into one).
    */
   async #settleHead(identity: PlanIdentity, openingId: string, pr: { number: number; url: string; headSha: string; draft: boolean }, head: string,
-    draft: boolean, status: string, branch: string, signal?: AbortSignal): Promise<PublishOutcome> {
+    draft: boolean, status: string, branch: string, beforeMutation?: MutationGuard, signal?: AbortSignal): Promise<PublishOutcome> {
     const base = this.#config.baseBranch;
     // The version right after the open or refresh was recorded (no await since); on the leftReady path nothing is written
     // after the draft call, so a change made during it was not seen (#114).
@@ -413,7 +445,10 @@ export class PullRequestPublisher {
     let drafted;
     // Only the GitHub call's failure becomes leftReady (the PR stays ready; the next publish of a task that can still be published reconciles it). A Store
     // failure after a draft change that landed propagates, so it is not misreported as a ready PR.
-    try { drafted = await this.#pulls.markDraft(pr.number, { base, headBranch: branch, marker: marker(openingId) }, signal); }
+    try { drafted = await this.#pulls.markDraft(pr.number, { base, headBranch: branch, marker: marker(openingId),
+      beforeDraft: this.#boundary(beforeMutation, signal, () => {
+        if (this.#mayKeepReady(identity)) throw new GuardRefusal('The task now keeps its pull request ready.');
+      }) }, signal); }
     catch (error) { if (signal?.aborted) throw error; return { ...opened, leftReady: pr.number }; }
     // A fact about the PR, recorded against the versions read right now (no await since).
     this.#store.recordPullRequestDraft(identity, openingId, drafted.number, drafted.draft,
@@ -446,7 +481,7 @@ export class PullRequestPublisher {
    * does not prove the request was refused while GitHub may still apply or show it, so the opening stays owned until
    * the settle time has passed; only then is it abandoned. The caller retries after OpeningUnsettled.
    */
-  async #recover(identity: PlanIdentity, draft: boolean, signal?: AbortSignal): Promise<PublishOutcome | null> {
+  async #recover(identity: PlanIdentity, draft: boolean, beforeMutation?: MutationGuard, signal?: AbortSignal): Promise<PublishOutcome | null> {
     // An update whose confirmation was lost is repeated, not adopted: its description may or may not have landed. What
     // GitHub shows now (draft flag, head) is recorded first, so a change that did land is not forgotten.
     for (const refreshing of this.#store.taskPullRequests(identity).filter(pr => pr.refresh !== null)) {
@@ -494,7 +529,10 @@ export class PullRequestPublisher {
     // Only when this publish is itself a draft publish; a ready publish's main path marks the PR ready anyway.
     // Re-read after the lookup's await, as before every other draft change: an approved task keeps its PR ready.
     if (lost.draft && draft && !pr.draft && !this.#mayKeepReady(identity)) {
-      try { found = await this.#pulls.markDraft(pr.number, { base: pr.base, headBranch: lost.headBranch, marker: marker(lost.openingId) }, signal); }
+      try { found = await this.#pulls.markDraft(pr.number, { base: pr.base, headBranch: lost.headBranch, marker: marker(lost.openingId),
+        beforeDraft: this.#boundary(beforeMutation, signal, () => {
+          if (this.#mayKeepReady(identity)) throw new GuardRefusal('The task now keeps its pull request ready.');
+        }) }, signal); }
       catch (error) {
         if (!(error instanceof DraftsUnsupported)) throw error;
         // Definite: the PR is recorded as it is, and the main path reports it (`draft unsupported`, or the misplaced
@@ -513,7 +551,7 @@ export class PullRequestPublisher {
     const status = this.#store.recordPullRequestOpened(identity, lost.openingId, found, mayReview);
     // It ends the publish only for a PR the main path would accept. Any other goes on to the main path, which makes all of
     // the task's PRs drafts and refuses with what a person has to do, as it does for every misplaced PR.
-    if (current && mayReview) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, signal);
+    if (current && mayReview) return this.#settleHead(identity, lost.openingId, found, lost.headSha, draft, status, lost.headBranch, beforeMutation, signal);
     return null;
   }
 
@@ -526,7 +564,7 @@ export class PullRequestPublisher {
    * which also adopts, may refuse first. A draft flag GitHub already shows is only recorded. A GitHub failure does not
    * replace the status refusal that follows: it is returned as a note for it, and the next publish tries again.
    */
-  async #draftStranded(identity: PlanIdentity, signal?: AbortSignal, misplaced = false): Promise<string[]> {
+  async #draftStranded(identity: PlanIdentity, beforeMutation?: MutationGuard, signal?: AbortSignal, misplaced = false): Promise<string[]> {
     // `misplaced`: the main path found the task's PRs where it cannot publish, so being publishable keeps nothing ready.
     const keepsReady = () => this.#mayKeepReady(identity) || (!misplaced && this.#store.canPublish(identity, false));
     if (keepsReady()) return [];
@@ -561,7 +599,10 @@ export class PullRequestPublisher {
         let drafted: { number: number; draft: boolean } = live;
         // Re-read after the lookup's await: a task that was approved meanwhile keeps its PR ready.
         if (!live.draft && !keepsReady()) {
-          try { drafted = await this.#pulls.markDraft(live.number, { base: live.base, headBranch, marker: live.marker }, signal); }
+          try { drafted = await this.#pulls.markDraft(live.number, { base: live.base, headBranch, marker: live.marker,
+            beforeDraft: this.#boundary(beforeMutation, signal, () => {
+              if (keepsReady()) throw new GuardRefusal('The task now keeps its pull request ready.');
+            }) }, signal); }
           catch (error) {
             if (signal?.aborted) throw error;
             notes.push(error instanceof DraftsUnsupported

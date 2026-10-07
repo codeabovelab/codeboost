@@ -44,8 +44,15 @@ export interface RunnerDeps {
    * Task storage waits for the terminal write.
    */
   cleanupPreparation(attempt: AttemptRecord): Promise<void>;
+  /** Synchronous fail-closed evidence written after every preparation check and before D can receive the prompt. */
+  beforeStart?(attempt: AttemptRecord, prepared: PreparedAttempt): void;
   /** D's start call: returns a handle at once, or throws with nothing left running. */
   start(input: InvocationInput, prepared: PreparedAttempt): InvocationHandle;
+  /**
+   * Synchronous durable evidence for a launch that returned a handle. It runs after the coordinator owns that handle
+   * and before the running transition; a failure cancels and awaits D, then retains the slot as start-not-saved.
+   */
+  onStarted?(attempt: AttemptRecord, prepared: PreparedAttempt): void;
   /** Validate a clean result; throw with an actionable reason if it is invalid. Returns the value to persist. */
   validate(attempt: AttemptRecord, result: InvocationResult): unknown;
   /**
@@ -318,11 +325,15 @@ export class RunnerCoordinator {
       try {
         const input = captureInvocation({ clone: prepared.clone, phase: ATTEMPT_PHASES[attempt.kind], vendor: prepared.vendor,
           approvedArgv: prepared.approvedArgv, deadline: attempt.deadline, attemptId: attempt.id, runnerOwner: this.#deps.runnerOwner, context: attempt.context }, now);
+        this.#deps.beforeStart?.(attempt, prepared);
         handle = this.#deps.start(input, prepared);
       } catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Launch failed: ${message(error)}` }, prepared); }
       job.handle = handle;
       let running: boolean | undefined;
-      try { running = this.#write(() => this.#store.markRunning(job.identity, attempt.id)); } catch { running = undefined; }
+      try {
+        this.#deps.onStarted?.(attempt, prepared);
+        running = this.#write(() => this.#store.markRunning(job.identity, attempt.id));
+      } catch { running = undefined; }
       if (running === undefined) {
         // A storage error, not a stop: keep ownership until D settles, then hold the slot under a marker.
         handle.cancel('capture-failure');
