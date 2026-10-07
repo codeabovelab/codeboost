@@ -63,3 +63,22 @@ export function createAdapterInvocationBudget(invocation: InvocationInput,
     throw new Error('timeoutMs cannot exceed the production ten-minute ceiling.');
   return createInvocationBudget(invocation, timeoutMs);
 }
+
+/** Preserve the caller's monotonic deadline while applying this adapter's configured timeout as an additional cap. */
+export function capAdapterInvocationBudget(invocationBudget: () => number,
+  timeoutMs = MAXIMUM_INVOCATION_MS): () => number {
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1)
+    throw new Error('timeoutMs must be a positive integer.');
+  if (timeoutMs > MAXIMUM_INVOCATION_MS)
+    throw new Error('timeoutMs cannot exceed the production ten-minute ceiling.');
+  const initialRemaining = invocationBudget();
+  if (!Number.isSafeInteger(initialRemaining) || initialRemaining < 1)
+    throw new Error('Invocation deadline expired during adapter setup.');
+  const end = performance.now() + Math.min(initialRemaining, timeoutMs);
+  return () => {
+    const value = Math.min(invocationBudget(), Math.ceil(end - performance.now()));
+    if (!Number.isSafeInteger(value) || value < 1)
+      throw new Error('Invocation deadline expired during adapter setup.');
+    return value;
+  };
+}

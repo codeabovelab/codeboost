@@ -7,12 +7,15 @@ const TEST_RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
 // window. It must not add a second network removal with a fresh deadline on every retry (#51 item 1).
 const state = vi.hoisted(() => ({ budgets: [] as { at: number; budget: number }[], networkRemovals: 0,
   profileFails: true, profileDisposals: 0, advanceWall: false, wallOffset: 0,
-  networkBudget: undefined as number | undefined, profileBudget: undefined as number | undefined }));
+  networkBudget: undefined as number | undefined, profileBudget: undefined as number | undefined,
+  networkHangs: false }));
 vi.mock('../agents/network/network.ts', async importOriginal => ({
   ...await importOriginal<typeof import('../agents/network/network.ts')>(),
-  createVendorNetwork: (...args: unknown[]) => {
+  createVendorNetwork: async (...args: unknown[]) => {
     if (state.advanceWall) state.wallOffset = 60_000;
     state.networkBudget = (args[6] as (() => number) | undefined)?.();
+    if (state.networkHangs) await new Promise((_resolve, reject) =>
+      (args[4] as AbortSignal).addEventListener('abort', () => reject(new Error('network setup cancelled')), { once: true }));
     return { name: 'codeboost-egress-claude-x', proxyContainer: 'codeboost-proxy-claude-x',
       proxyUrl: 'http://10.254.0.2:3128', vendor: 'claude' };
   },
@@ -45,6 +48,7 @@ describe('adapter profile-creation cleanup', () => {
     vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
     state.budgets = []; state.networkRemovals = 0; state.profileFails = true; state.profileDisposals = 0;
     state.advanceWall = false; state.wallOffset = 0; state.networkBudget = undefined; state.profileBudget = undefined;
+    state.networkHangs = false;
   });
   afterEach(() => { vi.useRealTimers(); });
 
@@ -105,6 +109,24 @@ describe('adapter profile-creation cleanup', () => {
       expect(state.profileBudget).toBeGreaterThan(0);
       expect(state.profileDisposals).toBe(1);
     } finally { clock.mockRestore(); }
+  });
+
+  it('keeps a shorter configured timeout over a longer carried budget during adapter setup', async () => {
+    state.networkHangs = true;
+    const invocation = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER,
+      clone: { id: 'clone', taskId: 'task', directory: '/tmp/task', head: 'a'.repeat(40) },
+      phase: 'review', vendor: 'claude', approvedArgv: [], deadline: Date.now() + 60_000,
+      attemptId: 'adapter-configured-cap',
+      context: { snapshotId: 's', planId: 'p', planRevision: 1, assignmentId: 'a', referencedCodeHash: 'c', stateVersion: 1 },
+    });
+    const handle = startClaudeInvocation({ invocation, filesystems: {} as never, inputDirectory: '/unused',
+      imageId: `sha256:${'a'.repeat(64)}`, prompt: 'unused', networkAllocationId: randomUUID() }, 'token',
+    { timeoutMs: 1_000, invocationBudget: () => 60_000 });
+    const box: { result?: InvocationResult } = {};
+    void handle.settled.then(result => { box.result = result; });
+    await vi.advanceTimersByTimeAsync(1_001);
+    expect(box.result?.stopReason).toBe('timeout');
+    expect(state.profileBudget).toBeUndefined();
   });
 });
 
