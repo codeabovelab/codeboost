@@ -208,6 +208,9 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       review.runnerRepository = repository.path;
       return repository;
     });
+  // F3-F4 assemble the trusted local rewrite/conflict engine here so startup can recover its durable markers. No
+  // production action starts it yet: F5-F6 must first own base/head refresh, admission, checks, push and merge handoff.
+  // Exposing the raw rebaser before that coordinator exists would let a caller bypass those required guards.
   const getRebaser = () => rebaserPromise ??= getRepository().then(repository => new GitRebaser({ repository,
     runnerRoot: config.root, runnerOwner, committer: config.committer,
     onProcessStarting: attemptId => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, null, 'spawning'),
