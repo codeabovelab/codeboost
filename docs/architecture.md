@@ -1,6 +1,6 @@
 # codeboost architecture: a high-level overview
 
-Status: current as of `main` at `1d81303` (2026-10-06). Open work is listed in **Build status and roadmap**.
+Status: current as of `main` at `d463cda` (2026-10-07). Open work is listed in **Build status and roadmap**.
 Writing standard: plain language, ISO 24495-1:2023
 
 ## About this document
@@ -357,14 +357,14 @@ The diagram shows the designed transitions. With the `runner` block, running, ne
 
 ### Stored data
 
-All state is in one SQLite file, opened with WAL and full synchronization. Each write takes an immediate write lock. The schema version is `PRAGMA user_version`, and migrations run in explicit steps (version 16 today); an unknown version fails.
+All state is in one SQLite file, opened with WAL and full synchronization. Each write takes an immediate write lock. The schema version is `PRAGMA user_version`, and migrations run in explicit steps (version 17 today); an unknown version fails.
 
 | Group | Tables | Notes |
 |---|---|---|
 | Plans | `plans`, `revisions`, `requests` | SQLite allocates revision numbers. Old revisions are never changed. Suggestion and draft requests (`mode`, #124) are bound to a revision and snapshot; continuation requests also retain their checkpoint, audited head and completed prefix. |
 | Code history | `snapshots`, `ledger`, `rewrites` | Ledger entries are immutable. Rebase mappings record which old commit became which new one; foreign stays foreign. |
 | Review | `approvals`, `choices`, `review_notes`, `checkpoints`, `continuations` | Stored approvals are claims about a past snapshot. Freshness is recomputed every time. |
-| Runner | `tasks`, `attempts`, `user_actions`, `feedback_events`, `merge_attempts`, `app_settings` | User actions carry idempotency keys. Feedback events are append-only and feed the future learning feature. An attempt carries its safety finding and diagnostic reference. `app_settings` holds the runner, Ask and planning owner tokens. |
+| Runner | `tasks`, `attempts`, `issue_trust`, `user_actions`, `feedback_events`, `merge_attempts`, `app_settings` | User actions carry idempotency keys. Feedback events are append-only and feed the future learning feature. An attempt carries its safety finding, diagnostic reference and the issue-comment evidence prepared for its prompt. `issue_trust` records trust and revocation for each repository issue. `app_settings` holds the runner, Ask and planning owner tokens. |
 | Publishing | `task_pull_requests`, `already_fixed_checks`, `publish_outcomes` | An opening is recorded before the GitHub call, so a lost outcome is recovered, not repeated. Each task's last publish outcome is stamped with the state version that publish last saw (#114), so a later change still makes a new publish owed. |
 
 ## Deployment view
