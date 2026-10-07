@@ -57,6 +57,7 @@ test('ranks demo issues with visible reasons and trust, and keeps review input a
   ]);
   await expect(top.locator('td').nth(2)).toHaveText('160');
   await expect(top.getByLabel('Trust: author is a repository collaborator')).toHaveText('✓ Collaborator');
+  await expect(top.getByRole('button', { name: 'Trust all comments' })).toBeVisible();
   await expect(issueRows(page).nth(2).getByLabel(/needs your trust before queueing/)).toHaveText('! Needs trust');
   await expect(issueRows(page).nth(4).getByRole('listitem')).toHaveText(['1 point: 1 comment']);
   await expect(top.getByRole('link')).toHaveAttribute('rel', 'noopener noreferrer');
@@ -77,6 +78,19 @@ test('ranks demo issues with visible reasons and trust, and keeps review input a
   await page.setViewportSize({ width: 1280, height: 900 });
   await expect(issueRows(page).first().locator('td').nth(3)).toBeVisible();
   expect(errors).toEqual([]);
+});
+
+test('can explicitly trust a collaborator issue to include all comments, then remove that widening', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="17"]');
+  await row.getByRole('button', { name: 'Trust all comments' }).click();
+  await expect(row.getByRole('button', { name: 'Remove trust' })).toBeFocused();
+  await expect(row.getByLabel(/trusted by you on/i)).toBeVisible();
+  await row.getByRole('button', { name: 'Remove trust' }).click();
+  await expect(row.getByRole('button', { name: 'Trust all comments' })).toBeFocused();
+  await expect(row.getByLabel('Trust: author is a repository collaborator')).toBeVisible();
 });
 
 test('trusts and untrusts a demo issue without GitHub and keeps keyboard focus on the action', async ({ page }) => {
@@ -124,7 +138,32 @@ test('ignores an older trust response that returns after a newer action', async 
   await expect(page.locator('#issues-status')).toContainText('✓ Current');
 });
 
-test('merges concurrent trust responses for different issues without losing either decision', async ({ page }) => {
+test('keeps another issue disabled and focused when an overlapping trust request fails', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let held: import('@playwright/test').Route | undefined;
+  const captured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request();
+    const body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action !== 'trust' || body.number !== 21 || held) { await route.continue(); return; }
+    held = route;
+    captured.resolve();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await captured.promise;
+  await page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Trust this issue' }).click();
+  const second = page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Remove trust' });
+  await expect(second).toBeFocused();
+  await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trusting…' })).toHaveAttribute('aria-disabled', 'true');
+  await held!.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'GitHub unavailable.' }) });
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
+  await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' })).toBeVisible();
+  await expect(second).toBeFocused();
+});
+
+test('merges successful overlapping trust responses for different issues', async ({ page }) => {
   app = await startServer(createDemo(join(root, 'demo')), 0);
   let held: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
   const captured = deferred<void>();
@@ -144,6 +183,33 @@ test('merges concurrent trust responses for different issues without losing eith
   await held!.route.fulfill({ response: held!.response });
   await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
   await expect(page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+});
+
+test('does not let a refresh started during trust overwrite the committed decision', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let trustRoute: import('@playwright/test').Route | undefined;
+  let refreshRoute: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const trustCaptured = deferred<void>(), refreshCaptured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request();
+    const body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action === 'trust' && body.number === 21 && !trustRoute) { trustRoute = route; trustCaptured.resolve(); return; }
+    if (body.action === 'refresh' && trustRoute && !refreshRoute) {
+      refreshRoute = { route, response: await route.fetch() }; refreshCaptured.resolve(); return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await trustCaptured.promise;
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await refreshCaptured.promise;
+  const trusted = await trustRoute!.fetch();
+  await trustRoute!.fulfill({ response: trusted });
+  await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await refreshRoute!.route.fulfill({ response: refreshRoute!.response });
+  await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
 });
 
 test('shows unavailable, then current, then stale issue data with the retrieval error', async ({ page }) => {

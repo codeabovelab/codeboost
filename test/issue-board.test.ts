@@ -99,6 +99,16 @@ describe('issue board', () => {
     expect(board.trustStatus(1)).toBe('unknown');
   });
 
+  it('shows a matching explicit decision before collaborator trust so its broader permission can be removed', async () => {
+    const { gateway, calls } = heldGateway();
+    const board = new IssueBoard(gateway, undefined, undefined, () => ({ repository: 'owner/repo', issue: 1,
+      authorLogin: 'owner', trustedBy: 'local user', trustedAt: '2026-09-25T00:00:00.000Z', revokedAt: null }));
+    const refresh = board.refresh();
+    calls[0]!.result.resolve(snapshot());
+    await refresh;
+    expect(board.view()).toMatchObject({ state: { issues: [{ trust: 'approved', trustedBy: 'local user' }] } });
+  });
+
   it('close aborts the refresh, awaits its settlement, and refuses new refreshes', async () => {
     const { gateway, calls } = heldGateway();
     const board = new IssueBoard(gateway);

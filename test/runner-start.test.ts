@@ -113,13 +113,15 @@ describe('start (#91 part 2)', () => {
     store.setIssueTrust({ repository: 'owner/repo', issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
     expect((await act(app, 'start')).body.result).toMatchObject({ outcome: 'started', item: 'P1' });
   });
-  it('records a failed or incomplete collaborator read as a definite refusal', async () => {
+  it('records and replays a failed or incomplete collaborator read as a definite upstream failure', async () => {
     let result: ReturnType<Parameters<typeof trustGateway>[0]> = new Error('incomplete collaborator page');
     const { app, identity, store } = await serve({ issueGateway: trustGateway(() => result) });
     const actionId = randomUUID();
-    expect((await act(app, 'start', { actionId })).body.error).toMatch(/could not be verified.*incomplete collaborator page/i);
+    expect(await act(app, 'start', { actionId })).toMatchObject({ status: 502,
+      body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
     result = { authorLogin: 'member', collaborator: true };
-    expect((await act(app, 'start', { actionId })).body.error).toMatch(/could not be verified.*incomplete collaborator page/i);
+    expect(await act(app, 'start', { actionId })).toMatchObject({ status: 502,
+      body: { error: expect.stringMatching(/could not be verified.*incomplete collaborator page/i) } });
     expect(store.getAttempts(identity)).toEqual([]);
   });
   it('requires every item of the current plan revision to be approved before start', async () => {
@@ -313,7 +315,8 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect(store.continuationProgress(identity)).toMatchObject({ completed: ['P1', 'P2'], next: 'P3' });
   });
   it('requires explicit continuation approval and resumes at the audited suffix through the API', async () => {
-    const { app, identity, store, items } = await serve({ before: service => {
+    const gateway = trustGateway(() => ({ authorLogin: 'outside', collaborator: false }));
+    const { app, identity, store, items } = await serve({ issueGateway: gateway, before: service => {
       committedFirstItem(service, false, ['other.ts']);
       const s = service.store, id = service.config.identity, snapshot = s.getSnapshot(id);
       const entries = [...service.planContext().baseEntries, { path: 'other.ts', kind: 'file' as const }];
@@ -328,9 +331,13 @@ describe('start and resume refusals and races (#91 part 2)', () => {
         next.items.map(item => approveItem(next, [], item.id, id, true)), []);
       const baseContext = service.planContext();
       service.planContextAt = () => ({ ...baseContext, baseEntries: entries });
+      s.setIssueTrust({ repository: gateway.repository, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
     } });
     expect(await view(app)).toMatchObject({ resumable: false, startable: false });
     expect((await act(app, 'resume')).body.error).toMatch(/Approve the amended plan continuation/);
+    store.setIssueTrust({ repository: gateway.repository, issue: 3, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+    expect((await act(app, 'approve-continuation')).body.error).toMatch(/not trusted/);
+    store.setIssueTrust({ repository: gateway.repository, issue: 3, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
     const approved = await act(app, 'approve-continuation');
     expect(approved).toMatchObject({ status: 200, body: { result: { outcome: 'approved', next: items[1] } } });
     expect(store.getTask(identity).status).toBe('queued');

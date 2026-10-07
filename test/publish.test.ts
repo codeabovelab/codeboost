@@ -150,7 +150,10 @@ function harness(store: Store, options: { results?: AlreadyFixedResult[]; open?:
       return pr;
     },
   };
-  const pusher: BranchPusher = { async push(id, input, signal) { log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal); } };
+  const pusher: BranchPusher = { async push(id, input, signal) {
+    input.beforePush?.();
+    log.push(`push ${input.branch.replace(/-[0-9a-f]{16}$/, '')} ${input.head.slice(-3)}`); await options.push?.(id, input, signal);
+  } };
   const publisher = new PullRequestPublisher(store, { checks: gate, pulls, pusher, closing: options.closing }, publishConfig);
   publishBranch = publisher.branch(identity);
   return { log, checks, opened, pulls, publisher };
@@ -968,6 +971,21 @@ describe('recovering a lost opening', () => {
     // The draft is not marked ready and its description is not replaced; the update stays in flight for the next publish.
     expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
     expect(store.taskPullRequests(identity)).toMatchObject([{ number: 100, draft: true, refresh: { head: oid(3) } }]);
+  });
+  it('rechecks authorization after an existing PR push and before refreshing it', async () => {
+    const store = runningTask(), live = new Map<string, OpenedPullRequest>(), next = { value: 100 };
+    store.transitionTask(identity, store.getTask(identity).stateVersion, 'needs human');
+    await harness(store, { live, next }).publisher.publish(identity, { problems: ['x'] });
+    rerun(store);
+    let checks = 0;
+    const again = harness(store, { live, next });
+    await expect(again.publisher.publish(identity, { beforeMutation: () => {
+      checks++;
+      if (checks === 3) throw new GuardRefusal('Issue trust was revoked.');
+    } })).rejects.toThrow('Issue trust was revoked');
+    expect(checks).toBe(3);
+    expect(again.log.some(line => line.startsWith('push'))).toBe(true);
+    expect(again.log.some(line => line.startsWith('refresh'))).toBe(false);
   });
   it('runs one publish per task at a time, across publishers over the same Store', async () => {
     const store = runningTask();

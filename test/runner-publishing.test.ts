@@ -470,6 +470,21 @@ describe('publishing a finished task (#103)', () => {
     expect(store.lastPublish(identity)).toMatchObject({ outcome: 'opened' });
   });
 
+  it('records an unavailable issue-access read as a failed publish, not a trust refusal', async () => {
+    const w = world();
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess() { throw new Error('GitHub returned HTTP 502'); },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, store, identity } = await serve(w, { before: completeAll, startup: false, issueGateway });
+    app.publishOwed(() => undefined);
+    await publishSettled(app, identity);
+    expect(store.lastPublish(identity)).toMatchObject({ outcome: 'failed', message: expect.stringMatching(/could not be verified.*502/) });
+    expect(w.github.calls).toEqual([]);
+  });
+
   it('rechecks issue trust before an automatic publish retry and stops after revocation', async () => {
     const w = world();
     let accessReads = 0;

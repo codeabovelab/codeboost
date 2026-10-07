@@ -54,7 +54,9 @@ export interface IssueGateway {
 /** The extra current-issue reads used by trust actions and runner admission. */
 export interface IssueTrustGateway extends IssueGateway {
   issueAccess(number: number, options?: { signal?: AbortSignal; timeoutMs?: number }): Promise<IssueAccess>;
-  issueText(number: number, options?: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null }): Promise<IssueText>;
+  issueText(number: number, options?: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null;
+    /** Revalidate the admission read against the issue and collaborator snapshot used for this text read. */
+    expectedAccess?: IssueAccess }): Promise<IssueText>;
 }
 
 type RunGh = (args: readonly string[], options?: { signal?: AbortSignal }) => Promise<string>;
@@ -261,7 +263,8 @@ export class GhIssueGateway implements IssueGateway {
    * (design, "Which comments reach the agent"), oldest first. Everything stays untrusted data inside the prompt.
    * Fails closed on anything malformed, on a pull request, and past the comment page limit.
    */
-  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null } = {}): Promise<IssueText> {
+  async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null;
+    expectedAccess?: IssueAccess } = {}): Promise<IssueText> {
     if (!Number.isSafeInteger(number) || number < 1) throw new Error('Invalid issue number.');
     return this.#bounded(options, async signal => {
       let decoded: unknown;
@@ -285,7 +288,13 @@ export class GhIssueGateway implements IssueGateway {
       // The title and body alone, as the prompt serializes them (escaping included): an issue that cannot fit reads nothing more.
       carried({ number, title, body, comments: [] });
       let total = Buffer.byteLength(title) + Buffer.byteLength(body);
-      const collaborators = includeEveryComment ? null : await this.#loadCollaborators(signal);
+      const collaborators = includeEveryComment && !options.expectedAccess ? null : await this.#loadCollaborators(signal);
+      if (options.expectedAccess) {
+        const collaborator = authorLogin !== null && collaborators!.has(authorLogin.toLocaleLowerCase('en-US'));
+        if (options.expectedAccess.number !== number || options.expectedAccess.authorLogin !== authorLogin
+          || options.expectedAccess.collaborator !== collaborator)
+          throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
+      }
       const comments: string[] = [];
       for (let page = 1; ; page++) {
         const listed = await this.run(['api', '--method', 'GET', '-H', 'Accept: application/vnd.github+json',

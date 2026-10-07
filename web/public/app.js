@@ -833,7 +833,8 @@ function issueStatus() {
   return ["bad", `✕ Unavailable · ${esc(state.error)}`];
 }
 function trustMark(issue) {
-  if (issue.trust === "trusted") return '<span class="good" aria-label="Trust: author is a repository collaborator">✓ Collaborator</span>';
+  if (issue.trust === "trusted") return `<span class="good" aria-label="Trust: author is a repository collaborator">✓ Collaborator</span>
+    <button class="issue-trust" data-action="trust" data-issue="${issue.number}">Trust all comments</button>`;
   if (issue.trust === "approved") return `<span class="good" aria-label="Trust: trusted by you on ${esc(issue.trustedAt)}">✓ Trusted by you on ${esc(new Date(issue.trustedAt).toLocaleDateString())}</span>
     <button class="issue-trust" data-action="untrust" data-issue="${issue.number}">Remove trust</button>`;
   return `<span class="warn" aria-label="Trust: needs your trust before queueing, author is not a repository collaborator">! Needs trust</span>
@@ -863,7 +864,19 @@ function renderIssues() {
     )
     .join("")}</tbody></table>`;
 }
-const trustGenerations = new Map();
+const trustGenerations = new Map(), trustPending = new Map(), committedTrustRows = new Map();
+let trustCommitGeneration = 0;
+function renderIssuesWithPending(focusIssue) {
+  const focused = focusIssue ?? Number(document.activeElement?.closest?.("button.issue-trust")?.dataset.issue);
+  renderIssues();
+  for (const [number, pending] of trustPending) {
+    const control = document.querySelector(`.issue-trust[data-issue="${number}"]`);
+    if (!control) continue;
+    control.setAttribute("aria-disabled", "true");
+    control.textContent = pending.action === "trust" ? "Trusting…" : "Removing…";
+  }
+  if (Number.isSafeInteger(focused)) document.querySelector(`.issue-trust[data-issue="${focused}"]`)?.focus();
+}
 function mergeIssueTrustView(updated, number) {
   const currentState = issuesView?.configured ? issuesView.state : null;
   const updatedState = updated?.configured ? updated.state : null;
@@ -875,6 +888,13 @@ function mergeIssueTrustView(updated, number) {
   issuesView = { ...issuesView, repository: updated.repository, refreshing: updated.refreshing,
     state: { ...currentState, issues: currentState.issues.map((issue) => issue.number === number ? replacement : issue) } };
 }
+function mergeTrustCommittedDuring(updated, generation) {
+  if (!updated?.configured || !updated.state) return updated;
+  return { ...updated, state: { ...updated.state, issues: updated.state.issues.map((issue) => {
+    const committed = committedTrustRows.get(issue.number);
+    return committed && committed.generation > generation && committed.issue.authorLogin === issue.authorLogin ? committed.issue : issue;
+  }) } };
+}
 async function changeIssueTrust(button) {
   if (button.getAttribute("aria-disabled") === "true") return;
   const number = Number(button.dataset.issue), action = button.dataset.action;
@@ -882,25 +902,21 @@ async function changeIssueTrust(button) {
   if (!issue || !["trust", "untrust"].includes(action)) return;
   const generation = (trustGenerations.get(number) ?? 0) + 1;
   trustGenerations.set(number, generation);
-  const viewGeneration = ++issuesGeneration;
-  if (issuesLoading) {
-    issuesLoading = false;
-    $("issues-refresh").removeAttribute("aria-disabled");
-    $("issues-refresh").textContent = "Refresh issues";
-  }
-  const restoreFocus = document.activeElement === button;
+  trustPending.set(number, { action, generation });
   button.setAttribute("aria-disabled", "true");
   button.textContent = action === "trust" ? "Trusting…" : "Removing…";
   try {
     const updated = await api("/api/issues", { action, actionId: crypto.randomUUID(), number, authorLogin: issue.authorLogin });
     if (trustGenerations.get(number) !== generation) return;
+    trustPending.delete(number);
     mergeIssueTrustView(updated, number);
-    renderIssues();
-    if (restoreFocus) document.querySelector(`.issue-trust[data-issue="${number}"]`)?.focus();
+    const committed = updated?.configured && updated.state?.issues.find((entry) => entry.number === number);
+    if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, issue: committed });
+    renderIssuesWithPending();
   } catch (error) {
-    if (trustGenerations.get(number) !== generation || issuesGeneration !== viewGeneration) return;
-    button.removeAttribute("aria-disabled");
-    button.textContent = action === "trust" ? "Trust this issue" : "Remove trust";
+    if (trustGenerations.get(number) !== generation) return;
+    trustPending.delete(number);
+    renderIssuesWithPending();
     $("issues-status").className = "bad";
     $("issues-status").textContent = `✕ Could not ${action === "trust" ? "trust" : "remove trust from"} issue #${number}. ${error.message}`;
   }
@@ -908,22 +924,23 @@ async function changeIssueTrust(button) {
 async function loadIssues() {
   if (issuesLoading) return;
   const generation = ++issuesGeneration;
+  const trustGeneration = trustCommitGeneration;
   issuesRequested = true;
   issuesLoading = true;
   // aria-disabled, not disabled: disabling the focused button would drop keyboard focus to the page.
   $("issues-refresh").setAttribute("aria-disabled", "true");
   $("issues-refresh").textContent = "Refreshing…";
   if (issuesView?.configured) issuesView = { ...issuesView, refreshing: true };
-  renderIssues();
+  renderIssuesWithPending();
   try {
     const updated = await api("/api/issues", { action: "refresh" });
     if (generation !== issuesGeneration) return;
-    issuesView = updated;
-    renderIssues();
+    issuesView = mergeTrustCommittedDuring(updated, trustGeneration);
+    renderIssuesWithPending();
   } catch (error) {
     if (generation !== issuesGeneration) return;
     if (issuesView?.configured) issuesView = { ...issuesView, refreshing: false };
-    renderIssues();
+    renderIssuesWithPending();
     $("issues-status").className = "bad";
     $("issues-status").textContent = `✕ Could not refresh issues. ${error.message}`;
   } finally {

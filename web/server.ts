@@ -13,7 +13,7 @@ import { OWED_REFUSAL, TaskPublishing } from '../runner/publishing.ts';
 import type { RunnerAssembly } from '../runner/production.ts';
 import { baseBranch } from '../github/validate.ts';
 import type { ShutdownCapability } from '../runner/lifecycle.ts';
-import { ActionIdReused, BadRequest, GuardRefusal, ShuttingDownError, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
+import { ActionIdReused, BadRequest, GuardRefusal, ShuttingDownError, UpstreamFailure, assertUuidV4, isUuidV4, sameContext } from '../runner/lifecycle.ts';
 import { GhIssueGateway, type IssueGateway, type IssueAccess, type IssueTrustGateway } from '../github/issues.ts';
 import { demoIssueGateway } from '../scripts/demo-issues.ts';
 import { IssueBoard } from './issues.ts';
@@ -34,8 +34,6 @@ export interface PlanningDeps {
 }
 /** Start, cancel or apply a suggestion or a draft (#124): `/api/plan/<kind>` or `/api/plan/<kind>/<id>/<action>`. */
 const PLANNING_REQUEST = /^\/api\/plan\/(suggestions|drafts)(?:\/([0-9a-f-]{36})\/(cancel|apply))?$/;
-/** A dependency the server reads from (GitHub) failed: 502, not recorded. */
-class UpstreamFailure extends Error {}
 /** How long a planning request may take to settle after shutdown aborts it, before its worker is abandoned (Ask's grace). */
 export const PLANNING_SHUTDOWN_GRACE_MS = 20_000;
 /** Production planning is built after the Store opens, from the review it serves (see web/cli.ts). */
@@ -133,7 +131,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     try { return await trustGateway.issueAccess(config.github.issue, { signal, timeoutMs: 12_000 }); }
     catch (error) {
       if (signal.aborted) throw signal.reason;
-      throw new GuardRefusal(`Issue trust could not be verified: ${error instanceof Error ? error.message : String(error)}`);
+      throw new UpstreamFailure(`Issue trust could not be verified: ${error instanceof Error ? error.message : String(error)}`);
     }
   };
   authorizePublish = async (_publishIdentity, signal) => {
@@ -294,7 +292,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     let access: IssueAccess | undefined;
     const trustGated = !!config.github &&
       (((action === 'start' || action === 'resume') && !!executor) ||
-        ((action === 'publish' || action === 'approve-continuation') && !!publishing));
+        (action === 'approve-continuation' && !!executor) || (action === 'publish' && !!publishing));
     if (trustGated) {
       if (stopping || runner?.closing) throw new ShuttingDownError();
       const replay = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request });
@@ -563,7 +561,6 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
             catch (error) { throw new UpstreamFailure(`The issue author could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`); }
             service.store.userAction(identity, { actionId: input.actionId, kind, request }, () => {
               if (access.authorLogin !== input.authorLogin) throw new GuardRefusal('The issue author changed. Refresh before changing trust.');
-              if (input.action === 'trust' && access.collaborator) throw new GuardRefusal('This issue is already trusted because its author is a repository collaborator.');
               service.store.setIssueTrust({ repository: trustGateway.repository, issue: access.number, authorLogin: access.authorLogin,
                 trusted: input.action === 'trust', trustedBy: 'local user' });
               return { outcome: input.action === 'trust' ? 'trusted' : 'untrusted', number: access.number };

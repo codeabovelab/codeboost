@@ -1,4 +1,5 @@
-import { GhIssueGateway, type IssueText } from '../github/issues.ts';
+import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 import { PlanningAgent } from '../runner/planning.ts';
 import type { ReviewConfig, ReviewService } from '../runner/review.ts';
 import type { PlanningSetup } from './server.ts';
@@ -14,7 +15,7 @@ export const ISSUE_READ_TIMEOUT_MS = 30_000;
 export function productionPlanning(config: ReviewConfig, options: {
   /** The single-runner lock's check that the database path still names the locked file (runner/recovery.ts). */
   verifyLock: () => void;
-  issues?: { issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number; trustedAuthor?: string | null }): Promise<IssueText> };
+  issues?: Pick<IssueTrustGateway, 'issueAccess' | 'issueText'>;
   agent?: (service: ReviewService) => PlanningAgent;
 }): PlanningSetup | undefined {
   const github = config.github;
@@ -30,9 +31,12 @@ export function productionPlanning(config: ReviewConfig, options: {
     return {
       provider,
       async describe(signal) {
+        const access = await issues.issueAccess(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
         const trust = service.store.issueTrust(github.repository, github.issue);
+        const explicitlyTrusted = trust?.revokedAt === null && trust.authorLogin === access.authorLogin;
+        if (!access.collaborator && !explicitlyTrusted) throw new GuardRefusal(`Issue #${github.issue} is not trusted for its current author.`);
         const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS,
-          trustedAuthor: trust?.revokedAt === null ? trust.authorLogin : undefined });
+          trustedAuthor: explicitlyTrusted ? access.authorLogin : undefined, expectedAccess: access });
         // The configured base branch (#103), or the base commit when none (or an empty one) is configured.
         const baseRef = github.baseBranch || service.store.getSnapshot(config.identity).base;
         return { issue: { number: text.number, title: text.title, body: text.body, comments: [...text.comments] },

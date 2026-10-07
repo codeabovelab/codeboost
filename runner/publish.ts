@@ -11,7 +11,7 @@ import type { Store, TaskPullRequest } from './store.ts';
  * "Needs human"). The push of the task head to its branch is injected; `GitBranchPusher` (`branch-push.ts`) is the real one.
  */
 export interface BranchPusher {
-  /** Makes `refs/heads/<branch>` on GitHub point at `head`. Settles only when the push finished or failed. */
+  /** Makes the branch point at `head`. Implementations call `beforePush` after their final await, immediately before the write. */
   push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: () => void }, signal?: AbortSignal): Promise<void>;
 }
 export interface PublishConfig {

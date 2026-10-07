@@ -4,7 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
-import type { IssueText } from '../github/issues.ts';
+import type { IssueAccess, IssueText } from '../github/issues.ts';
 import { createDemo } from '../scripts/demo.ts';
 import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
@@ -30,6 +30,9 @@ function production(config = demo()): ReviewConfig {
   return { ...config, demo: false, github: { repository: 'acme/retry-service', pullRequest: 7, issue } };
 }
 const text = (number: number): IssueText => ({ number, title: 'Retries ignore the cap', body: 'Body with <tags>.', comments: ['Collaborator note.'] });
+const issues = (issueText: (number: number, options?: { trustedAuthor?: string | null; expectedAccess?: IssueAccess }) => Promise<IssueText>, collaborator = true) => ({
+  issueAccess: async (number: number) => ({ number, authorLogin: 'outside', collaborator }), issueText,
+});
 const closable = (close = vi.fn(async () => undefined)) => ({ close, invoke: vi.fn() }) as unknown as PlanningAgent;
 const verified = { verifyLock: () => undefined };
 
@@ -43,10 +46,33 @@ it('is off in a demo and without a github block, so neither plans', () => {
 it('tells each request the GitHub issue, the repository and the base commit, read with a bound', async () => {
   const config = production(), service = new ReviewService(config); closers.push(() => service.close());
   const issueText = vi.fn(async (number: number) => text(number)), signal = new AbortController().signal;
-  const deps = productionPlanning(config, { ...verified, issues: { issueText }, agent: () => closable() })!(service);
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText), agent: () => closable() })!(service);
   expect(await deps.describe(signal)).toEqual({ issue: text(config.github!.issue), approvedLessons: [],
     repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base } });
-  expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
+  expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS, trustedAuthor: undefined,
+    expectedAccess: { number: config.github!.issue, authorLogin: 'outside', collaborator: true } });
+});
+
+it('passes explicit trust into planning comments and refuses the next read after revocation', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const issueText = vi.fn(async (number: number, options?: { trustedAuthor?: string | null }) =>
+    ({ ...text(number), comments: options?.trustedAuthor === 'outside' ? ['Outside note.'] : [] }));
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText, false), agent: () => closable() })!(service);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  await expect(deps.describe(new AbortController().signal)).resolves.toMatchObject({ issue: { comments: ['Outside note.'] } });
+  expect(issueText).toHaveBeenLastCalledWith(config.github!.issue, expect.objectContaining({ trustedAuthor: 'outside' }));
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  await expect(deps.describe(new AbortController().signal)).rejects.toThrow(/not trusted/);
+});
+
+it('refuses when the issue author or collaborator access changes between admission and the text read', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const issueText = vi.fn(async (_number: number, options?: { expectedAccess?: IssueAccess }) => {
+    expect(options?.expectedAccess).toEqual({ number: config.github!.issue, authorLogin: 'outside', collaborator: true });
+    throw new Error(`Issue #${config.github!.issue}'s author or collaborator access changed during admission.`);
+  });
+  const deps = productionPlanning(config, { ...verified, issues: issues(issueText), agent: () => closable() })!(service);
+  await expect(deps.describe(new AbortController().signal)).rejects.toThrow(/access changed during admission/);
 });
 
 it.each([['release', 'release'], ['', null]] as const)('names the configured base branch %j, or else the base commit, in the prompt', async (baseBranch, expected) => {
@@ -55,7 +81,7 @@ it.each([['release', 'release'], ['', null]] as const)('names the configured bas
   const agent = () => ({ close: async () => undefined, invoke: async (request: AuthorRequest, signal: AbortSignal) => {
     requests.push(request); return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } }) as unknown as PlanningAgent;
   const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined,
-    productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent })!);
+    productionPlanning(config, { ...verified, issues: issues(async number => text(number)), agent })!);
   closers.push(() => app.close());
   const call = async (method: string, path: string, body?: unknown) => (await fetch(`${new URL(app.url).origin}${path}`, { method,
     headers: { 'x-codeboost-token': app.token, ...(body ? { 'content-type': 'application/json' } : {}) }, body: body ? JSON.stringify(body) : undefined })).json() as Promise<Record<string, any>>;
@@ -89,7 +115,7 @@ it('closes the Store and starts nothing when the planning setup refuses', async 
 
 it('closes the planning agent when the server closes', async () => {
   const config = production(), close = vi.fn(async () => undefined);
-  const setup = productionPlanning(config, { ...verified, issues: { issueText: async number => text(number) }, agent: () => closable(close) })!;
+  const setup = productionPlanning(config, { ...verified, issues: issues(async number => text(number)), agent: () => closable(close) })!;
   const app = await startServer(config, 0, async () => 'answer', undefined, 2_000, undefined, undefined, setup);
   await app.close();
   expect(close).toHaveBeenCalledTimes(1);

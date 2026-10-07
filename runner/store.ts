@@ -9,7 +9,7 @@ import type { Approval, SegmentChoice } from '../core/approvals.ts';
 import type { InvocationContext, StopReason } from '../agents/contract.ts';
 import type { AlreadyFixedResult } from '../github/already-fixed.ts';
 import {
-  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, HUMAN_GATES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
+  ATTEMPT_PHASES, BadRequest, CLOSED_STATUSES, HUMAN_GATES, MERGEABLE_STATUSES, ShuttingDownError, type ShutdownCapability, DEFAULT_TASK_BUDGET_MS, FIRST_REASONS, GuardRefusal, UpstreamFailure, ActionIdReused, RefusalWithEffect, MAX_RESULT_BYTES, TASK_STATUSES, TERMINAL_STATES,
   WRITABLE_KINDS, assertUuidV4, bounded, classifySettlement, requestHash, sameContext,
   type AttemptKind, type AttemptState, type Classification, type FirstReason, type Settlement, type TaskStatus,
 } from './lifecycle.ts';
@@ -1736,7 +1736,8 @@ export class Store {
       if (!replaying && !storage && !(error instanceof ActionIdReused) && !(error instanceof BadRequest) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
         this.#transaction(() => {
-          if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId)) record({ ok: false, error: message });
+          if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId))
+            record({ ok: false, error: message, ...(error instanceof UpstreamFailure ? { kind: 'upstream' } : {}) });
           if (error instanceof RefusalWithEffect) error.effect();
         });
       }
@@ -1752,8 +1753,8 @@ export class Store {
     const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', identityKey(identity), action.actionId);
     if (!row) return undefined;
     if (row.request_hash !== requestHash(action.kind, action.request)) throw new ActionIdReused('Action ID already used for a different request.');
-    const outcome = decode<{ ok: boolean; value?: T; error?: string }>(row.response);
-    if (!outcome.ok) throw new GuardRefusal(outcome.error!);
+    const outcome = decode<{ ok: boolean; value?: T; error?: string; kind?: string }>(row.response);
+    if (!outcome.ok) throw outcome.kind === 'upstream' ? new UpstreamFailure(outcome.error!) : new GuardRefusal(outcome.error!);
     return { response: outcome.value as T, replayed: true };
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */

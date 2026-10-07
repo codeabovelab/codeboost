@@ -45,11 +45,10 @@ export class IssueBoard {
   view(): IssueBoardView {
     if (!this.#prioritizer) return { configured: false, reason: this.#reason };
     const state = this.#state && { ...this.#state, issues: this.#state.issues.map(issue => {
-      if (issue.trust === 'trusted') return issue;
       const decision = this.#trust(issue.repository, issue.number);
-      return decision?.revokedAt === null && decision.authorLogin === issue.authorLogin
-        ? { ...issue, trust: 'approved' as const, trustedAt: decision.trustedAt, trustedBy: decision.trustedBy }
-        : issue;
+      if (decision?.revokedAt === null && decision.authorLogin === issue.authorLogin)
+        return { ...issue, trust: 'approved' as const, trustedAt: decision.trustedAt, trustedBy: decision.trustedBy };
+      return issue;
     }) } as IssueBoardState;
     return { configured: true, repository: this.#prioritizer.gateway.repository, refreshing: this.#flight !== null, state };
   }

@@ -1071,6 +1071,17 @@ describe('item execution', () => {
     runner = h.runner;
     expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'not started', reason: 'The review server is shutting down.', completed: ['P1'] });
   });
+  it('stops before launching the next item when its per-item issue trust read is refused', async () => {
+    let reads = 0;
+    const h = setup({ issue: () => {
+      if (++reads === 2) throw new GuardRefusal('Issue #1 is not trusted for its current author.');
+      return { number: 1, title: 'Issue', body: 'Please fix', comments: [] };
+    } });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P2', state: 'failed', completed: ['P1'],
+      reason: expect.stringMatching(/not trusted for its current author/) });
+    expect(h.store.getAttempts(identity)).toMatchObject([{ item: 'P1', state: 'completed' }, { item: 'P2', state: 'failed' }]);
+    expect(h.log.some(line => line.includes('start P2'))).toBe(false);
+  });
   it('builds a pause\'s executed prefix from the plan the item ran against, even if a revision inserts an item before it', async () => {
     let store!: Store, imported: Error | undefined;
     const h = setup({ manifests: { P1: manifest([change('a.ts'), change('extra.ts', { kind: 'add', oldType: undefined })]) }, release: async () => {

@@ -269,6 +269,14 @@ describe('issue text for an execute prompt (#91)', () => {
       number: 7, authorLogin: null, collaborator: false,
     });
   });
+  it('refuses text when its current author or collaborator access differs from admission', async () => {
+    const changedAuthor = gateway([], rawIssue({ user: { login: 'other' } }), ['other']).gateway;
+    await expect(changedAuthor.issueText(7, { expectedAccess: { number: 7, authorLogin: 'member', collaborator: true } }))
+      .rejects.toThrow(/author or collaborator access changed during admission/);
+    const changedAccess = gateway([], rawIssue({ user: { login: 'member' } }), []).gateway;
+    await expect(changedAccess.issueText(7, { expectedAccess: { number: 7, authorLogin: 'member', collaborator: true } }))
+      .rejects.toThrow(/author or collaborator access changed during admission/);
+  });
   it('refuses a pull request, a different issue, and text too long for a prompt', async () => {
     await expect(gateway([], rawIssue({ pull_request: { url: 'x' } })).gateway.issueText(7)).rejects.toThrow(/is a pull request/);
     await expect(gateway([], rawIssue({ number: 8 })).gateway.issueText(7)).rejects.toThrow(/different issue/);
