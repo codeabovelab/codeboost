@@ -213,7 +213,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     onProcessGroup: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, 'spawning', group),
     onProcessGroupSettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, null),
     onProcessUnsettled: (attemptId, group) => service.store.setRebaseProcessGroup(rebasePlanKey, attemptId, group, 'unsettled'),
-    onResultPrepared: (attemptId, head, history) => service.store.prepareRebaseResult(rebasePlanKey, attemptId, head, history),
+    onResultPrepared: (attemptId, head, history, conflicts) => service.store.prepareRebaseResult(rebasePlanKey, attemptId, head, history, conflicts),
     onResultState: (attemptId, state) => state === 'ready'
       ? service.store.completeRebaseResult(rebasePlanKey, attemptId)
       : service.store.setRebaseResultState(rebasePlanKey, attemptId, state) }));

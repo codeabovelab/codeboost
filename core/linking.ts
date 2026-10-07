@@ -17,8 +17,10 @@ export interface Segment {
   row: string; scope: 'in-scope' | 'out-of-scope' | 'unplanned' | 'ambiguous';
   oldLine: number | null; newLine: number | null; operation: '+' | '-' | null;
   content: string; context: string; hunk: number; sharesHunkWith: string[];
+  /** At least one contributing foreign commit was resolved by the sandboxed rebase agent. */
+  conflictResolved?: boolean;
 }
-interface Evidence { owners: (string | null)[]; outOfScope: string[] }
+interface Evidence { owners: (string | null)[]; outOfScope: string[]; conflictResolved: boolean }
 interface TrackedLine { text: string; evidence: Evidence; origins: string[]; moved: Evidence }
 interface TrackedFile { lines: TrackedLine[]; metadata: Evidence; metadataPaths: string[] }
 const unique = <T>(values: T[]): T[] => [...new Set(values)];
@@ -30,7 +32,7 @@ function metadataChange(delta: FileDelta): boolean {
   return delta.oldPath !== delta.newPath || delta.before?.mode !== delta.after?.mode ||
     !textFile(delta.before) || !textFile(delta.after);
 }
-const empty = (): Evidence => ({ owners: [], outOfScope: [] });
+const empty = (): Evidence => ({ owners: [], outOfScope: [], conflictResolved: false });
 function classify(evidence: Evidence): Pick<Segment, 'row' | 'scope'> {
   const { owners, outOfScope } = evidence;
   if (!owners.length || owners.includes(null)) return { row: 'Unplanned', scope: 'unplanned' };
@@ -42,7 +44,8 @@ function classify(evidence: Evidence): Pick<Segment, 'row' | 'scope'> {
 export interface LinkingLimits { maxLines?: number; maxSegments?: number; maxReferences?: number; maxDurationMs?: number }
 
 /** Replays a linear history. Commit messages and Plan-Item trailers are never trusted. */
-export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<string, string | null>, pathKey: (path: string) => string, limits: LinkingLimits = {}): Segment[] {
+export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<string, string | null>, pathKey: (path: string) => string,
+  limits: LinkingLimits = {}, resolvedConflicts: ReadonlySet<string> = new Set()): Segment[] {
   if (typeof pathKey !== 'function') throw new Error('Known checkout path identity is required.');
   const budget = (value: number | undefined, ceiling: number, name: string) => {
     const limit = value ?? ceiling;
@@ -87,7 +90,7 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
       for (const owner of entry.owners) owners.add(owner);
       for (const owner of entry.outOfScope) outOfScope.add(owner);
     }
-    return { owners: [...owners], outOfScope: [...outOfScope] };
+    return { owners: [...owners], outOfScope: [...outOfScope], conflictResolved: evidence.some(entry => entry.conflictResolved) };
   };
   const mergeOrigins = (tracked: readonly TrackedLine[]): string[] => {
     const origins = new Set<string>();
@@ -111,7 +114,8 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
       const item = plan.items.find(item => item.id === owner);
       const declared = new Set(item?.files.flatMap(file => [file.path, ...(file.renamed_from ? [file.renamed_from] : [])]).map(pathKey));
       const touched = [delta.oldPath, delta.newPath].filter((path): path is string => path !== null);
-      const current: Evidence = { owners: [owner], outOfScope: owner !== null && touched.some(path => !declared.has(pathKey(path))) ? [owner] : [] };
+      const current: Evidence = { owners: [owner], outOfScope: owner !== null && touched.some(path => !declared.has(pathKey(path))) ? [owner] : [],
+        conflictResolved: owner === null && resolvedConflicts.has(commit.sha) };
       let previous = oldPath ? files.get(oldPath) : undefined;
       if (!previous) previous = {
         lines: lines(textFile(delta.before) ? delta.before!.text : '').map((text, i) => {
@@ -170,7 +174,8 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
     const push = (part: Omit<Segment, 'row' | 'scope' | 'sharesHunkWith' | 'owners'>, evidence: Evidence) => {
       remaining();
       if (++segmentCount > maxSegments) throw new Error('Linking exceeds its cumulative segment budget.');
-      fileSegments.push({ ...part, owners: evidence.owners, ...classify(evidence), sharesHunkWith: [] });
+      fileSegments.push({ ...part, owners: evidence.owners, ...classify(evidence), sharesHunkWith: [],
+        ...(evidence.conflictResolved ? { conflictResolved: true } : {}) });
     };
     if (metadataChange(delta)) {
       const evidence = combine(affectedPaths.map(path => metadata.get(path) ?? empty()));
@@ -213,6 +218,7 @@ export function linkHistory(plan: Plan, history: History, ledger: ReadonlyMap<st
       const last = grouped.at(-1);
       if (last && part.kind === 'text' && last.kind === 'text' && last.hunk === part.hunk &&
           last.operation === part.operation && last.context === part.context && last.scope === part.scope &&
+          !!last.conflictResolved === !!part.conflictResolved &&
           (part.operation === '+' ? last.newLine! + groupedLineCount === part.newLine : last.oldLine! + groupedLineCount === part.oldLine) &&
           JSON.stringify(last.owners) === JSON.stringify(part.owners)) { last.content += part.content; groupedLineCount++; }
       else { grouped.push({ ...part }); groupedLineCount = part.kind === 'text' ? 1 : 0; }

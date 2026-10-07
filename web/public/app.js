@@ -355,8 +355,8 @@ function renderCode() {
     comparison +
     (segments
       .map((segment, index) => {
-        const provenance =
-          segment.row === "Accepted" ? "Accepted" : segment.row;
+        const provenance = `${segment.row === "Accepted" ? "Accepted" : segment.row}${segment.conflictResolved ? " · conflict resolved by agent" : ""}`;
+        const unplanned = segment.row === "Unplanned";
         let content;
         if (segment.kind === "file") {
           const meta = JSON.parse(segment.content);
@@ -372,13 +372,13 @@ function renderCode() {
                       meta.newMode
                     ? "File mode changed"
                     : "File change";
-          content = `<div class="file-card"><div class="provenance ${provenance === "Unplanned" ? "unplanned" : ""}">${esc(provenance)}</div><div class="file-values"><strong>▧ ${label}</strong><dl><dt>Path</dt><dd><code>${esc(meta.oldPath || "Absent")} → ${esc(meta.newPath || "Absent")}</code></dd><dt>Mode</dt><dd><code>${esc(meta.oldMode || "Absent")} → ${esc(meta.newMode || "Absent")}</code></dd></dl><p class="muted">Size: ${segment.file?.oldSize ?? "N/A"} → ${segment.file?.newSize ?? "N/A"} bytes</p>${segment.file?.beforePreview || segment.file?.afterPreview ? `<div class="image-previews">${segment.file.beforePreview ? `<figure><figcaption>Before</figcaption><img alt="Previous image in ${esc(segment.path)}" src="${esc(segment.file.beforePreview)}"></figure>` : ""}${segment.file.afterPreview ? `<figure><figcaption>After</figcaption><img alt="Current image in ${esc(segment.path)}" src="${esc(segment.file.afterPreview)}"></figure>` : ""}</div>` : '<p class="muted">No preview available</p>'}<details><summary>Details · content IDs</summary><pre>${esc(JSON.stringify(meta, null, 2))}</pre></details></div></div>`;
+          content = `<div class="file-card"><div class="provenance ${unplanned ? "unplanned" : ""}">${esc(provenance)}</div><div class="file-values"><strong>▧ ${label}</strong><dl><dt>Path</dt><dd><code>${esc(meta.oldPath || "Absent")} → ${esc(meta.newPath || "Absent")}</code></dd><dt>Mode</dt><dd><code>${esc(meta.oldMode || "Absent")} → ${esc(meta.newMode || "Absent")}</code></dd></dl><p class="muted">Size: ${segment.file?.oldSize ?? "N/A"} → ${segment.file?.newSize ?? "N/A"} bytes</p>${segment.file?.beforePreview || segment.file?.afterPreview ? `<div class="image-previews">${segment.file.beforePreview ? `<figure><figcaption>Before</figcaption><img alt="Previous image in ${esc(segment.path)}" src="${esc(segment.file.beforePreview)}"></figure>` : ""}${segment.file.afterPreview ? `<figure><figcaption>After</figcaption><img alt="Current image in ${esc(segment.path)}" src="${esc(segment.file.afterPreview)}"></figure>` : ""}</div>` : '<p class="muted">No preview available</p>'}<details><summary>Details · content IDs</summary><pre>${esc(JSON.stringify(meta, null, 2))}</pre></details></div></div>`;
         } else {
           const lines = segment.content.split("\n");
           if (lines.at(-1) === "") lines.pop();
           const start =
             segment.operation === "+" ? segment.newLine : segment.oldLine;
-          content = `<div class="diff ${segment.operation === "+" ? "added" : "removed"}" data-segment="${segment.key}"><div class="provenance ${provenance === "Unplanned" ? "unplanned" : ""}">${esc(provenance)}</div><div class="line-numbers">${lines.map((_, i) => `<button type="button" class="line-number" data-line="${start + i}" aria-label="Select ${segment.operation === "+" ? "added" : "removed"} line ${start + i}">${start + i}</button>`).join("")}</div><div class="sign">${esc(segment.operation)}</div><pre class="code-lines">${lines.map((line,i) => `<span data-code-line="${start+i}">${esc(line) || "&#8203;"}</span>`).join("\n")}</pre></div>`;
+          content = `<div class="diff ${segment.operation === "+" ? "added" : "removed"}" data-segment="${segment.key}"><div class="provenance ${unplanned ? "unplanned" : ""}">${esc(provenance)}</div><div class="line-numbers">${lines.map((_, i) => `<button type="button" class="line-number" data-line="${start + i}" aria-label="Select ${segment.operation === "+" ? "added" : "removed"} line ${start + i}">${start + i}</button>`).join("")}</div><div class="sign">${esc(segment.operation)}</div><pre class="code-lines">${lines.map((line,i) => `<span data-code-line="${start+i}">${esc(line) || "&#8203;"}</span>`).join("\n")}</pre></div>`;
         }
         const choices = ["Unplanned", "Ambiguous"].includes(segment.row)
           ? `<div class="choice-controls"><p>Assigning this change makes the selected item’s approval stale.</p><select aria-label="Assign change ${index + 1} to" data-target="${index}"><option value="">Assign to…</option>${data.items.map((p) => `<option value="${esc(p.id)}">${esc(p.id)} · ${esc(p.title)}</option>`).join("")}</select><button data-assign="${index}">Assign</button><button data-accept="${index}">Accept as is</button></div>`

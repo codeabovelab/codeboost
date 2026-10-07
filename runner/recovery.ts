@@ -185,6 +185,14 @@ function validRebaseResult(marker: Partial<RebaseMarker>, history: unknown, head
   return !!endpoint && endpoint.oldSha === marker.oldHead &&
     (head === null ? endpoint.newSha === marker.oldHead && mappings.every(mapping => mapping.oldSha === mapping.newSha) : endpoint.newSha === head);
 }
+function validResolvedConflicts(history: unknown, mappings: unknown, conflicts: unknown): boolean {
+  if (!Array.isArray(conflicts) || conflicts.length > 500) return false;
+  if (history === null) return conflicts.length === 0;
+  if (!Array.isArray(history) || !Array.isArray(mappings)) return false;
+  const sources = new Map((mappings as { oldSha?: unknown; newSha?: unknown }[]).map(mapping => [mapping.oldSha, mapping.newSha]));
+  return new Set(conflicts).size === conflicts.length && conflicts.every(value => typeof value === 'string' &&
+    /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(value) && history.includes(value) && sources.get(value) !== value);
+}
 const EXPORT_LIMIT = 1024 * 1024;
 
 /**
@@ -241,7 +249,8 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
     const processGroup = marker?.processGroup, processGroupIdentity = processGroup && typeof processGroup === 'object'
       ? processGroup.identity ?? null : null, oldHistory = marker?.oldHistory ?? null,
       resultHead = marker?.resultHead ?? null, resultMappings = marker?.resultMappings ?? null,
-      resultState = marker?.resultState ?? 'none';
+      resultState = marker?.resultState ?? 'none', rawResolvedConflicts = marker && Object.hasOwn(marker, 'resolvedConflicts')
+        ? marker.resolvedConflicts : [];
     if (!marker || !isUuidV4(marker.attemptId) || typeof marker.oldBase !== 'string' || typeof marker.oldHead !== 'string' || typeof marker.onto !== 'string' ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldBase) || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.oldHead) ||
         !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(marker.onto) ||
@@ -252,10 +261,13 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
         !['none', 'prepared', 'uncertain', 'refused', 'ready'].includes(resultState) ||
         (resultState === 'none' ? resultHead !== null || resultMappings !== null : resultMappings === null) ||
         !validRebaseResult(marker, oldHistory, resultHead, resultMappings) ||
+        !validResolvedConflicts(oldHistory, resultMappings ?? [], rawResolvedConflicts) ||
+        (resultState === 'none' && Array.isArray(rawResolvedConflicts) && rawResolvedConflicts.length !== 0) ||
         (processGroup !== null && (!processGroup || typeof processGroup === 'string' || !Number.isSafeInteger(processGroup.pgid) || processGroup.pgid <= 1 ||
           !Number.isSafeInteger(processGroup.startedAt) || processGroup.startedAt < 0 ||
           (processGroupIdentity !== null && !/^linux:[0-9a-f-]{36}:\d+$/.test(processGroupIdentity)))))
       throw new RecoveryBlocked('An interrupted rebase has an invalid recovery marker', [rebase.planKey]);
+    const resolvedConflicts = rawResolvedConflicts as string[];
     if (processGroup) {
       if (processes.isAlive(processGroup.pgid))
         await processes.terminate(processGroup.pgid, processGroupIdentity, o.graceMs ?? 5_000);
@@ -269,7 +281,7 @@ export async function recoverStartup(o: RecoveryOptions): Promise<RecoveryReport
       if (users.length) throw new RecoveryBlocked('A process still uses an interrupted rebase workspace', users);
       o.store.setRebaseProcessGroup(rebase.planKey, marker.attemptId, processGroup, null);
     }
-    await o.deps.abortRebase(rebase.planKey, { ...marker, oldHistory, resultState, resultHead, resultMappings, processGroup: null });
+    await o.deps.abortRebase(rebase.planKey, { ...marker, oldHistory, resultState, resultHead, resultMappings, resolvedConflicts, processGroup: null });
     if (!o.store.abortRebase(rebase.planKey, marker.attemptId))
       throw new RecoveryBlocked('An interrupted rebase changed while recovery aborted it', [rebase.planKey]);
   }

@@ -62,7 +62,9 @@ export class ReviewService {
     const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = this.#pathKey;
-    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey);
+    const ledger = this.store.getLedger(identity);
+    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey, {},
+      new Set(ledger.filter(entry => entry.conflictResolved).map(entry => entry.sha)));
     const saved = this.store.getReview(identity), keys = choiceKeys(raw, identity);
     const deltas = new Map(history.final.map(file => [JSON.stringify([file.newPath ?? file.oldPath, file.oldPath]), file]));
     let previewBudget = 6 * 1024 * 1024;

@@ -289,8 +289,36 @@ describe('startup recovery sequence', () => {
     await recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
       deps: deps({ abortRebase }).d });
     expect(abortRebase).toHaveBeenCalledWith(planKey, { ...marker, oldHistory: null, resultState: 'none',
-      resultHead: null, resultMappings: null });
+      resultHead: null, resultMappings: null, resolvedConflicts: [] });
     expect(store.getTask(id(1)).rebaseInProgress).toBeNull();
+  });
+  it('retains a recovery marker whose resolved-conflict provenance is outside its captured history', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123,
+      resultState: 'ready', resultHead: oid(4), resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }],
+      resolvedConflicts: [oid(9)], processGroup: null };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
+  });
+  it('rejects explicit null resolved-conflict provenance instead of treating it as a legacy field', async () => {
+    const { d: root, store, raw } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), attemptId = randomUUID(), planKey = store.getTask(id(1)).planKey;
+    const marker = { attemptId, oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head], startedAt: 123,
+      resultState: 'ready', resultHead: oid(4), resultMappings: [{ oldSha: snapshot.head, newSha: oid(4) }],
+      resolvedConflicts: null, processGroup: null };
+    raw(`UPDATE tasks SET rebase_in_progress='${JSON.stringify(marker)}' WHERE plan_key='${planKey}'`);
+    const abortRebase = vi.fn(async () => undefined);
+    await expect(recoverStartup({ store, runnerOwner: token, runnerRoot: join(root, 'r'), diagnosticsDir: join(root, 'd'),
+      deps: deps({ abortRebase }).d })).rejects.toThrow(/invalid recovery marker/);
+    expect(abortRebase).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toEqual(marker);
   });
   it('rejects incomplete and cleanup-only markers that claim retained-result ownership', async () => {
     for (const shape of ['missing-state', 'missing-history'] as const) {

@@ -1,13 +1,16 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
-import { GitRebaser, RebaseConflict, rebaseRef } from '../runner/rebase.ts';
+import { GitRebaser, RebaseConflict, rebaseRef, type GitRebaserOptions } from '../runner/rebase.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
-import { verifyCheckout } from '../runner/verify-checkout.ts';
+import { splitBoundedIndexRecords, verifyCheckout } from '../runner/verify-checkout.ts';
+import { readBoundedRebaseStateNames } from '../runner/hash-rebase-state.ts';
+import { listGitPaths } from '../runner/list-git-paths.ts';
+import { outsideConflictDigest } from '../runner/hash-outside-conflict.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
 const roots: string[] = [];
@@ -24,17 +27,25 @@ function commit(repository: string, path: string, text: string, message: string)
   return git(repository, 'rev-parse', 'HEAD');
 }
 
-async function setup(conflict = false) {
+async function setup(conflict: boolean | 'foreign' = false, conflictPath = 'a.txt', baseSiblingPath?: string) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-rebase-')); roots.push(root);
   const source = join(root, 'source');
   git(root, 'init', '-q', '-b', 'main', source);
   git(source, 'config', 'user.name', 'Source'); git(source, 'config', 'user.email', 'source@example.invalid');
-  const base = commit(source, 'a.txt', 'base\n', 'base');
+  if (baseSiblingPath) {
+    mkdirSync(dirname(join(source, baseSiblingPath)), { recursive: true });
+    writeFileSync(join(source, baseSiblingPath), 'base sibling\n');
+    git(source, 'add', '--', baseSiblingPath);
+  }
+  const base = commit(source, conflictPath, 'base\n', 'base');
   git(source, 'switch', '-qc', 'feature');
-  const owned = commit(source, 'a.txt', 'feature\n', 'owned');
-  const foreign = commit(source, 'feature.txt', 'collaborator\n', 'foreign');
+  const owned = commit(source, conflict === 'foreign' ? 'owned.txt' : conflictPath, 'feature\n', 'owned');
+  if (conflict === 'foreign') { git(source, 'config', 'user.name', 'Collaborator'); git(source, 'config', 'user.email', 'collaborator@example.invalid'); }
+  const foreign = commit(source, conflict === 'foreign' ? conflictPath : 'feature.txt', 'collaborator\n',
+    conflict === 'foreign' ? 'foreign\n\nPlan-Item: P1' : 'foreign');
+  git(source, 'config', 'user.name', 'Source'); git(source, 'config', 'user.email', 'source@example.invalid');
   git(source, 'switch', '-q', 'main');
-  const onto = commit(source, conflict ? 'a.txt' : 'base.txt', conflict ? 'main\n' : 'main moved\n', 'move base');
+  const onto = commit(source, conflict ? conflictPath : 'base.txt', conflict ? 'main\n' : 'main moved\n', 'move base');
   const runnerRoot = join(root, 'runner');
   const repository = await openRunnerRepository({ runnerRoot, runnerOwner: OWNER, repositoryId: 'repo', source });
   await ensureCommit(repository, foreign); await ensureCommit(repository, onto);
@@ -45,7 +56,46 @@ async function setup(conflict = false) {
   return { root, source, runnerRoot, repository, rebaser, base, owned, foreign, history: [owned, foreign], onto };
 }
 
+function createRebaser(s: Awaited<ReturnType<typeof setup>>, options: Partial<GitRebaserOptions> = {}) {
+  return new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
+    committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+    onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+    onResultPrepared: () => {}, onResultState: () => {}, ...options });
+}
+
 describe('trusted pre-merge rebase', () => {
+  it('bounds rebase-state directory names while they are enumerated', () => {
+    const names = [Buffer.from('one'), Buffer.from('two'), Buffer.from('three')];
+    let index = 0;
+    expect(() => readBoundedRebaseStateNames(() => names[index++] ?? null,
+      { entries: 0, nameBytes: 0 }, { entries: 1, nameBytes: 64 })).toThrow(/entry bound/);
+    expect(index).toBe(2);
+
+    index = 0;
+    expect(() => readBoundedRebaseStateNames(() => names[index++] ?? null,
+      { entries: 0, nameBytes: 0 }, { entries: 64, nameBytes: 5 })).toThrow(/name-byte bound/);
+    expect(index).toBe(2);
+  });
+
+  it('rejects an over-limit index record before retaining it', () => {
+    expect(() => splitBoundedIndexRecords(Buffer.from([0, 0]), 1)).toThrow(/entry bound/);
+  });
+
+  it('distinguishes identical-content outside deletions instead of collapsing them as renames', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-outside-digest-')); roots.push(root);
+    git(root, 'init', '-q', '-b', 'main');
+    git(root, 'config', 'user.name', 'Source'); git(root, 'config', 'user.email', 'source@example.invalid');
+    writeFileSync(join(root, 'a'), 'same\n'); writeFileSync(join(root, 'b'), 'same\n');
+    git(root, 'add', '--', 'a', 'b'); git(root, 'commit', '-qm', 'base');
+    const head = git(root, 'rev-parse', 'HEAD');
+    const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    rmSync(join(root, 'a')); writeFileSync(join(root, 'c'), 'same\n'); git(root, 'add', '--all');
+    const first = outsideConflictDigest(root, realGit, head, Buffer.alloc(0));
+    git(root, 'reset', '--hard', '-q', head);
+    rmSync(join(root, 'b')); writeFileSync(join(root, 'c'), 'same\n'); git(root, 'add', '--all');
+    expect(outsideConflictDigest(root, realGit, head, Buffer.alloc(0))).not.toBe(first);
+  });
+
   it('uses the configured Git PATH inside the checkout verifier subprocess', async () => {
     const s = await setup(), attemptId = randomUUID(), bin = join(s.root, 'git-bin'), marker = join(s.root, 'verified');
     mkdirSync(bin);
@@ -68,6 +118,14 @@ describe('trusted pre-merge rebase', () => {
     } finally {
       if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
     }
+  });
+
+  it('disables submodule inspection in the conflict-path diff', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-path-list-')); roots.push(root);
+    const executable = join(root, 'git'), args = join(root, 'args');
+    writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' "$@" > '${args}'\n`, { mode: 0o755 });
+    expect(listGitPaths(root, executable, 'conflicts')).toBe('');
+    expect(readFileSync(args, 'utf8').split('\n')).toContain('--ignore-submodules=all');
   });
 
   it('never resolves Git from a relative PATH component inside the untrusted checkout', async () => {
@@ -117,7 +175,7 @@ describe('trusted pre-merge rebase', () => {
     const s = await setup(), attemptId = randomUUID();
     const result = await s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.base });
     expect(result).toEqual({ oldHead: s.foreign, base: s.base, head: s.foreign,
-      mappings: [{ oldSha: s.owned, newSha: s.owned }, { oldSha: s.foreign, newSha: s.foreign }] });
+      mappings: [{ oldSha: s.owned, newSha: s.owned }, { oldSha: s.foreign, newSha: s.foreign }], resolvedConflicts: [] });
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
   });
@@ -310,6 +368,310 @@ describe('trusted pre-merge rebase', () => {
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
     expect(() => git(s.repository.path, 'show-ref', '--verify', rebaseRef(attemptId))).toThrow();
     expect(git(s.source, 'rev-parse', 'feature')).toBe(s.foreign);
+  });
+
+  it('routes a missing-ledger foreign conflict to the resolver and preserves its author and provenance', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const seen: unknown[] = [];
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      seen.push({ commit: input.commit, files: input.files });
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+    } });
+    const result = await runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.owned, owner: 'P1', origin: 'owned' }] });
+    expect(seen).toEqual([{ commit: s.foreign, files: ['a.txt'] }]);
+    expect(result.resolvedConflicts).toEqual([s.foreign]);
+    const rewritten = result.mappings.find(entry => entry.oldSha === s.foreign)!.newSha;
+    expect(git(s.repository.path, 'show', '-s', '--format=%an <%ae>', rewritten)).toBe('Collaborator <collaborator@example.invalid>');
+    expect(git(s.repository.path, 'show', '-s', '--format=%B', rewritten)).toContain('Plan-Item: P1');
+    expect(git(s.repository.path, 'show', `${result.head}:a.txt`)).toBe('resolved foreign change');
+  });
+
+  it('allows clean files from the conflicted commit without attributing them to the resolver', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    writeFileSync(join(s.source, 'clean.txt'), 'clean foreign change\n');
+    git(s.source, 'add', '--', 'clean.txt');
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+    } });
+    const result = await runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] });
+    expect(git(s.repository.path, 'show', `${result.head}:a.txt`)).toBe('resolved foreign change');
+    expect(git(s.repository.path, 'show', `${result.head}:clean.txt`)).toBe('clean foreign change');
+  });
+
+  it('refuses a resolver edit to a cleanly applied file from the conflicted commit', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    writeFileSync(join(s.source, 'clean.txt'), 'clean foreign change\n');
+    git(s.source, 'add', '--', 'clean.txt');
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      writeFileSync(join(input.repository, 'clean.txt'), 'resolver changed clean file\n');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+  });
+
+  it('refuses a symlink ancestor before auditing a clean sibling outside the workspace', async () => {
+    const s = await setup('foreign', 'a.txt', 'nested/clean.txt'), attemptId = randomUUID(), outside = join(s.root, 'outside');
+    git(s.source, 'switch', '-q', 'feature');
+    writeFileSync(join(s.source, 'nested', 'clean.txt'), 'clean foreign change\n');
+    git(s.source, 'add', '--', 'nested/clean.txt');
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    mkdirSync(outside); writeFileSync(join(outside, 'clean.txt'), 'outside data must not be audited\n');
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      rmSync(join(input.repository, 'nested'), { recursive: true });
+      symlinkSync(outside, join(input.repository, 'nested'), 'dir');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/symlink ancestor/);
+  });
+
+  it('preserves an unchanged gitlink from the conflicted commit', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.base},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+    } });
+    const result = await runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] });
+    expect(git(s.repository.path, 'ls-tree', result.head, '--', 'submodule')).toContain(`commit ${s.base}\tsubmodule`);
+  });
+
+  it('refuses a resolver index-only change to a gitlink outside the conflict', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.base},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      git(input.repository, 'update-index', '--cacheinfo', `160000,${s.onto},submodule`);
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto: s.onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink/);
+  });
+
+  it('refuses a resolver commit that moves HEAD and smuggles an outside file', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      writeFileSync(join(input.repository, 'smuggled.txt'), 'outside conflict\n');
+      git(input.repository, 'add', '--all');
+      git(input.repository, '-c', 'user.name=Resolver', '-c', 'user.email=resolver@example.invalid', 'commit', '-qm', 'smuggle');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/changed the rebase operation/);
+  });
+
+  it('refuses a resolver change to the remaining rebase operation', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    const later = commit(s.source, 'later.txt', 'expected later change\n', 'later');
+    git(s.source, 'switch', '-qc', 'alternate', s.foreign);
+    const alternate = commit(s.source, 'smuggled.txt', 'substituted change\n', 'alternate');
+    await ensureCommit(s.repository, later); await ensureCommit(s.repository, alternate);
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      const todo = git(input.repository, 'rev-parse', '--path-format=absolute', '--git-path', 'rebase-merge/git-rebase-todo');
+      writeFileSync(todo, `pick ${alternate} alternate\n`);
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: later,
+      oldHistory: [s.owned, s.foreign, later], onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/changed the rebase operation/);
+  });
+
+  it('routes a gitlink conflict to manual review without invoking the file resolver', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    git(s.source, 'switch', '-q', 'feature');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.base},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const foreign = git(s.source, 'rev-parse', 'HEAD');
+    git(s.source, 'switch', '-q', 'main');
+    git(s.source, 'update-index', '--add', '--cacheinfo', `160000,${s.owned},submodule`);
+    git(s.source, 'commit', '--amend', '--no-edit', '-q');
+    const onto = git(s.source, 'rev-parse', 'HEAD');
+    await ensureCommit(s.repository, foreign); await ensureCommit(s.repository, onto);
+    const resolveForeignConflict = vi.fn(async () => {});
+    const runner = createRebaser(s, { resolveForeignConflict });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: foreign, oldHistory: [s.owned, foreign], onto,
+      ledger: [{ sha: foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink conflict needs manual/);
+    expect(resolveForeignConflict).not.toHaveBeenCalled();
+  });
+
+  it('refuses replacing an allowed conflicted file with an embedded repository', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      const nested = join(input.repository, 'a.txt');
+      rmSync(nested); mkdirSync(nested);
+      git(nested, 'init', '-q', '-b', 'main');
+      git(nested, 'config', 'user.name', 'Nested'); git(nested, 'config', 'user.email', 'nested@example.invalid');
+      commit(nested, 'nested.txt', 'nested\n', 'nested');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink/);
+  });
+
+  it('refuses a resolver index-only regular file outside the conflict', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      const payload = join(input.repository, 'payload.tmp');
+      writeFileSync(payload, 'index-only payload\n');
+      const blob = git(input.repository, 'hash-object', '-w', 'payload.tmp');
+      rmSync(payload);
+      git(input.repository, 'update-index', '--add', '--cacheinfo', `100644,${blob},smuggled.txt`);
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+  });
+
+  it('passes a literal replacement character in a valid UTF-8 conflict path to the resolver', async () => {
+    const name = '\ufffd.txt', s = await setup('foreign', name), attemptId = randomUUID();
+    const resolveForeignConflict = vi.fn(async input => { writeFileSync(join(input.repository, name), 'resolved\n'); });
+    const runner = createRebaser(s, { resolveForeignConflict });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).resolves.toMatchObject({ resolvedConflicts: [s.foreign] });
+    expect(resolveForeignConflict).toHaveBeenCalledOnce();
+    expect(resolveForeignConflict.mock.calls[0]![0].files).toEqual([name]);
+  });
+
+  it('refuses a resolver edit outside the exact conflicted files and drops the partial rewrite', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved\n');
+      writeFileSync(join(input.repository, 'extra.txt'), 'outside conflict\n');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+    expect(() => git(s.repository.path, 'rev-parse', '--verify', rebaseRef(attemptId))).toThrow();
+  });
+
+  it('aborts and awaits the resolver before removing its workspace', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID(), controller = new AbortController();
+    let entered!: () => void, settled = false;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const runner = createRebaser(s, { resolveForeignConflict: input => new Promise((_, reject) => {
+      entered(); input.signal!.addEventListener('abort', () => { settled = true; reject(input.signal!.reason); }, { once: true });
+    }) });
+    const operation = runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }], signal: controller.signal });
+    await started; controller.abort(new Error('stop conflict resolver'));
+    await expect(operation).rejects.toThrow(/stop conflict resolver/);
+    expect(settled).toBe(true);
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+  });
+
+  it('preserves the cancellation reason when the resolver rejects with another error after abort', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID(), controller = new AbortController();
+    let entered!: () => void;
+    const started = new Promise<void>(resolve => { entered = resolve; });
+    const runner = createRebaser(s, { resolveForeignConflict: input => new Promise((_, reject) => {
+      entered(); input.signal!.addEventListener('abort', () => reject(new Error('resolver cleanup failed')), { once: true });
+    }) });
+    const operation = runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }], signal: controller.signal });
+    await started;
+    controller.abort(new Error('original cancellation'));
+    await expect(operation).rejects.toThrow(/original cancellation/);
+  });
+
+  it('does not enter the conflict resolver after its work deadline has already elapsed', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const realNow = performance.now.bind(performance);
+    let expire = false, entered = 0, resolverReads = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => expire ? Number.MAX_SAFE_INTEGER : realNow());
+    const runner = new GitRebaser({ repository: s.repository, runnerRoot: s.runnerRoot, runnerOwner: OWNER,
+      committer: { name: 'Codeboost', email: 'codeboost@example.invalid' },
+      onProcessStarting: () => {}, onProcessGroup: () => {}, onProcessGroupSettled: () => {}, onProcessUnsettled: () => {},
+      onResultPrepared: () => {}, onResultState: () => {},
+      get resolveForeignConflict() {
+        if (++resolverReads === 2) expire = true;
+        return async () => { entered++; };
+      } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/deadline expired/);
+    expect(entered).toBe(0);
+    expect(resolverReads).toBe(2);
+  });
+
+  it('rejects a resolver that synchronously exhausts its deadline before its timer can run', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const realNow = performance.now.bind(performance);
+    let expireNextRead = false;
+    vi.spyOn(performance, 'now').mockImplementation(() => {
+      if (!expireNextRead) return realNow();
+      expireNextRead = false;
+      return Number.MAX_SAFE_INTEGER;
+    });
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      expireNextRead = true;
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] }))
+      .rejects.toThrow(/deadline expired during conflict resolution/);
+    expect(expireNextRead).toBe(false);
+  });
+
+  it('preserves an exhausted deadline when the synchronously blocking resolver also rejects', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const realNow = performance.now.bind(performance);
+    let expireNextRead = false;
+    vi.spyOn(performance, 'now').mockImplementation(() => {
+      if (!expireNextRead) return realNow();
+      expireNextRead = false;
+      return Number.MAX_SAFE_INTEGER;
+    });
+    const runner = createRebaser(s, { resolveForeignConflict: async () => {
+      expireNextRead = true;
+      throw new Error('resolver failed after blocking');
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] }))
+      .rejects.toThrow(/deadline expired during conflict resolution/);
+    expect(expireNextRead).toBe(false);
+  });
+
+  it('never sends an owned conflict through the foreign resolver', async () => {
+    const s = await setup(true), attemptId = randomUUID(), resolveForeignConflict = vi.fn(async () => {});
+    const runner = createRebaser(s, { resolveForeignConflict });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.owned, owner: 'P1', origin: 'owned' }, { sha: s.foreign, owner: null, origin: 'foreign' }] }))
+      .rejects.toThrow(/owned commit conflict/);
+    expect(resolveForeignConflict).not.toHaveBeenCalled();
+  });
+
+  it('refuses an inconsistent trusted ledger before creating a rebase workspace', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    await expect(s.rebaser.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: 'P1', origin: 'foreign' }] })).rejects.toThrow(/ledger is invalid/);
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
+  });
+
+  it('refuses an unknown trusted-ledger origin before starting Git', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { onProcessStarting: () => { throw new Error('Git must not start for a malformed ledger.'); } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'typo' as 'foreign' }] })).rejects.toThrow(/ledger is invalid/);
+    expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(false);
   });
 
   it('refuses a case-colliding reviewed tree when the host cannot check it out faithfully', async () => {

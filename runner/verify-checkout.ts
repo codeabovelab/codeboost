@@ -4,8 +4,8 @@ import { spawnSync } from 'node:child_process';
 import { pathToFileURL } from 'node:url';
 import { GIT_OPTIONS, gitEnvironment } from '../git/clone.ts';
 
-const MAX_INDEX_BYTES = 32 * 1024 * 1024;
-const MAX_DIRECTORY_ENTRIES = 262_144;
+export const MAX_INDEX_BYTES = 32 * 1024 * 1024;
+export const MAX_INDEX_ENTRIES = 262_144;
 // A C-quoted path can expand every input byte to four bytes. Keep transport above every accepted index listing;
 // accepted input is then rejected by our explicit bounds, never by spawnSync's smaller implementation limit.
 const MAX_GIT_OUTPUT_BYTES = MAX_INDEX_BYTES * 4 + 1024;
@@ -15,10 +15,13 @@ const git = (executable: string, args: readonly string[], input?: Buffer): Buffe
   if (result.status !== 0 || result.error) throw result.error ?? new Error(`git ${args[0]} failed while verifying the checkout.`);
   return result.stdout;
 };
-const split0 = (input: Buffer): Buffer[] => {
+export const splitBoundedIndexRecords = (input: Buffer, maxEntries = MAX_INDEX_ENTRIES): Buffer[] => {
   const values: Buffer[] = [];
   let start = 0;
-  for (let i = 0; i < input.length; i++) if (input[i] === 0) { values.push(input.subarray(start, i)); start = i + 1; }
+  for (let i = 0; i < input.length; i++) if (input[i] === 0) {
+    if (values.length >= maxEntries) throw new Error('Checkout index exceeds its entry bound.');
+    values.push(input.subarray(start, i)); start = i + 1;
+  }
   if (start !== input.length) throw new Error('Git returned an unterminated index record.');
   return values;
 };
@@ -35,13 +38,26 @@ const splitPath = (path: Buffer): Buffer[] => {
 const objectId = (algorithm: 'sha1' | 'sha256', bytes: Buffer): string =>
   createHash(algorithm).update(Buffer.from(`blob ${bytes.length}\0`)).update(bytes).digest('hex');
 
+/** Hash index-only gitlink entries without entering or reading their nested repositories. */
+export function gitlinkIndexDigest(root = process.cwd(), executable = 'git'): string {
+  const rawOutput = git(executable, ['-C', root, 'ls-files', '--stage', '-z']);
+  if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
+  const raw = splitBoundedIndexRecords(rawOutput);
+  const hash = createHash('sha256');
+  for (const record of raw) {
+    const tab = record.indexOf(0x09), header = record.subarray(0, tab).toString('ascii').split(' ');
+    if (tab < 0 || header.length !== 3 || !/^[0-3]$/.test(header[2]!)) throw new Error('Git returned an invalid index record.');
+    if (header[0] === '160000') hash.update(record).update('\0');
+  }
+  return hash.digest('hex');
+}
+
 /** Byte-exact, content-based proof that the disposable worktree represents its index. Gitlinks stay index-only. */
 export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
   const repositoryGit = (args: readonly string[], input?: Buffer) => git(executable, ['-C', root, ...args], input);
   const rawOutput = repositoryGit(['ls-files', '--stage', '-z']);
   if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
-  const raw = split0(rawOutput);
-  if (raw.length > MAX_DIRECTORY_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
+  const raw = splitBoundedIndexRecords(rawOutput);
   const quotedOutput = repositoryGit(['ls-files', '--stage']).toString('utf8');
   if (quotedOutput && !quotedOutput.endsWith('\n')) throw new Error('Git returned an unterminated quoted index listing.');
   const quoted = quotedOutput ? quotedOutput.slice(0, -1).split('\n') : [];
@@ -62,7 +78,7 @@ export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
     const names = new Set<string>();
     try {
       for (let entry = opened.readSync(); entry; entry = opened.readSync()) {
-        if (++entries > MAX_DIRECTORY_ENTRIES) throw new Error('Checkout verification exceeded its directory-entry bound.');
+        if (++entries > MAX_INDEX_ENTRIES) throw new Error('Checkout verification exceeded its directory-entry bound.');
         names.add((entry.name as unknown as Buffer).toString('hex'));
       }
     } finally { opened.closeSync(); }
@@ -105,5 +121,7 @@ export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
 
 if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) {
   if (!process.argv[2]) throw new Error('Checkout verification requires a pinned Git executable.');
-  verifyCheckout(process.cwd(), process.argv[2]);
+  if (process.argv[3] === 'gitlinks') process.stdout.write(gitlinkIndexDigest(process.cwd(), process.argv[2]));
+  else if (process.argv[3] === undefined) verifyCheckout(process.cwd(), process.argv[2]);
+  else throw new Error('Unknown checkout verification mode.');
 }
