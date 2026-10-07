@@ -117,6 +117,11 @@ async function refresh() {
     rememberDraft();
     const updated = await api("/api/review");
     if (generation !== reviewGeneration) return;
+    mergeGeneration++;
+    if (mergePollTimer) clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+    mergePollState = null;
+    mergePollDelay = 2000;
     rememberDraft();
     data = updated;
     snippetSelection = null;
@@ -831,7 +836,7 @@ let issuesGeneration = 0,
   issuesRefreshError = null,
   issueErrorOrder = 0;
 let planImportPending = false,
-  planImportRetry = null,
+  planImportRetries = new Map(),
   planRefreshPending = false,
   planOperationGeneration = 0,
   planStatusGeneration = 0;
@@ -928,15 +933,14 @@ async function importPlan(event) {
     return;
   }
   const expectedRevision = data.plan.revision;
-  const retained = planImportRetry;
-  const request = retained?.source === source && retained.format === format
-    ? retained : { source, format, expectedRevision, actionId: crypto.randomUUID() };
-  planImportRetry = request;
+  const retryKey = JSON.stringify([format, source]);
+  const request = planImportRetries.get(retryKey) ?? { source, format, expectedRevision, actionId: crypto.randomUUID() };
+  planImportRetries.set(retryKey, request);
   setPlanStatus(statusOwner, "neutral", "Importing the next revision…");
   try {
     const response = await api("/api/plan/import", request);
     const revision = Number.isSafeInteger(response.result?.revision) ? response.result.revision : null;
-    planImportRetry = null;
+    planImportRetries.delete(retryKey);
     if (data?.merge?.available) data = { ...data, merge: { ...data.merge, ready: false, action: null,
       blockers: [{ code: "plan-changed", message: "The plan changed. Refresh before merging." }] } };
     renderMerge();
@@ -964,7 +968,7 @@ async function importPlan(event) {
     }
   } catch (error) {
     const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
-    if (!ambiguous) planImportRetry = null;
+    if (!ambiguous) planImportRetries.delete(retryKey);
     if (ambiguous && data?.merge?.available) data = { ...data, merge: { ...data.merge, ready: false, action: null,
       blockers: [{ code: "plan-import-unknown", message: "The plan import outcome is unknown. Refresh before merging." }] } };
     setPlanStatus(statusOwner, "bad", `✕ Could not import the plan. ${error.message}`);
@@ -1182,6 +1186,11 @@ $("plans-refresh").onclick = async () => {
     rememberDraft();
     const updated = await api("/api/review");
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
+    mergeGeneration++;
+    if (mergePollTimer) clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+    mergePollState = null;
+    mergePollDelay = 2000;
     rememberDraft();
     data = updated;
     render();
