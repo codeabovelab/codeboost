@@ -100,7 +100,7 @@ describe('production foreign conflict resolver', () => {
     expect(DEFAULT_PROCESS_SETTLEMENT_MS).toBe(16_000);
   });
 
-  it('keeps every stage and child invocation on one monotonic deadline when wall time moves backward', async () => {
+  it.each([-60_000, 60_000])('keeps every stage and child invocation on one monotonic deadline when wall time moves by %i ms', async wallStep => {
     vi.useFakeTimers();
     try {
       const f = fixture(), x = deps(f), budgets: number[] = [];
@@ -108,7 +108,7 @@ describe('production foreign conflict resolver', () => {
       x.d.clone = async (options: AsyncCloneOptions) => {
         budgets.push(options.timeoutMs!);
         const result = await clone(options);
-        vi.setSystemTime(Date.now() - 60_000);
+        vi.setSystemTime(Date.now() + wallStep);
         return result;
       };
       x.d.allocate = async (...args: Parameters<typeof allocate>) => {
@@ -122,6 +122,7 @@ describe('production foreign conflict resolver', () => {
       await resolve({ ...input(f), deadline: Date.now() + CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS + 5_000 });
       expect(budgets).toHaveLength(2);
       expect(budgets[1]).toBeLessThanOrEqual(budgets[0]!);
+      expect(x.request!.invocation.deadline - Date.now()).toBeGreaterThan(0);
       expect(x.request!.invocation.deadline - Date.now()).toBeLessThanOrEqual(budgets[0]!);
     } finally { vi.useRealTimers(); }
   });
