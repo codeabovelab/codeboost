@@ -864,7 +864,7 @@ function renderIssues() {
     )
     .join("")}</tbody></table>`;
 }
-const trustGenerations = new Map(), trustPending = new Map(), committedTrustRows = new Map();
+const trustGenerations = new Map(), trustPending = new Map(), trustRetries = new Map(), committedTrustRows = new Map();
 let trustCommitGeneration = 0;
 function renderIssuesWithPending(focusIssue) {
   const focused = focusIssue ?? Number(document.activeElement?.closest?.("button.issue-trust")?.dataset.issue);
@@ -900,13 +900,18 @@ async function changeIssueTrust(button) {
   const number = Number(button.dataset.issue), action = button.dataset.action;
   const issue = issuesView?.configured && issuesView.state?.issues.find((entry) => entry.number === number);
   if (!issue || !["trust", "untrust"].includes(action)) return;
+  const retained = trustRetries.get(number);
+  const request = retained?.action === action && retained.authorLogin === issue.authorLogin ? retained
+    : { action, actionId: crypto.randomUUID(), number, authorLogin: issue.authorLogin };
+  trustRetries.set(number, request);
   const generation = (trustGenerations.get(number) ?? 0) + 1;
   trustGenerations.set(number, generation);
   trustPending.set(number, { action, generation });
   button.setAttribute("aria-disabled", "true");
   button.textContent = action === "trust" ? "Trusting…" : "Removing…";
   try {
-    const updated = await api("/api/issues", { action, actionId: crypto.randomUUID(), number, authorLogin: issue.authorLogin });
+    const updated = await api("/api/issues", request);
+    if (trustRetries.get(number) === request) trustRetries.delete(number);
     if (trustGenerations.get(number) !== generation) return;
     trustPending.delete(number);
     mergeIssueTrustView(updated, number);
@@ -914,6 +919,9 @@ async function changeIssueTrust(button) {
     if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, issue: committed });
     renderIssuesWithPending();
   } catch (error) {
+    // A transport failure or 503 proves nothing was returned. Keep the exact request and idempotency key for retry.
+    const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
+    if (!ambiguous && trustRetries.get(number) === request) trustRetries.delete(number);
     if (trustGenerations.get(number) !== generation) return;
     trustPending.delete(number);
     renderIssuesWithPending();

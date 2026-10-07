@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -136,6 +137,61 @@ test('ignores an older trust response that returns after a newer action', async 
   await first!.route.fulfill({ response: first!.response });
   await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
   await expect(page.locator('#issues-status')).toContainText('✓ Current');
+});
+
+test('reuses the trust action ID after a lost response without overwriting a newer decision', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  type TrustBody = { action: string; actionId: string; number: number; authorLogin: string | null };
+  const requests: TrustBody[] = [];
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as TrustBody : undefined;
+    if (body?.action !== 'trust' || body.number !== 21) { await route.continue(); return; }
+    requests.push(body);
+    if (requests.length === 1) {
+      await route.fetch(); // The server commits, but the browser never receives the response.
+      await route.abort('connectionreset');
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="21"]');
+  await row.getByRole('button', { name: 'Trust this issue' }).click();
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
+  const direct = await page.request.post(new URL('/api/issues', app.url).href, {
+    headers: { 'x-codeboost-token': app.token }, data: { action: 'untrust', actionId: randomUUID(), number: 21,
+      authorLogin: requests[0]!.authorLogin },
+  });
+  expect(direct.ok()).toBe(true);
+  await row.getByRole('button', { name: 'Trust this issue' }).click();
+  await expect.poll(() => requests.length).toBe(2);
+  expect(requests[1]!.actionId).toBe(requests[0]!.actionId);
+  await expect(row.getByRole('button', { name: 'Trust this issue' })).toBeVisible();
+});
+
+test('reuses the trust action ID after a retryable 503', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  const actionIds: string[] = [];
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; actionId?: string; number?: number } : {};
+    if (body.action !== 'trust' || body.number !== 21) { await route.continue(); return; }
+    actionIds.push(body.actionId!);
+    if (actionIds.length === 1) {
+      await route.fulfill({ status: 503, contentType: 'application/json', body: JSON.stringify({ error: 'The server is shutting down.' }) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  const row = page.locator('tr[data-issue="21"]');
+  await row.getByRole('button', { name: 'Trust this issue' }).click();
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
+  await row.getByRole('button', { name: 'Trust this issue' }).click();
+  await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  expect(actionIds).toHaveLength(2);
+  expect(actionIds[1]).toBe(actionIds[0]);
 });
 
 test('keeps another issue disabled and focused when an overlapping trust request fails', async ({ page }) => {
