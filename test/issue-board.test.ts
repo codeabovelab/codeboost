@@ -99,6 +99,20 @@ describe('issue board', () => {
     expect(board.trustStatus(1)).toBe('unknown');
   });
 
+  it('checks trust only for the requested non-collaborator issue', async () => {
+    const { gateway, calls } = heldGateway(), trust = vi.fn(() => null);
+    const board = new IssueBoard(gateway, undefined, undefined, trust);
+    const issues = Array.from({ length: 1_000 }, (_, index) => ({ ...snapshot().issues[0]!, number: index + 1,
+      title: `Issue ${index + 1}`, trust: 'requires-approval' as const }));
+    const refresh = board.refresh();
+    calls[0]!.result.resolve({ ...snapshot(), issues });
+    await refresh;
+    trust.mockClear();
+    expect(board.trustStatus(1_000)).toBe('blocked');
+    expect(trust).toHaveBeenCalledTimes(1);
+    expect(trust).toHaveBeenCalledWith('owner/repo', 1_000);
+  });
+
   it('shows a matching explicit decision before collaborator trust so its broader permission can be removed', async () => {
     const { gateway, calls } = heldGateway();
     const board = new IssueBoard(gateway, undefined, undefined, () => ({ repository: 'owner/repo', issue: 1,

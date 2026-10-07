@@ -258,16 +258,15 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const trustBlocked = !!config.github && issues.trustStatus(config.github.issue) === 'blocked';
     return { available: !!runner, task, attempts, startable: !trustBlocked && !!progress && offered('start', progress), resumable: !trustBlocked && !!progress && offered('resume', progress),
       stateVersion: task.stateVersion, reviewVersion: service.store.reviewVersion(identity), retryable, stopRequested: status.stopRequested,
-      unresolved: status.unresolved, continuation, publish: publishView(progress) };
+      unresolved: status.unresolved, continuation, publish: publishView(progress, trustBlocked) };
   };
   /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
-  const publishView = (progress?: ReturnType<ItemExecutor['progress']>) => {
+  const publishView = (progress: ReturnType<ItemExecutor['progress']> | undefined, trustBlocked: boolean) => {
     if (!publishing) return { available: false, active: false, publishable: false, closable: false, draft: false, last: null };
     let job: ReturnType<TaskPublishing['mode']> | null = null;
     try { job = publishing.mode(identity, progress); } catch (error) { if (!(error instanceof GuardRefusal) && !(error instanceof ShuttingDownError)) throw error; }
     // `closable`: the task is cancelled and a close of its PRs is owed (#111): not after one that closed them.
     const last = publishing.lastOutcome(identity);
-    const trustBlocked = !!config.github && issues.trustStatus(config.github.issue) === 'blocked';
     return { available: true, active: publishing.busy(identity), publishable: !trustBlocked && job?.kind === 'publish', closable: job?.kind === 'close' && last?.outcome !== 'closed',
       draft: job?.kind === 'publish' && job.draft, last };
   };

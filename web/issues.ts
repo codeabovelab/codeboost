@@ -55,11 +55,12 @@ export class IssueBoard {
 
   /** Latest complete board knowledge for one issue. Unknown is deliberately not treated as trusted. */
   trustStatus(number: number): 'allowed' | 'blocked' | 'unknown' {
-    const view = this.view();
-    if (!view.configured || !view.state || view.state.state !== 'fresh') return 'unknown';
-    const issue = view.state.issues.find(candidate => candidate.number === number);
+    if (!this.#prioritizer || !this.#state || this.#state.state !== 'fresh') return 'unknown';
+    const issue = this.#state.issues.find(candidate => candidate.number === number);
     if (!issue) return 'unknown';
-    return issue.trust === 'trusted' || issue.trust === 'approved' ? 'allowed' : 'blocked';
+    if (issue.trust === 'trusted') return 'allowed';
+    const decision = this.#trust(issue.repository, issue.number);
+    return decision?.revokedAt === null && decision.authorLogin === issue.authorLogin ? 'allowed' : 'blocked';
   }
 
   async refresh(signal?: AbortSignal): Promise<IssueBoardView> {
