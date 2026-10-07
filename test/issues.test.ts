@@ -1,5 +1,6 @@
 import { describe, expect, it, vi } from 'vitest';
-import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES, type IssueText } from '../github/issues.ts';
+import { GhIssueGateway, ISSUE_PAGE_MAX_BYTES, ISSUE_PIPE_GRACE_MS, ISSUE_KILL_GRACE_MS, ISSUE_READ_ACTIVE_MS,
+  ISSUE_READ_TIMEOUT_MS, withIssueReadDeadline, type IssueText } from '../github/issues.ts';
 import { prepareExecution } from '../core/execution-prompt.ts';
 
 const rawIssue = (overrides: Record<string, unknown> = {}) => ({
@@ -24,6 +25,71 @@ const responses = (issues: readonly unknown[], collaborators: readonly string[] 
   async (args: readonly string[]) => JSON.stringify(isCollaboratorRequest(args)
     ? collaborators.map(login => ({ login }))
     : issues);
+
+it('shares one issue-read deadline across sequential stages and awaits subprocess settlement inside the wall budget', async () => {
+  vi.useFakeTimers();
+  try {
+    const caller = new AbortController(), access = Promise.withResolvers<void>();
+    let shared: AbortSignal | undefined, settled = false;
+    const operation = withIssueReadDeadline(caller.signal, async (signal, timeoutMs) => {
+      shared = signal;
+      expect(timeoutMs).toBe(ISSUE_READ_ACTIVE_MS);
+      await access.promise;
+      return new Promise<never>((_resolve, reject) => signal.addEventListener('abort', () => {
+        setTimeout(() => { settled = true; reject(signal.reason); }, ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS);
+      }, { once: true }));
+    });
+    const outcome = operation.then(() => null, error => error);
+    await vi.advanceTimersByTimeAsync(20_000);
+    access.resolve();
+    await vi.advanceTimersByTimeAsync(ISSUE_READ_ACTIVE_MS - 20_001);
+    expect(shared?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(shared?.aborted).toBe(true);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS - 1);
+    expect(settled).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(await outcome).toBe(shared?.reason);
+    expect(settled).toBe(true);
+    expect(ISSUE_READ_ACTIVE_MS + ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS).toBe(ISSUE_READ_TIMEOUT_MS);
+  } finally { vi.useRealTimers(); }
+});
+
+it('preserves the caller abort reason and waits for the active issue stage to settle', async () => {
+  const caller = new AbortController(), aborted = Promise.withResolvers<void>(), release = Promise.withResolvers<void>();
+  const reason = new Error('caller stopped');
+  const operation = withIssueReadDeadline(caller.signal, async signal => {
+    signal.addEventListener('abort', () => aborted.resolve(), { once: true });
+    await release.promise;
+    signal.throwIfAborted();
+  });
+  let settled = false;
+  void operation.finally(() => { settled = true; }).catch(() => undefined);
+  caller.abort(reason);
+  await aborted.promise;
+  expect(settled).toBe(false);
+  release.resolve();
+  await expect(operation).rejects.toBe(reason);
+});
+
+it('refuses a successful issue stage that settles after the shared deadline', async () => {
+  vi.useFakeTimers();
+  try {
+    let shared: AbortSignal | undefined;
+    const operation = withIssueReadDeadline(new AbortController().signal, signal => {
+      shared = signal;
+      return new Promise<string>(resolve => signal.addEventListener('abort', () => {
+        setTimeout(() => resolve('late success'), ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS);
+      }, { once: true }));
+    });
+    const outcome = operation.then(value => value, error => error);
+    await vi.advanceTimersByTimeAsync(ISSUE_READ_ACTIVE_MS);
+    expect(shared?.aborted).toBe(true);
+    await vi.advanceTimersByTimeAsync(ISSUE_KILL_GRACE_MS + ISSUE_PIPE_GRACE_MS);
+    expect(await outcome).toBe(shared?.reason);
+  } finally { vi.useRealTimers(); }
+});
 
 describe('GitHub issue retrieval', () => {
   it.each([

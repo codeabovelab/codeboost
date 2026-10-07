@@ -807,7 +807,9 @@ new ResizeObserver(() => {
 let issuesGeneration = 0,
   issuesView = null,
   issuesRequested = false,
-  issuesLoading = false;
+  issuesLoading = false,
+  issuesRefreshError = null,
+  issueErrorOrder = 0;
 function showView(next) {
   view = next;
   $("review-view").hidden = next !== "review";
@@ -842,8 +844,10 @@ function trustMark(issue) {
 }
 function renderIssues() {
   const [tone, text] = issueStatus();
-  $("issues-status").className = tone;
-  $("issues-status").innerHTML = text;
+  const errors = [...trustErrors.values(), ...(issuesRefreshError ? [issuesRefreshError] : [])].sort((a, b) => a.order - b.order);
+  $("issues-status").className = errors.length ? "bad" : tone;
+  if (errors.length) $("issues-status").textContent = errors.map(error => error.message).join(" ");
+  else $("issues-status").innerHTML = text;
   $("issues-repository").textContent = issuesView?.configured ? issuesView.repository : "";
   const state = issuesView?.configured ? issuesView.state : null;
   if (!state) {
@@ -864,7 +868,7 @@ function renderIssues() {
     )
     .join("")}</tbody></table>`;
 }
-const trustGenerations = new Map(), trustPending = new Map(), trustRetries = new Map(), committedTrustRows = new Map();
+const trustGenerations = new Map(), trustPending = new Map(), trustRetries = new Map(), committedTrustRows = new Map(), trustErrors = new Map();
 let trustCommitGeneration = 0;
 function renderIssuesWithPending(focusIssue) {
   const active = document.activeElement;
@@ -927,14 +931,15 @@ async function changeIssueTrust(button) {
   trustRetries.set(number, request);
   const generation = (trustGenerations.get(number) ?? 0) + 1;
   trustGenerations.set(number, generation);
+  trustErrors.delete(number);
   trustPending.set(number, { action, generation });
-  button.setAttribute("aria-disabled", "true");
-  button.textContent = action === "trust" ? "Trusting…" : "Removing…";
+  renderIssuesWithPending(number);
   try {
     const updated = await api("/api/issues", request);
     if (trustRetries.get(number) === request) trustRetries.delete(number);
     if (trustGenerations.get(number) !== generation) return;
     trustPending.delete(number);
+    trustErrors.delete(number);
     const committed = mergeIssueTrustView(updated, number);
     if (committed) committedTrustRows.set(number, { generation: ++trustCommitGeneration, authorLogin: committed.authorLogin,
       trust: committed.trust, trustedAt: committed.trustedAt, trustedBy: committed.trustedBy, trustChangedAt: committed.trustChangedAt });
@@ -945,17 +950,19 @@ async function changeIssueTrust(button) {
     if (!ambiguous && trustRetries.get(number) === request) trustRetries.delete(number);
     if (trustGenerations.get(number) !== generation) return;
     trustPending.delete(number);
+    trustErrors.set(number, { generation, order: ++issueErrorOrder,
+      message: `✕ Could not ${action === "trust" ? "trust" : "remove trust from"} issue #${number}. ${error.message}` });
     renderIssuesWithPending();
-    $("issues-status").className = "bad";
-    $("issues-status").textContent = `✕ Could not ${action === "trust" ? "trust" : "remove trust from"} issue #${number}. ${error.message}`;
   }
 }
 async function loadIssues() {
   if (issuesLoading) return;
   const generation = ++issuesGeneration;
   const trustGeneration = trustCommitGeneration;
+  const trustErrorOrder = issueErrorOrder;
   issuesRequested = true;
   issuesLoading = true;
+  issuesRefreshError = null;
   // aria-disabled, not disabled: disabling the focused button would drop keyboard focus to the page.
   $("issues-refresh").setAttribute("aria-disabled", "true");
   $("issues-refresh").textContent = "Refreshing…";
@@ -965,13 +972,13 @@ async function loadIssues() {
     const updated = await api("/api/issues", { action: "refresh" });
     if (generation !== issuesGeneration) return;
     issuesView = mergeTrustCommittedDuring(updated, trustGeneration);
+    for (const [number, error] of trustErrors) if (error.order <= trustErrorOrder) trustErrors.delete(number);
     renderIssuesWithPending();
   } catch (error) {
     if (generation !== issuesGeneration) return;
     if (issuesView?.configured) issuesView = { ...issuesView, refreshing: false };
+    issuesRefreshError = { generation, order: ++issueErrorOrder, message: `✕ Could not refresh issues. ${error.message}` };
     renderIssuesWithPending();
-    $("issues-status").className = "bad";
-    $("issues-status").textContent = `✕ Could not refresh issues. ${error.message}`;
   } finally {
     if (generation === issuesGeneration) {
       issuesLoading = false;

@@ -4,11 +4,11 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, expect, it, vi } from 'vitest';
 import type { AuthorProvider, AuthorRequest } from '../core/planning-author.ts';
-import type { IssueAccess, IssueText } from '../github/issues.ts';
+import { ISSUE_READ_ACTIVE_MS, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { createDemo } from '../scripts/demo.ts';
 import type { PlanningAgent } from '../runner/planning.ts';
 import { ReviewService, type ReviewConfig } from '../runner/review.ts';
-import { ISSUE_READ_TIMEOUT_MS, productionPlanning } from '../web/planning.ts';
+import { productionPlanning } from '../web/planning.ts';
 import { DatabaseSync } from 'node:sqlite';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
 import { PLANNING_SHUTDOWN_GRACE_MS, startServer, type PlanningDeps } from '../web/server.ts';
@@ -46,11 +46,19 @@ it('is off in a demo and without a github block, so neither plans', () => {
 
 it('tells each request the GitHub issue, the repository and the base commit, read with a bound', async () => {
   const config = production(), service = new ReviewService(config); closers.push(() => service.close());
-  const issueText = vi.fn(async (number: number) => text(number)), signal = new AbortController().signal;
-  const deps = productionPlanning(config, { ...verified, issues: issues(issueText), agent: () => closable() })!(service);
+  const issueText = vi.fn(async (number: number, options?: { signal?: AbortSignal; timeoutMs?: number;
+    trustedAuthor?: string | null; expectedAccess?: IssueAccess }) => text(number));
+  const issueAccess = vi.fn(async (number: number, _options?: { signal?: AbortSignal; timeoutMs?: number }) =>
+    ({ number, authorLogin: 'outside', collaborator: true }));
+  const signal = new AbortController().signal;
+  const deps = productionPlanning(config, { ...verified, issues: { issueAccess, issueText }, agent: () => closable() })!(service);
   expect(await deps.describe(signal)).toMatchObject({ issue: text(config.github!.issue), approvedLessons: [],
     repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base }, validate: expect.any(Function) });
-  expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS, trustedAuthor: undefined,
+  expect(issueAccess.mock.calls[0]![1]!.signal).toBe(issueText.mock.calls[0]![1]!.signal);
+  expect(issueAccess.mock.calls[0]![1]!.signal).not.toBe(signal);
+  expect(issueAccess.mock.calls[0]![1]!.timeoutMs).toBe(ISSUE_READ_ACTIVE_MS);
+  expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal: issueAccess.mock.calls[0]![1]!.signal,
+    timeoutMs: ISSUE_READ_ACTIVE_MS, trustedAuthor: undefined,
     expectedAccess: { number: config.github!.issue, authorLogin: 'outside', collaborator: true } });
 });
 

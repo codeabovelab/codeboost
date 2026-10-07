@@ -1,16 +1,16 @@
-import { GhIssueGateway, type IssueTrustGateway } from '../github/issues.ts';
+import { GhIssueGateway, ISSUE_READ_TIMEOUT_MS, withIssueReadDeadline, type IssueTrustGateway } from '../github/issues.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
 import { PlanningAgent } from '../runner/planning.ts';
 import type { ReviewConfig, ReviewService } from '../runner/review.ts';
 import type { PlanningSetup } from './server.ts';
 
-/** Bounds the GitHub read of the issue before a suggestion request starts. */
-export const ISSUE_READ_TIMEOUT_MS = 30_000;
+export { ISSUE_READ_TIMEOUT_MS } from '../github/issues.ts';
 
 /**
  * Production planning (#117): on for a review with a github block, never in a demo. It needs no runner block, since
- * planning only reads code, as Ask does. The issue text is read from GitHub for each request (collaborators' comments
- * only, bounded like an execute prompt's); approved lessons stay empty until lessons exist (L1 to L4).
+ * planning only reads code, as Ask does. The issue text is read from GitHub for each request (current collaborators'
+ * comments, or every comment under explicit author-bound trust), bounded like an execute prompt; approved lessons stay
+ * empty until lessons exist (L1 to L4).
  */
 export function productionPlanning(config: ReviewConfig, options: {
   /** The single-runner lock's check that the database path still names the locked file (runner/recovery.ts). */
@@ -30,8 +30,8 @@ export function productionPlanning(config: ReviewConfig, options: {
     const provider = options.agent?.(service) ?? new PlanningAgent(service);
     return {
       provider,
-      async describe(signal) {
-        const access = await issues.issueAccess(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS });
+      describe(signal) { return withIssueReadDeadline(signal, async (readSignal, timeoutMs) => {
+        const access = await issues.issueAccess(github.issue, { signal: readSignal, timeoutMs });
         const trust = service.store.issueTrust(github.repository, github.issue);
         const explicitlyTrusted = trust?.revokedAt === null && trust.authorLogin === access.authorLogin;
         if (!access.collaborator && !explicitlyTrusted) throw new GuardRefusal(`Issue #${github.issue} is not trusted for its current author.`);
@@ -41,14 +41,14 @@ export function productionPlanning(config: ReviewConfig, options: {
           if (!current || current.revokedAt !== null || current.authorLogin !== access.authorLogin)
             throw new GuardRefusal(`Issue #${github.issue} is not trusted for its current author.`);
         };
-        const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS,
+        const text = await issues.issueText(github.issue, { signal: readSignal, timeoutMs,
           trustedAuthor: explicitlyTrusted ? access.authorLogin : undefined, expectedAccess: access });
         validate();
         // The configured base branch (#103), or the base commit when none (or an empty one) is configured.
         const baseRef = github.baseBranch || service.store.getSnapshot(config.identity).base;
         return { issue: { number: text.number, title: text.title, body: text.body, comments: [...text.comments] },
           approvedLessons: [], repo: { name: github.repository, baseRef }, validate };
-      },
+      }); },
       close: () => provider.close(),
     };
   };

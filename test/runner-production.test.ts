@@ -11,7 +11,7 @@ import type { RecoveryDeps } from '../runner/recovery.ts';
 import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import { readCapturedFile } from '../agents/container/profile.ts';
 import type { InvocationInput } from '../agents/contract.ts';
-import type { IssueAccess } from '../github/issues.ts';
+import { ISSUE_READ_ACTIVE_MS, type IssueAccess } from '../github/issues.ts';
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { exportTaskDiff, removeTaskFilesystemsAsync } from '../agents/container/storage.ts';
 import { RunnerCoordinator, type RunnerDeps } from '../runner/coordinator.ts';
@@ -24,15 +24,19 @@ let issueAuthor = 'member', issueCollaborator = true;
 let collaboratorComments: string[] = [];
 let afterIssueAccess: (() => void) | undefined;
 let beforeIssueTextReturn: (() => Promise<void> | void) | undefined;
+const issueStageOptions: { signal?: AbortSignal; timeoutMs?: number }[] = [];
 vi.mock('../github/issues.ts', async original => {
   const actual = await original<typeof import('../github/issues.ts')>();
   return { ...actual, GhIssueGateway: class extends actual.GhIssueGateway {
-    override async issueAccess(number: number) {
+    override async issueAccess(number: number, options: { signal?: AbortSignal; timeoutMs?: number } = {}) {
+      issueStageOptions.push(options);
       const result = { number, authorLogin: issueAuthor, collaborator: issueCollaborator };
       afterIssueAccess?.();
       return result;
     }
-    override async issueText(number: number, options: { trustedAuthor?: string | null; expectedAccess?: IssueAccess } = {}) {
+    override async issueText(number: number, options: { signal?: AbortSignal; timeoutMs?: number;
+      trustedAuthor?: string | null; expectedAccess?: IssueAccess } = {}) {
+      issueStageOptions.push(options);
       await beforeIssueTextReturn?.();
       if (options.expectedAccess && (options.expectedAccess.authorLogin !== issueAuthor || options.expectedAccess.collaborator !== issueCollaborator))
         throw new Error(`Issue #${number}'s author or collaborator access changed during admission.`);
@@ -52,6 +56,7 @@ afterEach(async () => {
   collaboratorComments = [];
   afterIssueAccess = undefined;
   beforeIssueTextReturn = undefined;
+  issueStageOptions.length = 0;
   vi.restoreAllMocks();
 });
 const OWNER = 'c'.repeat(32), committer = { name: 'codeboost', email: 'runner@codeboost.invalid' };
@@ -120,6 +125,8 @@ describe('runner startup', () => {
     const signal = new AbortController().signal, identity = service.config.identity;
     await sources.issue(identity, signal); await sources.issue(identity, signal);
     expect(issueReads).toHaveLength(1);
+    expect(issueStageOptions[0]!.signal).toBe(issueStageOptions[1]!.signal);
+    expect(issueStageOptions.slice(0, 2).map(options => options.timeoutMs)).toEqual([ISSUE_READ_ACTIVE_MS, ISSUE_READ_ACTIVE_MS]);
     // A wall-clock step back does not keep the old text.
     vi.spyOn(Date, 'now').mockReturnValue(0);
     await sources.issue(identity, signal);

@@ -278,6 +278,7 @@ test('reuses the trust action ID after a retryable 503', async ({ page }) => {
   await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
   await row.getByRole('button', { name: 'Trust this issue' }).click();
   await expect(row.getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await expect(page.locator('#issues-status')).toContainText('✓ Current');
   expect(actionIds).toHaveLength(2);
   expect(actionIds[1]).toBe(actionIds[0]);
 });
@@ -305,6 +306,85 @@ test('keeps another issue disabled and focused when an overlapping trust request
   await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
   await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' })).toBeVisible();
   await expect(second).toBeFocused();
+});
+
+test('keeps one issue trust failure visible when another overlapping request succeeds', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let first: import('@playwright/test').Route | undefined;
+  let second: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const firstCaptured = deferred<void>(), secondCaptured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action !== 'trust') { await route.continue(); return; }
+    if (body.number === 21 && !first) { first = route; firstCaptured.resolve(); return; }
+    if (body.number === 23 && !second) { second = { route, response: await route.fetch() }; secondCaptured.resolve(); return; }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await firstCaptured.promise;
+  await page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await secondCaptured.promise;
+  await first!.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'GitHub unavailable.' }) });
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
+  await second!.route.fulfill({ response: second!.response });
+  await expect(page.locator('tr[data-issue="23"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await expect(page.locator('#issues-status')).toContainText('✓ Current');
+});
+
+test('keeps a refresh failure visible through trust rendering and clears it on the next refresh', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let failRefresh = false;
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as { action?: string } : {};
+    if (body.action === 'refresh' && failRefresh) {
+      failRefresh = false;
+      await route.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'Refresh unavailable.' }) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await expect(page.locator('#issues-status')).toContainText('✓ Current');
+  failRefresh = true;
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await expect(page.locator('#issues-status')).toContainText('Could not refresh issues. Refresh unavailable.');
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await expect(page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Remove trust' })).toBeVisible();
+  await expect(page.locator('#issues-status')).toContainText('Could not refresh issues. Refresh unavailable.');
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await expect(page.locator('#issues-status')).toContainText('✓ Current');
+});
+
+test('does not reconcile a trust failure that occurs after refresh starts', async ({ page }) => {
+  app = await startServer(createDemo(join(root, 'demo')), 0);
+  let holdRefresh = false;
+  let held: { route: import('@playwright/test').Route; response: import('@playwright/test').APIResponse } | undefined;
+  const captured = deferred<void>();
+  await page.route('**/api/issues', async route => {
+    const request = route.request(), body = request.method() === 'POST' ? request.postDataJSON() as { action?: string; number?: number } : {};
+    if (body.action === 'refresh' && holdRefresh && !held) {
+      held = { route, response: await route.fetch() }; captured.resolve(); return;
+    }
+    if (body.action === 'trust' && body.number === 21) {
+      await route.fulfill({ status: 502, contentType: 'application/json', body: JSON.stringify({ error: 'GitHub unavailable.' }) }); return;
+    }
+    await route.continue();
+  });
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Issues', exact: true }).click();
+  await expect(page.locator('#issues-status')).toContainText('✓ Current');
+  holdRefresh = true;
+  await page.getByRole('button', { name: 'Refresh issues' }).click();
+  await captured.promise;
+  await page.locator('tr[data-issue="21"]').getByRole('button', { name: 'Trust this issue' }).click();
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
+  await held!.route.fulfill({ response: held!.response });
+  await expect(page.locator('#issues-status')).toContainText('Could not trust issue #21');
 });
 
 test('merges successful overlapping trust responses for different issues', async ({ page }) => {

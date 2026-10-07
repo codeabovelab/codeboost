@@ -6,7 +6,7 @@ import { exportTaskDiff, removeTaskFilesystemsAsync, type TaskStorageLimits } fr
 import { recoverLeftovers } from '../agents/recovery.ts';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
 import { GhAlreadyFixedGateway } from '../github/already-fixed.ts';
-import { GhIssueGateway, type IssueAccess, type IssueText } from '../github/issues.ts';
+import { GhIssueGateway, withIssueReadDeadline, type IssueAccess, type IssueText } from '../github/issues.ts';
 import { GhPullRequestGateway } from '../github/pull-requests.ts';
 import { baseBranch } from '../github/validate.ts';
 import { identityKey } from '../core/identity.ts';
@@ -232,8 +232,8 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
    * measured on the monotonic clock, so a wall-clock step back cannot stretch it.
    */
   let lastRead: { access: IssueAccess; trustedAuthor: string | null | undefined; at: number; text: IssueText } | null = null;
-  const issueText = async (number: number, signal: AbortSignal): Promise<GuardedIssueText> => {
-    const access = await issues.issueAccess(number, { signal, timeoutMs: 30_000 });
+  const issueText = (number: number, signal: AbortSignal): Promise<GuardedIssueText> => withIssueReadDeadline(signal, async (readSignal, timeoutMs) => {
+    const access = await issues.issueAccess(number, { signal: readSignal, timeoutMs });
     const trust = service.store.issueTrust(review.github!.repository, number);
     const explicitlyTrusted = trust?.revokedAt === null && trust.authorLogin === access.authorLogin;
     if (!access.collaborator && !explicitlyTrusted) throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
@@ -249,11 +249,11 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     if (trustedAuthor !== undefined && lastRead && lastRead.access.number === number && lastRead.access.authorLogin === access.authorLogin
       && lastRead.access.collaborator === access.collaborator && lastRead.trustedAuthor === trustedAuthor
       && performance.now() - lastRead.at < ISSUE_REUSE_MS) return { text: lastRead.text, validate };
-    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000, trustedAuthor, expectedAccess: access });
+    const at = performance.now(), text = await issues.issueText(number, { signal: readSignal, timeoutMs, trustedAuthor, expectedAccess: access });
     validate();
     lastRead = { access, trustedAuthor, at, text };
     return { text, validate };
-  };
+  });
   const only = (requested: typeof identity) => {
     if (identityKey(requested) !== identityKey(identity)) throw new Error('This server runs only its configured plan.');
   };

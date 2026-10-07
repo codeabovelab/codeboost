@@ -15,6 +15,24 @@ export const ISSUE_PAGE_MAX_BYTES = 64 * 1024 * 1024;
  * to 0.75 s later: 12.75 s, below the 15-second serving request budget.
  */
 export const ISSUE_KILL_GRACE_MS = 500, ISSUE_PIPE_GRACE_MS = 250;
+/** One sequential access-and-text operation, including the subprocess settlement tail after its active-work abort. */
+export const ISSUE_READ_TIMEOUT_MS = 30_000;
+export const ISSUE_READ_ACTIVE_MS = ISSUE_READ_TIMEOUT_MS - ISSUE_KILL_GRACE_MS - ISSUE_PIPE_GRACE_MS;
+
+/** Shares one active-work deadline across every sequential stage and awaits the caller's work through settlement. */
+export async function withIssueReadDeadline<T>(signal: AbortSignal,
+  read: (sharedSignal: AbortSignal, activeTimeoutMs: number) => Promise<T>): Promise<T> {
+  signal.throwIfAborted();
+  const deadline = new AbortController();
+  const shared = AbortSignal.any([signal, deadline.signal]);
+  const timer = setTimeout(() => deadline.abort(new Error('Issue retrieval timed out.')), ISSUE_READ_ACTIVE_MS);
+  try {
+    const value = await read(shared, ISSUE_READ_ACTIVE_MS);
+    shared.throwIfAborted();
+    return value;
+  }
+  finally { clearTimeout(timer); }
+}
 
 export type IssueAuthorAssociation =
   | 'OWNER' | 'MEMBER' | 'COLLABORATOR' | 'CONTRIBUTOR'
