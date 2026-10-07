@@ -2,9 +2,9 @@ import { execFileSync } from 'node:child_process';
 import { fixtureGit } from './fixtures/git.ts';
 import { mkdtempSync, mkdirSync, readFileSync, readdirSync, rmSync, lstatSync, symlinkSync, writeFileSync, renameSync, opendirSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, win32 } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { createTaskClone } from '../git/clone.ts';
+import { createTaskClone, pathIsWithin } from '../git/clone.ts';
 
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -26,6 +26,22 @@ function fixture() {
   return { source, parent, head: git(source, 'rev-parse', 'HEAD'), taskId: 'task-1' };
 }
 afterEach(() => { vi.restoreAllMocks(); vi.resetAllMocks(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+describe('path containment', () => {
+  it.each([
+    ['same directory despite case', 'C:\\repo', 'c:\\REPO', true],
+    ['nested directory', 'C:\\repo', 'C:\\repo\\tasks', true],
+    ['similarly named sibling', 'C:\\repo', 'C:\\repository', false],
+    ['same-drive sibling', 'C:\\repo', 'C:\\tasks', false],
+    ['parent directory', 'C:\\repo\\source', 'C:\\repo', false],
+    ['different drive', 'C:\\repo', 'D:\\tasks', false],
+    ['nested UNC directory', '\\\\server\\share\\repo', '\\\\server\\share\\repo\\tasks', true],
+    ['same-share UNC sibling', '\\\\server\\share\\repo', '\\\\server\\share\\tasks', false],
+    ['different UNC share', '\\\\server\\share\\repo', '\\\\server\\other\\tasks', false],
+    ['different UNC server', '\\\\server\\share\\repo', '\\\\other\\share\\tasks', false],
+  ])('uses Windows boundaries for a %s', (_name, base, candidate, expected) => {
+    expect(pathIsWithin(base, candidate, win32)).toBe(expected);
+  });
+});
 describe('isolated staging clone', () => {
   it('copies objects, ignores dirty source changes, and has no origin or shared metadata', () => {
     const input = fixture();
@@ -66,9 +82,9 @@ describe('isolated staging clone', () => {
     git(input.source, 'update-ref', `refs/replace/${input.head}`, input.head);
     expect(() => createTaskClone(input)).toThrow('Replacement');
   });
-  it('rejects nested storage, including paths through symlinks', () => {
+  it('rejects nested storage after resolving a directory alias, including a Windows junction', () => {
     const input = fixture(), nested = join(input.source, 'tasks'), alias = join(input.parent, 'alias');
-    mkdirSync(nested); symlinkSync(nested, alias);
+    mkdirSync(nested); symlinkSync(nested, alias, process.platform === 'win32' ? 'junction' : 'dir');
     expect(() => createTaskClone({ ...input, parent: alias })).toThrow('outside');
   });
   it('requires a full existing commit and finite time budget', () => {
