@@ -1359,6 +1359,24 @@ describe('github.baseBranch', () => {
 
 describe('closing a cancelled task\'s pull requests (#111)', () => {
   const closedRecord = { outcome: 'closed', action: 'close' };
+  it('settles pre-merge before shutdown closes Store writes', async () => {
+    const w = world();
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { return { number, authorLogin: 'member', collaborator: true }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    let writesClosed: boolean | undefined;
+    const { close } = await serve(w, { issueGateway, preMerge: service => ({
+      get active() { return false; }, get last() { return null; }, assertStartable() {},
+      start: async () => { throw new Error('not used'); }, cancelTask: () => 'closed' as const,
+      close: async () => { writesClosed = service.store.writesClosed; },
+    } as unknown as PreMergeCoordinator) });
+    await close();
+    expect(writesClosed).toBe(false);
+  });
+
   it('closes a ready PR after an asynchronously cancelled pre-merge preparation settles', async () => {
     const w = world(), settle = Promise.withResolvers<void>();
     const issueGateway: IssueTrustGateway = {

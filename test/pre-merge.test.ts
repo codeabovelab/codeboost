@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
-import { PreMergeCoordinator } from '../runner/pre-merge.ts';
+import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PreMergeCoordinator } from '../runner/pre-merge.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -256,12 +256,23 @@ it('marks historical readiness stale after the review changes', async () => {
 });
 
 it('keeps a command-check deadline separate from the code-writing task budget', async () => {
-  const fixture = await rebaseFixture('feature\n', 0, { commandWaitsForDeadline: true, operationTimeoutMs: 5_000 });
+  const fixture = await rebaseFixture('feature\n', 0,
+    { commandWaitsForDeadline: true, operationTimeoutMs: COMMAND_CHECK_SETTLEMENT_RESERVE_MS + 5_000 });
   expect(fixture.result).toMatchObject({ state: 'failed' });
   expect(fixture.result.reason).toMatch(/Timed out|deadline exceeded/);
   const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
   expect(check).toMatchObject({ state: 'failed', firstReason: null, stopReason: 'timeout' });
   expect(fixture.service.store.getTask(fixture.service.config.identity).status).toBe('in review');
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('keeps the complete command settlement window inside the overall preparation deadline', async () => {
+  const fixture = await rebaseFixture('feature\n', 0,
+    { operationTimeoutMs: COMMAND_CHECK_SETTLEMENT_RESERVE_MS + 5_000 });
+  const attempt = fixture.service.store.getAttempts(fixture.service.config.identity).find(value => value.kind === 'check');
+  expect(attempt).toBeDefined();
+  expect(attempt!.deadline - Date.parse(attempt!.createdAt)).toBeLessThanOrEqual(5_000);
+  expect(fixture.result).toMatchObject({ state: 'ready' });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 

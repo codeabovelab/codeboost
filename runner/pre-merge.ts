@@ -16,6 +16,10 @@ export interface PreMergeResult {
   base: string; head: string; checked: readonly string[]; reason: string | null;
 }
 
+// D may spend 30 s on its first cleanup and 60 s retrying it; F may then spend 30 s releasing task storage. Keep all
+// of that ownership settlement inside the preparation's one overall deadline.
+export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
+
 /** Production preparation before F6: refresh, rebase, re-review, then exact-head command checks. */
 export class PreMergeCoordinator {
   readonly service: ReviewService;
@@ -160,6 +164,12 @@ export class PreMergeCoordinator {
       if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded.'), { code: 'ETIMEDOUT' });
       return value;
     };
+    const commandBudget = () => {
+      const value = Math.ceil(deadline - performance.now() - COMMAND_CHECK_SETTLEMENT_RESERVE_MS);
+      if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded before command-check settlement could be reserved.'),
+        { code: 'ETIMEDOUT' });
+      return value;
+    };
     const authorize = async () => {
       if (!this.authorize) return;
       const validate = await this.authorize(signal);
@@ -227,7 +237,7 @@ export class PreMergeCoordinator {
       signal.throwIfAborted();
       task = this.service.store.getTask(identity);
       const attempt = this.runner.start(identity, { expectedStateVersion: task.stateVersion, kind: 'check', item: item.id,
-        deadline: Date.now() + remaining(), expectedContext: this.service.store.currentContext(identity),
+        deadline: Date.now() + commandBudget(), expectedContext: this.service.store.currentContext(identity),
         ...(this.authorize ? { authorize: this.authorize } : {}) });
       const stop = () => {
         // The invocation owns the same deadline and reports its own timeout. `time-limit` is reserved for the

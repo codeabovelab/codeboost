@@ -722,6 +722,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if(active.readingBody)active.request.destroy(reason);
     }
     const publishingFailure = await publishingClosed;
+    // A conflict resolver records and clears child process ownership directly through the Store. Abort and await the
+    // whole pre-merge lifecycle before the write gate closes, so those settlement writes cannot be refused.
+    const failures: unknown[] = publishingFailure === undefined ? [] : [publishingFailure];
+    const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
+    await step(() => preMerge?.close());
     // Step 3: after the drain, close the Store write gate. A request-path write still pending after the abort
     // (for example merge reconciliation after a GitHub await) now fails with 503; settling coordinators keep the capability.
     service.store.closeWrites();
@@ -730,9 +735,6 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const issuesClosed=issues.close();
     // Every step runs even when an earlier one fails: agents are still stopped, plan runs awaited and the Store closed
     // last. The first failure is reported; a later one never hides it.
-    const failures: unknown[] = publishingFailure === undefined ? [] : [publishingFailure];
-    const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
-    await step(() => preMerge?.close());
     await step(() => merges?.close());
     await step(() => issuesClosed);
     // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.
