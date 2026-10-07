@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
 import { GitRebaser, RebaseConflict, rebaseRef, type GitRebaserOptions } from '../runner/rebase.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
-import { verifyCheckout } from '../runner/verify-checkout.ts';
+import { splitBoundedIndexRecords, verifyCheckout } from '../runner/verify-checkout.ts';
 import { readBoundedRebaseStateNames } from '../runner/hash-rebase-state.ts';
 import { listGitPaths } from '../runner/list-git-paths.ts';
 import { outsideConflictDigest } from '../runner/hash-outside-conflict.ts';
@@ -75,6 +75,10 @@ describe('trusted pre-merge rebase', () => {
     expect(() => readBoundedRebaseStateNames(() => names[index++] ?? null,
       { entries: 0, nameBytes: 0 }, { entries: 64, nameBytes: 5 })).toThrow(/name-byte bound/);
     expect(index).toBe(2);
+  });
+
+  it('rejects an over-limit index record before retaining it', () => {
+    expect(() => splitBoundedIndexRecords(Buffer.from([0, 0]), 1)).toThrow(/entry bound/);
   });
 
   it('distinguishes identical-content outside deletions instead of collapsing them as renames', () => {

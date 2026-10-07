@@ -15,10 +15,13 @@ const git = (executable: string, args: readonly string[], input?: Buffer): Buffe
   if (result.status !== 0 || result.error) throw result.error ?? new Error(`git ${args[0]} failed while verifying the checkout.`);
   return result.stdout;
 };
-const split0 = (input: Buffer): Buffer[] => {
+export const splitBoundedIndexRecords = (input: Buffer, maxEntries = MAX_INDEX_ENTRIES): Buffer[] => {
   const values: Buffer[] = [];
   let start = 0;
-  for (let i = 0; i < input.length; i++) if (input[i] === 0) { values.push(input.subarray(start, i)); start = i + 1; }
+  for (let i = 0; i < input.length; i++) if (input[i] === 0) {
+    if (values.length >= maxEntries) throw new Error('Checkout index exceeds its entry bound.');
+    values.push(input.subarray(start, i)); start = i + 1;
+  }
   if (start !== input.length) throw new Error('Git returned an unterminated index record.');
   return values;
 };
@@ -39,8 +42,7 @@ const objectId = (algorithm: 'sha1' | 'sha256', bytes: Buffer): string =>
 export function gitlinkIndexDigest(root = process.cwd(), executable = 'git'): string {
   const rawOutput = git(executable, ['-C', root, 'ls-files', '--stage', '-z']);
   if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
-  const raw = split0(rawOutput);
-  if (raw.length > MAX_INDEX_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
+  const raw = splitBoundedIndexRecords(rawOutput);
   const hash = createHash('sha256');
   for (const record of raw) {
     const tab = record.indexOf(0x09), header = record.subarray(0, tab).toString('ascii').split(' ');
@@ -55,8 +57,7 @@ export function verifyCheckout(root = process.cwd(), executable = 'git'): void {
   const repositoryGit = (args: readonly string[], input?: Buffer) => git(executable, ['-C', root, ...args], input);
   const rawOutput = repositoryGit(['ls-files', '--stage', '-z']);
   if (rawOutput.length > MAX_INDEX_BYTES) throw new Error('Checkout index exceeds its byte bound.');
-  const raw = split0(rawOutput);
-  if (raw.length > MAX_INDEX_ENTRIES) throw new Error('Checkout index exceeds its entry bound.');
+  const raw = splitBoundedIndexRecords(rawOutput);
   const quotedOutput = repositoryGit(['ls-files', '--stage']).toString('utf8');
   if (quotedOutput && !quotedOutput.endsWith('\n')) throw new Error('Git returned an unterminated quoted index listing.');
   const quoted = quotedOutput ? quotedOutput.slice(0, -1).split('\n') : [];
