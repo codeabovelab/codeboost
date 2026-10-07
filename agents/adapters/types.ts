@@ -33,6 +33,8 @@ export function assertAdapterRequest(request: AgentAdapterRequest): void {
 export interface AgentAdapterOptions {
   readonly timeoutMs?: number;
   readonly limits?: Partial<CaptureLimits>;
+  /** Trusted monotonic budget supplied by a caller that already converted its transported wall deadline. */
+  readonly invocationBudget?: () => number;
 }
 const MAXIMUM_INVOCATION_MS = 10 * 60_000;
 

@@ -210,7 +210,8 @@ export async function assertVendorNetwork(network: VendorNetwork, invocation?: I
  * and everything created so far is removed (cleanup itself is not cancelled) before the promise rejects.
  */
 export async function createVendorNetwork(invocation: InvocationInput, imageId: string, allocationId: string,
-  timeoutMs = 60_000, signal?: AbortSignal, processLifecycle?: ProcessGroupLifecycle): Promise<VendorNetwork> {
+  timeoutMs = 60_000, signal?: AbortSignal, processLifecycle?: ProcessGroupLifecycle,
+  invocationBudget?: () => number): Promise<VendorNetwork> {
   assertCapturedInvocation(invocation);
   assertBuiltAgentImage(imageId);
   // The network and proxy carry the invocation's runner and attempt and this caller-chosen allocation ID.
@@ -220,7 +221,7 @@ export async function createVendorNetwork(invocation: InvocationInput, imageId: 
   const vendor = invocation.vendor;
   // Setup runs inside the caller's budget minus a cleanup reserve, so failure cleanup cannot overrun timeoutMs.
   // No allocation may outlive the invocation it serves.
-  const invocationLeft = Math.floor(invocation.deadline - Date.now());
+  const invocationLeft = Math.floor(invocationBudget?.() ?? invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   timeoutMs = Math.min(timeoutMs, invocationLeft);
   const overall = deadline(timeoutMs), cleanupReserve = Math.min(10_000, Math.floor(timeoutMs / 3));

@@ -133,6 +133,25 @@ describe('production foreign conflict resolver', () => {
     } finally { vi.useRealTimers(); }
   });
 
+  it('carries the resolver monotonic budget into adapter setup across a later wall-clock step', async () => {
+    vi.useFakeTimers();
+    try {
+      const f = fixture(), x = deps(f), start = x.d.start;
+      x.d.start = ((value: AgentAdapterRequest, _token: string,
+        options?: { invocationBudget?: () => number }) => {
+        vi.setSystemTime(Date.now() + 60_000);
+        expect(options?.invocationBudget?.()).toBeGreaterThan(0);
+        return start(value);
+      }) as typeof x.d.start;
+      const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+        repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+        image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+        limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+
+      await resolve({ ...input(f), deadline: Date.now() + CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS + 5_000 });
+    } finally { vi.useRealTimers(); }
+  });
+
   it('does not claim a conflict child for an already-aborted request', async () => {
     const f = fixture(), x = deps(f), reason = new Error('cancelled before conflict admission');
     const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,

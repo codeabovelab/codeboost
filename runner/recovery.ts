@@ -355,7 +355,8 @@ async function stopped(exporting: Promise<unknown>, graceMs: number, attemptId: 
 /** --release-preparation: remove an attempt directory only when no process has a file open or a working directory in it. */
 export function releasePreparation(o: { store: Store; runnerRoot: string; runnerOwner: string; attemptId: string; openFiles?: (dir: string) => string[] }): void {
   if (!isUuidV4(o.attemptId) || o.store.attemptOwner(o.attemptId) === null) throw new Error('Unknown attempt.');
-  const dir = join(o.runnerRoot, o.runnerOwner, 'attempts', o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
+  const attempts = ownerOnlyDirectory(o.runnerRoot, o.runnerOwner, 'attempts');
+  const dir = join(attempts, o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
   if (st && (!st.isDirectory() || st.isSymbolicLink())) throw new Error('The attempt path is not a plain directory.');
   if (st) {
     const users = (o.openFiles ?? hostOpenFiles)(dir);
@@ -376,7 +377,8 @@ export function releaseRebaseProcess(o: { store: Store; runnerRoot: string; runn
   if (matches.length !== 1) throw new Error('Unknown rebase attempt.');
   const marker = matches[0]!.marker as { processGroup?: unknown };
   if (marker.processGroup !== 'unsettled') throw new Error('The rebase attempt is not waiting for escaped-process release.');
-  const dir = join(o.runnerRoot, o.runnerOwner, 'rebases', o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
+  const rebases = ownerOnlyDirectory(o.runnerRoot, o.runnerOwner, 'rebases');
+  const dir = join(rebases, o.attemptId), st = lstatSync(dir, { throwIfNoEntry: false });
   if (st && (!st.isDirectory() || st.isSymbolicLink())) throw new Error('The rebase path is not a plain directory.');
   if (st) {
     const users = (o.openFiles ?? hostOpenFiles)(dir);

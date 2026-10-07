@@ -469,6 +469,24 @@ describe('startup recovery sequence', () => {
     expect(abortRebase).not.toHaveBeenCalled();
     expect(recoverLeftovers).not.toHaveBeenCalled();
   });
+  it('refuses explicit release through a replaced rebase-directory ancestor', () => {
+    const { d: root, store } = fixture();
+    store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
+    const snapshot = store.getSnapshot(id(1)), planKey = store.getTask(id(1)).planKey;
+    const marker = store.beginRebase(id(1), { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(id(1)) },
+      store.getTask(id(1)).stateVersion, { oldBase: snapshot.base, oldHead: snapshot.head, onto: oid(3), oldHistory: [snapshot.head] });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', 'unsettled');
+    const runnerRoot = join(root, 'r'), owner = join(runnerRoot, token), redirected = join(root, 'redirected-rebases');
+    mkdirSync(owner, { recursive: true }); mkdirSync(join(redirected, marker.attemptId), { recursive: true });
+    symlinkSync(redirected, join(owner, 'rebases'));
+    const openFiles = vi.fn(() => [] as string[]);
+
+    expect(() => releaseRebaseProcess({ store, runnerRoot, runnerOwner: token,
+      attemptId: marker.attemptId, openFiles })).toThrow(/directory owned by you|plain directory/);
+    expect(openFiles).not.toHaveBeenCalled();
+    expect(store.getTask(id(1)).rebaseInProgress).toMatchObject({ processGroup: 'unsettled' });
+  });
   it('retains a terminated recovered group when explicit release finds an escaped workspace user', async () => {
     const { d: root, store } = fixture();
     store.transitionTask(id(1), store.getTask(id(1)).stateVersion, 'approved but merge blocked');
@@ -661,6 +679,19 @@ describe('startup recovery sequence', () => {
     releasePreparation({ store, runnerRoot, runnerOwner: token, attemptId: attempt.id, openFiles: () => [] });
     expect(existsSync(dirPath)).toBe(false);
     await expect(run()).resolves.toMatchObject({ finalized: [] });
+  });
+  it('refuses preparation release through a replaced attempts-directory ancestor', () => {
+    const { d: root, store, admit } = fixture();
+    const attempt = admit(id(1)); store.markPreparationStarting(id(1), attempt.id, Date.now());
+    const runnerRoot = join(root, 'r'), owner = join(runnerRoot, token), redirected = join(root, 'redirected-attempts');
+    mkdirSync(owner, { recursive: true }); mkdirSync(join(redirected, attempt.id), { recursive: true });
+    symlinkSync(redirected, join(owner, 'attempts'));
+    const openFiles = vi.fn(() => [] as string[]);
+
+    expect(() => releasePreparation({ store, runnerRoot, runnerOwner: token,
+      attemptId: attempt.id, openFiles })).toThrow(/directory owned by you|plain directory/);
+    expect(openFiles).not.toHaveBeenCalled();
+    expect(store.interruptedAttempts().find(value => value.id === attempt.id)?.preparationStartedAt).not.toBeNull();
   });
 });
 

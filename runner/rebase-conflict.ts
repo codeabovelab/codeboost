@@ -3,7 +3,7 @@ import { chmodSync, constants, lstatSync, mkdirSync, openSync, closeSync, fstatS
   realpathSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { startClaudeInvocation } from '../agents/adapters/claude.ts';
-import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
+import type { AgentAdapterOptions, AgentAdapterRequest } from '../agents/adapters/types.ts';
 import { captureInvocation, type InvocationHandle, type TaskClone } from '../agents/contract.ts';
 import { checkConflictTree, inspectTaskChanges, MAXIMUM_DECLARED_LINKS, MAXIMUM_NAME_BYTES, snapshotDeclaredLinks,
   type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
@@ -29,7 +29,7 @@ interface ResolverDeps {
   allocate: typeof prepareTaskFilesystemsAsync;
   snapshotLinks: typeof snapshotDeclaredLinks;
   checkTree: typeof checkConflictTree;
-  start(request: AgentAdapterRequest, token: string): InvocationHandle;
+  start(request: AgentAdapterRequest, token: string, options?: AgentAdapterOptions): InvocationHandle;
   inspect: typeof inspectTaskChanges;
   exportPaths: typeof exportTaskPaths;
   importPaths: typeof importTaskPaths;
@@ -300,7 +300,8 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
       const prompt = `Resolve the in-progress rebase conflict in exactly these paths: ${JSON.stringify(input.files)}. `
         + 'Edit only those paths. Do not create commits or change repository metadata. Preserve the intent of both sides and leave each path in its final resolved form.';
       handle = deps.start({ invocation, filesystems, inputDirectory, imageId, prompt,
-        networkAllocationId, treeCheck, cleanupRoot: staging, processLifecycle }, options.token);
+        networkAllocationId, treeCheck, cleanupRoot: staging, processLifecycle }, options.token,
+        { invocationBudget: operationBudget });
       const cancel = () => handle!.cancel(stopReason(input.signal!));
       if (input.signal?.aborted) cancel(); else input.signal?.addEventListener('abort', cancel, { once: true });
       const result = await bounded(handle.settled).finally(() => input.signal?.removeEventListener('abort', cancel));

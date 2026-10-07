@@ -49,6 +49,8 @@ export interface ProfileOptions {
   readonly treeCheck?: TaskTreeCheck;
   /** Remaining invocation budget for Docker-backed profile validation. */
   readonly timeoutMs?: number;
+  /** Trusted monotonic budget carried from adapter admission. */
+  readonly invocationBudget?: () => number;
   /** Cancels creation; whatever was staged is removed before the promise rejects. */
   readonly signal?: AbortSignal;
   /** Optional owner-only plain directory beneath which temporary profile snapshots are created. */
@@ -262,7 +264,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
   const storageOwner = taskFilesystemOwner(filesystems);
   if (storageOwner.runnerOwner !== invocation.runnerOwner) throw new Error('Task filesystems belong to another runner.');
   const containerOwner = agentContainerOwner(invocation, filesystems);
-  const invocationLeft = Math.floor(invocation.deadline - Date.now());
+  const invocationLeft = Math.floor(options.invocationBudget?.() ?? invocation.deadline - Date.now());
   if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   await assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft),
     options.signal, options.processLifecycle);

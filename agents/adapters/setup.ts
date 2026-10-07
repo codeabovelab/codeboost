@@ -20,11 +20,11 @@ export async function setUpProfile(request: AgentAdapterRequest, remaining: () =
   profileOptions: (network: VendorNetwork) => Omit<ProfileOptions, 'timeoutMs' | 'signal'>,
   start: (profile: ContainerProfile) => InvocationHandle): Promise<InvocationHandle> {
   const network = await createVendorNetwork(request.invocation, request.imageId, request.networkAllocationId,
-    Math.min(60_000, remaining()), signal, request.processLifecycle);
+    Math.min(60_000, remaining()), signal, request.processLifecycle, remaining);
   let profile: ContainerProfile;
   try {
     profile = await createContainerProfile({ ...profileOptions(network), timeoutMs: Math.min(60_000, remaining()),
-      signal });
+      invocationBudget: remaining, signal });
   } catch (error) {
     // Profile creation removes the network itself once it has claimed it; otherwise the network is still ours.
     if (error instanceof ProfileCreationCleanupError) throw error;

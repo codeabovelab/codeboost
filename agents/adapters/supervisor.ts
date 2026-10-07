@@ -484,7 +484,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
     return rejectProfile(profile, error, true, disposeContainerProfile,
       isDeadlineError(error) ? 'timeout' : undefined, options.processLifecycle);
   }
-  const wallRemaining = invocation.deadline - Date.now();
+  const wallRemaining = options.invocationBudget ? carriedBudget : invocation.deadline - Date.now();
   if (!Number.isSafeInteger(wallRemaining) || wallRemaining < 1) {
     return rejectProfile(profile, new Error('Invocation deadline has already expired.'), true, disposeContainerProfile,
       'timeout', options.processLifecycle);

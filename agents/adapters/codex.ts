@@ -25,7 +25,7 @@ export function startCodexInvocation(request: AgentAdapterRequest,
   authFile: string, options: AgentAdapterOptions = {}): InvocationHandle {
   if (!authFile || authFile.includes('\0')) throw new Error('Codex auth path is malformed.');
   const policy = createPhasePolicy(request.invocation);
-  const remaining = createAdapterInvocationBudget(request.invocation, options.timeoutMs);
+  const remaining = options.invocationBudget ?? createAdapterInvocationBudget(request.invocation, options.timeoutMs);
   // Invalid input, including any phase Codex is refused (today every phase, #93), throws here, before anything is
   // allocated; only Docker setup runs inside the handle.
   const command = createCodexCommand(policy, request.prompt);
