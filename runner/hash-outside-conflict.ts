@@ -47,7 +47,8 @@ export function outsideConflictDigest(root: string, executable: string, head: st
   const allowed = new Set(split0(allowedInput).map(path => path.toString('hex')));
   const changed = new Map<string, Buffer>();
   let changedBytes = 0;
-  for (const path of [...split0(git(root, executable, ['diff', '--name-only', '--ignore-submodules=all', '-z', head, '--'])),
+  for (const path of [...split0(git(root, executable, ['diff', '--name-only', '--no-renames', '--ignore-submodules=all', '-z', head, '--'])),
+    ...split0(git(root, executable, ['diff', '--cached', '--name-only', '--no-renames', '--ignore-submodules=all', '-z', head, '--'])),
     ...split0(git(root, executable, ['ls-files', '--others', '-z', '--']))]) {
     const key = path.toString('hex');
     if (!allowed.has(key) && !changed.has(key)) {

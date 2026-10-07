@@ -9,7 +9,7 @@ type PathListMode = 'conflicts' | 'unmerged';
 
 /** Return one bounded raw NUL stream as base64 so the parent can perform fatal UTF-8 decoding without replacement. */
 export function listGitPaths(root: string, executable: string, mode: PathListMode): string {
-  const command = mode === 'conflicts' ? ['diff', '--name-only', '--diff-filter=U', '-z', '--']
+  const command = mode === 'conflicts' ? ['diff', '--name-only', '--ignore-submodules=all', '--diff-filter=U', '-z', '--']
     : ['ls-files', '--unmerged', '-z', '--'];
   const result = spawnSync(executable, [...GIT_OPTIONS, '-c', 'gc.auto=0', '-c', 'maintenance.auto=false', ...command],
     { cwd: root, env: gitEnvironment(), maxBuffer: MAX_GIT_OUTPUT_BYTES, stdio: ['ignore', 'pipe', 'pipe'] });

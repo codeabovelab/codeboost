@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { execFileSync } from 'node:child_process';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -9,6 +9,8 @@ import { GitRebaser, RebaseConflict, rebaseRef, type GitRebaserOptions } from '.
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
 import { verifyCheckout } from '../runner/verify-checkout.ts';
 import { readBoundedRebaseStateNames } from '../runner/hash-rebase-state.ts';
+import { listGitPaths } from '../runner/list-git-paths.ts';
+import { outsideConflictDigest } from '../runner/hash-outside-conflict.ts';
 
 const OWNER = '0123456789abcdef0123456789abcdef';
 const roots: string[] = [];
@@ -75,6 +77,21 @@ describe('trusted pre-merge rebase', () => {
     expect(index).toBe(2);
   });
 
+  it('distinguishes identical-content outside deletions instead of collapsing them as renames', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-outside-digest-')); roots.push(root);
+    git(root, 'init', '-q', '-b', 'main');
+    git(root, 'config', 'user.name', 'Source'); git(root, 'config', 'user.email', 'source@example.invalid');
+    writeFileSync(join(root, 'a'), 'same\n'); writeFileSync(join(root, 'b'), 'same\n');
+    git(root, 'add', '--', 'a', 'b'); git(root, 'commit', '-qm', 'base');
+    const head = git(root, 'rev-parse', 'HEAD');
+    const realGit = execFileSync('/bin/sh', ['-c', 'command -v git'], { encoding: 'utf8' }).trim();
+    rmSync(join(root, 'a')); writeFileSync(join(root, 'c'), 'same\n'); git(root, 'add', '--all');
+    const first = outsideConflictDigest(root, realGit, head, Buffer.alloc(0));
+    git(root, 'reset', '--hard', '-q', head);
+    rmSync(join(root, 'b')); writeFileSync(join(root, 'c'), 'same\n'); git(root, 'add', '--all');
+    expect(outsideConflictDigest(root, realGit, head, Buffer.alloc(0))).not.toBe(first);
+  });
+
   it('uses the configured Git PATH inside the checkout verifier subprocess', async () => {
     const s = await setup(), attemptId = randomUUID(), bin = join(s.root, 'git-bin'), marker = join(s.root, 'verified');
     mkdirSync(bin);
@@ -97,6 +114,14 @@ describe('trusted pre-merge rebase', () => {
     } finally {
       if (path === undefined) delete process.env.PATH; else process.env.PATH = path;
     }
+  });
+
+  it('disables submodule inspection in the conflict-path diff', () => {
+    const root = mkdtempSync(join(tmpdir(), 'codeboost-path-list-')); roots.push(root);
+    const executable = join(root, 'git'), args = join(root, 'args');
+    writeFileSync(executable, `#!/bin/sh\nprintf '%s\\n' "$@" > '${args}'\n`, { mode: 0o755 });
+    expect(listGitPaths(root, executable, 'conflicts')).toBe('');
+    expect(readFileSync(args, 'utf8').split('\n')).toContain('--ignore-submodules=all');
   });
 
   it('never resolves Git from a relative PATH component inside the untrusted checkout', async () => {
@@ -497,6 +522,20 @@ describe('trusted pre-merge rebase', () => {
     } });
     await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
       ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/gitlink/);
+  });
+
+  it('refuses a resolver index-only regular file outside the conflict', async () => {
+    const s = await setup('foreign'), attemptId = randomUUID();
+    const runner = createRebaser(s, { resolveForeignConflict: async input => {
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
+      const payload = join(input.repository, 'payload.tmp');
+      writeFileSync(payload, 'index-only payload\n');
+      const blob = git(input.repository, 'hash-object', '-w', 'payload.tmp');
+      rmSync(payload);
+      git(input.repository, 'update-index', '--add', '--cacheinfo', `100644,${blob},smuggled.txt`);
+    } });
+    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.foreign, owner: null, origin: 'foreign' }] })).rejects.toThrow(/outside the conflicted set/);
   });
 
   it('passes a literal replacement character in a valid UTF-8 conflict path to the resolver', async () => {
