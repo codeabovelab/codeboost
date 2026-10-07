@@ -745,6 +745,47 @@ describe('start and resume refusals and races (#91 part 2)', () => {
     expect((await act(app, 'resume', { expectedStateVersion: stateVersion })).body.error).toMatch(/Stale task state/);
     expect(store.getAttempts(identity)).toHaveLength(2);
   });
+  it('replays a saved action after shutdown stops new runner admission', async () => {
+    const { app, identity, store } = await serve({ issueGateway: trustGateway(() => ({ authorLogin: 'owner', collaborator: true })) });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    const request = { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId };
+    const first = await act(app, 'start', request);
+    expect(first.status).toBe(200);
+    expect(store.savedAction(identity, { actionId, kind: 'start', request: {
+      attemptId: undefined, expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion,
+    } })).toBeDefined();
+
+    app.runner!.rejectAdmission();
+    expect(await act(app, 'start', request)).toMatchObject({ status: 200, body: { result: first.body.result } });
+    expect((await act(app, 'start', { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion })).status).toBe(503);
+  });
+  it('replays a saved action whose body finishes arriving after server shutdown begins', async () => {
+    const { app, close, database, identity, store } = await serve({ issueGateway: trustGateway(() => ({ authorLogin: 'owner', collaborator: true })) });
+    const { stateVersion, reviewVersion } = await view(app), actionId = randomUUID();
+    const first = await act(app, 'start', { expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId });
+    const attemptCount = store.getAttempts(identity).length, url = new URL(app.url);
+    const text = JSON.stringify({ action: 'start', expectedStateVersion: stateVersion, expectedReviewVersion: reviewVersion, actionId });
+    let finish!: () => void;
+    const replay = new Promise<{ status: number; body: Record<string, any> }>((resolve, reject) => {
+      const req = httpRequest({ host: url.hostname, port: url.port, path: '/api/runner', method: 'POST',
+        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json', 'content-length': Buffer.byteLength(text) } }, res => {
+        const chunks: Buffer[] = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve({ status: res.statusCode!, body: JSON.parse(Buffer.concat(chunks).toString()) }));
+      });
+      req.on('error', reject);
+      req.write(text.slice(0, 5));
+      finish = () => req.end(text.slice(5));
+    });
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const closing = close();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    finish();
+    expect(await replay).toMatchObject({ status: 200, body: { result: first.body.result } });
+    await closing;
+    const reopened = new Store(database); cleanups.push(() => reopened.close());
+    expect(reopened.getAttempts(identity)).toHaveLength(attemptCount);
+  });
   it('replays a pre-review-version action, but never creates a new action without the review version', async () => {
     const actionId = randomUUID(); let stateVersion = 0;
     const { app, identity, store } = await serve({ before: service => {

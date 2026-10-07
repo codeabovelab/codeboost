@@ -297,9 +297,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       (((action === 'start' || action === 'resume') && !!executor) ||
         (action === 'approve-continuation' && !!executor) || (action === 'publish' && !!publishing));
     if (trustGated) {
-      if (stopping || runner?.closing) throw new ShuttingDownError();
       const replay = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request });
       if (replay) return replay.response;
+      if (stopping || runner?.closing) throw new ShuttingDownError();
       try { access = await readIssueAccess(signal); }
       catch (error) {
         if (stopping || runner?.closing || signal.aborted) throw new ShuttingDownError();
