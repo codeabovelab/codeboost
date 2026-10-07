@@ -895,7 +895,12 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         env: dockerEnvironment(), stdio: ['ignore', 'pipe', 'pipe'], detached: options.processLifecycle !== undefined,
       });
       if (options.processLifecycle) startOwnedAttachClient({ lifecycle: options.processLifecycle,
-        stopped: () => stopReason !== undefined, spawn: spawnAttach,
+        stopped: () => {
+          // Lifecycle hooks are synchronous and can keep the deadline timer from running. Recheck the monotonic
+          // deadline at the spawn boundary so an overdue invocation cannot create an attach client afterward.
+          if (!stopReason && performance.now() >= deadline) stop('timeout');
+          return stopReason !== undefined;
+        }, spawn: spawnAttach,
         attach: (started, owner, group) => attach(started, owner, group), terminate,
         recordFailure: error => {
           failureDetail ??= `Could not record Docker client ownership: ${error instanceof Error ? error.message : String(error)}`;

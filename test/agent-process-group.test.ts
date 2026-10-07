@@ -98,6 +98,22 @@ describe('runInProcessGroup', () => {
     expect(owner).toBeNull();
   });
 
+  it('does not spawn after the durable starting write exhausts the original deadline', async () => {
+    let spawned = false, settled: ProcessGroupOwner | undefined;
+    const outcome = await runTrackedProcess('sh', ['-c', 'exit 0'], { env, timeoutMs: 10,
+      lifecycle: {
+        starting: () => { const until = performance.now() + 20; while (performance.now() < until); },
+        started: () => { throw new Error('a process must not start after its deadline'); },
+        settled: owner => { settled = owner; },
+        unsettled: () => { throw new Error('an unstarted process cannot remain unsettled'); },
+      },
+      onProcessGroup: () => { spawned = true; },
+    });
+    expect((outcome.error as NodeJS.ErrnoException).code).toBe('ETIMEDOUT');
+    expect(spawned).toBe(false);
+    expect(settled).toBe('spawning');
+  });
+
   it('reports the group in the same turn as the spawn, and returns a normal exit', async () => {
     let reported: ProcessGroup | undefined;
     const pending = runInProcessGroup('sh', ['-c', 'echo out; echo err >&2; exit 3'],

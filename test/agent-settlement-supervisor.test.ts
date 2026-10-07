@@ -158,6 +158,23 @@ describe('startProfileInvocation bounded cleanup', () => {
     expect(state.spawned).toBe(0);
   });
 
+  it('does not spawn an attach client after its durable starting hook exhausts the deadline', async () => {
+    state.disposeOk = true;
+    const settledOwners: unknown[] = [];
+    const handle = startProfileInvocation(fakeProfile('attach-start-deadline'), { timeoutMs: 5_000,
+      processLifecycle: {
+        starting: () => { vi.advanceTimersByTime(5_001); },
+        started: () => { throw new Error('an attach client must not start after its deadline'); },
+        settled: owner => { settledOwners.push(owner); },
+        unsettled: () => { throw new Error('an unstarted attach client cannot remain unsettled'); },
+      } });
+    const box = watch(handle.settled);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(box.result?.stopReason).toBe('timeout');
+    expect(state.spawned).toBe(0);
+    expect(settledOwners).toContain('spawning');
+  });
+
   it('forwards a cancel made during adapter setup to the supervisor it hands off to', async () => {
     state.disposeOk = true;
     const profile = fakeProfile('handoff-cancel');
