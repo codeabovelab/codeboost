@@ -36,10 +36,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   commandWaitsForDeadline?: boolean;
+  commandWaitsForCancellation?: boolean;
   releaseFails?: boolean;
   unsettledRebase?: boolean;
   operationTimeoutMs?: number;
   authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
+  reserves?: { processMs?: number; commandMs?: number };
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -111,6 +113,15 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       });
       return { attemptId: input.attemptId, settled, cancel() {} } satisfies InvocationHandle;
     }
+    if (options.commandWaitsForCancellation) {
+      let settle!: (result: InvocationResult) => void;
+      const settled = new Promise<InvocationResult>(resolve => { settle = resolve; });
+      return { attemptId: input.attemptId, settled, cancel(reason) {
+        cancelReasons.push(reason);
+        settle({ attemptId: input.attemptId, context: input.context, exitCode: null,
+          signal: 'SIGTERM', stopReason: reason, stdout: '', stderr: '' });
+      } } satisfies InvocationHandle;
+    }
     return { attemptId: input.attemptId,
       settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: commandExit ?? 0,
         signal: null, stdout: '', stderr: commandExit ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
@@ -126,7 +137,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       remoteReads++;
       if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator);
       return remotePair;
-    }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize);
+    }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize, options.reserves);
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
@@ -298,6 +309,16 @@ it('preserves shutdown as the reason that stops an active command check', async 
   await fixture.runner.close();
 });
 
+it('stops an active command check when the operation-wide deadline expires', async () => {
+  const fixture = await rebaseFixture('feature\n', 0,
+    { commandWaitsForCancellation: true, operationTimeoutMs: 3_000, reserves: { processMs: 1_000, commandMs: 200 } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
+  const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
+  expect(check).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
+  expect(fixture.cancelReasons).toEqual(['cancelled']);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('refreshes the moved head against its prior base when the PR base and head advance together', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
@@ -420,6 +441,56 @@ it('applies one operation-wide deadline to remote work and later checks', async 
       fetch: async () => undefined }, 20);
   await expect(coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
     snapshotId: view.snapshot.id })).resolves.toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
+  await coordinator.close();
+});
+
+it('aborts remote work early enough to reserve bounded subprocess settlement', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-remote-settlement-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load(), task = service.store.getTask(config.identity);
+  let abortedAt = -1;
+  const processReserve = 1_000, operationTimeout = 2_000;
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => {
+      abortedAt = performance.now();
+      setTimeout(() => reject(signal.reason), processReserve);
+    }, { once: true })), fetch: async () => undefined }, operationTimeout, undefined, undefined,
+    { processMs: processReserve });
+  const startedAt = performance.now();
+  const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id });
+  expect(result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
+  expect(abortedAt - startedAt).toBeLessThanOrEqual(operationTimeout - processReserve + 500);
+  expect(performance.now() - startedAt).toBeLessThanOrEqual(operationTimeout + 500);
+  await coordinator.close();
+});
+
+it('makes a preparation action resendable when its terminal storage write fails', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-settlement-failure-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
+  const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
+  service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const original = service.store.settlePreMergeAction.bind(service.store);
+  vi.spyOn(service.store, 'settlePreMergeAction').mockImplementationOnce(() => {
+    throw Object.assign(new Error('transient storage failure'), { code: 'ERR_SQLITE_ERROR' });
+  }).mockImplementation(original);
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => ({ base: view.snapshot.base, head: view.snapshot.head }), fetch: async () => undefined });
+  const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id, actionId });
+  expect(result).toMatchObject({ state: 'failed', reason: 'transient storage failure' });
+  expect(service.store.savedAction(config.identity, { actionId, kind: 'prepare-merge', request })).toBeUndefined();
+  const replay = service.store.userAction(config.identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  expect(replay).toMatchObject({ replayed: false, response: { outcome: 'preparing' } });
   await coordinator.close();
 });
 

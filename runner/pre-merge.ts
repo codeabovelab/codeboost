@@ -1,4 +1,5 @@
 import { readHistory } from '../git/history.ts';
+import { DEFAULT_PROCESS_SETTLEMENT_MS } from '../agents/process-group.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
@@ -20,6 +21,8 @@ type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
 // D may spend 30 s on its first cleanup and 60 s retrying it; F may then spend 30 s releasing task storage. Keep all
 // of that ownership settlement inside the preparation's one overall deadline.
 export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
+/** Git and GitHub subprocesses abort before the advertised operation deadline, leaving their bounded stop/drain time. */
+export const PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS;
 
 /** Production preparation before F6: refresh, rebase, re-review, then exact-head command checks. */
 export class PreMergeCoordinator {
@@ -28,6 +31,8 @@ export class PreMergeCoordinator {
   readonly rebaser: GitRebaser;
   readonly remote: PreMergeRemote;
   readonly operationTimeoutMs: number;
+  readonly processSettlementReserveMs: number;
+  readonly commandSettlementReserveMs: number;
   readonly authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
   readonly settle: <T>(fn: () => T) => T;
   #active: Promise<PreMergeResult> | null = null;
@@ -38,11 +43,17 @@ export class PreMergeCoordinator {
 
   constructor(service: ReviewService, runner: RunnerCoordinator, rebaser: GitRebaser, remote: PreMergeRemote,
     operationTimeoutMs = 10 * 60_000, capability?: ShutdownCapability,
-    authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>) {
+    authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>,
+    reserves: { processMs?: number; commandMs?: number } = {}) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 60 * 60_000)
       throw new Error('Invalid pre-merge operation deadline.');
     this.service = service; this.runner = runner; this.rebaser = rebaser; this.remote = remote;
     this.operationTimeoutMs = operationTimeoutMs; this.authorize = authorize;
+    this.processSettlementReserveMs = reserves.processMs ?? PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS;
+    this.commandSettlementReserveMs = reserves.commandMs ?? COMMAND_CHECK_SETTLEMENT_RESERVE_MS;
+    if (!Number.isSafeInteger(this.processSettlementReserveMs) || this.processSettlementReserveMs < 0
+      || !Number.isSafeInteger(this.commandSettlementReserveMs) || this.commandSettlementReserveMs < 0)
+      throw new Error('Invalid pre-merge settlement reserve.');
     this.settle = settleWith(capability);
   }
 
@@ -67,7 +78,7 @@ export class PreMergeCoordinator {
     const controller = new AbortController(); this.#abort = controller;
     const deadline = performance.now() + this.operationTimeoutMs;
     const timer = setTimeout(() => controller.abort(Object.assign(new Error('Pre-merge preparation deadline exceeded.'),
-      { code: 'ETIMEDOUT' })), this.operationTimeoutMs);
+      { code: 'ETIMEDOUT' })), Math.max(0, this.operationTimeoutMs - this.processSettlementReserveMs));
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
     let readiness: PreMergeReadiness | null = null;
@@ -96,6 +107,10 @@ export class PreMergeCoordinator {
         if (effective !== result) result = remember(effective);
       }
       catch (error) {
+        // No terminal response or readiness was committed. Remove only this action's pending placeholder, so the same
+        // key can start the preparation again instead of replaying work that no longer exists.
+        try { this.settle(() => this.service.store.abandonPreMergeAction(this.service.config.identity, expected.actionId!)); }
+        catch { /* The original storage failure remains the result; startup recovery handles a placeholder we could not remove. */ }
         const failed: PreMergeResult = { ...result, state: 'failed',
           reason: error instanceof Error ? error.message : String(error) };
         return remember(failed);
@@ -176,7 +191,7 @@ export class PreMergeCoordinator {
       return value;
     };
     const commandBudget = () => {
-      const value = Math.ceil(deadline - performance.now() - COMMAND_CHECK_SETTLEMENT_RESERVE_MS);
+      const value = Math.ceil(deadline - performance.now() - this.commandSettlementReserveMs);
       if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded before command-check settlement could be reserved.'),
         { code: 'ETIMEDOUT' });
       return value;
@@ -253,8 +268,9 @@ export class PreMergeCoordinator {
       const stop = () => {
         // The invocation owns the same deadline and reports its own timeout. `time-limit` is reserved for the
         // code-writing task budget: recording it here would incorrectly move an in-review task to needs human.
-        if ((signal.reason as { code?: unknown } | undefined)?.code !== 'ETIMEDOUT')
-          this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown' : 'cancelled');
+        // The check's own deadline remains distinct from the code-writing budget, but an outer timeout still owns and
+        // must stop this attempt. Settlement then consumes the reserve kept inside the operation-wide deadline.
+        this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown' : 'cancelled');
       };
       signal.addEventListener('abort', stop, { once: true });
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }

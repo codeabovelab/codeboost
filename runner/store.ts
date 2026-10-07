@@ -1930,6 +1930,16 @@ export class Store {
       return effective;
     });
   }
+  /**
+   * A background preparation whose terminal write failed applied no durable readiness. Remove only its still-pending
+   * placeholder so the same idempotency key can safely be resent; a terminal outcome is never made resendable.
+   */
+  abandonPreMergeAction(identity: PlanIdentity, actionId: string): boolean {
+    assertUuidV4(actionId, 'Action ID');
+    return this.#run(`DELETE FROM user_actions WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+      identityKey(identity), actionId).changes === 1;
+  }
   /** The latest preparation action is authoritative and must match every current local generation and the exact pair. */
   preMergeReady(identity: PlanIdentity, readiness: PreMergeReadiness): boolean {
     const row = this.#get("SELECT response FROM user_actions WHERE plan_key=? AND kind='prepare-merge' ORDER BY rowid DESC LIMIT 1",
