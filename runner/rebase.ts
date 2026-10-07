@@ -20,6 +20,8 @@ export interface RebaseMapping { oldSha: string; newSha: string }
 export interface RebaseConflictInput {
   readonly attemptId: string;
   readonly commit: string;
+  /** Trusted ledger owner for an owned commit, or null for a foreign/unowned commit. */
+  readonly owner: string | null;
   /** The pinned HEAD whose tree the resolver snapshot is based on. */
   readonly baseHead: string;
   readonly files: readonly string[];
@@ -47,7 +49,9 @@ export interface GitRebaserOptions {
   onResultPrepared: (attemptId: string, intendedHead: string | null, rewrittenHistory: readonly string[],
     resolvedConflicts: readonly string[]) => void;
   onResultState: (attemptId: string, state: 'uncertain' | 'refused' | 'ready') => void;
-  /** F4's sandboxed resolver. It must settle all owned resources before resolving or rejecting. */
+  /** F4's sandboxed resolver for owned and foreign conflicts. It must settle all resources before returning. */
+  resolveConflict?: (input: RebaseConflictInput) => Promise<void>;
+  /** Compatibility name used by the existing F4 production assembly. */
   resolveForeignConflict?: (input: RebaseConflictInput) => Promise<void>;
 }
 interface CallScope { attemptId: string; signal?: AbortSignal; deadline: number; workDeadline: number }
@@ -166,10 +170,9 @@ export class GitRebaser {
         if (!old.includes(commit)) throw new RebaseConflict('The conflicted commit is outside the captured rebase history.');
         const entry = ledger.get(commit);
         // Missing ledger entries and explicit foreign entries share the foreign branch. A forged trailer is never read.
-        if (entry && (entry.origin !== 'foreign' || entry.owner !== null))
-          throw new RebaseConflict('An owned commit conflict needs its plan-item resolver.');
-        if (!this.#options.resolveForeignConflict)
-          throw new RebaseConflict('A foreign commit conflict needs review.');
+        const owner = entry?.origin === 'owned' ? entry.owner : null;
+        if (!this.#conflictResolver())
+          throw new RebaseConflict(`${owner === null ? 'A foreign' : 'An owned'} commit conflict needs review.`);
         const files = Object.freeze(await this.#paths(path, 'conflicts', scope));
         if (!files.length) throw new RebaseConflict('Git reported a conflict without any conflicted files.');
         if (await this.#hasUnmergedGitlink(path, scope))
@@ -180,7 +183,7 @@ export class GitRebaser {
         const outsideBefore = await this.#outsideConflictState(path, allowed, priorHead, scope);
         const operationBefore = await this.#rebaseState(path, scope);
         this.#assertResultCurrent(scope);
-        await this.#resolveConflict({ attemptId, commit, baseHead: priorHead, files, repository: path,
+        await this.#resolveConflict({ attemptId, commit, owner, baseHead: priorHead, files, repository: path,
           deadline: Date.now() + Math.max(0, Math.floor(scope.workDeadline - performance.now())) }, scope);
         this.#assertResultCurrent(scope);
         if (await this.#git(path, ['rev-parse', '--verify', 'REBASE_HEAD^{commit}'], scope) !== commit)
@@ -203,7 +206,9 @@ export class GitRebaser {
           if (unresolved.status === 1) throw new RebaseConflict('The conflict resolver left unresolved files.');
           throw this.#failure('diff', unresolved);
         }
-        resolvedConflicts.push(commit);
+        // Only foreign resolutions receive the visible agent-resolution provenance. Owned commits retain their
+        // plan-item owner; the rewritten mapping lets review recompute whether that item's approval became stale.
+        if (owner === null) resolvedConflicts.push(commit);
         outcome = await this.#call(path, ['rebase', '--continue'], scope, false, true);
       }
       const head = await this.#git(path, ['rev-parse', '--verify', 'HEAD^{commit}'], scope);
@@ -411,7 +416,7 @@ export class GitRebaser {
   }
 
   async #resolveConflict(input: Omit<RebaseConflictInput, 'signal'>, scope: CallScope): Promise<void> {
-    const resolveConflict = this.#options.resolveForeignConflict!;
+    const resolveConflict = this.#conflictResolver()!;
     const controller = new AbortController();
     const abort = () => controller.abort(scope.signal?.reason ?? new Error('The rebase was cancelled.'));
     if (scope.signal?.aborted) abort();
@@ -442,6 +447,10 @@ export class GitRebaser {
       if (timer) clearTimeout(timer);
       scope.signal?.removeEventListener('abort', abort);
     }
+  }
+
+  #conflictResolver(): ((input: RebaseConflictInput) => Promise<void>) | undefined {
+    return this.#options.resolveConflict ?? this.#options.resolveForeignConflict;
   }
 
   async #git(repository: string, args: readonly string[], scope: CallScope, cleanup = false, input?: Buffer): Promise<string> {

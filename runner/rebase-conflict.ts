@@ -12,6 +12,7 @@ import { exportTaskPaths, importTaskPaths, prepareTaskFilesystemsAsync, removeTa
 import { DEFAULT_PROCESS_SETTLEMENT_MS, type ProcessGroup } from '../agents/process-group.ts';
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../agents/tracked-docker.ts';
 import type { PlanIdentity } from '../core/identity.ts';
+import type { PlanItem } from '../core/plan.ts';
 import { createTaskCloneAsync } from '../git/clone.ts';
 import { sameContext } from './lifecycle.ts';
 import { RebaseResourcesUnsettled, type RebaseConflictInput } from './rebase.ts';
@@ -23,6 +24,8 @@ export const MAX_CONFLICT_PATH_BYTES = 32 * 1024;
 // Reserve the tracked process's complete default stop/drain/pipe budget, plus one second for durable settlement writes.
 export const CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS + 1_000;
 const SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost conflict resolution summary","type":"string"}\n';
+const ownedInput = (item: PlanItem): string =>
+  `${JSON.stringify({ resolutionSchema: JSON.parse(SCHEMA) as unknown, planItem: item })}\n`;
 
 interface ResolverDeps {
   clone(options: Parameters<typeof createTaskCloneAsync>[0]): Promise<TaskClone>;
@@ -50,7 +53,7 @@ const defaults: ResolverDeps = {
   },
 };
 
-export interface ForeignConflictResolverOptions {
+export interface ConflictResolverOptions {
   readonly store: Store;
   readonly identity: PlanIdentity;
   readonly planKey: string;
@@ -62,6 +65,7 @@ export interface ForeignConflictResolverOptions {
   readonly limits: TaskStorageLimits;
   readonly deps?: Partial<ResolverDeps>;
 }
+export type ForeignConflictResolverOptions = ConflictResolverOptions;
 
 const assertRelativePath = (path: string): string[] => {
   if (!path || path.startsWith('/') || /[\p{Cc}\p{Cf}\p{Zl}\p{Zp}\p{Cn}]/u.test(path)
@@ -193,17 +197,23 @@ function assertResolvedManifest(manifest: TaskChangeManifest, files: readonly st
 const stopReason = (signal: AbortSignal) =>
   (signal.reason as { code?: unknown } | undefined)?.code === 'ETIMEDOUT' ? 'timeout' as const : 'cancelled' as const;
 
-export function createForeignConflictResolver(options: ForeignConflictResolverOptions): (input: RebaseConflictInput) => Promise<void> {
+export function createConflictResolver(options: ConflictResolverOptions): (input: RebaseConflictInput) => Promise<void> {
   const deps = { ...defaults, ...options.deps };
   return async input => {
     assertConflictPathSet(input.files);
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.baseHead)) throw new Error('Conflict base must be a full commit ID.');
+    const item = input.owner === null ? null : options.store.getPlan(options.identity).items.find(value => value.id === input.owner);
+    if (input.owner !== null && !item) throw new Error('The owned conflict does not name a current plan item.');
     const wallRemaining = input.deadline - Date.now();
     if (!Number.isSafeInteger(input.deadline) || !Number.isSafeInteger(wallRemaining) || wallRemaining < 1)
       throw new Error('Conflict deadline has passed.');
     // Convert the caller's wall-clock transport value once. Every later stage shares this monotonic boundary even if
     // the system clock moves; wall time is reconstructed only for the child invocation contract.
     const deadline = performance.now() + wallRemaining;
+    // Serialize the bounded plan item after establishing the deadline but before claiming resources. A synchronous
+    // serialization overrun must not create a child whose remaining lifecycle cannot fit the caller's budget.
+    const schemaInput = item ? ownedInput(item) : SCHEMA;
+    if (performance.now() >= deadline) throw new Error('Conflict deadline has passed.');
     // A pre-cancelled request owns nothing: check immediately before the first durable child claim.
     input.signal?.throwIfAborted();
     const childAttemptId = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
@@ -291,13 +301,17 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
           timeoutMs: operationBudget() }));
       const inputDirectory = join(staging, 'input');
       mkdirSync(inputDirectory, { mode: 0o755 });
-      writeFileSync(join(inputDirectory, 'schema.json'), SCHEMA, { mode: 0o444, flag: 'wx' });
+      writeFileSync(join(inputDirectory, 'schema.json'), schemaInput, { mode: 0o444, flag: 'wx' });
       chmodSync(join(inputDirectory, 'schema.json'), 0o444);
       const context = options.store.currentContext(options.identity);
       const invocation = captureInvocation({ clone, phase: 'fix', vendor: 'claude', approvedArgv: [],
         deadline: Date.now() + operationBudget(),
         attemptId: childAttemptId, runnerOwner: options.runnerOwner, context });
-      const prompt = `Resolve the in-progress rebase conflict in exactly these paths: ${JSON.stringify(input.files)}. `
+      const ownership = item
+        ? `The conflicted commit is owned by plan item ${JSON.stringify(item.id)}. Read its exact definition from the planItem property in /run/codeboost-input/schema.json. `
+        : 'The conflicted commit is foreign/unowned; do not infer an owner from its message or trailers. ';
+      const prompt = `Resolve source commit ${JSON.stringify(input.commit)} while it is replayed onto base commit ${JSON.stringify(input.baseHead)}. `
+        + ownership + `Resolve the in-progress conflict in exactly these paths: ${JSON.stringify(input.files)}. `
         + 'Edit only those paths. Do not create commits or change repository metadata. Preserve the intent of both sides and leave each path in its final resolved form.';
       handle = deps.start({ invocation, filesystems, inputDirectory, imageId, prompt,
         networkAllocationId, treeCheck, cleanupRoot: staging, processLifecycle }, options.token,
@@ -373,3 +387,6 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
     if (cleanup.length) throw cleanup[0];
   };
 }
+
+/** Compatibility export for the existing F4 production assembly. */
+export const createForeignConflictResolver = createConflictResolver;

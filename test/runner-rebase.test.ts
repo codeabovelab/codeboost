@@ -39,7 +39,8 @@ async function setup(conflict: boolean | 'foreign' = false, conflictPath = 'a.tx
   }
   const base = commit(source, conflictPath, 'base\n', 'base');
   git(source, 'switch', '-qc', 'feature');
-  const owned = commit(source, conflict === 'foreign' ? 'owned.txt' : conflictPath, 'feature\n', 'owned');
+  const owned = commit(source, conflict === 'foreign' ? 'owned.txt' : conflictPath, 'feature\n',
+    'owned\n\nPlan-Item: P1\nPlan-Revision: r1');
   if (conflict === 'foreign') { git(source, 'config', 'user.name', 'Collaborator'); git(source, 'config', 'user.email', 'collaborator@example.invalid'); }
   const foreign = commit(source, conflict === 'foreign' ? conflictPath : 'feature.txt', 'collaborator\n',
     conflict === 'foreign' ? 'foreign\n\nPlan-Item: P1' : 'foreign');
@@ -374,12 +375,12 @@ describe('trusted pre-merge rebase', () => {
     const s = await setup('foreign'), attemptId = randomUUID();
     const seen: unknown[] = [];
     const runner = createRebaser(s, { resolveForeignConflict: async input => {
-      seen.push({ commit: input.commit, files: input.files });
+      seen.push({ commit: input.commit, owner: input.owner, files: input.files });
       writeFileSync(join(input.repository, 'a.txt'), 'resolved foreign change\n');
     } });
     const result = await runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
       ledger: [{ sha: s.owned, owner: 'P1', origin: 'owned' }] });
-    expect(seen).toEqual([{ commit: s.foreign, files: ['a.txt'] }]);
+    expect(seen).toEqual([{ commit: s.foreign, owner: null, files: ['a.txt'] }]);
     expect(result.resolvedConflicts).toEqual([s.foreign]);
     const rewritten = result.mappings.find(entry => entry.oldSha === s.foreign)!.newSha;
     expect(git(s.repository.path, 'show', '-s', '--format=%an <%ae>', rewritten)).toBe('Collaborator <collaborator@example.invalid>');
@@ -660,13 +661,22 @@ describe('trusted pre-merge rebase', () => {
     expect(existsSync(join(s.runnerRoot, OWNER, 'rebases', attemptId))).toBe(true);
   });
 
-  it('never sends an owned conflict through the foreign resolver', async () => {
-    const s = await setup(true), attemptId = randomUUID(), resolveForeignConflict = vi.fn(async () => {});
-    const runner = createRebaser(s, { resolveForeignConflict });
-    await expect(runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
-      ledger: [{ sha: s.owned, owner: 'P1', origin: 'owned' }, { sha: s.foreign, owner: null, origin: 'foreign' }] }))
-      .rejects.toThrow(/owned commit conflict/);
-    expect(resolveForeignConflict).not.toHaveBeenCalled();
+  it('routes an owned conflict through the sandbox while preserving its owned provenance', async () => {
+    const s = await setup(true), attemptId = randomUUID(), seen: unknown[] = [];
+    const resolveConflict = vi.fn(async input => {
+      seen.push({ commit: input.commit, owner: input.owner, files: input.files });
+      writeFileSync(join(input.repository, 'a.txt'), 'resolved owned change\n');
+    });
+    const runner = createRebaser(s, { resolveConflict });
+    const result = await runner.run({ attemptId, oldBase: s.base, oldHead: s.foreign, oldHistory: s.history, onto: s.onto,
+      ledger: [{ sha: s.owned, owner: 'P1', origin: 'owned' }, { sha: s.foreign, owner: null, origin: 'foreign' }] });
+    expect(seen).toEqual([{ commit: s.owned, owner: 'P1', files: ['a.txt'] }]);
+    expect(result.resolvedConflicts).toEqual([]);
+    expect(git(s.repository.path, 'show', `${result.head}:a.txt`)).toBe('resolved owned change');
+    const rewritten = result.mappings.find(entry => entry.oldSha === s.owned)!.newSha;
+    expect(rewritten).not.toBe(s.owned);
+    expect(git(s.repository.path, 'show', '-s', '--format=%an <%ae>', rewritten)).toBe('Source <source@example.invalid>');
+    expect(git(s.repository.path, 'show', '-s', '--format=%B', rewritten)).toContain('Plan-Item: P1\nPlan-Revision: r1');
   });
 
   it('refuses an inconsistent trusted ledger before creating a rebase workspace', async () => {
