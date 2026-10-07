@@ -45,6 +45,7 @@ type ProcessOptions = { processLifecycle?: ProcessGroupLifecycle; timeoutMs?: nu
 function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {}) {
   const events: string[] = [];
   let request: AgentAdapterRequest | undefined;
+  let schemaInput: string | undefined;
   let storageAllocationId: string | undefined;
   let imported: readonly ExportedTaskPath[] | undefined;
   const storage = { keeper: 'keeper' } as TaskFilesystems;
@@ -83,6 +84,7 @@ function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {})
     },
     start: (value: typeof request) => {
       request = value; events.push('start');
+      schemaInput = readFileSync(join(value!.inputDirectory, 'schema.json'), 'utf8').trim();
       return { attemptId: value!.invocation.attemptId, cancel: vi.fn(), settled: Promise.resolve({
         attemptId: value!.invocation.attemptId, context: value!.invocation.context, exitCode: 0, signal: null, stdout: '', stderr: '',
       } satisfies InvocationResult) } satisfies InvocationHandle;
@@ -94,13 +96,13 @@ function deps(f: ReturnType<typeof fixture>, over: Record<string, unknown> = {})
     ...over,
   };
   return { d, events, storage, get request() { return request; }, get storageAllocationId() { return storageAllocationId; },
-    get imported() { return imported; } };
+    get imported() { return imported; }, get schemaInput() { return schemaInput; } };
 }
 
 const input = (f: ReturnType<typeof fixture>, signal?: AbortSignal): RebaseConflictInput => ({ attemptId: f.marker.attemptId,
-  commit: oid(2), baseHead: oid(2), files: ['conflict.txt'], repository: f.repository, deadline: Date.now() + 60_000, signal });
+  commit: oid(2), owner: null, baseHead: oid(2), files: ['conflict.txt'], repository: f.repository, deadline: Date.now() + 60_000, signal });
 
-describe('production foreign conflict resolver', () => {
+describe('production rebase conflict resolver', () => {
   it('reserves the complete default tracked-process settlement budget plus its durable-write margin', () => {
     expect(CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS).toBe(DEFAULT_PROCESS_SETTLEMENT_MS + 1_000);
     expect(DEFAULT_PROCESS_SETTLEMENT_MS).toBe(16_000);
@@ -221,6 +223,30 @@ describe('production foreign conflict resolver', () => {
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null });
   });
 
+  it('rejects an unknown owned item before claiming child resources', async () => {
+    const f = fixture(), x = deps(f);
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve({ ...input(f), owner: 'P2' })).rejects.toThrow(/current plan item/);
+    expect(x.events).toEqual([]);
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('does not claim resources when owned-item serialization consumes the deadline', async () => {
+    const f = fixture(), x = deps(f), realNow = performance.now.bind(performance);
+    let reads = 0;
+    vi.spyOn(performance, 'now').mockImplementation(() => ++reads === 1 ? realNow() : Number.MAX_SAFE_INTEGER);
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve({ ...input(f), owner: 'P1' })).rejects.toThrow(/deadline has passed/);
+    expect(x.events).toEqual([]);
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
   it('allocates from the clean clone before importing the conflict snapshot, then copies back only the audited path', async () => {
     const f = fixture(), x = deps(f);
     const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
@@ -233,6 +259,62 @@ describe('production foreign conflict resolver', () => {
       prompt: expect.stringContaining('["conflict.txt"]'), cleanupRoot: expect.stringContaining('.codeboost-conflict-') });
     expect(x.request!.networkAllocationId).not.toBe(x.storageAllocationId);
     expect(readFileSync(join(f.repository, 'conflict.txt'), 'utf8')).toBe('resolved\n');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('gives an owned conflict child the exact plan item and rebase commit identities', async () => {
+    const f = fixture(), x = deps(f);
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await resolve({ ...input(f), owner: 'P1', baseHead: oid(9) });
+    expect(JSON.parse(x.schemaInput!).planItem).toEqual(plan.items[0]);
+    expect(x.request?.prompt).toContain('/run/codeboost-input/schema.json');
+    expect(x.request?.prompt).toContain(oid(2));
+    expect(x.request?.prompt).toContain(oid(9));
+  });
+
+  it('does not launch an owned conflict child after its captured plan revision changes', async () => {
+    const f = fixture(), x = deps(f), cloneEntered = Promise.withResolvers<void>(), releaseClone = Promise.withResolvers<void>();
+    const clone = x.d.clone;
+    x.d.clone = async (...args: Parameters<typeof clone>) => {
+      const result = await clone(...args);
+      cloneEntered.resolve();
+      await releaseClone.promise;
+      return result;
+    };
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    const running = resolve({ ...input(f), owner: 'P1' });
+    await cloneEntered.promise;
+    f.store.importRevision(JSON.stringify({ ...plan, items: [{ ...plan.items[0]!, title: 'Changed' }] }), 'json', context, 1);
+    releaseClone.resolve();
+    await expect(running).rejects.toThrow(/context changed/);
+    expect(x.events).not.toContain('start');
+    expect(readFileSync(join(f.repository, 'conflict.txt'), 'utf8')).toBe('conflicted\n');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('does not apply owned conflict output after its captured plan revision changes', async () => {
+    const f = fixture(), inspectEntered = Promise.withResolvers<void>(), releaseInspect = Promise.withResolvers<void>();
+    const x = deps(f, { inspect: async () => {
+      inspectEntered.resolve();
+      await releaseInspect.promise;
+      return manifest();
+    } });
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    const running = resolve({ ...input(f), owner: 'P1' });
+    await inspectEntered.promise;
+    f.store.importRevision(JSON.stringify({ ...plan, items: [{ ...plan.items[0]!, title: 'Changed' }] }), 'json', context, 1);
+    releaseInspect.resolve();
+    await expect(running).rejects.toThrow(/context changed/);
+    expect(readFileSync(join(f.repository, 'conflict.txt'), 'utf8')).toBe('conflicted\n');
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
   });
 
