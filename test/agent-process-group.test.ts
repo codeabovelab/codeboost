@@ -245,6 +245,32 @@ describe('runInProcessGroup', () => {
     }
   }, 30_000);
 
+  it('does not release an untracked caller while a process outside the group holds its output pipe', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'escaped-untracked-')), pidFile = join(dir, 'pid');
+    const escape = `const c = require('node:child_process').spawn('sleep', ['60'], { detached: true, `
+      + `stdio: ['ignore', 'inherit', 'inherit'] }); require('node:fs').writeFileSync(${JSON.stringify(pidFile)}, `
+      + `String(c.pid)); c.unref(); console.log('leader done');`;
+    let settled = false;
+    try {
+      const pending = runInProcessGroup(process.execPath, ['-e', escape], { env, timeoutMs: 30_000 });
+      void pending.then(() => { settled = true; });
+      const until = performance.now() + 5_000;
+      while (!readFileSync(pidFile, { encoding: 'utf8', flag: 'a+' }).trim()) {
+        if (performance.now() >= until) throw new Error('escaped pipe holder did not start');
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+      await new Promise(resolve => setTimeout(resolve, 1_100));
+      expect(settled).toBe(false);
+      process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL');
+      const outcome = await pending;
+      expect(outcome).toMatchObject({ status: 0, stdout: 'leader done\n' });
+      expect(outcome.error).toBeUndefined();
+    } finally {
+      try { process.kill(Number(readFileSync(pidFile, 'utf8')), 'SIGKILL'); } catch { /* already gone */ }
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 10_000);
+
   it('counts time spent recording the group against the deadline', async () => {
     const began = performance.now();
     const outcome = await runInProcessGroup('sleep', ['60'], { env, timeoutMs: 1_000, graceMs: 100,
