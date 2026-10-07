@@ -9,7 +9,7 @@ import { checkConflictTree, inspectTaskChanges, MAXIMUM_DECLARED_LINKS, MAXIMUM_
   type TaskChangeManifest, type TaskTreeCheck } from '../agents/container/changes.ts';
 import { exportTaskPaths, prepareTaskFilesystemsAsync, removeTaskFilesystemsAsync,
   type ExportedTaskPath, type PreparationOptions, type TaskFilesystems, type TaskStorageLimits } from '../agents/container/storage.ts';
-import type { ProcessGroup } from '../agents/process-group.ts';
+import { DEFAULT_PROCESS_SETTLEMENT_MS, type ProcessGroup } from '../agents/process-group.ts';
 import { runTrackedProcess, type ProcessGroupLifecycle } from '../agents/tracked-docker.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import { createTaskCloneAsync } from '../git/clone.ts';
@@ -20,8 +20,8 @@ import type { Store } from './store.ts';
 
 export const MAX_CONFLICT_SNAPSHOT_BYTES = 32 * 1024 * 1024;
 export const MAX_CONFLICT_PATH_BYTES = 32 * 1024;
-// A timed-out process may need 1 s of graceful termination, 10 s to drain descendants and 1 s to close held pipes.
-export const CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS = 13_000;
+// Reserve the tracked process's complete default stop/drain/pipe budget, plus one second for durable settlement writes.
+export const CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS + 1_000;
 const SCHEMA = '{"$schema":"https://json-schema.org/draft/2020-12/schema","title":"codeboost conflict resolution summary","type":"string"}\n';
 
 interface ResolverDeps {
@@ -193,6 +193,8 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
     assertConflictPathSet(input.files);
     if (!/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(input.baseHead)) throw new Error('Conflict base must be a full commit ID.');
     if (!Number.isSafeInteger(input.deadline) || input.deadline <= Date.now()) throw new Error('Conflict deadline has passed.');
+    // A pre-cancelled request owns nothing: check immediately before the first durable child claim.
+    input.signal?.throwIfAborted();
     const childAttemptId = randomUUID(), allocationId = randomUUID(), networkAllocationId = randomUUID();
     options.store.beginRebaseConflict(options.planKey, input.attemptId,
       { attemptId: childAttemptId, allocationId, networkAllocationId, source: input.commit });

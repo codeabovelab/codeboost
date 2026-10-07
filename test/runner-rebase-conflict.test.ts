@@ -8,6 +8,7 @@ import type { AgentAdapterRequest } from '../agents/adapters/types.ts';
 import type { TaskChangeManifest, TaskTreeCheck } from '../agents/container/changes.ts';
 import type { ExportedTaskPath, TaskFilesystems } from '../agents/container/storage.ts';
 import type { ProcessGroupLifecycle } from '../agents/tracked-docker.ts';
+import { DEFAULT_PROCESS_SETTLEMENT_MS } from '../agents/process-group.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
 import type { AsyncCloneOptions } from '../git/clone.ts';
 import { CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS, copyConflictPaths, createForeignConflictResolver,
@@ -94,6 +95,22 @@ const input = (f: ReturnType<typeof fixture>, signal?: AbortSignal): RebaseConfl
   commit: oid(2), baseHead: oid(2), files: ['conflict.txt'], repository: f.repository, deadline: Date.now() + 60_000, signal });
 
 describe('production foreign conflict resolver', () => {
+  it('reserves the complete default tracked-process settlement budget plus its durable-write margin', () => {
+    expect(CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS).toBe(DEFAULT_PROCESS_SETTLEMENT_MS + 1_000);
+    expect(DEFAULT_PROCESS_SETTLEMENT_MS).toBe(16_000);
+  });
+
+  it('does not claim a conflict child for an already-aborted request', async () => {
+    const f = fixture(), x = deps(f), reason = new Error('cancelled before conflict admission');
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: vi.fn(() => 'sha256:' + 'b'.repeat(64)), token: 'secret',
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve(input(f, AbortSignal.abort(reason)))).rejects.toBe(reason);
+    expect(x.events).toEqual([]);
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
   it('bounds the complete host snapshot before changing the destination', () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-conflict-copy-')); roots.push(root);
     const source = join(root, 'source'), destination = join(root, 'destination');

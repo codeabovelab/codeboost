@@ -60,6 +60,8 @@ const DRAIN_LIMIT_MS = 10_000;
 // Once the group is gone, how long to wait for stdout and stderr to reach end of file. Only a process outside the group
 // (one that called setsid but kept the inherited pipe) can hold them open after that, and it must not hold this call.
 const STDIO_CLOSE_MS = 1_000;
+/** Worst-case default SIGTERM grace plus post-exit group and pipe settlement. */
+export const DEFAULT_PROCESS_SETTLEMENT_MS = DEFAULT_GRACE_MS + DRAIN_LIMIT_MS + STDIO_CLOSE_MS;
 const pause = (ms: number) => new Promise<void>(resolve => setTimeout(resolve, ms));
 const notStarted = (message: string): DockerOutcome =>
   ({ status: null, stdout: '', stderr: '', error: Object.assign(new Error(message), { code: NOT_STARTED }) });

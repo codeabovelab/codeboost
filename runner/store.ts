@@ -811,6 +811,8 @@ export class Store {
       const task = this.#task(planKey), marker = task.rebase_in_progress === null ? null : decode<RebaseMarker>(task.rebase_in_progress);
       if (marker?.attemptId !== attemptId || marker.conflict?.attemptId !== conflictAttemptId)
         throw new GuardRefusal('This conflict child no longer owns the rebase.');
+      if (marker.processGroup !== null)
+        throw new GuardRefusal('The conflict child process has not settled.');
       if (this.#run('UPDATE tasks SET rebase_in_progress=? WHERE plan_key=? AND rebase_in_progress=?',
         encode({ ...marker, conflict: null }), planKey, task.rebase_in_progress as string).changes !== 1)
         throw new GuardRefusal('This conflict child no longer owns the rebase.');

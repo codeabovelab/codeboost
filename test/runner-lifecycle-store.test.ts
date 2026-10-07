@@ -588,6 +588,10 @@ describe('pre-merge rebase ownership', () => {
     expect(() => store.prepareRebaseResult(planKey, marker.attemptId, oid(4), [oid(4)], [oid(2)])).toThrow(/child has not settled/);
     expect(store.abortRebase(planKey, marker.attemptId)).toBe(false);
     expect(() => store.clearRebaseConflict(planKey, marker.attemptId, randomUUID())).toThrow(/no longer owns/);
+    store.setRebaseProcessGroup(planKey, marker.attemptId, null, 'spawning');
+    expect(() => store.clearRebaseConflict(planKey, marker.attemptId, child)).toThrow(/process has not settled/);
+    expect(store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: { attemptId: child }, processGroup: 'spawning' });
+    store.setRebaseProcessGroup(planKey, marker.attemptId, 'spawning', null);
     store.clearRebaseConflict(planKey, marker.attemptId, child);
     expect(store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null });
     expect(store.abortRebase(planKey, marker.attemptId)).toBe(true);
