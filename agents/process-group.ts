@@ -91,8 +91,9 @@ export const drainProcessGroup = (group: ProcessGroup): Promise<boolean> => drai
  * Run one command as the leader of a new process group. The group is reported through `onProcessGroup` before this
  * returns control to the event loop. On abort or at the deadline the whole group gets SIGTERM, then SIGKILL after the
  * grace period, so a child that ignores SIGTERM is still bounded. The promise settles only after the leader has
- * exited and every other member of its group is gone. Never rejects: failures are in the outcome, shaped like
- * `runDocker`'s, so `status` is a number only when the command ran to completion.
+ * exited and every other member of its group is gone, unless a caller with durable recovery ownership explicitly
+ * allows an unsettled return. Never rejects: failures are in the outcome, shaped like `runDocker`'s, so `status` is a
+ * number only when the command ran to completion.
  */
 export function runInProcessGroup(file: string, args: readonly string[],
   options: ProcessGroupOptions): Promise<DockerOutcome> {
