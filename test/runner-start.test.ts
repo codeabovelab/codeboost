@@ -37,7 +37,7 @@ async function serve(options: { kinds?: AttemptKind[]; approve?: boolean; before
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: options.kinds ?? ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
     const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: () => service.planContext(),
-      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+      issue: () => ({ text: { number: 1, title: '', body: '', comments: [] }, validate: () => undefined }), lessons: () => [], vendor: () => 'claude' };
     const findings = new SafetyFindings(service.store);
     options.findings?.(findings, service);
     return { deps, sources, findings, recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };

@@ -12,7 +12,7 @@ import { baseBranch } from '../github/validate.ts';
 import { identityKey } from '../core/identity.ts';
 import type { RunnerDeps } from './coordinator.ts';
 import { DEFAULT_DIAGNOSTICS_CAP_BYTES } from './diagnostics.ts';
-import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources } from './execution.ts';
+import { executionDeps, SafetyFindings, type AgentLauncher, type ExecutionSources, type GuardedIssueText } from './execution.ts';
 import { GuardRefusal, isUuidV4, quoteForTerminal, type ShutdownCapability } from './lifecycle.ts';
 import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport, type RunnerLock } from './recovery.ts';
 import { GitBranchPusher, pushUrl } from './branch-push.ts';
@@ -232,23 +232,25 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
    * measured on the monotonic clock, so a wall-clock step back cannot stretch it.
    */
   let lastRead: { access: IssueAccess; trustedAuthor: string | null | undefined; at: number; text: IssueText } | null = null;
-  const issueText = async (number: number, signal: AbortSignal): Promise<IssueText> => {
+  const issueText = async (number: number, signal: AbortSignal): Promise<GuardedIssueText> => {
     const access = await issues.issueAccess(number, { signal, timeoutMs: 30_000 });
     const trust = service.store.issueTrust(review.github!.repository, number);
     const explicitlyTrusted = trust?.revokedAt === null && trust.authorLogin === access.authorLogin;
     if (!access.collaborator && !explicitlyTrusted) throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
     const trustedAuthor = explicitlyTrusted ? access.authorLogin : undefined;
-    if (lastRead && lastRead.access.number === number && lastRead.access.authorLogin === access.authorLogin
-      && lastRead.access.collaborator === access.collaborator && lastRead.trustedAuthor === trustedAuthor
-      && performance.now() - lastRead.at < ISSUE_REUSE_MS) return lastRead.text;
-    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000, trustedAuthor, expectedAccess: access });
-    if (trustedAuthor !== undefined) {
+    const validate = () => {
+      if (trustedAuthor === undefined) return;
       const current = service.store.issueTrust(review.github!.repository, number);
       if (!current || current.revokedAt !== null || current.authorLogin !== trustedAuthor)
         throw new GuardRefusal(`Issue #${number} is not trusted for its current author.`);
-    }
+    };
+    if (lastRead && lastRead.access.number === number && lastRead.access.authorLogin === access.authorLogin
+      && lastRead.access.collaborator === access.collaborator && lastRead.trustedAuthor === trustedAuthor
+      && performance.now() - lastRead.at < ISSUE_REUSE_MS) return { text: lastRead.text, validate };
+    const at = performance.now(), text = await issues.issueText(number, { signal, timeoutMs: 30_000, trustedAuthor, expectedAccess: access });
+    validate();
     lastRead = { access, trustedAuthor, at, text };
-    return text;
+    return { text, validate };
   };
   const only = (requested: typeof identity) => {
     if (identityKey(requested) !== identityKey(identity)) throw new Error('This server runs only its configured plan.');

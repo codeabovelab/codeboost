@@ -55,13 +55,15 @@ export interface TaskWorkspace {
 }
 /** D's start call for an execute/fix phase with this prompt and the tree check made for it; returns at once (see #51). */
 export type AgentLauncher = (input: InvocationInput, prompt: string, workspace: WorkspaceRef, treeCheck: TaskTreeCheck) => InvocationHandle;
+/** Issue text plus the synchronous authorization check that must run in the same turn as prompt construction. */
+export interface GuardedIssueText { readonly text: IssueText; validate(): void }
 /** Trusted runner-side sources for a task. Issue text and lessons are untrusted data inside the prompt. */
 export interface ExecutionSources {
   planContext(identity: PlanIdentity): PlanContext;
   /** Entries of the audited runner commit, read from its immutable tree after export. */
   checkpointContext(identity: PlanIdentity, head: string): PlanContext;
-  /** The issue text the prompt carries; fetched per attempt, so it may await (and must stop on abort). */
-  issue(identity: PlanIdentity, signal: AbortSignal): IssueText | Promise<IssueText>;
+  /** Fetched per attempt; its guard is re-run synchronously at prompt construction after the await. */
+  issue(identity: PlanIdentity, signal: AbortSignal): GuardedIssueText | Promise<GuardedIssueText>;
   lessons(identity: PlanIdentity): readonly string[];
   vendor(identity: PlanIdentity): 'claude' | 'codex';
 }
@@ -171,8 +173,10 @@ export function executionDeps(store: Store, workspace: TaskWorkspace, launch: Ag
       const vendor = sources.vendor(identity);
       // D refuses Codex in phases it cannot work in (#93); refuse here too, before any GitHub call or task storage.
       if (vendor === 'codex') assertCodexPhase('execute');
-      const issue = await sources.issue(identity, signal);
+      const guardedIssue = await sources.issue(identity, signal);
       signal.throwIfAborted();
+      guardedIssue.validate();
+      const issue = guardedIssue.text;
       const request = prepareExecution({ identity, attemptId: attempt.id, mode: 'execute', plan, itemId: item.id,
         issue, approvedLessons: sources.lessons(identity), allowedCommands: context.allowedCommands });
       store.recordAttemptComments(identity, attempt.id, {

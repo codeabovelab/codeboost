@@ -35,17 +35,19 @@ export function productionPlanning(config: ReviewConfig, options: {
         const trust = service.store.issueTrust(github.repository, github.issue);
         const explicitlyTrusted = trust?.revokedAt === null && trust.authorLogin === access.authorLogin;
         if (!access.collaborator && !explicitlyTrusted) throw new GuardRefusal(`Issue #${github.issue} is not trusted for its current author.`);
-        const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS,
-          trustedAuthor: explicitlyTrusted ? access.authorLogin : undefined, expectedAccess: access });
-        if (explicitlyTrusted) {
+        const validate = () => {
+          if (!explicitlyTrusted) return;
           const current = service.store.issueTrust(github.repository, github.issue);
           if (!current || current.revokedAt !== null || current.authorLogin !== access.authorLogin)
             throw new GuardRefusal(`Issue #${github.issue} is not trusted for its current author.`);
-        }
+        };
+        const text = await issues.issueText(github.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS,
+          trustedAuthor: explicitlyTrusted ? access.authorLogin : undefined, expectedAccess: access });
+        validate();
         // The configured base branch (#103), or the base commit when none (or an empty one) is configured.
         const baseRef = github.baseBranch || service.store.getSnapshot(config.identity).base;
         return { issue: { number: text.number, title: text.title, body: text.body, comments: [...text.comments] },
-          approvedLessons: [], repo: { name: github.repository, baseRef } };
+          approvedLessons: [], repo: { name: github.repository, baseRef }, validate };
       },
       close: () => provider.close(),
     };

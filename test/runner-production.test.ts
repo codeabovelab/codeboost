@@ -132,7 +132,7 @@ describe('runner startup', () => {
       authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
     const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
       buildImage: () => 'x', recovery: () => recovery([]) });
-    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ comments: ['Outside note.'] });
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: ['Outside note.'] } });
     service.store.setIssueTrust({ repository: 'owner/repo', issue: service.store.getPlan(service.config.identity).issue,
       authorLogin: issueAuthor, trusted: false, trustedBy: 'local user' });
     await expect(sources.issue(service.config.identity, new AbortController().signal)).rejects.toThrow(/not trusted/);
@@ -158,8 +158,20 @@ describe('runner startup', () => {
     await expect(sources.issue(service.config.identity, new AbortController().signal)).rejects.toThrow(/not trusted/);
     beforeIssueTextReturn = undefined;
     service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
-    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ comments: ['Outside note.'] });
+    await expect(sources.issue(service.config.identity, new AbortController().signal)).resolves.toMatchObject({ text: { comments: ['Outside note.'] } });
     expect(issueReads).toEqual([issue, issue]);
+  });
+  it('returns a prompt-boundary guard that catches revocation after issue text resolves', async () => {
+    const { root, service } = fixture();
+    issueAuthor = 'outside'; issueCollaborator = false;
+    const issue = service.store.getPlan(service.config.identity).issue;
+    service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: true, trustedBy: 'local user' });
+    const { sources } = await setUpRunner({ service, capability, config: { root: join(root, 'runner'), committer }, lock: lock([]), env: { CLAUDE_CODE_OAUTH_TOKEN: 't' },
+      buildImage: () => 'x', recovery: () => recovery([]) });
+    const guarded = await sources.issue(service.config.identity, new AbortController().signal);
+    expect(guarded.text.comments).toEqual(['Outside note.']);
+    service.store.setIssueTrust({ repository: 'owner/repo', issue, authorLogin: issueAuthor, trusted: false, trustedBy: 'local user' });
+    expect(() => guarded.validate()).toThrow(/not trusted/);
   });
   it('refuses before touching anything without a github block, a token, or with a demo', async () => {
     for (const [patch, env, message] of [[{ github: undefined }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /github block/], [{}, {}, RUNNER_CREDENTIAL_MISSING], [{ demo: true }, { CLAUDE_CODE_OAUTH_TOKEN: 't' }, /Demos never/]] as const) {
@@ -205,7 +217,7 @@ describe('server with a runner setup', () => {
     const deps: RunnerDeps = { runnerOwner: OWNER, kinds: ['execute'], prepare: async () => { throw new Error('no agent here'); },
       cleanupPreparation: async () => undefined, start: () => { throw new Error('no agent here'); }, validate: () => null };
     const sources: ExecutionSources = { planContext: () => service.planContext(), checkpointContext: (_identity, head) => service.planContextAt(head),
-      issue: () => ({ number: 1, title: '', body: '', comments: [] }), lessons: () => [], vendor: () => 'claude' };
+      issue: () => ({ text: { number: 1, title: '', body: '', comments: [] }, validate: () => undefined }), lessons: () => [], vendor: () => 'claude' };
     return { deps, sources, findings: new SafetyFindings(service.store), recovery: { finalized: [], requeue: [], removedDirectories: [], unknownEntries: [], unmatchedStorage: [], repairedMerges: [] } };
   };
   it('closes the Store only after the plan runs in progress, and after a failing step', async () => {

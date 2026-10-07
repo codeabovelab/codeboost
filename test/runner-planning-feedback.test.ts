@@ -122,7 +122,7 @@ describe('planning API for lane G', () => {
       calls.push({ signal, resolve });
       signal.addEventListener('abort', () => reject(signal.reason), { once: true });
     }) };
-    const deps: PlanningDeps = { provider, describe: () => ({ repo: { name: 'retry-service', baseRef: 'main' }, issue: { number: 3, title: 'Retries', body: '', comments: [] }, approvedLessons: [] }) };
+    const deps: PlanningDeps = { provider, describe: () => ({ repo: { name: 'retry-service', baseRef: 'main' }, issue: { number: 3, title: 'Retries', body: '', comments: [] }, approvedLessons: [], validate: () => undefined }) };
     return { deps, calls };
   }
   const until = async (check: () => boolean) => { for (let i = 0; i < 100 && !check(); i++) await new Promise(r => setTimeout(r, 20)); };

@@ -48,8 +48,8 @@ it('tells each request the GitHub issue, the repository and the base commit, rea
   const config = production(), service = new ReviewService(config); closers.push(() => service.close());
   const issueText = vi.fn(async (number: number) => text(number)), signal = new AbortController().signal;
   const deps = productionPlanning(config, { ...verified, issues: issues(issueText), agent: () => closable() })!(service);
-  expect(await deps.describe(signal)).toEqual({ issue: text(config.github!.issue), approvedLessons: [],
-    repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base } });
+  expect(await deps.describe(signal)).toMatchObject({ issue: text(config.github!.issue), approvedLessons: [],
+    repo: { name: 'acme/retry-service', baseRef: service.store.getSnapshot(config.identity).base }, validate: expect.any(Function) });
   expect(issueText).toHaveBeenCalledWith(config.github!.issue, { signal, timeoutMs: ISSUE_READ_TIMEOUT_MS, trustedAuthor: undefined,
     expectedAccess: { number: config.github!.issue, authorLogin: 'outside', collaborator: true } });
 });
@@ -87,6 +87,15 @@ it('refuses all-comments text when explicit trust is revoked during the awaited 
   service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
   release.resolve();
   await expect(description).rejects.toThrow(/not trusted/);
+});
+
+it('carries explicit trust to the planning prompt boundary', async () => {
+  const config = production(), service = new ReviewService(config); closers.push(() => service.close());
+  const deps = productionPlanning(config, { ...verified, issues: issues(async number => text(number), false), agent: () => closable() })!(service);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: true, trustedBy: 'local user' });
+  const described = await deps.describe(new AbortController().signal);
+  service.store.setIssueTrust({ repository: config.github!.repository, issue: config.github!.issue, authorLogin: 'outside', trusted: false, trustedBy: 'local user' });
+  expect(() => described.validate()).toThrow(/not trusted/);
 });
 
 it.each([['release', 'release'], ['', null]] as const)('names the configured base branch %j, or else the base commit, in the prompt', async (baseBranch, expected) => {
@@ -163,7 +172,8 @@ function holding() {
     return new Promise<string>((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })); } };
   return { provider, requests };
 }
-const issueOf = (number: number) => ({ issue: text(number), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' } });
+const issueOf = (number: number) => ({ issue: text(number), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' },
+  validate: () => undefined });
 
 it('awaits the issue before starting a suggestion, and sends it to the provider', async () => {
   const requests: AuthorRequest[] = [];
@@ -176,7 +186,7 @@ it('awaits the issue before starting a suggestion, and sends it to the provider'
   const started = start();
   await new Promise(done => setTimeout(done, 50));
   expect(requests).toHaveLength(0);
-  resolve({ issue: text(view.plan.issue), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' } });
+  resolve({ issue: text(view.plan.issue), approvedLessons: [], repo: { name: 'acme/retry-service', baseRef: 'abc' }, validate: () => undefined });
   const response = await started;
   expect(response).toMatchObject({ status: 200, body: { result: { requestId: expect.any(String) } } });
   await vi.waitFor(() => expect(requests).toHaveLength(1));
@@ -184,12 +194,19 @@ it('awaits the issue before starting a suggestion, and sends it to the provider'
   expect(requests[0]!.prompt).toContain('acme/retry-service');
 });
 
-it('starts no suggestion when the issue cannot be read, and reports GitHub\'s failure as 502', async () => {
-  const invoke = vi.fn();
-  const { start, recorded } = await serve({ provider: { invoke }, describe: async () => { throw new Error('GitHub is unreachable.'); } });
-  const response = await start();
+it('starts no suggestion when the issue cannot be read, and durably replays GitHub\'s 502', async () => {
+  let available = false;
+  const invoke = vi.fn(), describe = vi.fn(async () => {
+    if (!available) throw new Error('GitHub is unreachable.');
+    return issueOf(1);
+  });
+  const { start, recorded } = await serve({ provider: { invoke }, describe });
+  const actionId = randomUUID(), response = await start(actionId);
   expect(response).toMatchObject({ status: 502, body: { error: 'The issue could not be read from GitHub: GitHub is unreachable.' } });
+  available = true;
+  expect(await start(actionId)).toEqual(response);
   expect(invoke).not.toHaveBeenCalled();
+  expect(describe).toHaveBeenCalledTimes(1);
   expect(recorded()).toBe(0);
 });
 
@@ -206,6 +223,19 @@ it('preserves a planning trust refusal as 409 instead of labelling it a GitHub r
   expect(await start(actionId)).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
   expect(invoke).not.toHaveBeenCalled();
   expect(describe).toHaveBeenCalledTimes(1);
+  expect(recorded()).toBe(0);
+});
+
+it('revalidates planning trust after describe resolves and before constructing the prompt', async () => {
+  let trusted = true;
+  const invoke = vi.fn(), description = issueOf(1);
+  const describe = () => new Promise<ReturnType<typeof issueOf> & { validate(): void }>(resolve => {
+    resolve({ ...description, validate: () => { if (!trusted) throw new GuardRefusal('Issue is not trusted.'); } });
+    queueMicrotask(() => { trusted = false; });
+  });
+  const { start, recorded } = await serve({ provider: { invoke }, describe });
+  expect(await start()).toMatchObject({ status: 409, body: { error: 'Issue is not trusted.' } });
+  expect(invoke).not.toHaveBeenCalled();
   expect(recorded()).toBe(0);
 });
 

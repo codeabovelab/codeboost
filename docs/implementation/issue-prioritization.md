@@ -149,7 +149,9 @@ collaborator list under a bounded GitHub read. A collaborator-authored issue pas
 other issue needs a live, unrevoked row for that exact repository, number and author. A prompt text read revalidates the
 admitted author and collaborator result against the issue and collaborator snapshot used for that text, closing the gap
 between authorization and prompt construction. When explicit trust widened the comments, its author-bound Store row is
-re-read immediately after the awaited text fetch so revocation cannot admit the stale all-comments result. Malformed,
+re-read immediately after the awaited text fetch so revocation cannot admit the stale all-comments result. The returned
+execute source carries the same synchronous guard into `prepareExecution`, and the planning description carries it
+into the recorded user action; each runs in the same turn immediately before its prompt is constructed. Malformed,
 partial, failed and over-limit reads fail closed. Action-time
 failures are saved under the action ID; per-item failures settle that attempt without admitting the next item. The task
 and review versions are still checked in the same transaction that admits an attempt, after the external read.

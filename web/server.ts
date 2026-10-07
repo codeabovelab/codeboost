@@ -20,7 +20,11 @@ import { IssueBoard } from './issues.ts';
 import { SuggestionCoordinator, type PlanningMode, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
-export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & { repo: { name: string; baseRef: string } };
+export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & {
+  repo: { name: string; baseRef: string };
+  /** Revalidates any mutable authority carried by this description at the synchronous prompt-construction boundary. */
+  validate(): void;
+};
 /** Live planning runs only through D (G4 after #51, #117). Until a provider is injected, starting a suggestion is refused. */
 export interface PlanningDeps {
   provider: AuthorProvider;
@@ -459,9 +463,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         try { described = await planning.describe(signal); }
         catch (error) {
           if (stopping) throw new ShuttingDownError();
-          if (error instanceof GuardRefusal)
-            return service.store.userAction<unknown>(identity, { actionId, kind, request }, () => { throw error; }).response;
-          throw new UpstreamFailure(`The issue could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+          const outcome = error instanceof GuardRefusal ? error
+            : new UpstreamFailure(`The issue could not be read from GitHub: ${error instanceof Error ? error.message : String(error)}`);
+          return service.store.userAction<unknown>(identity, { actionId, kind, request }, () => { throw outcome; }).response;
         }
       }
     }
@@ -480,6 +484,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
         // Read above whenever the checks before this line pass; they cannot change across the synchronous action.
         if (!described) throw new GuardRefusal('Planning agent not available yet.');
         const amendment = service.planningContextForAmendment(), context = amendment.context;
+        described.validate();
         const handle = suggestions.start({ context, completedItems: amendment.completedItems, continuationBinding: amendment.continuation,
           continuationContext: amendment.continuationContext,
           revision: plan.revision, snapshotId: snapshot.id, issue: described.issue, approvedLessons: described.approvedLessons, feedback: input.feedback,

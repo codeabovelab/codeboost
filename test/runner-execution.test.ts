@@ -12,7 +12,9 @@ import { MAX_REASON, ShuttingDownError, type ShutdownCapability } from '../runne
 import type { ChangeManifest, ManifestChange } from '../core/run-audit.ts';
 import type { InvocationResult } from '../agents/contract.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
+import type { PlanIdentity } from '../core/identity.ts';
 import { TaskTreeRefused } from '../agents/container/changes.ts';
+import type { IssueText } from '../github/issues.ts';
 
 const oid = (n: number) => n.toString(16).padStart(40, '0');
 const RUNNER_OWNER = '0123456789abcdef0123456789abcdef';
@@ -39,7 +41,10 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
   /** Called by the fake launcher once the agent has started, before its result settles. */
   onLaunch?: (attemptId: string) => void;
   /** The fake agent's result names this attempt instead. */
-  foreignResult?: boolean; issue?: ExecutionSources['issue'] } = {}) {
+  foreignResult?: boolean;
+  issue?: (identity: PlanIdentity, signal: AbortSignal) => IssueText | Promise<IssueText>;
+  guardedIssue?: ExecutionSources['issue'];
+} = {}) {
   const dir = mkdtempSync(join(tmpdir(), 'codeboost-exec-')); dirs.push(dir);
   const path = join(dir, 'state.sqlite'), store = new Store(path);
   store.createPlan(JSON.stringify(options.plan ?? plan), 'json', context, oid(1), oid(2));
@@ -84,7 +89,10 @@ function setup(options: { manifests?: Record<string, ChangeManifest & { digest: 
     checkpointContext: () => ({ ...auditContext, baseEntries: [...auditContext.baseEntries,
       ...Object.values(options.manifests ?? {}).flatMap(value => value.changes.filter(change => change.kind === 'add' && change.path === 'extra.ts')
         .map(change => ({ path: change.path, kind: 'file' as const })))] }),
-    issue: options.issue ?? (() => ({ number: 1, title: 'Issue', body: 'Please fix', comments: [] })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
+    issue: options.guardedIssue ?? (async (id, signal) => ({
+      text: await (options.issue?.(id, signal) ?? { number: 1, title: 'Issue', body: 'Please fix', comments: [] }),
+      validate: () => undefined,
+    })), lessons: () => [], vendor: () => options.vendor ?? 'claude' };
   const prompts: string[] = [], argv: (readonly (readonly string[])[])[] = [], owners: string[] = [], checks: unknown[] = [];
   const capability = options.capability?.(store), findings = new SafetyFindings(store, capability);
   if (options.settleError) store.settleAttempt = () => { throw Object.assign(new Error('disk full'), { code: 'ERR_SQLITE_ERROR' }); };
@@ -1081,6 +1089,19 @@ describe('item execution', () => {
       reason: expect.stringMatching(/not trusted for its current author/) });
     expect(h.store.getAttempts(identity)).toMatchObject([{ item: 'P1', state: 'completed' }, { item: 'P2', state: 'failed' }]);
     expect(h.log.some(line => line.includes('start P2'))).toBe(false);
+  });
+  it('revalidates issue trust synchronously when the execute prompt is constructed', async () => {
+    let trusted = true;
+    const h = setup({ guardedIssue: () => new Promise(resolve => {
+      resolve({ text: { number: 1, title: 'Issue', body: 'Please fix', comments: ['Outside note.'] },
+        validate: () => { if (!trusted) throw new GuardRefusal('Issue #1 is not trusted for its current author.'); } });
+      // The source has resolved, but the await continuation that constructs the prompt has not run yet.
+      trusted = false;
+    }) });
+    expect(await h.executor.runTask(identity)).toMatchObject({ kind: 'stopped', item: 'P1', state: 'failed',
+      reason: expect.stringMatching(/not trusted for its current author/) });
+    expect(h.store.getAttempts(identity)).toMatchObject([{ item: 'P1', state: 'failed', promptComments: null }]);
+    expect(h.log.some(line => line.includes('start P1'))).toBe(false);
   });
   it('builds a pause\'s executed prefix from the plan the item ran against, even if a revision inserts an item before it', async () => {
     let store!: Store, imported: Error | undefined;
