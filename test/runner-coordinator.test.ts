@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { RunnerCoordinator, type PreparedAttempt, type RunnerDeps, type StartRequest } from '../runner/coordinator.ts';
+import { PreparationFailure, RunnerCoordinator, combineRunnerDeps, type PreparedAttempt, type RunnerDeps, type StartRequest } from '../runner/coordinator.ts';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -72,6 +72,22 @@ async function until(check: () => boolean, label: string) {
 }
 
 describe('admission and slots', () => {
+  it('routes a partial allocation back to the delegate that created it when combined preparation fails', async () => {
+    const { store } = setup();
+    const allocated: PreparedAttempt = { clone: { id: 'partial', taskId: 'task', directory: '/tmp/partial', head: oid(2) },
+      vendor: 'runner', approvedArgv: [], private: { storage: 'owned' } };
+    const release = vi.fn(async (_attempt, prepared: PreparedAttempt) => { expect(prepared).toBe(allocated); });
+    const failing: RunnerDeps = { runnerOwner: RUNNER_OWNER, kinds: ['execute'],
+      prepare: async () => { throw new PreparationFailure(new Error('materialization failed'), allocated); },
+      cleanupPreparation: async () => undefined, start: () => { throw new Error('must not launch'); }, validate: () => null, release };
+    const other: RunnerDeps = { ...fakeD().deps, kinds: ['review'] };
+    const combined = new RunnerCoordinator(store, combineRunnerDeps(failing, other)); coordinators.push(combined);
+    const attempt = combined.start(A, request(store, A));
+    await combined.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: "materialization failed"' });
+    expect(release).toHaveBeenCalledOnce();
+    expect(combined.status(A).unresolved).toBeNull();
+  });
   it('refuses a kind its deps cannot run before writing anything (#91)', () => {
     const { store } = setup();
     const limited = new RunnerCoordinator(store, { ...fakeD().deps, kinds: ['execute'] }); coordinators.push(limited);

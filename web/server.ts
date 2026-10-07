@@ -436,6 +436,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       const last = service.store.getAttempt(identity, attemptId as string);
       // A plan item runs only through the executor, which pauses or escalates after it; a bare retry would skip both.
       if (executor && last.kind === 'execute') throw new GuardRefusal('A plan item is run again by resuming the task, not by retrying its attempt.');
+      // Exact-head command checks belong to pre-merge preparation, which refreshes the remote pair, review state and
+      // issue authorization before every launch. A bare retry would bypass all of those guards.
+      if (last.kind === 'check') throw new GuardRefusal('Command checks are run again by preparing the merge, not by retrying their attempt.');
       const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
       // A cancel that stops this attempt closes the task when it settles; its PRs are closed then (#111), as after a run.

@@ -33,8 +33,11 @@ const markRunnerOwned = (service: ReviewService) => {
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
+  duringAuthorize?: (service: ReviewService, call: number) => void;
   closeDuringCommand?: boolean;
+  commandWaitsForDeadline?: boolean;
   unsettledRebase?: boolean;
+  operationTimeoutMs?: number;
   authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
@@ -99,18 +102,29 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
           signal: 'SIGTERM', stopReason: reason, stdout: '', stderr: '' });
       } } satisfies InvocationHandle;
     }
+    if (options.commandWaitsForDeadline) {
+      const settled = new Promise<InvocationResult>(resolve => {
+        setTimeout(() => resolve({ attemptId: input.attemptId, context: input.context, exitCode: null,
+          signal: 'SIGTERM', stopReason: 'timeout', stdout: '', stderr: '' }), Math.max(0, input.deadline - Date.now()));
+      });
+      return { attemptId: input.attemptId, settled, cancel() {} } satisfies InvocationHandle;
+    }
     return { attemptId: input.attemptId,
       settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: commandExit ?? 0,
         signal: null, stdout: '', stderr: commandExit ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
   }, () => context, 'a'.repeat(32)));
   let remoteReads = 0;
+  let authorizationChecks = 0;
+  const authorize = options.authorize ?? (options.duringAuthorize ? async () => () => {
+    options.duringAuthorize!(service, ++authorizationChecks);
+  } : undefined);
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
       remoteReads++;
       if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator);
       return { base: onto, head };
-    }, fetch: async () => undefined }, undefined, undefined, options.authorize);
+    }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize);
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
@@ -195,6 +209,27 @@ it('revalidates task and review versions after the final remote read', async () 
   });
   expect(fixture.result).toMatchObject({ state: 'failed' });
   expect(fixture.result.reason).toMatch(/task or review changed/);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('revalidates task and review versions after final authorization', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    if (call !== 2) return;
+    const view = service.load();
+    service.store.addReviewNote(service.config.identity, view.expected, 'P1', 'change', 'Changed during authorization.');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.result.reason).toMatch(/task or review changed/);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('keeps a command-check deadline separate from the code-writing task budget', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { commandWaitsForDeadline: true, operationTimeoutMs: 5_000 });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.result.reason).toMatch(/Timed out|deadline exceeded/);
+  const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
+  expect(check).toMatchObject({ state: 'failed', firstReason: null, stopReason: 'timeout' });
+  expect(fixture.service.store.getTask(fixture.service.config.identity).status).toBe('in review');
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 

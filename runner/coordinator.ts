@@ -102,7 +102,17 @@ export function combineRunnerDeps(...delegates: readonly RunnerDeps[]): RunnerDe
   };
   return {
     runnerOwner, kinds: [...byKind.keys()],
-    async prepare(attempt, signal) { const delegate = select(attempt); return wrap(delegate, await delegate.prepare(attempt, signal)); },
+    async prepare(attempt, signal) {
+      const delegate = select(attempt);
+      try { return wrap(delegate, await delegate.prepare(attempt, signal)); }
+      catch (error) {
+        // A delegate may allocate task storage before preparation fails. Preserve both its implementation identity and
+        // opaque cleanup handle so the combined release path can still route that allocation back to its owner.
+        if (error instanceof PreparationFailure)
+          throw new PreparationFailure(error.cause ?? error, wrap(delegate, error.allocated));
+        throw error;
+      }
+    },
     async cleanupPreparation(attempt) { await select(attempt).cleanupPreparation(attempt); },
     beforeStart(attempt, prepared) { const value = unpack(prepared); value.delegate.beforeStart?.(attempt, value.prepared); },
     start(input, prepared) { const value = unpack(prepared); return value.delegate.start(input, value.prepared); },

@@ -191,8 +191,12 @@ export class PreMergeCoordinator {
       const attempt = this.runner.start(identity, { expectedStateVersion: task.stateVersion, kind: 'check', item: item.id,
         deadline: Date.now() + remaining(), expectedContext: this.service.store.currentContext(identity),
         ...(this.authorize ? { authorize: this.authorize } : {}) });
-      const stop = () => this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown'
-        : (signal.reason as { code?: unknown } | undefined)?.code === 'ETIMEDOUT' ? 'time-limit' : 'cancelled');
+      const stop = () => {
+        // The invocation owns the same deadline and reports its own timeout. `time-limit` is reserved for the
+        // code-writing task budget: recording it here would incorrectly move an in-review task to needs human.
+        if ((signal.reason as { code?: unknown } | undefined)?.code !== 'ETIMEDOUT')
+          this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown' : 'cancelled');
+      };
       signal.addEventListener('abort', stop, { once: true });
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       signal.throwIfAborted();
@@ -222,6 +226,16 @@ export class PreMergeCoordinator {
     if (finalBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
       reason: finalBlocker };
     await authorize();
+    // Authorization is asynchronous. A review edit during that read invalidates its result just as one during the
+    // final remote inspection does; nothing may persist readiness from the pre-authorization view.
+    assertCurrent(guarded);
+    view = this.service.load();
+    if (view.snapshot.base !== prepared.base || view.snapshot.head !== prepared.head)
+      return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
+        reason: 'The local review changed during final authorization; reload it.' };
+    const authorizedBlocker = this.#reviewBlocker(view, true);
+    if (authorizedBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
+      reason: authorizedBlocker };
     return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null };
   }
 }
