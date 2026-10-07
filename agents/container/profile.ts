@@ -89,7 +89,7 @@ interface FileIdentity {
 interface ProfileIdentity { readonly inputDirectory: string; readonly schema: FileIdentity; readonly auth?: FileIdentity;
   readonly cleanupDirectories: readonly string[]; readonly filesystems: TaskFilesystems;
   readonly clone: InvocationInput['clone']; readonly deadline: number; readonly network: VendorNetwork;
-  readonly policy: PhasePolicy; readonly invocation: InvocationInput }
+  readonly invocationBudget?: () => number; readonly policy: PhasePolicy; readonly invocation: InvocationInput }
 type InputIdentity = Pick<ProfileIdentity, 'inputDirectory' | 'schema'>;
 interface InputCapture extends InputIdentity { readonly content: Buffer }
 const identities = new WeakMap<ContainerProfile, ProfileIdentity>();
@@ -192,12 +192,12 @@ export async function assertContainerProfile(profile: ContainerProfile, timeoutM
   }
 }
 
-/** Clamp a Docker budget to the captured invocation deadline, which no launch may outlive. */
+/** Clamp a Docker budget to the captured monotonic budget, or the wall deadline when no budget was carried. */
 export function profileTimeout(profile: ContainerProfile, timeoutMs: number, now = Date.now()): number {
   const expected = identities.get(profile);
   if (!expected) throw new Error('Container profile was not created by the trusted profile builder.');
-  const left = Math.floor(expected.deadline - now);
-  if (left < 1) throw new Error('Invocation deadline has passed.');
+  const left = Math.floor(expected.invocationBudget?.() ?? expected.deadline - now);
+  if (!Number.isSafeInteger(left) || left < 1) throw new Error('Invocation deadline has passed.');
   return Math.min(timeoutMs, left);
 }
 
@@ -265,7 +265,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
   if (storageOwner.runnerOwner !== invocation.runnerOwner) throw new Error('Task filesystems belong to another runner.');
   const containerOwner = agentContainerOwner(invocation, filesystems);
   const invocationLeft = Math.floor(options.invocationBudget?.() ?? invocation.deadline - Date.now());
-  if (invocationLeft < 1) throw new Error('Invocation deadline has passed.');
+  if (!Number.isSafeInteger(invocationLeft) || invocationLeft < 1) throw new Error('Invocation deadline has passed.');
   await assertVendorNetwork(options.network, invocation, undefined, Math.min(options.timeoutMs ?? 30_000, invocationLeft),
     options.signal, options.processLifecycle);
   if (claimedNetworks.has(options.network)) throw new Error('Vendor network already belongs to another container profile.');
@@ -367,7 +367,8 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
     identities.set(profile, Object.freeze({ inputDirectory: inputIdentity.inputDirectory, schema: inputIdentity.schema,
       auth: authIdentity,
       cleanupDirectories: Object.freeze([...cleanupDirectories]), filesystems, clone: invocation.clone,
-      deadline: invocation.deadline, network: options.network, policy: options.policy, invocation }));
+      deadline: invocation.deadline, invocationBudget: options.invocationBudget,
+      network: options.network, policy: options.policy, invocation }));
     return profile;
   } catch (error) {
     const cleanupProfileResources = async (budgetMs = 30_000) => {

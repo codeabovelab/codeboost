@@ -13,7 +13,7 @@ import type { Plan, PlanContext } from '../core/plan.ts';
 import type { AsyncCloneOptions } from '../git/clone.ts';
 import { CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS, copyConflictPaths, createForeignConflictResolver,
   MAX_CONFLICT_PATH_BYTES } from '../runner/rebase-conflict.ts';
-import type { RebaseConflictInput } from '../runner/rebase.ts';
+import { RebaseResourcesUnsettled, type RebaseConflictInput } from '../runner/rebase.ts';
 import type { RunnerRepository } from '../runner/runner-repository.ts';
 import { Store } from '../runner/store.ts';
 
@@ -299,6 +299,20 @@ describe('production foreign conflict resolver', () => {
     await expect(resolve(input(f))).rejects.toThrow(/retained resources/);
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: { source: oid(2) } });
     expect(readdirSync(f.repository).some(name => name.startsWith('.codeboost-conflict-'))).toBe(true);
+  });
+
+  it('preserves both the primary failure and cleanup failure when retaining ownership', async () => {
+    const f = fixture(), primary = new Error('manifest inspection failed'), cleanup = new Error('storage cleanup failed');
+    const x = deps(f, { inspect: async () => { throw primary; }, remove: async () => { throw cleanup; } });
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret', limits: { workBytes: 1, workInodes: 1,
+        metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    const failure = await resolve(input(f)).then(() => undefined, error => error as Error);
+    expect(failure).toBeInstanceOf(RebaseResourcesUnsettled);
+    expect(failure?.cause).toBeInstanceOf(AggregateError);
+    expect((failure?.cause as AggregateError).errors).toEqual([primary, cleanup]);
+    expect((failure?.cause as AggregateError).cause).toBe(primary);
   });
 
   it.each([[[]], [[{ kind: 'container' as const, name: 'left' }]]])(

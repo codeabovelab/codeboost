@@ -359,9 +359,14 @@ export function createForeignConflictResolver(options: ForeignConflictResolverOp
       try { options.store.clearRebaseConflict(options.planKey, input.attemptId, childAttemptId); }
       catch (error) { cleanup.push(error); }
     }
-    if (retainOwnership) throw new RebaseResourcesUnsettled(
-      `Conflict resolution retained resources for startup recovery${primary instanceof Error ? `: ${primary.message}` : '.'}`,
-      primary === undefined && !cleanup.length ? undefined : { cause: primary ?? cleanup[0] });
+    if (retainOwnership) {
+      const cause = primary !== undefined && cleanup.length
+        ? new AggregateError([primary, ...cleanup], 'Conflict resolution and cleanup failed.', { cause: primary })
+        : primary ?? cleanup[0];
+      throw new RebaseResourcesUnsettled(
+        `Conflict resolution retained resources for startup recovery${primary instanceof Error ? `: ${primary.message}` : '.'}`,
+        cause === undefined ? undefined : { cause });
+    }
     if (primary && cleanup.length) throw new AggregateError([primary, ...cleanup], 'Conflict resolution and cleanup failed.', { cause: primary });
     if (primary) throw primary;
     if (cleanup.length > 1) throw new AggregateError(cleanup, 'Conflict resolver cleanup failed.');

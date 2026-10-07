@@ -97,7 +97,7 @@ const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop
 async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
   vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
-  treeCheck?: TaskTreeCheck; cleanupRoot?: string;
+  treeCheck?: TaskTreeCheck; cleanupRoot?: string; invocationBudget?: () => number;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
   const captured = invocation(data.clone, phase, vendor, options.deadlineMs);
@@ -110,6 +110,7 @@ async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   const base = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
     inputDirectory: data.input, command: trustedCommand, imageId, treeCheck,
     cleanupRoot: options.cleanupRoot,
+    invocationBudget: options.invocationBudget,
     codexAuthFile: vendor === 'codex' ? (options.codexAuthFile ?? data.fakeAuth) : undefined,
     claudeToken: vendor === 'claude' ? options.claudeToken : undefined });
   profiles.push(base);
@@ -2405,6 +2406,16 @@ describe('real Docker agent isolation', () => {
     const data = fixture(), captured = Date.now(), late = await profile(data, 'planning', 'noop', { deadlineMs: 6_000 });
     execFileSync('sleep', [String(Math.max(0, captured + 6_500 - Date.now()) / 1000)]);
     await expect(runContainer(late, 60_000)).rejects.toThrow('deadline has passed');
+  }, 60_000);
+
+  it('carries a monotonic invocation budget through real container launch after wall time moves forward', async () => {
+    const data = fixture(), end = performance.now() + 60_000;
+    const valid = await profile(data, 'planning', 'noop', {
+      deadlineMs: 5 * 60_000, invocationBudget: () => Math.ceil(end - performance.now()),
+    });
+    const wall = Date.now(), clock = vi.spyOn(Date, 'now').mockReturnValue(wall + 10 * 60_000);
+    try { expect(await runContainer(valid, 60_000)).toBe(''); }
+    finally { clock.mockRestore(); }
   }, 60_000);
 
   it('refuses to build a profile once the invocation deadline has passed', async () => {
