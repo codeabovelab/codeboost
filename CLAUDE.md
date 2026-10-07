@@ -42,3 +42,32 @@ In QA mode, flag any code that doesn't match DESIGN.md.
 - A validation fixture for a summary-only concern must assert the disputed intermediate representation or state before using a downstream outcome as evidence that the concern was exercised.
 - For each self-review, independent-agent and Copilot round, record the review type and reviewer, exact base/head pair, findings, what changed, what was declined and why, and the regression evidence. Record the clean independent-agent pass that authorizes each Copilot request; re-requests must follow the same prerequisite.
 - Treat review-lesson extraction as a merge gate. Before invoking merge, classify every review finding in the PR body as: covered by an existing rule (cite it), captured by a new rule in this branch (cite it), or one-off (record why). Do not merge until this audit is complete and every required `AGENTS.md` update is included in the reviewed head. Omit rules that merely repeat existing guidance.
+
+## Task resumption and ownership
+
+- When asked to start, continue or resume an issue or pull request, first locate any existing PR, branch, worktree and active task for it. Fetch current remote refs and inspect the exact base/head pair, working-tree status and untracked files before creating another branch or implementation.
+- Do not duplicate work merely because it is absent from the current checkout. Inspect open PRs, issues and worktrees, and identify what remains uncovered.
+- Before starting parallel work, compare touched files and shared dependencies. Prefer non-overlapping work; when overlap is necessary, name one integration owner and define ownership of shared files.
+
+## Validation evidence
+
+- Report focused tests, affected-suite tests, the full suite, type checking, CI and real-Docker validation as separate gates. Passing one does not imply that another passed, and a focused suite never substitutes for a required full-suite, CI or real-Docker gate.
+- When validation fails because of machine load, Docker exhaustion, timeout or infrastructure instability, record the observed failure separately from product failures. Targeted checks may diagnose the change, but the required gate must eventually pass or remain explicitly blocked.
+- Give heavyweight Docker and integration validation one active owner per repository. Do not launch competing runs that make their results unreliable.
+
+## External status confirmation
+
+- Distinguish requested, started, pushed, review-pending, checks-pending, mergeable, merged and deployed states. Never collapse an intermediate state into completion.
+- After opening, updating, retargeting, marking ready, closing or merging a pull request, read the remote record back and confirm the exact head and resulting state before reporting success.
+- A successful command, a merge button click, a green local run or another agent's status summary is evidence of that step only; it is not proof of the downstream result.
+
+## Stacked pull requests
+
+- Before changing a stacked PR, record its current parent, base and head, plus any overlapping files with adjacent PRs.
+- When resolving overlap, preserve the intended behavior, documentation and regression coverage from both sides. Do not resolve shared-file conflicts by blindly choosing one branch.
+- A parent merge, rebase, restack or base change invalidates prior review and validation evidence. Re-run the applicable validation and independent-review loop on the new base/head pair.
+- Do not restack dependent PRs until the parent merge is confirmed remotely.
+
+## Instruction synchronization
+
+- Any operating rule duplicated between `AGENTS.md` and `CLAUDE.md` must be changed in both files in the same commit. Validate that mirrored sections remain textually identical.
