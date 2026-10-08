@@ -24,7 +24,7 @@ import { GitRebaser } from './rebase.ts';
 import { createForeignConflictResolver } from './rebase-conflict.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
 import { commandCheckDeps } from './checks.ts';
-import { PreMergeCoordinator } from './pre-merge.ts';
+import { PreMergeCoordinator, type PreMergeAuthorization } from './pre-merge.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
 
 /**
@@ -188,7 +188,7 @@ export interface RunnerAssembly {
   readonly shortRetryMs?: number;
   /** F5 production refresh/rebase/check coordinator, built against the configured task PR. */
   readonly preMerge?: (runner: RunnerCoordinator, inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>,
-    authorize: (signal: AbortSignal) => Promise<() => void | Promise<void>>) => PreMergeCoordinator;
+    authorize: (signal: AbortSignal) => Promise<PreMergeAuthorization>) => PreMergeCoordinator;
   readonly sources: ExecutionSources;
   readonly findings: SafetyFindings;
   readonly recovery: RecoveryReport;
@@ -224,7 +224,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const identity = review.identity;
   const rebasePlanKey = identityKey(identity);
   let repositoryPromise: Promise<RunnerRepository> | undefined, rebaserPromise: Promise<GitRebaser> | undefined;
-  let authorizePreMerge: ((signal: AbortSignal) => Promise<() => void | Promise<void>>) | undefined;
+  let authorizePreMerge: ((signal: AbortSignal) => Promise<PreMergeAuthorization>) | undefined;
   const getRepository = () => repositoryPromise ??= openRunnerRepository({ runnerRoot: config.root, runnerOwner,
     repositoryId: identity.repositoryId, source: review.repository }).then(async repository => {
       // The review and rebase recovery read the same runner-owned repository that execution writes.
@@ -254,7 +254,10 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       repository, runnerOwner, image, token,
       authorize: signal => {
         if (!authorizePreMerge) throw new GuardRefusal('Issue trust admission is not configured.');
-        return authorizePreMerge(signal);
+        return authorizePreMerge(signal).then(async authorization => {
+          await authorization.refresh();
+          return () => authorization.validate();
+        });
       },
       limits: { ...EXECUTE_STORAGE, ...config.limits } }) }));
   const recovery = await recoverStartup({ store: service.store, runnerOwner, runnerRoot: config.root, diagnosticsDir,
@@ -326,7 +329,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   const rebaser = await getRebaser();
   const preMerge = (runner: RunnerCoordinator,
     inspect: (signal?: AbortSignal) => Promise<{ base: string; head: string }>,
-    authorize: (signal: AbortSignal) => Promise<() => void | Promise<void>>) => {
+    authorize: (signal: AbortSignal) => Promise<PreMergeAuthorization>) => {
     authorizePreMerge = authorize;
     return new PreMergeCoordinator(service, runner, rebaser, {
       inspect,

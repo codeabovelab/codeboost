@@ -3,7 +3,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
-import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PreMergeCoordinator } from '../runner/pre-merge.ts';
+import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PreMergeCoordinator, type PreMergeAuthorization } from '../runner/pre-merge.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -42,7 +42,7 @@ const markRunnerUnchanged = (service: ReviewService) => {
 
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
-  duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
+  duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator, read: number) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
   commandWaitsForDeadline?: boolean;
@@ -51,7 +51,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   unsettledRebase?: boolean;
   runnerCommitted?: boolean;
   operationTimeoutMs?: number;
-  authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
+  authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
   reserves?: { processMs?: number; commandMs?: number };
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
@@ -140,14 +140,15 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }, () => context, 'a'.repeat(32)));
   let remoteReads = 0, remotePair = { base: onto, head };
   let authorizationChecks = 0;
-  const authorize = options.authorize ?? (options.duringAuthorize ? async () => () => {
-    remotePair = options.duringAuthorize!(service, ++authorizationChecks) ?? remotePair;
-  } : undefined);
+  const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
+    refresh: async () => undefined,
+    validate: () => { remotePair = options.duringAuthorize!(service, ++authorizationChecks) ?? remotePair; },
+  }) : undefined);
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
       remoteReads++;
-      if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator);
+      if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator, remoteReads);
       return remotePair;
     }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize, options.reserves);
   const task = service.store.getTask(identity);
@@ -198,13 +199,25 @@ it('leaves an unsettled conflict and its rebase marker for startup recovery', as
 it('revalidates authorization before starting the delayed local rebase', async () => {
   const calls: string[] = [];
   const fixture = await rebaseFixture('feature\n', undefined, { authorize: async () => {
-    calls.push('read'); return () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); };
+    calls.push('read'); return { refresh: async () => undefined,
+      validate: () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); } };
   } });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Issue trust was revoked.' });
   expect(calls).toEqual(['read', 'validate']);
   expect(fixture.rebaseRuns()).toBe(0);
   expect(fixture.rebaseAborts()).toBe(1);
   expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('refuses readiness when local issue trust is revoked during the final remote inspection', async () => {
+  let trusted = true;
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    authorize: async () => ({ refresh: async () => undefined,
+      validate: () => { if (!trusted) throw new Error('Issue trust was revoked.'); } }),
+    duringFinalInspect: (_service, _coordinator, read) => { if (read === 3) trusted = false; },
+  });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Issue trust was revoked.' });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 

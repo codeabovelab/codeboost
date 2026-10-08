@@ -12,6 +12,12 @@ export interface PreMergeRemote {
   inspect(signal?: AbortSignal): Promise<RemotePair>;
   fetch(pair: RemotePair, signal?: AbortSignal): Promise<void>;
 }
+export interface PreMergeAuthorization {
+  /** Complete the last external authorization read before a later external operation. */
+  refresh(): Promise<void>;
+  /** Recheck only local trust state after that operation, without opening another external race. */
+  validate(): void;
+}
 export interface PreMergeResult {
   state: 'ready' | 'review-required' | 'failed';
   base: string; head: string; checked: readonly string[]; reason: string | null;
@@ -33,7 +39,7 @@ export class PreMergeCoordinator {
   readonly operationTimeoutMs: number;
   readonly processSettlementReserveMs: number;
   readonly commandSettlementReserveMs: number;
-  readonly authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
+  readonly authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
   readonly settle: <T>(fn: () => T) => T;
   #active: Promise<PreMergeResult> | null = null;
   #abort: AbortController | null = null;
@@ -43,7 +49,7 @@ export class PreMergeCoordinator {
 
   constructor(service: ReviewService, runner: RunnerCoordinator, rebaser: GitRebaser, remote: PreMergeRemote,
     operationTimeoutMs = 10 * 60_000, capability?: ShutdownCapability,
-    authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>,
+    authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>,
     reserves: { processMs?: number; commandMs?: number } = {}) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 60 * 60_000)
       throw new Error('Invalid pre-merge operation deadline.');
@@ -213,8 +219,9 @@ export class PreMergeCoordinator {
     };
     const authorize = async () => {
       if (!this.authorize) return;
-      const validate = await this.authorize(signal);
-      await validate(); signal.throwIfAborted(); remaining();
+      const authorization = await this.authorize(signal);
+      await authorization.refresh(); authorization.validate(); signal.throwIfAborted(); remaining();
+      return authorization;
     };
     const track = <T extends ReturnType<ReviewService['load']>>(current: T): T => {
       onObserved({ pair: { base: current.snapshot.base, head: current.snapshot.head }, binding: {
@@ -288,7 +295,11 @@ export class PreMergeCoordinator {
       task = this.service.store.getTask(identity);
       const attempt = this.runner.start(identity, { expectedStateVersion: task.stateVersion, kind: 'check', item: item.id,
         deadline: Date.now() + commandBudget(), expectedContext: this.service.store.currentContext(identity),
-        ...(this.authorize ? { authorize: this.authorize } : {}) });
+        ...(this.authorize ? { authorize: async (checkSignal: AbortSignal) => {
+          const authorization = await this.authorize!(checkSignal);
+          await authorization.refresh();
+          return () => authorization.validate();
+        } } : {}) });
       const stop = () => {
         // The invocation owns the same deadline and reports its own timeout. `time-limit` is reserved for the
         // code-writing task budget: recording it here would incorrectly move an in-review task to needs human.
@@ -339,7 +350,7 @@ export class PreMergeCoordinator {
     const finalBlocker = this.#reviewBlocker(view, true);
     if (finalBlocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
       reason: finalBlocker };
-    await authorize();
+    const authorization = await authorize();
     // Authorization is asynchronous. A review edit during that read invalidates its result just as one during the
     // final remote inspection does; nothing may persist readiness from the pre-authorization view.
     assertCurrent(guarded);
@@ -354,6 +365,7 @@ export class PreMergeCoordinator {
     // it, then immediately recheck every local generation before recording readiness.
     const authorizedRemote = await this.remote.inspect(signal); signal.throwIfAborted();
     assertCurrent(guarded);
+    authorization?.validate();
     if (authorizedRemote.base !== initial.base || authorizedRemote.head !== initial.head) {
       await this.remote.fetch(authorizedRemote, signal); signal.throwIfAborted(); assertCurrent(guarded);
       view = track(this.#refresh(authorizedRemote, reviewBudget, initial.head));

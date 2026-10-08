@@ -108,9 +108,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     try {
       const assembly = await runnerSetup(service, capability);
       runner = new RunnerCoordinator(service.store, assembly.deps, undefined, capability);
-      if (assembly.preMerge && merges) preMerge = assembly.preMerge(runner, signal => merges!.remotePair(signal), signal => {
-        if (!authorizePublish) throw new GuardRefusal('Issue trust admission is not configured.');
-        return authorizePublish(identity, signal);
+      if (assembly.preMerge && merges) preMerge = assembly.preMerge(runner, signal => merges!.remotePair(signal), async signal => {
+        let access = await readIssueAccess(signal);
+        requireTrustedIssue(access);
+        return {
+          refresh: async () => { access = await readIssueAccess(signal); requireTrustedIssue(access); },
+          validate: () => requireTrustedIssue(access),
+        };
       });
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
