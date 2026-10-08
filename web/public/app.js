@@ -247,8 +247,10 @@ async function act(command) {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    data = updated;
+    const newerQueue = newerMergeQueue(updated);
+    data = newerQueue ? withMergeQueue(updated, newerQueue) : updated;
     render();
+    if (newerQueue) showMergeQueueStatus(newerQueue);
     return true;
   } catch (error) {
     if (generation !== reviewGeneration) return false;
