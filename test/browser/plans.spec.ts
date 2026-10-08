@@ -200,6 +200,102 @@ test('replays an ambiguous committed import after refresh without creating anoth
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });
 
+test('does not let a replayed import reload overwrite a newer terminal merge observation', async ({ page }) => {
+  test.slow();
+  const config = { ...app.service.config, demo: false };
+  await app.close();
+  chmodSync(join(config.repository, 'run.sh'), 0o644);
+  fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope');
+  let appRef: typeof app;
+  const gateway: MergeGateway & MergeQueueGateway = {
+    inspect: async () => {
+      const snapshot = appRef.service.load().snapshot;
+      return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
+        atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
+    },
+    queueWatermark: async () => null,
+    merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
+    inspectQueue: async head => ({ state: 'queued', reviewedHead: head, entryId: 'MQE_1', phase: 'QUEUED', position: 1,
+      enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
+  };
+  app = appRef = await startServer(config, 0, undefined, gateway);
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(nextPlan)) });
+  const sent: unknown[] = [];
+  await page.route('**/api/plan/import', async route => {
+    sent.push(route.request().postDataJSON());
+    if (sent.length === 1) {
+      await route.fetch();
+      await route.abort('failed');
+      return;
+    }
+    await route.continue();
+  });
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Could not import the plan.' })).toBeVisible();
+  await page.locator('#plans-refresh').click();
+  await expect(page.getByRole('status').filter({ hasText: 'Revision r2 is current.' })).toBeVisible();
+
+  let view = app.service.load();
+  for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
+    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+  for (const item of view.items)
+    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Merge PR', exact: true })).toBeEnabled();
+  page.on('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
+  await expect.poll(() => app.service.store.getMergeAttempt(config.identity)?.state).toBe('queued');
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+
+  let releaseReload!: () => void, reloadArrived!: () => void;
+  const heldReload = new Promise<void>(resolve => { releaseReload = resolve; });
+  const capturedReload = new Promise<void>(resolve => { reloadArrived = resolve; });
+  let queued!: Record<string, unknown>;
+  await page.route('**/api/review', async route => {
+    const response = await route.fetch();
+    const refreshed = await response.json();
+    queued = refreshed.merge.queue;
+    refreshed.repository = 'import-replay-refreshed';
+    refreshed.merge.blockers.push({ code: 'check', message: 'Fresh replay blocker is pending.' });
+    reloadArrived();
+    await heldReload;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(refreshed) });
+  });
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+  await capturedReload;
+  expect(sent).toHaveLength(2);
+  expect(sent[1]).toEqual(sent[0]);
+  expect(queued.actionId).toEqual(expect.any(String));
+
+  await page.route('**/api/merge', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ queue: { ...queued, state: 'merged', phase: null, position: null,
+      occurredAt: '2026-10-07T08:08:00Z', url: 'https://github.com/example/repo/pull/7', reason: null } }),
+  }));
+  const mergedPoll = page.waitForResponse(response => response.url().endsWith('/api/merge'));
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: /P1 Expose the retry ceiling/ }).click();
+  await mergedPoll;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+
+  const staleReloadResponse = page.waitForResponse(response => response.url().endsWith('/api/review'));
+  releaseReload();
+  await (await staleReloadResponse).finished();
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator('#repository')).toHaveText('import-replay-refreshed');
+  await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+  await expect(page.locator('#dialog-body')).toContainText('merged');
+  await expect(page.locator('#dialog-body')).toContainText('Fresh replay blocker is pending.');
+});
+
 test('preserves an unresolved import retry while another file is definitely refused', async ({ page }) => {
   await page.goto(app.url);
   await page.getByRole('link', { name: 'Plans', exact: true }).click();
@@ -686,13 +782,11 @@ test('does not let an older Plans refresh overwrite a newer terminal merge obser
   await capturedRefresh;
   expect(queued.actionId).toEqual(expect.any(String));
 
-  let polls = 0;
   await page.route('**/api/merge', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ queue: polls++ === 0
-      ? { ...queued, state: 'merged', phase: null, position: null, occurredAt: '2026-10-07T08:06:00Z', url: 'https://github.com/example/repo/pull/7', reason: null }
-      : queued }),
+    body: JSON.stringify({ queue: { ...queued, state: 'merged', phase: null, position: null,
+      occurredAt: '2026-10-07T08:06:00Z', url: 'https://github.com/example/repo/pull/7', reason: null } }),
   }));
   const mergedPoll = page.waitForResponse(response => response.url().endsWith('/api/merge'));
   await page.getByRole('link', { name: 'Review', exact: true }).click();
@@ -759,13 +853,11 @@ test('does not let an older Review refresh overwrite a newer terminal merge obse
   await capturedRefresh;
   expect(queued.actionId).toEqual(expect.any(String));
 
-  let polls = 0;
   await page.route('**/api/merge', route => route.fulfill({
     status: 200,
     contentType: 'application/json',
-    body: JSON.stringify({ queue: polls++ === 0
-      ? { ...queued, state: 'merged', phase: null, position: null, occurredAt: '2026-10-07T08:07:00Z', url: 'https://github.com/example/repo/pull/7', reason: null }
-      : queued }),
+    body: JSON.stringify({ queue: { ...queued, state: 'merged', phase: null, position: null,
+      occurredAt: '2026-10-07T08:07:00Z', url: 'https://github.com/example/repo/pull/7', reason: null } }),
   }));
   const mergedPoll = page.waitForResponse(response => response.url().endsWith('/api/merge'));
   await page.getByRole('button', { name: /P1 Bound exponential retries/ }).click();

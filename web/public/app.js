@@ -998,8 +998,10 @@ async function importPlan(event) {
       mergePollState = null;
       mergePollDelay = 2000;
       rememberDraft();
-      data = updated;
+      const newerQueue = newerMergeQueue(updated);
+      data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
       render();
+      if (newerQueue) showMergeQueueStatus(newerQueue);
       if ($("plan-file").files[0] === file) $("plan-file").value = "";
       renderPlanFile();
       setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
