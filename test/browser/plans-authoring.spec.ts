@@ -397,14 +397,15 @@ test('rejects failed output and marks consumed output stale', async ({ page }) =
   const { deps } = planning();
   await openPlans(page, deps);
   const snapshotId = app.service.load().snapshot.id;
-  let reads = 0;
+  let reads = 0, starts = 0;
   let releaseConsumed!: () => void;
   const consumedHeld = new Promise<void>(resolve => { releaseConsumed = resolve; });
-  await page.route('**/api/plan/suggestions', route => route.fulfill({
-    status: 200, contentType: 'application/json', body: JSON.stringify({
+  await page.route('**/api/plan/suggestions', route => {
+    starts++;
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
       result: { requestId: '12345678-1234-4123-8123-123456789abc' },
-    }),
-  }));
+    }) });
+  });
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
     if (reads > 1) await consumedHeld;
@@ -424,7 +425,9 @@ test('rejects failed output and marks consumed output stale', async ({ page }) =
   await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Dismiss suggestions' })).toHaveCount(0);
   await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(0);
-  await expect(suggest).not.toHaveAttribute('aria-disabled', 'true');
+  await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  await suggest.evaluate((button: HTMLButtonElement) => button.click());
+  expect(starts).toBe(1);
 });
 
 test('rejects a status response for the wrong planning operation', async ({ page }) => {
