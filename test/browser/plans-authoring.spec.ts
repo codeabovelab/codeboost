@@ -125,6 +125,30 @@ test('retries an ambiguous suggestion start with the exact request', async ({ pa
   await expect(guidance).toHaveValue('Do not replace these newer notes.');
 });
 
+test('reports a definite stale start refusal after an import advances the plan', async ({ page }) => {
+  const { deps, invocations } = planning();
+  let release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  const describe = deps.describe;
+  deps.describe = async signal => { arrived(); await held; return describe(signal); };
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await captured;
+  await page.getByLabel('Plan file').setInputFiles({
+    name: 'next-plan.json', mimeType: 'application/json', buffer: Buffer.from(JSON.stringify(draft(current))),
+  });
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  release();
+
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestion failed.' })).toContainText('Stale plan revision or snapshot');
+  await expect(page.getByRole('status').filter({ hasText: 'generated for r1' })).toHaveCount(0);
+  expect(invocations).toHaveLength(0);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+});
+
 test('keeps ownership while a malformed status response is retried', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
@@ -199,6 +223,40 @@ test('rejects an operation-specific payload that is unsafe to render', async ({ 
   expect(errors).toEqual([]);
   invocations[0]!.resolve(JSON.stringify(suggestions()));
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+});
+
+test('renders hostile suggestion and draft fields only as literal text', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  const hostileReply = '<img id="g2-injected-image" src=x onerror="window.__g2Injected=true">';
+  const hostileSummary = '\"><svg id="g2-injected-svg" onload="window.__g2Injected=true">';
+  const hostileReason = '<script id="g2-injected-script">window.__g2Injected=true</script>';
+  const hostileValue = '</p><button id="g2-injected-button">bad</button>';
+  const reply = suggestions();
+  reply.reply = hostileReply;
+  reply.edits[0] = { ...reply.edits[0]!, summary: hostileSummary, reason: hostileReason, value: hostileValue };
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(reply));
+  await expect(page.locator('#plan-author-result')).toContainText(hostileReply);
+  await expect(page.locator('#plan-author-result')).toContainText(hostileSummary);
+  await expect(page.locator('#plan-author-result')).toContainText(hostileReason);
+  await expect(page.locator('#plan-author-result')).toContainText(hostileValue);
+
+  const hostileDraftSummary = '<img id="g2-draft-image" src=x onerror="window.__g2Injected=true">';
+  const hostileDraftTitle = '\"><button id="g2-draft-button">draft</button>';
+  const hostileDraft = draft(current);
+  hostileDraft.summary = hostileDraftSummary;
+  hostileDraft.items[0] = { ...hostileDraft.items[0]!, title: hostileDraftTitle };
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(2);
+  invocations[1]!.resolve(JSON.stringify(hostileDraft));
+  await expect(page.locator('#plan-author-result')).toContainText(hostileDraftSummary);
+  await expect(page.locator('#plan-author-result')).toContainText(hostileDraftTitle);
+  for (const selector of ['#g2-injected-image', '#g2-injected-svg', '#g2-injected-script', '#g2-injected-button', '#g2-draft-image', '#g2-draft-button'])
+    await expect(page.locator(selector)).toHaveCount(0);
+  expect(await page.evaluate(() => (window as unknown as Record<string, unknown>).__g2Injected)).toBeUndefined();
 });
 
 test('keeps a completed result when the next request is refused', async ({ page }) => {

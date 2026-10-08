@@ -1025,16 +1025,17 @@ function renderPlanAuthor() {
     return;
   }
   const noun = request.mode === "draft" ? "draft" : "suggestions", stale = planAuthorStale(request);
+  const hasResult = !!(request.reply || request.plan);
   let tone = "neutral", message = "";
-  if (stale) { tone = "warn"; message = `! Stale ${noun} · generated for r${request.revision}`; }
-  else if (request.state === "starting") message = `Starting ${noun}…`;
-  else if (request.state === "pending") message = `Agent is preparing ${noun} for r${request.revision}…`;
-  else if (request.state === "cancelling") message = `Cancelling ${noun}…`;
+  if (request.state === "starting") message = `Starting ${noun}…`;
   else if (request.state === "uncertain") { tone = "warn"; message = `! The ${noun} request outcome is unknown. Retry the exact request.`; }
-  else if (request.state === "ready") { tone = "good"; message = `✓ ${request.mode === "draft" ? "Draft" : "Suggestions"} ready for r${request.revision}.`; }
   else if (request.state === "failed") { tone = "bad"; message = `✕ ${request.mode === "draft" ? "Draft" : "Suggestion"} failed. ${request.reason || "Try again."}`; }
-  else if (request.state === "invalidated") { tone = "warn"; message = `! ${request.mode === "draft" ? "Draft" : "Suggestions"} became stale. ${request.reason || "Reload and ask again."}`; }
+  else if (request.state === "cancelling") message = `Cancelling ${noun}…`;
   else if (request.state === "cancelled") message = `– ${request.mode === "draft" ? "Draft" : "Suggestions"} dismissed. ${request.reason || ""}`.trim();
+  else if (request.state === "invalidated") { tone = "warn"; message = `! ${request.mode === "draft" ? "Draft" : "Suggestions"} became stale. ${request.reason || "Reload and ask again."}`; }
+  else if (stale) { tone = "warn"; message = `! Stale ${hasResult ? `${noun} · generated` : `${noun} request · started`} for r${request.revision}`; }
+  else if (request.state === "pending") message = `Agent is preparing ${noun} for r${request.revision}…`;
+  else if (request.state === "ready") { tone = "good"; message = `✓ ${request.mode === "draft" ? "Draft" : "Suggestions"} ready for r${request.revision}.`; }
   if (request.observationError) message += ` Status check failed: ${request.observationError}`;
   $("plan-author-status").className = tone;
   $("plan-author-status").textContent = message;
