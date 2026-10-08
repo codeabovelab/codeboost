@@ -907,6 +907,7 @@ let planImportPending = false,
   planStatusGeneration = 0;
 let planAuthorGeneration = 0,
   planAuthorRequest = null;
+const planAuthorHistory = [];
 const planAuthorPollInitial = 500,
   planAuthorPollMaximum = 5000;
 function claimPlanStatus(className, text) {
@@ -949,6 +950,44 @@ function describePlanEdit(edit) {
     default: return "Change the plan";
   }
 }
+function validPlanAuthorStatus(status, mode) {
+  const states = ["pending", "ready", "failed", "cancelled", "invalidated", "consumed"];
+  if (!status || typeof status !== "object" || !states.includes(status.state) ||
+      !Number.isSafeInteger(status.revision) || status.revision < 1 ||
+      typeof status.snapshotId !== "string" || !status.snapshotId ||
+      !(status.reason === null || typeof status.reason === "string")) return false;
+  const terminalReason = ["failed", "cancelled", "invalidated"].includes(status.state);
+  if (terminalReason ? !(typeof status.reason === "string" && status.reason.length > 0) : status.reason !== null) return false;
+  const result = mode === "draft" ? status.plan : status.reply;
+  const validDraft = result && typeof result === "object" && Number.isSafeInteger(result.revision) &&
+    result.revision === status.revision + 1 && typeof result.summary === "string" && Array.isArray(result.items) &&
+    result.items.every((item) => item && typeof item.id === "string" && typeof item.title === "string");
+  const validReply = result && typeof result === "object" && Number.isSafeInteger(result.base_revision) &&
+    result.base_revision === status.revision && typeof result.reply === "string" && Array.isArray(result.edits) && result.edits.every((edit) =>
+      edit && ["add_item", "remove_item", "set_field", "add_file", "update_file", "remove_file", "add_check", "remove_check", "set_depends"].includes(edit.op) && typeof edit.item === "string" &&
+      typeof edit.summary === "string" && typeof edit.reason === "string");
+  const validResult = mode === "draft" ? validDraft : validReply;
+  if (status.state === "pending") return result === null;
+  if (["ready", "consumed"].includes(status.state)) return !!validResult;
+  return result === null || !!validResult;
+}
+function planAuthorResultMarkup(request, historical = false) {
+  const stale = planAuthorStale(request);
+  const historyMark = historical ? ` <span class="${stale ? "warn" : "muted"}">${stale ? "! Stale" : "– Earlier result"}</span>` : "";
+  let result = "";
+  if (request.mode === "suggest" && request.reply) {
+    result = `<div class="plan-author-result-heading"><strong>${historical ? "Earlier suggested edits" : "Suggested edits"}</strong> <span class="mono muted">r${esc(request.revision)}</span>${historyMark}</div>
+      ${request.reply.reply ? `<p class="plan-author-reply">${esc(request.reply.reply)}</p>` : ""}
+      ${request.reply.edits.map((edit) => `<article class="suggestion-row" aria-label="${esc(edit.summary)}"><header><code>${esc(edit.item)}</code><h3>${esc(edit.summary)}</h3></header><p>${esc(edit.reason)}</p><p class="suggestion-change">${esc(describePlanEdit(edit))}</p></article>`).join("") || '<p class="plan-author-reply muted">No edits were suggested.</p>'}`;
+  } else if (request.mode === "draft" && request.plan) {
+    result = `<div class="plan-author-result-heading"><strong>${historical ? "Earlier draft revision" : "Draft revision"}</strong> <span class="mono muted">r${esc(request.plan.revision)}</span>${historyMark}</div>
+      <section class="draft-preview" aria-label="Draft ${esc(request.plan.summary)}"><header><h3>${esc(request.plan.summary)}</h3></header>
+      <ul class="draft-items">${request.plan.items.map((item) => `<li><code>${esc(item.id)}</code> ${esc(item.title)}</li>`).join("")}</ul></section>`;
+  }
+  if (!historical && result && request.requestId && !["cancelled", "consumed"].includes(request.state))
+    result += `<div class="plan-author-result-actions"><button type="button" id="plan-author-dismiss"${request.state === "cancelling" ? ' aria-disabled="true"' : ""}>${request.state === "cancelling" ? "Dismissing…" : `Dismiss ${request.mode === "draft" ? "draft" : "suggestions"}`}</button></div>`;
+  return result;
+}
 function renderPlanAuthor() {
   const restoreDismissFocus = document.activeElement?.id === "plan-author-dismiss";
   const request = planAuthorRequest, unavailable = !data?.plan;
@@ -984,19 +1023,7 @@ function renderPlanAuthor() {
   if (request.observationError) message += ` Status check failed: ${request.observationError}`;
   $("plan-author-status").className = tone;
   $("plan-author-status").textContent = message;
-  let result = "";
-  if (request.mode === "suggest" && request.reply) {
-    result = `<div class="plan-author-result-heading"><strong>Suggested edits</strong> <span class="mono muted">r${esc(request.revision)}</span></div>
-      ${request.reply.reply ? `<p class="plan-author-reply">${esc(request.reply.reply)}</p>` : ""}
-      ${request.reply.edits.map((edit) => `<article class="suggestion-row" aria-label="${esc(edit.summary)}"><header><code>${esc(edit.item)}</code><h3>${esc(edit.summary)}</h3></header><p>${esc(edit.reason)}</p><p class="suggestion-change">${esc(describePlanEdit(edit))}</p></article>`).join("") || '<p class="plan-author-reply muted">No edits were suggested.</p>'}`;
-  } else if (request.mode === "draft" && request.plan) {
-    result = `<div class="plan-author-result-heading"><strong>Draft revision</strong> <span class="mono muted">r${esc(request.plan.revision)}</span></div>
-      <section class="draft-preview" aria-label="Draft ${esc(request.plan.summary)}"><header><h3>${esc(request.plan.summary)}</h3></header>
-      <ul class="draft-items">${request.plan.items.map((item) => `<li><code>${esc(item.id)}</code> ${esc(item.title)}</li>`).join("")}</ul></section>`;
-  }
-  if (result && request.requestId && !["cancelled", "consumed"].includes(request.state))
-    result += `<div class="plan-author-result-actions"><button type="button" id="plan-author-dismiss"${request.state === "cancelling" ? ' aria-disabled="true"' : ""}>${request.state === "cancelling" ? "Dismissing…" : `Dismiss ${request.mode === "draft" ? "draft" : "suggestions"}`}</button></div>`;
-  $("plan-author-result").innerHTML = result;
+  $("plan-author-result").innerHTML = [planAuthorResultMarkup(request), ...planAuthorHistory.map(entry => planAuthorResultMarkup(entry, true))].join("");
   $("plan-author-dismiss")?.addEventListener("click", dismissPlanAuthor);
   if (restoreDismissFocus) $("plan-author-dismiss")?.focus();
 }
@@ -1136,9 +1163,11 @@ async function pollPlanAuthor(generation) {
   const request = planAuthorRequest;
   if (!request || request.generation !== generation || !request.requestId) return;
   request.pollTimer = null;
+  const operationGeneration = request.operationGeneration;
   try {
     const status = await api(`/api/plan/${request.mode === "draft" ? "drafts" : "suggestions"}/${request.requestId}`);
-    if (planAuthorRequest !== request || request.generation !== generation) return;
+    if (planAuthorRequest !== request || request.generation !== generation || request.operationGeneration !== operationGeneration) return;
+    if (!validPlanAuthorStatus(status, request.mode)) throw new Error("Planning status response was incomplete or invalid.");
     const changed = request.state !== status.state;
     request.state = status.state;
     request.revision = status.revision;
@@ -1147,11 +1176,12 @@ async function pollPlanAuthor(generation) {
     request.observationError = null;
     if (request.mode === "draft") request.plan = status.plan;
     else request.reply = status.reply;
+    request.operationGeneration++;
     request.pollDelay = changed ? planAuthorPollInitial : Math.min(request.pollDelay * 2, planAuthorPollMaximum);
     renderPlanAuthor();
     if (request.state === "pending") schedulePlanAuthorPoll(generation);
   } catch (error) {
-    if (planAuthorRequest !== request || request.generation !== generation) return;
+    if (planAuthorRequest !== request || request.generation !== generation || request.operationGeneration !== operationGeneration) return;
     request.observationError = error.message;
     request.pollDelay = Math.min(request.pollDelay * 2, planAuthorPollMaximum);
     renderPlanAuthor();
@@ -1173,6 +1203,8 @@ async function startPlanAuthor(mode) {
     feedback: $("plan-feedback").value,
     actionId: crypto.randomUUID(),
   };
+  if (planAuthorRequest?.reply || planAuthorRequest?.plan)
+    planAuthorHistory.unshift({ ...planAuthorRequest, pollTimer: null });
   const request = {
     generation: ++planAuthorGeneration,
     mode,
@@ -1188,6 +1220,7 @@ async function startPlanAuthor(mode) {
     pollDelay: planAuthorPollInitial,
     pollTimer: null,
     cancelActionId: null,
+    operationGeneration: 0,
   };
   planAuthorRequest = request;
   renderPlanAuthor();
@@ -1195,7 +1228,8 @@ async function startPlanAuthor(mode) {
     const response = await api(`/api/plan/${mode === "draft" ? "drafts" : "suggestions"}`, requestBody);
     if (planAuthorRequest !== request) return;
     const requestId = response.result?.requestId;
-    if (typeof requestId !== "string") throw new Error("The planning request started without an ID.");
+    if (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId))
+      throw new Error("The planning request started without a valid ID.");
     request.requestId = requestId;
     request.state = "pending";
     renderPlanAuthor();
@@ -1212,7 +1246,7 @@ async function dismissPlanAuthor() {
   const request = planAuthorRequest;
   if (!request?.requestId || planAuthorBusy()) return;
   request.cancelActionId ??= crypto.randomUUID();
-  const previousState = request.state;
+  request.operationGeneration++;
   request.state = "cancelling";
   renderPlanAuthor();
   try {
@@ -1222,7 +1256,8 @@ async function dismissPlanAuthor() {
     schedulePlanAuthorPoll(request.generation, 0);
   } catch (error) {
     if (planAuthorRequest !== request) return;
-    request.state = previousState;
+    const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
+    if (!ambiguous) request.cancelActionId = null;
     request.observationError = error.message;
     renderPlanAuthor();
     schedulePlanAuthorPoll(request.generation);

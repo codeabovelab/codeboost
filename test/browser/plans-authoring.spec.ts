@@ -125,6 +125,45 @@ test('retries an ambiguous suggestion start with the exact request', async ({ pa
   await expect(guidance).toHaveValue('Do not replace these newer notes.');
 });
 
+test('keeps ownership while a malformed status response is retried', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  let reads = 0;
+  await page.route('**/api/plan/suggestions/*', async route => {
+    reads++;
+    if (reads === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ state: 'surprise' }) });
+      return;
+    }
+    await route.continue();
+  });
+  const suggest = page.locator('#plan-suggest');
+  await suggest.click();
+  await expect.poll(() => invocations.length).toBe(1);
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete or invalid.' })).toBeVisible();
+  await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  await suggest.evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+  expect(invocations).toHaveLength(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+});
+
+test('keeps a completed result when the next request is refused', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
+  await page.route('**/api/plan/drafts', route => route.fulfill({
+    status: 409, contentType: 'application/json', body: JSON.stringify({ error: 'Drafting is temporarily unavailable.' }),
+  }));
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Draft failed.' })).toContainText('temporarily unavailable');
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
+  await expect(page.getByText('Earlier suggested edits')).toBeVisible();
+});
+
 test('dismisses ready suggestions without changing the plan', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
@@ -145,6 +184,41 @@ test('dismisses ready suggestions without changing the plan', async ({ page }) =
   release();
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions dismissed.' })).toBeVisible();
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(1);
+});
+
+test('blocks repeat dismissal until an ambiguous cancellation is reconciled', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  const dismiss = page.locator('#plan-author-dismiss');
+  await expect(dismiss).toBeVisible();
+  let cancels = 0, release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  await page.route('**/api/plan/suggestions/*/cancel', async route => {
+    cancels++;
+    if (cancels === 1) await route.abort('failed');
+    else await route.continue();
+  });
+  await page.route('**/api/plan/suggestions/*', async route => {
+    if (route.request().method() !== 'GET') { await route.fallback(); return; }
+    const response = await route.fetch();
+    arrived();
+    await held;
+    await route.fulfill({ response });
+  });
+  await dismiss.click();
+  await captured;
+  await expect(dismiss).toHaveAttribute('aria-disabled', 'true');
+  await dismiss.evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+  expect(cancels).toBe(1);
+  release();
+  await expect(page.getByRole('button', { name: 'Dismiss suggestions' })).toBeVisible();
+  await page.getByRole('button', { name: 'Dismiss suggestions' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions dismissed.' })).toBeVisible();
+  expect(cancels).toBe(2);
 });
 
 test('marks a delayed suggestion poll stale after an import advances the plan', async ({ page }) => {
