@@ -950,26 +950,77 @@ function describePlanEdit(edit) {
     default: return "Change the plan";
   }
 }
+function exactObject(value, keys) {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+function boundedText(value, minimum, maximum) {
+  return typeof value === "string" && value.length >= minimum && value.length <= maximum;
+}
+function validPlanId(value) {
+  return typeof value === "string" && /^P[1-9][0-9]{0,2}$/.test(value);
+}
+function validPlanFileForDisplay(file) {
+  return exactObject(file, ["path", "kind", "renamed_from", "change"]) &&
+    boundedText(file.path, 1, 300) && /^[^/\\][^\\]*$/.test(file.path) &&
+    ["edit", "add", "delete", "rename"].includes(file.kind) &&
+    (file.renamed_from === null || boundedText(file.renamed_from, 0, 300)) &&
+    boundedText(file.change, 1, 1200);
+}
+function validPlanCheckForDisplay(check) {
+  return exactObject(check, ["type", "text"]) && ["cmd", "check"].includes(check.type) &&
+    boundedText(check.text, 1, 400);
+}
+function validPlanItemForDisplay(item) {
+  return exactObject(item, ["id", "title", "intent", "files", "acceptance", "depends_on"]) &&
+    validPlanId(item.id) && boundedText(item.title, 1, 120) && boundedText(item.intent, 1, 600) &&
+    Array.isArray(item.files) && item.files.length >= 1 && item.files.length <= 40 && item.files.every(validPlanFileForDisplay) &&
+    Array.isArray(item.acceptance) && item.acceptance.length >= 1 && item.acceptance.length <= 10 && item.acceptance.every(validPlanCheckForDisplay) &&
+    Array.isArray(item.depends_on) && item.depends_on.length <= 29 && item.depends_on.every(validPlanId);
+}
+function validPlanForDisplay(plan) {
+  return exactObject(plan, ["schema_version", "issue", "revision", "summary", "items", "questions"]) &&
+    plan.schema_version === 1 && Number.isSafeInteger(plan.issue) && plan.issue >= 1 &&
+    Number.isSafeInteger(plan.revision) && plan.revision >= 1 && boundedText(plan.summary, 1, 600) &&
+    Array.isArray(plan.items) && plan.items.length >= 1 && plan.items.length <= 30 && plan.items.every(validPlanItemForDisplay) &&
+    Array.isArray(plan.questions) && plan.questions.length <= 10 && plan.questions.every((question) => boundedText(question, 1, 400));
+}
 function validPlanEditForDisplay(edit) {
-  if (!edit || typeof edit.item !== "string" || typeof edit.summary !== "string" || typeof edit.reason !== "string") return false;
+  const payloads = ["field", "value", "file", "check", "check_index", "depends_on", "new_item"];
+  const used = {
+    add_item: ["new_item"], remove_item: [], set_field: ["field", "value"],
+    add_file: ["file"], update_file: ["file"], remove_file: ["value"],
+    add_check: ["check"], remove_check: ["check_index"], set_depends: ["depends_on"],
+  };
+  const operationPayloads = Object.hasOwn(used, edit?.op) ? used[edit.op] : null;
+  if (!exactObject(edit, ["op", "item", "summary", "reason", ...payloads]) || !operationPayloads ||
+      !validPlanId(edit.item) || !boundedText(edit.summary, 1, 160) || !boundedText(edit.reason, 1, 400) ||
+      payloads.some((key) => operationPayloads.includes(key) ? edit[key] === null : edit[key] !== null)) return false;
   switch (edit.op) {
-    case "add_item":
+    case "add_item": return validPlanItemForDisplay(edit.new_item) && edit.new_item.id === edit.item;
     case "remove_item": return true;
-    case "set_field": return ["title", "intent"].includes(edit.field) && typeof edit.value === "string";
+    case "set_field": return ["title", "intent"].includes(edit.field) && boundedText(edit.value, 0, 1200);
     case "add_file":
-    case "update_file": return !!edit.file && typeof edit.file === "object" && typeof edit.file.path === "string";
-    case "remove_file": return typeof edit.value === "string";
-    case "add_check": return !!edit.check && typeof edit.check === "object" && typeof edit.check.type === "string";
+    case "update_file": return validPlanFileForDisplay(edit.file);
+    case "remove_file": return boundedText(edit.value, 0, 1200);
+    case "add_check": return validPlanCheckForDisplay(edit.check);
     case "remove_check": return Number.isSafeInteger(edit.check_index) && edit.check_index >= 0;
-    case "set_depends": return Array.isArray(edit.depends_on) && edit.depends_on.every((item) => typeof item === "string");
+    case "set_depends": return Array.isArray(edit.depends_on) && edit.depends_on.length <= 29 && edit.depends_on.every(validPlanId);
     default: return false;
   }
 }
+function validEditReplyForDisplay(reply, revision) {
+  return exactObject(reply, ["schema_version", "base_revision", "reply", "edits"]) && reply.schema_version === 1 &&
+    Number.isSafeInteger(reply.base_revision) && reply.base_revision === revision && boundedText(reply.reply, 0, 4000) &&
+    Array.isArray(reply.edits) && reply.edits.length <= 10 && reply.edits.every(validPlanEditForDisplay);
+}
 function validPlanAuthorStatus(status, request) {
   const states = ["pending", "ready", "failed", "cancelled", "invalidated", "consumed"];
-  const objectStatus = !!status && typeof status === "object";
-  const validMode = objectStatus && (request.mode === "suggest" ? status.mode === "suggest" : !("mode" in status));
-  if (!objectStatus || !validMode || !states.includes(status.state) ||
+  const statusKeys = request.mode === "suggest" ? ["mode", "state", "revision", "snapshotId", "reply", "reason"]
+    : ["state", "revision", "snapshotId", "plan", "reason"];
+  const validShape = exactObject(status, statusKeys);
+  const validMode = validShape && (request.mode === "suggest" ? status.mode === "suggest" : !("mode" in status));
+  if (!validShape || !validMode || !states.includes(status.state) ||
       !Number.isSafeInteger(status.revision) || status.revision < 1 ||
       typeof status.snapshotId !== "string" || !status.snapshotId ||
       status.revision !== request.revision || status.snapshotId !== request.snapshotId ||
@@ -977,12 +1028,8 @@ function validPlanAuthorStatus(status, request) {
   const terminalReason = ["failed", "cancelled", "invalidated"].includes(status.state);
   if (terminalReason ? !(typeof status.reason === "string" && status.reason.length > 0) : status.reason !== null) return false;
   const result = request.mode === "draft" ? status.plan : status.reply;
-  const validDraft = result && typeof result === "object" && Number.isSafeInteger(result.revision) &&
-    result.revision === status.revision + 1 && typeof result.summary === "string" && Array.isArray(result.items) &&
-    result.items.every((item) => item && typeof item.id === "string" && typeof item.title === "string");
-  const validReply = result && typeof result === "object" && Number.isSafeInteger(result.base_revision) &&
-    result.base_revision === status.revision && typeof result.reply === "string" && Array.isArray(result.edits) &&
-    result.edits.every(validPlanEditForDisplay);
+  const validDraft = validPlanForDisplay(result) && result.issue === request.issue && result.revision === status.revision + 1;
+  const validReply = validEditReplyForDisplay(result, status.revision);
   const validResult = request.mode === "draft" ? validDraft : validReply;
   if (status.state === "pending") return result === null;
   if (["ready", "consumed"].includes(status.state)) return !!validResult;
@@ -1232,6 +1279,7 @@ async function startPlanAuthor(mode) {
     state: "starting",
     revision: requestBody.expectedRevision,
     snapshotId: requestBody.snapshotId,
+    issue: data.plan.issue,
     request: requestBody,
     requestId: null,
     reason: null,

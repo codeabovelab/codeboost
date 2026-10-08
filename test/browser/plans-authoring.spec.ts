@@ -96,13 +96,63 @@ test('renders suggestion cards and preserves guidance edited after submission', 
   expect(invocations[0]!.request.prompt).toContain('Make the plan clearer.');
 });
 
+test('accepts complete payloads for every edit operation', async ({ page }) => {
+  const { deps } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  const snapshotId = app.service.load().snapshot.id;
+  const card = (op: EditReply['edits'][number]['op'], payload: Record<string, unknown> = {}, item = 'P1') => ({
+    op, item, summary: `Exercise ${op}`, reason: `The ${op} payload is complete.`,
+    field: null, value: null, file: null, check: null, check_index: null, depends_on: null, new_item: null, ...payload,
+  }) as EditReply['edits'][number];
+  const newItem = { ...structuredClone(current.items[0]!), id: 'P4', depends_on: ['P1'] };
+  const reply: EditReply = { ...suggestions(), edits: [
+    card('add_item', { new_item: newItem }, 'P4'),
+    card('set_field', { field: 'intent', value: 'Explain the bounded retry behavior.' }),
+    card('add_file', { file: { path: 'added.ts', kind: 'add', renamed_from: null, change: 'Add the helper.' } }),
+    card('update_file', { file: { path: 'retry.ts', kind: 'edit', renamed_from: null, change: 'Clarify retries.' } }),
+    card('remove_file', { value: 'retry.ts' }),
+    card('add_check', { check: { type: 'check', text: 'Retries stay bounded.' } }),
+    card('remove_check', { check_index: 0 }),
+    card('set_depends', { depends_on: [] }),
+    card('remove_item', {}, 'P3'),
+  ] };
+  const requestId = '12345678-1234-4123-8123-123456789abc';
+  await page.route('**/api/plan/suggestions', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ result: { requestId } }),
+  }));
+  await page.route(`**/api/plan/suggestions/${requestId}`, route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      mode: 'suggest', state: 'ready', revision: 1, snapshotId, reply, reason: null,
+    }),
+  }));
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+  await expect(page.locator('.suggestion-row')).toHaveCount(9);
+});
+
 test('renders a whole next-revision draft without changing the current plan', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
   const current = app.service.store.getPlan(app.service.config.identity);
+  const snapshotId = app.service.load().snapshot.id;
+  let reads = 0;
+  await page.route('**/api/plan/drafts/*', async route => {
+    reads++;
+    if (reads === 1) {
+      const malformed = { ...draft(current), items: [{ id: 'P1', title: 'Incomplete item' }] };
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        state: 'ready', revision: 1, snapshotId, plan: malformed, reason: null,
+      }) });
+      return;
+    }
+    await route.continue();
+  });
   await page.getByLabel('Guidance').fill('Rewrite the plan around operator visibility.');
   await page.getByRole('button', { name: 'Draft next revision' }).click();
   await expect.poll(() => invocations.length).toBe(1);
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Draft Make retry limits visible to operators' })).toHaveCount(0);
   invocations[0]!.resolve(JSON.stringify(draft(current)));
 
   await expect(page.getByRole('status').filter({ hasText: 'Draft ready for r1.' })).toBeVisible();
@@ -287,9 +337,12 @@ test('rejects an operation-specific payload that is unsafe to render', async ({ 
   let reads = 0;
   await page.route('**/api/plan/suggestions/*', async route => {
     reads++;
-    if (reads === 1) {
+    if (reads <= 2) {
       const reply = suggestions();
-      const malformed = { ...reply, edits: [{ ...reply.edits[0], op: 'set_depends', field: null, value: null, depends_on: 'P2' }] };
+      const malformedEdit = reads === 1
+        ? { ...reply.edits[0], op: 'add_item', field: null, value: null, new_item: null }
+        : { ...reply.edits[0], op: 'add_file', field: null, value: null, file: { path: 'partial.ts' } };
+      const malformed = { ...reply, edits: [malformedEdit] };
       await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
         mode: 'suggest', state: 'ready', revision: 1, snapshotId, reply: malformed, reason: null,
       }) });
@@ -304,6 +357,8 @@ test('rejects an operation-specific payload that is unsafe to render', async ({ 
   await expect.poll(() => invocations.length).toBe(1);
   await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
   await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  await expect.poll(() => reads).toBeGreaterThanOrEqual(2);
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
   expect(errors).toEqual([]);
   invocations[0]!.resolve(JSON.stringify(suggestions()));
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
