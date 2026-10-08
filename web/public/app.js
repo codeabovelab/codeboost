@@ -25,6 +25,7 @@ let data,
 let reviewGeneration = 0;
 let view = "review";
 let mergeGeneration = 0,
+  mergeObservationGeneration = 0,
   mergePollTimer = null,
   mergePollState = null,
   mergePollDelay = 2000;
@@ -114,7 +115,10 @@ async function refresh() {
   const planStatusOwner = planStatusGeneration;
   const busyOwner = beginBusy("read");
   const generation = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
   mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
   mergePollState = null;
   mergePollDelay = 2000;
   renderAttachment();
@@ -129,7 +133,7 @@ async function refresh() {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated);
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
     snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
@@ -194,6 +198,7 @@ async function pollMergeQueue(generation) {
     const update = await api("/api/merge");
     if (generation !== mergeGeneration || !data?.merge?.available) return;
     const queue = update.queue;
+    mergeObservationGeneration++;
     data = withMergeQueue(data, queue);
     showMergeQueueStatus(queue);
     if (queue?.state === mergePollState) backOffMergePoll();
@@ -232,7 +237,10 @@ async function act(command) {
   supersedePlanRefresh();
   const busyOwner = beginBusy("write");
   const generation = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
   mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
   mergePollState = null;
   mergePollDelay = 2000;
   renderAttachment();
@@ -247,7 +255,7 @@ async function act(command) {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated);
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
     data = newerQueue ? withMergeQueue(updated, newerQueue) : updated;
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);
@@ -815,14 +823,12 @@ function preserveSettledQuestionAnswers(updated) {
       : note;
   }) };
 }
-function newerMergeQueue(updated) {
+function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
-  const progressed = newer?.state === "queued" && older?.state === "submitting" ||
-    ["merged", "removed", "failed"].includes(newer?.state) && ["submitting", "queued"].includes(older?.state);
-  return newer?.actionId &&
+  return observationOwner !== mergeObservationGeneration &&
+    newer?.actionId &&
     newer.actionId === older?.actionId &&
-    newer.reviewedHead === older.reviewedHead &&
-    progressed
+    newer.reviewedHead === older.reviewedHead
     ? newer
     : null;
 }
@@ -1004,6 +1010,7 @@ async function importPlan(event) {
       : `✓ Imported revision r${revision}. Reloading…`);
     try {
       rememberDraft();
+      const mergeObservationOwner = mergeObservationGeneration;
       const updated = await api("/api/review");
       if (sharedGeneration !== reviewGeneration) return;
       mergeGeneration++;
@@ -1012,7 +1019,7 @@ async function importPlan(event) {
       mergePollState = null;
       mergePollDelay = 2000;
       rememberDraft();
-      const newerQueue = newerMergeQueue(updated);
+      const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
       data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
       render();
       if (newerQueue) showMergeQueueStatus(newerQueue);
@@ -1230,6 +1237,7 @@ $("plans-refresh").onclick = async () => {
   if (busy) return;
   const generation = ++planOperationGeneration;
   let sharedGeneration = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
   mergeGeneration++;
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
@@ -1250,7 +1258,7 @@ $("plans-refresh").onclick = async () => {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    const newerQueue = newerMergeQueue(updated);
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
     data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);

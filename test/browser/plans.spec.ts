@@ -784,7 +784,7 @@ test('does not let a merge poll started during a review action replace restored 
   expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({ id: attempt.id, state: 'removed' });
 });
 
-test('does not let an older review action response replace a confirmed queued merge with submitting', async ({ page }) => {
+test('does not let an older review action response replace a newer queued observation', async ({ page }) => {
   test.slow();
   const config = { ...app.service.config, demo: false };
   await app.close();
@@ -799,7 +799,7 @@ test('does not let an older review action response replace a confirmed queued me
     },
     queueWatermark: async () => null,
     merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
-    inspectQueue: async head => ({ state: 'queued', reviewedHead: head, entryId: 'MQE_3', phase: 'QUEUED', position: 3,
+    inspectQueue: async head => ({ state: 'queued', reviewedHead: head, entryId: 'MQE_3', phase: 'QUEUED', position: 2,
       enqueuedAt: '2026-10-08T08:10:00Z', queueHead: head }),
   };
   app = appRef = await startServer(config, 0, undefined, gateway);
@@ -809,16 +809,19 @@ test('does not let an older review action response replace a confirmed queued me
   for (const item of review.items)
     review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
   const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
-  const staleReview = await page.request.get(new URL('/api/review', app.url).toString(), {
-    headers: { 'x-codeboost-token': app.token },
-  });
-  const actionResponse = await staleReview.json();
-  expect(actionResponse.merge.queue).toMatchObject({ actionId: attempt.actionId, reviewedHead: review.snapshot.head, state: 'submitting' });
+  app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
+  app.service.store.observeQueuedMerge(config.identity, attempt.id, { entryId: 'MQE_3', phase: 'QUEUED', position: 3 });
 
   let releaseAction!: () => void, actionArrived!: () => void;
   const heldAction = new Promise<void>(resolve => { releaseAction = resolve; });
   const capturedAction = new Promise<void>(resolve => { actionArrived = resolve; });
+  let actionPending = false;
   await page.route('**/api/action', async route => {
+    const response = await route.fetch();
+    const actionResponse = await response.json();
+    expect(actionResponse.merge.queue).toMatchObject({ actionId: attempt.actionId, reviewedHead: review.snapshot.head,
+      state: 'queued', phase: 'QUEUED', position: 3 });
+    actionPending = true;
     actionArrived();
     await heldAction;
     await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(actionResponse) });
@@ -826,30 +829,49 @@ test('does not let an older review action response replace a confirmed queued me
   let polls = 0, releaseLaterPolls!: () => void;
   const heldLaterPolls = new Promise<void>(resolve => { releaseLaterPolls = resolve; });
   await page.route('**/api/merge', async route => {
+    if (!actionPending) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ queue: {
+        kind: 'queue', state: 'queued', actionId: attempt.actionId, reviewedHead: review.snapshot.head,
+        url: 'https://github.com/example/repo/pull/7', reason: null, phase: 'QUEUED', position: 3,
+        occurredAt: '2026-10-08T08:05:00Z', retryable: false,
+      } }) });
+      return;
+    }
     polls++;
     if (polls > 1) await heldLaterPolls;
     await route.continue();
   });
 
   await page.goto(app.url);
-  await expect(page.getByRole('button', { name: 'Submitting…', exact: true })).toBeDisabled();
+  await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
   await page.getByRole('button', { name: 'Request change', exact: true }).click();
   await page.getByLabel('Change to request').fill('Preserve queue progress after this response.');
   await page.getByRole('button', { name: 'Save change request', exact: true }).click();
   await capturedAction;
   try {
-    const queuedPoll = page.waitForResponse(response => response.url().endsWith('/api/merge'));
+    const queuedPoll = page.waitForResponse(async response => response.url().endsWith('/api/merge') &&
+      (await response.json()).queue?.position === 2);
     await page.getByRole('button', { name: /P2 Document retry behavior/ }).click();
     await (await queuedPoll).finished();
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+    await expect(page.locator('#dialog-body')).toContainText('position 2');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
+    expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({ id: attempt.id, state: 'queued', position: 2 });
 
     const staleAction = page.waitForResponse(response => response.url().endsWith('/api/action'));
     releaseAction();
     await (await staleAction).finished();
     await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
     await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: /P1 Bound exponential retries/ }).click();
+    await expect(page.getByText('Preserve queue progress after this response.', { exact: true })).toBeVisible();
+    await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+    await expect(page.locator('#dialog-body')).toContainText('position 2');
+    await page.getByRole('button', { name: 'Close', exact: true }).click();
     expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({ id: attempt.id, state: 'queued' });
+    expect(app.service.store.getReviewNotes(config.identity).some(note => note.text === 'Preserve queue progress after this response.')).toBe(true);
   } finally {
     releaseLaterPolls();
   }
