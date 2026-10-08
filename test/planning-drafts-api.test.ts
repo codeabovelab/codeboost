@@ -252,9 +252,23 @@ it('does not record a storage error on a cancel as a refusal, so the same action
   const failing = vi.spyOn(Store.prototype, 'requestMode').mockImplementationOnce(() => {
     throw Object.assign(new Error('disk I/O error'), { code: 'ERR_SQLITE_ERROR' }); });
   const cancel = { actionId: randomUUID() };
-  expect((await served.api('POST', `/api/plan/drafts/${id}/cancel`, cancel)).body.error).toBe('disk I/O error');
+  expect(await served.api('POST', `/api/plan/drafts/${id}/cancel`, cancel))
+    .toEqual({ status: 503, body: { error: 'disk I/O error', outcomeUnknown: true } });
   failing.mockRestore();
   expect(await served.api('POST', `/api/plan/drafts/${id}/cancel`, cancel)).toEqual({ status: 200, body: { result: { state: 'cancelled' } } });
+});
+
+it('reports an unrecorded Apply storage error as retryable and replays the same action ID', async () => {
+  const served = await serve(redraft), id = (await served.start('drafts')).body.result.requestId as string;
+  await served.settled('drafts', id);
+  const failing = vi.spyOn(Store.prototype, 'applyDraft').mockImplementationOnce(() => {
+    throw Object.assign(new Error('database is locked'), { code: 'ERR_SQLITE_ERROR' }); });
+  const apply = { actionId: randomUUID() };
+  expect(await served.api('POST', `/api/plan/drafts/${id}/apply`, apply))
+    .toEqual({ status: 503, body: { error: 'database is locked', outcomeUnknown: true } });
+  failing.mockRestore();
+  expect(await served.api('POST', `/api/plan/drafts/${id}/apply`, apply))
+    .toEqual({ status: 200, body: { result: { revision: served.view.plan.revision + 1 } } });
 });
 
 it('dismisses a ready draft, and cancels a pending one when the server shuts down', async () => {
