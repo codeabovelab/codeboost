@@ -177,6 +177,16 @@ it('returns to review when a moved-base rewrite changes an approved fingerprint'
   await coordinator.close(); await runner.close();
 });
 
+it('marks a failed preparation stale when its final remote inspection was invalidated by a review edit', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringFinalInspect(service) {
+    const current = service.load();
+    service.store.addReviewNote(service.config.identity, current.expected, 'P1', 'change', 'Changed during inspection.');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/changed during preparation/i) });
+  expect(fixture.coordinator.last?.stale).toBe(true);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('leaves an unsettled conflict and its rebase marker for startup recovery', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { unsettledRebase: true });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Conflict resources remain owned.' });

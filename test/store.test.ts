@@ -271,6 +271,44 @@ it('preserves owned, foreign, and conflict-resolution provenance through repeate
   expect(recovered.getLedger(identity).find(e => e.sha === oid(24))).toEqual({ sha: oid(24), owner: null, origin: 'foreign', sourceSha: oid(14) });
   expect(recovered.getRewrites(identity, snapshot.id)).toHaveLength(3);
 });
+it('preserves execution approval recorded at the rewritten final output snapshot', () => {
+  const { store } = fixture();
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: store.currentContext(identity) });
+  store.markRunning(identity, attempt.id);
+  store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: false, head: oid(3) } });
+  store.recordHistory(identity, state(store), oid(1), oid(3), [
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+  ]);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  store.recordRebase(identity, state(store), oid(10), oid(13), [
+    { oldSha: oid(2), newSha: oid(12) }, { oldSha: oid(3), newSha: oid(13) },
+  ]);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+});
+it('preserves an approved checkpoint continuation across its validated rewrite lineage', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: store.currentContext(identity) });
+  store.markRunning(identity, attempt.id);
+  store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: false, head: oid(2) } });
+  const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'],
+    outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  store.approveContinuation(identity, checkpoint.id, state(store), context);
+  store.recordRebase(identity, state(store), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+  const progress = store.continuationProgress(identity);
+  expect(progress).toMatchObject({ completed: ['P1'], head: oid(12), next: 'P2' });
+  expect(store.continuationApproved(identity, progress!)).toBe(true);
+});
 it('feeds persisted remapped ownership into the linking engine on real Git history', () => {
   const dir = directory(); const git = (...args: string[]) => fixtureGit(dir, ...args);
   git('init', '-b', 'main'); git('config', 'user.name', 'Test'); git('config', 'user.email', 'test@example.invalid'); git('config', 'commit.gpgsign', 'false');

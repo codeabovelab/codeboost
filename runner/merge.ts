@@ -45,6 +45,12 @@ export interface PublishedTarget {
 class MergeTargetUnavailable extends Error { blockers: MergeBlocker[] = []; }
 /** The PR one status read inspected. `openingId` is set for the task's published PR, which admission re-reads. */
 interface ResolvedTarget { target?: MergeTarget; openingId: string | null; marker?: string; headBranch?: string }
+interface MergeAuthorization {
+  /** Complete the last external authorization read before the final PR identity/mode inspection. */
+  refresh(): Promise<void>;
+  /** Recheck only local trust state after that inspection, without opening another external race. */
+  validate(): void;
+}
 
 function queueGateway(gateway: MergeGateway): gateway is QueueGateway {
   const queue = gateway as Partial<MergeQueueGateway>;
@@ -63,7 +69,7 @@ export class MergeCoordinator {
   readonly gateway: MergeGateway;
   readonly operationTimeoutMs: number;
   readonly published: PublishedTarget | null;
-  #authorize: ((signal: AbortSignal) => Promise<() => void | Promise<void>>) | null = null;
+  #authorize: ((signal: AbortSignal) => Promise<MergeAuthorization>) | null = null;
   /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
   #settle: <T>(fn: () => T) => T;
   constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability, published?: PublishedTarget) {
@@ -74,7 +80,7 @@ export class MergeCoordinator {
   }
 
   /** Install the production issue-trust guard once the server's issue gateway is available. */
-  setAuthorization(authorize: (signal: AbortSignal) => Promise<() => void | Promise<void>>): void {
+  setAuthorization(authorize: (signal: AbortSignal) => Promise<MergeAuthorization>): void {
     if (this.#authorize) throw new Error('Merge authorization is already configured.');
     this.#authorize = authorize;
   }
@@ -366,9 +372,9 @@ export class MergeCoordinator {
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
-      // Capture the externally authorized issue identity before validation, then re-read it after every other await and
-      // immediately before the local admission transaction. A revoked trust record or changed author fails closed.
-      const validateAuthorization = this.#authorize ? await this.#authorize(signal) : null;
+      // Capture the externally authorized issue identity before validation. Its final external refresh precedes the
+      // final PR inspection; a synchronous local trust check then closes the admission window without another await.
+      const authorization = this.#authorize ? await this.#authorize(signal) : null;
       const { status, resolved } = await this.#statusForMerge(view, signal);
       if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
       view = this.service.load();
@@ -393,17 +399,17 @@ export class MergeCoordinator {
           throw new Error('Merge-queue requirements changed after queue correlation. Refresh before merging.');
         if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
       }
-      if (validateAuthorization) {
-        await validateAuthorization();
+      if (authorization) {
+        await authorization.refresh();
         const authorized = await this.#statusForMerge(view, signal);
         if (authorized.status.remote.base !== commandStatus.remote.base || authorized.status.remote.head !== commandStatus.remote.head
           || authorized.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(authorized))
           throw new Error('The pull request changed during merge validation. Refresh before merging.');
         if (!authorized.status.ready)
           throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
-        // The final status read is asynchronous too. Reuse the captured identity validator so a trust or author change
-        // during that read is refused immediately before the synchronous durable admission.
-        await validateAuthorization();
+        // The external authorization read completed before the final remote inspection. Only local trust state is read
+        // afterward, synchronously, so no await can reopen a PR identity or merge-mode race before durable admission.
+        authorization.validate();
         commandStatus = authorized.status;
       }
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');

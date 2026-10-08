@@ -201,11 +201,16 @@ it('uses a configured runner repository before the first changed runner commit',
  const {service,config}=fixture();service.config.runnerRepository=config.repository;
  expect(service.reviewRepository()).toEqual({path:config.repository,runnerOwned:true});
 });
+it('reads the base tree from the authoritative runner repository', () => {
+ const {service,config}=fixture();
+ service.config={...config,repository:join(config.repository,'missing'),runnerRepository:config.repository};
+ expect(service.planContext().baseEntries.length).toBeGreaterThan(0);
+});
 it('keeps a legacy malformed command visible and blocked so the plan can be amended', () => {
  const {service,config}=fixture();service.close();services.splice(services.indexOf(service),1);
  const db=new DatabaseSync(config.database),key=identityKey(config.identity);
  const row=db.prepare('SELECT data FROM revisions WHERE key=? AND revision=1').get(key)!;
- const plan=JSON.parse(row.data as string);plan.items[0].acceptance=[{type:'cmd',text:'node "\\ud800"'}];
+ const plan=JSON.parse(row.data as string);plan.items[0].acceptance=[{type:'cmd',text:`node "${String.fromCharCode(0xd800)}"`}];
  db.prepare('UPDATE revisions SET data=? WHERE key=? AND revision=1').run(JSON.stringify(plan),key);db.close();
  const reopened=new ReviewService(config);services.push(reopened);const view=reopened.load();
  expect(view.items[0]!.checks.tests).toBe('✕ Invalid command');

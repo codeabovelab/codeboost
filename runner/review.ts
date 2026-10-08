@@ -179,13 +179,14 @@ export class ReviewService {
   }
   /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */
   planContextAt(head?: string): PlanContext {
-    const { identity, repository } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const { identity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const repository = this.reviewRepository().path;
     const pathKey = this.#pathKey;
     // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
     const treeHead = head ?? snapshot.base;
     if (head && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Expected a full checkpoint head.');
     const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], {
-      cwd: head ? this.reviewRepository().path : repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer,
+      cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (this.#baseEntries?.base !== treeHead) {

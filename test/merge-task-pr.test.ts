@@ -140,7 +140,8 @@ describe('the merge gate with a runner block (#121)', () => {
     const calls: string[] = [];
     merges.setAuthorization(async () => {
       calls.push('capture');
-      return () => { calls.push('revalidate'); throw new GuardRefusal('Issue trust was revoked.'); };
+      return { refresh: async () => { calls.push('revalidate'); throw new GuardRefusal('Issue trust was revoked.'); },
+        validate: () => { calls.push('local'); } };
     });
     await expect(merges.merge('review-token')).rejects.toThrow('Issue trust was revoked.');
     expect(calls).toEqual(['capture', 'revalidate']);
@@ -154,7 +155,7 @@ describe('the merge gate with a runner block (#121)', () => {
     const gh = github(store, () => ({ base: remoteBase }));
     prepare(store);
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
-    merges.setAuthorization(async () => () => { remoteBase = oid(3); });
+    merges.setAuthorization(async () => ({ refresh: async () => { remoteBase = oid(3); }, validate: () => undefined }));
     await expect(merges.merge('review-token')).rejects.toThrow(/pull request changed during merge validation/i);
     expect(gh.merged).toEqual([]);
     expect(store.getMergeAttempt(identity)).toBeNull();
@@ -166,10 +167,23 @@ describe('the merge gate with a runner block (#121)', () => {
     gh.client.before = () => { if (++reads === 3) revoked = true; };
     prepare(store);
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
-    merges.setAuthorization(async () => () => {
+    merges.setAuthorization(async () => ({ refresh: async () => undefined, validate: () => {
       if (revoked) throw new GuardRefusal('Issue trust was revoked during the final pull request refresh.');
-    });
+    } }));
     await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final pull request refresh/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('completes the final external authorization read before validating merge-queue mode', async () => {
+    const { store } = published();
+    let mergeQueue = false, authorizationReads = 0;
+    const gh = github(store, () => ({ mergeQueue }));
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { if (++authorizationReads === 1) mergeQueue = true; },
+      validate: () => undefined }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/merge-queue|pull request changed/i);
     expect(gh.merged).toEqual([]);
     expect(store.getMergeAttempt(identity)).toBeNull();
   });

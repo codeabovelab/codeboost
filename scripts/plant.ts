@@ -76,7 +76,7 @@ export function plant(config: ReviewConfig, destination: string, input: PlantInp
     // A plant is a new identity over deliberately altered code. External bindings and command authorization from the
     // source review are not authority for it; both must be established again for this derived target.
     const output:ReviewConfig={...config,repository,database:join(root,'review.sqlite'),identity,demo:false,
-      github:undefined,allowedCommands:undefined};
+      github:undefined,runnerRepository:undefined,allowedCommands:undefined};
     const store=new Store(output.database);
     try{
       store.createPlan(JSON.stringify(plan),'json',{identity,issue:plan.issue,baseEntries,pathKey,allowedCommands:[]},snapshot.base,snapshot.head);

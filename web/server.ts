@@ -150,7 +150,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     requireTrustedIssue(access);
     return async () => requireTrustedIssue(await readIssueAccess(signal));
   };
-  if (config.github) merges?.setAuthorization(signal => authorizePublish!(identity, signal));
+  if (config.github) merges?.setAuthorization(async signal => {
+    let access = await readIssueAccess(signal);
+    requireTrustedIssue(access);
+    return {
+      refresh: async () => { access = await readIssueAccess(signal); requireTrustedIssue(access); },
+      validate: () => requireTrustedIssue(access),
+    };
+  });
   /**
    * What `start` or `resume` would run (#91 part 2), or the local refusal. It writes nothing, so the view asks it too.
    * The view also suppresses controls when the latest complete issue board says trust is blocked; every action still

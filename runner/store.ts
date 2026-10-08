@@ -1111,7 +1111,7 @@ export class Store {
   /** Before execution, approvals belong to the current snapshot; after a completed item, this revision's approvals survive its own commits. */
   unapprovedExecutionItems(identity: PlanIdentity, revision: number): string[] {
     const key = identityKey(identity), plan = this.getPlan(identity, revision);
-    const snapshotId = this.getSnapshot(identity).id, review = this.getReview(identity);
+    const currentSnapshot = this.getSnapshot(identity), snapshotId = currentSnapshot.id, review = this.getReview(identity);
     // An approval inherited across runner commits must come from the context of the completed prefix, not merely from
     // this revision. Otherwise A -> unrelated B approval -> A could reuse B's approval when the prefix-head guard passes.
     const completedAt: Record<string, string> = Object.create(null);
@@ -1142,11 +1142,15 @@ export class Store {
         }
       }
     }
-    const reviewedExecutionSnapshot = (value: ReviewState) => value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId);
+    const reviewedExecutionSnapshot = (value: ReviewState) => {
+      if (value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId)) return true;
+      const evidenceHead = this.getSnapshot(identity, value.snapshotId).head;
+      return evidenceHead === currentSnapshot.head || this.isRewrittenHead(identity, evidenceHead, currentSnapshot.head);
+    };
     // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
     // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
     let latestChoiceVersion = -1;
-    for (const choice of review.choices) if (choice.revision === revision && (prefixSnapshots.size > 0 || choice.snapshotId === snapshotId)) {
+    for (const choice of review.choices) if (choice.revision === revision && reviewedExecutionSnapshot(choice)) {
       if (choice.reviewVersion === undefined) latestChoiceVersion = Number.MAX_SAFE_INTEGER;
       else if (choice.reviewVersion > latestChoiceVersion) latestChoiceVersion = choice.reviewVersion;
     }
@@ -1252,8 +1256,12 @@ export class Store {
       head = result.head;
       completed.push(row.item);
     }
-    if (head !== this.getSnapshot(identity).head)
-      throw new GuardRefusal('The task head no longer ends at the audited completed prefix.');
+    const currentHead = this.getSnapshot(identity).head;
+    if (head !== currentHead) {
+      if (!this.isRewrittenHead(identity, head, currentHead))
+        throw new GuardRefusal('The task head no longer ends at the audited completed prefix.');
+      head = currentHead;
+    }
     return { checkpoint, completed, completedDefinitions, head };
   }
   /** Reconcile audited completion against the current or proposed plan definition. */
@@ -1296,7 +1304,10 @@ export class Store {
     const revision = this.getPlan(identity).revision;
     const snapshotId = this.continuationApproval(identity, progress.checkpoint.id, revision);
     if (!snapshotId) return false;
-    if (snapshotId === this.getSnapshot(identity).id) return true;
+    const currentSnapshot = this.getSnapshot(identity);
+    const approvedHead = this.getSnapshot(identity, snapshotId).head;
+    if (snapshotId === currentSnapshot.id || approvedHead === currentSnapshot.head
+      || this.isRewrittenHead(identity, approvedHead, currentSnapshot.head)) return true;
     let head = this.getSnapshot(identity, snapshotId).head, advanced = false;
     const key = identityKey(identity), origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
       AND item=? AND json_extract(context,'$.planRevision')=? AND json_extract(result,'$.head')=? ORDER BY rowid DESC LIMIT 1`,

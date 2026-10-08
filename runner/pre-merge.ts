@@ -83,6 +83,8 @@ export class PreMergeCoordinator {
     // transaction and HTTP handler can finish.
     let readiness: PreMergeReadiness | null = null;
     let failurePair = { base: expected.base, head: expected.head };
+    let failureBinding = { stateVersion: expected.stateVersion, reviewVersion: expected.reviewVersion,
+      snapshotId: expected.snapshotId };
     const remember = (input: PreparedResult) => {
       const { readiness: readyBinding, ...plain } = input;
       readiness = readyBinding ?? null;
@@ -91,16 +93,12 @@ export class PreMergeCoordinator {
       if (result.state === 'ready' && readiness) this.#lastBinding = readiness;
       else if (result.state === 'ready') result = { ...result, state: 'failed',
         reason: 'Could not bind preparation readiness: preparation readiness was not bound to the final review.' };
-      else try {
-        this.#lastBinding = { stateVersion: this.service.store.getTask(this.service.config.identity).stateVersion,
-          reviewVersion: this.service.store.reviewVersion(this.service.config.identity),
-          snapshotId: this.service.store.getSnapshot(this.service.config.identity).id };
-      } catch { /* An unbound historical result is conservatively stale. */ }
+      else this.#lastBinding = failureBinding;
       this.#last = result;
       return result;
     };
     const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline,
-      pair => { failurePair = pair; })).then(remember, error => {
+      observation => { failurePair = observation.pair; failureBinding = observation.binding; })).then(remember, error => {
       // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
       const result: PreMergeResult = { state: 'failed', ...failurePair,
         checked: [], reason: error instanceof Error ? error.message : String(error) };
@@ -193,7 +191,8 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
-    deadline: number, onPair: (pair: RemotePair) => void): Promise<PreparedResult> {
+    deadline: number, onObserved: (value: { pair: RemotePair; binding: { stateVersion: number; reviewVersion: number;
+      snapshotId: string } }) => void): Promise<PreparedResult> {
     const identity = this.service.config.identity;
     const remaining = () => {
       const value = Math.ceil(deadline - performance.now());
@@ -218,7 +217,11 @@ export class PreMergeCoordinator {
       await validate(); signal.throwIfAborted(); remaining();
     };
     const track = <T extends ReturnType<ReviewService['load']>>(current: T): T => {
-      onPair({ base: current.snapshot.base, head: current.snapshot.head }); return current;
+      onObserved({ pair: { base: current.snapshot.base, head: current.snapshot.head }, binding: {
+        stateVersion: this.service.store.getTask(identity).stateVersion,
+        reviewVersion: this.service.store.reviewVersion(identity), snapshotId: current.snapshot.id,
+      } });
+      return current;
     };
     const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()) }));
     let view = load(), task = this.service.store.getTask(identity);
@@ -297,6 +300,15 @@ export class PreMergeCoordinator {
       };
       signal.addEventListener('abort', stop, { once: true });
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
+      // The check attempt itself advances task state even when it fails. Bind that owned transition without adopting a
+      // concurrent review edit; such an edit must leave the preparation historical and stale.
+      if (this.service.store.reviewVersion(identity) === view.expected.reviewVersion) {
+        const snapshot = this.service.store.getSnapshot(identity);
+        onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
+          stateVersion: this.service.store.getTask(identity).stateVersion,
+          reviewVersion: view.expected.reviewVersion!, snapshotId: snapshot.id,
+        } });
+      }
       signal.throwIfAborted();
       const settled = this.service.store.getAttempt(identity, attempt.id);
       const runnerStatus = this.runner.status(identity);
