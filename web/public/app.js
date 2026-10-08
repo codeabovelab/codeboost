@@ -955,7 +955,12 @@ function exactObject(value, keys) {
     Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
 }
 function boundedText(value, minimum, maximum) {
-  return typeof value === "string" && value.length >= minimum && value.length <= maximum;
+  if (typeof value !== "string") return false;
+  let length = 0;
+  for (const _point of value) {
+    if (++length > maximum) return false;
+  }
+  return length >= minimum;
 }
 function validPlanId(value) {
   return typeof value === "string" && /^P[1-9][0-9]{0,2}$/.test(value);

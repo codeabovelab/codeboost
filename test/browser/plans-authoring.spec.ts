@@ -106,7 +106,7 @@ test('accepts complete payloads for every edit operation', async ({ page }) => {
     field: null, value: null, file: null, check: null, check_index: null, depends_on: null, new_item: null, ...payload,
   }) as EditReply['edits'][number];
   const newItem = { ...structuredClone(current.items[0]!), id: 'P4', depends_on: ['P1'] };
-  const reply: EditReply = { ...suggestions(), edits: [
+  const reply: EditReply = { ...suggestions(), reply: '😀'.repeat(4000), edits: [
     card('add_item', { new_item: newItem }, 'P4'),
     card('set_field', { field: 'intent', value: 'Explain the bounded retry behavior.' }),
     card('add_file', { file: { path: 'added.ts', kind: 'add', renamed_from: null, change: 'Add the helper.' } }),
@@ -128,7 +128,9 @@ test('accepts complete payloads for every edit operation', async ({ page }) => {
   }));
   await page.getByRole('button', { name: 'Suggest edits' }).click();
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+  await expect(page.locator('.plan-author-reply')).toHaveText(reply.reply);
   await expect(page.locator('.suggestion-row')).toHaveCount(9);
+  await expect(page.getByRole('button', { name: 'Suggest edits' })).not.toHaveAttribute('aria-disabled', 'true');
 });
 
 test('renders a whole next-revision draft without changing the current plan', async ({ page }) => {
