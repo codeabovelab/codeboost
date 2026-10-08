@@ -140,10 +140,63 @@ test('keeps ownership while a malformed status response is retried', async ({ pa
   const suggest = page.locator('#plan-suggest');
   await suggest.click();
   await expect.poll(() => invocations.length).toBe(1);
-  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete or invalid.' })).toBeVisible();
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
   await expect(suggest).toHaveAttribute('aria-disabled', 'true');
   await suggest.evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
   expect(invocations).toHaveLength(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+});
+
+test('rejects a status observation bound to another snapshot', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  let reads = 0;
+  await page.route('**/api/plan/suggestions/*', async route => {
+    reads++;
+    if (reads === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        mode: 'suggest', state: 'ready', revision: 1, snapshotId: 'foreign-snapshot', reply: suggestions(), reason: null,
+      }) });
+      return;
+    }
+    await route.continue();
+  });
+  const suggest = page.locator('#plan-suggest');
+  await suggest.click();
+  await expect.poll(() => invocations.length).toBe(1);
+  await expect(page.getByRole('status').filter({ hasText: 'belonged to another plan context' })).toBeVisible();
+  await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+});
+
+test('rejects an operation-specific payload that is unsafe to render', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const snapshotId = app.service.load().snapshot.id;
+  let reads = 0;
+  await page.route('**/api/plan/suggestions/*', async route => {
+    reads++;
+    if (reads === 1) {
+      const reply = suggestions();
+      const malformed = { ...reply, edits: [{ ...reply.edits[0], op: 'set_depends', field: null, value: null, depends_on: 'P2' }] };
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        mode: 'suggest', state: 'ready', revision: 1, snapshotId, reply: malformed, reason: null,
+      }) });
+      return;
+    }
+    await route.continue();
+  });
+  const errors: string[] = [];
+  page.on('pageerror', error => errors.push(error.message));
+  const suggest = page.locator('#plan-suggest');
+  await suggest.click();
+  await expect.poll(() => invocations.length).toBe(1);
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
+  await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  expect(errors).toEqual([]);
   invocations[0]!.resolve(JSON.stringify(suggestions()));
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
 });

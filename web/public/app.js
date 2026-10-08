@@ -950,23 +950,38 @@ function describePlanEdit(edit) {
     default: return "Change the plan";
   }
 }
-function validPlanAuthorStatus(status, mode) {
+function validPlanEditForDisplay(edit) {
+  if (!edit || typeof edit.item !== "string" || typeof edit.summary !== "string" || typeof edit.reason !== "string") return false;
+  switch (edit.op) {
+    case "add_item":
+    case "remove_item": return true;
+    case "set_field": return ["title", "intent"].includes(edit.field) && typeof edit.value === "string";
+    case "add_file":
+    case "update_file": return !!edit.file && typeof edit.file === "object" && typeof edit.file.path === "string";
+    case "remove_file": return typeof edit.value === "string";
+    case "add_check": return !!edit.check && typeof edit.check === "object" && typeof edit.check.type === "string";
+    case "remove_check": return Number.isSafeInteger(edit.check_index) && edit.check_index >= 0;
+    case "set_depends": return Array.isArray(edit.depends_on) && edit.depends_on.every((item) => typeof item === "string");
+    default: return false;
+  }
+}
+function validPlanAuthorStatus(status, request) {
   const states = ["pending", "ready", "failed", "cancelled", "invalidated", "consumed"];
   if (!status || typeof status !== "object" || !states.includes(status.state) ||
       !Number.isSafeInteger(status.revision) || status.revision < 1 ||
       typeof status.snapshotId !== "string" || !status.snapshotId ||
+      status.revision !== request.revision || status.snapshotId !== request.snapshotId ||
       !(status.reason === null || typeof status.reason === "string")) return false;
   const terminalReason = ["failed", "cancelled", "invalidated"].includes(status.state);
   if (terminalReason ? !(typeof status.reason === "string" && status.reason.length > 0) : status.reason !== null) return false;
-  const result = mode === "draft" ? status.plan : status.reply;
+  const result = request.mode === "draft" ? status.plan : status.reply;
   const validDraft = result && typeof result === "object" && Number.isSafeInteger(result.revision) &&
     result.revision === status.revision + 1 && typeof result.summary === "string" && Array.isArray(result.items) &&
     result.items.every((item) => item && typeof item.id === "string" && typeof item.title === "string");
   const validReply = result && typeof result === "object" && Number.isSafeInteger(result.base_revision) &&
-    result.base_revision === status.revision && typeof result.reply === "string" && Array.isArray(result.edits) && result.edits.every((edit) =>
-      edit && ["add_item", "remove_item", "set_field", "add_file", "update_file", "remove_file", "add_check", "remove_check", "set_depends"].includes(edit.op) && typeof edit.item === "string" &&
-      typeof edit.summary === "string" && typeof edit.reason === "string");
-  const validResult = mode === "draft" ? validDraft : validReply;
+    result.base_revision === status.revision && typeof result.reply === "string" && Array.isArray(result.edits) &&
+    result.edits.every(validPlanEditForDisplay);
+  const validResult = request.mode === "draft" ? validDraft : validReply;
   if (status.state === "pending") return result === null;
   if (["ready", "consumed"].includes(status.state)) return !!validResult;
   return result === null || !!validResult;
@@ -1167,18 +1182,19 @@ async function pollPlanAuthor(generation) {
   try {
     const status = await api(`/api/plan/${request.mode === "draft" ? "drafts" : "suggestions"}/${request.requestId}`);
     if (planAuthorRequest !== request || request.generation !== generation || request.operationGeneration !== operationGeneration) return;
-    if (!validPlanAuthorStatus(status, request.mode)) throw new Error("Planning status response was incomplete or invalid.");
+    if (!validPlanAuthorStatus(status, request)) throw new Error("Planning status response was incomplete, invalid, or belonged to another plan context.");
     const changed = request.state !== status.state;
+    const previous = { state: request.state, reason: request.reason, reply: request.reply, plan: request.plan,
+      observationError: request.observationError, pollDelay: request.pollDelay };
     request.state = status.state;
-    request.revision = status.revision;
-    request.snapshotId = status.snapshotId;
     request.reason = status.reason;
     request.observationError = null;
     if (request.mode === "draft") request.plan = status.plan;
     else request.reply = status.reply;
-    request.operationGeneration++;
     request.pollDelay = changed ? planAuthorPollInitial : Math.min(request.pollDelay * 2, planAuthorPollMaximum);
-    renderPlanAuthor();
+    try { renderPlanAuthor(); }
+    catch (error) { Object.assign(request, previous); throw error; }
+    request.operationGeneration++;
     if (request.state === "pending") schedulePlanAuthorPoll(generation);
   } catch (error) {
     if (planAuthorRequest !== request || request.generation !== generation || request.operationGeneration !== operationGeneration) return;
