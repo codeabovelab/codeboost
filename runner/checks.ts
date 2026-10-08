@@ -1,7 +1,6 @@
 import { createHash } from 'node:crypto';
 import type { InvocationHandle, InvocationInput } from '../agents/contract.ts';
 import { commandAllowed, commandArgv } from '../core/plan.ts';
-import type { PlanIdentity } from '../core/identity.ts';
 import { findIdentity, type TaskWorkspace, type WorkspaceRef } from './execution.ts';
 import type { PreparedAttempt, RunnerDeps } from './coordinator.ts';
 import type { AttemptRecord, Store } from './store.ts';
@@ -18,8 +17,9 @@ export function commandDigest(commands: readonly (readonly string[])[]): string 
 
 /** Read-only, head-bound `cmd:` attempts. A non-zero command exit is a failed attempt and never passing evidence. */
 export function commandCheckDeps(store: Store, workspace: TaskWorkspace,
-  launch: RunnerCommandLauncher, context: (identity: PlanIdentity) => { allowedCommands: readonly (readonly string[])[] },
+  launch: RunnerCommandLauncher, allowedCommands: readonly (readonly string[])[],
   runnerOwner: string): RunnerDeps {
+  const allowed = allowedCommands.map(argv => [...argv]);
   return {
     runnerOwner, kinds: ['check'],
     async prepare(attempt, signal) {
@@ -27,7 +27,6 @@ export function commandCheckDeps(store: Store, workspace: TaskWorkspace,
       const identity = findIdentity(store, attempt), plan = store.getPlan(identity, attempt.context.planRevision);
       const item = plan.items.find(candidate => candidate.id === attempt.item);
       if (!item) throw new Error('Unknown command-check item.');
-      const allowed = context(identity).allowedCommands;
       const commands = item.acceptance.filter(check => check.type === 'cmd').map(check => commandArgv(check.text));
       if (!commands.length) throw new Error('This plan item has no command checks.');
       if (commands.some(argv => !commandAllowed(argv, allowed))) throw new Error('A command check is not approved in allowedCommands.');

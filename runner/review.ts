@@ -58,6 +58,15 @@ export class ReviewService {
     return { path: this.config.repository, runnerOwned: false };
   }
   load(options: { maxDurationMs?: number } = {}) {
+    const maxDurationMs = options.maxDurationMs ?? 30_000;
+    if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1 || maxDurationMs > 30_000)
+      throw new Error('Review duration budget must be a positive integer no larger than 30000 ms.');
+    const deadline = performance.now() + maxDurationMs;
+    const remaining = () => {
+      const ms = deadline - performance.now();
+      if (ms <= 0) throw new Error('Review load exceeded its overall deadline.');
+      return Math.max(1, Math.ceil(ms));
+    };
     const { identity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
@@ -67,11 +76,11 @@ export class ReviewService {
     // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
     // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
     const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD',
-      options.maxDurationMs === undefined ? {} : { maxDurationMs: options.maxDurationMs });
+      { maxDurationMs: remaining() });
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = this.#pathKey;
     const ledger = this.store.getLedger(identity);
-    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey, {},
+    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey, { maxDurationMs: remaining() },
       new Set(ledger.filter(entry => entry.conflictResolved).map(entry => entry.sha)));
     const saved = this.store.getReview(identity), keys = choiceKeys(raw, identity);
     const deltas = new Map(history.final.map(file => [JSON.stringify([file.newPath ?? file.oldPath, file.oldPath]), file]));
@@ -175,6 +184,7 @@ export class ReviewService {
       };
     });
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
+    remaining();
     return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
   /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */

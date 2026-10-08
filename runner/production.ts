@@ -315,7 +315,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     executionDeps(service.store, workspace, claudeLauncher({ imageId, runnerRoot: config.root, runnerOwner, token }), sources, runnerOwner, findings,
       { diagnostics: { directory: diagnosticsDir, capBytes: config.diagnosticsCapBytes ?? DEFAULT_DIAGNOSTICS_CAP_BYTES } }),
     commandCheckDeps(service.store, workspace,
-      runnerCommandLauncher({ imageId, runnerRoot: config.root, runnerOwner }), requested => sources.planContext(requested), runnerOwner));
+      runnerCommandLauncher({ imageId, runnerRoot: config.root, runnerOwner }), review.allowedCommands ?? [], runnerOwner));
   const github = review.github;
   // Never a `url` here (#101 review, finding 6): the push goes to the configured repository on GH_HOST, from the runner's
   // own repository. Only commits the ledger records as codeboost's may be overwritten. The F3 rebase foundation can

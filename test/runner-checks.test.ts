@@ -39,7 +39,7 @@ function fixture(result: (input: InvocationInput) => Promise<InvocationResult>) 
     expect(encoded).toBe(JSON.stringify(commands));
     const handle: InvocationHandle = { attemptId: input.attemptId, settled: result(input), cancel() {} };
     return handle;
-  }, () => context, 'a'.repeat(32));
+  }, commands, 'a'.repeat(32));
   return { store, runner: new RunnerCoordinator(store, deps), released };
 }
 

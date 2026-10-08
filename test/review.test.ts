@@ -17,6 +17,11 @@ vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
 afterEach(()=>{services.splice(0).forEach(service=>service.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));});
 function fixture(){const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const config=createDemo(join(root,'demo'));const service=new ReviewService(config);services.push(service);return {service,config};}
+it('shares one deadline across history reading and linking',()=>{
+ const {service}=fixture();let elapsed=0;const clock=vi.spyOn(performance,'now').mockImplementation(()=>elapsed++);
+ try{expect(()=>service.load({maxDurationMs:200})).toThrow(/deadline/i);}
+ finally{clock.mockRestore();}
+});
 it('closes the review service when merge gateway construction fails', async()=>{
  const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const demo=createDemo(join(root,'demo'));
  const close=vi.spyOn(ReviewService.prototype,'close');

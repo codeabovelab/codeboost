@@ -143,7 +143,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     return { attemptId: input.attemptId,
       settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: commandExit ?? 0,
         signal: null, stdout: '', stderr: commandExit ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
-  }, () => context, 'a'.repeat(32)));
+  }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair = { base: onto, head };
   let authorizationChecks = 0;
   const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
