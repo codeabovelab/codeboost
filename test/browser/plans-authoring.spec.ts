@@ -257,6 +257,18 @@ test('blocks stale authoring after a suggestion commits but its authoritative re
   await expect(page.locator('#plans-revision')).toHaveText('r2');
   await expect(page.getByRole('button', { name: 'Refresh suggestions', exact: true })).toBeVisible();
   await expect(page.locator('#plan-suggest')).not.toHaveAttribute('aria-disabled', 'true');
+
+  const next = app.service.store.getPlan(app.service.config.identity);
+  next.revision++;
+  next.summary = 'A later authoritative revision';
+  app.service.store.importRevision(JSON.stringify(next), 'json', app.service.planContextForAmendment(), 2);
+  await page.locator('#plans-refresh').click();
+  await expect(page.locator('#plans-revision')).toHaveText('r3');
+  await page.locator('#plan-suggest').click();
+  await expect.poll(() => invocations.length).toBe(2);
+  expect(invocations[1]!.request).toMatchObject({ mode: 'suggest', revision: 3 });
+  invocations[1]!.resolve(JSON.stringify(suggestions(3)));
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r3.' })).toBeVisible();
 });
 
 test('keeps Apply retryable when success names the wrong revision', async ({ page }) => {

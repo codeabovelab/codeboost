@@ -1070,7 +1070,7 @@ function planAuthorResultMarkup(request, historical = false) {
   if (!historical && result && request.requestId && dismissible)
     result += `<div class="plan-author-result-actions"><button type="button" id="plan-author-dismiss"${request.state === "cancelling" ? ' aria-disabled="true"' : ""}>${request.state === "cancelling" ? "Dismissing…" : `Dismiss ${request.mode === "draft" ? "draft" : "suggestions"}`}</button></div>`;
   const remaining = request.mode === "suggest" && request.state === "consumed" && Number.isSafeInteger(request.appliedIndex)
-      && data?.plan?.revision === request.revision + 1
+      && data?.plan?.revision >= request.revision + 1
     ? request.reply.edits.filter((_, index) => index !== request.appliedIndex) : [];
   if (!historical && remaining.length)
     result += '<div class="plan-author-result-actions"><span class="warn">! Plan changed — refresh suggestions</span><button type="button" id="plan-author-refresh-suggestions">Refresh suggestions</button></div>';
@@ -1081,7 +1081,7 @@ function renderPlanAuthor() {
   const restoreApplyFocus = document.activeElement?.id?.startsWith("plan-author-apply-") ? document.activeElement.id : null;
   const request = planAuthorRequest, unavailable = !data?.plan;
   const busyAuthor = planAuthorBusy(), uncertain = request?.state === "uncertain", applyUncertain = request?.state === "apply-uncertain";
-  const appliedReloadPending = request?.state === "consumed" && data?.plan?.revision !== request.revision + 1;
+  const appliedReloadPending = request?.state === "consumed" && !(data?.plan?.revision >= request.revision + 1);
   for (const [id, mode, label] of [["plan-draft", "draft", "Draft next revision"], ["plan-suggest", "suggest", "Suggest edits"]]) {
     const button = $(id);
     const blocked = unavailable || busyAuthor || applyUncertain || appliedReloadPending || (uncertain && request.mode !== mode);
@@ -1288,7 +1288,7 @@ async function pollPlanAuthor(generation) {
 }
 async function startPlanAuthor(mode, feedbackOverride = null) {
   if (!data?.plan || planAuthorBusy() || planAuthorRequest?.state === "apply-uncertain" ||
-      (planAuthorRequest?.state === "consumed" && data.plan.revision !== planAuthorRequest.revision + 1)) return;
+      (planAuthorRequest?.state === "consumed" && data.plan.revision < planAuthorRequest.revision + 1)) return;
   if (planImportPending || planRefreshPending || busy) {
     $("plan-author-status").className = "warn";
     $("plan-author-status").textContent = "! Wait for the current plan or review action before asking the agent.";
