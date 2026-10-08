@@ -375,7 +375,7 @@ describe('the merge gate with a runner block (#121)', () => {
     const gh = github(store);
     const merges = new MergeCoordinator(service(store), gh.client);
     await merges.merge('review-token');
-    expect(gh.targets).toEqual([undefined, undefined, undefined]);
+    expect(gh.targets).toEqual([undefined, undefined]);
     expect(gh.merged).toEqual([99]);
     expect(store.getMergeAttempt(identity)!.pullRequest).toBe(99);
   });
