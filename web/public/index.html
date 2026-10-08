@@ -79,15 +79,31 @@
             <div id="plans-questions"></div>
             <div id="plans-items"></div>
           </section>
-          <aside class="plan-import" aria-label="Import plan">
-            <div class="pane-heading">IMPORT PLAN</div>
-            <form id="plan-import-form">
-              <p>Import a complete JSON or YAML plan as the next revision. The selected issue cannot change.</p>
-              <label for="plan-file">Plan file</label>
-              <input id="plan-file" type="file" accept=".json,.yaml,.yml,application/json,application/yaml,text/yaml" required />
-              <p id="plan-file-details" class="mono muted">No file selected</p>
-              <button type="submit" id="plan-import" class="primary">Import next revision</button>
-            </form>
+          <aside class="plan-tools" aria-label="Plan tools">
+            <section class="plan-author" aria-labelledby="plan-author-heading">
+              <div class="pane-heading" id="plan-author-heading">AUTHOR WITH AGENT</div>
+              <form id="plan-author-form">
+                <label for="plan-feedback">Guidance</label>
+                <textarea id="plan-feedback" maxlength="4000" rows="5" placeholder="What should the plan improve?"></textarea>
+                <p class="muted">Draft a complete next revision, or ask for independent edit suggestions.</p>
+                <div class="plan-author-actions">
+                  <button type="button" id="plan-draft">Draft next revision</button>
+                  <button type="button" id="plan-suggest" class="primary">Suggest edits</button>
+                </div>
+              </form>
+              <div id="plan-author-status" class="neutral" role="status"></div>
+              <div id="plan-author-result"></div>
+            </section>
+            <section class="plan-import" aria-labelledby="plan-import-heading">
+              <div class="pane-heading" id="plan-import-heading">IMPORT PLAN</div>
+              <form id="plan-import-form">
+                <p>Import a complete JSON or YAML plan as the next revision. The selected issue cannot change.</p>
+                <label for="plan-file">Plan file</label>
+                <input id="plan-file" type="file" accept=".json,.yaml,.yml,application/json,application/yaml,text/yaml" required />
+                <p id="plan-file-details" class="mono muted">No file selected</p>
+                <button type="submit" id="plan-import" class="primary">Import next revision</button>
+              </form>
+            </section>
           </aside>
         </main>
       </div>
