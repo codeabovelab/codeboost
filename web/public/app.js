@@ -185,19 +185,9 @@ async function pollMergeQueue(generation) {
   try {
     const update = await api("/api/merge");
     if (generation !== mergeGeneration || !data?.merge?.available) return;
-    data = { ...data, merge: { ...data.merge, queue: update.queue } };
     const queue = update.queue;
-    if (queue?.state === "merged") {
-      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." }] };
-      $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
-    } else if (queue?.state === "removed" || queue?.state === "failed") {
-      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` }] };
-      $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
-    } else if (queue?.observationError) {
-      $("banner").textContent = `${queue.state === "submitting" ? "Merge submission status is unknown" : "Merge remains queued"}. ${queue.observationError}`;
-    } else if (queue?.state === "queued") {
-      $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
-    }
+    data = withMergeQueue(data, queue);
+    showMergeQueueStatus(queue);
     if (queue?.state === mergePollState) backOffMergePoll();
     renderMerge();
   } catch (error) {
@@ -205,6 +195,28 @@ async function pollMergeQueue(generation) {
     $("banner").textContent = `Could not refresh merge-queue status. ${error.message}`;
     backOffMergePoll();
     scheduleMergePoll();
+  }
+}
+const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge"]);
+function withMergeQueue(view, queue) {
+  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
+  if (queue?.state === "merged")
+    blockers.unshift({ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." });
+  else if (queue?.state === "removed" || queue?.state === "failed")
+    blockers.unshift({ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` });
+  else
+    blockers.unshift(...view.merge.blockers.filter(blocker => blocker.code === "queue-active"));
+  return { ...view, merge: { ...view.merge, ready: false, action: null, queue, blockers } };
+}
+function showMergeQueueStatus(queue) {
+  if (queue?.state === "merged") {
+    $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
+  } else if (queue?.state === "removed" || queue?.state === "failed") {
+    $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
+  } else if (queue?.observationError) {
+    $("banner").textContent = `${queue.state === "submitting" ? "Merge submission status is unknown" : "Merge remains queued"}. ${queue.observationError}`;
+  } else if (queue?.state === "queued") {
+    $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
   }
 }
 async function act(command) {
@@ -773,17 +785,27 @@ function renderNotes({ follow = false } = {}) {
   document.querySelectorAll("[data-retry-question]").forEach(button=>button.onclick=()=>act({action:"retry-question",id:button.dataset.retryQuestion}));
 }
 let pollingQuestions=false;
-function preserveCompletedQuestionAnswers(updated) {
+function preserveSettledQuestionAnswers(updated) {
   if (!data) return updated;
   const current = new Map(data.notes.map(note => [note.id, note]));
   return { ...updated, notes: updated.notes.map(note => {
     const newer = current.get(note.id);
-    return newer?.answer?.status === "complete" &&
+    return ["complete", "failed"].includes(newer?.answer?.status) &&
       note.answer?.status === "pending" &&
       newer.answer.attempt === note.answer.attempt
       ? { ...note, answer: newer.answer, answerActive: newer.answerActive }
       : note;
   }) };
+}
+function newerMergeQueue(updated) {
+  const newer = data?.merge?.queue, older = updated.merge?.queue;
+  return newer?.actionId &&
+    newer.actionId === older?.actionId &&
+    newer.reviewedHead === older.reviewedHead &&
+    ["merged", "removed", "failed"].includes(newer.state) &&
+    ["submitting", "queued"].includes(older.state)
+    ? newer
+    : null;
 }
 setInterval(async()=>{
   if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending" || n.answerActive)) return;
@@ -1207,8 +1229,10 @@ $("plans-refresh").onclick = async () => {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    data = preserveCompletedQuestionAnswers(updated);
+    const newerQueue = newerMergeQueue(updated);
+    data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
     render();
+    if (newerQueue) showMergeQueueStatus(newerQueue);
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
     if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;

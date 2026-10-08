@@ -387,6 +387,49 @@ test('does not let an older Plans refresh replace an answer completed while it w
   await expect(page.getByText('Agent · Answering…', { exact: true })).toHaveCount(0);
 });
 
+test('does not let an older Plans refresh replace an answer failure from the same attempt', async ({ page }) => {
+  const config = app.service.config;
+  await app.close();
+  app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
+  await page.goto(app.url);
+  await page.getByLabel('Question about this item').fill('Will this failure stay visible?');
+  await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
+  await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
+  const note = app.service.store.getReviewNotes(config.identity).find(value => value.text === 'Will this failure stay visible?')!;
+
+  let releaseRefresh!: () => void, refreshArrived!: () => void;
+  const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+  const capturedRefresh = new Promise<void>(resolve => { refreshArrived = resolve; });
+  await page.route('**/api/review', async route => {
+    const response = await route.fetch();
+    refreshArrived();
+    await heldRefresh;
+    await route.fulfill({ response });
+  });
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.locator('#plans-refresh').click();
+  await capturedRefresh;
+
+  const failedAnswer = { ...note.answer, status: 'failed', error: 'The agent failed during refresh.' };
+  const failedPoll = page.waitForResponse(response => response.url().endsWith('/api/questions'));
+  let polls = 0;
+  await page.route('**/api/questions', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ notes: polls++ === 0 ? [{ id: note.id, answer: failedAnswer, answerActive: false }] : [] }),
+  }));
+  await failedPoll;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator('#notes')).toContainText('The agent failed during refresh.');
+
+  releaseRefresh();
+  await expect(page.locator('#plans-status')).toContainText('Revision r1 is current.');
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await expect(page.getByText('! The agent failed during refresh.', { exact: true })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Retry answer', exact: true })).toBeVisible();
+  await expect(page.getByText('Agent · Answering…', { exact: true })).toHaveCount(0);
+});
+
 test('does not let an older Plans refresh re-enable merge after it commits', async ({ page }) => {
   test.slow();
   const config = { ...app.service.config, demo: false };
@@ -538,6 +581,80 @@ test('does not let merge polls started during Review or Plans refresh overwrite 
   await page.waitForTimeout(100);
   await expect(page.locator('#banner')).not.toContainText('Old refresh poll result.');
   await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+});
+
+test('does not let an older Plans refresh overwrite a newer terminal merge observation', async ({ page }) => {
+  test.slow();
+  const config = { ...app.service.config, demo: false };
+  await app.close();
+  chmodSync(join(config.repository, 'run.sh'), 0o644);
+  fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope');
+  let appRef: typeof app;
+  const gateway: MergeGateway & MergeQueueGateway = {
+    inspect: async () => {
+      const snapshot = appRef.service.load().snapshot;
+      return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
+        atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
+    },
+    queueWatermark: async () => null,
+    merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
+    inspectQueue: async head => ({ state: 'queued', reviewedHead: head, entryId: 'MQE_1', phase: 'QUEUED', position: 1,
+      enqueuedAt: '2026-10-07T08:00:00Z', queueHead: head }),
+  };
+  app = appRef = await startServer(config, 0, undefined, gateway);
+  let view = app.service.load();
+  for (const segment of view.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
+    view = app.service.act({ action: 'accept', key: segment.key, token: view.token });
+  for (const item of view.items)
+    view = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: view.token });
+
+  await page.goto(app.url);
+  page.on('dialog', dialog => dialog.accept());
+  await page.getByRole('button', { name: 'Merge PR', exact: true }).click();
+  await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+
+  let releaseRefresh!: () => void, refreshArrived!: () => void;
+  const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+  const capturedRefresh = new Promise<void>(resolve => { refreshArrived = resolve; });
+  let queued!: Record<string, unknown>;
+  await page.route('**/api/review', async route => {
+    const response = await route.fetch();
+    const refreshed = await response.json();
+    queued = refreshed.merge.queue;
+    refreshed.repository = 'poll-first-refreshed';
+    refreshed.merge.blockers.push({ code: 'check', message: 'Fresh required check is pending.' });
+    refreshArrived();
+    await heldRefresh;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(refreshed) });
+  });
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.locator('#plans-refresh').click();
+  await capturedRefresh;
+  expect(queued.actionId).toEqual(expect.any(String));
+
+  let polls = 0;
+  await page.route('**/api/merge', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ queue: polls++ === 0
+      ? { ...queued, state: 'merged', phase: null, position: null, occurredAt: '2026-10-07T08:06:00Z', url: 'https://github.com/example/repo/pull/7', reason: null }
+      : queued }),
+  }));
+  const mergedPoll = page.waitForResponse(response => response.url().endsWith('/api/merge'));
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: /P1 Bound exponential retries/ }).click();
+  await mergedPoll;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+
+  releaseRefresh();
+  await expect(page.locator('#repository')).toHaveText('poll-first-refreshed');
+  await page.waitForTimeout(100);
+  await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+  await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+  await expect(page.locator('#dialog-body')).toContainText('merged');
+  await expect(page.locator('#dialog-body')).toContainText('GitHub confirmed that the reviewed head was merged.');
+  await expect(page.locator('#dialog-body')).toContainText('Fresh required check is pending.');
 });
 
 test('keeps merge-queue polling current across Plans refresh and import outcomes', async ({ page }) => {
