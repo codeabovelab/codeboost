@@ -893,6 +893,14 @@ body.resizing-conversation { cursor: col-resize; user-select: none; }
   font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
   font-size: 12px;
 }
+.suggestion-actions {
+  display: flex;
+  justify-content: flex-end;
+  margin-top: 12px;
+}
+.suggestion-actions button {
+  min-width: 104px;
+}
 .draft-items {
   list-style: none;
   margin: 8px 0 0;
@@ -903,6 +911,10 @@ body.resizing-conversation { cursor: col-resize; user-select: none; }
   border-top: 1px solid var(--line);
 }
 .plan-author-result-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
   padding: 12px 16px;
   border-top: 1px solid var(--line);
 }

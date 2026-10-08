@@ -930,7 +930,7 @@ function supersedePlanRefresh() {
   claimPlanStatus("neutral", "");
 }
 function planAuthorBusy() {
-  return ["starting", "pending", "cancelling"].includes(planAuthorRequest?.state);
+  return ["starting", "pending", "cancelling", "applying"].includes(planAuthorRequest?.state);
 }
 function planAuthorStale(request = planAuthorRequest) {
   return !!request && (["invalidated", "consumed"].includes(request.state) || !data?.plan ||
@@ -1040,6 +1040,18 @@ function validPlanAuthorStatus(status, request) {
   if (["ready", "consumed"].includes(status.state)) return !!validResult;
   return result === null || !!validResult;
 }
+function planApplyButton(request, index, stale) {
+  const selectedApply = request.applyingIndex === index;
+  const uncertain = request.state === "apply-uncertain";
+  const visible = (request.state === "ready" && !stale) || request.state === "applying" || uncertain;
+  if (!visible) return "";
+  const disabled = request.state === "applying" || (uncertain && !selectedApply);
+  const label = request.state === "applying" && selectedApply ? "Applying…"
+    : uncertain && selectedApply ? "Retry Apply"
+    : index === null ? "Apply draft" : "Apply this edit";
+  const suffix = index === null ? "draft" : String(index);
+  return `<button type="button" id="plan-author-apply-${suffix}" data-plan-apply="${suffix}"${disabled ? ' aria-disabled="true"' : ""}>${label}</button>`;
+}
 function planAuthorResultMarkup(request, historical = false) {
   if (request.state === "cancelled") return "";
   const stale = planAuthorStale(request);
@@ -1048,24 +1060,31 @@ function planAuthorResultMarkup(request, historical = false) {
   if (request.mode === "suggest" && request.reply) {
     result = `<div class="plan-author-result-heading"><strong>${historical ? "Earlier suggested edits" : "Suggested edits"}</strong> <span class="mono muted">r${esc(request.revision)}</span>${historyMark}</div>
       ${request.reply.reply ? `<p class="plan-author-reply">${esc(request.reply.reply)}</p>` : ""}
-      ${request.reply.edits.map((edit) => `<article class="suggestion-row" aria-label="${esc(edit.summary)}"><header><code>${esc(edit.item)}</code><h3>${esc(edit.summary)}</h3></header><p>${esc(edit.reason)}</p><p class="suggestion-change">${esc(describePlanEdit(edit))}</p></article>`).join("") || '<p class="plan-author-reply muted">No edits were suggested.</p>'}`;
+      ${request.reply.edits.map((edit, index) => `<article class="suggestion-row" aria-label="${esc(edit.summary)}"><header><code>${esc(edit.item)}</code><h3>${esc(edit.summary)}</h3></header><p>${esc(edit.reason)}</p><p class="suggestion-change">${esc(describePlanEdit(edit))}</p>${historical ? "" : `<div class="suggestion-actions">${planApplyButton(request, index, stale)}</div>`}</article>`).join("") || '<p class="plan-author-reply muted">No edits were suggested.</p>'}`;
   } else if (request.mode === "draft" && request.plan) {
     result = `<div class="plan-author-result-heading"><strong>${historical ? "Earlier draft revision" : "Draft revision"}</strong> <span class="mono muted">r${esc(request.plan.revision)}</span>${historyMark}</div>
       <section class="draft-preview" aria-label="Draft ${esc(request.plan.summary)}"><header><h3>${esc(request.plan.summary)}</h3></header>
-      <ul class="draft-items">${request.plan.items.map((item) => `<li><code>${esc(item.id)}</code> ${esc(item.title)}</li>`).join("")}</ul></section>`;
+      <ul class="draft-items">${request.plan.items.map((item) => `<li><code>${esc(item.id)}</code> ${esc(item.title)}</li>`).join("")}</ul>${historical ? "" : `<div class="suggestion-actions">${planApplyButton(request, null, stale)}</div>`}</section>`;
   }
   const dismissible = request.state === "cancelling" || (request.state === "ready" && !stale);
   if (!historical && result && request.requestId && dismissible)
     result += `<div class="plan-author-result-actions"><button type="button" id="plan-author-dismiss"${request.state === "cancelling" ? ' aria-disabled="true"' : ""}>${request.state === "cancelling" ? "Dismissing…" : `Dismiss ${request.mode === "draft" ? "draft" : "suggestions"}`}</button></div>`;
+  const remaining = request.mode === "suggest" && request.state === "consumed" && Number.isSafeInteger(request.appliedIndex)
+      && data?.plan?.revision >= request.revision + 1
+    ? request.reply.edits.filter((_, index) => index !== request.appliedIndex) : [];
+  if (!historical && remaining.length)
+    result += '<div class="plan-author-result-actions"><span class="warn">! Plan changed — refresh suggestions</span><button type="button" id="plan-author-refresh-suggestions">Refresh suggestions</button></div>';
   return result;
 }
 function renderPlanAuthor() {
   const restoreDismissFocus = document.activeElement?.id === "plan-author-dismiss";
+  const restoreApplyFocus = document.activeElement?.id?.startsWith("plan-author-apply-") ? document.activeElement.id : null;
   const request = planAuthorRequest, unavailable = !data?.plan;
-  const busyAuthor = planAuthorBusy(), uncertain = request?.state === "uncertain";
+  const busyAuthor = planAuthorBusy(), uncertain = request?.state === "uncertain", applyUncertain = request?.state === "apply-uncertain";
+  const appliedReloadPending = request?.state === "consumed" && !(data?.plan?.revision >= request.revision + 1);
   for (const [id, mode, label] of [["plan-draft", "draft", "Draft next revision"], ["plan-suggest", "suggest", "Suggest edits"]]) {
     const button = $(id);
-    const blocked = unavailable || busyAuthor || (uncertain && request.mode !== mode);
+    const blocked = unavailable || busyAuthor || applyUncertain || appliedReloadPending || (uncertain && request.mode !== mode);
     if (blocked) button.setAttribute("aria-disabled", "true");
     else button.removeAttribute("aria-disabled");
     button.textContent = request?.state === "starting" && request.mode === mode ? "Starting…"
@@ -1085,6 +1104,8 @@ function renderPlanAuthor() {
   let tone = "neutral", message = "";
   if (request.state === "starting") message = `Starting ${noun}…`;
   else if (request.state === "uncertain") { tone = "warn"; message = `! The ${noun} request outcome is unknown. Retry the exact request.`; }
+  else if (request.state === "applying") message = `Applying ${request.mode === "draft" ? "draft" : "suggestion"} to r${request.revision}…`;
+  else if (request.state === "apply-uncertain") { tone = "warn"; message = `! The Apply outcome is unknown. Retry the exact Apply action.`; }
   else if (request.state === "failed") { tone = "bad"; message = `✕ ${request.mode === "draft" ? "Draft" : "Suggestion"} failed. ${request.reason || "Try again."}`; }
   else if (request.state === "cancelling") message = `Cancelling ${noun}…`;
   else if (request.state === "cancelled") message = `– ${request.mode === "draft" ? "Draft" : "Suggestions"} dismissed. ${request.reason || ""}`.trim();
@@ -1097,7 +1118,11 @@ function renderPlanAuthor() {
   $("plan-author-status").textContent = message;
   $("plan-author-result").innerHTML = [planAuthorResultMarkup(request), ...planAuthorHistory.map(entry => planAuthorResultMarkup(entry, true))].join("");
   $("plan-author-dismiss")?.addEventListener("click", dismissPlanAuthor);
+  document.querySelectorAll("[data-plan-apply]").forEach(button => button.addEventListener("click", () =>
+    applyPlanAuthor(button.dataset.planApply === "draft" ? null : Number(button.dataset.planApply))));
+  $("plan-author-refresh-suggestions")?.addEventListener("click", refreshPlanSuggestions);
   if (restoreDismissFocus) $("plan-author-dismiss")?.focus();
+  else if (restoreApplyFocus) ($(restoreApplyFocus) ?? $("plan-author-refresh-suggestions") ?? $("plans-refresh"))?.focus();
 }
 function renderPlans() {
   if (!data?.plan) {
@@ -1261,8 +1286,9 @@ async function pollPlanAuthor(generation) {
     schedulePlanAuthorPoll(generation);
   }
 }
-async function startPlanAuthor(mode) {
-  if (!data?.plan || planAuthorBusy()) return;
+async function startPlanAuthor(mode, feedbackOverride = null) {
+  if (!data?.plan || planAuthorBusy() || planAuthorRequest?.state === "apply-uncertain" ||
+      (planAuthorRequest?.state === "consumed" && data.plan.revision < planAuthorRequest.revision + 1)) return;
   if (planImportPending || planRefreshPending || busy) {
     $("plan-author-status").className = "warn";
     $("plan-author-status").textContent = "! Wait for the current plan or review action before asking the agent.";
@@ -1273,7 +1299,7 @@ async function startPlanAuthor(mode) {
   const requestBody = retry ? planAuthorRequest.request : {
     expectedRevision: data.plan.revision,
     snapshotId: data.snapshot.id,
-    feedback: $("plan-feedback").value,
+    feedback: feedbackOverride ?? $("plan-feedback").value,
     actionId: crypto.randomUUID(),
   };
   if (planAuthorRequest?.reply || planAuthorRequest?.plan)
@@ -1294,6 +1320,9 @@ async function startPlanAuthor(mode) {
     pollDelay: planAuthorPollInitial,
     pollTimer: null,
     cancelActionId: null,
+    applyAction: null,
+    applyingIndex: null,
+    appliedIndex: null,
     operationGeneration: 0,
   };
   planAuthorRequest = request;
@@ -1314,6 +1343,98 @@ async function startPlanAuthor(mode) {
     request.state = ambiguous ? "uncertain" : "failed";
     request.reason = error.message;
     renderPlanAuthor();
+  }
+}
+function refreshPlanSuggestions() {
+  const request = planAuthorRequest;
+  if (!request || request.mode !== "suggest" || request.state !== "consumed" || !Number.isSafeInteger(request.appliedIndex)) return;
+  const remaining = request.reply.edits.filter((_, index) => index !== request.appliedIndex);
+  if (!remaining.length) return;
+  const feedback = `Re-evaluate these unapplied suggestions against the current plan. Do not assume their old indexes or payloads are still valid:\n${remaining.map(edit => `- ${edit.op} ${edit.item}: ${edit.summary}`).join("\n")}`;
+  startPlanAuthor("suggest", feedback);
+}
+async function applyPlanAuthor(index) {
+  const request = planAuthorRequest;
+  const retry = request?.state === "apply-uncertain" && request.applyingIndex === index;
+  if (!request?.requestId || (!retry && (request.state !== "ready" || planAuthorStale(request))) ||
+      (request.mode === "draft" ? index !== null : !Number.isSafeInteger(index) || !request.reply.edits[index])) return;
+  if (planImportPending || planRefreshPending || busy) {
+    $("plan-author-status").className = "warn";
+    $("plan-author-status").textContent = "! Wait for the current plan or review action before applying this result.";
+    return;
+  }
+  supersedePlanRefresh();
+  const generation = ++planOperationGeneration;
+  const sharedGeneration = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
+  mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
+  mergePollState = null;
+  mergePollDelay = 2000;
+  const busyOwner = beginBusy("write");
+  request.operationGeneration++;
+  if (request.pollTimer) clearTimeout(request.pollTimer);
+  request.pollTimer = null;
+  request.applyAction ??= { actionId: crypto.randomUUID(), index };
+  request.applyingIndex = index;
+  request.state = "applying";
+  request.reason = null;
+  request.observationError = null;
+  const statusOwner = claimPlanStatus("neutral", `Applying ${request.mode === "draft" ? "draft" : "suggestion"}…`);
+  rememberDraft();
+  renderPlanAuthor();
+  try {
+    const response = await api(`/api/plan/${request.mode === "draft" ? "drafts" : "suggestions"}/${request.requestId}/apply`, {
+      actionId: request.applyAction.actionId,
+      ...(request.mode === "suggest" ? { index } : {}),
+    });
+    const revision = response.result?.revision;
+    if (!Number.isSafeInteger(revision) || revision !== request.revision + 1)
+      throw Object.assign(new Error("Apply returned success without the expected revision."), { outcomeUnknown: true });
+    request.state = "consumed";
+    request.appliedIndex = index;
+    request.applyAction = null;
+    request.reason = null;
+    if (data?.merge?.available) data = { ...data, merge: { ...data.merge, ready: false, action: null,
+      blockers: [{ code: "plan-changed", message: "The plan changed. Refresh before merging." }] } };
+    renderMerge();
+    setPlanStatus(statusOwner, "good", `✓ Applied revision r${revision}. Reloading…`);
+    try {
+      const updated = await api("/api/review");
+      if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration || planAuthorRequest !== request) return;
+      if (!updated?.plan || updated.plan.revision < revision)
+        throw new Error(`The authoritative review did not include applied revision r${revision}.`);
+      rememberDraft();
+      mergeGeneration++;
+      if (mergePollTimer) clearTimeout(mergePollTimer);
+      mergePollTimer = null;
+      mergePollState = null;
+      mergePollDelay = 2000;
+      const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+      data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+      render();
+      if (newerQueue) showMergeQueueStatus(newerQueue);
+      setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+    } catch (error) {
+      request.observationError = `Revision r${revision} was applied, but the current plan could not reload. ${error.message}`;
+      renderPlanAuthor();
+      setPlanStatus(statusOwner, "warn", `! Revision r${revision} was applied, but the current plan could not reload. ${error.message}`);
+      renderMerge();
+    }
+  } catch (error) {
+    if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration || planAuthorRequest !== request) return;
+    const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
+    request.state = ambiguous ? "apply-uncertain" : "invalidated";
+    request.reason = error.message;
+    if (!ambiguous) request.applyAction = null;
+    if (data?.merge?.available) data = { ...data, merge: { ...data.merge, ready: false, action: null,
+      blockers: [{ code: ambiguous ? "plan-apply-unknown" : "plan-apply-refused", message: `${error.message} Refresh before merging.` }] } };
+    renderPlanAuthor();
+    renderMerge();
+    setPlanStatus(statusOwner, ambiguous ? "warn" : "bad", `${ambiguous ? "!" : "✕"} Could not confirm Apply. ${error.message}`);
+  } finally {
+    endBusy(busyOwner);
   }
 }
 async function dismissPlanAuthor() {

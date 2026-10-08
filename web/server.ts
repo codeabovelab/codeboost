@@ -692,6 +692,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       json(404, { error: 'Not found.' });
     } catch (error) {
       if (error instanceof ShuttingDownError) { json(503, { error: error.message }); return; }
+      if ((error as { code?: string })?.code === 'ERR_SQLITE_ERROR') {
+        json(503, { error: error instanceof Error ? error.message : 'Storage failed.', outcomeUnknown: true }); return;
+      }
       if (error instanceof BadRequest) { json(400, { error: error.message }); return; }
       if (error instanceof UpstreamFailure) { json(502, { error: error.message }); return; }
       json(409, { error: error instanceof Error ? error.message : 'Review failed.' });

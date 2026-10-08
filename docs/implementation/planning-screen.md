@@ -1,10 +1,12 @@
 # Planning screen
 
-**Lane and steps:** lane G, G1 and G2. Tracking issue: #145.
+**Lane and steps:** lane G, G1 through G3. Tracking issue: #145.
 
 G1 adds a Plans screen over the planning contracts already owned by lanes E and F. It does not add another plan writer: the browser imports through `POST /api/plan/import`, then reloads `GET /api/review` so the current Store revision remains the only displayed authority.
 
-G2 adds browser controls for the existing draft and suggestion request lifecycles. The screen can ask for a complete next-revision draft or independent edit cards, poll the durable request, render the result and dismiss it. It still cannot apply either result; Apply remains G3.
+G2 adds browser controls for the existing draft and suggestion request lifecycles. The screen can ask for a complete next-revision draft or independent edit cards, poll the durable request, render the result and dismiss it.
+
+G3 applies a ready draft or one suggestion card through the Store-owned revision-bound endpoint. The browser never constructs a new plan. It retains one action ID across an ambiguous Apply retry, accepts only the expected next revision, then reloads the authoritative review. Once Apply commits, a reload failure is reported separately and cannot re-enable the action or start authoring against the old revision; a manual refresh must observe the applied revision first. Applying one card consumes the response; sibling cards stay disabled and **Refresh suggestions** sends their bounded operation, item and summary descriptions in a new revision-bound request without replacing newer guidance in the textarea.
 
 ## Display contract
 
@@ -28,6 +30,6 @@ After start, the screen polls only the durable request resource with bounded bac
 
 Suggestion replies render as plain text followed by one line-separated row per typed edit. Drafts render the proposed revision summary and ordered items. Before rendering a ready result, the browser validates the complete v1 plan or edit-reply structure, including exact object fields, bounded nested file/check/item data and each edit operation's used and null payloads. The browser escapes every agent-provided field. A completed, non-cancelled result remains visible as history but is marked stale whenever its lifecycle is invalidated or consumed, or its captured revision or snapshot no longer matches the current review response. Dismissed output is removed, and a poll started before dismissal cannot restore it. A delayed ready poll likewise cannot present an old result as current after an import or refresh advances the plan.
 
-`test/browser/plans-authoring.spec.ts` covers duplicate activation, focus and disabled styling, request-time guidance preservation, exact ambiguous-start replay, a start refused after an intervening import, malformed-status ownership, failed states with impossible output, consumed-result stale labeling, rejection of mismatched bindings, wrong-operation payloads, incomplete edit cards and incomplete nested draft data, hostile markup and attribute text in both result types, retained completed history and invalidated-history labeling, suggestion rows, whole-draft preview without mutation, dismissal and ambiguous-cancellation reconciliation without a revision change, an older poll returning after dismissal, and the interleaving where an import advances the plan before an older ready poll returns and removes the stale dismissal action.
+`test/browser/plans-authoring.spec.ts` covers duplicate activation, focus and disabled styling, request-time guidance preservation, exact ambiguous-start replay, a start refused after an intervening import, malformed-status ownership, failed states with impossible output, consumed-result stale labeling, rejection of mismatched bindings, wrong-operation payloads, incomplete edit cards and incomplete nested draft data, hostile markup and attribute text in both result types, retained completed history and invalidated-history labeling, suggestion rows, whole-draft preview without mutation, dismissal and ambiguous-cancellation reconciliation without a revision change, an older poll returning after dismissal, the interleaving where an import advances the plan before an older ready poll returns, single-flight draft Apply with Review text and snippet preservation, committed-Apply reporting when the authoritative reload fails, and exact ambiguous Apply replay followed by sibling refresh and a second revision-bound Apply.
 
-G3 adds revision-bound Apply and request-time draft/attachment preservation. G4 completes real-provider/store integration and the remaining T18 browser/adapter gate.
+G4 completes real-provider/store integration and the remaining T18 browser/adapter gate.
