@@ -50,6 +50,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   releaseFails?: boolean;
   unsettledRebase?: boolean;
   rebaseFailure?: Error;
+  rebaseCleanupFailure?: Error;
   runnerCommitted?: boolean;
   operationTimeoutMs?: number;
   authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
@@ -101,6 +102,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       mappings: [{ oldSha: head, newSha: rebased }], resolvedConflicts: [] };
   }, abort: async (_attemptId: string, _head?: string, _state?: string, timeoutMs?: number) => {
     rebaseAborts++; abortBudgets.push(timeoutMs);
+    if (options.rebaseCleanupFailure) throw options.rebaseCleanupFailure;
   } } as never;
   const checkedHeads: string[] = [];
   const workspace: TaskWorkspace = {
@@ -199,6 +201,17 @@ it('leaves an unsettled conflict and its rebase marker for startup recovery', as
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Conflict resources remain owned.' });
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   expect(fixture.rebaseAborts()).toBe(0);
+  expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).not.toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('keeps a failed live cleanup current while its rebase marker awaits recovery', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    rebaseFailure: new Error('rebase failed'), rebaseCleanupFailure: new Error('cleanup failed'),
+  });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
+  expect(fixture.rebaseAborts()).toBe(1);
   expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).not.toBeNull();
   await fixture.coordinator.close(); await fixture.runner.close();
 });

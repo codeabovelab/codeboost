@@ -310,7 +310,10 @@ export class PreMergeCoordinator {
           throw error;
         }
         try { await this.#cleanupRebase(identity, marker, rebaseBudget(true)); }
-        catch (cleanup) { throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error }); }
+        catch (cleanup) {
+          bindCurrentFailure();
+          throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error });
+        }
         bindCurrentFailure();
         throw error;
       }
