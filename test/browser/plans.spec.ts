@@ -442,6 +442,32 @@ test('clears a Plans load-failure status when Review refresh recovers', async ({
   await expect(page.locator('#plans-status')).not.toContainText('Review read failed.');
 });
 
+test('does not let an older failed Review refresh replace newer Plans validation feedback', async ({ page }) => {
+  await page.goto(app.url);
+  let release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  await page.route('**/api/review', async route => {
+    arrived();
+    await held;
+    await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Older Review failure.' }) });
+  });
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await captured;
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.getByLabel('Plan file').setInputFiles({ name: 'plan.txt', mimeType: 'text/plain', buffer: Buffer.from('not a plan') });
+  await page.getByRole('button', { name: 'Import next revision' }).click();
+  await expect(page.locator('#plans-status')).toContainText('Choose a JSON or YAML plan file.');
+
+  const staleReviewResponse = page.waitForResponse(response => response.url().endsWith('/api/review'));
+  release();
+  await (await staleReviewResponse).finished();
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator('#plans-summary')).toHaveText('Plan unavailable');
+  await expect(page.locator('#plans-status')).toContainText('Choose a JSON or YAML plan file.');
+  await expect(page.locator('#plans-status')).not.toContainText('Older Review failure.');
+});
+
 test('does not let a question poll started during Plans refresh replace its completed answer', async ({ page }) => {
   const config = app.service.config;
   await app.close();

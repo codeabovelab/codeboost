@@ -70,7 +70,7 @@ async function api(path, body) {
 function rememberDraft() {
   if (selected) drafts.set(`${selected}:${mode}`, $("message").value);
 }
-function showFailure(message) {
+function showFailure(message, planStatusOwner) {
   mergeGeneration++;
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
@@ -79,7 +79,10 @@ function showFailure(message) {
   data = null;
   snippetSelection = null;
   renderPlans();
-  claimPlanStatus(view === "plans" ? "bad" : "neutral", view === "plans" ? `✕ ${message}` : "");
+  const planStatusClass = view === "plans" ? "bad" : "neutral";
+  const planStatusMessage = view === "plans" ? `✕ ${message}` : "";
+  if (planStatusOwner === undefined) claimPlanStatus(planStatusClass, planStatusMessage);
+  else setPlanStatus(planStatusOwner, planStatusClass, planStatusMessage);
   $("selection-actions").hidden = true;
   $("attachment").hidden = true;
   $("banner").textContent = message;
@@ -138,6 +141,7 @@ async function refresh() {
     rememberDraft();
     showFailure(
       `Could not read this branch’s history. ${error.message} Use Refresh to retry.`,
+      planStatusOwner,
     );
   } finally {
     endBusy(busyOwner);
