@@ -284,6 +284,7 @@ test('does not let a replayed import reload overwrite a newer terminal merge obs
   await mergedPoll;
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+  await page.unroute('**/api/merge');
 
   const staleReloadResponse = page.waitForResponse(response => response.url().endsWith('/api/review'));
   releaseReload();
@@ -794,6 +795,7 @@ test('does not let an older Plans refresh overwrite a newer terminal merge obser
   await mergedPoll;
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+  await page.unroute('**/api/merge');
 
   releaseRefresh();
   await expect(page.locator('#repository')).toHaveText('poll-first-refreshed');
@@ -864,6 +866,7 @@ test('does not let an older Review refresh overwrite a newer terminal merge obse
   await mergedPoll;
   await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
   await expect(page.getByRole('button', { name: 'Merged', exact: true })).toBeDisabled();
+  await page.unroute('**/api/merge');
 
   const staleReviewResponse = page.waitForResponse(response => response.url().endsWith('/api/review'));
   releaseRefresh();
