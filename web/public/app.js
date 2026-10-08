@@ -933,7 +933,7 @@ function planAuthorBusy() {
   return ["starting", "pending", "cancelling"].includes(planAuthorRequest?.state);
 }
 function planAuthorStale(request = planAuthorRequest) {
-  return !!request && (!data?.plan ||
+  return !!request && (request.state === "invalidated" || !data?.plan ||
     request.revision !== data.plan.revision || request.snapshotId !== data.snapshot?.id);
 }
 function describePlanEdit(edit) {
@@ -967,7 +967,9 @@ function validPlanEditForDisplay(edit) {
 }
 function validPlanAuthorStatus(status, request) {
   const states = ["pending", "ready", "failed", "cancelled", "invalidated", "consumed"];
-  if (!status || typeof status !== "object" || !states.includes(status.state) ||
+  const objectStatus = !!status && typeof status === "object";
+  const validMode = objectStatus && (request.mode === "suggest" ? status.mode === "suggest" : !("mode" in status));
+  if (!objectStatus || !validMode || !states.includes(status.state) ||
       !Number.isSafeInteger(status.revision) || status.revision < 1 ||
       typeof status.snapshotId !== "string" || !status.snapshotId ||
       status.revision !== request.revision || status.snapshotId !== request.snapshotId ||

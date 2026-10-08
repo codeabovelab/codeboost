@@ -182,6 +182,80 @@ test('keeps ownership while a malformed status response is retried', async ({ pa
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
 });
 
+test('rejects a status response for the wrong planning operation', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  const snapshotId = app.service.load().snapshot.id;
+  let reads = 0;
+  await page.route('**/api/plan/suggestions/*', async route => {
+    reads++;
+    if (reads === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        mode: 'draft', state: 'ready', revision: 1, snapshotId, reply: suggestions(), reason: null,
+      }) });
+      return;
+    }
+    await route.continue();
+  });
+  const suggest = page.locator('#plan-suggest');
+  await suggest.click();
+  await expect.poll(() => invocations.length).toBe(1);
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
+  await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
+
+  let draftReads = 0;
+  await page.route('**/api/plan/drafts/*', async route => {
+    draftReads++;
+    if (draftReads === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        mode: 'suggest', state: 'ready', revision: 1, snapshotId, plan: draft(current), reason: null,
+      }) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(2);
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
+  await expect(page.getByRole('region', { name: 'Draft Make retry limits visible to operators' })).toHaveCount(0);
+  invocations[1]!.resolve(JSON.stringify(draft(current)));
+  await expect(page.getByRole('status').filter({ hasText: 'Draft ready for r1.' })).toBeVisible();
+});
+
+test('marks invalidated output stale when it moves into history', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  const snapshotId = app.service.load().snapshot.id;
+  let reads = 0;
+  await page.route('**/api/plan/suggestions/*', async route => {
+    reads++;
+    if (reads === 1) {
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+        mode: 'suggest', state: 'invalidated', revision: 1, snapshotId, reply: suggestions(),
+        reason: 'The planning checkpoint changed.',
+      }) });
+      return;
+    }
+    await route.continue();
+  });
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions became stale.' })).toBeVisible();
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(2);
+  const historical = page.locator('.plan-author-result-heading').filter({ hasText: 'Earlier suggested edits' });
+  await expect(historical).toContainText('! Stale');
+  await expect(historical).not.toContainText('Earlier result');
+  invocations[1]!.resolve(JSON.stringify(draft(current)));
+  await expect(page.getByRole('status').filter({ hasText: 'Draft ready for r1.' })).toBeVisible();
+});
+
 test('rejects a status observation bound to another snapshot', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
