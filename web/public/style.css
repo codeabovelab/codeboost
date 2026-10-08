@@ -60,6 +60,20 @@ textarea,
 select {
   font: inherit;
 }
+input[type="file"] {
+  width: 100%;
+  color: var(--muted);
+}
+input[type="file"]::file-selector-button {
+  min-height: 28px;
+  margin-right: 8px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: var(--raised);
+  color: var(--text);
+  padding: 4px 10px;
+  cursor: pointer;
+}
 button,
 select {
   min-height: 28px;
@@ -713,6 +727,109 @@ body.resizing-conversation { cursor: col-resize; user-select: none; }
 #issues-status {
   margin-left: auto;
   overflow-wrap: anywhere;
+}
+#plans-status {
+  margin-left: auto;
+  overflow-wrap: anywhere;
+}
+.plans-workspace {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 360px;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+}
+.plan-document {
+  overflow: auto;
+  padding: 24px;
+}
+.plan-document-heading {
+  display: flex;
+  align-items: flex-start;
+  gap: 16px;
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line);
+}
+.plan-document-heading > div {
+  flex: 1;
+  min-width: 0;
+}
+.revision-badge {
+  border: 1px solid var(--line);
+  color: var(--muted);
+  padding: 4px 8px;
+}
+.plan-questions {
+  border-bottom: 1px solid var(--line);
+  padding: 12px 0;
+}
+.plan-card {
+  padding: 20px 0;
+  border-bottom: 1px solid var(--line);
+}
+.plan-card > header {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+}
+.plan-card h2,
+.plan-card h3 {
+  margin: 0;
+  font-weight: 500;
+}
+.plan-card h3 {
+  color: var(--muted);
+  font-size: 12px;
+  text-transform: uppercase;
+}
+.plan-dependencies code {
+  margin-left: 8px;
+  color: var(--text);
+}
+.plan-card-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 24px;
+  margin-top: 16px;
+}
+.plan-detail-list {
+  list-style: none;
+  padding: 0;
+  margin: 8px 0 0;
+}
+.plan-detail-list li {
+  display: grid;
+  grid-template-columns: minmax(88px, max-content) 1fr;
+  gap: 12px;
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+.plan-detail-list span {
+  overflow-wrap: anywhere;
+}
+.plan-file-path {
+  display: flex;
+  gap: 8px;
+}
+.plan-import {
+  overflow: auto;
+  border-left: 1px solid var(--line);
+  background: var(--surface);
+}
+#plan-import-form {
+  padding: 16px;
+}
+#plan-import-form label {
+  display: block;
+  margin: 20px 0 8px;
+  font-weight: 500;
+}
+#plan-file-details {
+  overflow-wrap: anywhere;
+}
+#plan-import {
+  width: 100%;
+  margin-top: 12px;
 }
 .issues-pane {
   flex: 1;

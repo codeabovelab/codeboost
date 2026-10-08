@@ -41,7 +41,7 @@
         ><span id="repository"></span>
         <nav aria-label="Main navigation">
           <a href="/?view=issues" id="issues-link">Issues</a
-          ><span>Plans</span><span>Queue</span
+          ><a href="/?view=plans" id="plans-link">Plans</a><span>Queue</span
           ><a href="/" aria-current="page" id="review-link">Review</a
           ><span>Lessons</span><span>Learning</span><button id="settings">Settings</button>
         </nav>
@@ -59,6 +59,36 @@
             Issues from people who are not repository collaborators need your trust before they can be queued.
           </p>
           <div id="issues-list"></div>
+        </main>
+      </div>
+      <div id="plans-view" class="view" hidden>
+        <div class="review-strip">
+          <div><strong>Plans</strong> <span id="plans-identity" class="mono muted"></span></div>
+          <div id="plans-status" role="status"></div>
+          <button id="plans-refresh">Refresh plan</button>
+        </div>
+        <main class="plans-workspace" aria-label="Current plan">
+          <section class="plan-document">
+            <header class="plan-document-heading">
+              <div>
+                <span class="eyebrow">CURRENT REVISION</span>
+                <h1 id="plans-summary">Loading plan…</h1>
+              </div>
+              <span id="plans-revision" class="revision-badge mono"></span>
+            </header>
+            <div id="plans-questions"></div>
+            <div id="plans-items"></div>
+          </section>
+          <aside class="plan-import" aria-label="Import plan">
+            <div class="pane-heading">IMPORT PLAN</div>
+            <form id="plan-import-form">
+              <p>Import a complete JSON or YAML plan as the next revision. The selected issue cannot change.</p>
+              <label for="plan-file">Plan file</label>
+              <input id="plan-file" type="file" accept=".json,.yaml,.yml,application/json,application/yaml,text/yaml" required />
+              <p id="plan-file-details" class="mono muted">No file selected</p>
+              <button type="submit" id="plan-import" class="primary">Import next revision</button>
+            </form>
+          </aside>
         </main>
       </div>
       <div id="review-view" class="view">
