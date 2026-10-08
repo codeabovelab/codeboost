@@ -6,7 +6,7 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { execFileSync } from 'node:child_process';
 import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
-import { commandArgv, type BaseEntry, type PlanContext } from '../core/plan.ts';
+import { commandArgv, PlanError, type BaseEntry, type PlanContext } from '../core/plan.ts';
 import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
@@ -15,7 +15,7 @@ import { GuardRefusal } from './lifecycle.ts';
 import { commandDigest } from './checks.ts';
 
 export interface ReviewConfig { database: string; repository: string;
-  /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
+  /** The runner-owned repository (#87) holding the production task branch, including its original imported head. */
   runnerRepository?: string;
   identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig;
   /** Exact complete argv arrays a stored plan may execute as `cmd:` acceptance checks. */
@@ -47,15 +47,15 @@ export class ReviewService {
   }
   close() { this.store.close(); }
   /**
-   * Where the task's reviewed commits are. Once the runner has committed for the task (a completed writable attempt that
-   * made a commit, #87), its branch is the runner's: the head is the one the Store recorded with that commit, in the
-   * runner-owned repository. Before that, the user's repository and its HEAD. Owned ledger entries alone do not decide it:
-   * a reviewed branch in the user's repository (the demo, a planted experiment) carries them too.
+   * Where the task's reviewed commits are. Production configures the runner-owned repository after importing the task's
+   * original head, so it remains authoritative even when every execution attempt is unchanged. Without one, the review
+   * observes the user's repository and HEAD (demo and planted-review behavior).
    */
   reviewRepository(): { path: string; runnerOwned: boolean } {
-    if (!this.store.hasRunnerCommit(this.config.identity)) return { path: this.config.repository, runnerOwned: false };
-    if (!this.config.runnerRepository) throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
-    return { path: this.config.runnerRepository, runnerOwned: true };
+    if (this.config.runnerRepository) return { path: this.config.runnerRepository, runnerOwned: true };
+    if (this.store.hasRunnerCommit(this.config.identity))
+      throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
+    return { path: this.config.repository, runnerOwned: false };
   }
   load(options: { maxDurationMs?: number } = {}) {
     const { identity } = this.config;
@@ -158,10 +158,18 @@ export class ReviewService {
         if (executionUnapproved.has(item.id)) reasons.push('Execution approval is out of date');
         if (!reasons.length) reasons.push('Code or plan definition changed');
       }
-      const commands = item.acceptance.filter(check => check.type === 'cmd').map(check => commandArgv(check.text));
-      const tests = commands.length
-        ? this.store.commandChecksPassed(identity, item.id, snapshot.head, commandDigest(commands)) ? '✓ Passed' : '– Not run'
-        : '– No tests defined';
+      let tests: string;
+      try {
+        const commands = item.acceptance.filter(check => check.type === 'cmd').map(check => commandArgv(check.text));
+        tests = commands.length
+          ? this.store.commandChecksPassed(identity, item.id, snapshot.head, commandDigest(commands)) ? '✓ Passed' : '– Not run'
+          : '– No tests defined';
+      } catch (error) {
+        // Plans imported before exact command spawning rejected malformed Unicode may contain an escaped lone surrogate.
+        // Keep the review repairable while making the legacy command visibly and durably non-passing.
+        if (!(error instanceof PlanError)) throw error;
+        tests = '✕ Invalid command';
+      }
       return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before, staleKey: staleKey(item),
         checks: { attributed: ambiguous ? `! ${ambiguous} ambiguous` : owned.length ? '✓ Attributed' : '– No changes', scope: outside.length ? `✕ ${new Set(outside).size} out of scope` : owned.length ? '✓ In scope' : '– No changes', tests, ai: '– Not run' }, outside: [...new Set(outside)],
       };

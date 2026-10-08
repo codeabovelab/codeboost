@@ -165,6 +165,8 @@ export class PreMergeCoordinator {
     return this.service.load(historyOptions());
   }
   #reviewBlocker(view: ReturnType<ReviewService['load']>, requireChecks = false): string | null {
+    const invalidCommand = view.items.find(item => item.checks.tests === '✕ Invalid command');
+    if (invalidCommand) return `${invalidCommand.id} has an invalid command check; amend the plan before preparing the merge.`;
     const item = view.items.find(value => value.state !== 'approved' || value.outside.length);
     if (item) return `${item.id} requires refreshed attribution or approval.`;
     if (view.segments.some(segment => segment.row === 'Ambiguous')) return 'Ambiguous changes require attribution.';

@@ -29,6 +29,16 @@ const markRunnerOwned = (service: ReviewService) => {
   service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
   service.config.runnerRepository = service.config.repository;
 };
+const markRunnerUnchanged = (service: ReviewService) => {
+  const identity = service.config.identity;
+  service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'queued');
+  const attempt = service.store.admitAttempt(identity, { expectedStateVersion: service.store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: service.store.currentContext(identity) });
+  service.store.markRunning(identity, attempt.id);
+  service.store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: true, head: service.store.getSnapshot(identity).head } });
+  service.store.transitionTask(identity, service.store.getTask(identity).stateVersion, 'in review');
+};
 
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
   duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
@@ -39,6 +49,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   commandWaitsForCancellation?: boolean;
   releaseFails?: boolean;
   unsettledRebase?: boolean;
+  runnerCommitted?: boolean;
   operationTimeoutMs?: number;
   authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
   reserves?: { processMs?: number; commandMs?: number };
@@ -70,7 +81,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   service.store.createPlan(JSON.stringify(plan), 'json', context, base, head);
   let view = service.load();
   service.store.recordHistory(identity, view.expected, base, head, [{ sha: head, owner: 'P1', origin: 'owned', sourceSha: null }]);
-  markRunnerOwned(service); view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
+  if (options.runnerCommitted !== false) markRunnerOwned(service); else markRunnerUnchanged(service);
+  view = service.load(); view = service.act({ action: 'approve', item: 'P1', token: view.token });
   let coordinator!: PreMergeCoordinator, rebaseRuns = 0;
   let rebaseAborts = 0;
   const rebaser = { run: async (input: { attemptId: string; signal: AbortSignal }) => {
@@ -149,6 +161,11 @@ it('preserves an approval when a moved base leaves its attributed fingerprint un
   const { service, coordinator, runner, result, rebased } = await rebaseFixture('feature\n');
   expect(result).toMatchObject({ state: 'ready', head: rebased, checked: [], reason: null });
   expect(service.load().items.find(item => item.id === 'P1')?.state).toBe('approved');
+  await coordinator.close(); await runner.close();
+});
+it('prepares a published original head when every runner item was unchanged', async () => {
+  const { coordinator, runner, result, rebased } = await rebaseFixture('feature\n', undefined, { runnerCommitted: false });
+  expect(result).toMatchObject({ state: 'ready', head: rebased, checked: [], reason: null });
   await coordinator.close(); await runner.close();
 });
 
