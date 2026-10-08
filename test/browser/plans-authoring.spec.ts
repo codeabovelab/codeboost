@@ -163,6 +163,132 @@ test('renders a whole next-revision draft without changing the current plan', as
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(1);
 });
 
+test('applies a draft once while preserving newer review text and its attachment', async ({ page }) => {
+  const { deps, invocations } = planning();
+  app = await startServer(createDemo(join(root, 'demo')), 0, undefined, undefined, undefined, undefined, undefined, deps);
+  await page.goto(app.url);
+  await page.locator('.added [data-line]').first().click();
+  await page.getByRole('button', { name: 'Ask about selection', exact: true }).click();
+  await page.getByLabel('Question about this item').fill('Before Apply');
+  await expect(page.locator('#attachment')).toContainText('retry.ts');
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  const current = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(draft(current)));
+  const apply = page.getByRole('button', { name: 'Apply draft', exact: true });
+  await expect(apply).toBeVisible();
+
+  let release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  let applies = 0;
+  await page.route('**/api/plan/drafts/*/apply', async route => { applies++; arrived(); await held; await route.continue(); });
+  await apply.focus();
+  await apply.evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+  await captured;
+  expect(applies).toBe(1);
+  await expect(page.getByRole('button', { name: 'Applying…', exact: true })).toBeFocused();
+  await expect(page.getByRole('button', { name: 'Applying…', exact: true })).toHaveAttribute('aria-disabled', 'true');
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByLabel('Question about this item').fill('Edited while Apply was in flight');
+  release();
+
+  await expect(page.locator('#issue')).toContainText('r2');
+  await expect(page.getByLabel('Question about this item')).toHaveValue('Edited while Apply was in flight');
+  await expect(page.locator('#attachment')).toContainText('retry.ts');
+  await expect(page.locator('#attachment')).not.toContainText('Outdated');
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+});
+
+test('keeps a committed draft applied when the authoritative reload fails', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(draft(current)));
+  let reloads = 0;
+  await page.route('**/api/review', async route => {
+    reloads++;
+    if (reloads === 1) await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary review read failure' }) });
+    else await route.continue();
+  });
+  await page.getByRole('button', { name: 'Apply draft', exact: true }).click();
+
+  await expect(page.locator('#plans-status')).toContainText('Revision r2 was applied, but the current plan could not reload');
+  await expect(page.getByRole('button', { name: 'Apply draft', exact: true })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Retry Apply', exact: true })).toHaveCount(0);
+  await expect(page.locator('#plans-revision')).toHaveText('r1');
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+  await page.locator('#plans-refresh').click();
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  expect(reloads).toBe(2);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+});
+
+test('keeps Apply retryable when success names the wrong revision', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(draft(current)));
+  await page.route('**/api/plan/drafts/*/apply', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({ result: { revision: 3 } }),
+  }));
+  await page.getByRole('button', { name: 'Apply draft', exact: true }).click();
+
+  await expect(page.getByRole('button', { name: 'Retry Apply', exact: true })).toBeVisible();
+  await expect(page.locator('#plans-status')).toContainText('Apply returned success without the expected revision');
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(1);
+});
+
+test('replays an ambiguous suggestion Apply, stales siblings, and refreshes before the next edit', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const first = suggestions();
+  first.edits.push({ ...first.edits[0]!, summary: 'Clarify retry intent', reason: 'The intent should name the visible limit.',
+    field: 'intent', value: 'Explain the operator-visible retry limit.' });
+  await page.getByLabel('Guidance').fill('Improve the retry item.');
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(first));
+  await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(2);
+  await page.getByLabel('Guidance').fill('Keep this newer guidance.');
+
+  const sent: unknown[] = [];
+  await page.route('**/api/plan/suggestions/*/apply', async route => {
+    sent.push(route.request().postDataJSON());
+    if (sent.length === 1) { await route.fetch(); await route.abort('failed'); }
+    else await route.continue();
+  });
+  await page.getByRole('button', { name: 'Apply this edit' }).first().click();
+  await expect(page.getByRole('button', { name: 'Retry Apply', exact: true })).toBeVisible();
+  await expect(page.locator('#plan-suggest')).toHaveAttribute('aria-disabled', 'true');
+  await page.locator('#plan-suggest').evaluate((button: HTMLButtonElement) => { button.click(); button.click(); });
+  expect(invocations).toHaveLength(1);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+  await page.getByRole('button', { name: 'Retry Apply', exact: true }).click();
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  expect(sent).toHaveLength(2);
+  expect(sent[1]).toEqual(sent[0]);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+  await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(0);
+  await expect(page.getByText('Plan changed — refresh suggestions', { exact: false })).toBeVisible();
+
+  await page.getByRole('button', { name: 'Refresh suggestions', exact: true }).click();
+  await expect.poll(() => invocations.length).toBe(2);
+  expect(invocations[1]!.request).toMatchObject({ mode: 'suggest', revision: 2 });
+  expect(invocations[1]!.request.prompt).toContain('Clarify retry intent');
+  await expect(page.getByLabel('Guidance')).toHaveValue('Keep this newer guidance.');
+  invocations[1]!.resolve(JSON.stringify(suggestions(2)));
+  await expect(page.getByRole('button', { name: 'Apply this edit', exact: true })).toBeVisible();
+  await page.getByRole('button', { name: 'Apply this edit', exact: true }).click();
+  await expect(page.locator('#plans-revision')).toHaveText('r3');
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(3);
+});
+
 test('retries an ambiguous suggestion start with the exact request', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
@@ -264,6 +390,7 @@ test('rejects failed output and marks consumed output stale', async ({ page }) =
   await expect(page.getByRole('status').filter({ hasText: 'Stale suggestions · generated for r1' })).toBeVisible();
   await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Dismiss suggestions' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(0);
   await expect(suggest).not.toHaveAttribute('aria-disabled', 'true');
 });
 
@@ -586,5 +713,6 @@ test('marks a delayed suggestion poll stale after an import advances the plan', 
   await expect(page.getByRole('status').filter({ hasText: 'Stale suggestions · generated for r1' })).toBeVisible();
   await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
   await expect(page.getByRole('button', { name: 'Dismiss suggestions' })).toHaveCount(0);
+  await expect(page.getByRole('button', { name: 'Apply this edit' })).toHaveCount(0);
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });
