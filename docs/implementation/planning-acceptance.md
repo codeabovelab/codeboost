@@ -85,6 +85,6 @@ it leaves anything.
 The Store guarantees revision/snapshot binding and pending-only settlement across
 processes, and E3 requires the caller's snapshot identity before admission. G4 now
 composes the browser with production planning setup, lane D's provider boundary,
-F's HTTP lifecycle and Store persistence in `plans-production.spec.ts`. T18 completes
-when G4's exact head also passes the real-Docker planning gate above. T9 remains
-incomplete until its remaining F6 common-CI and all-suite gate passes.
+F's HTTP lifecycle and Store persistence in `plans-production.spec.ts`. The exact-head
+real-Docker planning gate also passes, completing T18. T9 remains incomplete until
+its remaining F6 common-CI and all-suite gate passes.
