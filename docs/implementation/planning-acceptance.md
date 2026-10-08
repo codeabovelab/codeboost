@@ -82,8 +82,9 @@ suggestion timer and the request share one ten-minute budget. The recording
 script still runs the provider in its own process and prints its runner label if
 it leaves anything.
 
-F/G still own live API and UI integration. The Store now guarantees revision/snapshot
-binding and pending-only settlement across processes, and E3 requires the caller's
-snapshot identity before admission. G must not treat these fixture-only results as a
-completed production planning milestone. T18/T9 remain incomplete until all assigned
-lane slices pass their original acceptance.
+The Store guarantees revision/snapshot binding and pending-only settlement across
+processes, and E3 requires the caller's snapshot identity before admission. G4 now
+composes the browser with production planning setup, lane D's provider boundary,
+F's HTTP lifecycle and Store persistence in `plans-production.spec.ts`. T18 completes
+when G4's exact head also passes the real-Docker planning gate above. T9 remains
+incomplete until its remaining F6 common-CI and all-suite gate passes.

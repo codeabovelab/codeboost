@@ -125,6 +125,9 @@ function runningApp() {
 
 test('persists browser-applied provider suggestions and drafts through the production Store', async ({ page }) => {
   const config = productionConfig();
+  const baselineStore = new Store(config.database);
+  const baseRef = baselineStore.getSnapshot(config.identity).base;
+  baselineStore.close();
   const observations = { invocations: [] as InvocationInput[], schemas: [] as string[], prompts: [] as string[], releases: [] as number[] };
   await boot(config, observations);
   await openPlans(page);
@@ -176,8 +179,13 @@ test('persists browser-applied provider suggestions and drafts through the produ
   ]);
   for (const prompt of observations.prompts) {
     expect(prompt).toContain('acme/retry-service');
+    expect(prompt).toContain(baseRef);
     expect(prompt).toContain('Retries ignore the cap');
+    expect(prompt).toContain('Keep retry delays bounded.');
+    expect(prompt).toContain('Preserve the public API.');
   }
   expect(observations.prompts[0]).toContain('Make the retry ceiling explicit.');
+  expect(observations.prompts[1]).toContain('Expose the bounded retry ceiling at r2');
+  expect(observations.prompts[1]).toContain('"revision":2');
   expect(observations.releases).toHaveLength(2);
 });
