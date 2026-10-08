@@ -933,6 +933,92 @@ test('lets a terminal full response replace an active poll for the same merge at
   expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({ id: attempt.id, state: 'removed' });
 });
 
+test('lets a queued full response replace a stale submitting poll for the same merge attempt', async ({ page }) => {
+  test.slow();
+  const config = { ...app.service.config, demo: false };
+  await app.close();
+  chmodSync(join(config.repository, 'run.sh'), 0o644);
+  fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope');
+  let appRef: typeof app;
+  const gateway: MergeGateway & MergeQueueGateway = {
+    inspect: async () => {
+      const snapshot = appRef.service.load().snapshot;
+      return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
+        atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
+    },
+    queueWatermark: async () => null,
+    merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
+    inspectQueue: async head => ({ state: 'queued', reviewedHead: head, entryId: 'MQE_1', phase: 'QUEUED', position: 3,
+      enqueuedAt: '2026-10-08T08:00:00Z', queueHead: head }),
+  };
+  app = appRef = await startServer(config, 0, undefined, gateway);
+  let review = app.service.load();
+  for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
+    review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+  for (const item of review.items)
+    review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+  const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
+
+  await page.goto(app.url);
+  await expect(page.getByRole('button', { name: 'Submitting…', exact: true })).toBeDisabled();
+  app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
+  app.service.store.observeQueuedMerge(config.identity, attempt.id, { entryId: 'MQE_1', phase: 'QUEUED', position: 3 });
+
+  let releaseRefresh!: () => void, refreshArrived!: () => void;
+  const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+  const capturedRefresh = new Promise<void>(resolve => { refreshArrived = resolve; });
+  await page.route('**/api/review', async route => {
+    const response = await route.fetch();
+    const refreshed = await response.json();
+    expect(refreshed.merge.queue).toMatchObject({
+      actionId: attempt.actionId, reviewedHead: review.snapshot.head, state: 'queued', phase: 'QUEUED', position: 3,
+    });
+    refreshArrived();
+    await heldRefresh;
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(refreshed) });
+  });
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.locator('#plans-refresh').click();
+  await capturedRefresh;
+
+  let polls = 0, releaseLaterPolls!: () => void;
+  const heldLaterPolls = new Promise<void>(resolve => { releaseLaterPolls = resolve; });
+  await page.route('**/api/merge', async route => {
+    if (polls++ > 0) {
+      await heldLaterPolls;
+      await route.continue();
+      return;
+    }
+    await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ queue: {
+      kind: 'queue', state: 'submitting', actionId: attempt.actionId, reviewedHead: review.snapshot.head,
+      url: null, reason: null, phase: null, position: null, occurredAt: '2026-10-08T08:05:00Z', retryable: false,
+      observationError: 'The older queue inspection failed.',
+    } }) });
+  });
+  const stalePoll = page.waitForResponse(response => response.url().endsWith('/api/merge'));
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: /P1 Bound exponential retries/ }).click();
+  await stalePoll;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator('#banner')).toContainText('The older queue inspection failed.');
+
+  try {
+    const refreshResponse = page.waitForResponse(response => response.url().endsWith('/api/review'));
+    releaseRefresh();
+    await (await refreshResponse).finished();
+    await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+    await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+    await expect(page.locator('#banner')).not.toContainText('The older queue inspection failed.');
+    await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+    await expect(page.locator('#dialog-body')).toContainText('queued');
+    await expect(page.locator('#dialog-body')).toContainText('position 3');
+    await expect(page.locator('#dialog-body')).not.toContainText('The older queue inspection failed.');
+    expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({ id: attempt.id, state: 'queued', position: 3 });
+  } finally {
+    releaseLaterPolls();
+  }
+});
+
 test('does not let an older review action response replace a newer queued observation', async ({ page }) => {
   test.slow();
   const config = { ...app.service.config, demo: false };

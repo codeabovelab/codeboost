@@ -826,11 +826,13 @@ function preserveSettledQuestionAnswers(updated) {
 function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
   const fullResponseIsTerminal = ["merged", "removed", "failed"].includes(older?.state);
+  const pollRegressesQueued = older?.state === "queued" && newer?.state === "submitting";
   return observationOwner !== mergeObservationGeneration &&
     newer?.actionId &&
     newer.actionId === older?.actionId &&
     newer.reviewedHead === older.reviewedHead &&
-    !fullResponseIsTerminal
+    !fullResponseIsTerminal &&
+    !pollRegressesQueued
     ? newer
     : null;
 }
