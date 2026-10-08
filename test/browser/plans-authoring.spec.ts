@@ -75,6 +75,16 @@ test('renders suggestion cards and preserves guidance edited after submission', 
   await expect.poll(() => invocations.length).toBe(1);
   await expect(suggest).toBeFocused();
   await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.locator('#plan-draft')).toHaveAttribute('aria-disabled', 'true');
+  await page.mouse.move(0, 0);
+  await expect.poll(async () => {
+    const disabledColors = await Promise.all([suggest, page.locator('#plan-draft')].map(locator =>
+      locator.evaluate(element => {
+        const style = getComputedStyle(element);
+        return { background: style.backgroundColor, border: style.borderColor, color: style.color };
+      })));
+    return JSON.stringify(disabledColors[0]) === JSON.stringify(disabledColors[1]);
+  }).toBe(true);
   await guidance.fill('Keep these newer notes while the request runs.');
   invocations[0]!.resolve(JSON.stringify(suggestions()));
 
@@ -411,5 +421,6 @@ test('marks a delayed suggestion poll stale after an import advances the plan', 
 
   await expect(page.getByRole('status').filter({ hasText: 'Stale suggestions · generated for r1' })).toBeVisible();
   await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Dismiss suggestions' })).toHaveCount(0);
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });

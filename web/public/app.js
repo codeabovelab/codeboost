@@ -1000,7 +1000,8 @@ function planAuthorResultMarkup(request, historical = false) {
       <section class="draft-preview" aria-label="Draft ${esc(request.plan.summary)}"><header><h3>${esc(request.plan.summary)}</h3></header>
       <ul class="draft-items">${request.plan.items.map((item) => `<li><code>${esc(item.id)}</code> ${esc(item.title)}</li>`).join("")}</ul></section>`;
   }
-  if (!historical && result && request.requestId && !["cancelled", "consumed"].includes(request.state))
+  const dismissible = request.state === "cancelling" || (request.state === "ready" && !stale);
+  if (!historical && result && request.requestId && dismissible)
     result += `<div class="plan-author-result-actions"><button type="button" id="plan-author-dismiss"${request.state === "cancelling" ? ' aria-disabled="true"' : ""}>${request.state === "cancelling" ? "Dismissing…" : `Dismiss ${request.mode === "draft" ? "draft" : "suggestions"}`}</button></div>`;
   return result;
 }
