@@ -227,6 +227,29 @@ test('keeps a committed draft applied when the authoritative reload fails', asyn
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });
 
+test('accepts a later authoritative revision when reloading a committed Apply', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(draft(current)));
+  await page.route('**/api/review', async route => {
+    const later = app.service.store.getPlan(app.service.config.identity);
+    expect(later.revision).toBe(2);
+    later.revision++;
+    later.summary = 'A concurrent authoritative revision';
+    app.service.store.importRevision(JSON.stringify(later), 'json', app.service.planContextForAmendment(), 2);
+    await route.continue();
+  });
+  await page.getByRole('button', { name: 'Apply draft', exact: true }).click();
+
+  await expect(page.locator('#plans-revision')).toHaveText('r3');
+  await expect(page.locator('#plans-status')).toHaveText('✓ Revision r3 is current.');
+  await expect(page.locator('#plan-suggest')).not.toHaveAttribute('aria-disabled', 'true');
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(3);
+});
+
 test('blocks stale authoring after a suggestion commits but its authoritative reload fails', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);

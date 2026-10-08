@@ -1399,8 +1399,8 @@ async function applyPlanAuthor(index) {
     try {
       const updated = await api("/api/review");
       if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration || planAuthorRequest !== request) return;
-      if (!updated?.plan || updated.plan.revision !== revision)
-        throw new Error(`The authoritative review did not return applied revision r${revision}.`);
+      if (!updated?.plan || updated.plan.revision < revision)
+        throw new Error(`The authoritative review did not include applied revision r${revision}.`);
       rememberDraft();
       mergeGeneration++;
       if (mergePollTimer) clearTimeout(mergePollTimer);
