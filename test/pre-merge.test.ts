@@ -542,7 +542,7 @@ it('aborts remote work early enough to reserve bounded subprocess settlement', a
 });
 
 it('budgets live rebase work and its follow-up cleanup inside the preparation deadline', async () => {
-  const operationTimeoutMs = 60_000;
+  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 10_000;
   const fixture = await rebaseFixture('feature\n', undefined,
     { operationTimeoutMs, rebaseFailure: new Error('rebase failed') });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });

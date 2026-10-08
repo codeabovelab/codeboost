@@ -5,7 +5,8 @@ import { dirname, join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fixtureGit as git } from './fixtures/git.ts';
-import { GitRebaser, RebaseConflict, RebaseResourcesUnsettled, rebaseRef, type GitRebaserOptions } from '../runner/rebase.ts';
+import { GitRebaser, MIN_REBASE_CLEANUP_TIMEOUT_MS, RebaseConflict, RebaseResourcesUnsettled, rebaseRef,
+  type GitRebaserOptions } from '../runner/rebase.ts';
 import { ensureCommit, openRunnerRepository } from '../runner/runner-repository.ts';
 import { splitBoundedIndexRecords, verifyCheckout } from '../runner/verify-checkout.ts';
 import { readBoundedRebaseStateNames } from '../runner/hash-rebase-state.ts';
@@ -65,6 +66,10 @@ function createRebaser(s: Awaited<ReturnType<typeof setup>>, options: Partial<Gi
 }
 
 describe('trusted pre-merge rebase', () => {
+  it('reserves Git work as well as process settlement for cleanup-only calls', () => {
+    expect(MIN_REBASE_CLEANUP_TIMEOUT_MS).toBe(30_000);
+  });
+
   it('bounds rebase-state directory names while they are enumerated', () => {
     const names = [Buffer.from('one'), Buffer.from('two'), Buffer.from('three')];
     let index = 0;

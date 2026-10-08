@@ -14,7 +14,7 @@ const MAX_REBASE_COMMITS = 500;
 const PROCESS_SETTLEMENT_RESERVE_MS = 13_000;
 // Cleanup receives an operation-wide 30 s: 13 s to settle a cleanup process group and 17 s for Git and follow-up calls.
 const CLEANUP_RESERVE_MS = 30_000;
-export const MIN_REBASE_CLEANUP_TIMEOUT_MS = PROCESS_SETTLEMENT_RESERVE_MS + 1;
+export const MIN_REBASE_CLEANUP_TIMEOUT_MS = CLEANUP_RESERVE_MS;
 export const MIN_REBASE_TIMEOUT_MS = CLEANUP_RESERVE_MS + PROCESS_SETTLEMENT_RESERVE_MS + 1;
 export const MAX_REBASE_TIMEOUT_MS = 120_000;
 

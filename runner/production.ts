@@ -19,7 +19,7 @@ import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport,
 import { GitBranchPusher, pushUrl } from './branch-push.ts';
 import { PullRequestPublisher } from './publish.ts';
 import type { ReviewService } from './review.ts';
-import { ensureCommit, openRunnerRepository, ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
+import { openRunnerRepository, ownerOnlyDirectory, retainSnapshotCommit, type RunnerRepository } from './runner-repository.ts';
 import { GitRebaser } from './rebase.ts';
 import { createForeignConflictResolver } from './rebase-conflict.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
@@ -233,8 +233,7 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       // A fresh bare repository has no objects yet. Seed the recorded snapshot before selecting it for review reads;
       // otherwise the server cannot render the initial review, and no execution attempt can get far enough to import it.
       const snapshot = service.store.getSnapshot(identity);
-      await ensureCommit(repository, snapshot.base);
-      await ensureCommit(repository, snapshot.head);
+      for (const commit of new Set([snapshot.base, snapshot.head])) await retainSnapshotCommit(repository, commit);
       review.runnerRepository = repository.path;
       return repository;
     });

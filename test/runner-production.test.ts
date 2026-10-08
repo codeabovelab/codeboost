@@ -110,9 +110,11 @@ describe('runner startup', () => {
     // The review now reads runner commits from the repository the runner writes.
     const repositories = join(root, 'runner', assembly.deps.runnerOwner, 'repositories');
     expect(service.config.runnerRepository).toBe(join(repositories, readdirSync(repositories)[0]!));
+    const snapshot = service.store.getSnapshot(service.config.identity);
+    for (const commit of new Set([snapshot.base, snapshot.head]))
+      expect(existsSync(join(service.config.runnerRepository!, 'refs', 'codeboost', 'remote-commits', commit))).toBe(true);
     // Selecting a freshly-created runner repository must not make the initial review unreadable before any attempt runs.
-    expect(service.load().snapshot).toMatchObject({ base: service.store.getSnapshot(service.config.identity).base,
-      head: service.store.getSnapshot(service.config.identity).head });
+    expect(service.load().snapshot).toMatchObject({ base: snapshot.base, head: snapshot.head });
     // Per database, under its runner token: another database sharing the root keeps its own folder.
     expect(statSync(join(root, 'runner', assembly.deps.runnerOwner, 'diagnostics')).mode & 0o777).toBe(0o700);
     expect(existsSync(join(root, 'runner', 'diagnostics'))).toBe(false);
