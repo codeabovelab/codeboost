@@ -241,6 +241,17 @@ export class PreMergeCoordinator {
       } });
       return current;
     };
+    // Rebase lifecycle writes advance task state without changing the reviewed pair. Bind a resulting failure to that
+    // settled durable state without rebuilding history; if a read fails, the older binding remains safely stale.
+    const bindCurrentFailure = () => {
+      try {
+        const snapshot = this.service.store.getSnapshot(identity);
+        onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
+          stateVersion: this.service.store.getTask(identity).stateVersion,
+          reviewVersion: this.service.store.reviewVersion(identity), snapshotId: snapshot.id,
+        } });
+      } catch { /* An unbound failure is conservatively historical. */ }
+    };
     const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()) }));
     let view = load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
@@ -292,18 +303,13 @@ export class PreMergeCoordinator {
         this.service.store.finishRebase(identity, reviewed, task.stateVersion, marker.attemptId,
           result.base, result.head, result.mappings);
       } catch (error) {
-        if (error instanceof RebaseResourcesUnsettled) throw error;
+        if (error instanceof RebaseResourcesUnsettled) {
+          bindCurrentFailure();
+          throw error;
+        }
         try { await this.#cleanupRebase(identity, marker, rebaseBudget(true)); }
         catch (cleanup) { throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error }); }
-        // beginRebase and successful cleanup both advance task state. Bind the actionable failure to that settled
-        // state without rebuilding history; if a read itself fails, retaining the older binding fails closed as stale.
-        try {
-          const snapshot = this.service.store.getSnapshot(identity);
-          onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
-            stateVersion: this.service.store.getTask(identity).stateVersion,
-            reviewVersion: this.service.store.reviewVersion(identity), snapshotId: snapshot.id,
-          } });
-        } catch { /* An unbound failure is conservatively historical. */ }
+        bindCurrentFailure();
         throw error;
       }
       view = load();

@@ -197,6 +197,7 @@ it('marks a failed preparation stale when its final remote inspection was invali
 it('leaves an unsettled conflict and its rebase marker for startup recovery', async () => {
   const fixture = await rebaseFixture('feature\n', undefined, { unsettledRebase: true });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Conflict resources remain owned.' });
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   expect(fixture.rebaseAborts()).toBe(0);
   expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).not.toBeNull();
   await fixture.coordinator.close(); await fixture.runner.close();
