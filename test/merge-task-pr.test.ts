@@ -188,6 +188,22 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(store.getMergeAttempt(identity)).toMatchObject({ queueWatermark: 'CURSOR_after_authorization' });
   });
 
+  it('revalidates the pull request after capturing the queue event boundary', async () => {
+    const { store } = published();
+    let remoteBase = oid(1), watermarks = 0;
+    const gh = github(store, () => ({ base: remoteBase, mergeQueue: true }));
+    gh.client.queueWatermark = vi.fn(async () => {
+      if (++watermarks === 2) remoteBase = oid(3);
+      return 'CURSOR';
+    });
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+
+    await expect(merges.merge('review-token')).rejects.toThrow(/pull request|requirements changed/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('revalidates local authorization after the final queue event boundary', async () => {
     const { store } = published(), gh = github(store, () => ({ mergeQueue: true }));
     let authorized = false, revoked = false;

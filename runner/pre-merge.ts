@@ -3,7 +3,8 @@ import { DEFAULT_PROCESS_SETTLEMENT_MS } from '../agents/process-group.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { RunnerCoordinator } from './coordinator.ts';
 import { GuardRefusal, MERGEABLE_STATUSES, settleWith, type ShutdownCapability } from './lifecycle.ts';
-import { RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
+import { MAX_REBASE_TIMEOUT_MS, MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS,
+  RebaseResourcesUnsettled, type GitRebaser } from './rebase.ts';
 import type { ReviewService } from './review.ts';
 import type { PreMergeReadiness, RebaseMarker } from './store.ts';
 
@@ -189,10 +190,10 @@ export class PreMergeCoordinator {
     }
     return null;
   }
-  async #cleanupRebase(identity: PlanIdentity, marker: RebaseMarker): Promise<void> {
+  async #cleanupRebase(identity: PlanIdentity, marker: RebaseMarker, timeoutMs: number): Promise<void> {
     const current = this.service.store.getTask(identity).rebaseInProgress as RebaseMarker | null;
     if (current?.attemptId !== marker.attemptId) throw new GuardRefusal('This rebase attempt no longer owns cleanup.');
-    await this.rebaser.abort(marker.attemptId, current.resultHead ?? undefined, current.resultState);
+    await this.rebaser.abort(marker.attemptId, current.resultHead ?? undefined, current.resultState, timeoutMs);
     if (!this.settle(() => this.service.store.abortRebase(this.service.store.getTask(identity).planKey, marker.attemptId)))
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
@@ -215,6 +216,13 @@ export class PreMergeCoordinator {
       const value = Math.ceil(deadline - performance.now() - this.commandSettlementReserveMs);
       if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded before command-check settlement could be reserved.'),
         { code: 'ETIMEDOUT' });
+      return value;
+    };
+    const rebaseBudget = (cleanupOnly = false) => {
+      const value = Math.min(MAX_REBASE_TIMEOUT_MS, remaining());
+      if (value < (cleanupOnly ? MIN_REBASE_CLEANUP_TIMEOUT_MS : MIN_REBASE_TIMEOUT_MS))
+        throw Object.assign(new Error(`Pre-merge preparation deadline exceeded before rebase ${cleanupOnly ? 'cleanup' : 'work and cleanup'} could be reserved.`),
+          { code: 'ETIMEDOUT' });
       return value;
     };
     const authorize = async () => {
@@ -268,19 +276,21 @@ export class PreMergeCoordinator {
       const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
         reviewVersion: view.expected.reviewVersion! };
       const oldBase = view.snapshot.base, oldHead = view.snapshot.head;
+      await authorize();
+      signal.throwIfAborted();
+      const rebaseTimeoutMs = rebaseBudget();
       const marker = this.service.store.beginRebase(identity, reviewed, task.stateVersion,
         { oldBase: view.snapshot.base, oldHead: view.snapshot.head, oldHistory: old, onto: initial.base });
       try {
-        await authorize();
         const result = await this.rebaser.run({ attemptId: marker.attemptId, oldBase,
           oldHead, oldHistory: old, onto: initial.base,
-          ledger: this.service.store.getLedger(identity), signal });
+          ledger: this.service.store.getLedger(identity), signal, timeoutMs: rebaseTimeoutMs });
         signal.throwIfAborted();
         this.service.store.finishRebase(identity, reviewed, task.stateVersion, marker.attemptId,
           result.base, result.head, result.mappings);
       } catch (error) {
         if (error instanceof RebaseResourcesUnsettled) throw error;
-        try { await this.#cleanupRebase(identity, marker); }
+        try { await this.#cleanupRebase(identity, marker, rebaseBudget(true)); }
         catch (cleanup) { throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error }); }
         // beginRebase and successful cleanup both advance task state. Bind the actionable failure to that settled
         // state without rebuilding history; if a read itself fails, retaining the older binding fails closed as stale.

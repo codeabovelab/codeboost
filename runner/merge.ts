@@ -410,10 +410,18 @@ export class MergeCoordinator {
         commandStatus = authorized.status;
       }
       if (commandStatus.remote.mergeQueue) {
-        // The stored cursor is the final external read: events produced by another actor during authorization or the
-        // status checks precede this boundary and therefore cannot be adopted as this attempt's queue lifecycle.
+        // Events produced by another actor during authorization or the preceding status checks come before this
+        // boundary and cannot be adopted as this attempt's lifecycle. The following fresh status read then validates
+        // the PR identity and queue mode that this cursor will be stored with.
         queueWatermark = await (this.gateway as QueueGateway).queueWatermark(commandStatus.remote.head,
           { signal, timeoutMs: 6_000, pullRequest: commandStatus.remote.pullRequest });
+        const boundary = await this.#statusForMerge(view, signal);
+        if (boundary.status.remote.base !== commandStatus.remote.base || boundary.status.remote.head !== commandStatus.remote.head
+          || boundary.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(boundary))
+          throw new Error('The pull request changed after queue correlation. Refresh before merging.');
+        if (!boundary.status.ready)
+          throw new Error(`Merge requirements changed after queue correlation. ${boundary.status.blockers[0]!.message}`);
+        commandStatus = boundary.status;
       }
       // The external authorization read completed before the final PR inspection and queue boundary. Re-read local
       // trust synchronously after those awaits so neither remote identity nor local authorization can race admission.

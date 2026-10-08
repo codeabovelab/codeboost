@@ -14,7 +14,9 @@ const MAX_REBASE_COMMITS = 500;
 const PROCESS_SETTLEMENT_RESERVE_MS = 13_000;
 // Cleanup receives an operation-wide 30 s: 13 s to settle a cleanup process group and 17 s for Git and follow-up calls.
 const CLEANUP_RESERVE_MS = 30_000;
-const MIN_REBASE_TIMEOUT_MS = CLEANUP_RESERVE_MS + PROCESS_SETTLEMENT_RESERVE_MS + 1;
+export const MIN_REBASE_CLEANUP_TIMEOUT_MS = PROCESS_SETTLEMENT_RESERVE_MS + 1;
+export const MIN_REBASE_TIMEOUT_MS = CLEANUP_RESERVE_MS + PROCESS_SETTLEMENT_RESERVE_MS + 1;
+export const MAX_REBASE_TIMEOUT_MS = 120_000;
 
 export interface RebaseMapping { oldSha: string; newSha: string }
 export interface RebaseConflictInput {
@@ -101,7 +103,7 @@ export class GitRebaser {
     if (!options.committer.name || !options.committer.email || /[<>\n\r\0]/.test(options.committer.name + options.committer.email))
       throw new Error('A valid rebase committer is required.');
     if (options.timeoutMs !== undefined && (!Number.isSafeInteger(options.timeoutMs) ||
-        options.timeoutMs < MIN_REBASE_TIMEOUT_MS || options.timeoutMs > 120_000))
+        options.timeoutMs < MIN_REBASE_TIMEOUT_MS || options.timeoutMs > MAX_REBASE_TIMEOUT_MS))
       throw new Error('Invalid rebase deadline.');
     const git = configuredGit();
     this.#options = options;
@@ -111,7 +113,8 @@ export class GitRebaser {
   }
 
   async run(input: { attemptId: string; oldBase: string; oldHead: string; oldHistory: readonly string[]; onto: string;
-    ledger?: readonly { sha: string; owner: string | null; origin: 'owned' | 'foreign' }[]; signal?: AbortSignal }): Promise<RebaseResult> {
+    ledger?: readonly { sha: string; owner: string | null; origin: 'owned' | 'foreign' }[]; signal?: AbortSignal;
+    timeoutMs?: number }): Promise<RebaseResult> {
     const { attemptId, oldBase, oldHead, oldHistory, onto, signal } = input;
     rebaseRef(attemptId);
     for (const value of [oldBase, oldHead, onto]) if (!COMMIT_ID.test(value)) throw new Error('A full commit ID is required for rebasing.');
@@ -123,7 +126,7 @@ export class GitRebaser {
       ledger.set(entry.sha, { owner: entry.owner, origin: entry.origin });
     }
     signal?.throwIfAborted();
-    const scope = this.#scope(attemptId, signal);
+    const scope = this.#scope(attemptId, signal, input.timeoutMs);
     const ref = rebaseRef(attemptId);
     const existing = await this.#call(this.#options.repository.path, ['show-ref', '--verify', '--quiet', ref], scope);
     this.#throwIfCancelled(existing, scope);
@@ -260,10 +263,10 @@ export class GitRebaser {
 
   /** Startup/live recovery for an attempt whose Store marker still exists. */
   async abort(attemptId: string, resultHead?: string,
-    resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready' = 'ready'): Promise<void> {
+    resultState: 'none' | 'prepared' | 'uncertain' | 'refused' | 'ready' = 'ready', timeoutMs?: number): Promise<void> {
     const ref = rebaseRef(attemptId), path = this.#path(attemptId), stat = lstatSync(path, { throwIfNoEntry: false });
     if (resultHead !== undefined && !COMMIT_ID.test(resultHead)) throw new Error('A full retained result ID is required.');
-    const scope = this.#scope(attemptId);
+    const scope = this.#scope(attemptId, undefined, timeoutMs, true);
     if (stat && (!stat.isDirectory() || stat.isSymbolicLink())) throw new Error('The rebase workspace is not a plain directory.');
     await this.#remove(path, scope);
     if (resultState === 'refused') return;
@@ -548,8 +551,13 @@ export class GitRebaser {
     return outcome;
   }
 
-  #scope(attemptId: string, signal?: AbortSignal): CallScope {
-    const timeout = this.#options.timeoutMs ?? 120_000, deadline = performance.now() + timeout;
+  #scope(attemptId: string, signal?: AbortSignal, requestedTimeoutMs?: number, cleanupOnly = false): CallScope {
+    const configured = this.#options.timeoutMs ?? MAX_REBASE_TIMEOUT_MS;
+    const timeout = requestedTimeoutMs === undefined ? configured : Math.min(requestedTimeoutMs, configured);
+    const minimum = cleanupOnly ? MIN_REBASE_CLEANUP_TIMEOUT_MS : MIN_REBASE_TIMEOUT_MS;
+    if (!Number.isSafeInteger(timeout) || timeout < minimum || timeout > MAX_REBASE_TIMEOUT_MS)
+      throw new Error('Invalid rebase deadline.');
+    const deadline = performance.now() + timeout;
     return { attemptId, signal, deadline, workDeadline: deadline - CLEANUP_RESERVE_MS };
   }
 
