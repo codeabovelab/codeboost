@@ -877,6 +877,98 @@ test('does not let an older review action response replace a newer queued observ
   }
 });
 
+for (const mismatch of [
+  { label: 'action ID', change: (queue: Record<string, unknown>) => ({ ...queue, actionId: randomUUID() }) },
+  { label: 'reviewed head', change: (queue: Record<string, unknown>) => ({ ...queue, reviewedHead: 'f'.repeat(40) }) },
+]) {
+  test(`does not preserve a newer queue observation with a different ${mismatch.label}`, async ({ page }) => {
+    test.slow();
+    const config = { ...app.service.config, demo: false };
+    await app.close();
+    chmodSync(join(config.repository, 'run.sh'), 0o644);
+    fixtureGit(config.repository, 'commit', '-am', 'Restore declared scope');
+    let appRef: typeof app;
+    const gateway: MergeGateway & MergeQueueGateway = {
+      inspect: async () => {
+        const snapshot = appRef.service.load().snapshot;
+        return { base: snapshot.base, head: snapshot.head, pullRequestState: 'OPEN', mergeable: 'MERGEABLE', rulesKnown: true,
+          atomicBaseGuard: true, mergeQueue: true, requiredChecks: [], alreadyFixed: 'clear', pullRequest: 7, draft: false };
+      },
+      queueWatermark: async () => null,
+      merge: async () => ({ url: 'https://github.com/example/repo/pull/7' }),
+      inspectQueue: async head => ({ state: 'queued', reviewedHead: head, entryId: 'MQE_identity', phase: 'QUEUED', position: 3,
+        enqueuedAt: '2026-10-08T08:15:00Z', queueHead: head }),
+    };
+    app = appRef = await startServer(config, 0, undefined, gateway);
+    let review = app.service.load();
+    for (const segment of review.segments.filter(value => value.row === 'Unplanned' || value.row === 'Ambiguous'))
+      review = app.service.act({ action: 'accept', key: segment.key, token: review.token });
+    for (const item of review.items)
+      review = app.service.act({ action: 'approve', item: item.id, confirmNoChange: item.count === 0, token: review.token });
+    const attempt = app.service.store.beginMergeAttempt(config.identity, review.expected as never, review.snapshot.head, null, 'queue', randomUUID());
+    app.service.store.queueMergeAttempt(config.identity, attempt.id, 'https://github.com/example/repo/pull/7');
+    app.service.store.observeQueuedMerge(config.identity, attempt.id, { entryId: 'MQE_identity', phase: 'QUEUED', position: 3 });
+    const observed = mismatch.change({
+      kind: 'queue', state: 'queued', actionId: attempt.actionId, reviewedHead: review.snapshot.head,
+      url: 'https://github.com/example/repo/pull/7', reason: null, phase: 'QUEUED', position: 2,
+      occurredAt: '2026-10-08T08:16:00Z', retryable: false,
+    });
+
+    let releaseAction!: () => void, actionArrived!: () => void;
+    const heldAction = new Promise<void>(resolve => { releaseAction = resolve; });
+    const capturedAction = new Promise<void>(resolve => { actionArrived = resolve; });
+    await page.route('**/api/action', async route => {
+      const response = await route.fetch();
+      const actionResponse = await response.json();
+      expect(actionResponse.merge.queue).toMatchObject({ actionId: attempt.actionId, reviewedHead: review.snapshot.head,
+        state: 'queued', position: 3 });
+      actionArrived();
+      await heldAction;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify(actionResponse) });
+    });
+
+    await page.goto(app.url);
+    await expect(page.getByRole('button', { name: 'Merge queued', exact: true })).toBeDisabled();
+    await page.getByRole('button', { name: 'Request change', exact: true }).click();
+    const note = `Keep the action response for a different ${mismatch.label}.`;
+    await page.getByLabel('Change to request').fill(note);
+    await page.getByRole('button', { name: 'Save change request', exact: true }).click();
+    await capturedAction;
+
+    let polls = 0, releaseLaterPolls!: () => void;
+    const heldLaterPolls = new Promise<void>(resolve => { releaseLaterPolls = resolve; });
+    await page.route('**/api/merge', async route => {
+      polls++;
+      if (polls > 1) await heldLaterPolls;
+      await route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({ queue: observed }) });
+    });
+    try {
+      const mismatchedPoll = page.waitForResponse(async response => response.url().endsWith('/api/merge') &&
+        (await response.json()).queue?.position === 2);
+      await page.getByRole('button', { name: /P2 Document retry behavior/ }).click();
+      await (await mismatchedPoll).finished();
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+      await expect(page.locator('#dialog-body')).toContainText('position 2');
+      await page.getByRole('button', { name: 'Close', exact: true }).click();
+
+      const staleAction = page.waitForResponse(response => response.url().endsWith('/api/action'));
+      releaseAction();
+      await (await staleAction).finished();
+      await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+      await page.getByRole('button', { name: /P1 Bound exponential retries/ }).click();
+      await expect(page.getByText(note, { exact: true })).toBeVisible();
+      await page.getByRole('button', { name: 'Merge status', exact: true }).click();
+      await expect(page.locator('#dialog-body')).toContainText('position 3');
+      await page.getByRole('button', { name: 'Close', exact: true }).click();
+      expect(app.service.store.getMergeAttempt(config.identity)).toMatchObject({ id: attempt.id, reviewedHead: review.snapshot.head, position: 3 });
+      expect(app.service.store.getReviewNotes(config.identity).some(saved => saved.text === note)).toBe(true);
+    } finally {
+      releaseLaterPolls();
+    }
+  });
+}
+
 test('does not let an older Plans refresh replace a confirmed queued merge with submitting', async ({ page }) => {
   test.slow();
   const config = { ...app.service.config, demo: false };
