@@ -125,10 +125,12 @@ async function refresh() {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    data = updated;
+    const newerQueue = newerMergeQueue(updated);
+    data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
     snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
     render();
+    if (newerQueue) showMergeQueueStatus(newerQueue);
   } catch (error) {
     if (generation !== reviewGeneration) return;
     rememberDraft();
@@ -790,9 +792,12 @@ function preserveSettledQuestionAnswers(updated) {
   const current = new Map(data.notes.map(note => [note.id, note]));
   return { ...updated, notes: updated.notes.map(note => {
     const newer = current.get(note.id);
-    return ["complete", "failed"].includes(newer?.answer?.status) &&
-      note.answer?.status === "pending" &&
-      newer.answer.attempt === note.answer.attempt
+    const sameAttempt = newer?.answer?.attempt !== undefined && newer.answer.attempt === note.answer?.attempt;
+    const settledFromPending = note.answer?.status === "pending";
+    const cancellationSettled = note.answerActive && newer?.answerActive === false &&
+      newer.answer?.status === note.answer?.status;
+    return sameAttempt && ["complete", "failed"].includes(newer.answer.status) &&
+      (settledFromPending || cancellationSettled)
       ? { ...note, answer: newer.answer, answerActive: newer.answerActive }
       : note;
   }) };
