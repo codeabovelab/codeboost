@@ -105,6 +105,12 @@ button.primary,
   color: var(--on-primary);
   border-color: var(--primary);
 }
+button.primary:disabled,
+button.primary[aria-disabled="true"] {
+  background: var(--surface);
+  color: var(--muted);
+  border-color: var(--line);
+}
 #approve:hover,
 #merge:not(:disabled):hover {
   background: var(--hover);
@@ -811,18 +817,94 @@ body.resizing-conversation { cursor: col-resize; user-select: none; }
   display: flex;
   gap: 8px;
 }
-.plan-import {
+.plan-tools {
   overflow: auto;
   border-left: 1px solid var(--line);
   background: var(--surface);
 }
+#plan-author-form,
 #plan-import-form {
   padding: 16px;
 }
+#plan-author-form label,
 #plan-import-form label {
   display: block;
-  margin: 20px 0 8px;
+  margin: 0 0 8px;
   font-weight: 500;
+}
+#plan-import-form label {
+  margin-top: 20px;
+}
+#plan-feedback {
+  width: 100%;
+  resize: vertical;
+}
+.plan-author-actions {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 12px;
+}
+.plan-author-actions button {
+  min-width: 0;
+}
+#plan-author-status {
+  min-height: 18px;
+  padding: 0 16px 12px;
+  overflow-wrap: anywhere;
+}
+#plan-author-result {
+  border-bottom: 1px solid var(--line);
+}
+.plan-author-result-heading {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+}
+.plan-author-reply {
+  margin: 0;
+  padding: 0 16px 12px;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.suggestion-row,
+.draft-preview {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
+}
+.suggestion-row header,
+.draft-preview header {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.suggestion-row h3,
+.draft-preview h3 {
+  margin: 0;
+  font-size: 13px;
+  font-weight: 500;
+}
+.suggestion-row p,
+.draft-preview p {
+  margin-bottom: 0;
+  overflow-wrap: anywhere;
+}
+.suggestion-change {
+  color: var(--muted);
+  font-family: "IBM Plex Mono", Menlo, Consolas, monospace;
+  font-size: 12px;
+}
+.draft-items {
+  list-style: none;
+  margin: 8px 0 0;
+  padding: 0;
+}
+.draft-items li {
+  padding: 6px 0;
+  border-top: 1px solid var(--line);
+}
+.plan-author-result-actions {
+  padding: 12px 16px;
+  border-top: 1px solid var(--line);
 }
 #plan-file-details {
   overflow-wrap: anywhere;

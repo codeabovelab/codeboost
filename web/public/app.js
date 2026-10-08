@@ -905,6 +905,11 @@ let planImportPending = false,
   planRefreshPending = false,
   planOperationGeneration = 0,
   planStatusGeneration = 0;
+let planAuthorGeneration = 0,
+  planAuthorRequest = null;
+const planAuthorHistory = [];
+const planAuthorPollInitial = 500,
+  planAuthorPollMaximum = 5000;
 function claimPlanStatus(className, text) {
   const owner = ++planStatusGeneration;
   $("plans-status").className = className;
@@ -924,12 +929,183 @@ function supersedePlanRefresh() {
   $("plans-refresh").textContent = "Refresh plan";
   claimPlanStatus("neutral", "");
 }
+function planAuthorBusy() {
+  return ["starting", "pending", "cancelling"].includes(planAuthorRequest?.state);
+}
+function planAuthorStale(request = planAuthorRequest) {
+  return !!request && (["invalidated", "consumed"].includes(request.state) || !data?.plan ||
+    request.revision !== data.plan.revision || request.snapshotId !== data.snapshot?.id);
+}
+function describePlanEdit(edit) {
+  switch (edit.op) {
+    case "add_item": return `Add ${edit.item}`;
+    case "remove_item": return `Remove ${edit.item}`;
+    case "set_field": return `Set ${edit.item}.${edit.field} to ${edit.value}`;
+    case "add_file": return `Add ${edit.file?.path} to ${edit.item}`;
+    case "update_file": return `Update ${edit.file?.path} in ${edit.item}`;
+    case "remove_file": return `Remove ${edit.value} from ${edit.item}`;
+    case "add_check": return `Add ${edit.check?.type} check to ${edit.item}`;
+    case "remove_check": return `Remove check ${Number(edit.check_index) + 1} from ${edit.item}`;
+    case "set_depends": return `Set ${edit.item} dependencies to ${(edit.depends_on || []).join(", ") || "none"}`;
+    default: return "Change the plan";
+  }
+}
+function exactObject(value, keys) {
+  return !!value && typeof value === "object" && !Array.isArray(value) &&
+    Object.keys(value).length === keys.length && keys.every((key) => Object.hasOwn(value, key));
+}
+function boundedText(value, minimum, maximum) {
+  if (typeof value !== "string") return false;
+  let length = 0;
+  for (const _point of value) {
+    if (++length > maximum) return false;
+  }
+  return length >= minimum;
+}
+function validPlanId(value) {
+  return typeof value === "string" && /^P[1-9][0-9]{0,2}$/.test(value);
+}
+function validPlanFileForDisplay(file) {
+  return exactObject(file, ["path", "kind", "renamed_from", "change"]) &&
+    boundedText(file.path, 1, 300) && /^[^/\\][^\\]*$/.test(file.path) &&
+    ["edit", "add", "delete", "rename"].includes(file.kind) &&
+    (file.renamed_from === null || boundedText(file.renamed_from, 0, 300)) &&
+    boundedText(file.change, 1, 1200);
+}
+function validPlanCheckForDisplay(check) {
+  return exactObject(check, ["type", "text"]) && ["cmd", "check"].includes(check.type) &&
+    boundedText(check.text, 1, 400);
+}
+function validPlanItemForDisplay(item) {
+  return exactObject(item, ["id", "title", "intent", "files", "acceptance", "depends_on"]) &&
+    validPlanId(item.id) && boundedText(item.title, 1, 120) && boundedText(item.intent, 1, 600) &&
+    Array.isArray(item.files) && item.files.length >= 1 && item.files.length <= 40 && item.files.every(validPlanFileForDisplay) &&
+    Array.isArray(item.acceptance) && item.acceptance.length >= 1 && item.acceptance.length <= 10 && item.acceptance.every(validPlanCheckForDisplay) &&
+    Array.isArray(item.depends_on) && item.depends_on.length <= 29 && item.depends_on.every(validPlanId);
+}
+function validPlanForDisplay(plan) {
+  return exactObject(plan, ["schema_version", "issue", "revision", "summary", "items", "questions"]) &&
+    plan.schema_version === 1 && Number.isSafeInteger(plan.issue) && plan.issue >= 1 &&
+    Number.isSafeInteger(plan.revision) && plan.revision >= 1 && boundedText(plan.summary, 1, 600) &&
+    Array.isArray(plan.items) && plan.items.length >= 1 && plan.items.length <= 30 && plan.items.every(validPlanItemForDisplay) &&
+    Array.isArray(plan.questions) && plan.questions.length <= 10 && plan.questions.every((question) => boundedText(question, 1, 400));
+}
+function validPlanEditForDisplay(edit) {
+  const payloads = ["field", "value", "file", "check", "check_index", "depends_on", "new_item"];
+  const used = {
+    add_item: ["new_item"], remove_item: [], set_field: ["field", "value"],
+    add_file: ["file"], update_file: ["file"], remove_file: ["value"],
+    add_check: ["check"], remove_check: ["check_index"], set_depends: ["depends_on"],
+  };
+  const operationPayloads = Object.hasOwn(used, edit?.op) ? used[edit.op] : null;
+  if (!exactObject(edit, ["op", "item", "summary", "reason", ...payloads]) || !operationPayloads ||
+      !validPlanId(edit.item) || !boundedText(edit.summary, 1, 160) || !boundedText(edit.reason, 1, 400) ||
+      payloads.some((key) => operationPayloads.includes(key) ? edit[key] === null : edit[key] !== null)) return false;
+  switch (edit.op) {
+    case "add_item": return validPlanItemForDisplay(edit.new_item) && edit.new_item.id === edit.item;
+    case "remove_item": return true;
+    case "set_field": return ["title", "intent"].includes(edit.field) && boundedText(edit.value, 0, 1200);
+    case "add_file":
+    case "update_file": return validPlanFileForDisplay(edit.file);
+    case "remove_file": return boundedText(edit.value, 0, 1200);
+    case "add_check": return validPlanCheckForDisplay(edit.check);
+    case "remove_check": return Number.isSafeInteger(edit.check_index) && edit.check_index >= 0;
+    case "set_depends": return Array.isArray(edit.depends_on) && edit.depends_on.length <= 29 && edit.depends_on.every(validPlanId);
+    default: return false;
+  }
+}
+function validEditReplyForDisplay(reply, revision) {
+  return exactObject(reply, ["schema_version", "base_revision", "reply", "edits"]) && reply.schema_version === 1 &&
+    Number.isSafeInteger(reply.base_revision) && reply.base_revision === revision && boundedText(reply.reply, 0, 4000) &&
+    Array.isArray(reply.edits) && reply.edits.length <= 10 && reply.edits.every(validPlanEditForDisplay);
+}
+function validPlanAuthorStatus(status, request) {
+  const states = ["pending", "ready", "failed", "cancelled", "invalidated", "consumed"];
+  const statusKeys = request.mode === "suggest" ? ["mode", "state", "revision", "snapshotId", "reply", "reason"]
+    : ["state", "revision", "snapshotId", "plan", "reason"];
+  const validShape = exactObject(status, statusKeys);
+  const validMode = validShape && (request.mode === "suggest" ? status.mode === "suggest" : !("mode" in status));
+  if (!validShape || !validMode || !states.includes(status.state) ||
+      !Number.isSafeInteger(status.revision) || status.revision < 1 ||
+      typeof status.snapshotId !== "string" || !status.snapshotId ||
+      status.revision !== request.revision || status.snapshotId !== request.snapshotId ||
+      !(status.reason === null || typeof status.reason === "string")) return false;
+  const terminalReason = ["failed", "cancelled", "invalidated"].includes(status.state);
+  if (terminalReason ? !(typeof status.reason === "string" && status.reason.length > 0) : status.reason !== null) return false;
+  const result = request.mode === "draft" ? status.plan : status.reply;
+  const validDraft = validPlanForDisplay(result) && result.issue === request.issue && result.revision === status.revision + 1;
+  const validReply = validEditReplyForDisplay(result, status.revision);
+  const validResult = request.mode === "draft" ? validDraft : validReply;
+  if (["pending", "failed"].includes(status.state)) return result === null;
+  if (["ready", "consumed"].includes(status.state)) return !!validResult;
+  return result === null || !!validResult;
+}
+function planAuthorResultMarkup(request, historical = false) {
+  if (request.state === "cancelled") return "";
+  const stale = planAuthorStale(request);
+  const historyMark = historical ? ` <span class="${stale ? "warn" : "muted"}">${stale ? "! Stale" : "– Earlier result"}</span>` : "";
+  let result = "";
+  if (request.mode === "suggest" && request.reply) {
+    result = `<div class="plan-author-result-heading"><strong>${historical ? "Earlier suggested edits" : "Suggested edits"}</strong> <span class="mono muted">r${esc(request.revision)}</span>${historyMark}</div>
+      ${request.reply.reply ? `<p class="plan-author-reply">${esc(request.reply.reply)}</p>` : ""}
+      ${request.reply.edits.map((edit) => `<article class="suggestion-row" aria-label="${esc(edit.summary)}"><header><code>${esc(edit.item)}</code><h3>${esc(edit.summary)}</h3></header><p>${esc(edit.reason)}</p><p class="suggestion-change">${esc(describePlanEdit(edit))}</p></article>`).join("") || '<p class="plan-author-reply muted">No edits were suggested.</p>'}`;
+  } else if (request.mode === "draft" && request.plan) {
+    result = `<div class="plan-author-result-heading"><strong>${historical ? "Earlier draft revision" : "Draft revision"}</strong> <span class="mono muted">r${esc(request.plan.revision)}</span>${historyMark}</div>
+      <section class="draft-preview" aria-label="Draft ${esc(request.plan.summary)}"><header><h3>${esc(request.plan.summary)}</h3></header>
+      <ul class="draft-items">${request.plan.items.map((item) => `<li><code>${esc(item.id)}</code> ${esc(item.title)}</li>`).join("")}</ul></section>`;
+  }
+  const dismissible = request.state === "cancelling" || (request.state === "ready" && !stale);
+  if (!historical && result && request.requestId && dismissible)
+    result += `<div class="plan-author-result-actions"><button type="button" id="plan-author-dismiss"${request.state === "cancelling" ? ' aria-disabled="true"' : ""}>${request.state === "cancelling" ? "Dismissing…" : `Dismiss ${request.mode === "draft" ? "draft" : "suggestions"}`}</button></div>`;
+  return result;
+}
+function renderPlanAuthor() {
+  const restoreDismissFocus = document.activeElement?.id === "plan-author-dismiss";
+  const request = planAuthorRequest, unavailable = !data?.plan;
+  const busyAuthor = planAuthorBusy(), uncertain = request?.state === "uncertain";
+  for (const [id, mode, label] of [["plan-draft", "draft", "Draft next revision"], ["plan-suggest", "suggest", "Suggest edits"]]) {
+    const button = $(id);
+    const blocked = unavailable || busyAuthor || (uncertain && request.mode !== mode);
+    if (blocked) button.setAttribute("aria-disabled", "true");
+    else button.removeAttribute("aria-disabled");
+    button.textContent = request?.state === "starting" && request.mode === mode ? "Starting…"
+      : request?.state === "pending" && request.mode === mode ? "Working…"
+      : request?.state === "cancelling" && request.mode === mode ? "Cancelling…"
+      : uncertain && request.mode === mode ? `Retry ${mode === "draft" ? "draft" : "suggestion"} request`
+      : label;
+  }
+  if (!request) {
+    $("plan-author-status").className = "neutral";
+    $("plan-author-status").textContent = unavailable ? "Load a plan before asking the agent." : "";
+    $("plan-author-result").innerHTML = "";
+    return;
+  }
+  const noun = request.mode === "draft" ? "draft" : "suggestions", stale = planAuthorStale(request);
+  const hasResult = !!(request.reply || request.plan);
+  let tone = "neutral", message = "";
+  if (request.state === "starting") message = `Starting ${noun}…`;
+  else if (request.state === "uncertain") { tone = "warn"; message = `! The ${noun} request outcome is unknown. Retry the exact request.`; }
+  else if (request.state === "failed") { tone = "bad"; message = `✕ ${request.mode === "draft" ? "Draft" : "Suggestion"} failed. ${request.reason || "Try again."}`; }
+  else if (request.state === "cancelling") message = `Cancelling ${noun}…`;
+  else if (request.state === "cancelled") message = `– ${request.mode === "draft" ? "Draft" : "Suggestions"} dismissed. ${request.reason || ""}`.trim();
+  else if (request.state === "invalidated") { tone = "warn"; message = `! ${request.mode === "draft" ? "Draft" : "Suggestions"} became stale. ${request.reason || "Reload and ask again."}`; }
+  else if (stale) { tone = "warn"; message = `! Stale ${hasResult ? `${noun} · generated` : `${noun} request · started`} for r${request.revision}`; }
+  else if (request.state === "pending") message = `Agent is preparing ${noun} for r${request.revision}…`;
+  else if (request.state === "ready") { tone = "good"; message = `✓ ${request.mode === "draft" ? "Draft" : "Suggestions"} ready for r${request.revision}.`; }
+  if (request.observationError) message += ` Status check failed: ${request.observationError}`;
+  $("plan-author-status").className = tone;
+  $("plan-author-status").textContent = message;
+  $("plan-author-result").innerHTML = [planAuthorResultMarkup(request), ...planAuthorHistory.map(entry => planAuthorResultMarkup(entry, true))].join("");
+  $("plan-author-dismiss")?.addEventListener("click", dismissPlanAuthor);
+  if (restoreDismissFocus) $("plan-author-dismiss")?.focus();
+}
 function renderPlans() {
   if (!data?.plan) {
     $("plans-summary").textContent = "Plan unavailable";
     $("plans-revision").textContent = "";
     $("plans-items").innerHTML = "";
     $("plans-questions").innerHTML = "";
+    renderPlanAuthor();
     return;
   }
   const plan = data.plan;
@@ -949,6 +1125,7 @@ function renderPlans() {
         <section><h3>Acceptance</h3><ul class="plan-detail-list">${item.acceptance.map((check) => `<li><code>${esc(check.type)}</code><span>${esc(check.text)}</span></li>`).join("")}</ul></section>
       </div>
     </article>`).join("");
+  renderPlanAuthor();
 }
 function planFileFormat(name) {
   return /\.ya?ml$/i.test(name) ? "yaml" : /\.json$/i.test(name) ? "json" : null;
@@ -1046,6 +1223,118 @@ async function importPlan(event) {
     endBusy(busyOwner);
     $("plan-import").removeAttribute("aria-disabled");
     $("plan-import").textContent = "Import next revision";
+  }
+}
+function schedulePlanAuthorPoll(generation, delay = planAuthorRequest?.pollDelay ?? planAuthorPollInitial) {
+  const request = planAuthorRequest;
+  if (!request || request.generation !== generation || !request.requestId) return;
+  if (request.pollTimer) clearTimeout(request.pollTimer);
+  request.pollTimer = setTimeout(() => pollPlanAuthor(generation), delay);
+}
+async function pollPlanAuthor(generation) {
+  const request = planAuthorRequest;
+  if (!request || request.generation !== generation || !request.requestId) return;
+  request.pollTimer = null;
+  const operationGeneration = request.operationGeneration;
+  try {
+    const status = await api(`/api/plan/${request.mode === "draft" ? "drafts" : "suggestions"}/${request.requestId}`);
+    if (planAuthorRequest !== request || request.generation !== generation || request.operationGeneration !== operationGeneration) return;
+    if (!validPlanAuthorStatus(status, request)) throw new Error("Planning status response was incomplete, invalid, or belonged to another plan context.");
+    const changed = request.state !== status.state;
+    const previous = { state: request.state, reason: request.reason, reply: request.reply, plan: request.plan,
+      observationError: request.observationError, pollDelay: request.pollDelay };
+    request.state = status.state;
+    request.reason = status.reason;
+    request.observationError = null;
+    if (request.mode === "draft") request.plan = status.plan;
+    else request.reply = status.reply;
+    request.pollDelay = changed ? planAuthorPollInitial : Math.min(request.pollDelay * 2, planAuthorPollMaximum);
+    try { renderPlanAuthor(); }
+    catch (error) { Object.assign(request, previous); throw error; }
+    request.operationGeneration++;
+    if (request.state === "pending") schedulePlanAuthorPoll(generation);
+  } catch (error) {
+    if (planAuthorRequest !== request || request.generation !== generation || request.operationGeneration !== operationGeneration) return;
+    request.observationError = error.message;
+    request.pollDelay = Math.min(request.pollDelay * 2, planAuthorPollMaximum);
+    renderPlanAuthor();
+    schedulePlanAuthorPoll(generation);
+  }
+}
+async function startPlanAuthor(mode) {
+  if (!data?.plan || planAuthorBusy()) return;
+  if (planImportPending || planRefreshPending || busy) {
+    $("plan-author-status").className = "warn";
+    $("plan-author-status").textContent = "! Wait for the current plan or review action before asking the agent.";
+    return;
+  }
+  if (planAuthorRequest?.state === "uncertain" && planAuthorRequest.mode !== mode) return;
+  const retry = planAuthorRequest?.state === "uncertain" && planAuthorRequest.mode === mode;
+  const requestBody = retry ? planAuthorRequest.request : {
+    expectedRevision: data.plan.revision,
+    snapshotId: data.snapshot.id,
+    feedback: $("plan-feedback").value,
+    actionId: crypto.randomUUID(),
+  };
+  if (planAuthorRequest?.reply || planAuthorRequest?.plan)
+    planAuthorHistory.unshift({ ...planAuthorRequest, pollTimer: null });
+  const request = {
+    generation: ++planAuthorGeneration,
+    mode,
+    state: "starting",
+    revision: requestBody.expectedRevision,
+    snapshotId: requestBody.snapshotId,
+    issue: data.plan.issue,
+    request: requestBody,
+    requestId: null,
+    reason: null,
+    reply: null,
+    plan: null,
+    observationError: null,
+    pollDelay: planAuthorPollInitial,
+    pollTimer: null,
+    cancelActionId: null,
+    operationGeneration: 0,
+  };
+  planAuthorRequest = request;
+  renderPlanAuthor();
+  try {
+    const response = await api(`/api/plan/${mode === "draft" ? "drafts" : "suggestions"}`, requestBody);
+    if (planAuthorRequest !== request) return;
+    const requestId = response.result?.requestId;
+    if (typeof requestId !== "string" || !/^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(requestId))
+      throw new Error("The planning request started without a valid ID.");
+    request.requestId = requestId;
+    request.state = "pending";
+    renderPlanAuthor();
+    schedulePlanAuthorPoll(request.generation, 0);
+  } catch (error) {
+    if (planAuthorRequest !== request) return;
+    const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
+    request.state = ambiguous ? "uncertain" : "failed";
+    request.reason = error.message;
+    renderPlanAuthor();
+  }
+}
+async function dismissPlanAuthor() {
+  const request = planAuthorRequest;
+  if (!request?.requestId || planAuthorBusy()) return;
+  request.cancelActionId ??= crypto.randomUUID();
+  request.operationGeneration++;
+  request.state = "cancelling";
+  renderPlanAuthor();
+  try {
+    await api(`/api/plan/${request.mode === "draft" ? "drafts" : "suggestions"}/${request.requestId}/cancel`, { actionId: request.cancelActionId });
+    if (planAuthorRequest !== request) return;
+    request.observationError = null;
+    schedulePlanAuthorPoll(request.generation, 0);
+  } catch (error) {
+    if (planAuthorRequest !== request) return;
+    const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
+    if (!ambiguous) request.cancelActionId = null;
+    request.observationError = error.message;
+    renderPlanAuthor();
+    schedulePlanAuthorPoll(request.generation);
   }
 }
 function showView(next) {
@@ -1284,6 +1573,8 @@ $("plans-refresh").onclick = async () => {
 };
 $("plan-file").onchange = renderPlanFile;
 $("plan-import-form").onsubmit = importPlan;
+$("plan-draft").onclick = () => startPlanAuthor("draft");
+$("plan-suggest").onclick = () => startPlanAuthor("suggest");
 $("issues-refresh").onclick = () => loadIssues();
 $("issues-list").onclick = (event) => {
   const button = event.target.closest("button.issue-trust");
