@@ -282,6 +282,15 @@ export class PreMergeCoordinator {
         if (error instanceof RebaseResourcesUnsettled) throw error;
         try { await this.#cleanupRebase(identity, marker); }
         catch (cleanup) { throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error }); }
+        // beginRebase and successful cleanup both advance task state. Bind the actionable failure to that settled
+        // state without rebuilding history; if a read itself fails, retaining the older binding fails closed as stale.
+        try {
+          const snapshot = this.service.store.getSnapshot(identity);
+          onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
+            stateVersion: this.service.store.getTask(identity).stateVersion,
+            reviewVersion: this.service.store.reviewVersion(identity), snapshotId: snapshot.id,
+          } });
+        } catch { /* An unbound failure is conservatively historical. */ }
         throw error;
       }
       view = load();

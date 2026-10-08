@@ -207,6 +207,7 @@ it('revalidates authorization before starting the delayed local rebase', async (
   expect(fixture.rebaseRuns()).toBe(0);
   expect(fixture.rebaseAborts()).toBe(1);
   expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).toBeNull();
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
