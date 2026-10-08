@@ -19,10 +19,13 @@ let data,
   mode = "question",
   // The reviewer's explicit view choice, held only for the item and server-named stale state (staleKey) it was made on; otherwise a stale item opens the comparison.
   sinceChoice = null,
-  busy = false;
+  busy = false,
+  busyKind = null,
+  busyGeneration = 0;
 let reviewGeneration = 0;
 let view = "review";
 let mergeGeneration = 0,
+  mergeObservationGeneration = 0,
   mergePollTimer = null,
   mergePollState = null,
   mergePollDelay = 2000;
@@ -41,6 +44,17 @@ const statusClass = (text) =>
       : text.startsWith("!")
         ? "warn"
         : "neutral";
+function beginBusy(kind) {
+  busy = true;
+  busyKind = kind;
+  return ++busyGeneration;
+}
+function endBusy(owner) {
+  if (owner !== busyGeneration) return;
+  busy = false;
+  busyKind = null;
+  renderAttachment();
+}
 async function api(path, body) {
   const response = await fetch(path, {
     method: body ? "POST" : "GET",
@@ -57,7 +71,7 @@ async function api(path, body) {
 function rememberDraft() {
   if (selected) drafts.set(`${selected}:${mode}`, $("message").value);
 }
-function showFailure(message) {
+function showFailure(message, planStatusOwner) {
   mergeGeneration++;
   if (mergePollTimer) clearTimeout(mergePollTimer);
   mergePollTimer = null;
@@ -65,6 +79,11 @@ function showFailure(message) {
   mergePollDelay = 2000;
   data = null;
   snippetSelection = null;
+  renderPlans();
+  const planStatusClass = view === "plans" ? "bad" : "neutral";
+  const planStatusMessage = view === "plans" ? `✕ ${message}` : "";
+  if (planStatusOwner === undefined) claimPlanStatus(planStatusClass, planStatusMessage);
+  else setPlanStatus(planStatusOwner, planStatusClass, planStatusMessage);
   $("selection-actions").hidden = true;
   $("attachment").hidden = true;
   $("banner").textContent = message;
@@ -91,10 +110,15 @@ function showFailure(message) {
     '<div class="empty"><h2>Review could not load</h2><p>Refresh after resolving the error above.</p></div>';
 }
 async function refresh() {
-  if (busy) return;
-  busy = true;
-  reviewGeneration++;
+  if (busy || planImportPending) return;
+  supersedePlanRefresh();
+  const planStatusOwner = planStatusGeneration;
+  const busyOwner = beginBusy("read");
+  const generation = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
   mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
   mergePollState = null;
   mergePollDelay = 2000;
   renderAttachment();
@@ -102,19 +126,29 @@ async function refresh() {
   try {
     rememberDraft();
     const updated = await api("/api/review");
+    if (generation !== reviewGeneration) return;
+    mergeGeneration++;
+    if (mergePollTimer) clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+    mergePollState = null;
+    mergePollDelay = 2000;
     rememberDraft();
-    data = updated;
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+    data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
     snippetSelection = null;
     selected ??= data.items[0]?.id || "Unplanned";
     render();
+    if (newerQueue) showMergeQueueStatus(newerQueue);
+    setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
+    if (generation !== reviewGeneration) return;
     rememberDraft();
     showFailure(
       `Could not read this branch’s history. ${error.message} Use Refresh to retry.`,
+      planStatusOwner,
     );
   } finally {
-    busy = false;
-    renderAttachment();
+    endBusy(busyOwner);
   }
 }
 function renderMerge() {
@@ -163,19 +197,10 @@ async function pollMergeQueue(generation) {
   try {
     const update = await api("/api/merge");
     if (generation !== mergeGeneration || !data?.merge?.available) return;
-    data = { ...data, merge: { ...data.merge, queue: update.queue } };
     const queue = update.queue;
-    if (queue?.state === "merged") {
-      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." }] };
-      $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
-    } else if (queue?.state === "removed" || queue?.state === "failed") {
-      data.merge = { ...data.merge, ready: false, action: null, blockers: [{ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` }] };
-      $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
-    } else if (queue?.observationError) {
-      $("banner").textContent = `${queue.state === "submitting" ? "Merge submission status is unknown" : "Merge remains queued"}. ${queue.observationError}`;
-    } else if (queue?.state === "queued") {
-      $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
-    }
+    mergeObservationGeneration++;
+    data = withMergeQueue(data, queue);
+    showMergeQueueStatus(queue);
     if (queue?.state === mergePollState) backOffMergePoll();
     renderMerge();
   } catch (error) {
@@ -185,11 +210,37 @@ async function pollMergeQueue(generation) {
     scheduleMergePoll();
   }
 }
+const mergeLifecycleBlockers = new Set(["merge-submitted", "queue-active", "queue-head", "queue-merged", "queue-refresh", "stale-merge"]);
+function withMergeQueue(view, queue) {
+  const blockers = view.merge.blockers.filter(blocker => !mergeLifecycleBlockers.has(blocker.code));
+  if (queue?.state === "merged")
+    blockers.unshift({ code: "queue-merged", message: "GitHub confirmed that the reviewed head was merged." });
+  else if (queue?.state === "removed" || queue?.state === "failed")
+    blockers.unshift({ code: "queue-refresh", message: `${queue.reason} Refresh to verify retry readiness.` });
+  else
+    blockers.unshift(...view.merge.blockers.filter(blocker => blocker.code === "queue-active"));
+  return { ...view, merge: { ...view.merge, ready: false, action: null, queue, blockers } };
+}
+function showMergeQueueStatus(queue) {
+  if (queue?.state === "merged") {
+    $("banner").textContent = "GitHub confirmed the reviewed head was merged.";
+  } else if (queue?.state === "removed" || queue?.state === "failed") {
+    $("banner").textContent = `${queue.state === "removed" ? "Removed from merge queue" : "Merge queue failed"}. ${queue.reason} Refresh to verify retry readiness.`;
+  } else if (queue?.observationError) {
+    $("banner").textContent = `${queue.state === "submitting" ? "Merge submission status is unknown" : "Merge remains queued"}. ${queue.observationError}`;
+  } else if (queue?.state === "queued") {
+    $("banner").textContent = `Merge queued${queue.position === null ? "" : ` at position ${queue.position}`}. Waiting for GitHub.`;
+  }
+}
 async function act(command) {
-  if (busy || !data) return false;
-  busy = true;
-  reviewGeneration++;
+  if (busy || planImportPending || !data) return false;
+  supersedePlanRefresh();
+  const busyOwner = beginBusy("write");
+  const generation = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
   mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
   mergePollState = null;
   mergePollDelay = 2000;
   renderAttachment();
@@ -197,17 +248,25 @@ async function act(command) {
     rememberDraft();
     // One action ID per user action: the server replays it exactly and records feedback with it.
     const updated = await api("/api/action", { ...command, token: data.token, actionId: crypto.randomUUID() });
+    if (generation !== reviewGeneration) return true;
+    mergeGeneration++;
+    if (mergePollTimer) clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+    mergePollState = null;
+    mergePollDelay = 2000;
     rememberDraft();
-    data = updated;
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+    data = newerQueue ? withMergeQueue(updated, newerQueue) : updated;
     render();
+    if (newerQueue) showMergeQueueStatus(newerQueue);
     return true;
   } catch (error) {
+    if (generation !== reviewGeneration) return false;
     rememberDraft();
     showFailure(`${error.message} Refresh to review the latest state.`);
     return false;
   } finally {
-    busy = false;
-    renderAttachment();
+    endBusy(busyOwner);
   }
 }
 const showSince = (item) =>
@@ -233,6 +292,7 @@ function render() {
     return render();
   }
   $("repository").textContent = data.repository;
+  renderPlans();
   $("issue").textContent =
     `#${data.plan.issue} ${data.plan.summary} · r${data.plan.revision}`;
   $("progress").textContent =
@@ -468,8 +528,10 @@ $("merge-details").onclick = () => {
   );
 };
 $("merge").onclick = async () => {
-  if (busy || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
-  busy = true;
+  if (busy || planImportPending || !data?.merge?.ready || !window.confirm(data.merge.action === "retry" ? "Retry merging this exact reviewed head?" : "Merge this reviewed pull request?")) return;
+  supersedePlanRefresh();
+  const busyOwner = beginBusy("write");
+  reviewGeneration++;
   mergeGeneration++;
   mergePollState = null;
   mergePollDelay = 2000;
@@ -494,7 +556,7 @@ $("merge").onclick = async () => {
     render();
     $("banner").textContent = `Merge blocked. ${error.message}`;
   } finally {
-    busy = false;
+    endBusy(busyOwner);
   }
 };
 $("review-link").onclick = (event) => {
@@ -746,6 +808,34 @@ function renderNotes({ follow = false } = {}) {
   document.querySelectorAll("[data-retry-question]").forEach(button=>button.onclick=()=>act({action:"retry-question",id:button.dataset.retryQuestion}));
 }
 let pollingQuestions=false;
+function preserveSettledQuestionAnswers(updated) {
+  if (!data) return updated;
+  const current = new Map(data.notes.map(note => [note.id, note]));
+  return { ...updated, notes: updated.notes.map(note => {
+    const newer = current.get(note.id);
+    const sameAttempt = newer?.answer?.attempt !== undefined && newer.answer.attempt === note.answer?.attempt;
+    const settledFromPending = note.answer?.status === "pending";
+    const cancellationSettled = note.answerActive && newer?.answerActive === false &&
+      newer.answer?.status === note.answer?.status;
+    return sameAttempt && ["complete", "failed"].includes(newer.answer.status) &&
+      (settledFromPending || cancellationSettled)
+      ? { ...note, answer: newer.answer, answerActive: newer.answerActive }
+      : note;
+  }) };
+}
+function newerMergeQueue(updated, observationOwner) {
+  const newer = data?.merge?.queue, older = updated.merge?.queue;
+  const fullResponseIsTerminal = ["merged", "removed", "failed"].includes(older?.state);
+  const pollRegressesQueued = older?.state === "queued" && newer?.state === "submitting";
+  return observationOwner !== mergeObservationGeneration &&
+    newer?.actionId &&
+    newer.actionId === older?.actionId &&
+    newer.reviewedHead === older.reviewedHead &&
+    !fullResponseIsTerminal &&
+    !pollRegressesQueued
+    ? newer
+    : null;
+}
 setInterval(async()=>{
   if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending" || n.answerActive)) return;
   pollingQuestions=true;
@@ -810,17 +900,168 @@ let issuesGeneration = 0,
   issuesLoading = false,
   issuesRefreshError = null,
   issueErrorOrder = 0;
+let planImportPending = false,
+  planImportRetries = new Map(),
+  planRefreshPending = false,
+  planOperationGeneration = 0,
+  planStatusGeneration = 0;
+function claimPlanStatus(className, text) {
+  const owner = ++planStatusGeneration;
+  $("plans-status").className = className;
+  $("plans-status").textContent = text;
+  return owner;
+}
+function setPlanStatus(owner, className, text) {
+  if (owner !== planStatusGeneration) return;
+  $("plans-status").className = className;
+  $("plans-status").textContent = text;
+}
+function supersedePlanRefresh() {
+  if (!planRefreshPending) return;
+  planOperationGeneration++;
+  planRefreshPending = false;
+  $("plans-refresh").removeAttribute("aria-disabled");
+  $("plans-refresh").textContent = "Refresh plan";
+  claimPlanStatus("neutral", "");
+}
+function renderPlans() {
+  if (!data?.plan) {
+    $("plans-summary").textContent = "Plan unavailable";
+    $("plans-revision").textContent = "";
+    $("plans-items").innerHTML = "";
+    $("plans-questions").innerHTML = "";
+    return;
+  }
+  const plan = data.plan;
+  $("plans-identity").textContent = `#${plan.issue}`;
+  $("plans-summary").textContent = plan.summary;
+  $("plans-revision").textContent = `r${plan.revision}`;
+  $("plans-questions").innerHTML = plan.questions.length
+    ? `<section class="plan-questions"><h2>Open questions</h2><ul>${plan.questions.map((question) => `<li>${esc(question)}</li>`).join("")}</ul></section>`
+    : "";
+  $("plans-items").innerHTML = plan.items.map((item) => `
+    <article class="plan-card" aria-labelledby="plan-${esc(item.id)}">
+      <header><code>${esc(item.id)}</code><h2 id="plan-${esc(item.id)}">${esc(item.title)}</h2></header>
+      <p>${esc(item.intent)}</p>
+      ${item.depends_on.length ? `<p class="plan-dependencies"><span class="muted">Depends on</span> ${item.depends_on.map((dependency) => `<code>${esc(dependency)}</code>`).join(" ")}</p>` : ""}
+      <div class="plan-card-grid">
+        <section><h3>Files</h3><ul class="plan-detail-list">${item.files.map((file) => `<li><span class="plan-file-path">${file.kind === "rename" ? `<code>${esc(file.renamed_from)}</code><span aria-hidden="true">→</span>` : ""}<code>${esc(file.path)}</code></span><span>${esc(file.kind)} · ${esc(file.change)}</span></li>`).join("")}</ul></section>
+        <section><h3>Acceptance</h3><ul class="plan-detail-list">${item.acceptance.map((check) => `<li><code>${esc(check.type)}</code><span>${esc(check.text)}</span></li>`).join("")}</ul></section>
+      </div>
+    </article>`).join("");
+}
+function planFileFormat(name) {
+  return /\.ya?ml$/i.test(name) ? "yaml" : /\.json$/i.test(name) ? "json" : null;
+}
+function renderPlanFile() {
+  const file = $("plan-file").files[0];
+  const format = file && planFileFormat(file.name);
+  $("plan-file-details").textContent = file
+    ? `${file.name} · ${format ? format.toUpperCase() : "Choose a .json, .yaml, or .yml file"}`
+    : "No file selected";
+}
+async function importPlan(event) {
+  event.preventDefault();
+  if (planImportPending || !data?.plan) return;
+  if (busy && busyKind !== "read") {
+    claimPlanStatus("warn", "! Wait for the current review action before importing a plan.");
+    return;
+  }
+  const file = $("plan-file").files[0], format = file && planFileFormat(file.name);
+  if (!file || !format) {
+    claimPlanStatus("bad", "✕ Choose a JSON or YAML plan file.");
+    return;
+  }
+  supersedePlanRefresh();
+  planOperationGeneration++;
+  const sharedGeneration = ++reviewGeneration;
+  mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
+  mergePollState = null;
+  mergePollDelay = 2000;
+  const busyOwner = beginBusy("write");
+  planImportPending = true;
+  $("plan-import").setAttribute("aria-disabled", "true");
+  $("plan-import").textContent = "Importing…";
+  const statusOwner = claimPlanStatus("neutral", "Reading the plan file…");
+  let source;
+  try {
+    source = await file.text();
+  } catch (error) {
+    planImportPending = false;
+    endBusy(busyOwner);
+    $("plan-import").removeAttribute("aria-disabled");
+    $("plan-import").textContent = "Import next revision";
+    setPlanStatus(statusOwner, "bad", `✕ Could not read the plan file. ${error.message}`);
+    renderMerge();
+    return;
+  }
+  const expectedRevision = data.plan.revision;
+  const retryKey = JSON.stringify([format, source]);
+  const request = planImportRetries.get(retryKey) ?? { source, format, expectedRevision, actionId: crypto.randomUUID() };
+  planImportRetries.set(retryKey, request);
+  setPlanStatus(statusOwner, "neutral", "Importing the next revision…");
+  try {
+    const response = await api("/api/plan/import", request);
+    const revision = Number.isSafeInteger(response.result?.revision) ? response.result.revision : null;
+    planImportRetries.delete(retryKey);
+    if (data?.merge?.available) data = { ...data, merge: { ...data.merge, ready: false, action: null,
+      blockers: [{ code: "plan-changed", message: "The plan changed. Refresh before merging." }] } };
+    renderMerge();
+    setPlanStatus(statusOwner, revision === null ? "warn" : "good", revision === null
+      ? "! The import returned success without a revision. Reloading the current plan…"
+      : `✓ Imported revision r${revision}. Reloading…`);
+    try {
+      rememberDraft();
+      const mergeObservationOwner = mergeObservationGeneration;
+      const updated = await api("/api/review");
+      if (sharedGeneration !== reviewGeneration) return;
+      mergeGeneration++;
+      if (mergePollTimer) clearTimeout(mergePollTimer);
+      mergePollTimer = null;
+      mergePollState = null;
+      mergePollDelay = 2000;
+      rememberDraft();
+      const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+      data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+      render();
+      if (newerQueue) showMergeQueueStatus(newerQueue);
+      if ($("plan-file").files[0] === file) $("plan-file").value = "";
+      renderPlanFile();
+      setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+    } catch (error) {
+      setPlanStatus(statusOwner, "warn", `! ${revision === null ? "The import returned success" : `Revision r${revision} was imported`}, but the current plan could not reload. ${error.message}`);
+      renderMerge();
+    }
+  } catch (error) {
+    const ambiguous = !Number.isSafeInteger(error?.status) || error.status === 503 || error.outcomeUnknown === true;
+    if (!ambiguous) planImportRetries.delete(retryKey);
+    if (ambiguous && data?.merge?.available) data = { ...data, merge: { ...data.merge, ready: false, action: null,
+      blockers: [{ code: "plan-import-unknown", message: "The plan import outcome is unknown. Refresh before merging." }] } };
+    setPlanStatus(statusOwner, "bad", `✕ Could not import the plan. ${error.message}`);
+    renderMerge();
+  } finally {
+    planImportPending = false;
+    endBusy(busyOwner);
+    $("plan-import").removeAttribute("aria-disabled");
+    $("plan-import").textContent = "Import next revision";
+  }
+}
 function showView(next) {
   view = next;
   $("review-view").hidden = next !== "review";
   $("issues-view").hidden = next !== "issues";
-  for (const [id, name] of [["review-link", "review"], ["issues-link", "issues"]]) {
+  $("plans-view").hidden = next !== "plans";
+  for (const [id, name] of [["review-link", "review"], ["issues-link", "issues"], ["plans-link", "plans"]]) {
     if (name === next) $(id).setAttribute("aria-current", "page");
     else $(id).removeAttribute("aria-current");
   }
-  document.title = `${next === "issues" ? "Issues" : "Review"} · codeboost`;
-  history.replaceState(null, "", next === "issues" ? "/?view=issues" : "/");
+  const title = next === "issues" ? "Issues" : next === "plans" ? "Plans" : "Review";
+  document.title = `${title} · codeboost`;
+  history.replaceState(null, "", next === "review" ? "/" : `/?view=${next}`);
   if (next === "issues" && !issuesRequested) loadIssues();
+  if (next === "plans") renderPlans();
 }
 const issueTime = (value) => esc(new Date(value).toLocaleString());
 function issueStatus() {
@@ -991,11 +1232,64 @@ $("issues-link").onclick = (event) => {
   event.preventDefault();
   showView("issues");
 };
+$("plans-link").onclick = (event) => {
+  event.preventDefault();
+  showView("plans");
+};
+$("plans-refresh").onclick = async () => {
+  if (planRefreshPending || planImportPending) return;
+  if (busy) return;
+  const generation = ++planOperationGeneration;
+  let sharedGeneration = ++reviewGeneration;
+  const mergeObservationOwner = mergeObservationGeneration;
+  mergeGeneration++;
+  if (mergePollTimer) clearTimeout(mergePollTimer);
+  mergePollTimer = null;
+  mergePollState = null;
+  mergePollDelay = 2000;
+  planRefreshPending = true;
+  $("plans-refresh").setAttribute("aria-disabled", "true");
+  $("plans-refresh").textContent = "Refreshing…";
+  const statusOwner = claimPlanStatus("neutral", "Refreshing the current plan…");
+  try {
+    rememberDraft();
+    const updated = await api("/api/review");
+    if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
+    sharedGeneration = ++reviewGeneration;
+    mergeGeneration++;
+    if (mergePollTimer) clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+    mergePollState = null;
+    mergePollDelay = 2000;
+    rememberDraft();
+    const newerQueue = newerMergeQueue(updated, mergeObservationOwner);
+    data = preserveSettledQuestionAnswers(newerQueue ? withMergeQueue(updated, newerQueue) : updated);
+    render();
+    if (newerQueue) showMergeQueueStatus(newerQueue);
+    setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
+  } catch (error) {
+    if (generation !== planOperationGeneration || sharedGeneration !== reviewGeneration) return;
+    setPlanStatus(statusOwner, "bad", `✕ Could not refresh the current plan. ${error.message}`);
+    renderMerge();
+  } finally {
+    const current = generation === planOperationGeneration && sharedGeneration === reviewGeneration;
+    if (!current)
+      setPlanStatus(statusOwner, "neutral", "");
+    if (generation === planOperationGeneration) {
+      planRefreshPending = false;
+      $("plans-refresh").removeAttribute("aria-disabled");
+      $("plans-refresh").textContent = "Refresh plan";
+    }
+  }
+};
+$("plan-file").onchange = renderPlanFile;
+$("plan-import-form").onsubmit = importPlan;
 $("issues-refresh").onclick = () => loadIssues();
 $("issues-list").onclick = (event) => {
   const button = event.target.closest("button.issue-trust");
   if (button) changeIssueTrust(button);
 };
-showView(new URLSearchParams(location.search).get("view") === "issues" ? "issues" : "review");
+const initialView = new URLSearchParams(location.search).get("view");
+showView(["issues", "plans"].includes(initialView) ? initialView : "review");
 
 await refresh();
