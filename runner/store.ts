@@ -1964,7 +1964,8 @@ export class Store {
   }
   /** The latest preparation action is authoritative and must match every current local generation and the exact pair. */
   preMergeReady(identity: PlanIdentity, readiness: PreMergeReadiness): boolean {
-    const row = this.#get("SELECT response FROM user_actions WHERE plan_key=? AND kind='prepare-merge' ORDER BY rowid DESC LIMIT 1",
+    const row = this.#get(`SELECT response FROM user_actions WHERE plan_key=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 ORDER BY rowid DESC LIMIT 1`,
       identityKey(identity));
     if (!row) return false;
     const saved = decode<{ ok?: unknown; value?: { outcome?: unknown }; preMergeReadiness?: PreMergeReadiness }>(row.response);

@@ -13,6 +13,7 @@ import { approveItem, approvalStates, choiceKeys, applyChoices, stable } from '.
 import { linkHistory, type Segment } from '../core/linking.ts';
 import { readHistory } from '../git/history.ts';
 import { identityKey } from '../core/identity.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
 const plan = (): Plan => ({ schema_version: 1, revision: 99, issue: 1, summary: 'Example', questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
@@ -47,6 +48,20 @@ it('settles prepare-merge replays through shutdown and fails interrupted prepara
     { state: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null }, readiness));
   expect(store.savedAction(identity, { actionId: active, kind: 'prepare-merge', request })?.response)
     .toEqual({ outcome: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null });
+  expect(store.preMergeReady(identity, readiness)).toBe(true);
+});
+it('does not let a refused preparation shadow an admitted preparation that later becomes ready', () => {
+  const { store } = fixture(), request = { expectedStateVersion: 0, expectedReviewVersion: 0 };
+  const admitted = randomUUID();
+  store.userAction(identity, { actionId: admitted, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  expect(() => store.userAction(identity, { actionId: randomUUID(), kind: 'prepare-merge', request }, () => {
+    throw new GuardRefusal('Pre-merge preparation is already running.');
+  })).toThrow('Pre-merge preparation is already running.');
+  const snapshot = store.getSnapshot(identity);
+  const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head };
+  store.settlePreMergeAction(identity, admitted,
+    { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
   expect(store.preMergeReady(identity, readiness)).toBe(true);
 });
 it('fails closed when durable rewrite lineage exceeds its safety bound', () => {

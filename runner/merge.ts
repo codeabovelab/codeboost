@@ -394,6 +394,13 @@ export class MergeCoordinator {
         if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
       }
       if (validateAuthorization) await validateAuthorization();
+      const authorized = await this.#statusForMerge(view, signal);
+      if (authorized.status.remote.base !== commandStatus.remote.base || authorized.status.remote.head !== commandStatus.remote.head
+        || authorized.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(authorized))
+        throw new Error('The pull request changed during merge validation. Refresh before merging.');
+      if (!authorized.status.ready)
+        throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
+      commandStatus = authorized.status;
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {

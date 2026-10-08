@@ -148,6 +148,18 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(store.getMergeAttempt(identity)).toBeNull();
   });
 
+  it('revalidates the pull request after the final authorization refresh', async () => {
+    const { store } = published();
+    let remoteBase = oid(1);
+    const gh = github(store, () => ({ base: remoteBase }));
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => () => { remoteBase = oid(3); });
+    await expect(merges.merge('review-token')).rejects.toThrow(/pull request changed during merge validation/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('inspects and merges the task\'s published PR and pins it on the attempt', async () => {
     const { store } = published();
     const gh = github(store);
@@ -349,7 +361,7 @@ describe('the merge gate with a runner block (#121)', () => {
     const gh = github(store);
     const merges = new MergeCoordinator(service(store), gh.client);
     await merges.merge('review-token');
-    expect(gh.targets).toEqual([undefined, undefined]);
+    expect(gh.targets).toEqual([undefined, undefined, undefined]);
     expect(gh.merged).toEqual([99]);
     expect(store.getMergeAttempt(identity)!.pullRequest).toBe(99);
   });
