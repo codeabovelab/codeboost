@@ -234,6 +234,39 @@ test('keeps ownership while a malformed status response is retried', async ({ pa
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions ready for r1.' })).toBeVisible();
 });
 
+test('rejects failed output and marks consumed output stale', async ({ page }) => {
+  const { deps } = planning();
+  await openPlans(page, deps);
+  const snapshotId = app.service.load().snapshot.id;
+  let reads = 0;
+  let releaseConsumed!: () => void;
+  const consumedHeld = new Promise<void>(resolve => { releaseConsumed = resolve; });
+  await page.route('**/api/plan/suggestions', route => route.fulfill({
+    status: 200, contentType: 'application/json', body: JSON.stringify({
+      result: { requestId: '12345678-1234-4123-8123-123456789abc' },
+    }),
+  }));
+  await page.route('**/api/plan/suggestions/*', async route => {
+    reads++;
+    if (reads > 1) await consumedHeld;
+    return route.fulfill({ status: 200, contentType: 'application/json', body: JSON.stringify({
+      mode: 'suggest', state: reads === 1 ? 'failed' : 'consumed', revision: 1, snapshotId,
+      reply: suggestions(), reason: reads === 1 ? 'The provider refused the request.' : null,
+    }) });
+  });
+  const suggest = page.locator('#plan-suggest');
+  await suggest.click();
+  await expect(page.getByRole('status').filter({ hasText: 'Planning status response was incomplete, invalid' })).toBeVisible();
+  await expect(suggest).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
+  await expect.poll(() => reads).toBeGreaterThanOrEqual(2);
+  releaseConsumed();
+  await expect(page.getByRole('status').filter({ hasText: 'Stale suggestions · generated for r1' })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toBeVisible();
+  await expect(page.getByRole('button', { name: 'Dismiss suggestions' })).toHaveCount(0);
+  await expect(suggest).not.toHaveAttribute('aria-disabled', 'true');
+});
+
 test('rejects a status response for the wrong planning operation', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);

@@ -933,7 +933,7 @@ function planAuthorBusy() {
   return ["starting", "pending", "cancelling"].includes(planAuthorRequest?.state);
 }
 function planAuthorStale(request = planAuthorRequest) {
-  return !!request && (request.state === "invalidated" || !data?.plan ||
+  return !!request && (["invalidated", "consumed"].includes(request.state) || !data?.plan ||
     request.revision !== data.plan.revision || request.snapshotId !== data.snapshot?.id);
 }
 function describePlanEdit(edit) {
@@ -1036,7 +1036,7 @@ function validPlanAuthorStatus(status, request) {
   const validDraft = validPlanForDisplay(result) && result.issue === request.issue && result.revision === status.revision + 1;
   const validReply = validEditReplyForDisplay(result, status.revision);
   const validResult = request.mode === "draft" ? validDraft : validReply;
-  if (status.state === "pending") return result === null;
+  if (["pending", "failed"].includes(status.state)) return result === null;
   if (["ready", "consumed"].includes(status.state)) return !!validResult;
   return result === null || !!validResult;
 }
