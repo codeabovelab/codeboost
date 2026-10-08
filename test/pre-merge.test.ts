@@ -283,6 +283,19 @@ it('marks historical readiness stale after the review changes', async () => {
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it.each([
+  ['review-required', 'changed by rebase\n', undefined],
+  ['failed', 'feature\n', 1],
+] as const)('marks a historical %s preparation stale after the review changes', async (state, text, exitCode) => {
+  const fixture = await rebaseFixture(text, exitCode);
+  expect(fixture.result.state).toBe(state);
+  expect(fixture.coordinator.last).toMatchObject({ state, stale: false });
+  const view = fixture.service.load();
+  fixture.service.store.addReviewNote(fixture.service.config.identity, view.expected, 'P1', 'change', 'Review changed later.');
+  expect(fixture.coordinator.last).toMatchObject({ state, stale: true });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('keeps a command-check deadline separate from the code-writing task budget', async () => {
   const fixture = await rebaseFixture('feature\n', 0,
     { commandWaitsForDeadline: true, operationTimeoutMs: COMMAND_CHECK_SETTLEMENT_RESERVE_MS + 5_000 });
@@ -331,8 +344,8 @@ it('stops an active command check when the operation-wide deadline expires', asy
     { commandWaitsForCancellation: true, operationTimeoutMs: 3_000, reserves: { processMs: 1_000, commandMs: 200 } });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
   const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
-  expect(check).toMatchObject({ state: 'cancelled', firstReason: 'cancelled' });
-  expect(fixture.cancelReasons).toEqual(['cancelled']);
+  expect(check).toMatchObject({ state: 'failed', firstReason: null, stopReason: 'timeout', diagnostic: 'Timed out.' });
+  expect(fixture.cancelReasons).toEqual(['timeout']);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 

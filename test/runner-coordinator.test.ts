@@ -148,6 +148,31 @@ describe('admission and slots', () => {
 });
 
 describe('stops and settlement', () => {
+  it('persists an owning-operation timeout and refuses to recast it as cancellation', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    expect(runner.timeout(A, attempt.id)).toBe(true);
+    expect(runner.stop(A, attempt.id, 'cancelled')).toBe(false);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'timeout', saved: true });
+    expect(launches[0]!.cancels).toEqual(['timeout']);
+    launches[0]!.settle({ exitCode: null, signal: 'SIGTERM', stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null,
+      stopReason: 'timeout', diagnostic: 'Timed out.' });
+  });
+  it('does not launch when an owning-operation timeout lands during preparation', async () => {
+    const { store, runner, launches, preparations } = setup({ prepareIgnoresAbort: true });
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    expect(runner.timeout(A, attempt.id)).toBe(true);
+    preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(launches).toEqual([]);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null,
+      stopReason: 'timeout', diagnostic: 'Timed out.' });
+  });
   it('keeps the slot after cancel until D settles, and keeps the first reason', async () => {
     const { store, runner, launches, preparations } = setup();
     const attempt = runner.start(A, request(store, A));

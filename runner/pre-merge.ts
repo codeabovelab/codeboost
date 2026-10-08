@@ -60,8 +60,8 @@ export class PreMergeCoordinator {
   get active(): boolean { return this.#active !== null; }
   get last(): (PreMergeResult & { stale: boolean }) | null {
     if (!this.#last) return null;
-    let stale = false;
-    if (this.#last.state === 'ready' && this.#lastBinding) try {
+    let stale = this.#lastBinding === null;
+    if (this.#lastBinding) try {
       const task = this.service.store.getTask(this.service.config.identity);
       stale = task.stateVersion !== this.#lastBinding.stateVersion
         || this.service.store.reviewVersion(this.service.config.identity) !== this.#lastBinding.reviewVersion
@@ -91,6 +91,11 @@ export class PreMergeCoordinator {
       if (result.state === 'ready' && readiness) this.#lastBinding = readiness;
       else if (result.state === 'ready') result = { ...result, state: 'failed',
         reason: 'Could not bind preparation readiness: preparation readiness was not bound to the final review.' };
+      else try {
+        this.#lastBinding = { stateVersion: this.service.store.getTask(this.service.config.identity).stateVersion,
+          reviewVersion: this.service.store.reviewVersion(this.service.config.identity),
+          snapshotId: this.service.store.getSnapshot(this.service.config.identity).id };
+      } catch { /* An unbound historical result is conservatively stale. */ }
       this.#last = result;
       return result;
     };
@@ -280,7 +285,9 @@ export class PreMergeCoordinator {
         // code-writing task budget: recording it here would incorrectly move an in-review task to needs human.
         // The check's own deadline remains distinct from the code-writing budget, but an outer timeout still owns and
         // must stop this attempt. Settlement then consumes the reserve kept inside the operation-wide deadline.
-        this.runner.stop(identity, attempt.id, this.#closing ? 'shutdown' : 'cancelled');
+        if (this.#closing) this.runner.stop(identity, attempt.id, 'shutdown');
+        else if ((signal.reason as { code?: unknown } | undefined)?.code === 'ETIMEDOUT') this.runner.timeout(identity, attempt.id);
+        else this.runner.stop(identity, attempt.id, 'cancelled');
       };
       signal.addEventListener('abort', stop, { once: true });
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }

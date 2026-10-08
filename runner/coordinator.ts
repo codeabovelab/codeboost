@@ -139,7 +139,7 @@ export interface StartRequest {
 }
 export interface RunnerStatus {
   active: boolean;
-  stopRequested: { attemptId: string; reason: FirstReason; saved: boolean } | null;
+  stopRequested: { attemptId: string; reason: FirstReason | 'timeout'; saved: boolean } | null;
   unresolved: { attemptId: string; reason: UnresolvedReason } | null;
 }
 /**
@@ -151,6 +151,7 @@ type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
   firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean; staleCause?: string;
+  timeoutRequested?: boolean; timeoutSaved?: boolean;
   /**
    * The outcome is fixed: before launch once the job starts ending (cleanup, then the terminal write), after launch once
    * the terminal write is done. A later stop has nothing left to change.
@@ -250,6 +251,23 @@ export class RunnerCoordinator {
     if (!job || job.attemptId !== attemptId) return false;
     return this.#requestStop(job, reason, reason === 'stale' && cause !== undefined ? bounded(cause) : undefined);
   }
+  /** Stop one invocation because its owning operation expired, preserving timeout rather than user cancellation. */
+  timeout(identity: PlanIdentity, attemptId: string): boolean {
+    const job = this.#jobs.get(identityKey(identity));
+    if (!job || job.attemptId !== attemptId || job.decided || job.firstReason || job.pendingReason || job.timeoutRequested)
+      return false;
+    const apply = (saved: boolean) => {
+      job.timeoutRequested = true; job.timeoutSaved = saved;
+      job.controller.abort(Object.assign(new Error('Timed out.'), { code: 'ETIMEDOUT' }));
+      job.handle?.cancel('timeout');
+    };
+    try {
+      const changed = this.#write(() => this.#store.recordAttemptTimeout(job.identity, job.attemptId));
+      if (!changed) return false;
+      apply(true);
+    } catch { apply(false); }
+    return true;
+  }
   /** Cancel task: the Store records the reason and the pending close; the coordinator stops the running work. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
     const job = this.#jobs.get(identityKey(identity));
@@ -267,9 +285,8 @@ export class RunnerCoordinator {
     }
     const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
     if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason && !job.pendingReason) {
-      // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout).
-      // Status shows it once the write commits, but it never becomes the job's reason: the terminal write reads the
-      // row's own reason.
+      // The Store writes `cancelled` when no earlier durable invocation timeout owns the row. The task cancellation still
+      // wins task closure either way; this marker shows the request only when no in-memory stop already explains it.
       this.#store.afterCommit(() => { job.cancelShown = true; });
     }
     return outcome;
@@ -280,6 +297,7 @@ export class RunnerCoordinator {
     return {
       active: !!job,
       stopRequested: job?.firstReason ? { attemptId: job.attemptId, reason: job.firstReason, saved: job.reasonSaved }
+        : job?.timeoutRequested ? { attemptId: job.attemptId, reason: 'timeout', saved: job.timeoutSaved === true }
         : job?.cancelShown ? { attemptId: job.attemptId, reason: 'cancelled', saved: true } : null,
       unresolved: marker ? { attemptId: marker.attemptId, reason: marker.reason } : null,
     };
@@ -307,6 +325,7 @@ export class RunnerCoordinator {
     // The attempt deadline passed before launch: it ends `failed` with no first reason, so a later stop cannot claim it.
     if (job.decided || (job.preparationTimedOut && !job.firstReason)) return false;
     if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
+    if (job.timeoutRequested) return false;
     // An earlier stop in the same transaction wins; its commit applies it.
     if (job.pendingReason) return false;
     const apply = (first: FirstReason, saved: boolean) => {
@@ -342,7 +361,9 @@ export class RunnerCoordinator {
     };
     const budget = this.#store.getTask(job.identity).budgetDeadline;
     if (attempt.kind !== 'check' && budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
-    at(attempt.deadline, () => { if (!job.handle && !job.firstReason) { job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT)); } });
+    at(attempt.deadline, () => { if (!job.handle && !job.firstReason && !job.timeoutRequested) {
+      job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT));
+    } });
   }
   async #run(job: Job, attempt: AttemptRecord): Promise<void> {
     try {
@@ -354,14 +375,15 @@ export class RunnerCoordinator {
       try { this.#arm(job, attempt); }
       catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Could not arm the task time limit: ${message(error)}` }); }
       // A stop can land before this point; do not start preparation for it.
-      if (job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
+      if (job.firstReason || job.timeoutRequested) return await this.#endBeforeLaunch(job, attempt, {});
       let prepared: PreparedAttempt;
       try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
       catch (error) {
         // Storage that preparation allocated before it failed is removed after the terminal write, like every other path.
         return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error), error instanceof PreparationFailure ? error.allocated : undefined);
       }
-      if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
+      if (job.firstReason || job.timeoutRequested || job.preparationTimedOut)
+        return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
       if (job.authorize) try {
         const validate = await job.authorize(job.controller.signal);
         await validate();
@@ -373,7 +395,8 @@ export class RunnerCoordinator {
       // Launch check: one synchronous turn, no await between the checks and D's start call.
       const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
-      if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {}, prepared);
+      if (row.state !== 'pending' || job.firstReason || job.timeoutRequested)
+        return await this.#endBeforeLaunch(job, attempt, {}, prepared);
       // A context change comes before both time checks, as in the settlement order and startup recovery.
       if (!sameContext(row.context, this.#store.currentContext(job.identity))) {
         // Recorded like any stale stop, so the row keeps it even if a cancel task lands during cleanup.
@@ -523,7 +546,8 @@ export class RunnerCoordinator {
   }
   #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord; diagnosticRef?: string }): Classification | undefined {
     try {
-      return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason }));
+      return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId,
+        { ...s, ...(job.timeoutRequested ? { stopReason: 'timeout' as const } : {}), firstReason: job.firstReason }));
     } catch {
       // The row's outcome is unknown: hold the slot until startup recovery reconciles it.
       this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });

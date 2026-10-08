@@ -1751,7 +1751,18 @@ export class Store {
     if (!FIRST_REASONS.includes(reason)) throw new GuardRefusal('Unknown stop reason.');
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const changed = this.#run(`UPDATE attempts SET first_reason=? WHERE plan_key=? AND id=? AND state IN ('pending','running') AND first_reason IS NULL`, reason, key, id).changes === 1;
+      const changed = this.#run(`UPDATE attempts SET first_reason=? WHERE plan_key=? AND id=?
+        AND state IN ('pending','running') AND first_reason IS NULL AND stop_reason IS NULL`, reason, key, id).changes === 1;
+      if (changed) this.#touch(key);
+      return changed;
+    });
+  }
+  /** Persist an invocation-owned timeout without recasting it as a user, shutdown, stale, or task-budget stop. */
+  recordAttemptTimeout(identity: PlanIdentity, id: string): boolean {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const changed = this.#run(`UPDATE attempts SET stop_reason='timeout' WHERE plan_key=? AND id=?
+        AND state IN ('pending','running') AND first_reason IS NULL AND stop_reason IS NULL`, key, id).changes === 1;
       if (changed) this.#touch(key);
       return changed;
     });
@@ -1760,7 +1771,8 @@ export class Store {
   markRunning(identity: PlanIdentity, id: string): boolean {
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const changed = this.#run(`UPDATE attempts SET state='running', started_at=? WHERE plan_key=? AND id=? AND state='pending' AND first_reason IS NULL
+      const changed = this.#run(`UPDATE attempts SET state='running', started_at=? WHERE plan_key=? AND id=? AND state='pending'
+        AND first_reason IS NULL AND stop_reason IS NULL
         AND id=(SELECT current_attempt_id FROM tasks WHERE plan_key=?)`, new Date().toISOString(), key, id, key).changes === 1;
       if (changed) this.#touch(key);
       return changed;
@@ -1848,7 +1860,7 @@ export class Store {
       }
       if (!active) { this.#closeTask(key, 'cancelled', actionId); return 'closed'; }
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
-      this.#run(`UPDATE attempts SET first_reason='cancelled' WHERE id=? AND first_reason IS NULL`, active.id!);
+      this.#run(`UPDATE attempts SET first_reason='cancelled' WHERE id=? AND first_reason IS NULL AND stop_reason IS NULL`, active.id!);
       this.#run('UPDATE tasks SET cancel_requested=? WHERE plan_key=?', actionId, key);
       this.#touch(key);
       return 'stopping';
