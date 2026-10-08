@@ -160,6 +160,20 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(store.getMergeAttempt(identity)).toBeNull();
   });
 
+  it('revalidates authorization after the final pull request refresh', async () => {
+    const { store } = published(), gh = github(store);
+    let reads = 0, revoked = false;
+    gh.client.before = () => { if (++reads === 3) revoked = true; };
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => () => {
+      if (revoked) throw new GuardRefusal('Issue trust was revoked during the final pull request refresh.');
+    });
+    await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final pull request refresh/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('inspects and merges the task\'s published PR and pins it on the attempt', async () => {
     const { store } = published();
     const gh = github(store);

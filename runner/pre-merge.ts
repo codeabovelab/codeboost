@@ -200,6 +200,12 @@ export class PreMergeCoordinator {
       if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded.'), { code: 'ETIMEDOUT' });
       return value;
     };
+    const reviewBudget = () => {
+      const value = Math.ceil(deadline - performance.now() - this.processSettlementReserveMs);
+      if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded before process settlement could be reserved.'),
+        { code: 'ETIMEDOUT' });
+      return value;
+    };
     const commandBudget = () => {
       const value = Math.ceil(deadline - performance.now() - this.commandSettlementReserveMs);
       if (value < 1) throw Object.assign(new Error('Pre-merge preparation deadline exceeded before command-check settlement could be reserved.'),
@@ -214,7 +220,7 @@ export class PreMergeCoordinator {
     const track = <T extends ReturnType<ReviewService['load']>>(current: T): T => {
       onPair({ base: current.snapshot.base, head: current.snapshot.head }); return current;
     };
-    const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, remaining()) }));
+    const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()) }));
     let view = load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
@@ -240,14 +246,14 @@ export class PreMergeCoordinator {
     const retainedRemoteHead = initial.head !== view.snapshot.head
       && this.service.store.isRewrittenHead(identity, initial.head, view.snapshot.head);
     if (initial.head !== view.snapshot.head && !retainedRemoteHead) {
-      view = track(this.#refresh(initial, remaining, view.snapshot.head));
+      view = track(this.#refresh(initial, reviewBudget, view.snapshot.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
         reason: 'The pull request head moved; attribution and approvals were refreshed.' };
     }
     if (initial.base !== view.snapshot.base) {
       const repository = this.service.reviewRepository().path;
       const old = readHistory(repository, view.snapshot.base, view.snapshot.head,
-        { maxDurationMs: Math.min(30_000, remaining()) }).commits.map(commit => commit.sha);
+        { maxDurationMs: Math.min(30_000, reviewBudget()) }).commits.map(commit => commit.sha);
       task = this.service.store.getTask(identity);
       const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
         reviewVersion: view.expected.reviewVersion! };
@@ -310,7 +316,7 @@ export class PreMergeCoordinator {
     assertCurrent(guarded);
     if (final.base !== initial.base || final.head !== initial.head) {
       await this.remote.fetch(final, signal); signal.throwIfAborted(); assertCurrent(guarded);
-      view = track(this.#refresh(final, remaining, initial.head));
+      view = track(this.#refresh(final, reviewBudget, initial.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during preparation; attribution and approvals were refreshed.' };
     }
@@ -338,7 +344,7 @@ export class PreMergeCoordinator {
     assertCurrent(guarded);
     if (authorizedRemote.base !== initial.base || authorizedRemote.head !== initial.head) {
       await this.remote.fetch(authorizedRemote, signal); signal.throwIfAborted(); assertCurrent(guarded);
-      view = track(this.#refresh(authorizedRemote, remaining, initial.head));
+      view = track(this.#refresh(authorizedRemote, reviewBudget, initial.head));
       return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked,
         reason: 'The pull request moved during final authorization; attribution and approvals were refreshed.' };
     }

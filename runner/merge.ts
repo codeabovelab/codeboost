@@ -400,6 +400,9 @@ export class MergeCoordinator {
         throw new Error('The pull request changed during merge validation. Refresh before merging.');
       if (!authorized.status.ready)
         throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
+      // The final status read is asynchronous too. Reuse the captured identity validator so a trust or author change
+      // during that read is refused immediately before the synchronous durable admission.
+      if (validateAuthorization) await validateAuthorization();
       commandStatus = authorized.status;
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;

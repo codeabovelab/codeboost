@@ -558,7 +558,8 @@ it('settles a failed preparation even when the fallback snapshot read would fail
 });
 
 it('threads the remaining operation budget through every synchronous review reload', async () => {
-  const fixture = await rebaseFixture('feature\n');
+  const operationTimeoutMs = 30_000, processMs = 10_000;
+  const fixture = await rebaseFixture('feature\n', undefined, { operationTimeoutMs, reserves: { processMs, commandMs: 0 } });
   const view = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
   const original = fixture.service.load.bind(fixture.service); const budgets: number[] = [];
   vi.spyOn(fixture.service, 'load').mockImplementation(options => {
@@ -568,7 +569,7 @@ it('threads the remaining operation budget through every synchronous review relo
     snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   expect(result.state).toBe('ready');
   expect(budgets.length).toBeGreaterThan(1);
-  expect(budgets.every(value => value > 0 && value <= 30_000)).toBe(true);
+  expect(budgets.every(value => value > 0 && value <= operationTimeoutMs - processMs)).toBe(true);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
