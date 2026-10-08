@@ -825,10 +825,12 @@ function preserveSettledQuestionAnswers(updated) {
 }
 function newerMergeQueue(updated, observationOwner) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
+  const sameTerminalState = newer?.state === older?.state && ["merged", "removed", "failed"].includes(newer?.state);
   return observationOwner !== mergeObservationGeneration &&
     newer?.actionId &&
     newer.actionId === older?.actionId &&
-    newer.reviewedHead === older.reviewedHead
+    newer.reviewedHead === older.reviewedHead &&
+    !sameTerminalState
     ? newer
     : null;
 }
