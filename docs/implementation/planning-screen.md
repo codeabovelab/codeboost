@@ -6,7 +6,7 @@ G1 adds a Plans screen over the planning contracts already owned by lanes E and 
 
 G2 adds browser controls for the existing draft and suggestion request lifecycles. The screen can ask for a complete next-revision draft or independent edit cards, poll the durable request, render the result and dismiss it.
 
-G3 applies a ready draft or one suggestion card through the Store-owned revision-bound endpoint. The browser never constructs a new plan. It retains one action ID across an ambiguous Apply retry, accepts only the expected next revision, then reloads the authoritative review. Once Apply commits, a reload failure is reported separately and cannot re-enable the action. Applying one card consumes the response; sibling cards stay disabled and **Refresh suggestions** sends their bounded operation, item and summary descriptions in a new revision-bound request without replacing newer guidance in the textarea.
+G3 applies a ready draft or one suggestion card through the Store-owned revision-bound endpoint. The browser never constructs a new plan. It retains one action ID across an ambiguous Apply retry, accepts only the expected next revision, then reloads the authoritative review. Once Apply commits, a reload failure is reported separately and cannot re-enable the action or start authoring against the old revision; a manual refresh must observe the applied revision first. Applying one card consumes the response; sibling cards stay disabled and **Refresh suggestions** sends their bounded operation, item and summary descriptions in a new revision-bound request without replacing newer guidance in the textarea.
 
 ## Display contract
 

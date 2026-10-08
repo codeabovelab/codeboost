@@ -227,6 +227,38 @@ test('keeps a committed draft applied when the authoritative reload fails', asyn
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });
 
+test('blocks stale authoring after a suggestion commits but its authoritative reload fails', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const reply = suggestions();
+  reply.edits.push({ ...reply.edits[0]!, summary: 'Clarify retry intent', reason: 'The intent should name the visible limit.',
+    field: 'intent', value: 'Explain the operator-visible retry limit.' });
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(reply));
+  let reloads = 0;
+  await page.route('**/api/review', async route => {
+    reloads++;
+    if (reloads === 1) await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Temporary review read failure' }) });
+    else await route.continue();
+  });
+  await page.getByRole('button', { name: 'Apply this edit' }).first().click();
+
+  await expect(page.locator('#plans-status')).toContainText('Revision r2 was applied, but the current plan could not reload');
+  await expect(page.getByRole('button', { name: 'Refresh suggestions', exact: true })).toHaveCount(0);
+  await expect(page.locator('#plan-draft')).toHaveAttribute('aria-disabled', 'true');
+  await expect(page.locator('#plan-suggest')).toHaveAttribute('aria-disabled', 'true');
+  await page.locator('#plan-suggest').evaluate((button: HTMLButtonElement) => button.click());
+  expect(invocations).toHaveLength(1);
+  await expect(page.locator('#plans-refresh')).toBeFocused();
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
+
+  await page.locator('#plans-refresh').click();
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  await expect(page.getByRole('button', { name: 'Refresh suggestions', exact: true })).toBeVisible();
+  await expect(page.locator('#plan-suggest')).not.toHaveAttribute('aria-disabled', 'true');
+});
+
 test('keeps Apply retryable when success names the wrong revision', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);
@@ -271,6 +303,7 @@ test('replays an ambiguous suggestion Apply, stales siblings, and refreshes befo
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
   await page.getByRole('button', { name: 'Retry Apply', exact: true }).click();
   await expect(page.locator('#plans-revision')).toHaveText('r2');
+  await expect(page.getByRole('button', { name: 'Refresh suggestions', exact: true })).toBeFocused();
   expect(sent).toHaveLength(2);
   expect(sent[1]).toEqual(sent[0]);
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
