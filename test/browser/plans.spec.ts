@@ -345,6 +345,48 @@ test('does not let a question poll started during Plans refresh replace its comp
   await expect(page.getByText('Agent · Answering…', { exact: true })).toHaveCount(0);
 });
 
+test('does not let an older Plans refresh replace an answer completed while it was pending', async ({ page }) => {
+  const config = app.service.config;
+  await app.close();
+  app = await startServer(config, 0, (_prompt, signal) => new Promise((_, reject) => signal.addEventListener('abort', () => reject(signal.reason), { once: true })));
+  await page.goto(app.url);
+  await page.getByLabel('Question about this item').fill('Did this finish during refresh?');
+  await page.getByRole('button', { name: 'Ask agent', exact: true }).click();
+  await expect(page.getByText('Agent · Answering…', { exact: true })).toBeVisible();
+  const note = app.service.store.getReviewNotes(config.identity).find(value => value.text === 'Did this finish during refresh?')!;
+
+  let releaseRefresh!: () => void, refreshArrived!: () => void;
+  const heldRefresh = new Promise<void>(resolve => { releaseRefresh = resolve; });
+  const capturedRefresh = new Promise<void>(resolve => { refreshArrived = resolve; });
+  await page.route('**/api/review', async route => {
+    const response = await route.fetch();
+    refreshArrived();
+    await heldRefresh;
+    await route.fulfill({ response });
+  });
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.locator('#plans-refresh').click();
+  await capturedRefresh;
+
+  const completedAnswer = { ...note.answer, status: 'complete', text: 'The poll completed this answer.' };
+  const completedPoll = page.waitForResponse(response => response.url().endsWith('/api/questions'));
+  let polls = 0;
+  await page.route('**/api/questions', route => route.fulfill({
+    status: 200,
+    contentType: 'application/json',
+    body: JSON.stringify({ notes: polls++ === 0 ? [{ id: note.id, answer: completedAnswer, answerActive: false }] : [] }),
+  }));
+  await completedPoll;
+  await page.evaluate(() => new Promise<void>(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve()))));
+  await expect(page.locator('#notes')).toContainText('The poll completed this answer.');
+
+  releaseRefresh();
+  await expect(page.locator('#plans-status')).toContainText('Revision r1 is current.');
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await expect(page.getByText('The poll completed this answer.', { exact: true })).toBeVisible();
+  await expect(page.getByText('Agent · Answering…', { exact: true })).toHaveCount(0);
+});
+
 test('does not let an older Plans refresh re-enable merge after it commits', async ({ page }) => {
   test.slow();
   const config = { ...app.service.config, demo: false };

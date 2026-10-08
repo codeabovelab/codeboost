@@ -773,6 +773,18 @@ function renderNotes({ follow = false } = {}) {
   document.querySelectorAll("[data-retry-question]").forEach(button=>button.onclick=()=>act({action:"retry-question",id:button.dataset.retryQuestion}));
 }
 let pollingQuestions=false;
+function preserveCompletedQuestionAnswers(updated) {
+  if (!data) return updated;
+  const current = new Map(data.notes.map(note => [note.id, note]));
+  return { ...updated, notes: updated.notes.map(note => {
+    const newer = current.get(note.id);
+    return newer?.answer?.status === "complete" &&
+      note.answer?.status === "pending" &&
+      newer.answer.attempt === note.answer.attempt
+      ? { ...note, answer: newer.answer, answerActive: newer.answerActive }
+      : note;
+  }) };
+}
 setInterval(async()=>{
   if(pollingQuestions || busy || !data || !data.notes.some(n=>n.answer?.status==="pending" || n.answerActive)) return;
   pollingQuestions=true;
@@ -1195,7 +1207,7 @@ $("plans-refresh").onclick = async () => {
     mergePollState = null;
     mergePollDelay = 2000;
     rememberDraft();
-    data = updated;
+    data = preserveCompletedQuestionAnswers(updated);
     render();
     setPlanStatus(statusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
