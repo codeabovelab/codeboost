@@ -407,11 +407,17 @@ export class MergeCoordinator {
           throw new Error('The pull request changed during merge validation. Refresh before merging.');
         if (!authorized.status.ready)
           throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
-        // The external authorization read completed before the final remote inspection. Only local trust state is read
-        // afterward, synchronously, so no await can reopen a PR identity or merge-mode race before durable admission.
-        authorization.validate();
         commandStatus = authorized.status;
       }
+      if (commandStatus.remote.mergeQueue) {
+        // The stored cursor is the final external read: events produced by another actor during authorization or the
+        // status checks precede this boundary and therefore cannot be adopted as this attempt's queue lifecycle.
+        queueWatermark = await (this.gateway as QueueGateway).queueWatermark(commandStatus.remote.head,
+          { signal, timeoutMs: 6_000, pullRequest: commandStatus.remote.pullRequest });
+      }
+      // The external authorization read completed before the final PR inspection and queue boundary. Re-read local
+      // trust synchronously after those awaits so neither remote identity nor local authorization can race admission.
+      authorization?.validate();
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {

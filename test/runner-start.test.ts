@@ -13,6 +13,7 @@ import { SafetyFindings, type ExecutionSources } from '../runner/execution.ts';
 import type { AttemptKind } from '../runner/lifecycle.ts';
 import { approveItem } from '../core/approvals.ts';
 import type { IssueTrustGateway } from '../github/issues.ts';
+import { fixtureGit } from './fixtures/git.ts';
 
 vi.setConfig({ testTimeout: 20_000 });
 const roots: string[] = [], cleanups: (() => Promise<void> | void)[] = [];
@@ -85,7 +86,13 @@ function failedFirstItem(service: ReviewService, budgetMs?: number) {
 function committedFirstItem(service: ReviewService, unchanged = false, outOfScope: string[] = [], kind: AttemptKind = 'execute') {
   const s = service.store, id = service.config.identity;
   s.transitionTask(id, s.getTask(id).stateVersion, 'queued');
-  const item = s.getPlan(id).items[0]!.id, snapshot = s.getSnapshot(id), head = 'f'.repeat(40);
+  const item = s.getPlan(id).items[0]!.id, snapshot = s.getSnapshot(id);
+  // Production selects the runner-owned repository before settlement. This fixture uses the demo repository as that
+  // authority and, for a changed result, creates a real commit object without moving its checkout.
+  service.config.runnerRepository = service.config.repository;
+  const tree = unchanged ? null : fixtureGit(service.config.repository, 'rev-parse', `${snapshot.head}^{tree}`);
+  const head = tree === null ? snapshot.head
+    : fixtureGit(service.config.repository, 'commit-tree', tree, '-p', snapshot.head, '-m', `Runner fixture ${randomUUID()}`);
   const attempt = s.admitAttempt(id, { expectedStateVersion: s.getTask(id).stateVersion, kind, item,
     expectedContext: s.currentContext(id), deadline: Date.now() + 60_000 });
   s.markRunning(id, attempt.id);

@@ -175,6 +175,37 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(store.getMergeAttempt(identity)).toBeNull();
   });
 
+  it('captures the queue event boundary after the final authorization and pull request reads', async () => {
+    const { store } = published(), gh = github(store, () => ({ mergeQueue: true }));
+    let authorized = false;
+    gh.client.queueWatermark = vi.fn(async () => authorized ? 'CURSOR_after_authorization' : 'CURSOR_before_authorization');
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { authorized = true; }, validate: () => undefined }));
+
+    await merges.merge('review-token');
+
+    expect(store.getMergeAttempt(identity)).toMatchObject({ queueWatermark: 'CURSOR_after_authorization' });
+  });
+
+  it('revalidates local authorization after the final queue event boundary', async () => {
+    const { store } = published(), gh = github(store, () => ({ mergeQueue: true }));
+    let authorized = false, revoked = false;
+    gh.client.queueWatermark = vi.fn(async () => {
+      if (authorized) revoked = true;
+      return 'CURSOR';
+    });
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { authorized = true; }, validate: () => {
+      if (revoked) throw new GuardRefusal('Issue trust was revoked during the final queue read.');
+    } }));
+
+    await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final queue read/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('completes the final external authorization read before validating merge-queue mode', async () => {
     const { store } = published();
     let mergeQueue = false, authorizationReads = 0;
