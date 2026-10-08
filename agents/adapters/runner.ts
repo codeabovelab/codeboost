@@ -22,5 +22,6 @@ export function startRunnerCommandInvocation(request: AgentAdapterRequest,
   assertAdapterRequest(request);
   return launchInvocation(request.invocation, remaining, (signal, start) => setUpProfile(request, remaining, signal,
     network => ({ ...request, policy, network, command }),
-    profile => start(profile, { ...options, processLifecycle: request.processLifecycle, invocationBudget: remaining })));
+    profile => start(profile, { ...options, processLifecycle: request.processLifecycle, invocationBudget: remaining,
+      diagnosticOutput: true })));
 }

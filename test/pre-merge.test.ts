@@ -262,6 +262,14 @@ it('blocks when a command check fails on the rewritten head', async () => {
   await coordinator.close(); await runner.close();
 });
 
+it('preserves completed command-check IDs when a later preparation step fails', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { duringFinalInspect() {
+    throw new Error('final remote inspection failed');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', checked: ['P1'], reason: 'final remote inspection failed' });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('does not report readiness when command-check cleanup is unresolved', async () => {
   const fixture = await rebaseFixture('feature\n', 0, { releaseFails: true });
   expect(fixture.result).toMatchObject({ state: 'failed', checked: [] });

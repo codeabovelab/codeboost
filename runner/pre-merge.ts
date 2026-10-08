@@ -89,6 +89,7 @@ export class PreMergeCoordinator {
     // Admission reserves the coordinator synchronously, but expensive Git/GitHub work begins after the user-action
     // transaction and HTTP handler can finish.
     let readiness: PreMergeReadiness | null = null;
+    let failureChecked: readonly string[] = [];
     let failurePair = { base: expected.base, head: expected.head };
     let failureBinding = { stateVersion: expected.stateVersion, reviewVersion: expected.reviewVersion,
       snapshotId: expected.snapshotId };
@@ -105,10 +106,11 @@ export class PreMergeCoordinator {
       return result;
     };
     const active = Promise.resolve().then(() => this.#run(expected, controller.signal, deadline,
-      observation => { failurePair = observation.pair; failureBinding = observation.binding; })).then(remember, error => {
+      observation => { failurePair = observation.pair; failureBinding = observation.binding; },
+      checked => { failureChecked = Object.freeze([...checked]); })).then(remember, error => {
       // Failure settlement must not rebuild Git history: the original failure may itself be a repository-read error.
       const result: PreMergeResult = { state: 'failed', ...failurePair,
-        checked: [], reason: error instanceof Error ? error.message : String(error) };
+        checked: failureChecked, reason: error instanceof Error ? error.message : String(error) };
       return remember(result);
     }).then(result => {
       if (!expected.actionId) return result;
@@ -199,7 +201,7 @@ export class PreMergeCoordinator {
   }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
     deadline: number, onObserved: (value: { pair: RemotePair; binding: { stateVersion: number; reviewVersion: number;
-      snapshotId: string } }) => void): Promise<PreparedResult> {
+      snapshotId: string } }) => void, onChecked: (checked: readonly string[]) => void): Promise<PreparedResult> {
     const identity = this.service.config.identity;
     const remaining = () => {
       const value = Math.ceil(deadline - performance.now());
@@ -355,7 +357,7 @@ export class PreMergeCoordinator {
         throw new GuardRefusal('Command-check cleanup could not be confirmed; restart and recover owned resources before preparing a merge.');
       if (settled.state !== 'completed') throw new GuardRefusal(settled.exitCode === null && settled.diagnostic
         ? settled.diagnostic : `${item.id} command checks did not pass.`);
-      checked.push(item.id); view = load();
+      checked.push(item.id); onChecked(checked); view = load();
       const changed = this.#reviewBlocker(view);
       if (changed) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked, reason: changed };
     }
