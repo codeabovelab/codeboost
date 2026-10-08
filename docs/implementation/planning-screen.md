@@ -1,8 +1,10 @@
 # Planning screen
 
-**Lane and step:** lane G, step G1. Tracking issue: #145.
+**Lane and steps:** lane G, G1 and G2. Tracking issue: #145.
 
 G1 adds a Plans screen over the planning contracts already owned by lanes E and F. It does not add another plan writer: the browser imports through `POST /api/plan/import`, then reloads `GET /api/review` so the current Store revision remains the only displayed authority.
+
+G2 adds browser controls for the existing draft and suggestion request lifecycles. The screen can ask for a complete next-revision draft or independent edit cards, poll the durable request, render the result and dismiss it. It still cannot apply either result; Apply remains G3.
 
 ## Display contract
 
@@ -18,4 +20,14 @@ The Store validates schema, issue identity, revision, paths, dependencies and co
 
 `test/browser/plans.spec.ts` covers JSON and YAML imports, full plan and rename rendering, navigation/reload, unsent Review draft preservation, duplicate activation and focus, a newer file selection surviving an older response, exact ambiguous retry before and after a refresh observes a lost-response commit, retry preservation across another file's refusal, committed-import/reload-failure reporting, post-import Review writes while a superseded read remains unsettled, immediate stale Plans UI release after an irreversible merge, both orderings of Review/Plans refreshes against terminal merge and question observations, terminal full-response authority over matching terminal and active polls, submitting-to-queued progress in both response orders, cancellation settlement, both response orderings between review actions and merge polls, queue-poll resumption after a rejected import, and an issue-mismatch refusal that leaves the Store at the original revision.
 
-G2 adds authoring and suggestion cards. G3 adds revision-bound Apply and request-time draft/attachment preservation. G4 completes real-provider/store integration and the remaining T18 browser/adapter gate.
+## Authoring and suggestions
+
+The guidance field is shared by the two explicit request types. **Draft next revision** starts `/api/plan/drafts`; **Suggest edits** starts `/api/plan/suggestions`. Each request is bound to the displayed revision and repository snapshot and carries a UUID action ID. If the start response is ambiguous, the matching control retries that exact body and action ID; the other request type stays unavailable until the outcome is known.
+
+After start, the screen polls only the durable request resource with bounded backoff. A lifecycle transition resets the interval. Poll updates replace only the request status and result: they never write the guidance field. The active control uses `aria-disabled` with an in-flight guard, so keyboard focus stays in place and repeat activation cannot start a second invocation. Dismiss uses the request's cancel endpoint and its own stable action ID.
+
+Suggestion replies render as plain text followed by one line-separated row per typed edit. Drafts render the proposed revision summary and ordered items. The browser escapes every agent-provided field. A result remains visible as history but is marked stale whenever its captured revision or snapshot no longer matches the current review response. A delayed ready poll therefore cannot present an old result as current after an import or refresh advances the plan.
+
+`test/browser/plans-authoring.spec.ts` covers duplicate activation and focus, request-time guidance preservation, suggestion rows, whole-draft preview without mutation, dismissal without a revision change, and the interleaving where an import advances the plan before an older ready poll returns.
+
+G3 adds revision-bound Apply and request-time draft/attachment preservation. G4 completes real-provider/store integration and the remaining T18 browser/adapter gate.
