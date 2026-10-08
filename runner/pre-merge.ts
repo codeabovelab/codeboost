@@ -219,7 +219,10 @@ export class PreMergeCoordinator {
       return value;
     };
     const rebaseBudget = (cleanupOnly = false) => {
-      const value = Math.min(MAX_REBASE_TIMEOUT_MS, remaining());
+      // A failed live run still needs a separate abort that clears its durable marker. Keep that minimum outside the
+      // run's scope instead of letting the run consume the whole operation budget.
+      const available = remaining() - (cleanupOnly ? 0 : MIN_REBASE_CLEANUP_TIMEOUT_MS);
+      const value = Math.min(MAX_REBASE_TIMEOUT_MS, available);
       if (value < (cleanupOnly ? MIN_REBASE_CLEANUP_TIMEOUT_MS : MIN_REBASE_TIMEOUT_MS))
         throw Object.assign(new Error(`Pre-merge preparation deadline exceeded before rebase ${cleanupOnly ? 'cleanup' : 'work and cleanup'} could be reserved.`),
           { code: 'ETIMEDOUT' });
@@ -401,6 +404,7 @@ export class PreMergeCoordinator {
     return { state: 'ready', base: view.snapshot.base, head: view.snapshot.head, checked, reason: null,
       readiness: { stateVersion: this.service.store.getTask(identity).stateVersion,
         reviewVersion: this.service.store.reviewVersion(identity), snapshotId: view.snapshot.id,
-        base: view.snapshot.base, head: view.snapshot.head } };
+        base: view.snapshot.base, head: view.snapshot.head,
+        commandPolicyDigest: this.service.commandPolicyDigest() } };
   }
 }

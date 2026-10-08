@@ -14,6 +14,7 @@ import { linkHistory, type Segment } from '../core/linking.ts';
 import { readHistory } from '../git/history.ts';
 import { identityKey } from '../core/identity.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
+import { commandDigest } from '../runner/checks.ts';
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
 const plan = (): Plan => ({ schema_version: 1, revision: 99, issue: 1, summary: 'Example', questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
@@ -42,7 +43,7 @@ it('settles prepare-merge replays through shutdown and fails interrupted prepara
   store.userAction(identity, { actionId: active, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   const snapshot = store.getSnapshot(identity);
   const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
-    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head };
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) };
   const capability = store.shutdownCapability(); store.closeWrites();
   capability.run(() => store.settlePreMergeAction(identity, active,
     { state: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null }, readiness));
@@ -59,7 +60,7 @@ it('does not let a refused preparation shadow an admitted preparation that later
   })).toThrow('Pre-merge preparation is already running.');
   const snapshot = store.getSnapshot(identity);
   const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
-    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head };
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) };
   store.settlePreMergeAction(identity, admitted,
     { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
   expect(store.preMergeReady(identity, readiness)).toBe(true);

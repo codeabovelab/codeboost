@@ -36,7 +36,7 @@ export class ReviewService {
     this.config = config;
     if (config.allowedCommands !== undefined && (!Array.isArray(config.allowedCommands)
       || config.allowedCommands.some(argv => !Array.isArray(argv) || argv.length === 0
-        || argv.some(arg => typeof arg !== 'string' || arg.includes('\0')))))
+        || argv.some(arg => typeof arg !== 'string' || !arg.isWellFormed() || arg.includes('\0')))))
       throw new Error('allowedCommands must contain complete literal argv arrays.');
     this.#pathKey = path => {
       if (!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
@@ -45,6 +45,8 @@ export class ReviewService {
     };
     this.store = new Store(config.database, this.#pathKey);
   }
+  /** Stable binding for preparation evidence; a restart with a different command policy invalidates old readiness. */
+  commandPolicyDigest(): string { return commandDigest(this.config.allowedCommands ?? []); }
   close() { this.store.close(); }
   /**
    * Where the task's reviewed commits are. Production configures the runner-owned repository after importing the task's

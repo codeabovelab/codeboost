@@ -83,7 +83,7 @@ export interface PreMergeActionResult {
   base: string; head: string; checked: readonly string[]; reason: string | null;
 }
 export interface PreMergeReadiness {
-  stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string;
+  stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; commandPolicyDigest: string;
 }
 export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
 /** What a completed `prepare-merge` action replays after its background coordinator settles. */
@@ -515,7 +515,8 @@ export class Store {
    * task's PRs may be in flight.
    */
   beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null,
-    target: { pullRequest: number; openingId: string | null } | null = null, requirePreparation = false): MergeAttempt {
+    target: { pullRequest: number; openingId: string | null } | null = null, requirePreparation = false,
+    commandPolicyDigest: string | null = null): MergeAttempt {
     sha(reviewedHead);
     if (target !== null && (!Number.isSafeInteger(target.pullRequest) || target.pullRequest < 1 || (target.openingId !== null && typeof target.openingId !== 'string')))
       throw new Error('Invalid merge target.');
@@ -539,6 +540,7 @@ export class Store {
       if (requirePreparation && !this.preMergeReady(identity, {
         stateVersion: task.state_version as number, reviewVersion: expected.reviewVersion,
         snapshotId: expected.snapshotId, base: this.getSnapshot(identity).base, head: reviewedHead,
+        commandPolicyDigest: commandPolicyDigest ?? '',
       })) throw new GuardRefusal('Pre-merge preparation has not completed for the current review. Prepare the merge again.');
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
@@ -1949,7 +1951,8 @@ export class Store {
         const task = this.#task(key), current = this.#current(key), snapshot = this.getSnapshot(identity);
         if (!readiness || task.state_version !== readiness.stateVersion || current.review_version !== readiness.reviewVersion
           || current.snapshot_id !== readiness.snapshotId || snapshot.base !== readiness.base || snapshot.head !== readiness.head
-          || result.base !== readiness.base || result.head !== readiness.head) {
+          || result.base !== readiness.base || result.head !== readiness.head
+          || !/^[a-f0-9]{64}$/.test(readiness.commandPolicyDigest)) {
           effective = { ...result, state: 'review-required', reason: 'The task or review changed before preparation readiness was recorded. Prepare the merge again.' };
           readiness = null;
         }
@@ -1975,6 +1978,7 @@ export class Store {
   }
   /** The latest preparation action is authoritative and must match every current local generation and the exact pair. */
   preMergeReady(identity: PlanIdentity, readiness: PreMergeReadiness): boolean {
+    if (!/^[a-f0-9]{64}$/.test(readiness.commandPolicyDigest)) return false;
     const row = this.#get(`SELECT response FROM user_actions WHERE plan_key=? AND kind='prepare-merge'
       AND json_extract(response,'$.ok')=1 ORDER BY rowid DESC LIMIT 1`,
       identityKey(identity));

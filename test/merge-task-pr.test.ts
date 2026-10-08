@@ -13,6 +13,7 @@ import type { AlreadyFixedGateway, AlreadyFixedInput } from '../github/already-f
 import type { Plan, PlanContext } from '../core/plan.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
+import { commandDigest } from '../runner/checks.ts';
 
 // #121: with a runner block, the merge gate targets the task's published PR, not github.pullRequest.
 const oid = (n: number) => n.toString(16).padStart(40, '0');
@@ -58,7 +59,7 @@ function prepare(store: Store) {
   store.userAction(identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   const snapshot = store.getSnapshot(identity);
   const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
-    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head };
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) };
   store.settlePreMergeAction(identity, actionId,
     { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
   return readiness;
@@ -83,7 +84,7 @@ function service(store: Store) {
     plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: snapshot.id, base: oid(1), head: oid(2) }, token: 'review-token',
     expected: { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
   };
-  return { store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService;
+  return { store, config: { identity }, load: vi.fn(() => view), commandPolicyDigest: () => commandDigest([]) } as unknown as ReviewService;
 }
 
 /**
@@ -112,6 +113,16 @@ function github(store: Store, change: (number: number) => Partial<RemoteMergeSta
 }
 
 describe('the merge gate with a runner block (#121)', () => {
+  it('invalidates preparation when the current command policy changes', async () => {
+    const { store } = published(), gh = github(store);
+    prepare(store);
+    const review = service(store);
+    review.commandPolicyDigest = () => commandDigest([['npm', 'test']]);
+    const merges = new MergeCoordinator(review, gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    expect((await merges.status()).blockers).toContainEqual({ code: 'preparation',
+      message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
+  });
+
   it('requires durable current preparation through the irreversible admission transaction', async () => {
     const { store } = published(), gh = github(store);
     const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);

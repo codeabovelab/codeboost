@@ -12,7 +12,7 @@ import { commandCheckDeps } from '../runner/checks.ts';
 import { RunnerCoordinator } from '../runner/coordinator.ts';
 import type { InvocationHandle, InvocationResult } from '../agents/contract.ts';
 import type { TaskWorkspace, WorkspaceRef } from '../runner/execution.ts';
-import { MIN_REBASE_TIMEOUT_MS, RebaseResourcesUnsettled } from '../runner/rebase.ts';
+import { MIN_REBASE_CLEANUP_TIMEOUT_MS, MIN_REBASE_TIMEOUT_MS, RebaseResourcesUnsettled } from '../runner/rebase.ts';
 
 const roots: string[] = [], services: ReviewService[] = [];
 vi.setConfig({ testTimeout: 15_000 });
@@ -372,8 +372,9 @@ it('preserves shutdown as the reason that stops an active command check', async 
 
 it('stops an active command check when the operation-wide deadline expires', async () => {
   const fixture = await rebaseFixture('feature\n', 0,
-    { commandWaitsForCancellation: true, operationTimeoutMs: MIN_REBASE_TIMEOUT_MS + 3_000,
-      reserves: { processMs: MIN_REBASE_TIMEOUT_MS + 1_000, commandMs: 200 } });
+    { commandWaitsForCancellation: true,
+      operationTimeoutMs: MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 3_000,
+      reserves: { processMs: MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 1_000, commandMs: 200 } });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
   const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
   expect(check).toMatchObject({ state: 'failed', firstReason: null, stopReason: 'timeout', diagnostic: 'Timed out.' });
@@ -538,6 +539,7 @@ it('budgets live rebase work and its follow-up cleanup inside the preparation de
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
   expect(fixture.rebaseBudgets).toHaveLength(1);
   expect(fixture.abortBudgets).toHaveLength(1);
+  expect(fixture.rebaseBudgets[0]).toBeLessThanOrEqual(operationTimeoutMs - MIN_REBASE_CLEANUP_TIMEOUT_MS);
   for (const budget of [...fixture.rebaseBudgets, ...fixture.abortBudgets]) {
     expect(budget).toBeTypeOf('number');
     expect(budget).toBeGreaterThan(0);
@@ -552,7 +554,8 @@ it('makes a preparation action resendable when its terminal storage write fails'
   const view = service.load(), task = service.store.getTask(config.identity), actionId = randomUUID();
   const request = { attemptId: undefined, expectedStateVersion: task.stateVersion, expectedReviewVersion: view.expected.reviewVersion };
   const readiness = { stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
-    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head };
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
+    commandPolicyDigest: service.commandPolicyDigest() };
   const priorActionId = randomUUID();
   service.store.userAction(config.identity, { actionId: priorActionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
   service.store.settlePreMergeAction(config.identity, priorActionId,
@@ -604,7 +607,7 @@ it('settles a failed preparation even when the fallback snapshot read would fail
 });
 
 it('threads the remaining operation budget through every synchronous review reload', async () => {
-  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + 10_000, processMs = 10_000;
+  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 10_000, processMs = 10_000;
   const fixture = await rebaseFixture('feature\n', undefined, { operationTimeoutMs, reserves: { processMs, commandMs: 0 } });
   const view = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
   const original = fixture.service.load.bind(fixture.service); const budgets: number[] = [];

@@ -202,6 +202,7 @@ export class MergeCoordinator {
         && !this.service.store.preMergeReady(this.service.config.identity, {
           stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion,
           snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
+          commandPolicyDigest: this.service.commandPolicyDigest(),
         })) blockers.push({ code: 'preparation', message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
     }
     let resolved: ResolvedTarget;
@@ -430,9 +431,11 @@ export class MergeCoordinator {
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
         const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
+        const requiresPreparation = this.published?.requiresPreparation === true;
         const begin = () => store.beginMergeAttempt(config.identity, { ...view.expected, reviewVersion }, commandStatus.remote.head, queueWatermark,
           commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion,
-          { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId }, this.published?.requiresPreparation === true);
+          { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId }, requiresPreparation,
+          requiresPreparation ? this.service.commandPolicyDigest() : null);
         let begun: MergeAttempt | null = null;
         // The attempt and the click's saved response commit in one transaction, or neither does.
         if (action) store.userAction(config.identity, action, () => mergeActionResponse(begun = begin()));
