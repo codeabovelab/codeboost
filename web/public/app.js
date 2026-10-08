@@ -241,6 +241,11 @@ async function act(command) {
     // One action ID per user action: the server replays it exactly and records feedback with it.
     const updated = await api("/api/action", { ...command, token: data.token, actionId: crypto.randomUUID() });
     if (generation !== reviewGeneration) return true;
+    mergeGeneration++;
+    if (mergePollTimer) clearTimeout(mergePollTimer);
+    mergePollTimer = null;
+    mergePollState = null;
+    mergePollDelay = 2000;
     rememberDraft();
     data = updated;
     render();
@@ -810,11 +815,12 @@ function preserveSettledQuestionAnswers(updated) {
 }
 function newerMergeQueue(updated) {
   const newer = data?.merge?.queue, older = updated.merge?.queue;
+  const progressed = newer?.state === "queued" && older?.state === "submitting" ||
+    ["merged", "removed", "failed"].includes(newer?.state) && ["submitting", "queued"].includes(older?.state);
   return newer?.actionId &&
     newer.actionId === older?.actionId &&
     newer.reviewedHead === older.reviewedHead &&
-    ["merged", "removed", "failed"].includes(newer.state) &&
-    ["submitting", "queued"].includes(older.state)
+    progressed
     ? newer
     : null;
 }
