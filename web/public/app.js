@@ -987,6 +987,7 @@ function validPlanAuthorStatus(status, request) {
   return result === null || !!validResult;
 }
 function planAuthorResultMarkup(request, historical = false) {
+  if (request.state === "cancelled") return "";
   const stale = planAuthorStale(request);
   const historyMark = historical ? ` <span class="${stale ? "warn" : "muted"}">${stale ? "! Stale" : "– Earlier result"}</span>` : "";
   let result = "";

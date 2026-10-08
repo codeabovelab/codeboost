@@ -294,7 +294,54 @@ test('dismisses ready suggestions without changing the plan', async ({ page }) =
   await expect(dismiss).toHaveAttribute('aria-disabled', 'true');
   release();
   await expect(page.getByRole('status').filter({ hasText: 'Suggestions dismissed.' })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(1);
+});
+
+test('ignores a ready poll response that returns after dismissal completes', async ({ page }) => {
+  await page.addInitScript(() => {
+    const nativeSetTimeout = window.setTimeout.bind(window);
+    window.setTimeout = ((handler: TimerHandler, timeout?: number, ...args: unknown[]) => {
+      if (typeof handler === 'function' && handler.toString().includes('pollPlanAuthor'))
+        (window as typeof window & { __planAuthorPoll?: () => void }).__planAuthorPoll = handler as () => void;
+      return nativeSetTimeout(handler, timeout, ...args);
+    }) as typeof window.setTimeout;
+  });
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  await page.getByRole('button', { name: 'Suggest edits' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(suggestions()));
+  const dismiss = page.locator('#plan-author-dismiss');
+  await expect(dismiss).toBeVisible();
+
+  let release!: () => void, arrived!: () => void, requestId = '';
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  let heldOldPoll = false;
+  await page.route('**/api/plan/suggestions/*', async route => {
+    if (route.request().method() !== 'GET' || heldOldPoll) { await route.fallback(); return; }
+    heldOldPoll = true;
+    requestId = new URL(route.request().url()).pathname.split('/').at(-1) ?? '';
+    const response = await route.fetch();
+    arrived();
+    await held;
+    await route.fulfill({ response });
+  });
+  await page.evaluate(() => {
+    (window as typeof window & { __planAuthorPoll?: () => void }).__planAuthorPoll?.();
+  });
+  await captured;
+
+  await dismiss.click();
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions dismissed.' })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
+  expect(app.service.store.getSuggestions(app.service.config.identity, requestId).state).toBe('cancelled');
+  release();
+
+  await expect(page.getByRole('status').filter({ hasText: 'Suggestions dismissed.' })).toBeVisible();
+  await expect(page.getByRole('article', { name: 'Name the retry ceiling' })).toHaveCount(0);
+  expect(app.service.store.getSuggestions(app.service.config.identity, requestId).state).toBe('cancelled');
 });
 
 test('blocks repeat dismissal until an ambiguous cancellation is reconciled', async ({ page }) => {
