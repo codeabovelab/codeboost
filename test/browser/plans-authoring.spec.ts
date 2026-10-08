@@ -201,6 +201,35 @@ test('applies a draft once while preserving newer review text and its attachment
   expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(2);
 });
 
+test('explains why Apply waits for an in-flight plan refresh', async ({ page }) => {
+  const { deps, invocations } = planning();
+  await openPlans(page, deps);
+  const current = app.service.store.getPlan(app.service.config.identity);
+  await page.getByRole('button', { name: 'Draft next revision' }).click();
+  await expect.poll(() => invocations.length).toBe(1);
+  invocations[0]!.resolve(JSON.stringify(draft(current)));
+  const apply = page.getByRole('button', { name: 'Apply draft', exact: true });
+  await expect(apply).toBeVisible();
+
+  let release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  await page.route('**/api/review', async route => { arrived(); await held; await route.continue(); });
+  let applies = 0;
+  await page.route('**/api/plan/drafts/*/apply', async route => { applies++; await route.continue(); });
+  await page.locator('#plans-refresh').click();
+  await captured;
+  await apply.click();
+
+  await expect(page.locator('#plan-author-status')).toHaveText('! Wait for the current plan or review action before applying this result.');
+  await expect(apply).toBeFocused();
+  expect(applies).toBe(0);
+  expect(app.service.store.getPlan(app.service.config.identity).revision).toBe(1);
+  release();
+  await expect(page.locator('#plans-status')).toHaveText('✓ Revision r1 is current.');
+  await expect(apply).toBeVisible();
+});
+
 test('keeps a committed draft applied when the authoritative reload fails', async ({ page }) => {
   const { deps, invocations } = planning();
   await openPlans(page, deps);

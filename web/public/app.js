@@ -1357,8 +1357,12 @@ async function applyPlanAuthor(index) {
   const request = planAuthorRequest;
   const retry = request?.state === "apply-uncertain" && request.applyingIndex === index;
   if (!request?.requestId || (!retry && (request.state !== "ready" || planAuthorStale(request))) ||
-      (request.mode === "draft" ? index !== null : !Number.isSafeInteger(index) || !request.reply.edits[index]) ||
-      planImportPending || planRefreshPending || busy) return;
+      (request.mode === "draft" ? index !== null : !Number.isSafeInteger(index) || !request.reply.edits[index])) return;
+  if (planImportPending || planRefreshPending || busy) {
+    $("plan-author-status").className = "warn";
+    $("plan-author-status").textContent = "! Wait for the current plan or review action before applying this result.";
+    return;
+  }
   supersedePlanRefresh();
   const generation = ++planOperationGeneration;
   const sharedGeneration = ++reviewGeneration;
