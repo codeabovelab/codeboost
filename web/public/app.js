@@ -108,6 +108,7 @@ function showFailure(message) {
 async function refresh() {
   if (busy || planImportPending) return;
   supersedePlanRefresh();
+  const planStatusOwner = planStatusGeneration;
   const busyOwner = beginBusy("read");
   const generation = ++reviewGeneration;
   mergeGeneration++;
@@ -131,6 +132,7 @@ async function refresh() {
     selected ??= data.items[0]?.id || "Unplanned";
     render();
     if (newerQueue) showMergeQueueStatus(newerQueue);
+    setPlanStatus(planStatusOwner, "good", `✓ Revision r${data.plan.revision} is current.`);
   } catch (error) {
     if (generation !== reviewGeneration) return;
     rememberDraft();

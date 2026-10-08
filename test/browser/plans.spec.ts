@@ -1,4 +1,5 @@
 import { test, expect } from '@playwright/test';
+import { randomUUID } from 'node:crypto';
 import { chmodSync, mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -394,6 +395,51 @@ test('clears stale Plans data when a Review refresh fails after navigation', asy
   await expect(page.locator('#reload')).toHaveText('Refresh');
   await expect(page.locator('#plans-summary')).toHaveText('Plan unavailable');
   await expect(page.locator('#plans-status')).toContainText('Could not read this branch’s history. Review read failed. Use Refresh to retry.');
+});
+
+test('updates a settled Plans revision status when Review refresh observes a newer plan', async ({ page }) => {
+  await page.goto(app.url);
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await page.locator('#plans-refresh').click();
+  await expect(page.getByRole('status').filter({ hasText: 'Revision r1 is current.' })).toBeVisible();
+
+  const response = await fetch(new URL('/api/plan/import', app.url), {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-codeboost-token': app.token },
+    body: JSON.stringify({ source: JSON.stringify(nextPlan), format: 'json', expectedRevision: 1, actionId: randomUUID() }),
+  });
+  expect(response.status).toBe(200);
+
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await expect(page.locator('#plans-revision')).toHaveText('r2');
+  await expect(page.getByRole('status').filter({ hasText: 'Revision r2 is current.' })).toBeVisible();
+  await expect(page.locator('#plans-status')).not.toContainText('Revision r1 is current.');
+});
+
+test('clears a Plans load-failure status when Review refresh recovers', async ({ page }) => {
+  await page.goto(app.url);
+  let release!: () => void, arrived!: () => void;
+  const held = new Promise<void>(resolve => { release = resolve; });
+  const captured = new Promise<void>(resolve => { arrived = resolve; });
+  await page.route('**/api/review', async route => {
+    arrived();
+    await held;
+    await route.fulfill({ status: 500, contentType: 'application/json', body: JSON.stringify({ error: 'Review read failed.' }) });
+  });
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await captured;
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  release();
+  await expect(page.locator('#plans-status')).toContainText('Could not read this branch’s history. Review read failed.');
+
+  await page.unroute('**/api/review');
+  await page.getByRole('link', { name: 'Review', exact: true }).click();
+  await page.getByRole('button', { name: 'Refresh', exact: true }).click();
+  await page.getByRole('link', { name: 'Plans', exact: true }).click();
+  await expect(page.getByRole('status').filter({ hasText: 'Revision r1 is current.' })).toBeVisible();
+  await expect(page.locator('#plans-status')).not.toContainText('Review read failed.');
 });
 
 test('does not let a question poll started during Plans refresh replace its completed answer', async ({ page }) => {

@@ -6,7 +6,7 @@ G1 adds a Plans screen over the planning contracts already owned by lanes E and 
 
 ## Display contract
 
-The screen renders the complete current plan: issue, summary, revision, open questions, ordered items, dependencies, files (including both sides of a rename) and acceptance checks. Navigation uses `?view=plans`, announces the active destination with `aria-current`, and preserves the existing Review composer DOM while the Plans screen is open.
+The screen renders the complete current plan: issue, summary, revision, open questions, ordered items, dependencies, files (including both sides of a rename) and acceptance checks. Navigation uses `?view=plans`, announces the active destination with `aria-current`, and preserves the existing Review composer DOM while the Plans screen is open. An authoritative Review refresh reconciles a settled Plans revision or load-failure status with the response it applies, but only while no newer plan operation owns that status.
 
 ## Import contract
 
