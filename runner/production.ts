@@ -19,7 +19,7 @@ import { recoverStartup, removalCommand, type RecoveryDeps, type RecoveryReport,
 import { GitBranchPusher, pushUrl } from './branch-push.ts';
 import { PullRequestPublisher } from './publish.ts';
 import type { ReviewService } from './review.ts';
-import { openRunnerRepository, ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
+import { ensureCommit, openRunnerRepository, ownerOnlyDirectory, type RunnerRepository } from './runner-repository.ts';
 import { GitRebaser } from './rebase.ts';
 import { createForeignConflictResolver } from './rebase-conflict.ts';
 import { createTaskWorkspace, workspaceFilesystems } from './workspace.ts';
@@ -226,10 +226,15 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
   let repositoryPromise: Promise<RunnerRepository> | undefined, rebaserPromise: Promise<GitRebaser> | undefined;
   let authorizePreMerge: ((signal: AbortSignal) => Promise<() => void | Promise<void>>) | undefined;
   const getRepository = () => repositoryPromise ??= openRunnerRepository({ runnerRoot: config.root, runnerOwner,
-    repositoryId: identity.repositoryId, source: review.repository }).then(repository => {
+    repositoryId: identity.repositoryId, source: review.repository }).then(async repository => {
       // The review and rebase recovery read the same runner-owned repository that execution writes.
       if (review.runnerRepository !== undefined && review.runnerRepository !== repository.path)
         throw new Error(`runnerRepository (${review.runnerRepository}) is not the runner's repository (${repository.path}); remove it from the configuration.`);
+      // A fresh bare repository has no objects yet. Seed the recorded snapshot before selecting it for review reads;
+      // otherwise the server cannot render the initial review, and no execution attempt can get far enough to import it.
+      const snapshot = service.store.getSnapshot(identity);
+      await ensureCommit(repository, snapshot.base);
+      await ensureCommit(repository, snapshot.head);
       review.runnerRepository = repository.path;
       return repository;
     });
