@@ -291,6 +291,26 @@ it('preserves execution approval recorded at the rewritten final output snapshot
   ]);
   expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
 });
+it('keeps a later attribution choice binding after a collaborator head replaces its snapshot', () => {
+  const { store } = fixture();
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: store.currentContext(identity) });
+  store.markRunning(identity, attempt.id);
+  store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: false, head: oid(3) } });
+  store.recordHistory(identity, state(store), oid(1), oid(3), [
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+  ]);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+  store.saveReview(identity, state(store), [], [{ key: 'later-choice', action: 'accept', item: null }]);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.recordHistory(identity, state(store), oid(1), oid(5), []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+});
 it('preserves an approved checkpoint continuation across its validated rewrite lineage', () => {
   const { store } = fixture(true);
   store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
