@@ -64,6 +64,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   reserves?: { processMs?: number; commandMs?: number; pushVisibleMs?: number };
   /** The PR API keeps reporting the pre-push head for this many inspections after a push. */
   pushVisibleAfter?: number;
+  /** The base branch moves as the push lands: lagging and later inspections report this base. */
+  movedBaseAfterPush?: (service: ReviewService) => string;
   /** The push lands on the branch before it fails. */
   landBeforeFailure?: boolean;
   /** Runs once the push has landed and may move the branch again, as a collaborator push would. */
@@ -197,9 +199,17 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       if (remotePair.head !== input.from) throw new BranchPushRefused('moved');
       lagged = remotePair; lagging = options.pushVisibleAfter ?? 0;
       remotePair = { ...remotePair, head: input.to };
+      if (options.movedBaseAfterPush) {
+        const base = options.movedBaseAfterPush(service);
+        lagged = { ...lagged, base }; remotePair = { ...remotePair, base };
+      }
       if (options.afterPush) remotePair = { ...remotePair, head: options.afterPush(service, input.to) };
     },
-    readBranch: async () => options.branchRead ? options.branchRead(remotePair.head) : remotePair.head,
+    // A real branch read is aborted by its signal; so is this one, so a cancel that stopped settlement would show.
+    readBranch: async (_branch, signal) => {
+      signal?.throwIfAborted();
+      return options.branchRead ? options.branchRead(remotePair.head) : remotePair.head;
+    },
   }, options.operationTimeoutMs, undefined, authorize, options.reserves);
   if (options.closeAfterCommandAdmission) {
     const start = runner.start.bind(runner);
@@ -1031,5 +1041,21 @@ it('reviews a collaborator push that lands on the rewritten head right after it 
   expect(fixture.result.reason).toMatch(/moved after the rewritten head was pushed/);
   expect(fixture.service.load().snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
   expect(fixture.checkedHeads).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('keeps waiting while GitHub still reports the pre-push head, even if the base moved meanwhile', async () => {
+  let movedBase = '';
+  const fixture = await rebaseFixture('feature\n', 0, { pushVisibleAfter: 2, movedBaseAfterPush(service) {
+    const onto = service.store.getSnapshot(service.config.identity).base;
+    const tree = fixtureGit(service.config.repository, 'rev-parse', `${onto}^{tree}`);
+    movedBase = fixtureGit(service.config.repository, 'commit-tree', tree, '-p', onto, '-m', 'base moved again');
+    return movedBase;
+  } });
+  expect(fixture.result).toMatchObject({ state: 'review-required', head: fixture.rebased, checked: [] });
+  expect(fixture.result.reason).toMatch(/moved after the rewritten head was pushed/);
+  // The review stays on the head the branch holds, against the base it descends from: never back on the pre-push head.
+  expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
+  expect(fixture.service.load().segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });

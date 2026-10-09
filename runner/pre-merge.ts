@@ -257,7 +257,8 @@ export class PreMergeCoordinator {
     const until = performance.now() + this.pushVisibleTimeoutMs;
     for (let delay = 250; ; delay = Math.min(delay * 2, 4_000)) {
       const seen = await this.remote.inspect(signal); signal.throwIfAborted();
-      if (seen.head !== before.head || seen.base !== before.base) return seen;
+      // Only the head shows whether GitHub caught up: a base that moved meanwhile says nothing about the pushed head.
+      if (seen.head !== before.head) return seen;
       const wait = Math.min(delay, until - performance.now(), remaining() - this.processSettlementReserveMs);
       if (wait < 1) throw new GuardRefusal(`GitHub has not reported the pushed head ${pushed} on the pull request yet. Prepare the merge again shortly.`);
       await new Promise<void>((resolve, reject) => {
