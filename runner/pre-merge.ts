@@ -243,18 +243,23 @@ export class PreMergeCoordinator {
       } });
       return current;
     };
-    // Rebase lifecycle writes advance task state without changing the reviewed pair. Bind a resulting failure to that
-    // settled durable state without rebuilding history; if a read fails, the older binding remains safely stale.
-    const bindCurrentFailure = () => {
+    // Rebase lifecycle writes advance task state without changing the review that admitted them. Bind a resulting
+    // failure to that original review/snapshot while adopting only the task-state transition owned by the rebase. If a
+    // read fails, the older binding remains safely stale.
+    const bindRebaseFailure = (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair) => {
       try {
-        const snapshot = this.service.store.getSnapshot(identity);
-        onObserved({ pair: { base: snapshot.base, head: snapshot.head }, binding: {
+        onObserved({ pair, binding: {
           stateVersion: this.service.store.getTask(identity).stateVersion,
-          reviewVersion: this.service.store.reviewVersion(identity), snapshotId: snapshot.id,
+          reviewVersion: reviewed.reviewVersion, snapshotId: reviewed.snapshotId,
         } });
       } catch { /* An unbound failure is conservatively historical. */ }
     };
     const load = () => track(this.service.load({ maxDurationMs: Math.min(30_000, reviewBudget()) }));
+    signal.throwIfAborted();
+    if (this.runner.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
+    const runnerStatus = this.runner.status(identity);
+    if (runnerStatus.unresolved || this.runner.unreleased)
+      throw new GuardRefusal('Runner cleanup is unresolved; restart and recover owned resources before preparing a merge.');
     let view = load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
@@ -262,7 +267,6 @@ export class PreMergeCoordinator {
     if (task.cancelRequested !== null) throw new GuardRefusal('The task is being cancelled.');
     if (!this.service.reviewRepository().runnerOwned)
       throw new GuardRefusal('Pre-merge preparation requires a runner-owned head.');
-    if (this.runner.isActive(identity)) throw new GuardRefusal('An attempt is already active for this task.');
     const merge = this.service.store.getMergeAttempt(identity);
     if (merge && (merge.state === 'submitting' || merge.state === 'queued'))
       throw new GuardRefusal('A merge is in progress; wait for its outcome.');
@@ -306,15 +310,15 @@ export class PreMergeCoordinator {
           result.base, result.head, result.mappings);
       } catch (error) {
         if (error instanceof RebaseResourcesUnsettled) {
-          bindCurrentFailure();
+          bindRebaseFailure(reviewed, { base: oldBase, head: oldHead });
           throw error;
         }
         try { await this.#cleanupRebase(identity, marker, rebaseBudget(true)); }
         catch (cleanup) {
-          bindCurrentFailure();
+          bindRebaseFailure(reviewed, { base: oldBase, head: oldHead });
           throw new AggregateError([error, cleanup], error instanceof Error ? error.message : 'Rebase failed.', { cause: error });
         }
-        bindCurrentFailure();
+        bindRebaseFailure(reviewed, { base: oldBase, head: oldHead });
         throw error;
       }
       view = load();

@@ -216,6 +216,19 @@ it('keeps a failed live cleanup current while its rebase marker awaits recovery'
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
+it('keeps a failed rebase bound to the review that started it when that review changes in flight', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    duringRebase(service) {
+      const current = service.load();
+      service.store.addReviewNote(service.config.identity, current.expected, 'P1', 'change', 'Changed during rebase.');
+    },
+    rebaseFailure: new Error('rebase failed'), rebaseCleanupFailure: new Error('cleanup failed'),
+  });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
 it('revalidates authorization before starting the delayed local rebase', async () => {
   const calls: string[] = [];
   const fixture = await rebaseFixture('feature\n', undefined, { authorize: async () => {
@@ -423,7 +436,8 @@ it('refreshes the moved head against its prior base when the PR base and head ad
   const moved = { base: fixtureGit(baseWork, 'rev-parse', 'HEAD'), head: fixtureGit(work, 'rev-parse', 'HEAD') };
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => moved, fetch: async () => undefined });
   const task = service.store.getTask(config.identity);
@@ -477,7 +491,8 @@ it('traces an unpushed rewrite back to the base of a collaborator head', async (
   let reads = 0;
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => ++reads === 1 ? { base: newBase, head: rewrittenHead } : { base: newBase, head: collaboratorHead },
       fetch: async () => undefined });
@@ -490,6 +505,51 @@ it('traces an unpushed rewrite back to the base of a collaborator head', async (
   await coordinator.close();
 });
 
+it('refuses preparation before review or remote work while runner cleanup is unresolved', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-unresolved-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load(), task = service.store.getTask(config.identity);
+  for (const kind of ['marker', 'resources'] as const) {
+    let inspected = false;
+    const load = vi.spyOn(service, 'load');
+    const coordinator = new PreMergeCoordinator(service,
+      { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+        stop: () => false, isActive: () => false,
+        status: () => ({ active: false, stopRequested: null,
+          unresolved: kind === 'marker' ? { attemptId: randomUUID(), reason: 'storage-not-removed' } : null }),
+        get unreleased() { return kind === 'resources' ? [{ kind: 'container', name: 'agent-x' }] : null; } } as never,
+      { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+      { inspect: async () => { inspected = true; return { base: view.snapshot.base, head: view.snapshot.head }; },
+        fetch: async () => undefined });
+    const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+      snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+    expect(result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/restart|cleanup/i) });
+    expect(inspected).toBe(false);
+    expect(load).not.toHaveBeenCalled();
+    load.mockRestore(); await coordinator.close();
+  }
+});
+
+it('preserves an already-requested shutdown without loading the review', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-pre-aborted-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load(), task = service.store.getTask(config.identity);
+  const load = vi.spyOn(service, 'load');
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => { throw new Error('No remote inspection expected.'); }, fetch: async () => undefined });
+  const active = coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+  await coordinator.close();
+  await expect(active).resolves.toMatchObject({ state: 'failed', reason: 'Server shutdown.' });
+  expect(load).not.toHaveBeenCalled();
+});
+
 it('settles an admitted action after shutdown aborts its remote refresh', async () => {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-shutdown-')); roots.push(root);
   const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
@@ -500,7 +560,8 @@ it('settles an admitted action after shutdown aborts its remote refresh', async 
   const capability = service.store.shutdownCapability();
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
       fetch: async () => undefined }, 60_000, capability);
@@ -520,7 +581,8 @@ it('applies one operation-wide deadline to remote work and later checks', async 
   const view = service.load(), task = service.store.getTask(config.identity);
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => reject(signal.reason), { once: true })),
       fetch: async () => undefined }, 20);
@@ -538,7 +600,8 @@ it('aborts remote work early enough to reserve bounded subprocess settlement', a
   const processReserve = 1_000, operationTimeout = 2_000;
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: signal => new Promise((_resolve, reject) => signal?.addEventListener('abort', () => {
       abortedAt = performance.now();
@@ -590,7 +653,8 @@ it('makes a preparation action resendable when its terminal storage write fails'
   }).mockImplementation(original);
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => ({ base: view.snapshot.base, head: view.snapshot.head }), fetch: async () => undefined });
   const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
@@ -617,7 +681,8 @@ it('settles a failed preparation even when the fallback snapshot read would fail
   });
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => { throw new Error('remote inspection failed'); }, fetch: async () => undefined });
   await expect(coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
@@ -672,7 +737,8 @@ it('rechecks the remote after local preparation and refreshes a head that moved 
   let reads = 0;
   const coordinator = new PreMergeCoordinator(service,
     { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
-      stop: () => false, isActive: () => false } as never,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
     { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
     { inspect: async () => ++reads === 1 ? { base, head } : moved, fetch: async () => undefined });
   const task = service.store.getTask(identity);
