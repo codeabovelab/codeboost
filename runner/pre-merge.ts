@@ -465,20 +465,17 @@ export class PreMergeCoordinator {
       checked: [], reason: blocker };
     if (initial.head !== view.snapshot.head) {
       const pushed = await this.#pushRewrite(initial, view, signal, deadline, authorize, bindRebaseFailure);
+      // The push (or refusal) advanced task state; bind any later failure to it so it is reported as current, not stale.
+      bindRebaseFailure({ reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id },
+        { base: view.snapshot.base, head: view.snapshot.head });
       // Either way the branch no longer holds the pre-push head: ours after a push, someone else's after a refusal.
       // GitHub's PR API reports that asynchronously, so wait for it; its lag must not read as the old head.
-      let seen: RemotePair;
-      try { seen = await this.#awaitHeadChange(initial, signal, remaining); }
-      catch (error) {
-        // The push (or refusal) advanced task state; bind this failure to it so it is reported as current, not stale.
-        bindRebaseFailure({ reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id },
-          { base: view.snapshot.base, head: view.snapshot.head });
-        throw error;
-      }
+      const seen = await this.#awaitHeadChange(initial, signal, remaining);
       if (pushed !== 'pushed' || seen.head !== view.snapshot.head || seen.base !== initial.base) {
         const moved = seen; await this.remote.fetch(moved, signal); signal.throwIfAborted();
-        // After a push, history is traced from the pushed head; after a refusal, from the head the push would replace.
-        view = track(this.#refresh(moved, reviewBudget, pushed === 'pushed' ? view.snapshot.head : initial.head));
+        // Traced from the reviewed head and its rewrite lineage, nearest first. That lineage holds the pushed head, every
+        // earlier rewrite codeboost may already have pushed, and the original head a collaborator may have built on.
+        view = track(this.#refresh(moved, reviewBudget, view.snapshot.head));
         return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
           reason: pushed === 'pushed'
             ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'

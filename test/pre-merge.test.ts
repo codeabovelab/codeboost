@@ -68,6 +68,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   movedBaseAfterPush?: (service: ReviewService) => string;
   /** The push lands on the branch before it fails. */
   landBeforeFailure?: boolean;
+  /** A later rebase's result (the first rebase always yields the fixture's `rebased`); `undefined` keeps the default. */
+  rebaseResult?: (service: ReviewService, input: { oldHead: string; onto: string }, run: number) => string | undefined;
+  /** Remote fetches fail once codeboost has pushed. */
+  fetchFailsAfterPush?: boolean;
   /** A collaborator pushes this commit to the branch just before codeboost's push, which is then refused. */
   pushedFirst?: (service: ReviewService) => string;
   /** Runs once the push has landed and may move the branch again, as a collaborator push would. */
@@ -107,7 +111,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   let coordinator!: PreMergeCoordinator, rebaseRuns = 0;
   let rebaseAborts = 0;
   const rebaseBudgets: Array<number | undefined> = [], abortBudgets: Array<number | undefined> = [];
-  const rebaser = { run: async (input: { attemptId: string; signal: AbortSignal; timeoutMs?: number }) => {
+  const rebaser = { run: async (input: { attemptId: string; signal: AbortSignal; timeoutMs?: number; oldHead: string; onto: string }) => {
     rebaseRuns++;
     rebaseBudgets.push(input.timeoutMs);
     options.duringRebase?.(service, coordinator, input.timeoutMs);
@@ -115,6 +119,12 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     if (options.unsettledRebase) throw new RebaseResourcesUnsettled('Conflict resources remain owned.');
     if (options.rebaseFailure) throw options.rebaseFailure;
     const planKey = service.store.getTask(identity).planKey;
+    const custom = options.rebaseResult?.(service, input, rebaseRuns);
+    if (custom) {
+      service.store.prepareRebaseResult(planKey, input.attemptId, custom, [custom]);
+      service.store.completeRebaseResult(planKey, input.attemptId);
+      return { oldHead: input.oldHead, base: input.onto, head: custom, mappings: [{ oldSha: input.oldHead, newSha: custom }], resolvedConflicts: [] };
+    }
     service.store.prepareRebaseResult(planKey, input.attemptId, rebased, [rebased]);
     service.store.completeRebaseResult(planKey, input.attemptId);
     return { oldHead: head, base: onto, head: rebased,
@@ -192,7 +202,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       // Read 2 is the post-push visibility check; hooks keep counting the later inspections as before the push existed.
       if (remoteReads > 2) options.duringFinalInspect?.(service, coordinator, remoteReads - 1);
       return remotePair;
-    }, fetch: async () => undefined,
+    }, fetch: async () => { if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push'); },
     push: async input => {
       pushes.push({ branch: input.branch, from: input.from, to: input.to });
       input.beforePush();
@@ -229,6 +239,11 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, pushes, remote: () => remotePair,
+    /** The branch moves (as GitHub's Git data shows it); the PR API reports `shown` for the next `reads` inspections. */
+    moveRemote: (pair: { base: string; head: string }, shown?: { base: string; head: string }, reads = 0) => {
+      remotePair = { ...remotePair, ...pair };
+      if (shown) { lagged = { ...remotePair, ...shown }; lagging = reads; } else lagging = 0;
+    },
     rebaseRuns: () => rebaseRuns, rebaseAborts: () => rebaseAborts, rebaseBudgets, abortBudgets };
 }
 
@@ -1107,5 +1122,50 @@ it('pushes nothing when the reviewed snapshot changes at the push boundary', asy
   expect(fixture.result.reason).toMatch(/changed before the rewritten head was pushed/);
   expect(fixture.remote().head).not.toBe(fixture.rebased);
   expect(fixture.service.store.getTask(fixture.service.config.identity).pushInProgress).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('after a refused push, traces a lagging earlier push of codeboost\'s own rewrite from its own base, not the original one', async () => {
+  // 1. The push of R1 lands, but the PR API keeps showing the original head, so preparation fails.
+  let r2 = '';
+  const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 1_000, reserves: { pushVisibleMs: 300 },
+    rebaseResult(service, input, run) {
+      if (run !== 2) return undefined;
+      // 3. The second rebase rewrites R1 onto the moved base as R2.
+      const repository = service.config.repository;
+      fixtureGit(repository, 'switch', '-qc', 'second-rebase', input.onto);
+      writeFileSync(join(repository, 'a.txt'), 'feature\n'); fixtureGit(repository, 'commit', '-qam', 'rebased feature again');
+      r2 = fixtureGit(repository, 'rev-parse', 'HEAD');
+      fixtureGit(repository, 'switch', '-q', 'feature');
+      return r2;
+    } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  const identity = fixture.service.config.identity, r1 = fixture.rebased, b1 = fixture.service.store.getSnapshot(identity).base;
+  expect(fixture.remote().head).toBe(r1);
+  // 2. The base branch moves again; the PR API still shows the original head for two more reads.
+  const repository = fixture.service.config.repository;
+  fixtureGit(repository, 'switch', '-qc', 'moved-again', b1);
+  writeFileSync(join(repository, 'c.txt'), 'later base\n'); fixtureGit(repository, 'add', 'c.txt'); fixtureGit(repository, 'commit', '-qm', 'move base again');
+  const b2 = fixtureGit(repository, 'rev-parse', 'HEAD');
+  fixtureGit(repository, 'switch', '-q', 'feature');
+  const original = fixture.pushes[0]!.from;
+  fixture.moveRemote({ base: b2, head: r1 }, { base: b2, head: original }, 2);
+  // 4. The retry rebases R1 onto B2 and pushes R2 leased to the original head; the branch holds R1, so it is refused.
+  const retried = await prepareAgain(fixture);
+  expect(retried).toMatchObject({ state: 'review-required', head: r1 });
+  expect(fixture.pushes.at(-1)).toMatchObject({ from: original, to: r2 });
+  // R1 is reviewed against B1, the base it was rewritten onto: the upstream base commit is not attributed to the PR.
+  expect(fixture.service.store.getSnapshot(identity)).toMatchObject({ base: b1, head: r1 });
+  expect(fixture.service.load().segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('reports a failure after a successful push as current, not stale', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { fetchFailsAfterPush: true, afterPush(service, pushed) {
+    const tree = fixtureGit(service.config.repository, 'rev-parse', `${pushed}^{tree}`);
+    return fixtureGit(service.config.repository, 'commit-tree', tree, '-p', pushed, '-m', 'collaborator on top');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
