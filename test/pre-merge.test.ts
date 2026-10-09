@@ -68,6 +68,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   movedBaseAfterPush?: (service: ReviewService) => string;
   /** The push lands on the branch before it fails. */
   landBeforeFailure?: boolean;
+  /** A collaborator pushes this commit to the branch just before codeboost's push, which is then refused. */
+  pushedFirst?: (service: ReviewService) => string;
   /** Runs once the push has landed and may move the branch again, as a collaborator push would. */
   afterPush?: (service: ReviewService, pushed: string) => string;
   pushFailure?: (service: ReviewService, input: { from: string; to: string }) => Error;
@@ -195,6 +197,10 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       pushes.push({ branch: input.branch, from: input.from, to: input.to });
       input.beforePush();
       if (options.landBeforeFailure && remotePair.head === input.from) { lagged = remotePair; remotePair = { ...remotePair, head: input.to }; }
+      if (options.pushedFirst) {
+        lagged = remotePair; lagging = options.pushVisibleAfter ?? 0;
+        remotePair = { ...remotePair, head: options.pushedFirst(service) };
+      }
       if (options.pushFailure) throw options.pushFailure(service, input);
       if (remotePair.head !== input.from) throw new BranchPushRefused('moved');
       lagged = remotePair; lagging = options.pushVisibleAfter ?? 0;
@@ -895,15 +901,29 @@ it('does not push a rewrite whose approval became stale', async () => {
 
 it('returns to review without pushing when the branch moved off the rewritten head', async () => {
   let collaborator = '';
-  const fixture = await rebaseFixture('feature\n', undefined, { pushFailure(service) {
+  const fixture = await rebaseFixture('feature\n', undefined, { pushedFirst(service) {
     writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
     fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
     collaborator = fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
-    return new BranchPushRefused('The branch moved.');
-  }, branchRead: () => collaborator });
-  expect(fixture.result).toMatchObject({ state: 'review-required' });
+    return collaborator;
+  } });
+  expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator });
   expect(fixture.result.reason).toMatch(/moved before the rewritten head could be pushed/);
+  expect(fixture.remote().head).toBe(collaborator);
   expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('waits for GitHub to report the collaborator head that refused the push before reviewing it', async () => {
+  let collaborator = '';
+  const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 2, pushedFirst(service) {
+    writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
+    collaborator = fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
+    return collaborator;
+  } });
+  expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator });
+  expect(fixture.service.load().snapshot.head).toBe(collaborator);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
@@ -983,7 +1003,7 @@ it('leaves the push marker for startup when shutdown interrupts the push, and st
   const restarted = new PreMergeCoordinator(fixture.service, fixture.runner, {} as never, {
     inspect: async () => { throw new Error('not used'); }, fetch: async () => undefined,
     push: async () => { throw new Error('not used'); }, readBranch: async () => fixture.remote().head });
-  await expect(restarted.settleAtStartup()).resolves.toBe('not-pushed');
+  await expect(restarted.settlePendingPush()).resolves.toBe('not-pushed');
   expect(pushMarker(fixture)).toBeNull();
   await restarted.close(); await fixture.runner.close();
 });
@@ -998,7 +1018,7 @@ it('waits for GitHub to report the pushed head before the later inspections comp
 it('fails without refreshing the review when GitHub never reports the pushed head in time', async () => {
   const fixture = await rebaseFixture('feature\n', 0, { pushVisibleAfter: 1_000, reserves: { pushVisibleMs: 600 } });
   expect(fixture.result).toMatchObject({ state: 'failed', checked: [] });
-  expect(fixture.result.reason).toMatch(/has not reported the pushed head/);
+  expect(fixture.result.reason).toMatch(/has not reported the pull request's new head yet/);
   expect(fixture.checkedHeads).toEqual([]);
   expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
   expect(pushMarker(fixture)).toBeNull();
@@ -1019,7 +1039,7 @@ it('lets a cancel during the startup push settlement finish the read and close t
     inspect: async () => { throw new Error('not used'); }, fetch: async () => undefined,
     push: async () => { throw new Error('not used'); },
     readBranch: async (_branch, signal) => { readSignal = signal; return read.promise; } });
-  const settling = restarted.settleAtStartup();
+  const settling = restarted.settlePendingPush();
   expect(restarted.active).toBe(true);
   expect(restarted.cancelTask(fixture.service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
   expect(readSignal?.aborted).toBe(false);

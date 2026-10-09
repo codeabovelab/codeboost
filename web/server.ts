@@ -389,10 +389,17 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
       if ((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
-      if (action === 'cancel-task') return { outcome: preMerge?.active
-        ? preMerge.cancelTask(expectedStateVersion as number, actionId as string)
-        : runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string)
-          : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
+      if (action === 'cancel-task') {
+        const outcome = preMerge?.active
+          ? preMerge.cancelTask(expectedStateVersion as number, actionId as string)
+          : runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string)
+            : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string);
+        // A push of a rewritten head whose outcome is still unknown holds this cancel at 'stopping'. With no preparation
+        // to settle it, read its branch now; clearing the marker closes the task, and then its PRs.
+        if (outcome === 'stopping' && preMerge && !preMerge.active && !stopping && service.store.getTask(identity).pushInProgress !== null)
+          service.store.afterCommit(() => afterPreMerge(preMerge!.settlePendingPush()));
+        return { outcome };
+      }
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
       if (action === 'prepare-merge') {
         if (access) requireTrustedIssue(access);
@@ -718,7 +725,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
      */
     publishOwed: (verifyLock: () => void): void | Promise<void> => {
       verifyLock();
-      if (preMerge && !stopping) afterPreMerge(preMerge.settleAtStartup());
+      if (preMerge && !stopping) afterPreMerge(preMerge.settlePendingPush());
       if (!publishing) return;
       publishing.startup(identity);
     },

@@ -179,11 +179,12 @@ export class PreMergeCoordinator {
     return marker ? this.#settlePush(marker) : null;
   }
   /**
-   * After startup recovery: settle a push left by a crash or shutdown, as one tracked job that shutdown aborts and awaits.
-   * While it runs, a preparation is refused as already running. Never throws: a failed read leaves the marker for the
-   * next preparation, and a server already closing or busy skips it.
+   * Settle a push left by a crash, shutdown or unreadable branch, as one tracked job that shutdown aborts and awaits:
+   * after startup recovery, and when a task is cancelled with no preparation running. While it runs, a preparation is
+   * refused as already running. Never throws: a failed read leaves the marker for the next preparation, and a server
+   * already closing or busy skips it.
    */
-  settleAtStartup(): Promise<PushOutcome | null> {
+  settlePendingPush(): Promise<PushOutcome | null> {
     if (this.#closing || this.#active) return Promise.resolve(null);
     const active = this.settleInterruptedPush().catch(() => null)
       .finally(() => { if (this.#active === active) this.#active = null; });
@@ -255,16 +256,16 @@ export class PreMergeCoordinator {
    * Inspect the PR until GitHub reports a head other than the pre-push head, with backoff. No inspection starts after
    * `pushVisibleTimeoutMs`, so the wait lasts at most that plus one inspection, within the preparation deadline. A PR
    * still at the pre-push head after that fails the preparation without refreshing the review: the branch itself
-   * already holds the pushed head.
+   * already holds another head.
    */
-  async #awaitPushedHead(before: RemotePair, pushed: string, signal: AbortSignal, remaining: () => number): Promise<RemotePair> {
+  async #awaitHeadChange(before: RemotePair, signal: AbortSignal, remaining: () => number): Promise<RemotePair> {
     const until = performance.now() + this.pushVisibleTimeoutMs;
     for (let delay = 250; ; delay = Math.min(delay * 2, 4_000)) {
       const seen = await this.remote.inspect(signal); signal.throwIfAborted();
       // Only the head shows whether GitHub caught up: a base that moved meanwhile says nothing about the pushed head.
       if (seen.head !== before.head) return seen;
       const wait = Math.min(delay, until - performance.now(), remaining() - this.processSettlementReserveMs);
-      if (wait < 1) throw new GuardRefusal(`GitHub has not reported the pushed head ${pushed} on the pull request yet. Prepare the merge again shortly.`);
+      if (wait < 1) throw new GuardRefusal(`GitHub has not reported the pull request's new head yet; it still shows ${before.head}. Prepare the merge again shortly.`);
       await new Promise<void>((resolve, reject) => {
         const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, wait);
         const stop = () => { clearTimeout(timer); reject(signal.reason); };
@@ -464,11 +465,11 @@ export class PreMergeCoordinator {
       checked: [], reason: blocker };
     if (initial.head !== view.snapshot.head) {
       const pushed = await this.#pushRewrite(initial, view, signal, deadline, authorize, bindRebaseFailure);
-      // Refused: the branch holds neither the reviewed predecessor nor our head. Otherwise wait for GitHub's PR API,
-      // which reports a pushed head asynchronously, so the later inspections do not mistake its lag for a move.
-      const seen = pushed === 'pushed' ? await this.#awaitPushedHead(initial, view.snapshot.head, signal, remaining) : null;
-      if (pushed !== 'pushed' || seen!.head !== view.snapshot.head || seen!.base !== initial.base) {
-        const moved = seen ?? await this.remote.inspect(signal); await this.remote.fetch(moved, signal); signal.throwIfAborted();
+      // Either way the branch no longer holds the pre-push head: ours after a push, someone else's after a refusal.
+      // GitHub's PR API reports that asynchronously, so wait for it; its lag must not read as the old head.
+      const seen = await this.#awaitHeadChange(initial, signal, remaining);
+      if (pushed !== 'pushed' || seen.head !== view.snapshot.head || seen.base !== initial.base) {
+        const moved = seen; await this.remote.fetch(moved, signal); signal.throwIfAborted();
         // After a push, history is traced from the pushed head; after a refusal, from the head the push would replace.
         view = track(this.#refresh(moved, reviewBudget, pushed === 'pushed' ? view.snapshot.head : initial.head));
         return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
@@ -476,7 +477,7 @@ export class PreMergeCoordinator {
             ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'
             : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
       }
-      initial = seen!;
+      initial = seen;
       view = load();
     }
     const checked: string[] = [];
