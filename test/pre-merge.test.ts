@@ -1080,3 +1080,32 @@ it('keeps waiting while GitHub still reports the pre-push head, even if the base
   expect(fixture.service.load().segments.filter(segment => segment.row === 'Unplanned')).toEqual([]);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
+
+it('pushes nothing when a cancel is requested at the push boundary, and closes the task once the outcome is read', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    if (call !== 3) return; // validations: 1 rebase, 2 push read, 3 push boundary
+    const identity = service.config.identity;
+    // Store-level, as a cancel committed by another request would be: this preparation's signal is not aborted.
+    expect(service.store.cancelTask(identity, service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.result.reason).toMatch(/changed before the rewritten head was pushed/);
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(fixture.service.store.getTask(fixture.service.config.identity)).toMatchObject({ status: 'cancelled', pushInProgress: null });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('pushes nothing when the reviewed snapshot changes at the push boundary', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    if (call !== 3) return; // validations: 1 rebase, 2 push read, 3 push boundary
+    const identity = service.config.identity, view = service.load(), snapshot = service.store.getSnapshot(identity);
+    const tree = fixtureGit(service.config.repository, 'rev-parse', `${snapshot.head}^{tree}`);
+    const later = fixtureGit(service.config.repository, 'commit-tree', tree, '-p', snapshot.head, '-m', 'later');
+    service.store.recordHistory(identity, view.expected, snapshot.base, later, []);
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.result.reason).toMatch(/changed before the rewritten head was pushed/);
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(fixture.service.store.getTask(fixture.service.config.identity).pushInProgress).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});

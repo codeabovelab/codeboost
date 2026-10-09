@@ -1448,8 +1448,9 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     expect(w.github.prs[0]!.open).toBe(false);
   });
 
-  it('settles a leftover pre-merge push when the task is cancelled with no preparation running, then closes its PRs', async () => {
+  it('settles a leftover pre-merge push when the task is cancelled with no preparation running, retrying on a repeated cancel', async () => {
     const w = world(), settled: string[] = [];
+    let readable = false;
     const issueGateway: IssueTrustGateway = {
       repository: REPO,
       async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
@@ -1463,6 +1464,8 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
         const marker = service.store.getTask(service.config.identity).pushInProgress;
         if (!marker) return null;
         settled.push(marker.attemptId);
+        // As the real job does when GitHub cannot be read: the marker stays.
+        if (!readable) return null;
         service.store.finishPrePush(service.store.getTask(service.config.identity).planKey, marker.attemptId);
         return 'not-pushed' as const;
       },
@@ -1476,8 +1479,13 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     store.recordRebase(identity, reviewed(), 'f'.repeat(40), rewritten, [{ oldSha: head, newSha: rewritten }]);
     const marker = store.beginPrePush(identity, reviewed(), store.getTask(identity).stateVersion, { branch, from: head, to: rewritten });
     expect((await act(app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
+    await vi.waitFor(() => expect(settled).toEqual([marker.attemptId]), { timeout: 20_000, interval: 20 });
+    expect(store.getTask(identity)).toMatchObject({ status: 'in review', pushInProgress: marker });
+    // GitHub is reachable again: repeating the cancel reads the branch again instead of refusing.
+    readable = true;
+    expect((await act(app, 'cancel-task')).body.result).toEqual({ outcome: 'stopping' });
     await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 20_000, interval: 20 });
-    expect(settled).toEqual([marker.attemptId]);
+    expect(settled).toEqual([marker.attemptId, marker.attemptId]);
     expect(store.getTask(identity)).toMatchObject({ status: 'cancelled', pushInProgress: null });
     expect(w.github.prs[0]!.open).toBe(false);
   });

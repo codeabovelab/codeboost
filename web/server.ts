@@ -390,6 +390,13 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if ((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
       if (action === 'cancel-task') {
+        // A cancel already waits on a push whose outcome is unknown, and the read that would settle it failed. Read the
+        // branch again instead of refusing, so repeating the cancel can still close the task without a restart.
+        const pending = service.store.getTask(identity);
+        if (preMerge && !preMerge.active && !stopping && pending.pushInProgress !== null && pending.cancelRequested !== null) {
+          service.store.afterCommit(() => afterPreMerge(preMerge!.settlePendingPush()));
+          return { outcome: 'stopping' as const };
+        }
         const outcome = preMerge?.active
           ? preMerge.cancelTask(expectedStateVersion as number, actionId as string)
           : runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string)
