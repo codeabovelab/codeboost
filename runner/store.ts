@@ -1151,11 +1151,10 @@ export class Store {
     };
     // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
     // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
-    // Once a completed prefix exists, every choice for this revision counts: a choice made on a snapshot that a later
-    // head replaced must still invalidate older approvals that survive through the completed prefix.
+    // Every choice for this revision counts, whatever its snapshot: approvals can survive head moves (equal or rewritten
+    // heads, completed prefixes), so a choice made on a snapshot that a later head replaced must still invalidate them.
     let latestChoiceVersion = -1;
-    for (const choice of review.choices) if (choice.revision === revision
-      && (prefixSnapshots.size > 0 || reviewedExecutionSnapshot(choice))) {
+    for (const choice of review.choices) if (choice.revision === revision) {
       if (choice.reviewVersion === undefined) latestChoiceVersion = Number.MAX_SAFE_INTEGER;
       else if (choice.reviewVersion > latestChoiceVersion) latestChoiceVersion = choice.reviewVersion;
     }

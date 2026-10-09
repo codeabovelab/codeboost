@@ -291,6 +291,19 @@ it('preserves execution approval recorded at the rewritten final output snapshot
   ]);
   expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
 });
+it('keeps a later attribution choice binding before execution when a collaborator head returns', () => {
+  const { store } = fixture();
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+  store.recordHistory(identity, state(store), oid(1), oid(5), []);
+  store.saveReview(identity, state(store), [], [{ key: 'later-choice', action: 'accept', item: null }]);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.recordHistory(identity, state(store), oid(1), oid(2), []);
+  expect(store.getSnapshot(identity).head).toBe(oid(2));
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+});
 it('keeps a later attribution choice binding after a collaborator head replaces its snapshot', () => {
   const { store } = fixture();
   store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
