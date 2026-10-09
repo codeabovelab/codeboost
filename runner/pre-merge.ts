@@ -24,6 +24,8 @@ export interface PreMergeRemote {
 }
 /** One bounded read of the branch settles a push whose outcome is unknown. */
 export const PUSH_SETTLEMENT_TIMEOUT_MS = 30_000;
+/** GitHub's pull-request API reports a pushed head asynchronously; wait at most this long for it after a push. */
+export const PUSHED_HEAD_VISIBLE_TIMEOUT_MS = 30_000;
 export interface PreMergeAuthorization {
   /** Complete the last external authorization read before a later external operation. */
   refresh(): Promise<void>;
@@ -53,10 +55,13 @@ export class PreMergeCoordinator {
   readonly operationTimeoutMs: number;
   readonly processSettlementReserveMs: number;
   readonly commandSettlementReserveMs: number;
+  readonly pushVisibleTimeoutMs: number;
   readonly authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
   readonly settle: <T>(fn: () => T) => T;
   #active: Promise<unknown> | null = null;
   #abort: AbortController | null = null;
+  /** Aborted only by shutdown: a cancel must not stop the branch read that settles a push and closes the task. */
+  readonly #shutdown = new AbortController();
   #closing = false;
   #last: PreMergeResult | null = null;
   #lastBinding: { stateVersion: number; reviewVersion: number; snapshotId: string } | null = null;
@@ -64,15 +69,17 @@ export class PreMergeCoordinator {
   constructor(service: ReviewService, runner: RunnerCoordinator, rebaser: GitRebaser, remote: PreMergeRemote,
     operationTimeoutMs = 10 * 60_000, capability?: ShutdownCapability,
     authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>,
-    reserves: { processMs?: number; commandMs?: number } = {}) {
+    reserves: { processMs?: number; commandMs?: number; pushVisibleMs?: number } = {}) {
     if (!Number.isSafeInteger(operationTimeoutMs) || operationTimeoutMs < 1 || operationTimeoutMs > 60 * 60_000)
       throw new Error('Invalid pre-merge operation deadline.');
     this.service = service; this.runner = runner; this.rebaser = rebaser; this.remote = remote;
     this.operationTimeoutMs = operationTimeoutMs; this.authorize = authorize;
     this.processSettlementReserveMs = reserves.processMs ?? PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS;
     this.commandSettlementReserveMs = reserves.commandMs ?? COMMAND_CHECK_SETTLEMENT_RESERVE_MS;
+    this.pushVisibleTimeoutMs = reserves.pushVisibleMs ?? PUSHED_HEAD_VISIBLE_TIMEOUT_MS;
     if (!Number.isSafeInteger(this.processSettlementReserveMs) || this.processSettlementReserveMs < 0
-      || !Number.isSafeInteger(this.commandSettlementReserveMs) || this.commandSettlementReserveMs < 0)
+      || !Number.isSafeInteger(this.commandSettlementReserveMs) || this.commandSettlementReserveMs < 0
+      || !Number.isSafeInteger(this.pushVisibleTimeoutMs) || this.pushVisibleTimeoutMs < 0)
       throw new Error('Invalid pre-merge settlement reserve.');
     this.settle = settleWith(capability);
   }
@@ -147,7 +154,8 @@ export class PreMergeCoordinator {
     return active;
   }
   async close(): Promise<void> {
-    this.#closing = true; this.#abort?.abort(new Error('Server shutdown.')); await this.#active;
+    this.#closing = true; this.#shutdown.abort(new Error('Server shutdown.')); this.#abort?.abort(new Error('Server shutdown.'));
+    await this.#active;
   }
   /** Cancel the task and promptly stop whichever rebase, remote read or command check this preparation owns. */
   cancelTask(expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
@@ -163,25 +171,25 @@ export class PreMergeCoordinator {
    * Settle a push whose outcome is unknown (a crash, shutdown or failure during the push) by reading the branch, then
    * clear its marker. Returns null when no push is pending; throws when the branch could not be read.
    */
-  async settleInterruptedPush(signal?: AbortSignal): Promise<PushOutcome | null> {
+  async settleInterruptedPush(): Promise<PushOutcome | null> {
     const marker = this.service.store.getTask(this.service.config.identity).pushInProgress;
-    return marker ? this.#settlePush(marker, signal) : null;
+    return marker ? this.#settlePush(marker) : null;
   }
   /**
-   * After startup recovery: settle a push left by a crash or shutdown, as one tracked job that shutdown aborts and awaits
-   * and that a preparation waits behind. A failed read leaves the marker for the next preparation.
+   * After startup recovery: settle a push left by a crash or shutdown, as one tracked job that shutdown aborts and awaits.
+   * While it runs, a preparation is refused as already running. Never throws: a failed read leaves the marker for the
+   * next preparation, and a server already closing or busy skips it.
    */
   settleAtStartup(): Promise<PushOutcome | null> {
-    this.assertStartable();
-    const controller = new AbortController(); this.#abort = controller;
-    const active = this.settleInterruptedPush(controller.signal).catch(() => null)
-      .finally(() => { if (this.#active === active) { this.#active = null; this.#abort = null; } });
+    if (this.#closing || this.#active) return Promise.resolve(null);
+    const active = this.settleInterruptedPush().catch(() => null)
+      .finally(() => { if (this.#active === active) this.#active = null; });
     this.#active = active;
     return active;
   }
-  async #settlePush(marker: PushMarker, signal?: AbortSignal): Promise<PushOutcome> {
-    const bounded = AbortSignal.timeout(PUSH_SETTLEMENT_TIMEOUT_MS);
-    const read = await this.remote.readBranch(marker.branch, signal ? AbortSignal.any([signal, bounded]) : bounded);
+  async #settlePush(marker: PushMarker, limitMs = PUSH_SETTLEMENT_TIMEOUT_MS): Promise<PushOutcome> {
+    const read = await this.remote.readBranch(marker.branch,
+      AbortSignal.any([this.#shutdown.signal, AbortSignal.timeout(Math.max(1, Math.min(PUSH_SETTLEMENT_TIMEOUT_MS, limitMs)))]));
     const outcome: PushOutcome = read === marker.to ? 'pushed' : read === marker.from ? 'not-pushed' : 'moved';
     this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(this.service.config.identity).planKey, marker.attemptId));
     return outcome;
@@ -241,11 +249,30 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
   /**
+   * Inspect the PR until GitHub reports something other than the pre-push head, with backoff, bounded by
+   * `pushVisibleTimeoutMs` and the preparation deadline. A PR still at the pre-push head after that fails the
+   * preparation without refreshing the review: the branch itself already holds the pushed head.
+   */
+  async #awaitPushedHead(before: RemotePair, pushed: string, signal: AbortSignal, remaining: () => number): Promise<RemotePair> {
+    const until = performance.now() + this.pushVisibleTimeoutMs;
+    for (let delay = 250; ; delay = Math.min(delay * 2, 4_000)) {
+      const seen = await this.remote.inspect(signal); signal.throwIfAborted();
+      if (seen.head !== before.head || seen.base !== before.base) return seen;
+      const wait = Math.min(delay, until - performance.now(), remaining() - this.processSettlementReserveMs);
+      if (wait < 1) throw new GuardRefusal(`GitHub has not reported the pushed head ${pushed} on the pull request yet. Prepare the merge again shortly.`);
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => { signal.removeEventListener('abort', stop); resolve(); }, wait);
+        const stop = () => { clearTimeout(timer); reject(signal.reason); };
+        signal.addEventListener('abort', stop, { once: true });
+      });
+    }
+  }
+  /**
    * Push the reviewed, rewritten head over exactly the remote head it rewrote. The durable marker is written before the
    * first external write and cleared only after a read of the branch settles the outcome; when that read is impossible
    * (shutdown, or GitHub unreachable) the marker stays for the next preparation or startup.
    */
-  async #pushRewrite(remote: RemotePair, view: ReturnType<ReviewService['load']>, signal: AbortSignal,
+  async #pushRewrite(remote: RemotePair, view: ReturnType<ReviewService['load']>, signal: AbortSignal, deadline: number,
     authorize: () => Promise<PreMergeAuthorization | undefined>,
     bind: (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair) => void): Promise<'pushed' | 'refused'> {
     const identity = this.service.config.identity;
@@ -274,9 +301,11 @@ export class PreMergeCoordinator {
         bind(reviewed, { base: view.snapshot.base, head: view.snapshot.head });
         return 'refused';
       }
-      // Shutdown: no new GitHub read may start. Startup settles the marker.
-      if (!this.#closing) {
-        try { await this.#settlePush(marker); }
+      // Shutdown: no new GitHub read may start; startup settles the marker. Otherwise one read, within what is left of
+      // the preparation's deadline (its settlement reserve included), settles it. A cancel does not stop that read.
+      const left = Math.floor(deadline - performance.now());
+      if (!this.#closing && left >= 1) {
+        try { await this.#settlePush(marker, left); }
         catch { /* The marker stays; the next preparation or startup reads the branch again. */ }
       }
       bind(reviewed, { base: view.snapshot.base, head: view.snapshot.head });
@@ -351,11 +380,13 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('Rebase cleanup is unresolved; restart and recover the owned rebase before preparing a merge.');
     const pending = this.service.store.getTask(identity).pushInProgress;
     if (pending) {
-      try { await this.#settlePush(pending, signal); }
+      // Not this preparation's signal: a cancel must let the read finish, so the cleared marker can close the task.
+      try { await this.#settlePush(pending, remaining()); }
       catch (error) {
         signal.throwIfAborted();
         throw new GuardRefusal(`The outcome of an earlier push of the rewritten head is unknown, and the branch could not be read: ${error instanceof Error ? error.message : String(error)}`);
       }
+      signal.throwIfAborted();
       // Settling advanced task state. The caller's binding is stale now; it reloads and starts again.
       throw new GuardRefusal('An earlier push of the rewritten head was settled. Reload, then prepare the merge again.');
     }
@@ -427,15 +458,20 @@ export class PreMergeCoordinator {
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
       checked: [], reason: blocker };
     if (initial.head !== view.snapshot.head) {
-      const pushed = await this.#pushRewrite(initial, view, signal, authorize, bindRebaseFailure);
-      if (pushed !== 'pushed') {
-        // Refused: the branch holds neither the reviewed predecessor nor our head. Review whatever is there now.
-        const moved = await this.remote.inspect(signal); await this.remote.fetch(moved, signal); signal.throwIfAborted();
-        view = track(this.#refresh(moved, reviewBudget, initial.head));
+      const pushed = await this.#pushRewrite(initial, view, signal, deadline, authorize, bindRebaseFailure);
+      // Refused: the branch holds neither the reviewed predecessor nor our head. Otherwise wait for GitHub's PR API,
+      // which reports a pushed head asynchronously, so the later inspections do not mistake its lag for a move.
+      const seen = pushed === 'pushed' ? await this.#awaitPushedHead(initial, view.snapshot.head, signal, remaining) : null;
+      if (pushed !== 'pushed' || seen!.head !== view.snapshot.head || seen!.base !== initial.base) {
+        const moved = seen ?? await this.remote.inspect(signal); await this.remote.fetch(moved, signal); signal.throwIfAborted();
+        // After a push, history is traced from the pushed head; after a refusal, from the head the push would replace.
+        view = track(this.#refresh(moved, reviewBudget, pushed === 'pushed' ? view.snapshot.head : initial.head));
         return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head, checked: [],
-          reason: 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
+          reason: pushed === 'pushed'
+            ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'
+            : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
       }
-      initial = { ...initial, head: view.snapshot.head };
+      initial = seen!;
       view = load();
     }
     const checked: string[] = [];

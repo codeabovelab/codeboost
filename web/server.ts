@@ -116,8 +116,6 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           validate: () => requireTrustedIssue(access),
         };
       });
-      // A push of a rewritten head left unsettled by a crash or shutdown blocks merging until a read of its branch.
-      void preMerge?.settleAtStartup();
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
       if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, {
@@ -715,9 +713,12 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
      * Startup (#103): a publish an earlier process owed (a lost opening, a run that ended before its publish completed)
      * runs once, in the background; recovery finds a lost opening by its marker. A publish pushes, so `verifyLock`
      * (the runner lock still names the database) runs first, here: if it throws, nothing starts and its error is thrown.
+     * Under the same lock, a push of a rewritten head left unsettled by a crash or shutdown (F6a of #22) is settled by a
+     * read of its branch. That can close a task cancelled meanwhile, so it ends like a preparation: its PRs are closed.
      */
     publishOwed: (verifyLock: () => void): void | Promise<void> => {
       verifyLock();
+      if (preMerge && !stopping) afterPreMerge(preMerge.settleAtStartup());
       if (!publishing) return;
       publishing.startup(identity);
     },

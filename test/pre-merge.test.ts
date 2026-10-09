@@ -22,7 +22,7 @@ const BRANCH = 'codeboost/task-1';
 const unusedPush = { push: async () => { throw new Error('No push expected.'); },
   readBranch: async () => { throw new Error('No branch read expected.'); } };
 vi.setConfig({ testTimeout: 15_000 });
-afterEach(() => { for (const service of services.splice(0)) service.close(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
+afterEach(() => { vi.restoreAllMocks(); for (const service of services.splice(0)) service.close(); for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }); });
 
 const markRunnerOwned = (service: ReviewService) => {
   const identity = service.config.identity;
@@ -61,7 +61,13 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   runnerCommitted?: boolean;
   operationTimeoutMs?: number;
   authorize?: (signal: AbortSignal) => Promise<PreMergeAuthorization>;
-  reserves?: { processMs?: number; commandMs?: number };
+  reserves?: { processMs?: number; commandMs?: number; pushVisibleMs?: number };
+  /** The PR API keeps reporting the pre-push head for this many inspections after a push. */
+  pushVisibleAfter?: number;
+  /** The push lands on the branch before it fails. */
+  landBeforeFailure?: boolean;
+  /** Runs once the push has landed and may move the branch again, as a collaborator push would. */
+  afterPush?: (service: ReviewService, pushed: string) => string;
   pushFailure?: (service: ReviewService, input: { from: string; to: string }) => Error;
   branchRead?: (current: string) => string | null | Promise<string | null>;
 } = {}) {
@@ -168,6 +174,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair: { base: string; head: string; branch?: string } = { base: onto, head, branch: BRANCH };
   const pushes: { branch: string; from: string; to: string }[] = [];
+  let lagging = 0, lagged = remotePair;
   let authorizationChecks = 0;
   const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
@@ -176,16 +183,21 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   coordinator = new PreMergeCoordinator(service,
     runner,
     rebaser, { inspect: async () => {
+      if (lagging > 0) { lagging--; return lagged; }
       remoteReads++;
-      if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator, remoteReads);
+      // Read 2 is the post-push visibility check; hooks keep counting the later inspections as before the push existed.
+      if (remoteReads > 2) options.duringFinalInspect?.(service, coordinator, remoteReads - 1);
       return remotePair;
     }, fetch: async () => undefined,
     push: async input => {
       pushes.push({ branch: input.branch, from: input.from, to: input.to });
       input.beforePush();
+      if (options.landBeforeFailure && remotePair.head === input.from) { lagged = remotePair; remotePair = { ...remotePair, head: input.to }; }
       if (options.pushFailure) throw options.pushFailure(service, input);
       if (remotePair.head !== input.from) throw new BranchPushRefused('moved');
+      lagged = remotePair; lagging = options.pushVisibleAfter ?? 0;
       remotePair = { ...remotePair, head: input.to };
+      if (options.afterPush) remotePair = { ...remotePair, head: options.afterPush(service, input.to) };
     },
     readBranch: async () => options.branchRead ? options.branchRead(remotePair.head) : remotePair.head,
   }, options.operationTimeoutMs, undefined, authorize, options.reserves);
@@ -886,13 +898,14 @@ it('returns to review without pushing when the branch moved off the rewritten he
 });
 
 it('settles an ambiguous push by reading the branch, then prepares again without pushing twice', async () => {
-  let landed: string | null = null;
-  const fixture = await rebaseFixture('feature\n', undefined, {
-    pushFailure: (_service, input) => { landed = input.to; return new Error('connection reset after the push was sent'); },
-    branchRead: current => landed ?? current,
-  });
+  let fail = true;
+  const fixture = await rebaseFixture('feature\n', undefined, { landBeforeFailure: true,
+    pushFailure: () => fail ? new Error('connection reset after the push was sent') : new Error('No second push expected.') });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset after the push was sent' });
   expect(pushMarker(fixture)).toBeNull();
+  expect(fixture.remote().head).toBe(fixture.rebased);
+  fail = false;
+  await expect(prepareAgain(fixture)).resolves.toMatchObject({ state: 'ready', head: fixture.rebased });
   expect(fixture.pushes).toHaveLength(1);
   await fixture.coordinator.close(); await fixture.runner.close();
 });
@@ -963,4 +976,60 @@ it('leaves the push marker for startup when shutdown interrupts the push, and st
   await expect(restarted.settleAtStartup()).resolves.toBe('not-pushed');
   expect(pushMarker(fixture)).toBeNull();
   await restarted.close(); await fixture.runner.close();
+});
+
+it('waits for GitHub to report the pushed head before the later inspections compare against it', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { pushVisibleAfter: 2 });
+  expect(fixture.result).toMatchObject({ state: 'ready', head: fixture.rebased, checked: ['P1'] });
+  expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('fails without refreshing the review when GitHub never reports the pushed head in time', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { pushVisibleAfter: 1_000, reserves: { pushVisibleMs: 600 } });
+  expect(fixture.result).toMatchObject({ state: 'failed', checked: [] });
+  expect(fixture.result.reason).toMatch(/has not reported the pushed head/);
+  expect(fixture.checkedHeads).toEqual([]);
+  expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
+  expect(pushMarker(fixture)).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('lets a cancel during the startup push settlement finish the read and close the task', async () => {
+  let coordinatorRef: PreMergeCoordinator | null = null;
+  const fixture = await rebaseFixture('feature\n', undefined, { pushFailure() {
+    void coordinatorRef!.close();
+    return new Error('Server shutdown.');
+  }, duringRebase(_service, coordinator) { coordinatorRef = coordinator; } });
+  const identity = fixture.service.config.identity;
+  expect(pushMarker(fixture)).not.toBeNull();
+  const read = Promise.withResolvers<string | null>();
+  let readSignal: AbortSignal | undefined;
+  const restarted = new PreMergeCoordinator(fixture.service, fixture.runner, {} as never, {
+    inspect: async () => { throw new Error('not used'); }, fetch: async () => undefined,
+    push: async () => { throw new Error('not used'); },
+    readBranch: async (_branch, signal) => { readSignal = signal; return read.promise; } });
+  const settling = restarted.settleAtStartup();
+  expect(restarted.active).toBe(true);
+  expect(restarted.cancelTask(fixture.service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+  expect(readSignal?.aborted).toBe(false);
+  read.resolve(fixture.remote().head);
+  await expect(settling).resolves.toBe('not-pushed');
+  expect(pushMarker(fixture)).toBeNull();
+  expect(fixture.service.store.getTask(identity).status).toBe('cancelled');
+  await restarted.close(); await fixture.runner.close();
+});
+
+it('reviews a collaborator push that lands on the rewritten head right after it was pushed', async () => {
+  let collaborator = '';
+  const fixture = await rebaseFixture('feature\n', 0, { afterPush(service, pushed) {
+    const tree = fixtureGit(service.config.repository, 'rev-parse', `${pushed}^{tree}`);
+    collaborator = fixtureGit(service.config.repository, 'commit-tree', tree, '-p', pushed, '-m', 'collaborator on top');
+    return collaborator;
+  } });
+  expect(fixture.result).toMatchObject({ state: 'review-required', head: collaborator, checked: [] });
+  expect(fixture.result.reason).toMatch(/moved after the rewritten head was pushed/);
+  expect(fixture.service.load().snapshot).toMatchObject({ base: fixture.remote().base, head: collaborator });
+  expect(fixture.checkedHeads).toEqual([]);
+  await fixture.coordinator.close(); await fixture.runner.close();
 });

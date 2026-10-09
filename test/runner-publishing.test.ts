@@ -1409,6 +1409,35 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     expect(w.github.prs[0]!.open).toBe(false);
   });
 
+  it('settles an interrupted pre-merge push only under the verified lock, and closes the PRs of a task it closed', async () => {
+    const w = world(), settle = Promise.withResolvers<void>(), calls: string[] = [];
+    const issueGateway: IssueTrustGateway = {
+      repository: REPO,
+      async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
+      async issueAccess(number) { return { number, authorLogin: 'member', collaborator: true }; },
+      async issueText(number) { return { number, title: '', body: '', comments: [] }; },
+    };
+    const { app, identity, store } = await serve(w, { before: completeAll, issueGateway, preMerge: service => ({
+      get active() { return false; }, get last() { return null; }, assertStartable() {},
+      settleAtStartup: () => { calls.push('settle'); return settle.promise.then(() => {
+        // What finishPrePush does when a cancel was requested while the push ran.
+        service.store.cancelTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, randomUUID());
+        return 'not-pushed' as const;
+      }); },
+      start: async () => { throw new Error('not used'); }, cancelTask: () => 'closed' as const, close: async () => undefined,
+    } as unknown as PreMergeCoordinator) });
+    // serve() ran startup as the CLI does, after its (passing) lock check.
+    expect(calls).toEqual(['settle']);
+    expect(() => app.publishOwed(() => { throw new Error('The database path changed.'); })).toThrow(/database path changed/);
+    expect(calls).toEqual(['settle']);
+    await publishSettled(app, identity);
+    expect(w.github.prs[0]!.open).toBe(true);
+    settle.resolve();
+    await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 20_000, interval: 20 });
+    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(w.github.prs[0]!.open).toBe(false);
+  });
+
   it('closes a ready PR when a task in review is cancelled, and keeps the branch', async () => {
     const w = world();
     const { app, identity, store, branch, head } = await serve(w, { before: completeAll });
