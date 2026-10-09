@@ -10,7 +10,10 @@ import type { GitCallOptions, RunnerRepository } from './runner-repository.ts';
  * user's checkout is never read or written, and neither the user's Git config nor their credential helpers are used.
  */
 
-/** The branch holds a commit codeboost did not make, or moved while the push ran. Nothing was pushed; a person decides. */
+/**
+ * Nothing was pushed: the branch holds a commit the push may not overwrite (one codeboost did not make, or, with an
+ * `expected` head, anything else), or it moved while the push ran. A person, or a fresh review, decides.
+ */
 export class BranchPushRefused extends Error {}
 
 export interface GitBranchPusherConfig extends Pick<GitCallOptions, 'onProcessGroup' | 'timeoutMs'> {
@@ -21,8 +24,8 @@ export interface GitBranchPusherConfig extends Pick<GitCallOptions, 'onProcessGr
   /** `owner/name` on GitHub. */
   readonly remote: string;
   /**
-   * The commits the task's ledger records as owned (made by codeboost). Only these may be overwritten. Read after the
-   * remote branch, so a ledger written meanwhile is seen.
+   * The commits the task's ledger records as owned (made by codeboost). Without an `expected` head, only these may be
+   * overwritten; with one, only that exact commit may be. Read after the remote branch, so a ledger written meanwhile is seen.
    */
   readonly ownedCommits: (identity: PlanIdentity) => Iterable<string>;
   /** The push URL. Default `https://<GH_HOST or github.com>/<remote>.git`. A local path is allowed, for tests. */
