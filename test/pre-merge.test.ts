@@ -956,6 +956,8 @@ it('settles an ambiguous push by reading the branch, then prepares again without
   const fixture = await rebaseFixture('feature\n', undefined, { landBeforeFailure: true,
     pushFailure: () => fail ? new Error('connection reset after the push was sent') : new Error('No second push expected.') });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset after the push was sent' });
+  // The push claim and its settlement advanced task state; the failure is bound to that state, so it reads as current.
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   expect(pushMarker(fixture)).toBeNull();
   expect(fixture.remote().head).toBe(fixture.rebased);
   fail = false;
