@@ -1270,3 +1270,23 @@ it('lets a cancel during the next preparation\'s push settlement finish the read
   expect(fixture.service.store.getTask(identity)).toMatchObject({ status: 'cancelled', pushInProgress: null });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
+
+it('reports a failed push as stale when a plan revision lands while its outcome is read', async () => {
+  let serviceRef: ReviewService | null = null, revised = false;
+  const fixture = await rebaseFixture('feature\n', undefined, { landBeforeFailure: true,
+    duringRebase(service) { serviceRef = service; },
+    pushFailure: () => new Error('connection reset'),
+    branchRead: (current) => {
+      // Another request applies a plan revision while the settlement read is in flight.
+      const service = serviceRef!, plan = service.store.getPlan(service.config.identity);
+      service.store.importRevision(JSON.stringify({ ...plan, summary: 'Amended during the read' }), 'json',
+        service.planContext(), plan.revision);
+      revised = true;
+      return current;
+    } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset' });
+  expect(revised).toBe(true);
+  expect(pushMarker(fixture)).toBeNull();
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
