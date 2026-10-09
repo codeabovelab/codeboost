@@ -6,7 +6,7 @@ import { ATTEMPT_PHASES, GuardRefusal, ShuttingDownError, WRITABLE_KINDS, bounde
 /** What F's host-side preparation hands to D's start call. */
 export interface PreparedAttempt {
   readonly clone: TaskClone;
-  readonly vendor: 'claude' | 'codex';
+  readonly vendor: InvocationInput['vendor'];
   readonly approvedArgv: readonly (readonly string[])[];
   /** Opaque data the deps keep for their own finish/release steps (for example the task workspace). */
   readonly private?: unknown;
@@ -77,16 +77,69 @@ export interface RunnerDeps {
   release?(attempt: AttemptRecord, prepared: PreparedAttempt): Promise<void>;
   now?(): number;
 }
+
+/** Compose kind-specific runner dependencies while preserving each implementation's private prepared value. */
+export function combineRunnerDeps(...delegates: readonly RunnerDeps[]): RunnerDeps {
+  if (!delegates.length) throw new Error('At least one runner dependency set is required.');
+  const runnerOwner = delegates[0]!.runnerOwner;
+  if (delegates.some(delegate => delegate.runnerOwner !== runnerOwner || !delegate.kinds?.length))
+    throw new Error('Combined runner dependencies need one owner and explicit kinds.');
+  const byKind = new Map<AttemptKind, RunnerDeps>();
+  for (const delegate of delegates) for (const kind of delegate.kinds!) {
+    if (byKind.has(kind)) throw new Error(`Runner kind ${kind} has more than one implementation.`);
+    byKind.set(kind, delegate);
+  }
+  type Combined = { delegate: RunnerDeps; prepared: PreparedAttempt };
+  const unpack = (prepared: PreparedAttempt): Combined => prepared.private as Combined;
+  const wrap = (delegate: RunnerDeps, prepared: PreparedAttempt): PreparedAttempt => ({
+    clone: prepared.clone, vendor: prepared.vendor, approvedArgv: prepared.approvedArgv,
+    private: { delegate, prepared } satisfies Combined,
+  });
+  const select = (attempt: AttemptRecord) => {
+    const delegate = byKind.get(attempt.kind);
+    if (!delegate) throw new Error(`No runner dependency can run ${attempt.kind}.`);
+    return delegate;
+  };
+  return {
+    runnerOwner, kinds: [...byKind.keys()],
+    async prepare(attempt, signal) {
+      const delegate = select(attempt);
+      try { return wrap(delegate, await delegate.prepare(attempt, signal)); }
+      catch (error) {
+        // A delegate may allocate task storage before preparation fails. Preserve both its implementation identity and
+        // opaque cleanup handle so the combined release path can still route that allocation back to its owner.
+        if (error instanceof PreparationFailure)
+          throw new PreparationFailure(error.cause ?? error, wrap(delegate, error.allocated));
+        throw error;
+      }
+    },
+    async cleanupPreparation(attempt) { await select(attempt).cleanupPreparation(attempt); },
+    beforeStart(attempt, prepared) { const value = unpack(prepared); value.delegate.beforeStart?.(attempt, value.prepared); },
+    start(input, prepared) { const value = unpack(prepared); return value.delegate.start(input, value.prepared); },
+    onStarted(attempt, prepared) { const value = unpack(prepared); value.delegate.onStarted?.(attempt, value.prepared); },
+    validate(attempt, result) { return select(attempt).validate(attempt, result); },
+    async finish(attempt, result, prepared, signal) {
+      const value = unpack(prepared);
+      if (!value.delegate.finish) return { value: value.delegate.validate(attempt, result) };
+      return value.delegate.finish(attempt, result, value.prepared, signal);
+    },
+    async auditFailed(attempt, prepared, signal) { const value = unpack(prepared); await value.delegate.auditFailed?.(attempt, value.prepared, signal); },
+    async exportPartial(attempt, prepared) { const value = unpack(prepared); return await value.delegate.exportPartial?.(attempt, value.prepared) ?? {}; },
+    async release(attempt, prepared) { const value = unpack(prepared); await value.delegate.release?.(attempt, value.prepared); },
+  };
+}
 export interface SlotLimits { readonly writable: number; readonly readOnly: number }
 export interface StartRequest {
   expectedStateVersion: number; kind: AttemptKind; item?: string | null; deadline: number; budgetMs?: number; retryOf?: string;
   expectedContext: AttemptRecord['context'];
   /** Clears the task's requeue claim in the admitting transaction: the user's Resume of an interrupted task. */
   claimRequeue?: boolean;
+  /** Fresh authorization plus its final launch guard. This is trusted coordinator state, never persisted input. */
+  authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
 }
 export interface RunnerStatus {
   active: boolean;
-  stopRequested: { attemptId: string; reason: FirstReason; saved: boolean } | null;
+  stopRequested: { attemptId: string; reason: FirstReason | 'timeout'; saved: boolean } | null;
   unresolved: { attemptId: string; reason: UnresolvedReason } | null;
 }
 /**
@@ -98,6 +151,7 @@ type Group = 'writable' | 'readOnly';
 interface Job {
   identity: PlanIdentity; key: string; group: Group; attemptId: string; attempt?: AttemptRecord;
   firstReason: FirstReason | null; reasonSaved: boolean; preparationTimedOut: boolean; staleCause?: string;
+  timeoutRequested?: boolean; timeoutSaved?: boolean;
   /**
    * The outcome is fixed: before launch once the job starts ending (cleanup, then the terminal write), after launch once
    * the terminal write is done. A later stop has nothing left to change.
@@ -110,6 +164,7 @@ interface Job {
    * later stop, but the job's reason, its abort signal and D's handle change only on commit; a rollback drops it (#79).
    */
   pendingReason?: FirstReason;
+  authorize?: StartRequest['authorize'];
   controller: AbortController; handle?: InvocationHandle; timers: ReturnType<typeof setTimeout>[]; done?: Promise<void>;
 }
 interface Marker { group: Group; attemptId: string; reason: UnresolvedReason }
@@ -173,7 +228,8 @@ export class RunnerCoordinator {
     if (this.#deps.kinds && !this.#deps.kinds.includes(request.kind)) throw new GuardRefusal(`The runner cannot run ${request.kind} attempts yet.`);
     const group: Group = WRITABLE_KINDS.includes(request.kind) ? 'writable' : 'readOnly';
     if (this.#used(group) >= this.#limits[group]) throw new GuardRefusal('No free runner slot. Try again when the current attempt finishes.');
-    const job: Job = { identity: { ...identity }, key, group, attemptId: '', firstReason: null, reasonSaved: true, preparationTimedOut: false, controller: new AbortController(), timers: [] };
+    const job: Job = { identity: { ...identity }, key, group, attemptId: '', firstReason: null, reasonSaved: true,
+      preparationTimedOut: false, authorize: request.authorize, controller: new AbortController(), timers: [] };
     this.#jobs.set(key, job);
     let attempt: AttemptRecord;
     try { attempt = this.#store.admitAttempt(identity, { ...request, now: this.#now() }); }
@@ -190,10 +246,27 @@ export class RunnerCoordinator {
    * User stop or detected staleness. The first reason wins; nothing is freed until settlement.
    * `cause` says what made the attempt stale (for example "plan revision 4 replaced 3") and is kept only if `stale` wins.
    */
-  stop(identity: PlanIdentity, attemptId: string, reason: 'cancelled' | 'stale', cause?: string): boolean {
+  stop(identity: PlanIdentity, attemptId: string, reason: FirstReason, cause?: string): boolean {
     const job = this.#jobs.get(identityKey(identity));
     if (!job || job.attemptId !== attemptId) return false;
     return this.#requestStop(job, reason, reason === 'stale' && cause !== undefined ? bounded(cause) : undefined);
+  }
+  /** Stop one invocation because its owning operation expired, preserving timeout rather than user cancellation. */
+  timeout(identity: PlanIdentity, attemptId: string): boolean {
+    const job = this.#jobs.get(identityKey(identity));
+    if (!job || job.attemptId !== attemptId || job.decided || job.firstReason || job.pendingReason || job.timeoutRequested)
+      return false;
+    const apply = (saved: boolean) => {
+      job.timeoutRequested = true; job.timeoutSaved = saved;
+      job.controller.abort(Object.assign(new Error('Timed out.'), { code: 'ETIMEDOUT' }));
+      job.handle?.cancel('timeout');
+    };
+    try {
+      const changed = this.#write(() => this.#store.recordAttemptTimeout(job.identity, job.attemptId));
+      if (!changed) return false;
+      apply(true);
+    } catch { apply(false); }
+    return true;
   }
   /** Cancel task: the Store records the reason and the pending close; the coordinator stops the running work. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
@@ -212,9 +285,8 @@ export class RunnerCoordinator {
     }
     const outcome = this.#store.cancelTask(identity, expectedStateVersion, actionId);
     if (outcome === 'stopping' && job && !this.#requestStop(job, 'cancelled') && !job.firstReason && !job.pendingReason) {
-      // The Store already wrote `cancelled` onto the row (a pending cancel task wins, even over a preparation timeout).
-      // Status shows it once the write commits, but it never becomes the job's reason: the terminal write reads the
-      // row's own reason.
+      // The Store writes `cancelled` when no earlier durable invocation timeout owns the row. The task cancellation still
+      // wins task closure either way; this marker shows the request only when no in-memory stop already explains it.
       this.#store.afterCommit(() => { job.cancelShown = true; });
     }
     return outcome;
@@ -225,6 +297,7 @@ export class RunnerCoordinator {
     return {
       active: !!job,
       stopRequested: job?.firstReason ? { attemptId: job.attemptId, reason: job.firstReason, saved: job.reasonSaved }
+        : job?.timeoutRequested ? { attemptId: job.attemptId, reason: 'timeout', saved: job.timeoutSaved === true }
         : job?.cancelShown ? { attemptId: job.attemptId, reason: 'cancelled', saved: true } : null,
       unresolved: marker ? { attemptId: marker.attemptId, reason: marker.reason } : null,
     };
@@ -252,6 +325,7 @@ export class RunnerCoordinator {
     // The attempt deadline passed before launch: it ends `failed` with no first reason, so a later stop cannot claim it.
     if (job.decided || (job.preparationTimedOut && !job.firstReason)) return false;
     if (job.firstReason) { job.handle?.cancel(D_REASON[job.firstReason]); return false; }
+    if (job.timeoutRequested) return false;
     // An earlier stop in the same transaction wins; its commit applies it.
     if (job.pendingReason) return false;
     const apply = (first: FirstReason, saved: boolean) => {
@@ -286,8 +360,10 @@ export class RunnerCoordinator {
       wait();
     };
     const budget = this.#store.getTask(job.identity).budgetDeadline;
-    if (budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
-    at(attempt.deadline, () => { if (!job.handle && !job.firstReason) { job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT)); } });
+    if (attempt.kind !== 'check' && budget !== null) at(budget, () => this.#requestStop(job, 'time-limit'));
+    at(attempt.deadline, () => { if (!job.handle && !job.firstReason && !job.timeoutRequested) {
+      job.preparationTimedOut = true; job.controller.abort(new Error(PREPARATION_TIMEOUT));
+    } });
   }
   async #run(job: Job, attempt: AttemptRecord): Promise<void> {
     try {
@@ -299,25 +375,35 @@ export class RunnerCoordinator {
       try { this.#arm(job, attempt); }
       catch (error) { return await this.#endBeforeLaunch(job, attempt, { detail: `Could not arm the task time limit: ${message(error)}` }); }
       // A stop can land before this point; do not start preparation for it.
-      if (job.firstReason) return await this.#endBeforeLaunch(job, attempt, {});
+      if (job.firstReason || job.timeoutRequested) return await this.#endBeforeLaunch(job, attempt, {});
       let prepared: PreparedAttempt;
       try { prepared = await this.#deps.prepare(attempt, job.controller.signal); }
       catch (error) {
         // Storage that preparation allocated before it failed is removed after the terminal write, like every other path.
         return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job, error), error instanceof PreparationFailure ? error.allocated : undefined);
       }
-      if (job.firstReason || job.preparationTimedOut) return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
+      if (job.firstReason || job.timeoutRequested || job.preparationTimedOut)
+        return await this.#endBeforeLaunch(job, attempt, this.#preparationDetail(job), prepared);
+      if (job.authorize) try {
+        const validate = await job.authorize(job.controller.signal);
+        await validate();
+        job.controller.signal.throwIfAborted();
+      } catch (error) {
+        return await this.#endBeforeLaunch(job, attempt,
+          { detail: `Authorization changed before launch: ${message(error)}` }, prepared);
+      }
       // Launch check: one synchronous turn, no await between the checks and D's start call.
       const now = this.#now(), row = this.#store.getAttempt(job.identity, attempt.id), task = this.#store.getTask(job.identity);
       if (row.firstReason && !job.firstReason) job.firstReason = row.firstReason;
-      if (row.state !== 'pending' || job.firstReason) return await this.#endBeforeLaunch(job, attempt, {}, prepared);
+      if (row.state !== 'pending' || job.firstReason || job.timeoutRequested)
+        return await this.#endBeforeLaunch(job, attempt, {}, prepared);
       // A context change comes before both time checks, as in the settlement order and startup recovery.
       if (!sameContext(row.context, this.#store.currentContext(job.identity))) {
         // Recorded like any stale stop, so the row keeps it even if a cancel task lands during cleanup.
         this.#requestStop(job, 'stale');
         return await this.#endBeforeLaunch(job, attempt, {}, prepared);
       }
-      if (task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}, prepared); }
+      if (attempt.kind !== 'check' && task.budgetDeadline !== null && now >= task.budgetDeadline) { this.#requestStop(job, 'time-limit'); return await this.#endBeforeLaunch(job, attempt, {}, prepared); }
       if (now >= attempt.deadline) { job.preparationTimedOut = true; return await this.#endBeforeLaunch(job, attempt, { detail: PREPARATION_TIMEOUT }, prepared); }
       // Fail closed: once D reported resources it could not remove, no new invocation starts, even one already admitted.
       if (this.#unreleased) return await this.#endBeforeLaunch(job, attempt, { detail: NOT_STARTED_UNRELEASED }, prepared);
@@ -460,7 +546,8 @@ export class RunnerCoordinator {
   }
   #settle(job: Job, s: { stopReason?: StopReason; exitCode: number | null; signal: string | null; valid: boolean; result?: unknown; detail?: string; history?: HistoryRecord; diagnosticRef?: string }): Classification | undefined {
     try {
-      return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId, { ...s, firstReason: job.firstReason }));
+      return this.#write(() => this.#store.settleAttempt(job.identity, job.attemptId,
+        { ...s, ...(job.timeoutRequested ? { stopReason: 'timeout' as const } : {}), firstReason: job.firstReason }));
     } catch {
       // The row's outcome is unknown: hold the slot until startup recovery reconciles it.
       this.#markers.set(job.key, { group: job.group, attemptId: job.attemptId, reason: 'result-not-saved' });

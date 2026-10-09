@@ -41,6 +41,8 @@ export interface SupervisorOptions {
   readonly secrets?: Readonly<Record<string, string>>;
   readonly timeoutMs?: number;
   readonly limits?: Partial<CaptureLimits>;
+  /** Keep bounded, lossy diagnostics without letting command output change the process exit result. */
+  readonly diagnosticOutput?: boolean;
   /** Trusted monotonic budget carried from adapter setup. */
   readonly invocationBudget?: () => number;
   readonly decode?: (profile: ContainerProfile, rawStdout: Buffer, maximumBytes: number,
@@ -480,6 +482,9 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       throw new Error('invocationBudget cannot exceed the production ten-minute ceiling.');
     if (options.processLifecycle && profile.deferredOutput)
       throw new Error('Durably tracked invocations cannot use concurrent deferred-output controls.');
+    if (options.diagnosticOutput && (invocation.vendor !== 'runner' || invocation.phase !== 'review'
+      || options.decode || profile.deferredOutput))
+      throw new Error('Lossy diagnostic output is reserved for runner command checks.');
   } catch (error) {
     return rejectProfile(profile, error, true, disposeContainerProfile,
       isDeadlineError(error) ? 'timeout' : undefined, options.processLifecycle);
@@ -498,6 +503,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
 
   const stdoutChunks = new ByteCollector(), stderrChunks = new ByteCollector();
   let stdoutBytes = 0, stderrBytes = 0, combinedBytes = 0;
+  let outputTruncated = false;
   let stopReason: StopReason | undefined, failureDetail: string | undefined;
   let closed = false, terminating = false, settlementComplete = false;
   let decodedOutput: DecodedOutput | undefined, decodePromise: Promise<void> | undefined;
@@ -595,7 +601,8 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
       combinedBytes += retained.length;
     }
     if (chunk.length > available) {
-      if (final) stopReason ??= 'output-limit';
+      if (options.diagnosticOutput) outputTruncated = true;
+      else if (final) stopReason ??= 'output-limit';
       else stop('output-limit');
     }
   };
@@ -777,20 +784,38 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         });
       }
     }
-    // Publish only strictly valid UTF-8: replacement characters would grow the result past the byte ceilings.
-    // Only output cut at a capture limit may end in an incomplete character, which the streaming decode then drops;
-    // otherwise the decode flushes, so a trailing lone lead byte fails closed.
+    // Agent answers publish only strictly valid UTF-8: replacement characters would grow the result past the byte
+    // ceilings. Runner command output is diagnostic rather than an answer, so it is decoded lossily and bounded again.
+    // Only strict output cut at a capture limit may end in an incomplete character, which streaming decode drops;
+    // otherwise strict decode flushes, so a trailing lone lead byte fails closed.
     const truncated = stopReason === 'output-limit';
     const strictText = (value: Buffer) => {
       try { return new TextDecoder('utf-8', { fatal: true }).decode(value, truncated ? { stream: true } : undefined); }
       catch { return undefined; }
     };
-    const stdoutText = strictText(finalStdout), stderrText = strictText(finalStderr);
-    if (stdoutText === undefined || stderrText === undefined) {
-      stopReason ??= 'capture-failure';
-      failureDetail ??= 'Captured output is not valid UTF-8.';
+    const boundedDiagnostic = (value: Buffer, maximum: number) => {
+      const encoded = Buffer.from(new TextDecoder('utf-8').decode(value));
+      if (encoded.length <= maximum) return encoded;
+      return Buffer.from(new TextDecoder('utf-8', { fatal: true }).decode(encoded.subarray(0, maximum), { stream: true }));
+    };
+    if (options.diagnosticOutput) {
+      finalStdout = boundedDiagnostic(finalStdout, Math.min(limits.stdoutBytes, limits.combinedBytes));
+      finalStderr = boundedDiagnostic(finalStderr,
+        Math.max(0, Math.min(limits.stderrBytes, limits.combinedBytes - finalStdout.length)));
+      if (outputTruncated) {
+        const notice = Buffer.from('[codeboost: command output truncated]\n');
+        const maximum = Math.max(0, Math.min(limits.stderrBytes, limits.combinedBytes - finalStdout.length));
+        finalStderr = maximum <= notice.length ? notice.subarray(0, maximum)
+          : Buffer.concat([boundedDiagnostic(finalStderr, maximum - notice.length), notice]);
+      }
+    } else {
+      const stdoutText = strictText(finalStdout), stderrText = strictText(finalStderr);
+      if (stdoutText === undefined || stderrText === undefined) {
+        stopReason ??= 'capture-failure';
+        failureDetail ??= 'Captured output is not valid UTF-8.';
+      }
+      finalStdout = Buffer.from(stdoutText ?? ''); finalStderr = Buffer.from(stderrText ?? '');
     }
-    finalStdout = Buffer.from(stdoutText ?? ''); finalStderr = Buffer.from(stderrText ?? '');
     if (stopReason) finalStderr = withDiagnostic(finalStderr, finalStdout.length, stopReason, limits, failureDetail);
     const result = Object.freeze({ attemptId: invocation.attemptId, context: invocation.context,
       exitCode, signal: finalSignal, ...(stopReason ? { stopReason } : {}),

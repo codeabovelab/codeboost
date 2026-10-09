@@ -80,7 +80,7 @@ export function isRepoPath(path: string): boolean {
 
 /** Small literal-argv grammar, deliberately not a shell parser. Never executes. */
 export function commandArgv(command: string): string[] {
-  if (/[\\\p{Cc}]/u.test(command))
+  if (!command.isWellFormed() || /[\\\p{Cc}]/u.test(command))
     fail('command-syntax', 'Commands must contain literal arguments, not shell syntax.');
   const argv: string[] = [];
   let word = '', quote = '', started = false;

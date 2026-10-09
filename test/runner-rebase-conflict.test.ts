@@ -165,6 +165,68 @@ describe('production rebase conflict resolver', () => {
     expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
   });
 
+  it('revalidates authorization immediately before the credentialed conflict agent launch', async () => {
+    const f = fixture(), x = deps(f), calls: string[] = [];
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      authorize: async () => { calls.push('read'); return () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); }; },
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve(input(f))).rejects.toThrow(/Issue trust was revoked/);
+    expect(calls).toEqual(['read', 'validate']);
+    expect(x.events).not.toContain('start');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('does not invoke the authorization validator after the read consumes the work deadline', async () => {
+    const f = fixture(), x = deps(f), calls: string[] = [], realNow = performance.now.bind(performance);
+    let expired = false;
+    vi.spyOn(performance, 'now').mockImplementation(() => expired ? Number.MAX_SAFE_INTEGER : realNow());
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      authorize: async () => { calls.push('read'); await Promise.resolve(); expired = true; return () => { calls.push('validate'); }; },
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve(input(f))).rejects.toThrow(/deadline/);
+    expect(calls).toEqual(['read']);
+    expect(x.events).not.toContain('start');
+  });
+
+  it('refuses launch and releases resources when the authorization hook throws synchronously', async () => {
+    const f = fixture(), x = deps(f);
+    const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+      repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+      image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+      authorize: (() => { throw new Error('Issue trust read failed.'); }) as never,
+      limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+    await expect(resolve(input(f))).rejects.toThrow(/Issue trust read failed/);
+    expect(x.events).not.toContain('start');
+    expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: null, processGroup: null });
+  });
+
+  it('retains a running child without leaking its rejection when the deadline passes before settlement is awaited', async () => {
+    const f = fixture(), realNow = performance.now.bind(performance), failed = Promise.withResolvers<InvocationResult>();
+    let expired = false;
+    vi.spyOn(performance, 'now').mockImplementation(() => expired ? Number.MAX_SAFE_INTEGER : realNow());
+    const unhandled: unknown[] = [], onUnhandled = (reason: unknown) => { unhandled.push(reason); };
+    process.on('unhandledRejection', onUnhandled);
+    try {
+      const x = deps(f, { start: (value: AgentAdapterRequest) => {
+        expired = true;
+        return { attemptId: value.invocation.attemptId, cancel: vi.fn(), settled: failed.promise } satisfies InvocationHandle;
+      } });
+      const resolve = createForeignConflictResolver({ store: f.store, identity, planKey: f.planKey,
+        repository: { path: join(f.root, 'bare.git') } as RunnerRepository, runnerOwner: 'a'.repeat(32),
+        image: () => 'sha256:' + 'b'.repeat(64), token: 'secret',
+        limits: { workBytes: 1, workInodes: 1, metadataBytes: 1, metadataInodes: 1 }, deps: x.d as never });
+      await expect(resolve(input(f))).rejects.toThrow(/retained resources/);
+      expect(f.store.getTask(identity).rebaseInProgress).toMatchObject({ conflict: { source: oid(2) } });
+      failed.reject(new Error('late child failure'));
+      await new Promise(resolve => setTimeout(resolve, 0));
+      expect(unhandled).toEqual([]);
+    } finally { process.off('unhandledRejection', onUnhandled); }
+  });
+
   it('bounds the complete host snapshot before changing the destination', () => {
     const root = mkdtempSync(join(tmpdir(), 'codeboost-conflict-copy-')); roots.push(root);
     const source = join(root, 'source'), destination = join(root, 'destination');
@@ -348,7 +410,7 @@ describe('production rebase conflict resolver', () => {
       const settlementDeadline = Date.now() + CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS + 1_000;
       const running = resolve({ ...input(f), deadline: settlementDeadline });
       const rejected = expect(running).rejects.toThrow(/retained resources/);
-      for (let turn = 0; turn < 20 && !request; turn++) await Promise.resolve();
+      for (let turn = 0; turn < 200 && !request; turn++) await Promise.resolve();
       expect(request?.invocation.deadline).toBe(settlementDeadline - CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS);
       await vi.advanceTimersByTimeAsync(CONFLICT_PROCESS_SETTLEMENT_RESERVE_MS + 1_000);
       await rejected;

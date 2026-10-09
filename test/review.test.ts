@@ -8,6 +8,7 @@ import { ReviewService } from '../runner/review.ts';
 import { startServer } from '../web/server.ts';
 import { approveItem, reviewedSegment } from '../core/approvals.ts';
 import { GuardRefusal } from '../runner/lifecycle.ts';
+import { identityKey } from '../core/identity.ts';
 import { fixtureGit } from './fixtures/git.ts';
 // A passthrough, so the stale-key test can count how often load() serializes a segment.
 vi.mock('../core/approvals.ts', async original => { const actual = await original<typeof import('../core/approvals.ts')>(); return { ...actual, reviewedSegment: vi.fn(actual.reviewedSegment) }; });
@@ -16,6 +17,11 @@ vi.setConfig({ testTimeout: 15000 });
 const roots:string[]=[];const services:ReviewService[]=[];
 afterEach(()=>{services.splice(0).forEach(service=>service.close());roots.splice(0).forEach(root=>rmSync(root,{recursive:true,force:true}));});
 function fixture(){const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const config=createDemo(join(root,'demo'));const service=new ReviewService(config);services.push(service);return {service,config};}
+it('shares one deadline across history reading and linking',()=>{
+ const {service}=fixture();let elapsed=0;const clock=vi.spyOn(performance,'now').mockImplementation(()=>elapsed++);
+ try{expect(()=>service.load({maxDurationMs:200})).toThrow(/deadline/i);}
+ finally{clock.mockRestore();}
+});
 it('closes the review service when merge gateway construction fails', async()=>{
  const root=mkdtempSync(join(tmpdir(),'codeboost-review-'));roots.push(root);const demo=createDemo(join(root,'demo'));
  const close=vi.spyOn(ReviewService.prototype,'close');
@@ -195,6 +201,27 @@ it('keeps observing the user\'s HEAD for a task the runner has not committed to,
  expect(service.reviewRepository()).toEqual({path:config.repository,runnerOwned:false});
  fixtureGit(config.repository,'commit','--allow-empty','-m','User work');
  expect(service.load().snapshot.head).toBe(fixtureGit(config.repository,'rev-parse','HEAD'));
+});
+it('uses a configured runner repository before the first changed runner commit', () => {
+ const {service,config}=fixture();service.config.runnerRepository=config.repository;
+ expect(service.reviewRepository()).toEqual({path:config.repository,runnerOwned:true});
+});
+it('reads the base tree from the authoritative runner repository', () => {
+ const {service,config}=fixture();
+ service.config={...config,repository:join(config.repository,'missing'),runnerRepository:config.repository};
+ expect(service.planContext().baseEntries.length).toBeGreaterThan(0);
+});
+it('keeps a legacy malformed command visible and blocked so the plan can be amended', () => {
+ const {service,config}=fixture();service.close();services.splice(services.indexOf(service),1);
+ const db=new DatabaseSync(config.database),key=identityKey(config.identity);
+ const row=db.prepare('SELECT data FROM revisions WHERE key=? AND revision=1').get(key)!;
+ const plan=JSON.parse(row.data as string);plan.items[0].acceptance=[{type:'cmd',text:`node "${String.fromCharCode(0xd800)}"`}];
+ db.prepare('UPDATE revisions SET data=? WHERE key=? AND revision=1').run(JSON.stringify(plan),key);db.close();
+ const reopened=new ReviewService(config);services.push(reopened);const view=reopened.load();
+ expect(view.items[0]!.checks.tests).toBe('✕ Invalid command');
+ expect(view.items[0]!.state).not.toBe('approved');
+ const repaired=structuredClone(view.plan);repaired.items[0]!.acceptance=[{type:'check',text:'Review manually.'}];
+ expect(reopened.store.importRevision(JSON.stringify(repaired),'json',reopened.planContext(),view.plan.revision).revision).toBe(2);
 });
 it('reads a base commit\'s tree once and hands each caller its own copy (#91)',()=>{
  const {service,config}=fixture();

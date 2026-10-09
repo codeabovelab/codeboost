@@ -5,7 +5,7 @@ import { randomUUID } from 'node:crypto';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { Store } from '../runner/store.ts';
-import { RunnerCoordinator, type PreparedAttempt, type RunnerDeps, type StartRequest } from '../runner/coordinator.ts';
+import { PreparationFailure, RunnerCoordinator, combineRunnerDeps, type PreparedAttempt, type RunnerDeps, type StartRequest } from '../runner/coordinator.ts';
 import type { InvocationHandle, InvocationInput, InvocationResult, StopReason } from '../agents/contract.ts';
 import type { PlanIdentity } from '../core/identity.ts';
 import type { Plan, PlanContext } from '../core/plan.ts';
@@ -72,6 +72,22 @@ async function until(check: () => boolean, label: string) {
 }
 
 describe('admission and slots', () => {
+  it('routes a partial allocation back to the delegate that created it when combined preparation fails', async () => {
+    const { store } = setup();
+    const allocated: PreparedAttempt = { clone: { id: 'partial', taskId: 'task', directory: '/tmp/partial', head: oid(2) },
+      vendor: 'runner', approvedArgv: [], private: { storage: 'owned' } };
+    const release = vi.fn(async (_attempt, prepared: PreparedAttempt) => { expect(prepared).toBe(allocated); });
+    const failing: RunnerDeps = { runnerOwner: RUNNER_OWNER, kinds: ['execute'],
+      prepare: async () => { throw new PreparationFailure(new Error('materialization failed'), allocated); },
+      cleanupPreparation: async () => undefined, start: () => { throw new Error('must not launch'); }, validate: () => null, release };
+    const other: RunnerDeps = { ...fakeD().deps, kinds: ['review'] };
+    const combined = new RunnerCoordinator(store, combineRunnerDeps(failing, other)); coordinators.push(combined);
+    const attempt = combined.start(A, request(store, A));
+    await combined.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', diagnostic: 'Preparation failed: "materialization failed"' });
+    expect(release).toHaveBeenCalledOnce();
+    expect(combined.status(A).unresolved).toBeNull();
+  });
   it('refuses a kind its deps cannot run before writing anything (#91)', () => {
     const { store } = setup();
     const limited = new RunnerCoordinator(store, { ...fakeD().deps, kinds: ['execute'] }); coordinators.push(limited);
@@ -132,6 +148,31 @@ describe('admission and slots', () => {
 });
 
 describe('stops and settlement', () => {
+  it('persists an owning-operation timeout and refuses to recast it as cancellation', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'launch');
+    expect(runner.timeout(A, attempt.id)).toBe(true);
+    expect(runner.stop(A, attempt.id, 'cancelled')).toBe(false);
+    expect(runner.status(A).stopRequested).toEqual({ attemptId: attempt.id, reason: 'timeout', saved: true });
+    expect(launches[0]!.cancels).toEqual(['timeout']);
+    launches[0]!.settle({ exitCode: null, signal: 'SIGTERM', stopReason: 'cancelled' });
+    await runner.settled(A);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null,
+      stopReason: 'timeout', diagnostic: 'Timed out.' });
+  });
+  it('does not launch when an owning-operation timeout lands during preparation', async () => {
+    const { store, runner, launches, preparations } = setup({ prepareIgnoresAbort: true });
+    const attempt = runner.start(A, request(store, A));
+    await until(() => preparations.length === 1, 'preparation');
+    expect(runner.timeout(A, attempt.id)).toBe(true);
+    preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(launches).toEqual([]);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null,
+      stopReason: 'timeout', diagnostic: 'Timed out.' });
+  });
   it('keeps the slot after cancel until D settles, and keeps the first reason', async () => {
     const { store, runner, launches, preparations } = setup();
     const attempt = runner.start(A, request(store, A));
@@ -365,6 +406,37 @@ describe('review regressions', () => {
     expect(launches).toHaveLength(0);
     expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'stale', firstReason: 'stale' });
     expect(store.getTask(A).status).not.toBe('needs human');
+  });
+  it('runs a review command check after the code-writing task budget has expired', async () => {
+    let clock = Date.now();
+    const { store, runner, launches, preparations, deps } = setup();
+    deps.now = () => clock;
+    runner.start(A, request(store, A, { budgetMs: 100, deadline: clock + 60_000 }));
+    await until(() => preparations.length === 1, 'execution preparation'); preparations[0]!.resolve();
+    await until(() => launches.length === 1, 'execution launch'); launches[0]!.settle();
+    await runner.settled(A);
+    store.transitionTask(A, store.getTask(A).stateVersion, 'in review');
+    clock += 1_000;
+    const check = runner.start(A, request(store, A, { kind: 'check', deadline: clock + 60_000 }));
+    await until(() => preparations.length === 2, 'check preparation'); preparations[1]!.resolve();
+    await until(() => launches.length === 2, 'check launch'); launches[1]!.settle();
+    await runner.settled(A);
+    expect(store.getAttempt(A, check.id)).toMatchObject({ state: 'completed', firstReason: null });
+    expect(store.getTask(A).status).toBe('in review');
+  });
+  it('revalidates authorization after preparation and refuses a revoked launch', async () => {
+    const { store, runner, launches, preparations } = setup();
+    const calls: string[] = [];
+    const attempt = runner.start(A, request(store, A, { authorize: async () => {
+      calls.push('read');
+      return () => { calls.push('validate'); throw new Error('Issue trust was revoked.'); };
+    } }));
+    await until(() => preparations.length === 1, 'preparation'); preparations[0]!.resolve();
+    await runner.settled(A);
+    expect(calls).toEqual(['read', 'validate']);
+    expect(launches).toEqual([]);
+    expect(store.getAttempt(A, attempt.id)).toMatchObject({ state: 'failed', firstReason: null,
+      diagnostic: expect.stringMatching(/Authorization changed before launch.*trust was revoked/) });
   });
   it('shows the cancel task stop after a preparation timeout, and closes the task', async () => {
     const { store, runner, preparations } = setup({ prepareIgnoresAbort: true });

@@ -17,7 +17,7 @@ export interface ContainerProfile {
   readonly args: readonly string[];
   readonly expectedImage: string;
   readonly phase: Phase;
-  readonly vendor: 'claude' | 'codex';
+  readonly vendor: InvocationInput['vendor'];
   readonly filesystems: TaskFilesystems;
   readonly inputDirectory: string;
   readonly codexAuthFile?: string;
@@ -283,6 +283,8 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
       throw new Error('Codex requires only its auth file.');
     if (invocation.vendor === 'claude' && (!options.claudeToken || options.codexAuthFile))
       throw new Error('Claude requires only its OAuth token.');
+    if (invocation.vendor === 'runner' && (options.claudeToken || options.codexAuthFile))
+      throw new Error('Runner commands receive no provider credential.');
     if (options.claudeToken?.includes('\0')) throw new Error('Claude OAuth token is malformed.');
     if (!/^codeboost-work-[0-9a-f-]+$/.test(filesystems.workVolume)
       || !/^codeboost-metadata-[0-9a-f-]+$/.test(filesystems.metadataVolume)
@@ -356,7 +358,7 @@ export async function createContainerProfile(options: ProfileOptions): Promise<C
         '--tmpfs', '/run/codeboost-output:rw,nosuid,nodev,noexec,size=20971520,nr_inodes=64,uid=10001,gid=10001,mode=0700',
         '--tmpfs', '/run/codeboost-auth/codex:rw,nosuid,nodev,size=4194304,nr_inodes=256,uid=10001,gid=10001,mode=0700',
         '--mount', mount({ type: 'bind', source: codexAuthFile!, target: '/run/codeboost-auth/codex/auth.json', readonly: true }));
-    } else args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
+    } else if (invocation.vendor === 'claude') args.push('--env', 'CLAUDE_CODE_OAUTH_TOKEN');
     args.push(options.imageId, ...command);
     const capturedFilesystems = filesystems;
     const profile = Object.freeze({ name, args: Object.freeze(args), expectedImage: options.imageId,

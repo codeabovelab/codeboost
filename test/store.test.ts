@@ -2,16 +2,19 @@ import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { execFileSync, spawn } from 'node:child_process';
+import { randomUUID } from 'node:crypto';
 import { fixtureGit } from './fixtures/git.ts';
 import { once } from 'node:events';
 import { DatabaseSync } from 'node:sqlite';
 import { afterEach, expect, it, vi } from 'vitest';
-import { Store, requireSupportedNode } from '../runner/store.ts';
+import { MAX_REWRITE_LINEAGE_ROWS, Store, requireSupportedNode } from '../runner/store.ts';
 import type { Plan, PlanContext, EditReply } from '../core/plan.ts';
 import { approveItem, approvalStates, choiceKeys, applyChoices, stable } from '../core/approvals.ts';
 import { linkHistory, type Segment } from '../core/linking.ts';
 import { readHistory } from '../git/history.ts';
 import { identityKey } from '../core/identity.ts';
+import { GuardRefusal } from '../runner/lifecycle.ts';
+import { commandDigest } from '../runner/checks.ts';
 const identity = { repositoryId: 'repo', taskId: 'task', planId: 'plan' };
 const context: PlanContext = { identity, issue: 1, baseEntries: [{ path: 'a', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
 const plan = (): Plan => ({ schema_version: 1, revision: 99, issue: 1, summary: 'Example', questions: [], items: [{ id: 'P1', title: 'Change', intent: 'Improve', files: [{ path: 'a', kind: 'edit', renamed_from: null, change: 'Change' }], acceptance: [{ type: 'check', text: 'Works' }], depends_on: [] }] });
@@ -28,6 +31,69 @@ function fixture(two = false) { const path = join(directory(), 'state.sqlite'); 
   store.createPlan(JSON.stringify(initial), 'json', context, oid(1), oid(2)); return { path, store }; }
 const state = (store: Store) => ({ revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id });
 function ready(store: Store) { const id = store.beginSuggestions(identity, state(store), 'suggest'); store.completeSuggestions(identity, id, reply()); return id; }
+it('settles prepare-merge replays through shutdown and fails interrupted preparations at startup recovery', () => {
+  const { store } = fixture(), request = { expectedStateVersion: 0, expectedReviewVersion: 0 };
+  const completed = randomUUID(), interrupted = randomUUID();
+  store.userAction(identity, { actionId: completed, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  store.userAction(identity, { actionId: interrupted, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  store.settleInterruptedPreMergeActions(identity);
+  expect(store.savedAction(identity, { actionId: completed, kind: 'prepare-merge', request })?.response)
+    .toMatchObject({ outcome: 'failed', reason: expect.stringMatching(/restarted/) });
+  const active = randomUUID();
+  store.userAction(identity, { actionId: active, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const snapshot = store.getSnapshot(identity);
+  const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) };
+  const capability = store.shutdownCapability(); store.closeWrites();
+  capability.run(() => store.settlePreMergeAction(identity, active,
+    { state: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null }, readiness));
+  expect(store.savedAction(identity, { actionId: active, kind: 'prepare-merge', request })?.response)
+    .toEqual({ outcome: 'ready', base: oid(1), head: oid(2), checked: ['P1'], reason: null });
+  expect(store.preMergeReady(identity, readiness)).toBe(true);
+});
+it('does not let a refused preparation shadow an admitted preparation that later becomes ready', () => {
+  const { store } = fixture(), request = { expectedStateVersion: 0, expectedReviewVersion: 0 };
+  const admitted = randomUUID();
+  store.userAction(identity, { actionId: admitted, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  expect(() => store.userAction(identity, { actionId: randomUUID(), kind: 'prepare-merge', request }, () => {
+    throw new GuardRefusal('Pre-merge preparation is already running.');
+  })).toThrow('Pre-merge preparation is already running.');
+  const snapshot = store.getSnapshot(identity);
+  const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) };
+  store.settlePreMergeAction(identity, admitted,
+    { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
+  expect(store.preMergeReady(identity, readiness)).toBe(true);
+});
+it('fails closed when durable rewrite lineage exceeds its safety bound', () => {
+  const { store } = fixture();
+  let head = oid(2);
+  for (let index = 0; index <= MAX_REWRITE_LINEAGE_ROWS; index++) {
+    const next = oid(index + 3);
+    store.recordRebase(identity, state(store), oid(1), next, [{ oldSha: head, newSha: next }]);
+    head = next;
+  }
+  expect(() => store.isRewrittenHead(identity, oid(2), head)).toThrow(/exceeds the 1000-row safety limit/);
+  expect(() => store.rewrittenAncestors(identity, head)).toThrow(/exceeds the 1000-row safety limit/);
+});
+it('recovers an interrupted review check without applying the expired code-writing budget', () => {
+  const { store } = fixture();
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const now = Date.now();
+  const execute = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: now + 60_000, budgetMs: 10,
+    expectedContext: store.currentContext(identity), now });
+  store.markRunning(identity, execute.id);
+  store.settleAttempt(identity, execute.id, { firstReason: null, exitCode: 0, valid: true });
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+  const check = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'check', item: 'P1', deadline: now + 60_000,
+    expectedContext: store.currentContext(identity), now: now + 1_000 });
+  const [recovered] = store.recoverInterrupted(now + 2_000);
+  expect(recovered).toMatchObject({ attemptId: check.id, state: 'failed', requeued: false });
+  expect(store.getAttempt(identity, check.id)).toMatchObject({ state: 'failed', firstReason: null });
+  expect(store.getTask(identity).status).toBe('in review');
+});
 it('allocates revisions in SQLite, survives reopen, and keeps old revisions and snapshots immutable', () => {
   const { store, path } = fixture(); const first = store.getSnapshot(identity);
   expect(store.getPlan(identity).revision).toBe(1);
@@ -205,6 +271,93 @@ it('preserves owned, foreign, and conflict-resolution provenance through repeate
   expect(recovered.getLedger(identity).find(e => e.sha === oid(23))).toEqual({ sha: oid(23), owner: null, origin: 'foreign', sourceSha: oid(13), conflictResolved: true });
   expect(recovered.getLedger(identity).find(e => e.sha === oid(24))).toEqual({ sha: oid(24), owner: null, origin: 'foreign', sourceSha: oid(14) });
   expect(recovered.getRewrites(identity, snapshot.id)).toHaveLength(3);
+});
+it('preserves execution approval recorded at the rewritten final output snapshot', () => {
+  const { store } = fixture();
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: store.currentContext(identity) });
+  store.markRunning(identity, attempt.id);
+  store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: false, head: oid(3) } });
+  store.recordHistory(identity, state(store), oid(1), oid(3), [
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+  ]);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  store.recordRebase(identity, state(store), oid(10), oid(13), [
+    { oldSha: oid(2), newSha: oid(12) }, { oldSha: oid(3), newSha: oid(13) },
+  ]);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+});
+it('binds pre-execution approvals to the current snapshot across a rewrite of the reviewed head', () => {
+  const { store } = fixture();
+  store.recordHistory(identity, state(store), oid(1), oid(3), [
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+  ]);
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+  store.recordRebase(identity, state(store), oid(10), oid(13), [
+    { oldSha: oid(2), newSha: oid(12) }, { oldSha: oid(3), newSha: oid(13) },
+  ]);
+  expect(store.isRewrittenHead(identity, oid(3), oid(13))).toBe(true);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.recordHistory(identity, state(store), oid(1), oid(3), []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+});
+it('keeps a later attribution choice binding before execution when a collaborator head returns', () => {
+  const { store } = fixture();
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+  store.recordHistory(identity, state(store), oid(1), oid(5), []);
+  store.saveReview(identity, state(store), [], [{ key: 'later-choice', action: 'accept', item: null }]);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.recordHistory(identity, state(store), oid(1), oid(2), []);
+  expect(store.getSnapshot(identity).head).toBe(oid(2));
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+});
+it('keeps a later attribution choice binding after a collaborator head replaces its snapshot', () => {
+  const { store } = fixture();
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: store.currentContext(identity) });
+  store.markRunning(identity, attempt.id);
+  store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: false, head: oid(3) } });
+  store.recordHistory(identity, state(store), oid(1), oid(3), [
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+  ]);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+  store.saveReview(identity, state(store), [], [{ key: 'later-choice', action: 'accept', item: null }]);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.recordHistory(identity, state(store), oid(1), oid(5), []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+});
+it('preserves an approved checkpoint continuation across its validated rewrite lineage', () => {
+  const { store } = fixture(true);
+  store.transitionTask(identity, store.getTask(identity).stateVersion, 'queued');
+  const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion,
+    kind: 'execute', item: 'P1', deadline: Date.now() + 60_000, expectedContext: store.currentContext(identity) });
+  store.markRunning(identity, attempt.id);
+  store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 0, valid: true,
+    result: { unchanged: false, head: oid(2) } });
+  const checkpoint = store.recordCheckpoint(identity, state(store), { item: 'P1', completedItems: ['P1'],
+    outOfScopePaths: ['outside'], baseEntries: context.baseEntries });
+  const amended = store.getPlan(identity);
+  amended.items[0]!.files.push({ path: 'outside', kind: 'add', renamed_from: null, change: 'scope amendment' });
+  store.importRevision(JSON.stringify(amended), 'json', context, 1);
+  store.approveContinuation(identity, checkpoint.id, state(store), context);
+  store.recordRebase(identity, state(store), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+  const progress = store.continuationProgress(identity);
+  expect(progress).toMatchObject({ completed: ['P1'], head: oid(12), next: 'P2' });
+  expect(store.continuationApproved(identity, progress!)).toBe(true);
 });
 it('feeds persisted remapped ownership into the linking engine on real Git history', () => {
   const dir = directory(); const git = (...args: string[]) => fixtureGit(dir, ...args);

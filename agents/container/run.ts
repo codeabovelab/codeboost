@@ -20,6 +20,8 @@ const validateSecrets = (profile: ContainerProfile, secrets: Readonly<Record<str
   if (profile.vendor === 'claude' && (keys.length !== 1 || keys[0] !== 'CLAUDE_CODE_OAUTH_TOKEN'
     || !secrets.CLAUDE_CODE_OAUTH_TOKEN || secrets.CLAUDE_CODE_OAUTH_TOKEN.includes('\0')))
     throw new Error('Claude profile requires only its OAuth environment credential.');
+  if (profile.vendor === 'runner' && keys.length)
+    throw new Error('Runner profile must not receive environment credentials.');
 };
 const docker = (args: readonly string[], options: { timeoutMs?: number; secrets?: Readonly<Record<string, string>>;
   signal?: AbortSignal; processLifecycle?: ProcessGroupLifecycle } = {}) => options.processLifecycle
@@ -361,7 +363,7 @@ export async function validateContainer(container: string, profile: ContainerPro
     || canonicalDockerBindSource(requestedAuth.Source) !== profile.codexAuthFile
     || canonicalDockerBindSource(auth!.Source) !== profile.codexAuthFile || !requestedAuth.ReadOnly))
     throw new Error('Codex auth mount identity changed.');
-  if (profile.vendor === 'claude' && auth) throw new Error('Claude profile must not mount Codex auth.');
+  if (profile.vendor !== 'codex' && auth) throw new Error('Non-Codex profiles must not mount Codex auth.');
   if (inspect.Config.Env.some(value => value.indexOf('=') < 1)) throw new Error('Container environment is malformed.');
   const names = inspect.Config.Env.map(value => value.slice(0, value.indexOf('=')));
   const environment = new Map(inspect.Config.Env.map(value => [value.slice(0, value.indexOf('=')), value.slice(value.indexOf('=') + 1)]));
@@ -370,7 +372,8 @@ export async function validateContainer(container: string, profile: ContainerPro
     'CODEBOOST_WORK_BYTES', 'CODEBOOST_WORK_INODES', 'CODEBOOST_METADATA_BYTES', 'CODEBOOST_METADATA_INODES',
     'npm_config_cache', 'XDG_CACHE_HOME', 'HTTPS_PROXY', 'HTTP_PROXY', 'NO_PROXY',
     ...(profile.deferredOutput ? ['CODEBOOST_DEFERRED_OUTPUT'] : []),
-    ...(profile.vendor === 'codex' ? ['CODEX_HOME'] : ['CLAUDE_CODE_OAUTH_TOKEN'])]);
+    ...(profile.vendor === 'codex' ? ['CODEX_HOME']
+      : profile.vendor === 'claude' ? ['CLAUDE_CODE_OAUTH_TOKEN'] : [])]);
   if (new Set(names).size !== names.length || names.some(name => !allowedEnvironment.has(name)))
     throw new Error('Container includes an unexpected environment variable.');
   if (environment.get('PATH') !== imageEnvironment.get('PATH')
@@ -393,6 +396,8 @@ export async function validateContainer(container: string, profile: ContainerPro
     throw new Error('Credential profiles must not be combined or redirected.');
   if (profile.vendor === 'claude' && (names.includes('CODEX_HOME') || !names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
     throw new Error('Credential profiles must not be combined.');
+  if (profile.vendor === 'runner' && (names.includes('CODEX_HOME') || names.includes('CLAUDE_CODE_OAUTH_TOKEN')))
+    throw new Error('Runner profile must not receive credentials.');
   await assertContainerProfile(profile, remaining(), signal, processLifecycle);
   remaining();
 }

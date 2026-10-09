@@ -103,12 +103,18 @@ describe('runner startup', () => {
       buildImage: () => { calls.push('image'); return 'sha256:x'; }, recovery: () => { calls.push('deps'); return recovery(calls); } });
     // D's recovery stops every leftover agent before the (possibly long) image build.
     expect(calls).toEqual(['verify', 'deps', 'recover', 'image']);
-    expect(assembly.deps.kinds).toEqual(['execute']);
+    expect(assembly.deps.kinds).toEqual(['execute', 'check']);
+    expect(assembly.preMerge).toBeTypeOf('function');
     // The token is the database's own, kept for this file identity.
     expect(assembly.deps.runnerOwner).toBe(service.store.runnerOwnerToken({ dev: 1n, ino: 2n }));
     // The review now reads runner commits from the repository the runner writes.
     const repositories = join(root, 'runner', assembly.deps.runnerOwner, 'repositories');
     expect(service.config.runnerRepository).toBe(join(repositories, readdirSync(repositories)[0]!));
+    const snapshot = service.store.getSnapshot(service.config.identity);
+    for (const commit of new Set([snapshot.base, snapshot.head]))
+      expect(existsSync(join(service.config.runnerRepository!, 'refs', 'codeboost', 'remote-commits', commit))).toBe(true);
+    // Selecting a freshly-created runner repository must not make the initial review unreadable before any attempt runs.
+    expect(service.load().snapshot).toMatchObject({ base: snapshot.base, head: snapshot.head });
     // Per database, under its runner token: another database sharing the root keeps its own folder.
     expect(statSync(join(root, 'runner', assembly.deps.runnerOwner, 'diagnostics')).mode & 0o777).toBe(0o700);
     expect(existsSync(join(root, 'runner', 'diagnostics'))).toBe(false);
@@ -288,6 +294,25 @@ describe('server with a runner setup', () => {
     const response = await fetch(`${origin}/api/runner`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
       body: JSON.stringify({ action: 'retry', attemptId: view.attempts[0]!.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() }) });
     expect(await response.json()).toEqual({ error: expect.stringMatching(/run again by resuming the task/) });
+    expect(app.service.store.getAttempts(demo.identity)).toHaveLength(1);
+  });
+  it('refuses to retry an exact-head command check outside pre-merge preparation', async () => {
+    const { demo } = fixture();
+    const app = await startServer({ ...demo }, 0, undefined, undefined, 2_000, undefined, undefined, undefined, async service => {
+      const store = service.store, identity = demo.identity;
+      store.transitionTask(identity, store.getTask(identity).stateVersion, 'in review');
+      const attempt = store.admitAttempt(identity, { expectedStateVersion: store.getTask(identity).stateVersion, kind: 'check', item: store.getPlan(identity).items[0]!.id,
+        expectedContext: store.currentContext(identity), deadline: Date.now() + 60_000 });
+      store.markRunning(identity, attempt.id);
+      store.settleAttempt(identity, attempt.id, { firstReason: null, exitCode: 1, valid: false });
+      return assembly(service);
+    });
+    cleanups.push(() => app.close());
+    const origin = new URL(app.url).origin, headers = { 'x-codeboost-token': app.token };
+    const view = await (await fetch(`${origin}/api/runner`, { headers })).json() as { stateVersion: number; attempts: { id: string }[] };
+    const response = await fetch(`${origin}/api/runner`, { method: 'POST', headers: { ...headers, 'content-type': 'application/json' },
+      body: JSON.stringify({ action: 'retry', attemptId: view.attempts[0]!.id, expectedStateVersion: view.stateVersion, actionId: randomUUID() }) });
+    expect(await response.json()).toEqual({ error: expect.stringMatching(/preparing the merge/) });
     expect(app.service.store.getAttempts(demo.identity)).toHaveLength(1);
   });
   it('tells a review without a runner block to add one, and a demo that it never runs the runner', async () => {

@@ -36,6 +36,8 @@ export interface MergeUnavailableStatus { available: true; ready: false; action:
 export interface PublishedTarget {
   repository: string;
   baseBranch: string;
+  /** Runner-owned production PRs require a durable, exact-review preparation before irreversible admission. */
+  requiresPreparation?: boolean;
   /** `github.pullRequest`, if the configuration still names one. It must be the task's PR. */
   configured?: number;
 }
@@ -43,6 +45,12 @@ export interface PublishedTarget {
 class MergeTargetUnavailable extends Error { blockers: MergeBlocker[] = []; }
 /** The PR one status read inspected. `openingId` is set for the task's published PR, which admission re-reads. */
 interface ResolvedTarget { target?: MergeTarget; openingId: string | null; marker?: string; headBranch?: string }
+interface MergeAuthorization {
+  /** Complete the last external authorization read before the final PR identity/mode inspection. */
+  refresh(): Promise<void>;
+  /** Recheck only local trust state after that inspection, without opening another external race. */
+  validate(): void;
+}
 
 function queueGateway(gateway: MergeGateway): gateway is QueueGateway {
   const queue = gateway as Partial<MergeQueueGateway>;
@@ -61,6 +69,7 @@ export class MergeCoordinator {
   readonly gateway: MergeGateway;
   readonly operationTimeoutMs: number;
   readonly published: PublishedTarget | null;
+  #authorize: ((signal: AbortSignal) => Promise<MergeAuthorization>) | null = null;
   /** Settlement of an irreversible merge keeps its writes after the Store gate closes; request-path reconciliation does not. */
   #settle: <T>(fn: () => T) => T;
   constructor(service: ReviewService, gateway: MergeGateway, operationTimeoutMs = MERGE_OPERATION_TIMEOUT_MS, capability?: ShutdownCapability, published?: PublishedTarget) {
@@ -68,6 +77,12 @@ export class MergeCoordinator {
     if (published && (published.configured !== undefined && (!Number.isSafeInteger(published.configured) || published.configured < 1))) throw new Error('Invalid configured pull request.');
     this.service = service; this.gateway = gateway; this.operationTimeoutMs = operationTimeoutMs; this.published = published ?? null;
     this.#settle = settleWith(capability);
+  }
+
+  /** Install the production issue-trust guard once the server's issue gateway is available. */
+  setAuthorization(authorize: (signal: AbortSignal) => Promise<MergeAuthorization>): void {
+    if (this.#authorize) throw new Error('Merge authorization is already configured.');
+    this.#authorize = authorize;
   }
 
   #attempt(): MergeAttempt | null {
@@ -147,6 +162,25 @@ export class MergeCoordinator {
     return (await this.#status(view, fresh, signal)).status;
   }
 
+  /** Fresh exact base/head pair for pre-merge preparation, using the same task-PR resolution as merge admission. */
+  async remotePair(signal?: AbortSignal): Promise<{ base: string; head: string }> {
+    const resolved = this.#resolve(this.#attempt());
+    const remote = await this.gateway.inspect({ fresh: true, timeoutMs: 6_000, signal,
+      ...(resolved.target ? { target: resolved.target } : {}) });
+    signal?.throwIfAborted();
+    if (resolved.target && remote.pullRequest !== resolved.target.pullRequest)
+      throw new Error('GitHub returned a different pull request.');
+    if (remote.pullRequestState !== 'OPEN')
+      throw new GuardRefusal(`Pull request #${remote.pullRequest} is ${remote.pullRequestState.toLowerCase()}; pre-merge preparation requires an open pull request.`);
+    if (remote.draft)
+      throw new GuardRefusal(`Pull request #${remote.pullRequest} is a draft; mark it ready before pre-merge preparation.`);
+    if (resolved.headBranch !== undefined) {
+      const blockers = this.#publishedBlockers(remote, resolved);
+      if (blockers.length) throw new GuardRefusal(blockers[0]!.message);
+    }
+    return { base: remote.base, head: remote.head };
+  }
+
   async #status(view: ReviewView, fresh: boolean, signal?: AbortSignal): Promise<{ status: MergeStatus; resolved: ResolvedTarget }> {
     const blockers: MergeBlocker[] = [];
     for (const item of view.items) {
@@ -164,6 +198,12 @@ export class MergeCoordinator {
     if (this.service.store && this.service.config) {
       const task = this.service.store.getTask(this.service.config.identity);
       if (task.status !== 'merged' && !MERGEABLE_STATUSES.includes(task.status)) blockers.push({ code: 'task', message: `The task is ${task.status}; merge it from review.` });
+      if (this.published?.requiresPreparation && view.expected.reviewVersion !== undefined
+        && !this.service.store.preMergeReady(this.service.config.identity, {
+          stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion,
+          snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head,
+          commandPolicyDigest: this.service.commandPolicyDigest(),
+        })) blockers.push({ code: 'preparation', message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
     }
     let resolved: ResolvedTarget;
     try { resolved = this.#resolve(this.#attempt()); }
@@ -333,6 +373,9 @@ export class MergeCoordinator {
       const taskStateVersion = this.service.store && this.service.config ? this.service.store.getTask(this.service.config.identity).stateVersion : null;
       let view = this.service.load();
       if (view.token !== token) throw new Error('Stale review state. Refresh before merging.');
+      // Capture the externally authorized issue identity before validation. Its final external refresh precedes the
+      // final PR inspection; a synchronous local trust check then closes the admission window without another await.
+      const authorization = this.#authorize ? await this.#authorize(signal) : null;
       const { status, resolved } = await this.#statusForMerge(view, signal);
       if (!status.ready) throw new Error(status.blockers[0]?.message ?? 'Merge is blocked.');
       view = this.service.load();
@@ -357,12 +400,42 @@ export class MergeCoordinator {
           throw new Error('Merge-queue requirements changed after queue correlation. Refresh before merging.');
         if (!commandStatus.ready) throw new Error(`Merge requirements changed after queue correlation. ${commandStatus.blockers[0]!.message}`);
       }
+      if (authorization) {
+        await authorization.refresh();
+        const authorized = await this.#statusForMerge(view, signal);
+        if (authorized.status.remote.base !== commandStatus.remote.base || authorized.status.remote.head !== commandStatus.remote.head
+          || authorized.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(authorized))
+          throw new Error('The pull request changed during merge validation. Refresh before merging.');
+        if (!authorized.status.ready)
+          throw new Error(`Merge requirements changed during authorization validation. ${authorized.status.blockers[0]!.message}`);
+        commandStatus = authorized.status;
+      }
+      if (commandStatus.remote.mergeQueue) {
+        // Events produced by another actor during authorization or the preceding status checks come before this
+        // boundary and cannot be adopted as this attempt's lifecycle. The following fresh status read then validates
+        // the PR identity and queue mode that this cursor will be stored with.
+        queueWatermark = await (this.gateway as QueueGateway).queueWatermark(commandStatus.remote.head,
+          { signal, timeoutMs: 6_000, pullRequest: commandStatus.remote.pullRequest });
+        const boundary = await this.#statusForMerge(view, signal);
+        if (boundary.status.remote.base !== commandStatus.remote.base || boundary.status.remote.head !== commandStatus.remote.head
+          || boundary.status.remote.mergeQueue !== commandStatus.remote.mergeQueue || !samePullRequest(boundary))
+          throw new Error('The pull request changed after queue correlation. Refresh before merging.');
+        if (!boundary.status.ready)
+          throw new Error(`Merge requirements changed after queue correlation. ${boundary.status.blockers[0]!.message}`);
+        commandStatus = boundary.status;
+      }
+      // The external authorization read completed before the final PR inspection and queue boundary. Re-read local
+      // trust synchronously after those awaits so neither remote identity nor local authorization can race admission.
+      authorization?.validate();
       if (this.service.load().token !== token) throw new Error('Review changed during merge validation. Refresh before merging.');
       if (signal.aborted) throw signal.reason;
       if (this.service.store && this.service.config && view.expected.reviewVersion !== undefined) {
         const { store, config } = this.service, reviewVersion = view.expected.reviewVersion;
+        const requiresPreparation = this.published?.requiresPreparation === true;
         const begin = () => store.beginMergeAttempt(config.identity, { ...view.expected, reviewVersion }, commandStatus.remote.head, queueWatermark,
-          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion, { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId });
+          commandStatus.remote.mergeQueue ? 'queue' : 'direct', actionId ?? null, taskStateVersion,
+          { pullRequest: commandStatus.remote.pullRequest, openingId: resolved.openingId }, requiresPreparation,
+          requiresPreparation ? this.service.commandPolicyDigest() : null);
         let begun: MergeAttempt | null = null;
         // The attempt and the click's saved response commit in one transaction, or neither does.
         if (action) store.userAction(config.identity, action, () => mergeActionResponse(begun = begin()));

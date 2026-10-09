@@ -106,6 +106,23 @@ export class GitBranchPusher implements BranchPusher {
     this.#config = config; this.#url = url;
   }
 
+  /** Fetch exact remote commits and keep them reachable while durable review snapshots may still name them. */
+  async fetchCommits(commits: readonly string[], signal?: AbortSignal): Promise<void> {
+    if (!commits.length || commits.length > 2 || commits.some(commit => !COMMIT_ID.test(commit)))
+      throw new Error('One or two full commit IDs are required for refresh.');
+    const unique = [...new Set(commits)];
+    await this.#git(['fetch', '--no-tags', '--no-write-fetch-head', '--no-recurse-submodules', '--', this.#url, ...unique], signal, true);
+    const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false,
+      Buffer.from(`${unique.join('\n')}\n`));
+    const records = found.split('\n');
+    if (records.length !== unique.length || records.some((record, index) => record !== `${unique[index]} commit`))
+      throw new Error('The refreshed remote base or head is not a commit in the runner repository.');
+    // A raw object-ID fetch creates no ref. Without these runner-owned anchors, `git gc` may prune a collaborator-only
+    // head after its SHA has been persisted in a snapshot, leaving review and restart recovery unable to read it.
+    for (const commit of unique)
+      await this.#git(['update-ref', `refs/codeboost/remote-commits/${commit}`, commit], signal);
+  }
+
   async push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: MutationBoundary }, signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     if (identity.repositoryId !== this.#config.repositoryId) throw new Error('The task belongs to another repository.');

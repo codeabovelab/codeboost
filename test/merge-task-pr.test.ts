@@ -13,6 +13,7 @@ import type { AlreadyFixedGateway, AlreadyFixedInput } from '../github/already-f
 import type { Plan, PlanContext } from '../core/plan.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { startServer } from '../web/server.ts';
+import { commandDigest } from '../runner/checks.ts';
 
 // #121: with a runner block, the merge gate targets the task's published PR, not github.pullRequest.
 const oid = (n: number) => n.toString(16).padStart(40, '0');
@@ -22,6 +23,7 @@ const plan: Plan = { schema_version: 1, issue: 12, revision: 1, summary: 'Stop t
 const context: PlanContext = { identity, issue: 12, baseEntries: [{ path: 'a.ts', kind: 'file' }], pathKey: p => p, allowedCommands: [] };
 const BRANCH = 'codeboost/issue-12-task-42-0123456789abcdef';
 const PUBLISHED: PublishedTarget = { repository: 'owner/repo', baseBranch: 'main' };
+const PREPARED_PUBLISHED: PublishedTarget = { ...PUBLISHED, requiresPreparation: true };
 const url = (n: number) => `https://github.com/owner/repo/pull/${n}`;
 
 const stores: Store[] = [], roots: string[] = [];
@@ -51,6 +53,17 @@ function published() {
   expect(opened(store, opening.openingId, 7)).toBe('in review');
   return { store, opening };
 }
+function prepare(store: Store) {
+  const actionId = randomUUID(), request = { expectedStateVersion: store.getTask(identity).stateVersion,
+    expectedReviewVersion: store.reviewVersion(identity) };
+  store.userAction(identity, { actionId, kind: 'prepare-merge', request }, () => ({ outcome: 'preparing' }));
+  const snapshot = store.getSnapshot(identity);
+  const readiness = { stateVersion: store.getTask(identity).stateVersion, reviewVersion: store.reviewVersion(identity),
+    snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head, commandPolicyDigest: commandDigest([]) };
+  store.settlePreMergeAction(identity, actionId,
+    { state: 'ready', base: snapshot.base, head: snapshot.head, checked: [], reason: null }, readiness);
+  return readiness;
+}
 /**
  * PR 7 is opened and running; a later opening was abandoned, so a test can adopt it as PR 8 (newer than 7) at any point.
  * The task is then in review.
@@ -71,7 +84,7 @@ function service(store: Store) {
     plan: { revision: 1 }, segments: [], notes: [], snapshot: { id: snapshot.id, base: oid(1), head: oid(2) }, token: 'review-token',
     expected: { revision: 1, snapshotId: snapshot.id, reviewVersion: store.reviewVersion(identity) },
   };
-  return { store, config: { identity }, load: vi.fn(() => view) } as unknown as ReviewService;
+  return { store, config: { identity }, load: vi.fn(() => view), commandPolicyDigest: () => commandDigest([]) } as unknown as ReviewService;
 }
 
 /**
@@ -100,6 +113,139 @@ function github(store: Store, change: (number: number) => Partial<RemoteMergeSta
 }
 
 describe('the merge gate with a runner block (#121)', () => {
+  it('invalidates preparation when the current command policy changes', async () => {
+    const { store } = published(), gh = github(store);
+    prepare(store);
+    const review = service(store);
+    review.commandPolicyDigest = () => commandDigest([['npm', 'test']]);
+    const merges = new MergeCoordinator(review, gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    expect((await merges.status()).blockers).toContainEqual({ code: 'preparation',
+      message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
+  });
+
+  it('requires durable current preparation through the irreversible admission transaction', async () => {
+    const { store } = published(), gh = github(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    expect((await merges.status()).blockers).toContainEqual({ code: 'preparation',
+      message: 'Pre-merge preparation has not completed for the current review. Prepare the merge again.' });
+    prepare(store);
+    expect((await merges.status()).ready).toBe(true);
+
+    let reads = 0;
+    gh.client.before = () => {
+      if (++reads !== 2) return;
+      const task = store.getTask(identity);
+      store.userAction(identity, { actionId: randomUUID(), kind: 'prepare-merge',
+        request: { expectedStateVersion: task.stateVersion, expectedReviewVersion: store.reviewVersion(identity) } },
+      () => ({ outcome: 'preparing' }));
+    };
+    await expect(merges.merge('review-token')).rejects.toThrow(/pre-merge preparation has not completed/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('reauthorizes issue trust immediately before irreversible admission', async () => {
+    const { store } = published(), gh = github(store);
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    const calls: string[] = [];
+    merges.setAuthorization(async () => {
+      calls.push('capture');
+      return { refresh: async () => { calls.push('revalidate'); throw new GuardRefusal('Issue trust was revoked.'); },
+        validate: () => { calls.push('local'); } };
+    });
+    await expect(merges.merge('review-token')).rejects.toThrow('Issue trust was revoked.');
+    expect(calls).toEqual(['capture', 'revalidate']);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('revalidates the pull request after the final authorization refresh', async () => {
+    const { store } = published();
+    let remoteBase = oid(1);
+    const gh = github(store, () => ({ base: remoteBase }));
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { remoteBase = oid(3); }, validate: () => undefined }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/pull request changed during merge validation/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('revalidates authorization after the final pull request refresh', async () => {
+    const { store } = published(), gh = github(store);
+    let reads = 0, revoked = false;
+    gh.client.before = () => { if (++reads === 3) revoked = true; };
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => undefined, validate: () => {
+      if (revoked) throw new GuardRefusal('Issue trust was revoked during the final pull request refresh.');
+    } }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final pull request refresh/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('captures the queue event boundary after the final authorization and pull request reads', async () => {
+    const { store } = published(), gh = github(store, () => ({ mergeQueue: true }));
+    let authorized = false;
+    gh.client.queueWatermark = vi.fn(async () => authorized ? 'CURSOR_after_authorization' : 'CURSOR_before_authorization');
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { authorized = true; }, validate: () => undefined }));
+
+    await merges.merge('review-token');
+
+    expect(store.getMergeAttempt(identity)).toMatchObject({ queueWatermark: 'CURSOR_after_authorization' });
+  });
+
+  it('revalidates the pull request after capturing the queue event boundary', async () => {
+    const { store } = published();
+    let remoteBase = oid(1), watermarks = 0;
+    const gh = github(store, () => ({ base: remoteBase, mergeQueue: true }));
+    gh.client.queueWatermark = vi.fn(async () => {
+      if (++watermarks === 2) remoteBase = oid(3);
+      return 'CURSOR';
+    });
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+
+    await expect(merges.merge('review-token')).rejects.toThrow(/pull request|requirements changed/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('revalidates local authorization after the final queue event boundary', async () => {
+    const { store } = published(), gh = github(store, () => ({ mergeQueue: true }));
+    let authorized = false, revoked = false;
+    gh.client.queueWatermark = vi.fn(async () => {
+      if (authorized) revoked = true;
+      return 'CURSOR';
+    });
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { authorized = true; }, validate: () => {
+      if (revoked) throw new GuardRefusal('Issue trust was revoked during the final queue read.');
+    } }));
+
+    await expect(merges.merge('review-token')).rejects.toThrow(/trust was revoked during the final queue read/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
+  it('completes the final external authorization read before validating merge-queue mode', async () => {
+    const { store } = published();
+    let mergeQueue = false, authorizationReads = 0;
+    const gh = github(store, () => ({ mergeQueue }));
+    prepare(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    merges.setAuthorization(async () => ({ refresh: async () => { if (++authorizationReads === 1) mergeQueue = true; },
+      validate: () => undefined }));
+    await expect(merges.merge('review-token')).rejects.toThrow(/merge-queue|pull request changed/i);
+    expect(gh.merged).toEqual([]);
+    expect(store.getMergeAttempt(identity)).toBeNull();
+  });
+
   it('inspects and merges the task\'s published PR and pins it on the attempt', async () => {
     const { store } = published();
     const gh = github(store);
@@ -162,8 +308,16 @@ describe('the merge gate with a runner block (#121)', () => {
     const status = await merges.status();
     expect(status.ready).toBe(false);
     expect(status.blockers.map(blocker => blocker.message)).toEqual([expect.stringMatching(message)]);
+    await expect(merges.remotePair()).rejects.toThrow(message);
     await expect(merges.merge('review-token')).rejects.toThrow(message);
     expect(gh.merged).toEqual([]);
+  });
+
+  it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
+    const { store } = published();
+    const gh = github(store, () => ({ pullRequestState: 'CLOSED' }));
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+    await expect(merges.remotePair()).rejects.toThrow(/is closed; pre-merge preparation requires an open pull request/);
   });
 
   it('does not ask a merged PR to still be open on its branch', async () => {

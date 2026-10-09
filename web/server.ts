@@ -20,6 +20,7 @@ import { IssueBoard } from './issues.ts';
 import { SuggestionCoordinator, type PlanningMode, type SuggestionHandle, type SuggestionInput, type SuggestionStore } from '../core/planning-suggestions.ts';
 import type { AuthorProvider } from '../core/planning-author.ts';
 import { PLANNING_BUDGET_MS } from '../runner/planning-provider.ts';
+import type { PreMergeCoordinator } from '../runner/pre-merge.ts';
 export type PlanningDescription = Pick<SuggestionInput, 'issue' | 'approvedLessons'> & {
   repo: { name: string; baseRef: string };
   /** Revalidates any mutable authority carried by this description at the synchronous prompt-construction boundary. */
@@ -61,6 +62,7 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
   if (!Number.isSafeInteger(shutdownDrainMs) || shutdownDrainMs < 1 || shutdownDrainMs > MAX_SHUTDOWN_DRAIN_MS) throw new Error('Invalid shutdown drain deadline.');
   const service = new ReviewService(config), token = randomBytes(32).toString('hex');
   let questions: Questions, merges: MergeCoordinator | null, issues: IssueBoard, runner: RunnerCoordinator | null, suggestions: SuggestionCoordinator | null;
+  let preMerge: PreMergeCoordinator | null = null;
   let planning: PlanningDeps | undefined, issueSource: IssueGateway | null;
   /** Runs a task's plan items; one per Store, like the coordinator. Only the production runner has one. */
   let executor: ItemExecutor | null = null;
@@ -80,7 +82,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       (repository, issue) => service.store.issueTrust(repository, issue));
     // With a runner block the merge targets the task's published PR (#121); without one, github.pullRequest is required.
     const published = !config.demo && config.runner !== undefined && config.github
-      ? { repository: config.github.repository, baseBranch: baseBranch(config.github), ...(config.github.pullRequest !== undefined ? { configured: config.github.pullRequest } : {}) } : undefined;
+      ? { repository: config.github.repository, baseBranch: baseBranch(config.github), requiresPreparation: true,
+        ...(config.github.pullRequest !== undefined ? { configured: config.github.pullRequest } : {}) } : undefined;
     if (!config.demo && config.github && !published && !mergeGateway && config.github.pullRequest === undefined)
       throw new Error('Add github.pullRequest, the pull request to merge, to the review configuration, or add a runner block so codeboost publishes its own.');
     merges = !config.demo && (mergeGateway || config.github) ? new MergeCoordinator(service, mergeGateway ?? new GhMergeGateway(config.github!), MERGE_OPERATION_TIMEOUT_MS, capability, published) : null;
@@ -105,6 +108,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     try {
       const assembly = await runnerSetup(service, capability);
       runner = new RunnerCoordinator(service.store, assembly.deps, undefined, capability);
+      if (assembly.preMerge && merges) preMerge = assembly.preMerge(runner, signal => merges!.remotePair(signal), async signal => {
+        let access = await readIssueAccess(signal);
+        requireTrustedIssue(access);
+        return {
+          refresh: async () => { access = await readIssueAccess(signal); requireTrustedIssue(access); },
+          validate: () => requireTrustedIssue(access),
+        };
+      });
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
       if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, {
@@ -143,6 +154,14 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     requireTrustedIssue(access);
     return async () => requireTrustedIssue(await readIssueAccess(signal));
   };
+  if (config.github) merges?.setAuthorization(async signal => {
+    let access = await readIssueAccess(signal);
+    requireTrustedIssue(access);
+    return {
+      refresh: async () => { access = await readIssueAccess(signal); requireTrustedIssue(access); },
+      validate: () => requireTrustedIssue(access),
+    };
+  });
   /**
    * What `start` or `resume` would run (#91 part 2), or the local refusal. It writes nothing, so the view asks it too.
    * The view also suppresses controls when the latest complete issue board says trust is blocked; every action still
@@ -258,7 +277,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const trustBlocked = !!config.github && issues.trustStatus(config.github.issue) === 'blocked';
     return { available: !!runner, task, attempts, startable: !trustBlocked && !!progress && offered('start', progress), resumable: !trustBlocked && !!progress && offered('resume', progress),
       stateVersion: task.stateVersion, reviewVersion: service.store.reviewVersion(identity), retryable, stopRequested: status.stopRequested,
-      unresolved: status.unresolved, continuation, publish: publishView(progress, trustBlocked) };
+      unresolved: status.unresolved, continuation, publish: publishView(progress, trustBlocked),
+      preMerge: { available: !!preMerge, active: preMerge?.active ?? false, last: preMerge?.last ?? null } };
   };
   /** The task's publishing (#103): in progress, offered (what the publish action would run), and the last outcome. */
   const publishView = (progress: ReturnType<ItemExecutor['progress']> | undefined, trustBlocked: boolean) => {
@@ -277,25 +297,32 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if (!publishing || stopping) return;
       publishing.actIfOwed(identity);
     });
+  /** A preparation can finish the delayed half of task cancellation; close its PRs only after that settlement. */
+  const afterPreMerge = (outcome: Promise<unknown>) => void outcome
+    .catch(error => console.error(`Pre-merge preparation failed: ${JSON.stringify(error instanceof Error ? error.message : String(error))}`))
+    .finally(() => {
+      if (!publishing || stopping || service.store.getTask(identity).status !== 'cancelled') return;
+      publishing.taskCancelled(identity);
+    });
   const runnerAction = async (input: Record<string, unknown>, signal: AbortSignal) => {
     const { action, attemptId, expectedStateVersion, expectedReviewVersion, actionId } = input;
     // Malformed requests are refused before userAction, so nothing is recorded under their action ID (HTTP 400).
-    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'approve-continuation', 'publish', 'close-pull-requests'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
+    if (!['cancel-attempt', 'retry', 'cancel-task', 'start', 'resume', 'approve-continuation', 'publish', 'close-pull-requests', 'prepare-merge'].includes(action as string)) throw new BadRequest('Unsupported runner action.');
     if (!Number.isSafeInteger(expectedStateVersion)) throw new BadRequest('expectedStateVersion must be an integer.');
-    if ((action === 'start' || action === 'resume' || action === 'approve-continuation') && !Number.isSafeInteger(expectedReviewVersion)) {
+    if ((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') && !Number.isSafeInteger(expectedReviewVersion)) {
       // Actions saved before #107 had no review version in their request hash. They remain replayable, but this shape
       // can never create a new action now: a miss falls through to the new-field validation below.
       const legacy = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string,
         request: { attemptId, expectedStateVersion } });
       if (legacy) return legacy.response;
-      throw new BadRequest('expectedReviewVersion must be an integer for start, resume and continuation approval.');
+      throw new BadRequest('expectedReviewVersion must be an integer for start, resume, preparation and continuation approval.');
     }
     if (action === 'cancel-attempt' || action === 'retry') assertUuidV4(attemptId, 'Attempt ID');
-    const request = { attemptId, expectedStateVersion, ...((action === 'start' || action === 'resume' || action === 'approve-continuation') ? { expectedReviewVersion } : {}) };
+    const request = { attemptId, expectedStateVersion, ...((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') ? { expectedReviewVersion } : {}) };
     let access: IssueAccess | undefined;
     const trustGated = !!config.github &&
       (((action === 'start' || action === 'resume') && !!executor) ||
-        (action === 'approve-continuation' && !!executor) || (action === 'publish' && !!publishing));
+        (action === 'approve-continuation' && !!executor) || (action === 'publish' && !!publishing) || (action === 'prepare-merge' && !!preMerge));
     if (trustGated) {
       const replay = service.store.savedAction<unknown>(identity, { actionId: actionId as string, kind: action as string, request });
       if (replay) return replay.response;
@@ -334,7 +361,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       }
     }
     // A cancel that closed the task stops its publish in progress and closes its PRs (#111). A cancel that is still
-    // stopping an attempt closes the task when the attempt settles; the run's end then closes them (afterRun).
+    // stopping an attempt closes the task when the attempt settles; the execution or pre-merge run's end then closes
+    // them (afterRun).
     // Only this action's own cancel: a replayed or refused one (the task already closed) starts nothing.
     if (action === 'cancel-task') {
       const before = service.store.getTask(identity).status;
@@ -357,12 +385,27 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       // A saved replay is returned by userAction before this callback. A new continuation approval admitted before
       // shutdown but parsed during the drain must remain retryable, even when no runner exists or its supplied versions
       // are stale.
-      if (action === 'approve-continuation' && (stopping || runner?.closing)) throw new ShuttingDownError();
+      if ((action === 'approve-continuation' || action === 'prepare-merge') && (stopping || runner?.closing)) throw new ShuttingDownError();
       if (service.store.getTask(identity).stateVersion !== expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
-      if ((action === 'start' || action === 'resume' || action === 'approve-continuation') && service.store.reviewVersion(identity) !== expectedReviewVersion)
+      if ((action === 'start' || action === 'resume' || action === 'approve-continuation' || action === 'prepare-merge') && service.store.reviewVersion(identity) !== expectedReviewVersion)
         throw new GuardRefusal('Stale review state. Reload before writing.');
-      if (action === 'cancel-task') return { outcome: runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string) : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
+      if (action === 'cancel-task') return { outcome: preMerge?.active
+        ? preMerge.cancelTask(expectedStateVersion as number, actionId as string)
+        : runner ? runner.cancelTask(identity, expectedStateVersion as number, actionId as string)
+          : service.store.cancelTask(identity, expectedStateVersion as number, actionId as string) };
       if (!runner) throw new GuardRefusal(config.demo ? RUNNER_NOT_IN_DEMO : RUNNER_NOT_CONFIGURED);
+      if (action === 'prepare-merge') {
+        if (access) requireTrustedIssue(access);
+        if (!preMerge) throw new GuardRefusal('Pre-merge preparation is not configured.');
+        if (runner.isActive(identity) || executor?.busy(identity) || publishing?.busy(identity))
+          throw new GuardRefusal('The runner or publisher is busy; pre-merge preparation cannot start yet.');
+        preMerge.assertStartable();
+        const snapshot = service.store.getSnapshot(identity);
+        service.store.afterCommit(() => { afterPreMerge(preMerge!.start({ stateVersion: expectedStateVersion as number,
+          reviewVersion: expectedReviewVersion as number, snapshotId: snapshot.id, base: snapshot.base, head: snapshot.head,
+          actionId: actionId as string })); });
+        return { outcome: 'preparing' };
+      }
       if (action === 'approve-continuation') {
         if (access) requireTrustedIssue(access);
         if (!executor || runner.isActive(identity) || executor.busy(identity) || publishing?.busy(identity))
@@ -415,6 +458,9 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       const last = service.store.getAttempt(identity, attemptId as string);
       // A plan item runs only through the executor, which pauses or escalates after it; a bare retry would skip both.
       if (executor && last.kind === 'execute') throw new GuardRefusal('A plan item is run again by resuming the task, not by retrying its attempt.');
+      // Exact-head command checks belong to pre-merge preparation, which refreshes the remote pair, review state and
+      // issue authorization before every launch. A bare retry would bypass all of those guards.
+      if (last.kind === 'check') throw new GuardRefusal('Command checks are run again by preparing the merge, not by retrying their attempt.');
       const retry = runner.retry(identity, attemptId as string, { expectedStateVersion: expectedStateVersion as number, kind: last.kind, item: last.item,
         expectedContext: service.store.currentContext(identity), deadline: Date.now() + 10 * 60_000 });
       // A cancel that stops this attempt closes the task when it settles; its PRs are closed then (#111), as after a run.
@@ -693,6 +739,11 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
       if(active.readingBody)active.request.destroy(reason);
     }
     const publishingFailure = await publishingClosed;
+    // A conflict resolver records and clears child process ownership directly through the Store. Abort and await the
+    // whole pre-merge lifecycle before the write gate closes, so those settlement writes cannot be refused.
+    const failures: unknown[] = publishingFailure === undefined ? [] : [publishingFailure];
+    const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
+    await step(() => preMerge?.close());
     // Step 3: after the drain, close the Store write gate. A request-path write still pending after the abort
     // (for example merge reconciliation after a GitHub await) now fails with 503; settling coordinators keep the capability.
     service.store.closeWrites();
@@ -701,8 +752,6 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
     const issuesClosed=issues.close();
     // Every step runs even when an earlier one fails: agents are still stopped, plan runs awaited and the Store closed
     // last. The first failure is reported; a later one never hides it.
-    const failures: unknown[] = publishingFailure === undefined ? [] : [publishingFailure];
-    const step = async (run: () => Promise<unknown> | unknown) => { try { await run(); } catch (error) { failures.push(error); } };
     await step(() => merges?.close());
     await step(() => issuesClosed);
     // Step 4: stop runner jobs (shutdown reason only where none is set) and await settlement; no timer abandons a job.

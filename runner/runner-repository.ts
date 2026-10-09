@@ -103,6 +103,12 @@ export async function ensureCommit(repository: RunnerRepository, head: string, o
   if (!(await exists(repository.path, `${head}^{commit}`, options))) throw new Error(`The source repository has no commit ${head}.`);
 }
 
+/** Import a persisted snapshot commit and anchor it so repository maintenance cannot prune it. */
+export async function retainSnapshotCommit(repository: RunnerRepository, head: string, options: GitCallOptions = {}): Promise<void> {
+  await ensureCommit(repository, head, options);
+  await git(repository.path, ['update-ref', `refs/codeboost/remote-commits/${head}`, head], options);
+}
+
 /**
  * Take a runner commit in from the bundle `commitTaskChanges` returned, under the attempt's ref, and check that it is
  * the commit the runner made: the bundle's one ref is `head`, and `head` is a single commit on top of `base`.

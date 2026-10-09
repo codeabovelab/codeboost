@@ -24,7 +24,7 @@ import { recoverLeftovers } from '../agents/recovery.ts';
 import { createVendorNetwork, removeVendorNetwork, VendorNetworkCreationCleanupError,
   type VendorNetwork } from '../agents/network/network.ts';
 import { createClaudeCommand, createIsolationProbeCommand, createPhasePolicy,
-  assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
+  createRunnerCommand, assertPhasePolicy, type AgentCommand, type IsolationProbe } from '../agents/policy.ts';
 const stagingFault = vi.hoisted(() => ({ chmodPathPrefix: '', realpathPathPrefix: '' }));
 vi.mock('node:fs', async importOriginal => {
   const actual = await importOriginal<typeof import('node:fs')>();
@@ -81,7 +81,7 @@ function fixture(options: { limits?: Parameters<typeof prepareTaskFilesystems>[1
   return { root, source, input, clone, filesystems, fakeAuth };
 }
 
-function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, vendor: 'codex' | 'claude' = 'codex',
+function invocation(clone: ReturnType<typeof createTaskClone>, phase: Phase, vendor: 'codex' | 'claude' | 'runner' = 'codex',
   deadlineMs = 60_000): InvocationInput {
   return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone, phase, vendor, approvedArgv: phase === 'planning' || phase === 'questions' ? [] : [['git', 'status']],
     deadline: Date.now() + deadlineMs, attemptId: `${vendor}-${phase}-${Math.random().toString(16).slice(2)}`,
@@ -96,7 +96,7 @@ const governed = async (captured: InvocationInput, probe: IsolationProbe = 'noop
 
 async function profile(data: ReturnType<typeof fixture>, phase: Phase,
   command: IsolationProbe | ((policy: ReturnType<typeof createPhasePolicy>) => AgentCommand), options: {
-  vendor?: 'codex' | 'claude'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
+  vendor?: 'codex' | 'claude' | 'runner'; authProbe?: boolean; codexAuthFile?: string; claudeToken?: string; deadlineMs?: number;
   treeCheck?: TaskTreeCheck; cleanupRoot?: string; invocationBudget?: () => number;
 } = {}) {
   const vendor = options.vendor ?? 'codex';
@@ -222,6 +222,25 @@ describe('real Docker agent isolation', () => {
     const claude = await profile(fixture(), 'execute', 'scratch-capacity', { vendor: 'claude', claudeToken: placeholder });
     expect(await runContainer(claude, 60_000, { CLAUDE_CODE_OAUTH_TOKEN: placeholder })).toBe('scratch-bounded');
   }, 120_000);
+
+  it('runs the review runner profile read-only without provider credentials', async () => {
+    const data = fixture(), argv = ['node', '-e', "process.stdout.write('runner-ok')"];
+    const commands = JSON.stringify([argv]);
+    chmodSync(data.input, 0o755); chmodSync(join(data.input, 'schema.json'), 0o644);
+    writeFileSync(join(data.input, 'schema.json'), commands); chmodSync(join(data.input, 'schema.json'), 0o444); chmodSync(data.input, 0o555);
+    const captured = captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone: data.clone, phase: 'review', vendor: 'runner',
+      approvedArgv: [argv], deadline: Date.now() + 60_000, attemptId: `runner-review-${randomUUID()}`,
+      context: { snapshotId: 'snapshot-1', planId: 'plan-1', planRevision: 1, assignmentId: 'assignment-1',
+        referencedCodeHash: 'code-1', stateVersion: 1 } });
+    const policy = createPhasePolicy(captured), network = await createVendorNetwork(captured, imageId, randomUUID());
+    vendorNetworks.push(network);
+    const runner = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
+      inputDirectory: data.input, command: createRunnerCommand(policy, commands), imageId });
+    profiles.push(runner);
+    expect(runner.args).not.toContain('CODEX_HOME=/run/codeboost-auth/codex');
+    expect(runner.args).not.toContain('CLAUDE_CODE_OAUTH_TOKEN');
+    expect(await runContainer(runner)).toBe('runner-ok');
+  }, 60_000);
 
   it.each([
     ['an absolute link to a host file', (source: string, root: string) => {

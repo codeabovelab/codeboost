@@ -6,17 +6,20 @@ import type { PlanIdentity } from '../core/identity.ts';
 import { readHistory } from '../git/history.ts';
 import { execFileSync } from 'node:child_process';
 import { HARDENED_GIT_OPTIONS, hardenedGitEnvironment } from '../scripts/git-environment.ts';
-import type { BaseEntry, PlanContext } from '../core/plan.ts';
+import { commandArgv, PlanError, type BaseEntry, type PlanContext } from '../core/plan.ts';
 import { linkHistory } from '../core/linking.ts';
 import { applyChoices, approvalStates, approveItem, choiceKeys, fingerprint, reviewedSegment, stable } from '../core/approvals.ts';
 import type { PlanItem } from '../core/plan.ts';
 import type { GhMergeConfig } from '../github/merge.ts';
 import { GuardRefusal } from './lifecycle.ts';
+import { commandDigest } from './checks.ts';
 
 export interface ReviewConfig { database: string; repository: string;
-  /** The runner-owned repository (#87) holding the commits codeboost makes; required once the task has any. */
+  /** The runner-owned repository (#87) holding the production task branch, including its original imported head. */
   runnerRepository?: string;
   identity: PlanIdentity; pathIdentity: { caseSensitive: boolean; unicodeNormalization: 'none' | 'NFC' }; demo?: boolean; github?: GhMergeConfig;
+  /** Exact complete argv arrays a stored plan may execute as `cmd:` acceptance checks. */
+  allowedCommands?: readonly (readonly string[])[];
   /** The runner block, parsed by `parseRunnerConfig`. Its presence also makes the merge target the task's published PR (#121). */
   runner?: unknown }
 export class ReviewService {
@@ -31,6 +34,10 @@ export class ReviewService {
   constructor(config: ReviewConfig) {
     if (typeof config.pathIdentity?.caseSensitive !== 'boolean' || !['none', 'NFC'].includes(config.pathIdentity.unicodeNormalization)) throw new Error('Known checkout path identity is required.');
     this.config = config;
+    if (config.allowedCommands !== undefined && (!Array.isArray(config.allowedCommands)
+      || config.allowedCommands.some(argv => !Array.isArray(argv) || argv.length === 0
+        || argv.some(arg => typeof arg !== 'string' || !arg.isWellFormed() || arg.includes('\0')))))
+      throw new Error('allowedCommands must contain complete literal argv arrays.');
     this.#pathKey = path => {
       if (!config.pathIdentity.caseSensitive && /[^\x20-\x7e]/.test(path)) throw new Error('Non-ASCII case-insensitive paths require a filesystem-specific identity adapter.');
       const normalized = config.pathIdentity.unicodeNormalization === 'NFC' ? path.normalize('NFC') : path;
@@ -38,19 +45,30 @@ export class ReviewService {
     };
     this.store = new Store(config.database, this.#pathKey);
   }
+  /** Stable binding for preparation evidence; a restart with a different command policy invalidates old readiness. */
+  commandPolicyDigest(): string { return commandDigest(this.config.allowedCommands ?? []); }
   close() { this.store.close(); }
   /**
-   * Where the task's reviewed commits are. Once the runner has committed for the task (a completed writable attempt that
-   * made a commit, #87), its branch is the runner's: the head is the one the Store recorded with that commit, in the
-   * runner-owned repository. Before that, the user's repository and its HEAD. Owned ledger entries alone do not decide it:
-   * a reviewed branch in the user's repository (the demo, a planted experiment) carries them too.
+   * Where the task's reviewed commits are. Production configures the runner-owned repository after importing the task's
+   * original head, so it remains authoritative even when every execution attempt is unchanged. Without one, the review
+   * observes the user's repository and HEAD (demo and planted-review behavior).
    */
   reviewRepository(): { path: string; runnerOwned: boolean } {
-    if (!this.store.hasRunnerCommit(this.config.identity)) return { path: this.config.repository, runnerOwned: false };
-    if (!this.config.runnerRepository) throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
-    return { path: this.config.runnerRepository, runnerOwned: true };
+    if (this.config.runnerRepository) return { path: this.config.runnerRepository, runnerOwned: true };
+    if (this.store.hasRunnerCommit(this.config.identity))
+      throw new Error('This task has runner commits, so its review needs the runner-owned repository, which is not configured.');
+    return { path: this.config.repository, runnerOwned: false };
   }
-  load() {
+  load(options: { maxDurationMs?: number } = {}) {
+    const maxDurationMs = options.maxDurationMs ?? 30_000;
+    if (!Number.isSafeInteger(maxDurationMs) || maxDurationMs < 1 || maxDurationMs > 30_000)
+      throw new Error('Review duration budget must be a positive integer no larger than 30000 ms.');
+    const deadline = performance.now() + maxDurationMs;
+    const remaining = () => {
+      const ms = deadline - performance.now();
+      if (ms <= 0) throw new Error('Review load exceeded its overall deadline.');
+      return Math.max(1, Math.ceil(ms));
+    };
     const { identity } = this.config;
     const reviewVersion = this.store.reviewVersion(identity);
     const plan = this.store.getPlan(identity);
@@ -59,11 +77,12 @@ export class ReviewService {
     // HEAD changes in the user's repository are observed; no Git mutation is performed by the review service. Runner
     // commits move the head only through the Store, in the same transaction as their ledger entries, so there the
     // recorded head is read as it is: observing the user's HEAD would record its older commit and roll the task back.
-    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD');
+    const history = readHistory(reviewed.path, snapshot.base, reviewed.runnerOwned ? snapshot.head : 'HEAD',
+      { maxDurationMs: remaining() });
     if (history.head !== snapshot.head) snapshot = this.store.recordHistory(identity, { revision: plan.revision, snapshotId: snapshot.id, reviewVersion }, history.base, history.head, []);
     const pathKey = this.#pathKey;
     const ledger = this.store.getLedger(identity);
-    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey, {},
+    const raw = linkHistory(plan, history, this.store.ownership(identity, plan.revision), pathKey, { maxDurationMs: remaining() },
       new Set(ledger.filter(entry => entry.conflictResolved).map(entry => entry.sha)));
     const saved = this.store.getReview(identity), keys = choiceKeys(raw, identity);
     const deltas = new Map(history.final.map(file => [JSON.stringify([file.newPath ?? file.oldPath, file.oldPath]), file]));
@@ -150,22 +169,36 @@ export class ReviewService {
         if (executionUnapproved.has(item.id)) reasons.push('Execution approval is out of date');
         if (!reasons.length) reasons.push('Code or plan definition changed');
       }
+      let tests: string;
+      try {
+        const commands = item.acceptance.filter(check => check.type === 'cmd').map(check => commandArgv(check.text));
+        tests = commands.length
+          ? this.store.commandChecksPassed(identity, item.id, snapshot.head, commandDigest(commands)) ? '✓ Passed' : '– Not run'
+          : '– No tests defined';
+      } catch (error) {
+        // Plans imported before exact command spawning rejected malformed Unicode may contain an escaped lone surrogate.
+        // Keep the review repairable while making the legacy command visibly and durably non-passing.
+        if (!(error instanceof PlanError)) throw error;
+        tests = '✕ Invalid command';
+      }
       return { ...item, state: states[item.id], count: owned.length, ambiguousCount: ambiguous, reasons, before, staleKey: staleKey(item),
-        checks: { attributed: ambiguous ? `! ${ambiguous} ambiguous` : owned.length ? '✓ Attributed' : '– No changes', scope: outside.length ? `✕ ${new Set(outside).size} out of scope` : owned.length ? '✓ In scope' : '– No changes', tests: item.acceptance.some(check => check.type === 'cmd') ? '– Not run' : '– No tests defined', ai: '– Not run' }, outside: [...new Set(outside)],
+        checks: { attributed: ambiguous ? `! ${ambiguous} ambiguous` : owned.length ? '✓ Attributed' : '– No changes', scope: outside.length ? `✕ ${new Set(outside).size} out of scope` : owned.length ? '✓ In scope' : '– No changes', tests, ai: '– Not run' }, outside: [...new Set(outside)],
       };
     });
     const token = createHash('sha256').update(JSON.stringify({ expected, saved, plan, segments })).digest('hex');
+    remaining();
     return { repository: basename(this.config.repository), demo: this.config.demo ?? false, plan, snapshot, expected, token, items, segments, notes, approved: items.filter(item => item.state === 'approved').length };
   }
   /** The trusted plan context for import and Apply, or for a continuation at an audited runner head. */
   planContextAt(head?: string): PlanContext {
-    const { identity, repository } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const { identity } = this.config, plan = this.store.getPlan(identity), snapshot = this.store.getSnapshot(identity);
+    const repository = this.reviewRepository().path;
     const pathKey = this.#pathKey;
     // Hardened like every repository Git call (#82, #83): no replace objects, hooks, network or inherited environment.
     const treeHead = head ?? snapshot.base;
     if (head && !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(head)) throw new Error('Expected a full checkpoint head.');
     const git = (args: string[], maxBuffer?: number) => execFileSync('git', [...HARDENED_GIT_OPTIONS, ...args], {
-      cwd: head ? this.reviewRepository().path : repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer,
+      cwd: repository, env: hardenedGitEnvironment(), encoding: 'utf8', maxBuffer,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     if (this.#baseEntries?.base !== treeHead) {
@@ -180,7 +213,8 @@ export class ReviewService {
     }
     // Copies: callers own what they are given, and the cached listing stays as Git reported it.
     const baseEntries = this.#baseEntries.entries.map(entry => ({ ...entry }));
-    return { identity, issue: plan.issue, baseEntries, pathKey, allowedCommands: [] };
+    return { identity, issue: plan.issue, baseEntries, pathKey,
+      allowedCommands: (this.config.allowedCommands ?? []).map(argv => [...argv]) };
   }
   planContext(): PlanContext { return this.planContextAt(); }
   /** When a checkpoint exists, edits are validated against the audited task head and completed work is excluded. */

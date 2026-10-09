@@ -78,6 +78,18 @@ export function publishActionResponse(record: PublishRecord) {
   return { outcome: record.outcome, draft: record.draft, message: record.message, ...(record.action ? { action: record.action } : {}), ...(record.reconcile ? { reconcile: true } : {}), ...(record.number === undefined ? {} : { number: record.number }),
     ...(record.url === undefined ? {} : { url: record.url }) };
 }
+export interface PreMergeActionResult {
+  state: 'ready' | 'review-required' | 'failed';
+  base: string; head: string; checked: readonly string[]; reason: string | null;
+}
+export interface PreMergeReadiness {
+  stateVersion: number; reviewVersion: number; snapshotId: string; base: string; head: string; commandPolicyDigest: string;
+}
+export const MAX_REWRITE_LINEAGE_ROWS = 1_000;
+/** What a completed `prepare-merge` action replays after its background coordinator settles. */
+export function preMergeActionResponse(result: PreMergeActionResult) {
+  return { outcome: result.state, base: result.base, head: result.head, checked: result.checked, reason: result.reason };
+}
 export interface TaskRecord {
   planKey: string; status: TaskStatus; stateVersion: number; contextGeneration: number; assignmentId: string; referencedCodeHash: string;
   currentAttemptId: string | null; requeuePending: boolean; cancelRequested: string | null; rebaseInProgress: unknown; budgetDeadline: number | null;
@@ -503,7 +515,8 @@ export class Store {
    * task's PRs may be in flight.
    */
   beginMergeAttempt(identity: PlanIdentity, expected: ReviewState & { reviewVersion: number }, reviewedHead: string, queueWatermark: string | null = null, kind: MergeAttempt['kind'] = 'queue', actionId: string | null = null, expectedTaskStateVersion: number | null = null,
-    target: { pullRequest: number; openingId: string | null } | null = null): MergeAttempt {
+    target: { pullRequest: number; openingId: string | null } | null = null, requirePreparation = false,
+    commandPolicyDigest: string | null = null): MergeAttempt {
     sha(reviewedHead);
     if (target !== null && (!Number.isSafeInteger(target.pullRequest) || target.pullRequest < 1 || (target.openingId !== null && typeof target.openingId !== 'string')))
       throw new Error('Invalid merge target.');
@@ -524,6 +537,11 @@ export class Store {
       if (!MERGEABLE_STATUSES.includes(task.status as TaskStatus)) throw new GuardRefusal(`The task is ${task.status}; merge it from review.`);
       if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is still active for this task; it cannot be merged.');
       if (expectedTaskStateVersion !== null && task.state_version !== expectedTaskStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
+      if (requirePreparation && !this.preMergeReady(identity, {
+        stateVersion: task.state_version as number, reviewVersion: expected.reviewVersion,
+        snapshotId: expected.snapshotId, base: this.getSnapshot(identity).base, head: reviewedHead,
+        commandPolicyDigest: commandPolicyDigest ?? '',
+      })) throw new GuardRefusal('Pre-merge preparation has not completed for the current review. Prepare the merge again.');
       const current = this.getMergeAttempt(identity);
       if (current?.state === 'submitting' || current?.state === 'queued') throw new Error('A merge-queue attempt is already active.');
       if (current?.state === 'merged') throw new Error('The reviewed pull request is already merged.');
@@ -989,6 +1007,43 @@ export class Store {
     this.getSnapshot(identity, snapshotId);
     return this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=? AND snapshot_id=? ORDER BY old_sha').all(identityKey(identity), snapshotId).map(row => ({ oldSha: row.old_sha as string, newSha: row.new_sha as string }));
   }
+  /** Whether `descendant` was produced by one or more durable rebase mappings from `ancestor`. */
+  isRewrittenHead(identity: PlanIdentity, ancestor: string, descendant: string): boolean {
+    sha(ancestor); sha(descendant);
+    const reverse = new Map<string, Set<string>>();
+    for (const row of this.#rewriteLineage(identity)) {
+      const prior = reverse.get(row.new_sha as string) ?? new Set<string>();
+      prior.add(row.old_sha as string); reverse.set(row.new_sha as string, prior);
+    }
+    const pending = [descendant], seen = new Set(pending);
+    while (pending.length) for (const prior of reverse.get(pending.pop()!) ?? []) {
+      if (prior === ancestor) return true;
+      if (!seen.has(prior)) { seen.add(prior); pending.push(prior); }
+    }
+    return false;
+  }
+  /** Durable predecessors of a rewritten commit, nearest first, across every retained rebase mapping. */
+  rewrittenAncestors(identity: PlanIdentity, descendant: string): string[] {
+    sha(descendant);
+    const reverse = new Map<string, Set<string>>();
+    for (const row of this.#rewriteLineage(identity)) {
+      const prior = reverse.get(row.new_sha as string) ?? new Set<string>();
+      prior.add(row.old_sha as string); reverse.set(row.new_sha as string, prior);
+    }
+    const answer: string[] = [], pending = [descendant], seen = new Set(pending);
+    for (let index = 0; index < pending.length; index++) for (const prior of reverse.get(pending[index]!) ?? []) if (!seen.has(prior)) {
+      seen.add(prior); answer.push(prior); pending.push(prior);
+    }
+    return answer;
+  }
+  /** A bounded safety scan: truncating rewrite evidence could misclassify a remote head as safe. */
+  #rewriteLineage(identity: PlanIdentity): { old_sha: string; new_sha: string }[] {
+    const rows = this.#db.prepare('SELECT old_sha,new_sha FROM rewrites WHERE key=? ORDER BY rowid DESC LIMIT ?')
+      .all(identityKey(identity), MAX_REWRITE_LINEAGE_ROWS + 1);
+    if (rows.length > MAX_REWRITE_LINEAGE_ROWS)
+      throw new GuardRefusal(`Rewrite lineage exceeds the ${MAX_REWRITE_LINEAGE_ROWS}-row safety limit; start a fresh review before preparing a merge.`);
+    return rows as { old_sha: string; new_sha: string }[];
+  }
   /** Values must be computed by the runner from this exact revision/snapshot, never supplied by a browser. */
   saveReview(identity: PlanIdentity, expected: ReviewState, approvals: readonly Approval[], choices: readonly SegmentChoice[]): void {
     const key = identityKey(identity);
@@ -1058,7 +1113,7 @@ export class Store {
   /** Before execution, approvals belong to the current snapshot; after a completed item, this revision's approvals survive its own commits. */
   unapprovedExecutionItems(identity: PlanIdentity, revision: number): string[] {
     const key = identityKey(identity), plan = this.getPlan(identity, revision);
-    const snapshotId = this.getSnapshot(identity).id, review = this.getReview(identity);
+    const currentSnapshot = this.getSnapshot(identity), snapshotId = currentSnapshot.id, review = this.getReview(identity);
     // An approval inherited across runner commits must come from the context of the completed prefix, not merely from
     // this revision. Otherwise A -> unrelated B approval -> A could reuse B's approval when the prefix-head guard passes.
     const completedAt: Record<string, string> = Object.create(null);
@@ -1089,11 +1144,20 @@ export class Store {
         }
       }
     }
-    const reviewedExecutionSnapshot = (value: ReviewState) => value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId);
+    const reviewedExecutionSnapshot = (value: ReviewState) => {
+      if (value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId)) return true;
+      // Head-based evidence carries approvals only across a completed prefix's own output and its validated rewrites.
+      // Before execution this gate does not compare fingerprints, so approvals stay bound to the current snapshot.
+      if (prefixSnapshots.size === 0) return false;
+      const evidenceHead = this.getSnapshot(identity, value.snapshotId).head;
+      return evidenceHead === currentSnapshot.head || this.isRewrittenHead(identity, evidenceHead, currentSnapshot.head);
+    };
     // A later attribution choice changes the material reviewed by at least one item. Without rebuilding Git history on a
     // status poll, conservatively require approvals recorded after the latest such choice for this execution context.
+    // Every choice for this revision counts, whatever its snapshot: approvals can survive head moves (equal or rewritten
+    // heads, completed prefixes), so a choice made on a snapshot that a later head replaced must still invalidate them.
     let latestChoiceVersion = -1;
-    for (const choice of review.choices) if (choice.revision === revision && (prefixSnapshots.size > 0 || choice.snapshotId === snapshotId)) {
+    for (const choice of review.choices) if (choice.revision === revision) {
       if (choice.reviewVersion === undefined) latestChoiceVersion = Number.MAX_SAFE_INTEGER;
       else if (choice.reviewVersion > latestChoiceVersion) latestChoiceVersion = choice.reviewVersion;
     }
@@ -1199,8 +1263,12 @@ export class Store {
       head = result.head;
       completed.push(row.item);
     }
-    if (head !== this.getSnapshot(identity).head)
-      throw new GuardRefusal('The task head no longer ends at the audited completed prefix.');
+    const currentHead = this.getSnapshot(identity).head;
+    if (head !== currentHead) {
+      if (!this.isRewrittenHead(identity, head, currentHead))
+        throw new GuardRefusal('The task head no longer ends at the audited completed prefix.');
+      head = currentHead;
+    }
     return { checkpoint, completed, completedDefinitions, head };
   }
   /** Reconcile audited completion against the current or proposed plan definition. */
@@ -1243,7 +1311,10 @@ export class Store {
     const revision = this.getPlan(identity).revision;
     const snapshotId = this.continuationApproval(identity, progress.checkpoint.id, revision);
     if (!snapshotId) return false;
-    if (snapshotId === this.getSnapshot(identity).id) return true;
+    const currentSnapshot = this.getSnapshot(identity);
+    const approvedHead = this.getSnapshot(identity, snapshotId).head;
+    if (snapshotId === currentSnapshot.id || approvedHead === currentSnapshot.head
+      || this.isRewrittenHead(identity, approvedHead, currentSnapshot.head)) return true;
     let head = this.getSnapshot(identity, snapshotId).head, advanced = false;
     const key = identityKey(identity), origin = this.#get(`SELECT rowid FROM attempts WHERE plan_key=? AND kind='execute' AND state='completed'
       AND item=? AND json_extract(context,'$.planRevision')=? AND json_extract(result,'$.head')=? ORDER BY rowid DESC LIMIT 1`,
@@ -1656,7 +1727,8 @@ export class Store {
     try {
       return this.#transaction((): AttemptRecord => {
         const task = this.#task(key);
-        if (task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
+        const reviewCheck = input.kind === 'check' && MERGEABLE_STATUSES.includes(task.status as TaskStatus);
+        if (!reviewCheck && task.status !== 'running' && task.status !== 'queued') throw new GuardRefusal(`The task is ${task.status}; it cannot start work.`);
         if (task.state_version !== input.expectedStateVersion) throw new GuardRefusal('Stale task state. Reload before writing.');
         // Requeue claim: exactly one path (I3's requeue, or the user's Resume) clears it, by CAS in this admitting transaction.
         if (task.requeue_pending === 1 && !input.claimRequeue) throw new GuardRefusal('Recovery is requeueing this task.');
@@ -1665,8 +1737,9 @@ export class Store {
         if (this.#activeAttempt(key)) throw new GuardRefusal('An attempt is already active for this task.');
         if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
         if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
-        // The whole-task budget (null until it starts) ends admission: the task waits for a person (time-limit mapping).
-        if (task.budget_deadline !== null && (task.budget_deadline as number) <= now)
+        // The code-writing task budget (null until execution starts) ends execution admission. Review checks have their
+        // own exact-head deadline and must remain runnable after implementation ends.
+        if (!reviewCheck && task.budget_deadline !== null && (task.budget_deadline as number) <= now)
           throw new RefusalWithEffect('The task time budget has run out; it needs a person.', expire);
         const current = this.#contextOf(key);
         if (!sameContext(input.expectedContext, current)) throw new GuardRefusal('The plan, snapshot, assignment or referenced code changed. Reload before starting.');
@@ -1680,7 +1753,8 @@ export class Store {
         const id = randomUUID(), created = new Date(now).toISOString();
         this.#run(`INSERT INTO attempts (id,plan_key,kind,phase,item,state,context,deadline,created_at) VALUES (?,?,?,?,?,'pending',?,?,?)`,
           id, key, input.kind, ATTEMPT_PHASES[input.kind], input.item ?? null, encode(current), input.deadline, created);
-        this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', requeue_pending=0, budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
+        if (reviewCheck) this.#run('UPDATE tasks SET current_attempt_id=? WHERE plan_key=?', id, key);
+        else this.#run(`UPDATE tasks SET current_attempt_id=?, status='running', requeue_pending=0, budget_deadline=COALESCE(budget_deadline, ?) WHERE plan_key=?`, id, now + budgetMs, key);
         this.#touch(key);
         return this.getAttempt(identity, id);
       });
@@ -1695,7 +1769,18 @@ export class Store {
     if (!FIRST_REASONS.includes(reason)) throw new GuardRefusal('Unknown stop reason.');
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const changed = this.#run(`UPDATE attempts SET first_reason=? WHERE plan_key=? AND id=? AND state IN ('pending','running') AND first_reason IS NULL`, reason, key, id).changes === 1;
+      const changed = this.#run(`UPDATE attempts SET first_reason=? WHERE plan_key=? AND id=?
+        AND state IN ('pending','running') AND first_reason IS NULL AND stop_reason IS NULL`, reason, key, id).changes === 1;
+      if (changed) this.#touch(key);
+      return changed;
+    });
+  }
+  /** Persist an invocation-owned timeout without recasting it as a user, shutdown, stale, or task-budget stop. */
+  recordAttemptTimeout(identity: PlanIdentity, id: string): boolean {
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      const changed = this.#run(`UPDATE attempts SET stop_reason='timeout' WHERE plan_key=? AND id=?
+        AND state IN ('pending','running') AND first_reason IS NULL AND stop_reason IS NULL`, key, id).changes === 1;
       if (changed) this.#touch(key);
       return changed;
     });
@@ -1704,7 +1789,8 @@ export class Store {
   markRunning(identity: PlanIdentity, id: string): boolean {
     const key = identityKey(identity);
     return this.#transaction(() => {
-      const changed = this.#run(`UPDATE attempts SET state='running', started_at=? WHERE plan_key=? AND id=? AND state='pending' AND first_reason IS NULL
+      const changed = this.#run(`UPDATE attempts SET state='running', started_at=? WHERE plan_key=? AND id=? AND state='pending'
+        AND first_reason IS NULL AND stop_reason IS NULL
         AND id=(SELECT current_attempt_id FROM tasks WHERE plan_key=?)`, new Date().toISOString(), key, id, key).changes === 1;
       if (changed) this.#touch(key);
       return changed;
@@ -1729,7 +1815,8 @@ export class Store {
       let outcome = classifySettlement({ ...settlement, firstReason, contextCurrent });
       if (outcome.state === 'completed' && row.state !== 'running') throw new GuardRefusal('Only a running attempt can complete.');
       // The task must still be running; a task never leaves running while an attempt is active, so this is a second safeguard.
-      if (outcome.state === 'completed' && (task.status !== 'running' || task.cancel_requested !== null))
+      const reviewCheck = row.kind === 'check' && MERGEABLE_STATUSES.includes(task.status as TaskStatus);
+      if (outcome.state === 'completed' && ((!reviewCheck && task.status !== 'running') || task.cancel_requested !== null))
         outcome = { state: 'cancelled', reason: this.#closed(task.status) || task.cancel_requested !== null
           ? 'The task was closed before the result was saved.' : 'The task left the running state before the result was saved.', timeLimit: false };
       let result: string | null = null;
@@ -1757,6 +1844,20 @@ export class Store {
       return outcome;
     });
   }
+  /** Passing evidence for exactly this item, head and command list. Interrupted, failed, stale and older-head rows do not count. */
+  commandChecksPassed(identity: PlanIdentity, item: string, head: string, commandsDigest: string): boolean {
+    sha(head);
+    if (!/^[a-f0-9]{64}$/.test(commandsDigest)) throw new Error('Invalid command-check digest.');
+    // The latest attempt for this item and materialized head is authoritative. A later failure, cancellation or
+    // interruption must invalidate an older pass even though terminal failures deliberately carry no result payload.
+    const row = this.#get(`SELECT a.state, a.result FROM attempts a JOIN snapshots s
+      ON s.key=a.plan_key AND s.id=json_extract(a.context,'$.snapshotId')
+      WHERE a.plan_key=? AND a.kind='check' AND a.item=? AND json_extract(s.data,'$.head')=?
+      ORDER BY a.rowid DESC LIMIT 1`, identityKey(identity), item, head);
+    if (!row || row.state !== 'completed' || typeof row.result !== 'string') return false;
+    const result = decode<Record<string, unknown>>(row.result);
+    return result.passed === true && result.head === head && result.commandsDigest === commandsDigest;
+  }
   /** Cancel task: closes now, or, with an active attempt, stops it first and closes when it settles. */
   cancelTask(identity: PlanIdentity, expectedStateVersion: number, actionId: string): 'closed' | 'stopping' {
     assertUuidV4(actionId, 'Action ID');
@@ -1777,7 +1878,7 @@ export class Store {
       }
       if (!active) { this.#closeTask(key, 'cancelled', actionId); return 'closed'; }
       if (task.cancel_requested !== null) throw new GuardRefusal('The task is already being cancelled.');
-      this.#run(`UPDATE attempts SET first_reason='cancelled' WHERE id=? AND first_reason IS NULL`, active.id!);
+      this.#run(`UPDATE attempts SET first_reason='cancelled' WHERE id=? AND first_reason IS NULL AND stop_reason IS NULL`, active.id!);
       this.#run('UPDATE tasks SET cancel_requested=? WHERE plan_key=?', actionId, key);
       this.#touch(key);
       return 'stopping';
@@ -1798,9 +1899,15 @@ export class Store {
       this.#run('INSERT INTO user_actions VALUES (?,?,?,?,?,?)', key, action.actionId, action.kind, hash, response, new Date().toISOString());
     };
     let replaying = false;
+    let restarting = false;
     try {
       return this.#transaction(() => {
         const prior = saved(); if (prior) { replaying = true; return prior; }
+        // A background storage failure leaves a tombstone: it blocks older preparation readiness while validation is
+        // retried, and is replaced atomically by this same request rather than exposed as a replay.
+        restarting = this.#run(`DELETE FROM user_actions WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+          AND request_hash=? AND json_extract(response,'$.ok')=1
+          AND json_extract(response,'$.value.outcome')='resendable'`, key, action.actionId, hash).changes === 1;
         const outer = this.#action;
         this.#action = { key, actionId: action.actionId };
         let value: T;
@@ -1813,6 +1920,9 @@ export class Store {
       if (!replaying && !storage && !(error instanceof ActionIdReused) && !(error instanceof BadRequest) && this.#depth === 0) {
         const message = error instanceof Error ? bounded(error.message) : 'Refused.';
         this.#transaction(() => {
+          if (restarting) this.#run(`DELETE FROM user_actions WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+            AND request_hash=? AND json_extract(response,'$.ok')=1
+            AND json_extract(response,'$.value.outcome')='resendable'`, key, action.actionId, hash);
           if (!this.#get('SELECT 1 FROM user_actions WHERE plan_key=? AND action_id=?', key, action.actionId))
             record({ ok: false, error: message, ...(error instanceof UpstreamFailure ? { kind: 'upstream' } : {}) });
           if (error instanceof RefusalWithEffect) error.effect();
@@ -1830,9 +1940,65 @@ export class Store {
     const row = this.#get('SELECT * FROM user_actions WHERE plan_key=? AND action_id=?', identityKey(identity), action.actionId);
     if (!row) return undefined;
     if (row.request_hash !== requestHash(action.kind, action.request)) throw new ActionIdReused('Action ID already used for a different request.');
-    const outcome = decode<{ ok: boolean; value?: T; error?: string; kind?: string }>(row.response);
+    const outcome = decode<{ ok: boolean; value?: T & { outcome?: unknown }; error?: string; kind?: string }>(row.response);
+    if (row.kind === 'prepare-merge' && outcome.ok && outcome.value?.outcome === 'resendable') return undefined;
     if (!outcome.ok) throw outcome.kind === 'upstream' ? new UpstreamFailure(outcome.error!) : new GuardRefusal(outcome.error!);
     return { response: outcome.value as T, replayed: true };
+  }
+  /** Settle the exact admitted pre-merge action so retry/restart replay never remains at `preparing`. */
+  settlePreMergeAction(identity: PlanIdentity, actionId: string, result: PreMergeActionResult,
+    readiness: PreMergeReadiness | null = null): PreMergeActionResult {
+    assertUuidV4(actionId, 'Action ID');
+    const key = identityKey(identity);
+    return this.#transaction(() => {
+      let effective = result;
+      if (result.state === 'ready') {
+        const task = this.#task(key), current = this.#current(key), snapshot = this.getSnapshot(identity);
+        if (!readiness || task.state_version !== readiness.stateVersion || current.review_version !== readiness.reviewVersion
+          || current.snapshot_id !== readiness.snapshotId || snapshot.base !== readiness.base || snapshot.head !== readiness.head
+          || result.base !== readiness.base || result.head !== readiness.head
+          || !/^[a-f0-9]{64}$/.test(readiness.commandPolicyDigest)) {
+          effective = { ...result, state: 'review-required', reason: 'The task or review changed before preparation readiness was recorded. Prepare the merge again.' };
+          readiness = null;
+        }
+      }
+      const response = encode({ ok: true, value: preMergeActionResponse(effective), ...(readiness ? { preMergeReadiness: readiness } : {}) });
+      if (response.length > 65536) throw new Error('Action response is too large to record.');
+      const changed = this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+        AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+        response, key, actionId).changes;
+      if (changed !== 1) throw new Error('The pre-merge action no longer owns settlement.');
+      return effective;
+    });
+  }
+  /**
+   * A background preparation whose terminal write failed applied no durable readiness. Replace only its still-pending
+   * placeholder with a tombstone so the same key can be resent without revealing an older ready preparation.
+   */
+  makePreMergeActionResendable(identity: PlanIdentity, actionId: string): boolean {
+    assertUuidV4(actionId, 'Action ID');
+    return this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND action_id=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+      encode({ ok: true, value: { outcome: 'resendable' } }), identityKey(identity), actionId).changes === 1;
+  }
+  /** The latest preparation action is authoritative and must match every current local generation and the exact pair. */
+  preMergeReady(identity: PlanIdentity, readiness: PreMergeReadiness): boolean {
+    if (!/^[a-f0-9]{64}$/.test(readiness.commandPolicyDigest)) return false;
+    const row = this.#get(`SELECT response FROM user_actions WHERE plan_key=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 ORDER BY rowid DESC LIMIT 1`,
+      identityKey(identity));
+    if (!row) return false;
+    const saved = decode<{ ok?: unknown; value?: { outcome?: unknown }; preMergeReadiness?: PreMergeReadiness }>(row.response);
+    return saved.ok === true && saved.value?.outcome === 'ready' && stable(saved.preMergeReadiness) === stable(readiness);
+  }
+  /** Startup recovery makes an interrupted preparation definite and replayable before new work is admitted. */
+  settleInterruptedPreMergeActions(identity: PlanIdentity): void {
+    const snapshot = this.getSnapshot(identity);
+    const result: PreMergeActionResult = { state: 'failed', base: snapshot.base, head: snapshot.head, checked: [],
+      reason: 'The server restarted before pre-merge preparation completed. Start a new preparation.' };
+    this.#run(`UPDATE user_actions SET response=? WHERE plan_key=? AND kind='prepare-merge'
+      AND json_extract(response,'$.ok')=1 AND json_extract(response,'$.value.outcome')='preparing'`,
+      encode({ ok: true, value: preMergeActionResponse(result) }), identityKey(identity));
   }
   /** Append one feedback event. Call inside userAction so the event and its action share one transaction. */
   recordFeedback(identity: PlanIdentity, actionId: string, event: { kind: Exclude<FeedbackKind, 'task-closed'>; item?: string | null; text?: string | null; sourceRef: string; supersedes?: string | null; supersedeLatest?: boolean }): FeedbackEvent {
@@ -2303,7 +2469,7 @@ export class Store {
       const key = row.plan_key as string, task = this.#task(key);
       const contextCurrent = sameContext(decode<InvocationContext>(row.context), this.#contextOf(key));
       let firstReason = row.first_reason as FirstReason | null;
-      if (firstReason === null && contextCurrent && task.budget_deadline !== null && now >= (task.budget_deadline as number)) firstReason = 'time-limit';
+      if (row.kind !== 'check' && firstReason === null && contextCurrent && task.budget_deadline !== null && now >= (task.budget_deadline as number)) firstReason = 'time-limit';
       const deadlinePassed = firstReason === null && now >= (row.deadline as number);
       const outcome = classifySettlement({
         firstReason, contextCurrent, exitCode: null, valid: false,
@@ -2324,7 +2490,7 @@ export class Store {
         const status = this.#task(key).status as string;
         const interrupted = outcome.state === 'failed' && (outcome.reason ?? '').startsWith('Interrupted');
         const shutdown = outcome.state === 'cancelled' && firstReason === 'shutdown';
-        if (!this.#closed(status) && !gated.includes(status) && (interrupted || shutdown)) {
+        if (row.kind !== 'check' && !this.#closed(status) && !gated.includes(status) && (interrupted || shutdown)) {
           this.#run('UPDATE tasks SET requeue_pending=1 WHERE plan_key=?', key); requeued = true;
         }
         this.#touch(key);

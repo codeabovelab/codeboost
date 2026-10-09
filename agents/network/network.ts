@@ -10,6 +10,7 @@ import { runTrackedDocker, runTrackedProcess, type ProcessGroupLifecycle } from 
 export const VENDOR_HOSTS = Object.freeze({
   claude: Object.freeze(['api.anthropic.com']),
   codex: Object.freeze(['api.openai.com', 'chatgpt.com']),
+  runner: Object.freeze([]),
 } satisfies Record<InvocationInput['vendor'], readonly string[]>);
 
 export interface VendorNetwork {

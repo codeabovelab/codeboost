@@ -63,6 +63,8 @@ export interface ConflictResolverOptions {
   readonly image: () => string;
   readonly token: string;
   readonly limits: TaskStorageLimits;
+  /** Fresh authorization re-read immediately before the credentialed conflict agent launches. */
+  readonly authorize?: (signal: AbortSignal) => Promise<() => void | Promise<void>>;
   readonly deps?: Partial<ResolverDeps>;
 }
 export type ForeignConflictResolverOptions = ConflictResolverOptions;
@@ -260,11 +262,11 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
       if (remaining < 1) throw deadlineError();
       return remaining;
     };
-    const bounded = async <T>(operation: Promise<T>): Promise<T> => {
+    // Takes a thunk so no operation (including caller-supplied hooks) starts before the deadline check and timer exist.
+    const bounded = async <T>(begin: () => Promise<T>): Promise<T> => {
       const remaining = Math.floor(deadline - performance.now());
       if (remaining < 1) {
         retainOwnership = true;
-        void operation.catch(() => { /* durable recovery owns any late result */ });
         throw new RebaseResourcesUnsettled('Conflict child settlement exceeded the rebase work deadline.');
       }
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -275,6 +277,7 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
           reject(new RebaseResourcesUnsettled('Conflict child settlement exceeded the rebase work deadline.'));
         }, remaining);
       });
+      const operation = new Promise<T>(resolve => resolve(begin()));
       try { return await Promise.race([operation, expired]); }
       finally {
         if (timer) clearTimeout(timer);
@@ -288,22 +291,22 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
       // Profile creation accepts only a canonical cleanup root. Preserve the UUID leaf while resolving any configured
       // root aliases (for example macOS /var -> /private/var) before handing the path across subsystem boundaries.
       staging = realpathSync(staging);
-      const clone = await bounded(deps.clone({ source: options.repository.path, parent: staging,
+      const clone = await bounded(() => deps.clone({ source: options.repository.path, parent: staging,
         taskId: options.planKey, head: input.baseHead, timeoutMs: operationBudget(), signal: input.signal, processLifecycle }));
       const conflictSnapshot = snapshotConflictPaths(input.repository, input.files);
       try {
-        filesystems = await bounded(deps.allocate(clone, options.limits, imageId,
+        filesystems = await bounded(() => deps.allocate(clone, options.limits, imageId,
           { runnerOwner: options.runnerOwner, attemptId: childAttemptId, allocationId },
           { signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
       } catch (error) {
         if (error instanceof AggregateError) retainOwnership = true;
         throw error;
       }
-      await bounded(deps.importPaths(filesystems, conflictSnapshot, MAX_CONFLICT_SNAPSHOT_BYTES,
+      await bounded(() => deps.importPaths(filesystems!, conflictSnapshot, MAX_CONFLICT_SNAPSHOT_BYTES,
         { imageId, signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
-      const links = await bounded(deps.snapshotLinks(filesystems!, input.files,
+      const links = await bounded(() => deps.snapshotLinks(filesystems!, input.files,
         { imageId, signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
-      const treeCheck: TaskTreeCheck = await bounded(deps.checkTree(filesystems!,
+      const treeCheck: TaskTreeCheck = await bounded(() => deps.checkTree(filesystems!,
         { base: input.baseHead, paths: input.files, imageId, signal: input.signal, processLifecycle,
           timeoutMs: operationBudget() }));
       const inputDirectory = join(staging, 'input');
@@ -319,13 +322,21 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
       const prompt = `Resolve source commit ${JSON.stringify(input.commit)} while it is replayed onto base commit ${JSON.stringify(input.baseHead)}. `
         + ownership + `Resolve the in-progress conflict in exactly these paths: ${JSON.stringify(input.files)}. `
         + 'Edit only those paths. Do not create commits or change repository metadata. Preserve the intent of both sides and leave each path in its final resolved form.';
+      if (options.authorize) {
+        const authorizationSignal = input.signal ?? new AbortController().signal;
+        const validate = await bounded(() => options.authorize!(authorizationSignal));
+        await bounded(async () => validate());
+        input.signal?.throwIfAborted();
+      }
       assertCurrentContext();
       handle = deps.start({ invocation, filesystems, inputDirectory, imageId, prompt,
         networkAllocationId, treeCheck, cleanupRoot: staging, processLifecycle }, options.token,
         { invocationBudget: operationBudget });
+      // The child is already running; if bounded() refuses before awaiting it, durable recovery owns any late result.
+      void handle.settled.catch(() => { /* durable recovery owns any late result */ });
       const cancel = () => handle!.cancel(stopReason(input.signal!));
       if (input.signal?.aborted) cancel(); else input.signal?.addEventListener('abort', cancel, { once: true });
-      const result = await bounded(handle.settled).finally(() => input.signal?.removeEventListener('abort', cancel));
+      const result = await bounded(() => handle!.settled).finally(() => input.signal?.removeEventListener('abort', cancel));
       if (processGroup !== null) {
         retainOwnership = true;
         throw new Error('The conflict resolver could not confirm settlement of its Docker client.');
@@ -338,10 +349,10 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
         throw new Error('The conflict resolver returned a result for another invocation.');
       if (result.exitCode !== 0 || result.stopReason) throw new Error(`The conflict resolver failed${result.stderr ? `: ${JSON.stringify(result.stderr.slice(0, 2048))}` : '.'}`);
       input.signal?.throwIfAborted();
-      const manifest = await bounded(deps.inspect(filesystems!, { base: input.baseHead, linkSnapshot: links,
+      const manifest = await bounded(() => deps.inspect(filesystems!, { base: input.baseHead, linkSnapshot: links,
         imageId, signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
       assertResolvedManifest(manifest, input.files);
-      const entries = await bounded(deps.exportPaths(filesystems!, input.files, MAX_CONFLICT_SNAPSHOT_BYTES,
+      const entries = await bounded(() => deps.exportPaths(filesystems!, input.files, MAX_CONFLICT_SNAPSHOT_BYTES,
         { imageId, signal: input.signal, processLifecycle, timeoutMs: operationBudget() }));
       input.signal?.throwIfAborted();
       if (entries.length !== input.files.length || entries.some((entry, index) => entry.path !== input.files[index]))
@@ -372,10 +383,10 @@ export function createConflictResolver(options: ConflictResolverOptions): (input
     const cleanup: unknown[] = [];
     if (handle && input.signal?.aborted) handle.cancel(stopReason(input.signal));
     if (filesystems && !retainOwnership) try {
-      await bounded(deps.remove(filesystems!, { processLifecycle, timeoutMs: operationBudget() }));
+      await bounded(() => deps.remove(filesystems!, { processLifecycle, timeoutMs: operationBudget() }));
     } catch (error) { cleanup.push(error); retainOwnership = true; }
     if (!retainOwnership) try {
-      await bounded(deps.removeStaging(staging, operationBudget(), processLifecycle));
+      await bounded(() => deps.removeStaging(staging, operationBudget(), processLifecycle));
     } catch (error) { cleanup.push(error); retainOwnership = true; }
     if (!cleanup.length && !retainOwnership) {
       try { options.store.clearRebaseConflict(options.planKey, input.attemptId, childAttemptId); }

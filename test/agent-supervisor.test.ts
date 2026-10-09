@@ -42,7 +42,7 @@ function fixture(schema = '{"probe":"codeboost-adapter-schema-marker"}\n') {
   return { root, input, clone, filesystems, auth };
 }
 function invocation(data: ReturnType<typeof fixture>, attemptId: string, deadlineMs = 2 * 60_000,
-  vendor: 'codex' | 'claude' = 'codex', phase: Phase = 'planning'): InvocationInput {
+  vendor: InvocationInput['vendor'] = 'codex', phase: Phase = 'planning'): InvocationInput {
   return captureInvocation({ runnerOwner: TEST_RUNNER_OWNER, clone: data.clone, phase, vendor, approvedArgv: [],
     deadline: Date.now() + deadlineMs, attemptId,
     context: { snapshotId: 'snapshot', planId: 'plan', planRevision: 1, assignmentId: 'assignment',
@@ -55,7 +55,8 @@ async function profile(data: ReturnType<typeof fixture>, probe: IsolationProbe,
   const policy = createPhasePolicy(captured);
   const network = await createVendorNetwork(captured, imageId, randomUUID());
   const value = await createContainerProfile({ invocation: captured, policy, network, filesystems: data.filesystems,
-    inputDirectory: data.input, command: createIsolationProbeCommand(policy, probe), imageId, codexAuthFile: data.auth,
+    inputDirectory: data.input, command: createIsolationProbeCommand(policy, probe), imageId,
+    ...(captured.vendor === 'codex' ? { codexAuthFile: data.auth } : {}),
     deferredOutput });
   profiles.push(value); return value;
 }
@@ -133,6 +134,43 @@ describe('container invocation supervisor', () => {
     expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.stderrBytes);
     expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.combinedBytes);
     expect(isInvocationActive(attemptId)).toBe(false);
+  }, 60_000);
+
+  it('drains finite command diagnostics past their capture limits without changing exit-0 success', async () => {
+    const data = fixture();
+    const result = await startProfileInvocation(
+      await profile(data, 'finite-large-output', invocation(data, 'bounded-command-diagnostics', 2 * 60_000, 'runner', 'review')),
+      { limits: { stdoutBytes: 64 * 1024, stderrBytes: 32 * 1024, combinedBytes: 96 * 1024 },
+        diagnosticOutput: true }).settled;
+    expect(result).toMatchObject({ exitCode: 0, signal: null });
+    expect(result.stopReason).toBeUndefined();
+    expect(Buffer.byteLength(result.stdout)).toBeLessThanOrEqual(64 * 1024);
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(32 * 1024);
+    expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(96 * 1024);
+    expect(result.stderr).toContain('[codeboost: command output truncated]');
+  }, 60_000);
+
+  it('keeps multibyte truncated command diagnostics inside the byte limit', async () => {
+    const data = fixture(), limits = { stdoutBytes: 1024, stderrBytes: 1024, combinedBytes: 1024 };
+    const result = await startProfileInvocation(await profile(data, 'finite-multibyte-output',
+      invocation(data, 'bounded-multibyte-command-diagnostics', 2 * 60_000, 'runner', 'review')),
+    { limits, diagnosticOutput: true }).settled;
+    expect(result).toMatchObject({ exitCode: 0, signal: null });
+    expect(result.stopReason).toBeUndefined();
+    expect(result.stderr).not.toContain('\uFFFD');
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.stderrBytes);
+    expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.combinedBytes);
+    expect(result.stderr).toContain('[codeboost: command output truncated]');
+  }, 60_000);
+
+  it('keeps invalid command diagnostics from changing exit-0 success', async () => {
+    const data = fixture();
+    const result = await startProfileInvocation(await profile(data, 'invalid-utf8-stderr',
+      invocation(data, 'lossy-command-diagnostics', 2 * 60_000, 'runner', 'review')),
+      { diagnosticOutput: true }).settled;
+    expect(result).toMatchObject({ exitCode: 0, signal: null });
+    expect(result.stopReason).toBeUndefined();
+    expect(result.stderr).toContain('bad-');
   }, 60_000);
 
   it('stops buffering deferred newline-free stderr after the limit is reached', async () => {

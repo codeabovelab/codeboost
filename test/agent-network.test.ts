@@ -222,9 +222,10 @@ describe('vendor-only egress', () => {
   }, 60_000);
 
   it('pins the host list with each vendor profile', async () => {
-    expect(VENDOR_HOSTS).toEqual({ claude: ['api.anthropic.com'], codex: ['api.openai.com', 'chatgpt.com'] });
+    expect(VENDOR_HOSTS).toEqual({ claude: ['api.anthropic.com'], codex: ['api.openai.com', 'chatgpt.com'], runner: [] });
     expect(Object.isFrozen(VENDOR_HOSTS.claude)).toBe(true);
     expect(Object.isFrozen(VENDOR_HOSTS.codex)).toBe(true);
+    expect(Object.isFrozen(VENDOR_HOSTS.runner)).toBe(true);
   });
 
   it('reaches the vendor through the proxy while blocking other and direct hosts', async () => {

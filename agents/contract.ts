@@ -21,7 +21,8 @@ export interface InvocationContext {
 export interface InvocationInput {
   readonly clone: TaskClone;
   readonly phase: Phase;
-  readonly vendor: 'claude' | 'codex';
+  /** `runner` executes only an exact runner-approved argv; it receives no provider credential or external egress. */
+  readonly vendor: 'claude' | 'codex' | 'runner';
   readonly approvedArgv: readonly (readonly string[])[];
   readonly deadline: number;
   readonly attemptId: string;
@@ -108,7 +109,7 @@ export function assertCapturedInvocation(input: InvocationInput): void {
 export function captureInvocation(input: InvocationInput, now = Date.now()): InvocationInput {
   if (!input || !input.clone || !input.context) throw new Error('Missing invocation context.');
   if (!['planning', 'questions', 'review', 'execute', 'fix'].includes(input.phase)
-    || !['claude', 'codex'].includes(input.vendor)) throw new Error('Unsupported invocation profile.');
+    || !['claude', 'codex', 'runner'].includes(input.vendor)) throw new Error('Unsupported invocation profile.');
   if (!isRunnerOwner(input.runnerOwner)) throw new Error('runnerOwner must be 32 lowercase hex characters.');
   if (!nonempty(input.attemptId) || !nonempty(input.clone.id) || !nonempty(input.clone.taskId)
     || !nonempty(input.clone.directory) || !/^(?:[a-f0-9]{40}|[a-f0-9]{64})$/.test(input.clone.head))

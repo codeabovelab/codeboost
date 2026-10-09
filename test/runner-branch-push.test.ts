@@ -61,6 +61,17 @@ const personPushes = (s: Setup, ref: string) => git(s.source, '-c', 'protocol.fi
 const remoteRefs = (s: Setup) => git(s.remote, 'for-each-ref', '--format=%(objectname) %(refname)');
 
 describe('GitBranchPusher', () => {
+  it('keeps exact remote commits reachable across runner-repository maintenance', async () => {
+    const s = await setup();
+    writeFileSync(join(s.source, 'remote.txt'), 'remote\n'); git(s.source, 'add', '.'); git(s.source, 'commit', '-qm', 'remote');
+    const head = git(s.source, 'rev-parse', 'HEAD');
+    git(s.source, '-c', 'protocol.file.allow=always', 'push', '-q', s.remote, `HEAD:refs/heads/main`);
+    await pusher(s).instance.fetchCommits([s.base, head]);
+    expect(git(s.repository.path, 'cat-file', '-t', head)).toBe('commit');
+    git(s.repository.path, 'reflog', 'expire', '--expire=now', '--all');
+    git(s.repository.path, 'gc', '--prune=now', '-q');
+    expect(git(s.repository.path, 'cat-file', '-t', head)).toBe('commit');
+  });
   it('creates the branch at the head, sending only that ref, and never writes the user\'s repository', async () => {
     const s = await setup(), head = await runnerCommit(s, 'one'), sourceRefs = git(s.source, 'for-each-ref');
     await pusher(s).instance.push(IDENTITY, { head, branch: BRANCH });
