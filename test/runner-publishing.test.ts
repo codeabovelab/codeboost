@@ -1369,7 +1369,7 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     };
     let writesClosed: boolean | undefined;
     const { close } = await serve(w, { issueGateway, preMerge: service => ({
-      get active() { return false; }, get last() { return null; }, assertStartable() {},
+      get active() { return false; }, get last() { return null; }, assertStartable() {}, settleAtStartup: async () => null,
       start: async () => { throw new Error('not used'); }, cancelTask: () => 'closed' as const,
       close: async () => { writesClosed = service.store.writesClosed; },
     } as unknown as PreMergeCoordinator) });
@@ -1387,7 +1387,7 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
     };
     let active = false, cancelId: string | undefined;
     const { app, identity, store } = await serve(w, { before: completeAll, issueGateway, preMerge: service => ({
-      get active() { return active; }, get last() { return null; }, assertStartable() {},
+      get active() { return active; }, get last() { return null; }, assertStartable() {}, settleAtStartup: async () => null,
       start: () => {
         active = true;
         return settle.promise.then(() => {

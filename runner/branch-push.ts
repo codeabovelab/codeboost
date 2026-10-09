@@ -123,12 +123,13 @@ export class GitBranchPusher implements BranchPusher {
       await this.#git(['update-ref', `refs/codeboost/remote-commits/${commit}`, commit], signal);
   }
 
-  async push(identity: PlanIdentity, input: { head: string; branch: string; beforePush?: MutationBoundary }, signal?: AbortSignal): Promise<void> {
+  async push(identity: PlanIdentity, input: { head: string; branch: string; expected?: string; beforePush?: MutationBoundary },
+    signal?: AbortSignal): Promise<void> {
     signal?.throwIfAborted();
     if (identity.repositoryId !== this.#config.repositoryId) throw new Error('The task belongs to another repository.');
     if (!COMMIT_ID.test(input.head)) throw new Error('A full commit ID is required.');
-    if (!BRANCH.test(input.branch) || input.branch.length > 255) throw new Error('Only a codeboost/ task branch can be pushed.');
-    const ref = `refs/heads/${input.branch}`;
+    if (input.expected !== undefined && !COMMIT_ID.test(input.expected)) throw new Error('A full commit ID is required.');
+    const ref = this.#ref(input.branch);
     // Git answers "<id> missing" for an absent object; any other failure (no repository, permissions) keeps Git's error.
     const found = await this.#git(['cat-file', '--batch-check=%(objectname) %(objecttype)'], signal, false, Buffer.from(`${input.head}\n`));
     if (found === `${input.head} missing`) throw new Error(`The runner repository has no commit ${input.head}.`);
@@ -136,9 +137,17 @@ export class GitBranchPusher implements BranchPusher {
     const remote = await this.#read(ref, signal);
     // Already there: a push whose outcome was lost, or a retry. Nothing to do.
     if (remote === input.head) return;
-    const owned = new Set(this.#config.ownedCommits(identity));
-    if (remote !== null && !owned.has(remote))
-      throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
+    // `expected` is the exact head a pre-merge rebase rewrote (F6 of #22). Its commits, a collaborator's included, live on
+    // in the rewritten head, so it alone may be overwritten: any other value, even a commit codeboost made, refuses.
+    if (input.expected !== undefined) {
+      if (remote !== input.expected)
+        throw new BranchPushRefused(`The branch ${input.branch} holds ${remote ?? 'nothing'}, not the rebased head ${input.expected}. Nothing was pushed.`);
+    } else {
+      // Read after the remote branch, every time, so a ledger written meanwhile is seen.
+      const owned = new Set(this.#config.ownedCommits(identity));
+      if (remote !== null && !owned.has(remote))
+        throw new BranchPushRefused(`The branch ${input.branch} holds commit ${remote}, which codeboost did not make. Nothing was pushed.`);
+    }
     signal?.throwIfAborted();
     const finalize = await input.beforePush?.();
     finalize?.();
@@ -153,6 +162,17 @@ export class GitBranchPusher implements BranchPusher {
     // A push that exits 0 does not prove the branch moved: read it back.
     const after = await this.#read(ref, signal);
     if (after !== input.head) throw new Error(`After the push, the branch ${input.branch} is at ${after ?? 'nothing'}, not ${input.head}.`);
+  }
+
+  /** The commit the task branch points at on the remote, or null when it does not exist. */
+  async readBranch(identity: PlanIdentity, branch: string, signal?: AbortSignal): Promise<string | null> {
+    if (identity.repositoryId !== this.#config.repositoryId) throw new Error('The task belongs to another repository.');
+    return this.#read(this.#ref(branch), signal);
+  }
+
+  #ref(branch: string): string {
+    if (!BRANCH.test(branch) || branch.length > 255) throw new Error('Only a codeboost/ task branch can be pushed.');
+    return `refs/heads/${branch}`;
   }
 
   /** The commit `ref` points at on the remote, or null when it does not exist. */

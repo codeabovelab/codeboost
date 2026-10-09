@@ -116,6 +116,8 @@ export async function startServer(config: ReviewConfig, port = 4318, questionAge
           validate: () => requireTrustedIssue(access),
         };
       });
+      // A push of a rewritten head left unsettled by a crash or shutdown blocks merging until a read of its branch.
+      void preMerge?.settleAtStartup();
       executor = new ItemExecutor(service.store, runner, assembly.sources, assembly.findings, { capability });
       // A demo never publishes, whatever its github block or an injected setup provides (setUpRunner refuses demos too).
       if (assembly.publisher && !config.demo) { const coordinator = runner; publishing = new TaskPublishing(service.store, assembly.publisher(() => coordinator.closing), runner, executor, capability, assembly.env, {

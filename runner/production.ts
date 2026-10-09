@@ -317,8 +317,8 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
       runnerCommandLauncher({ imageId, runnerRoot: config.root, runnerOwner }), review.allowedCommands ?? [], runnerOwner));
   const github = review.github;
   // Never a `url` here (#101 review, finding 6): the push goes to the configured repository on GH_HOST, from the runner's
-  // own repository. Only commits the ledger records as codeboost's may be overwritten. The F3 rebase foundation can
-  // write mapped foreign entries, but #22 does not wire their external push until its later durable-action slice.
+  // own repository. Publishing overwrites only commits the ledger records as codeboost's; pre-merge preparation overwrites
+  // only the exact head its durable rebase rewrote (F6 of #22).
   const pusher = new GitBranchPusher({ repository, repositoryId: identity.repositoryId, remote: github.repository, env: o.env as NodeJS.ProcessEnv,
     ownedCommits: requested => service.store.getLedger(requested).filter(entry => entry.origin === 'owned').map(entry => entry.sha) });
   // The same environment as the push, so the PR calls go to the same GH_HOST with the same credentials.
@@ -333,6 +333,10 @@ export async function setUpRunner(o: { service: ReviewService; capability: Shutd
     return new PreMergeCoordinator(service, runner, rebaser, {
       inspect,
       fetch: (pair, signal) => pusher.fetchCommits([pair.base, pair.head], signal),
+      // Leased to exactly the inspected head the rebase rewrote; the coordinator's durable marker brackets the write.
+      push: (input, signal) => pusher.push(identity, { head: input.to, branch: input.branch, expected: input.from,
+        beforePush: () => { input.beforePush(); } }, signal),
+      readBranch: (branch, signal) => pusher.readBranch(identity, branch, signal),
     }, undefined, o.capability, authorize);
   };
   return { deps, sources, findings, recovery, publisher, env, preMerge };

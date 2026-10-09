@@ -119,6 +119,33 @@ describe('GitBranchPusher', () => {
     expect(remoteRefs(s)).toBe(`${s.base} ${REF}`);
   });
 
+  it('with an expected head, overwrites exactly that commit, even one codeboost did not make', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'one');
+    personPushes(s, REF);
+    await pusher(s).instance.push(IDENTITY, { head, branch: BRANCH, expected: s.base });
+    expect(remoteRefs(s)).toBe(`${head} ${REF}`);
+  });
+
+  it('with an expected head, refuses any other value, even a commit codeboost made, and pushes nothing', async () => {
+    const s = await setup(), first = await runnerCommit(s, 'one'), second = await runnerCommit(s, 'two');
+    await pusher(s).instance.push(IDENTITY, { head: first, branch: BRANCH });
+    const p = pusher(s, { owned: () => [first] });
+    await expect(p.instance.push(IDENTITY, { head: second, branch: BRANCH, expected: s.base }))
+      .rejects.toThrow(`holds ${first}, not the rebased head ${s.base}`);
+    await expect(p.instance.push(IDENTITY, { head: second, branch: 'codeboost/absent-1', expected: s.base }))
+      .rejects.toThrow(BranchPushRefused);
+    expect(remoteRefs(s)).toBe(`${first} ${REF}`);
+  });
+
+  it('reads the task branch for push settlement, and null when it does not exist', async () => {
+    const s = await setup(), head = await runnerCommit(s, 'one'), p = pusher(s);
+    await expect(p.instance.readBranch(IDENTITY, BRANCH)).resolves.toBeNull();
+    await p.instance.push(IDENTITY, { head, branch: BRANCH });
+    await expect(p.instance.readBranch(IDENTITY, BRANCH)).resolves.toBe(head);
+    await expect(p.instance.readBranch(IDENTITY, 'main')).rejects.toThrow(/codeboost\/ task branch/);
+    await expect(p.instance.readBranch({ ...IDENTITY, repositoryId: 'other' }, BRANCH)).rejects.toThrow(/another repository/);
+  });
+
   it('refuses when the branch moves between the read and the push: the lease is the value read', async () => {
     const s = await setup(), first = await runnerCommit(s, 'one'), second = await runnerCommit(s, 'two');
     await pusher(s).instance.push(IDENTITY, { head: first, branch: BRANCH });

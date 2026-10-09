@@ -313,6 +313,25 @@ describe('the merge gate with a runner block (#121)', () => {
     expect(gh.merged).toEqual([]);
   });
 
+  it('gives pre-merge preparation the task PR\'s branch, the only one it may push a rewritten head to', async () => {
+    const { store } = published(), gh = github(store);
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PUBLISHED);
+    await expect(merges.remotePair()).resolves.toEqual({ base: oid(1), head: oid(2), branch: BRANCH });
+  });
+
+  it('names an unsettled push of the rewritten head as the preparation blocker', async () => {
+    const { store } = published(), gh = github(store);
+    const reviewed = () => ({ revision: 1, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    store.recordRebase(identity, reviewed(), oid(10), oid(12), [{ oldSha: oid(2), newSha: oid(12) }]);
+    store.beginPrePush(identity, reviewed(), store.getTask(identity).stateVersion, { branch: BRANCH, from: oid(2), to: oid(12) });
+    const merges = new MergeCoordinator(service(store), gh.client, undefined, undefined, PREPARED_PUBLISHED);
+    const blockers = (await merges.status()).blockers.filter(blocker => blocker.code === 'preparation');
+    expect(blockers).toEqual([{ code: 'preparation',
+      message: 'A push of the rewritten head has not settled. Prepare the merge again to read its outcome.' }]);
+    await expect(merges.merge('review-token')).rejects.toThrow();
+    expect(gh.merged).toEqual([]);
+  });
+
   it('refuses pre-merge preparation for a pull request that is no longer open', async () => {
     const { store } = published();
     const gh = github(store, () => ({ pullRequestState: 'CLOSED' }));
