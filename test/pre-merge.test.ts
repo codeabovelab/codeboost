@@ -70,6 +70,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   landBeforeFailure?: boolean;
   /** A later rebase's result (the first rebase always yields the fixture's `rebased`); `undefined` keeps the default. */
   rebaseResult?: (service: ReviewService, input: { oldHead: string; onto: string }, run: number) => string | undefined;
+  /** Branch reads never answer; only their abort signal ends them. */
+  branchReadHangs?: boolean;
   /** Remote fetches fail once codeboost has pushed. */
   fetchFailsAfterPush?: boolean;
   /** A collaborator pushes this commit to the branch just before codeboost's push, which is then refused. */
@@ -224,6 +226,8 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     // A real branch read is aborted by its signal; so is this one, so a cancel that stopped settlement would show.
     readBranch: async (_branch, signal) => {
       signal?.throwIfAborted();
+      if (options.branchReadHangs) return new Promise<never>((_resolve, reject) =>
+        signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
       return options.branchRead ? options.branchRead(remotePair.head) : remotePair.head;
     },
   }, options.operationTimeoutMs, undefined, authorize, options.reserves);
@@ -1168,4 +1172,71 @@ it('reports a failure after a successful push as current, not stale', async () =
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+/** Make the monotonic clock jump so only `leftMs` of a default ten-minute preparation deadline remains. */
+const leaveOfDeadline = (startedAt: number, leftMs: number) => {
+  const real = performance.now.bind(performance), offset = startedAt + 10 * 60_000 - leftMs - real();
+  vi.spyOn(performance, 'now').mockImplementation(() => real() + offset);
+};
+
+it('pushes nothing when a plan revision is applied at the push boundary', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
+    if (call !== 3) return; // validations: 1 rebase, 2 push read, 3 push boundary
+    const plan = service.store.getPlan(service.config.identity);
+    // A plan revision advances only the task state version: neither the review version nor the snapshot changes.
+    service.store.importRevision(JSON.stringify({ ...plan, summary: 'Amended at the push boundary' }), 'json',
+      service.planContext(), plan.revision);
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.result.reason).toMatch(/changed before the rewritten head was pushed/);
+  expect(fixture.remote().head).not.toBe(fixture.rebased);
+  expect(fixture.pushes).toHaveLength(1);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('ends the wait for the pushed head when the preparation deadline, not the visibility limit, runs out', async () => {
+  const startedAt = performance.now(), waitStarted: number[] = [];
+  const fixture = await rebaseFixture('feature\n', undefined, { pushVisibleAfter: 1_000_000, afterPush(_service, pushed) {
+    // The process-settlement reserve plus 1.5 s remain once the push lands; the 30 s visibility limit would outlast it.
+    leaveOfDeadline(startedAt, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 1_500);
+    waitStarted.push(Date.now());
+    return pushed;
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed' });
+  expect(fixture.result.reason).toMatch(/has not reported the pull request's new head yet/);
+  expect(Date.now() - waitStarted[0]!).toBeLessThan(10_000);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('bounds the settlement read after a failed push by what is left of the preparation deadline', async () => {
+  const startedAt = performance.now();
+  const fixture = await rebaseFixture('feature\n', undefined, { branchReadHangs: true, pushFailure() {
+    leaveOfDeadline(startedAt, 1_000);
+    return new Error('connection reset');
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'connection reset' });
+  // The read was cut off by the deadline, so the outcome is still unknown and the marker stays.
+  expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});
+
+it('lets shutdown abort a startup push settlement whose branch read does not answer', async () => {
+  let coordinatorRef: PreMergeCoordinator | null = null;
+  const fixture = await rebaseFixture('feature\n', undefined, { pushFailure() {
+    void coordinatorRef!.close();
+    return new Error('Server shutdown.');
+  }, duringRebase(_service, coordinator) { coordinatorRef = coordinator; } });
+  expect(pushMarker(fixture)).not.toBeNull();
+  const restarted = new PreMergeCoordinator(fixture.service, fixture.runner, {} as never, {
+    inspect: async () => { throw new Error('not used'); }, fetch: async () => undefined,
+    push: async () => { throw new Error('not used'); },
+    readBranch: async (_branch, signal) => new Promise<never>((_resolve, reject) =>
+      signal?.addEventListener('abort', () => reject(signal.reason), { once: true })) });
+  const settling = restarted.settlePendingPush(), closedAt = Date.now();
+  await restarted.close();
+  expect(Date.now() - closedAt).toBeLessThan(5_000);
+  await expect(settling).resolves.toBeNull();
+  expect(pushMarker(fixture)).not.toBeNull();
+  await fixture.runner.close();
 });
