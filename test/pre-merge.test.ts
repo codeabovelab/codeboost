@@ -45,6 +45,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator, read: number) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
+  closeAfterCommandAdmission?: boolean;
   commandWaitsForDeadline?: boolean;
   commandWaitsForCancellation?: boolean;
   releaseFails?: boolean;
@@ -142,6 +143,17 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
           signal: 'SIGTERM', stopReason: reason, stdout: '', stderr: '' });
       } } satisfies InvocationHandle;
     }
+    if (options.closeAfterCommandAdmission) {
+      let settle!: (result: InvocationResult) => void;
+      const settled = new Promise<InvocationResult>(resolve => { settle = resolve; });
+      setTimeout(() => settle({ attemptId: input.attemptId, context: input.context, exitCode: 0,
+        signal: null, stdout: '', stderr: '' }), 50);
+      return { attemptId: input.attemptId, settled, cancel(reason) {
+        cancelReasons.push(reason);
+        settle({ attemptId: input.attemptId, context: input.context, exitCode: null,
+          signal: 'SIGTERM', stopReason: reason, stdout: '', stderr: '' });
+      } } satisfies InvocationHandle;
+    }
     return { attemptId: input.attemptId,
       settled: Promise.resolve({ attemptId: input.attemptId, context: input.context, exitCode: commandExit ?? 0,
         signal: null, stdout: '', stderr: commandExit ? 'failed' : '' }), cancel() {} } satisfies InvocationHandle;
@@ -159,6 +171,14 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
       if (remoteReads > 1) options.duringFinalInspect?.(service, coordinator, remoteReads);
       return remotePair;
     }, fetch: async () => undefined }, options.operationTimeoutMs, undefined, authorize, options.reserves);
+  if (options.closeAfterCommandAdmission) {
+    const start = runner.start.bind(runner);
+    runner.start = ((...args: Parameters<RunnerCoordinator['start']>) => {
+      const attempt = start(...args);
+      void coordinator.close();
+      return attempt;
+    }) as RunnerCoordinator['start'];
+  }
   const task = service.store.getTask(identity);
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
@@ -405,6 +425,14 @@ it('preserves shutdown as the reason that stops an active command check', async 
   await fixture.runner.close();
 });
 
+it('stops a command check when shutdown races between admission and abort-listener registration', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { closeAfterCommandAdmission: true });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Server shutdown.' });
+  const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
+  expect(check).toMatchObject({ state: 'cancelled', firstReason: 'shutdown' });
+  await fixture.runner.close();
+});
+
 it('stops an active command check when the operation-wide deadline expires', async () => {
   const fixture = await rebaseFixture('feature\n', 0,
     { commandWaitsForCancellation: true,
@@ -529,6 +557,33 @@ it('refuses preparation before review or remote work while runner cleanup is unr
     expect(load).not.toHaveBeenCalled();
     load.mockRestore(); await coordinator.close();
   }
+});
+
+it('refuses preparation before review or remote work while a durable rebase marker awaits recovery', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-rebase-marker-')); roots.push(root);
+  const config = createDemo(join(root, 'demo')), service = new ReviewService(config); services.push(service);
+  markRunnerOwned(service);
+  const view = service.load();
+  service.store.beginRebase(config.identity, { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
+    reviewVersion: view.expected.reviewVersion! },
+    service.store.getTask(config.identity).stateVersion,
+    { oldBase: view.snapshot.base, oldHead: view.snapshot.head, oldHistory: [view.snapshot.head], onto: view.snapshot.base });
+  const task = service.store.getTask(config.identity);
+  let inspected = false;
+  const load = vi.spyOn(service, 'load');
+  const coordinator = new PreMergeCoordinator(service,
+    { start() { throw new Error('No command checks expected.'); }, settled: async () => undefined,
+      stop: () => false, isActive: () => false, status: () => ({ active: false, stopRequested: null, unresolved: null }),
+      get unreleased() { return null; } } as never,
+    { run: async () => { throw new Error('No rebase expected.'); }, abort: async () => undefined } as never,
+    { inspect: async () => { inspected = true; return { base: view.snapshot.base, head: view.snapshot.head }; },
+      fetch: async () => undefined });
+  const result = await coordinator.start({ stateVersion: task.stateVersion, reviewVersion: view.expected.reviewVersion!,
+    snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
+  expect(result).toMatchObject({ state: 'failed', reason: expect.stringMatching(/rebase|recovery|cleanup/i) });
+  expect(inspected).toBe(false);
+  expect(load).not.toHaveBeenCalled();
+  await coordinator.close();
 });
 
 it('preserves an already-requested shutdown without loading the review', async () => {

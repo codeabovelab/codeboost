@@ -260,6 +260,8 @@ export class PreMergeCoordinator {
     const runnerStatus = this.runner.status(identity);
     if (runnerStatus.unresolved || this.runner.unreleased)
       throw new GuardRefusal('Runner cleanup is unresolved; restart and recover owned resources before preparing a merge.');
+    if (this.service.store.getTask(identity).rebaseInProgress !== null)
+      throw new GuardRefusal('Rebase cleanup is unresolved; restart and recover the owned rebase before preparing a merge.');
     let view = load(), task = this.service.store.getTask(identity);
     if (task.stateVersion !== expected.stateVersion || view.expected.reviewVersion !== expected.reviewVersion
       || view.snapshot.id !== expected.snapshotId) throw new GuardRefusal('The review changed before preparation started. Reload first.');
@@ -347,6 +349,8 @@ export class PreMergeCoordinator {
         else this.runner.stop(identity, attempt.id, 'cancelled');
       };
       signal.addEventListener('abort', stop, { once: true });
+      // Adding a listener does not replay an abort that won the race after admission but before registration.
+      if (signal.aborted) stop();
       try { await this.runner.settled(identity); } finally { signal.removeEventListener('abort', stop); }
       // The check attempt itself advances task state even when it fails. Bind that owned transition without adopting a
       // concurrent review edit; such an edit must leave the preparation historical and stale.
