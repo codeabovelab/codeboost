@@ -467,7 +467,14 @@ export class PreMergeCoordinator {
       const pushed = await this.#pushRewrite(initial, view, signal, deadline, authorize, bindRebaseFailure);
       // Either way the branch no longer holds the pre-push head: ours after a push, someone else's after a refusal.
       // GitHub's PR API reports that asynchronously, so wait for it; its lag must not read as the old head.
-      const seen = await this.#awaitHeadChange(initial, signal, remaining);
+      let seen: RemotePair;
+      try { seen = await this.#awaitHeadChange(initial, signal, remaining); }
+      catch (error) {
+        // The push (or refusal) advanced task state; bind this failure to it so it is reported as current, not stale.
+        bindRebaseFailure({ reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id },
+          { base: view.snapshot.base, head: view.snapshot.head });
+        throw error;
+      }
       if (pushed !== 'pushed' || seen.head !== view.snapshot.head || seen.base !== initial.base) {
         const moved = seen; await this.remote.fetch(moved, signal); signal.throwIfAborted();
         // After a push, history is traced from the pushed head; after a refusal, from the head the push would replace.

@@ -1410,31 +1410,41 @@ describe('closing a cancelled task\'s pull requests (#111)', () => {
   });
 
   it('settles an interrupted pre-merge push only under the verified lock, and closes the PRs of a task it closed', async () => {
-    const w = world(), settle = Promise.withResolvers<void>(), calls: string[] = [];
+    const w = world(), calls: string[] = [];
     const issueGateway: IssueTrustGateway = {
       repository: REPO,
       async fetch() { return { repository: REPO, retrievedAt: new Date().toISOString(), issues: [] }; },
       async issueAccess(number) { return { number, authorLogin: 'member', collaborator: true }; },
       async issueText(number) { return { number, title: '', body: '', comments: [] }; },
     };
-    const { app, identity, store } = await serve(w, { before: completeAll, issueGateway, preMerge: service => ({
+    const { app, identity, store, branch } = await serve(w, { before: completeAll, issueGateway, preMerge: service => ({
       get active() { return false; }, get last() { return null; }, assertStartable() {},
-      settlePendingPush: () => { calls.push('settle'); return settle.promise.then(() => {
-        // What finishPrePush does when a cancel was requested while the push ran.
-        service.store.cancelTask(service.config.identity, service.store.getTask(service.config.identity).stateVersion, randomUUID());
+      // As the real job does: read the branch, then clear the marker it finds.
+      settlePendingPush: async () => {
+        calls.push('settle');
+        const marker = service.store.getTask(service.config.identity).pushInProgress;
+        if (!marker) return null;
+        service.store.finishPrePush(service.store.getTask(service.config.identity).planKey, marker.attemptId);
         return 'not-pushed' as const;
-      }); },
-      start: async () => { throw new Error('not used'); }, cancelTask: () => 'closed' as const, close: async () => undefined,
+      },
+      start: async () => { throw new Error('not used'); }, cancelTask: () => { throw new Error('not used'); }, close: async () => undefined,
     } as unknown as PreMergeCoordinator) });
-    // serve() ran startup as the CLI does, after its (passing) lock check.
-    expect(calls).toEqual(['settle']);
-    expect(() => app.publishOwed(() => { throw new Error('The database path changed.'); })).toThrow(/database path changed/);
+    // serve() ran startup as the CLI does, after its (passing) lock check; nothing was pending then.
     expect(calls).toEqual(['settle']);
     await publishSettled(app, identity);
-    expect(w.github.prs[0]!.open).toBe(true);
-    settle.resolve();
+    // The state a crash leaves: a push of the rewritten head whose outcome is unknown, and a cancel requested meanwhile.
+    const reviewed = () => ({ revision: store.getPlan(identity).revision, snapshotId: store.getSnapshot(identity).id, reviewVersion: store.reviewVersion(identity) });
+    const head = store.getSnapshot(identity).head, rewritten = 'e'.repeat(40);
+    store.recordRebase(identity, reviewed(), 'f'.repeat(40), rewritten, [{ oldSha: head, newSha: rewritten }]);
+    store.beginPrePush(identity, reviewed(), store.getTask(identity).stateVersion, { branch, from: head, to: rewritten });
+    expect(store.cancelTask(identity, store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+    // A failed lock check starts nothing.
+    expect(() => app.publishOwed(() => { throw new Error('The database path changed.'); })).toThrow(/database path changed/);
+    expect(calls).toEqual(['settle']);
+    app.publishOwed(() => { calls.push('verify'); });
+    expect(calls).toEqual(['settle', 'verify', 'settle']);
     await vi.waitFor(() => expect(store.lastPublish(identity)).toMatchObject(closedRecord), { timeout: 20_000, interval: 20 });
-    expect(store.getTask(identity).status).toBe('cancelled');
+    expect(store.getTask(identity)).toMatchObject({ status: 'cancelled', pushInProgress: null });
     expect(w.github.prs[0]!.open).toBe(false);
   });
 

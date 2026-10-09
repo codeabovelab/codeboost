@@ -1019,6 +1019,7 @@ it('fails without refreshing the review when GitHub never reports the pushed hea
   const fixture = await rebaseFixture('feature\n', 0, { pushVisibleAfter: 1_000, reserves: { pushVisibleMs: 600 } });
   expect(fixture.result).toMatchObject({ state: 'failed', checked: [] });
   expect(fixture.result.reason).toMatch(/has not reported the pull request's new head yet/);
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: false });
   expect(fixture.checkedHeads).toEqual([]);
   expect(fixture.service.load().snapshot.head).toBe(fixture.rebased);
   expect(pushMarker(fixture)).toBeNull();
