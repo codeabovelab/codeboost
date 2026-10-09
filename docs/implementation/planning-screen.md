@@ -1,12 +1,14 @@
 # Planning screen
 
-**Lane and steps:** lane G, G1 through G3. Tracking issue: #145.
+**Lane and steps:** lane G, G1 through G4. Tracking issue: #145.
 
 G1 adds a Plans screen over the planning contracts already owned by lanes E and F. It does not add another plan writer: the browser imports through `POST /api/plan/import`, then reloads `GET /api/review` so the current Store revision remains the only displayed authority.
 
 G2 adds browser controls for the existing draft and suggestion request lifecycles. The screen can ask for a complete next-revision draft or independent edit cards, poll the durable request, render the result and dismiss it.
 
 G3 applies a ready draft or one suggestion card through the Store-owned revision-bound endpoint. The browser never constructs a new plan. It retains one action ID across an ambiguous Apply retry, accepts only the expected next revision, then reloads the authoritative review. Once Apply commits, a reload failure is reported separately and cannot re-enable the action or start authoring against the old revision; a manual refresh must observe the applied revision first. Applying one card consumes the response; sibling cards stay disabled and **Refresh suggestions** sends their bounded operation, item and summary descriptions in a new revision-bound request without replacing newer guidance in the textarea.
+
+G4 connects those browser flows to the production planning setup rather than a browser-only provider stub. Its acceptance runs suggestions and whole-plan drafts through `productionPlanning`, the real `createPlanningProvider` boundary with deterministic lane D stand-ins, F's production HTTP endpoints and the SQLite Store. It applies each result in the browser, restarts the server between them and reopens SQLite after each Apply. The separate real-Docker suite remains the authority for the concrete clone, bounded storage and Claude adapter implementations.
 
 ## Display contract
 
@@ -32,4 +34,4 @@ Suggestion replies render as plain text followed by one line-separated row per t
 
 `test/browser/plans-authoring.spec.ts` covers duplicate activation, focus and disabled styling, request-time guidance preservation, exact ambiguous-start replay, a start refused after an intervening import, malformed-status ownership, failed states with impossible output, consumed-result stale labeling, rejection of mismatched bindings, wrong-operation payloads, incomplete edit cards and incomplete nested draft data, hostile markup and attribute text in both result types, retained completed history and invalidated-history labeling, suggestion rows, whole-draft preview without mutation, dismissal and ambiguous-cancellation reconciliation without a revision change, an older poll returning after dismissal, the interleaving where an import advances the plan before an older ready poll returns, single-flight draft Apply with Review text and snippet preservation, committed-Apply reporting when the authoritative reload fails, and exact ambiguous Apply replay followed by sibling refresh and a second revision-bound Apply.
 
-G4 completes real-provider/store integration and the remaining T18 browser/adapter gate.
+`test/browser/plans-production.spec.ts` is G4's composed browser/adapter acceptance. It proves the production issue description, provider schema mount and read-only planning invocation feed F's durable request lifecycle; the browser can render and Apply both result types; and revisions 2 and 3 survive independent Store reopens and a server restart. `test/planning-provider.test.ts`, `test/planning-production.test.ts` and `test/planning-recorded.test.ts` retain the focused adapter, production-wiring and real recorded-output checks. `test/agent-planning.test.ts` retains the real-Docker vendor-egress and cleanup gate.
