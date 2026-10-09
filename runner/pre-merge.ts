@@ -191,14 +191,17 @@ export class PreMergeCoordinator {
     this.#active = active;
     return active;
   }
-  /** Also returns the task state version just before and just after clearing the marker, read in that same turn. */
+  /** Clear the marker; returns the task state version just before and just after, read in the same turn. */
+  #finishPush(marker: PushMarker): { before: number; after: number } {
+    const identity = this.service.config.identity, before = this.service.store.getTask(identity).stateVersion;
+    this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(identity).planKey, marker.attemptId));
+    return { before, after: this.service.store.getTask(identity).stateVersion };
+  }
   async #settlePush(marker: PushMarker, limitMs = PUSH_SETTLEMENT_TIMEOUT_MS): Promise<{ outcome: PushOutcome; before: number; after: number }> {
     const read = await this.remote.readBranch(marker.branch,
       AbortSignal.any([this.#shutdown.signal, AbortSignal.timeout(Math.max(1, Math.min(PUSH_SETTLEMENT_TIMEOUT_MS, limitMs)))]));
     const outcome: PushOutcome = read === marker.to ? 'pushed' : read === marker.from ? 'not-pushed' : 'moved';
-    const before = this.service.store.getTask(this.service.config.identity).stateVersion;
-    this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(this.service.config.identity).planKey, marker.attemptId));
-    return { outcome, before, after: this.service.store.getTask(this.service.config.identity).stateVersion };
+    return { outcome, ...this.#finishPush(marker) };
   }
 
   #refresh(pair: RemotePair, remaining: () => number, priorHead?: string) {
@@ -282,7 +285,8 @@ export class PreMergeCoordinator {
    */
   async #pushRewrite(remote: RemotePair, view: ReturnType<ReviewService['load']>, signal: AbortSignal, deadline: number,
     authorize: () => Promise<PreMergeAuthorization | undefined>,
-    bind: (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair, stateVersion?: number) => void): Promise<'pushed' | 'refused'> {
+    bind: (reviewed: { reviewVersion: number; snapshotId: string }, pair: RemotePair, stateVersion?: number) => void):
+    Promise<{ result: 'pushed' | 'refused'; stateVersion: number }> {
     const identity = this.service.config.identity;
     if (!remote.branch) throw new GuardRefusal('The pull request was not published by the runner, so its rewritten head cannot be pushed.');
     const reviewed = { revision: view.expected.revision, snapshotId: view.expected.snapshotId,
@@ -292,6 +296,10 @@ export class PreMergeCoordinator {
     const marker = this.service.store.beginPrePush(identity, reviewed, this.service.store.getTask(identity).stateVersion,
       { branch: remote.branch, from: remote.head, to: view.snapshot.head });
     const binding = this.service.store.getTask(identity).stateVersion;
+    // The task state this push left, for binding a later failure: the version clearing the marker produced when nothing
+    // else wrote since the claim, else the claim's own. A write while the push or its read was in flight, such as a plan
+    // revision, must leave a later failure stale.
+    const owned = (cleared: { before: number; after: number }) => cleared.before === binding ? cleared.after : binding;
     try {
       await this.remote.push({ branch: marker.branch, from: marker.from, to: marker.to, beforePush: () => {
         // The last local checks before the external write: trust, and no task or review change since the claim.
@@ -304,26 +312,19 @@ export class PreMergeCoordinator {
         signal.throwIfAborted();
       } }, signal);
     } catch (error) {
-      if (error instanceof BranchPushRefused) {
-        this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(identity).planKey, marker.attemptId));
-        bind(reviewed, { base: view.snapshot.base, head: view.snapshot.head });
-        return 'refused';
-      }
+      if (error instanceof BranchPushRefused) return { result: 'refused', stateVersion: owned(this.#finishPush(marker)) };
       // Shutdown: no new GitHub read may start; startup settles the marker. Otherwise one read, within what is left of
       // the preparation's deadline (its settlement reserve included), settles it. A cancel does not stop that read.
-      // The failure is bound to the state this push left: the claim's version, or the one clearing the marker produced
-      // when nothing else wrote meanwhile. A write during the awaited read, such as a plan revision, must leave it stale.
       let settled = binding;
       const left = Math.floor(deadline - performance.now());
       if (!this.#closing && left >= 1) {
-        try { const read = await this.#settlePush(marker, left); if (read.before === binding) settled = read.after; }
+        try { settled = owned(await this.#settlePush(marker, left)); }
         catch { /* The marker stays; the next preparation or startup reads the branch again. */ }
       }
       bind(reviewed, { base: view.snapshot.base, head: view.snapshot.head }, settled);
       throw error;
     }
-    this.settle(() => this.service.store.finishPrePush(this.service.store.getTask(identity).planKey, marker.attemptId));
-    return 'pushed';
+    return { result: 'pushed', stateVersion: owned(this.#finishPush(marker)) };
   }
   async #run(expected: { stateVersion: number; reviewVersion: number; snapshotId: string; actionId?: string }, signal: AbortSignal,
     deadline: number, onObserved: (value: { pair: RemotePair; binding: { stateVersion: number; reviewVersion: number;
@@ -469,10 +470,11 @@ export class PreMergeCoordinator {
     if (blocker) return { state: 'review-required', base: view.snapshot.base, head: view.snapshot.head,
       checked: [], reason: blocker };
     if (initial.head !== view.snapshot.head) {
-      const pushed = await this.#pushRewrite(initial, view, signal, deadline, authorize, bindRebaseFailure);
-      // The push (or refusal) advanced task state; bind any later failure to it so it is reported as current, not stale.
+      const { result: pushed, stateVersion: pushState } = await this.#pushRewrite(initial, view, signal, deadline, authorize,
+        bindRebaseFailure);
+      // Bind any later failure to the state the push (or refusal) left, so it is reported as current, not stale.
       bindRebaseFailure({ reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id },
-        { base: view.snapshot.base, head: view.snapshot.head });
+        { base: view.snapshot.base, head: view.snapshot.head }, pushState);
       // Either way the branch no longer holds the pre-push head: ours after a push, someone else's after a refusal.
       // GitHub's PR API reports that asynchronously, so wait for it; its lag must not read as the old head.
       const seen = await this.#awaitHeadChange(initial, signal, remaining);

@@ -1290,3 +1290,30 @@ it('reports a failed push as stale when a plan revision lands while its outcome 
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
+
+it('reports a failure after a push as stale when a plan revision landed while the push was on the wire', async () => {
+  const revise = (service: ReviewService) => {
+    const plan = service.store.getPlan(service.config.identity);
+    service.store.importRevision(JSON.stringify({ ...plan, summary: 'Amended during the push' }), 'json',
+      service.planContext(), plan.revision);
+  };
+  // A successful push, then a failure while reviewing the head a collaborator pushed on top of it.
+  const pushed = await rebaseFixture('feature\n', 0, { fetchFailsAfterPush: true, afterPush(service, head) {
+    revise(service);
+    const tree = fixtureGit(service.config.repository, 'rev-parse', `${head}^{tree}`);
+    return fixtureGit(service.config.repository, 'commit-tree', tree, '-p', head, '-m', 'collaborator on top');
+  } });
+  expect(pushed.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  expect(pushed.coordinator.last).toMatchObject({ state: 'failed', stale: true });
+  await pushed.coordinator.close(); await pushed.runner.close();
+  // A refused push, then a failure while reviewing the collaborator head that refused it.
+  const refused = await rebaseFixture('feature\n', undefined, { fetchFailsAfterPush: true, pushedFirst(service) {
+    revise(service);
+    writeFileSync(join(service.config.repository, 'late.txt'), 'collaborator\n');
+    fixtureGit(service.config.repository, 'add', 'late.txt'); fixtureGit(service.config.repository, 'commit', '-qm', 'collaborator');
+    return fixtureGit(service.config.repository, 'rev-parse', 'HEAD');
+  } });
+  expect(refused.result).toMatchObject({ state: 'failed', reason: 'fetch failed after the push' });
+  expect(refused.coordinator.last).toMatchObject({ state: 'failed', stale: true });
+  await refused.coordinator.close(); await refused.runner.close();
+});
