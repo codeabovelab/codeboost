@@ -30,6 +30,8 @@ type PreparedResult = PreMergeResult & { readiness?: PreMergeReadiness };
 export const COMMAND_CHECK_SETTLEMENT_RESERVE_MS = 120_000;
 /** Git and GitHub subprocesses abort before the advertised operation deadline, leaving their bounded stop/drain time. */
 export const PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS = DEFAULT_PROCESS_SETTLEMENT_MS;
+/** Keep a full process-settlement window between live rebase expiry and its separately budgeted durable cleanup. */
+const REBASE_CLEANUP_HANDOFF_RESERVE_MS = PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS;
 
 /** Production preparation before F6: refresh, rebase, re-review, then exact-head command checks. */
 export class PreMergeCoordinator {
@@ -223,7 +225,8 @@ export class PreMergeCoordinator {
     const rebaseBudget = (cleanupOnly = false) => {
       // A failed live run still needs a separate abort that clears its durable marker. Keep that minimum outside the
       // run's scope instead of letting the run consume the whole operation budget.
-      const available = remaining() - (cleanupOnly ? 0 : MIN_REBASE_CLEANUP_TIMEOUT_MS);
+      const available = remaining() - (cleanupOnly ? 0
+        : MIN_REBASE_CLEANUP_TIMEOUT_MS + REBASE_CLEANUP_HANDOFF_RESERVE_MS);
       const value = Math.min(MAX_REBASE_TIMEOUT_MS, available);
       if (value < (cleanupOnly ? MIN_REBASE_CLEANUP_TIMEOUT_MS : MIN_REBASE_TIMEOUT_MS))
         throw Object.assign(new Error(`Pre-merge preparation deadline exceeded before rebase ${cleanupOnly ? 'cleanup' : 'work and cleanup'} could be reserved.`),

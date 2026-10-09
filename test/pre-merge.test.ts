@@ -3,7 +3,8 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { afterEach, expect, it, vi } from 'vitest';
-import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PreMergeCoordinator, type PreMergeAuthorization } from '../runner/pre-merge.ts';
+import { COMMAND_CHECK_SETTLEMENT_RESERVE_MS, PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS, PreMergeCoordinator,
+  type PreMergeAuthorization } from '../runner/pre-merge.ts';
 import { ReviewService } from '../runner/review.ts';
 import { createDemo } from '../scripts/demo.ts';
 import { fixtureGit } from './fixtures/git.ts';
@@ -41,7 +42,7 @@ const markRunnerUnchanged = (service: ReviewService) => {
 };
 
 async function rebaseFixture(rebasedText: string, commandExit?: number, options: {
-  duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
+  duringRebase?: (service: ReviewService, coordinator: PreMergeCoordinator, timeoutMs?: number) => void;
   duringFinalInspect?: (service: ReviewService, coordinator: PreMergeCoordinator, read: number) => void;
   duringAuthorize?: (service: ReviewService, call: number) => { base: string; head: string } | void;
   closeDuringCommand?: boolean;
@@ -92,7 +93,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const rebaser = { run: async (input: { attemptId: string; signal: AbortSignal; timeoutMs?: number }) => {
     rebaseRuns++;
     rebaseBudgets.push(input.timeoutMs);
-    options.duringRebase?.(service, coordinator);
+    options.duringRebase?.(service, coordinator, input.timeoutMs);
     input.signal.throwIfAborted();
     if (options.unsettledRebase) throw new RebaseResourcesUnsettled('Conflict resources remain owned.');
     if (options.rebaseFailure) throw options.rebaseFailure;
@@ -436,8 +437,9 @@ it('stops a command check when shutdown races between admission and abort-listen
 it('stops an active command check when the operation-wide deadline expires', async () => {
   const fixture = await rebaseFixture('feature\n', 0,
     { commandWaitsForCancellation: true,
-      operationTimeoutMs: MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 3_000,
-      reserves: { processMs: MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 1_000, commandMs: 200 } });
+      operationTimeoutMs: MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 3_000,
+      reserves: { processMs: MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS
+        + PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 1_000, commandMs: 200 } });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Pre-merge preparation deadline exceeded.' });
   const check = fixture.service.store.getAttempts(fixture.service.config.identity).find(attempt => attempt.kind === 'check');
   expect(check).toMatchObject({ state: 'failed', firstReason: null, stopReason: 'timeout', diagnostic: 'Timed out.' });
@@ -673,18 +675,35 @@ it('aborts remote work early enough to reserve bounded subprocess settlement', a
 });
 
 it('budgets live rebase work and its follow-up cleanup inside the preparation deadline', async () => {
-  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 10_000;
+  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS
+    + PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 10_000;
   const fixture = await rebaseFixture('feature\n', undefined,
     { operationTimeoutMs, rebaseFailure: new Error('rebase failed') });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
   expect(fixture.rebaseBudgets).toHaveLength(1);
   expect(fixture.abortBudgets).toHaveLength(1);
-  expect(fixture.rebaseBudgets[0]).toBeLessThanOrEqual(operationTimeoutMs - MIN_REBASE_CLEANUP_TIMEOUT_MS);
+  expect(fixture.rebaseBudgets[0]).toBeLessThanOrEqual(operationTimeoutMs - MIN_REBASE_CLEANUP_TIMEOUT_MS
+    - PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS);
   for (const budget of [...fixture.rebaseBudgets, ...fixture.abortBudgets]) {
     expect(budget).toBeTypeOf('number');
     expect(budget).toBeGreaterThan(0);
     expect(budget).toBeLessThanOrEqual(operationTimeoutMs);
   }
+});
+
+it('leaves handoff slack before starting follow-up rebase cleanup', async () => {
+  let elapsed = 0;
+  vi.spyOn(performance, 'now').mockImplementation(() => elapsed);
+  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS
+    + PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 10_000;
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    operationTimeoutMs, rebaseFailure: new Error('rebase failed'),
+    duringRebase: (_service, _coordinator, timeoutMs) => { elapsed += timeoutMs! + 1; },
+  });
+  expect(fixture.result).toMatchObject({ state: 'failed', reason: 'rebase failed' });
+  expect(fixture.rebaseAborts()).toBe(1);
+  expect(fixture.service.store.getTask(fixture.service.config.identity).rebaseInProgress).toBeNull();
+  await fixture.coordinator.close(); await fixture.runner.close();
 });
 
 it('makes a preparation action resendable when its terminal storage write fails', async () => {
@@ -749,7 +768,8 @@ it('settles a failed preparation even when the fallback snapshot read would fail
 });
 
 it('threads the remaining operation budget through every synchronous review reload', async () => {
-  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS + 10_000, processMs = 10_000;
+  const operationTimeoutMs = MIN_REBASE_TIMEOUT_MS + MIN_REBASE_CLEANUP_TIMEOUT_MS
+    + PRE_MERGE_PROCESS_SETTLEMENT_RESERVE_MS + 10_000, processMs = 10_000;
   const fixture = await rebaseFixture('feature\n', undefined, { operationTimeoutMs, reserves: { processMs, commandMs: 0 } });
   const view = fixture.service.load(), task = fixture.service.store.getTask(fixture.service.config.identity);
   const original = fixture.service.load.bind(fixture.service); const budgets: number[] = [];
