@@ -24,7 +24,10 @@ export interface PreMergeRemote {
 }
 /** One bounded read of the branch settles a push whose outcome is unknown. */
 export const PUSH_SETTLEMENT_TIMEOUT_MS = 30_000;
-/** GitHub's pull-request API reports a pushed head asynchronously; wait at most this long for it after a push. */
+/**
+ * GitHub's pull-request API reports a pushed head asynchronously. After a push, no new inspection starts once this long
+ * has passed; the last one may still take its own timeout to answer.
+ */
 export const PUSHED_HEAD_VISIBLE_TIMEOUT_MS = 30_000;
 export interface PreMergeAuthorization {
   /** Complete the last external authorization read before a later external operation. */
@@ -249,9 +252,10 @@ export class PreMergeCoordinator {
       throw new GuardRefusal('This rebase attempt no longer owns its durable marker.');
   }
   /**
-   * Inspect the PR until GitHub reports something other than the pre-push head, with backoff, bounded by
-   * `pushVisibleTimeoutMs` and the preparation deadline. A PR still at the pre-push head after that fails the
-   * preparation without refreshing the review: the branch itself already holds the pushed head.
+   * Inspect the PR until GitHub reports a head other than the pre-push head, with backoff. No inspection starts after
+   * `pushVisibleTimeoutMs`, so the wait lasts at most that plus one inspection, within the preparation deadline. A PR
+   * still at the pre-push head after that fails the preparation without refreshing the review: the branch itself
+   * already holds the pushed head.
    */
   async #awaitPushedHead(before: RemotePair, pushed: string, signal: AbortSignal, remaining: () => number): Promise<RemotePair> {
     const until = performance.now() + this.pushVisibleTimeoutMs;
