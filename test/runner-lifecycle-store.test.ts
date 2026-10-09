@@ -1047,6 +1047,9 @@ describe('pre-merge push marker (F6a of #22)', () => {
       .toThrow(/push of the rewritten head is in progress/);
     expect(() => f.store.recordRebase(identity, f.reviewed(), oid(20), oid(22), [{ oldSha: oid(12), newSha: oid(22) }]))
       .toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.admitAttempt(identity, { expectedStateVersion: version(), kind: 'check', item: 'P1',
+      expectedContext: f.store.currentContext(identity), deadline: later() })).toThrow(/push of the rewritten head is in progress/);
+    expect(() => f.store.setAssignment(identity, version(), 'someone', 'b'.repeat(40))).toThrow(/push of the rewritten head is in progress/);
     f.store.close(); stores.splice(stores.indexOf(f.store), 1);
     const reopened = open(f.path);
     expect(reopened.pushesInProgress()).toEqual([{ planKey: reopened.getTask(identity).planKey, marker }]);

@@ -79,7 +79,9 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   /** Runs once the push has landed and may move the branch again, as a collaborator push would. */
   afterPush?: (service: ReviewService, pushed: string) => string;
   pushFailure?: (service: ReviewService, input: { from: string; to: string }) => Error;
-  branchRead?: (current: string) => string | null | Promise<string | null>;
+  branchRead?: (current: string, signal?: AbortSignal) => string | null | Promise<string | null>;
+  /** Runs while the push reads the remote, before its final local checks (the pusher's `beforePush`). */
+  duringPushRead?: (service: ReviewService, coordinator: PreMergeCoordinator) => void;
 } = {}) {
   const root = mkdtempSync(join(tmpdir(), 'codeboost-pre-merge-base-')); roots.push(root);
   const repository = join(root, 'repo'); fixtureGit(root, 'init', '-q', '-b', 'main', repository);
@@ -190,7 +192,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   }, context.allowedCommands, 'a'.repeat(32)));
   let remoteReads = 0, remotePair: { base: string; head: string; branch?: string } = { base: onto, head, branch: BRANCH };
   const pushes: { branch: string; from: string; to: string }[] = [];
-  let lagging = 0, lagged = remotePair;
+  let lagging = 0, lagged = remotePair, branchReads = 0;
   let authorizationChecks = 0;
   const authorize = options.authorize ?? (options.duringAuthorize ? async () => ({
     refresh: async () => undefined,
@@ -207,6 +209,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     }, fetch: async () => { if (options.fetchFailsAfterPush && pushes.length) throw new Error('fetch failed after the push'); },
     push: async input => {
       pushes.push({ branch: input.branch, from: input.from, to: input.to });
+      options.duringPushRead?.(service, coordinator);
       input.beforePush();
       if (options.landBeforeFailure && remotePair.head === input.from) { lagged = remotePair; remotePair = { ...remotePair, head: input.to }; }
       if (options.pushedFirst) {
@@ -225,10 +228,11 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
     },
     // A real branch read is aborted by its signal; so is this one, so a cancel that stopped settlement would show.
     readBranch: async (_branch, signal) => {
+      branchReads++;
       signal?.throwIfAborted();
       if (options.branchReadHangs) return new Promise<never>((_resolve, reject) =>
         signal?.addEventListener('abort', () => reject(signal.reason), { once: true }));
-      return options.branchRead ? options.branchRead(remotePair.head) : remotePair.head;
+      return options.branchRead ? options.branchRead(remotePair.head, signal) : remotePair.head;
     },
   }, options.operationTimeoutMs, undefined, authorize, options.reserves);
   if (options.closeAfterCommandAdmission) {
@@ -243,6 +247,7 @@ async function rebaseFixture(rebasedText: string, commandExit?: number, options:
   const result = await coordinator.start({ stateVersion: task.stateVersion,
     reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id, base: view.snapshot.base, head: view.snapshot.head });
   return { service, coordinator, runner, result, rebased, checkedHeads, cancelReasons, pushes, remote: () => remotePair,
+    branchReads: () => branchReads,
     /** The branch moves (as GitHub's Git data shows it); the PR API reports `shown` for the next `reads` inspections. */
     moveRemote: (pair: { base: string; head: string }, shown?: { base: string; head: string }, reads = 0) => {
       remotePair = { ...remotePair, ...pair };
@@ -1019,6 +1024,8 @@ it('leaves the push marker for startup when shutdown interrupts the push, and st
   }, duringRebase(_service, coordinator) { coordinatorRef = coordinator; } });
   expect(fixture.result).toMatchObject({ state: 'failed', reason: 'Server shutdown.' });
   expect(pushMarker(fixture)).toMatchObject({ to: fixture.rebased });
+  // Shutdown starts no new GitHub read: the marker waits for startup.
+  expect(fixture.branchReads()).toBe(0);
   const restarted = new PreMergeCoordinator(fixture.service, fixture.runner, {} as never, {
     inspect: async () => { throw new Error('not used'); }, fetch: async () => undefined,
     push: async () => { throw new Error('not used'); }, readBranch: async () => fixture.remote().head });
@@ -1100,15 +1107,12 @@ it('keeps waiting while GitHub still reports the pre-push head, even if the base
   await fixture.coordinator.close(); await fixture.runner.close();
 });
 
-it('pushes nothing when a cancel is requested at the push boundary, and closes the task once the outcome is read', async () => {
-  const fixture = await rebaseFixture('feature\n', undefined, { duringAuthorize(service, call) {
-    if (call !== 3) return; // validations: 1 rebase, 2 push read, 3 push boundary
-    const identity = service.config.identity;
-    // Store-level, as a cancel committed by another request would be: this preparation's signal is not aborted.
-    expect(service.store.cancelTask(identity, service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+it('pushes nothing when a cancel is committed while the push reads the remote, and closes the task once the outcome is read', async () => {
+  const fixture = await rebaseFixture('feature\n', undefined, { duringPushRead(service, coordinator) {
+    // The production route: the coordinator cancels the task and aborts this preparation after the cancel commits.
+    expect(coordinator.cancelTask(service.store.getTask(service.config.identity).stateVersion, randomUUID())).toBe('stopping');
   } });
   expect(fixture.result).toMatchObject({ state: 'failed' });
-  expect(fixture.result.reason).toMatch(/changed before the rewritten head was pushed/);
   expect(fixture.remote().head).not.toBe(fixture.rebased);
   expect(fixture.service.store.getTask(fixture.service.config.identity)).toMatchObject({ status: 'cancelled', pushInProgress: null });
   await fixture.coordinator.close(); await fixture.runner.close();
@@ -1239,4 +1243,28 @@ it('lets shutdown abort a startup push settlement whose branch read does not ans
   await expect(settling).resolves.toBeNull();
   expect(pushMarker(fixture)).not.toBeNull();
   await fixture.runner.close();
+});
+
+it('lets a cancel during the next preparation\'s push settlement finish the read and close the task', async () => {
+  let readable = false;
+  const read = Promise.withResolvers<string | null>();
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    pushFailure: () => new Error('timed out'),
+    branchRead: (current, signal) => {
+      if (!readable) throw new Error('GitHub unreachable');
+      // A real read is aborted by its signal; a cancel must not be able to abort this one.
+      signal?.addEventListener('abort', () => read.reject(signal.reason), { once: true });
+      return read.promise;
+    },
+  });
+  const identity = fixture.service.config.identity;
+  expect(pushMarker(fixture)).not.toBeNull();
+  readable = true;
+  const preparing = prepareAgain(fixture);
+  await vi.waitFor(() => expect(fixture.branchReads()).toBe(2));
+  expect(fixture.coordinator.cancelTask(fixture.service.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+  read.resolve(fixture.remote().head);
+  await expect(preparing).resolves.toMatchObject({ state: 'failed', reason: 'Task cancelled.' });
+  expect(fixture.service.store.getTask(identity)).toMatchObject({ status: 'cancelled', pushInProgress: null });
+  await fixture.coordinator.close(); await fixture.runner.close();
 });
