@@ -291,6 +291,22 @@ it('preserves execution approval recorded at the rewritten final output snapshot
   ]);
   expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
 });
+it('binds pre-execution approvals to the current snapshot across a rewrite of the reviewed head', () => {
+  const { store } = fixture();
+  store.recordHistory(identity, state(store), oid(1), oid(3), [
+    { sha: oid(2), owner: 'P1', origin: 'owned', sourceSha: null },
+    { sha: oid(3), owner: 'P1', origin: 'owned', sourceSha: null },
+  ]);
+  store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual([]);
+  store.recordRebase(identity, state(store), oid(10), oid(13), [
+    { oldSha: oid(2), newSha: oid(12) }, { oldSha: oid(3), newSha: oid(13) },
+  ]);
+  expect(store.isRewrittenHead(identity, oid(3), oid(13))).toBe(true);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+  store.recordHistory(identity, state(store), oid(1), oid(3), []);
+  expect(store.unapprovedExecutionItems(identity, store.getPlan(identity).revision)).toEqual(['P1']);
+});
 it('keeps a later attribution choice binding before execution when a collaborator head returns', () => {
   const { store } = fixture();
   store.saveReview(identity, state(store), [approveItem(store.getPlan(identity), [], 'P1', identity, true)], []);

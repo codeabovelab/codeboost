@@ -1146,6 +1146,9 @@ export class Store {
     }
     const reviewedExecutionSnapshot = (value: ReviewState) => {
       if (value.snapshotId === snapshotId || prefixSnapshots.has(value.snapshotId)) return true;
+      // Head-based evidence carries approvals only across a completed prefix's own output and its validated rewrites.
+      // Before execution this gate does not compare fingerprints, so approvals stay bound to the current snapshot.
+      if (prefixSnapshots.size === 0) return false;
       const evidenceHead = this.getSnapshot(identity, value.snapshotId).head;
       return evidenceHead === currentSnapshot.head || this.isRewrittenHead(identity, evidenceHead, currentSnapshot.head);
     };
