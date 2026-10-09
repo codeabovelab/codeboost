@@ -488,6 +488,9 @@ export class PreMergeCoordinator {
             ? 'The pull request moved after the rewritten head was pushed; attribution and approvals were refreshed.'
             : 'The pull request branch moved before the rewritten head could be pushed; attribution and approvals were refreshed.' };
       }
+      // Nothing but this push may have changed the task meanwhile: a plan revision or review edit applied while it was in
+      // flight would otherwise be adopted by the reload below and run checks under approvals it made stale.
+      assertCurrent({ stateVersion: pushState, reviewVersion: view.expected.reviewVersion!, snapshotId: view.snapshot.id });
       initial = seen;
       view = load();
     }

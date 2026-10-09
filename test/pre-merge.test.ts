@@ -1317,3 +1317,17 @@ it('reports a failure after a push as stale when a plan revision landed while th
   expect(refused.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await refused.coordinator.close(); await refused.runner.close();
 });
+
+it('runs no command check when a plan revision landed while the push was on the wire', async () => {
+  const fixture = await rebaseFixture('feature\n', 0, { afterPush(service, head) {
+    const plan = service.store.getPlan(service.config.identity);
+    service.store.importRevision(JSON.stringify({ ...plan, summary: 'Amended during the push' }), 'json',
+      service.planContext(), plan.revision);
+    return head;
+  } });
+  expect(fixture.result).toMatchObject({ state: 'failed', checked: [] });
+  expect(fixture.result.reason).toMatch(/changed during preparation/);
+  expect(fixture.checkedHeads).toEqual([]);
+  expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
+  await fixture.coordinator.close(); await fixture.runner.close();
+});

@@ -2170,7 +2170,7 @@ export class Store {
     if (this.#activeMerge(key)) throw new GuardRefusal('A merge is in progress; wait for its outcome.');
     // Interrupted work waiting to be requeued, or a rebase in progress, is not finished work to publish.
     if (task.requeue_pending === 1) throw new GuardRefusal('The task has interrupted work waiting to be requeued.');
-    this.#assertNoRewriteInFlight(task);
+    if (task.rebase_in_progress !== null) throw new GuardRefusal('A rebase is in progress for this task.');
     // A ready PR is finished work: every item of the current plan revision has a completed execute attempt. Checked here,
     // at every guarded publish write, so a plan revision that adds an item while a publish awaits GitHub refuses it.
     if (!draft) {
