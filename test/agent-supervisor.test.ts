@@ -150,6 +150,19 @@ describe('container invocation supervisor', () => {
     expect(result.stderr).toContain('[codeboost: command output truncated]');
   }, 60_000);
 
+  it('keeps multibyte truncated command diagnostics inside the byte limit', async () => {
+    const data = fixture(), limits = { stdoutBytes: 1024, stderrBytes: 1024, combinedBytes: 1024 };
+    const result = await startProfileInvocation(await profile(data, 'finite-multibyte-output',
+      invocation(data, 'bounded-multibyte-command-diagnostics', 2 * 60_000, 'runner', 'review')),
+    { limits, diagnosticOutput: true }).settled;
+    expect(result).toMatchObject({ exitCode: 0, signal: null });
+    expect(result.stopReason).toBeUndefined();
+    expect(result.stderr).not.toContain('\uFFFD');
+    expect(Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.stderrBytes);
+    expect(Buffer.byteLength(result.stdout) + Buffer.byteLength(result.stderr)).toBeLessThanOrEqual(limits.combinedBytes);
+    expect(result.stderr).toContain('[codeboost: command output truncated]');
+  }, 60_000);
+
   it('keeps invalid command diagnostics from changing exit-0 success', async () => {
     const data = fixture();
     const result = await startProfileInvocation(await profile(data, 'invalid-utf8-stderr',

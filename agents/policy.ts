@@ -163,7 +163,7 @@ export function createCodexCommand(policy: PhasePolicy, prompt: string): AgentCo
 
 export type IsolationProbe = 'noop' | 'phase-worktree' | 'read-only-isolation' | 'persist-write'
   | 'persist-read' | 'capacity' | 'metadata' | 'must-not-run' | 'input-marker' | 'finite-output'
-  | 'finite-large-output'
+  | 'finite-large-output' | 'finite-multibyte-output'
   | 'infinite-stdout' | 'infinite-stderr' | 'infinite-mixed' | 'ignore-term' | 'symlink-output'
   | 'oversized-output' | 'fifo-output' | 'invalid-utf8-output' | 'invalid-utf8-stderr' | 'truncated-utf8-stderr'
   | 'replace-output-directory'
@@ -205,6 +205,7 @@ export function createIsolationProbeCommand(policy: PhasePolicy, probe: Isolatio
       + 'test ! -e /run/codeboost-input/extra.json',
     'finite-output': 'printf stdout-marker; printf stderr-marker >&2',
     'finite-large-output': "head -c 131072 /dev/zero | tr '\\0' x; head -c 65536 /dev/zero | tr '\\0' y >&2",
+    'finite-multibyte-output': "i=0; while test \"$i\" -lt 2000; do printf '\\342\\202\\254' >&2; i=$((i+1)); done",
     'invalid-utf8-stderr': "printf 'bad-\\377\\377-stderr' >&2",
     'truncated-utf8-stderr': "printf 'cut-\\342' >&2",
     'infinite-stdout': "while :; do head -c 4096 /dev/zero | tr '\\0' x; done",

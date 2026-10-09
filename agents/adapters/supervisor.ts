@@ -806,7 +806,7 @@ export function startProfileInvocation(profile: ContainerProfile, options: Super
         const notice = Buffer.from('[codeboost: command output truncated]\n');
         const maximum = Math.max(0, Math.min(limits.stderrBytes, limits.combinedBytes - finalStdout.length));
         finalStderr = maximum <= notice.length ? notice.subarray(0, maximum)
-          : Buffer.concat([finalStderr.subarray(0, maximum - notice.length), notice]);
+          : Buffer.concat([boundedDiagnostic(finalStderr, maximum - notice.length), notice]);
       }
     } else {
       const stdoutText = strictText(finalStdout), stderrText = strictText(finalStderr);
