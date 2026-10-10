@@ -190,8 +190,9 @@ describe('planning API for lane G', () => {
       const body = envelope('x'.repeat(MAX_IMPORT_REQUEST_BYTES - empty), view.plan.revision);
       expect(Buffer.byteLength(body)).toBe(MAX_IMPORT_REQUEST_BYTES);
       const response = await post(app, body);
-      expect(response.status).not.toBe(413);
-      expect(response.body.error).toMatch(/exceeds 1 MiB/);
+      expect(response).toEqual({ status: 409, body: { error: expect.stringMatching(/exceeds 1 MiB/) } });
+      // The refusal is recorded like any other import refusal: the same request replays it.
+      expect(await post(app, body)).toEqual(response);
       expect((await review(app)).plan.revision).toBe(view.plan.revision);
     });
     it('refuses a request one byte over the limit before reading it as JSON, and imports nothing', async () => {
@@ -202,11 +203,16 @@ describe('planning API for lane G', () => {
       expect(await post(app, body)).toEqual({ status: 413, body: { error: 'Request too large.' } });
       expect((await review(app)).plan.revision).toBe(view.plan.revision);
     });
-    it('keeps the 16 KiB limit for every other request', async () => {
+    it('keeps the 16 KiB limit for every other request, the other planning requests included', async () => {
       const { app } = await serve();
-      const response = await fetch(`${new URL(app.url).origin}/api/action`, { method: 'POST', body: JSON.stringify({ pad: 'x'.repeat(MAX_REQUEST_BYTES) }),
-        headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
-      expect(response.status).toBe(413);
+      const body = JSON.stringify({ pad: 'x'.repeat(MAX_REQUEST_BYTES - 9) });
+      expect(Buffer.byteLength(body)).toBe(MAX_REQUEST_BYTES + 1);
+      for (const path of ['/api/action', '/api/settings', '/api/issues', '/api/runner', '/api/plan/suggestions', '/api/plan/drafts',
+        `/api/plan/suggestions/${randomUUID()}/apply`, `/api/plan/drafts/${randomUUID()}/cancel`]) {
+        const response = await fetch(`${new URL(app.url).origin}${path}`, { method: 'POST', body,
+          headers: { 'x-codeboost-token': app.token, 'content-type': 'application/json' } });
+        expect([path, response.status]).toEqual([path, 413]);
+      }
     });
   });
   it('starts, reads, and applies a suggestion exactly once', async () => {

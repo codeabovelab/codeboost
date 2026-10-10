@@ -51,7 +51,8 @@ export const MAX_REQUEST_BYTES = 16 * 1024;
  * The largest body of `POST /api/plan/import`, in bytes (#146). The body carries the plan source as one JSON string.
  * Any JSON encoding writes each UTF-8 byte of that source as at most 6 bytes (`\u0001` for a control character, which
  * YAML accepts in a scalar). So the limit admits every source within the parser's limit, inside any envelope that
- * fits MAX_REQUEST_BYTES with an empty source. A larger source then gets the parser's refusal, not a transport one.
+ * fits MAX_REQUEST_BYTES with an empty source. A body within the limit whose source is above the parser's limit gets
+ * the parser's refusal, not a transport one.
  */
 export const MAX_IMPORT_REQUEST_BYTES = 6 * MAX_SOURCE_BYTES + MAX_REQUEST_BYTES;
 /** The longest shutdown waits for admitted requests to finish before aborting them; below the 15 s request timeout. */
