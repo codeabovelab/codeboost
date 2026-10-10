@@ -6,7 +6,7 @@ Repo: codeabovelab/codeboost
 Status: APPROVED
 Mode: Builder (open source / research)
 Writing standard: plain language, ISO 24495-1:2023
-Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes")
+Last checked against the code: 2026-09-26 (see "Lane status" under "Parallel build lanes"). For the current state of each lane, see the lane table in `docs/architecture.md`.
 
 ## About this document
 
@@ -1894,7 +1894,7 @@ Critical gaps (no test, no handling, and silent): 0.
 
 #### Lane status (checked 2026-09-26, after #55)
 
-This table records merged and open PRs only. A lane is complete only when every step meets its acceptance criteria on `main`.
+This table is a snapshot from 2026-09-26 and is not kept current. For the current state of each lane, see the lane table in `docs/architecture.md`. This table records merged and open PRs only. A lane is complete only when every step meets its acceptance criteria on `main`.
 
 | Lane | Merged | Open PRs | Next |
 |---|---|---|---|

@@ -38,6 +38,6 @@ Suggestion replies render as plain text followed by one line-separated row per t
 
 ## Handoff
 
-Lane G is complete (#145). G1–G4 merged as PRs #148, #150, #151 and #152. Lane G no longer owns `web/public/index.html`, `web/public/app.js`, `web/public/style.css` or the Plans browser specs. The next change to those files takes ownership under the usual rules: check open PRs and worktrees first.
+G1–G4 have merged as PRs #148, #150, #151 and #152, which completes lane G (#145). Lane G no longer owns `web/public/index.html`, `web/public/app.js`, `web/public/style.css`, `test/browser/plans.spec.ts`, `test/browser/plans-authoring.spec.ts`, `test/browser/plans-production.spec.ts` or this document. The next change to those files takes ownership under the usual rules: check open PRs and worktrees first.
 
 One related issue remains open. #146: `POST /api/plan/import` refuses request bodies over 16 KiB, but some schema-valid plans are larger. Lane F owns it, because the fix is in the server's request limit, not in the screen.
