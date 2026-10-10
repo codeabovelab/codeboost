@@ -1,6 +1,7 @@
 import { isAlias, isMap, isScalar, isSeq, parseDocument } from 'yaml';
 
-const MAX_BYTES = 1024 * 1024;
+/** The largest plan source import parses, in UTF-8 bytes. The import request limit (web/server.ts) is derived from it. */
+export const MAX_SOURCE_BYTES = 1024 * 1024;
 const number = /^-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?$/u;
 function reject(message: string): never { throw new Error(message); }
 function numeric(text: string): number {
@@ -21,9 +22,9 @@ function numeric(text: string): number {
 }
 /** Frozen v1 syntax contract. No runtime I/O or alias/object construction. */
 export function parseV1(input: string | Uint8Array, format: 'json' | 'yaml'): unknown {
-  if (typeof input === 'string' && input.length > MAX_BYTES) reject('Input size exceeds 1 MiB.');
+  if (typeof input === 'string' && input.length > MAX_SOURCE_BYTES) reject('Input size exceeds 1 MiB.');
   const bytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-  if (bytes.byteLength > MAX_BYTES) reject('Input size exceeds 1 MiB.');
+  if (bytes.byteLength > MAX_SOURCE_BYTES) reject('Input size exceeds 1 MiB.');
   const source = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
   if (typeof input === 'string' && input !== source) reject('Invalid UTF-8 source string.');
   if (format === 'json') return parseJson(source);
