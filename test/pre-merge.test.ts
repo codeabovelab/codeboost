@@ -1331,3 +1331,17 @@ it('runs no command check when a plan revision landed while the push was on the 
   expect(fixture.coordinator.last).toMatchObject({ state: 'failed', stale: true });
   await fixture.coordinator.close(); await fixture.runner.close();
 });
+
+it('leaves a running preparation in charge when a push settlement is requested meanwhile', async () => {
+  let requested: Promise<unknown> | null = null, stillActive: boolean | null = null;
+  const fixture = await rebaseFixture('feature\n', undefined, {
+    duringRebase(_service, coordinator) { requested = coordinator.settlePendingPush(); },
+    // Later, after several awaits: the settlement request must not have taken the preparation's place.
+    duringPushRead(_service, coordinator) { stillActive = coordinator.active; },
+  });
+  await expect(requested).resolves.toBeNull();
+  expect(stillActive).toBe(true);
+  expect(fixture.result).toMatchObject({ state: 'ready', head: fixture.rebased });
+  expect(fixture.branchReads()).toBe(0);
+  await fixture.coordinator.close(); await fixture.runner.close();
+});

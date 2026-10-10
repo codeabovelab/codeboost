@@ -1038,6 +1038,25 @@ describe('pre-merge push marker (F6a of #22)', () => {
     expect(() => begin(f)).toThrow(/Stale task state|push of the rewritten head is in progress/);
   });
 
+  it('refuses a push claim for a task that is not mergeable, is being cancelled, or has an attempt or merge in flight', () => {
+    const queuedTask = rewritten();
+    queuedTask.store.transitionTask(identity, queuedTask.store.getTask(identity).stateVersion, 'queued');
+    expect(() => begin(queuedTask)).toThrow(/The task is queued; push it from review/);
+
+    const attempting = rewritten();
+    admit(attempting.store, { kind: 'check' });
+    expect(() => begin(attempting)).toThrow(/attempt is still active/);
+
+    const cancelling = rewritten();
+    admit(cancelling.store, { kind: 'check' });
+    expect(cancelling.store.cancelTask(identity, cancelling.store.getTask(identity).stateVersion, randomUUID())).toBe('stopping');
+    expect(() => begin(cancelling)).toThrow(/being cancelled/);
+
+    const merging = rewritten();
+    merging.store.beginMergeAttempt(identity, merging.reviewed(), oid(12), null, 'direct', randomUUID(), merging.store.getTask(identity).stateVersion);
+    expect(() => begin(merging)).toThrow(/merge is in progress/);
+  });
+
   it('blocks every other task write, rebase and merge until the push settles, and survives a restart', () => {
     const f = rewritten(), marker = begin(f), version = () => f.store.getTask(identity).stateVersion;
     expect(() => f.store.transitionTask(identity, version(), 'queued')).toThrow(/push of the rewritten head is in progress/);
