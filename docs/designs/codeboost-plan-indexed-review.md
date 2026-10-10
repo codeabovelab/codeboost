@@ -190,6 +190,8 @@ This keeps the plan out of the code, and there is only one master copy.
 4. waits for you to approve or edit the proposal on the planning screen. Your approval creates the next plan revision;
 5. puts the task back in the queue at its old position, and re-runs that plan item from the start.
 
+The Plans screen does not yet show this proposal or support in-screen editing (#155). Today the next revision comes from an import, or from an applied agent draft or suggestion.
+
 If an invocation finishes normally and passes the safety audit but edited an undeclared regular file within the task repository, codeboost still commits the change. Unsafe path, metadata, symlink, or submodule violations instead stop the invocation before any test or commit and move it to needs human. The change shows on that plan item's row, marked out of scope. Execution deliberately pauses in **needs amendment** before any later item or check invocation. A person must approve a revised plan and continuation; the runner reconciles the already-executed prefix with the audited current head, then validates remaining operations from that actual checkpoint. Do not silently add the file to scope or erase its original out-of-scope evidence.
 
 **Checking whether the issue is already fixed.** Before it opens the PR, and again before merging, codeboost checks:
